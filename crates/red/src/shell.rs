@@ -37,10 +37,17 @@ impl AppState {
         active: &ActiveConn,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = cx.theme();
-        let (bg_app, bg_panel, bg_panel_2) = (theme.bg_app, theme.bg_panel, theme.bg_panel_2);
+        // Owned snapshot so building the pane contents below (which borrow `cx`
+        // mutably) doesn't clash with the theme tokens used throughout this fn.
+        let theme = cx.theme().clone();
+        let bg_app = theme.bg_app;
         let (muted, faint) = (theme.text_muted, theme.text_faint);
         let view = cx.entity().downgrade();
+
+        // Live pane contents (M3): the schema explorer + the interim preview grid.
+        let schema_pane = self.render_schema(active, cx);
+        let results_pane = self.render_results(active, cx);
+
         let config = &active.config;
 
         // --- top bar ---
@@ -149,7 +156,7 @@ impl AppState {
                     .ok();
                 })
                 .first(placeholder("SQL editor", "(M4)", bg_app, muted, faint))
-                .second(placeholder("Result grid", "(M5)", bg_panel, muted, faint))
+                .second(results_pane)
         };
 
         let outer = {
@@ -190,13 +197,7 @@ impl AppState {
                     })
                     .ok();
                 })
-                .first(placeholder(
-                    "Schema explorer",
-                    "(M3)",
-                    bg_panel_2,
-                    muted,
-                    faint,
-                ))
+                .first(schema_pane)
                 .second(inner)
         };
 

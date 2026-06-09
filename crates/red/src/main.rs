@@ -10,6 +10,7 @@ mod app;
 mod assets;
 mod config;
 mod connect;
+mod schema;
 mod shell;
 
 use flint::prelude::*;

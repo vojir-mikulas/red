@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use red_core::{Column, QueryOptions, RedError, Result, RowWindow};
+use red_core::{Column, QueryOptions, RedError, Result, RowWindow, SchemaMeta, TableDetail};
 
 mod sqlite;
 pub use sqlite::SqliteDriver;
@@ -32,6 +32,15 @@ pub trait DatabaseDriver: Send + Sync {
     /// design: this does NOT step rows — the first (potentially expensive) step
     /// happens on the first `next_window`, which is the cancellable path.
     async fn open_cursor(&self, sql: &str, opts: QueryOptions) -> Result<Box<dyn QueryCursor>>;
+
+    /// The schema-tree skeleton: every namespace with its table/view names. Cheap
+    /// by contract — names + kinds only, no per-table `COUNT(*)` and no column
+    /// walk (that's `describe_table`, pulled lazily on expand).
+    async fn list_objects(&self) -> Result<Vec<SchemaMeta>>;
+
+    /// One object's columns, foreign keys, and indexes. Loaded on demand when the
+    /// user expands a table, so the initial tree load stays light.
+    async fn describe_table(&self, schema: &str, table: &str) -> Result<TableDetail>;
 }
 
 /// A live, windowed result cursor. Object-safe; the service holds it as

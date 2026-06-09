@@ -4628,6 +4628,7 @@ dependencies = [
  "futures",
  "red-core",
  "red-driver",
+ "rusqlite",
  "tokio",
  "tracing",
 ]

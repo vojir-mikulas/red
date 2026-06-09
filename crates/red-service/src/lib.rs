@@ -18,7 +18,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
-use red_core::{Column, ConnectionConfig, DbKind, QueryOptions, RedError, RowWindow};
+use red_core::{
+    Column, ConnectionConfig, DbKind, QueryOptions, RedError, RowWindow, SchemaMeta, TableDetail,
+};
 use red_driver::{CancelToken, DatabaseDriver, QueryCursor, SqliteDriver};
 use tokio::sync::mpsc::{
     unbounded_channel, UnboundedReceiver as CmdReceiver, UnboundedSender as CmdSender,
@@ -36,6 +38,13 @@ pub enum Command {
     /// Pull the next window from the active cursor.
     FetchMore {
         max: usize,
+    },
+    /// Load the schema-tree skeleton (namespaces + object names) for the sidebar.
+    LoadObjects,
+    /// Describe one object's columns / FKs / indexes — sent lazily on tree expand.
+    DescribeTable {
+        schema: String,
+        table: String,
     },
     /// Abort the active query / drop its cursor.
     Cancel,
@@ -66,6 +75,17 @@ pub enum Event {
     },
     /// The active query was cancelled (user `Cancel`).
     QueryCancelled,
+    /// The schema-tree skeleton, in response to `LoadObjects`.
+    ObjectsLoaded {
+        schemas: Vec<SchemaMeta>,
+    },
+    /// One object's detail, in response to `DescribeTable`. Echoes `schema`/`table`
+    /// so the async UI routes the detail to the right node regardless of order.
+    TableDescribed {
+        schema: String,
+        table: String,
+        detail: TableDetail,
+    },
     Error(String),
 }
 
@@ -182,6 +202,35 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
                 }
                 None => emit(&events, Event::Error("no active query".into())),
             },
+
+            Command::LoadObjects => {
+                let Some(driver) = session.clone() else {
+                    emit(&events, Event::Error("not connected".into()));
+                    continue;
+                };
+                match driver.list_objects().await {
+                    Ok(schemas) => emit(&events, Event::ObjectsLoaded { schemas }),
+                    Err(e) => emit(&events, Event::Error(e.to_string())),
+                }
+            }
+
+            Command::DescribeTable { schema, table } => {
+                let Some(driver) = session.clone() else {
+                    emit(&events, Event::Error("not connected".into()));
+                    continue;
+                };
+                match driver.describe_table(&schema, &table).await {
+                    Ok(detail) => emit(
+                        &events,
+                        Event::TableDescribed {
+                            schema,
+                            table,
+                            detail,
+                        },
+                    ),
+                    Err(e) => emit(&events, Event::Error(e.to_string())),
+                }
+            }
 
             Command::Cancel => {
                 // No fetch is in flight here (pull protocol), so cancelling just
@@ -439,6 +488,59 @@ mod tests {
             other => panic!("expected not-connected error, got {other:?}"),
         }
         handle.send(Command::Shutdown);
+    }
+
+    /// Connect, load the skeleton, then describe a table — the schema-explorer
+    /// round-trip the sidebar drives (M3).
+    #[tokio::test]
+    async fn loads_and_describes_schema() {
+        // A unique temp file so the service's own connections see a populated DB.
+        let path = std::env::temp_dir().join(format!("red_svc_{}.db", std::process::id()));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                 CREATE VIEW v AS SELECT id FROM t;",
+            )
+            .unwrap();
+        }
+
+        let mut handle = spawn();
+        let mut events = handle.take_events().expect("event stream");
+        handle.send(Command::Connect(sqlite(path.to_str().unwrap(), true)));
+        assert!(matches!(events.next().await, Some(Event::Connected { .. })));
+
+        handle.send(Command::LoadObjects);
+        match events.next().await {
+            Some(Event::ObjectsLoaded { schemas }) => {
+                let main = schemas.iter().find(|s| s.name == "main").unwrap();
+                assert!(main.objects.iter().any(|o| o.name == "t"));
+                assert!(main.objects.iter().any(|o| o.name == "v"));
+            }
+            other => panic!("expected ObjectsLoaded, got {other:?}"),
+        }
+
+        handle.send(Command::DescribeTable {
+            schema: "main".into(),
+            table: "t".into(),
+        });
+        match events.next().await {
+            Some(Event::TableDescribed { table, detail, .. }) => {
+                assert_eq!(table, "t");
+                assert!(detail
+                    .columns
+                    .iter()
+                    .any(|c| c.name == "id" && c.primary_key));
+                assert!(detail
+                    .columns
+                    .iter()
+                    .any(|c| c.name == "name" && c.not_null));
+            }
+            other => panic!("expected TableDescribed, got {other:?}"),
+        }
+
+        handle.send(Command::Shutdown);
+        std::fs::remove_file(&path).ok();
     }
 
     #[tokio::test]

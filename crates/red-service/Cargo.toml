@@ -18,3 +18,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+# Used only by tests to populate a fixture DB the service then introspects.
+rusqlite.workspace = true

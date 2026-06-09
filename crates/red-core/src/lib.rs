@@ -66,6 +66,70 @@ pub struct Column {
     pub decl_type: Option<String>,
 }
 
+/// What a schema object is. SQLite has tables and views; Postgres (M7) maps onto
+/// the same two for the explorer's purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    Table,
+    View,
+}
+
+/// A namespace of objects — the top level of the schema tree. For SQLite this is
+/// a database from `PRAGMA database_list` (`main` / `temp` / an attached DB); for
+/// Postgres (M7) it's a real schema. One level so both engines fit the same tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaMeta {
+    pub name: String,
+    /// Names + kinds only — the cheap tree skeleton, loaded on connect. Column
+    /// detail is pulled per table via [`TableDetail`] on expand.
+    pub objects: Vec<ObjectMeta>,
+}
+
+/// One table or view in a [`SchemaMeta`] — just enough to draw the tree node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectMeta {
+    pub name: String,
+    pub kind: ObjectKind,
+}
+
+/// On-demand detail for one table/view: its columns, foreign keys, and indexes.
+/// Loaded lazily when the user expands the object, never as part of the skeleton.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableDetail {
+    pub columns: Vec<ColumnMeta>,
+    pub foreign_keys: Vec<ForeignKeyMeta>,
+    pub indexes: Vec<IndexMeta>,
+}
+
+/// One column of a table/view. Richer than result-set [`Column`]: it carries the
+/// schema facts the tree shows (nullability, primary-key membership, default).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnMeta {
+    pub name: String,
+    /// Declared type, best-effort (`None` for an untyped/computed column).
+    pub type_name: Option<String>,
+    pub not_null: bool,
+    pub primary_key: bool,
+    pub default: Option<String>,
+}
+
+/// A foreign-key edge from a local column to a referenced table/column. The tree
+/// derives a column's FK badge by matching `column` against the table's columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyMeta {
+    pub column: String,
+    pub ref_table: String,
+    pub ref_column: String,
+}
+
+/// An index over one or more columns of a table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexMeta {
+    pub name: String,
+    pub unique: bool,
+    pub columns: Vec<String>,
+}
+
 /// One bounded window of rows pulled from a streaming cursor. The streaming path
 /// never materializes a whole result — it yields these fixed-size windows.
 #[derive(Debug, Clone, Default)]

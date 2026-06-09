@@ -17,12 +17,15 @@ use red_service::{Command, Event, ServiceHandle};
 
 use crate::assets::FONT_UI;
 use crate::config::{self, StoredConnection};
+use crate::schema::{Preview, SchemaState};
 
 /// Which top-level screen is showing.
 pub(crate) enum Phase {
     Disconnected,
     Connecting { config: ConnectionConfig },
-    Connected(ActiveConn),
+    // Boxed: `ActiveConn` carries the whole schema model, dwarfing the other
+    // variants — box it to keep `Phase` small.
+    Connected(Box<ActiveConn>),
 }
 
 /// Add/edit connection form state. The name + DSN text live in the shared
@@ -35,8 +38,9 @@ pub(crate) struct FormState {
     pub editing: Option<usize>,
 }
 
-/// The live-connection view state: which connection, its engine version, and the
-/// resizable split sizes (caller-owned, per `SplitPane`'s stateless contract).
+/// The live-connection view state: which connection, its engine version, the
+/// resizable split sizes (caller-owned, per `SplitPane`'s stateless contract),
+/// the schema explorer (M3), and the current table preview (M3 interim results).
 pub(crate) struct ActiveConn {
     pub config: ConnectionConfig,
     pub version: String,
@@ -44,10 +48,12 @@ pub(crate) struct ActiveConn {
     pub sidebar_drag: Option<DragAnchor>,
     pub editor_h: Pixels,
     pub editor_drag: Option<DragAnchor>,
+    pub schema: SchemaState,
+    pub preview: Option<Preview>,
 }
 
 impl ActiveConn {
-    fn new(config: ConnectionConfig, version: String) -> Self {
+    fn new(config: ConnectionConfig, version: String, cx: &mut Context<AppState>) -> Self {
         Self {
             config,
             version,
@@ -55,12 +61,14 @@ impl ActiveConn {
             sidebar_drag: None,
             editor_h: px(300.),
             editor_drag: None,
+            schema: SchemaState::new(cx),
+            preview: None,
         }
     }
 }
 
 pub struct AppState {
-    service: ServiceHandle,
+    pub(crate) service: ServiceHandle,
     pub(crate) connections: Vec<StoredConnection>,
     pub(crate) phase: Phase,
     pub(crate) name_input: Entity<TextInput>,
@@ -107,7 +115,9 @@ impl AppState {
                 if let Phase::Connecting { config } =
                     std::mem::replace(&mut self.phase, Phase::Disconnected)
                 {
-                    self.phase = Phase::Connected(ActiveConn::new(config, version));
+                    self.phase = Phase::Connected(Box::new(ActiveConn::new(config, version, cx)));
+                    // Kick off the schema-tree skeleton load for the sidebar.
+                    self.service.send(Command::LoadObjects);
                 }
             }
             Event::Disconnected => self.phase = Phase::Disconnected,
@@ -115,10 +125,56 @@ impl AppState {
                 if matches!(self.phase, Phase::Connecting { .. }) {
                     self.phase = Phase::Disconnected;
                 }
+                if let Phase::Connected(active) = &mut self.phase {
+                    if let Some(preview) = &mut active.preview {
+                        preview.running = false;
+                        preview.error = Some(message.clone());
+                    }
+                }
                 self.toast = Some((message.into(), ToastVariant::Error));
             }
-            // Query-lifecycle events get consumed once the result grid lands (M5).
-            _ => {}
+
+            // --- schema explorer (M3) ---
+            Event::ObjectsLoaded { schemas } => {
+                if let Phase::Connected(active) = &mut self.phase {
+                    active.schema.apply_objects(schemas);
+                }
+            }
+            Event::TableDescribed {
+                schema,
+                table,
+                detail,
+            } => {
+                if let Phase::Connected(active) = &mut self.phase {
+                    active.schema.details.insert((schema, table), detail);
+                }
+            }
+
+            // --- table preview (M3 interim; the streaming grid is M5) ---
+            Event::QueryStarted { columns } => {
+                if let Phase::Connected(active) = &mut self.phase {
+                    if let Some(preview) = &mut active.preview {
+                        preview.columns = columns;
+                        preview.rows.clear();
+                        preview.running = true;
+                        preview.error = None;
+                    }
+                }
+            }
+            Event::QueryRows(window) => {
+                if let Phase::Connected(active) = &mut self.phase {
+                    if let Some(preview) = &mut active.preview {
+                        preview.rows.extend(window.rows);
+                    }
+                }
+            }
+            Event::QueryFinished { .. } | Event::QueryCancelled => {
+                if let Phase::Connected(active) = &mut self.phase {
+                    if let Some(preview) = &mut active.preview {
+                        preview.running = false;
+                    }
+                }
+            }
         }
         cx.notify();
     }
