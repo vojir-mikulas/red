@@ -19,7 +19,9 @@ use red_core::{
     TableDetail,
 };
 
+mod postgres;
 mod sqlite;
+pub use postgres::PostgresDriver;
 pub use sqlite::SqliteDriver;
 
 /// One open database session. Object-safe so the service can hold

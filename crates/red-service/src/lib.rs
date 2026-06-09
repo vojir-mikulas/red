@@ -23,7 +23,7 @@ use red_core::{
     Column, ConnectionConfig, DbKind, ExportFormat, QueryOptions, RedError, RowWindow, SchemaMeta,
     TableDetail,
 };
-use red_driver::{CancelToken, DatabaseDriver, QueryCursor, SqliteDriver};
+use red_driver::{CancelToken, DatabaseDriver, PostgresDriver, QueryCursor, SqliteDriver};
 use tokio::sync::mpsc::{
     unbounded_channel, UnboundedReceiver as CmdReceiver, UnboundedSender as CmdSender,
 };
@@ -186,7 +186,8 @@ pub fn spawn() -> ServiceHandle {
         .name("red-service".into())
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
+                // I/O enabled too: the Postgres driver's network connection needs it.
+                .enable_all()
                 .build()
                 .expect("build red-service tokio runtime");
             rt.block_on(dispatch(cmd_rx, evt_tx));
@@ -479,7 +480,12 @@ async fn connect(config: &ConnectionConfig) -> Result<Arc<dyn DatabaseDriver>, S
             driver.ping().await.map_err(|e| e.to_string())?;
             Ok(Arc::new(driver))
         }
-        DbKind::Postgres => Err("Postgres driver not yet implemented".into()),
+        DbKind::Postgres => {
+            let driver = PostgresDriver::connect(&config.dsn, config.read_only)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(Arc::new(driver))
+        }
     }
 }
 

@@ -29,8 +29,10 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 async-trait = "0.1"
 
 # --- Database drivers ---
-# v0.1 target: SQLite (bundled C lib, no system dep) + PostgreSQL (later).
+# v0.1 target: SQLite (bundled C lib, no system dep) + PostgreSQL.
 rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
+tokio-postgres = "0.7"
+futures-util = { version = "0.3", default-features = false }
 
 # --- Config persistence (connection list at the app edge) ---
 serde = { version = "1", features = ["derive"] }
