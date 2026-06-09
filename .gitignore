@@ -6,3 +6,17 @@ Cargo.lock
 *.sqlite
 *.sqlite3
 
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+/design/
+/docs/plans/
+/docs/codereview/
+/docs/security/
+.claude
+
+# Local Claude/agent settings overrides
+.claude/settings.local.json

@@ -67,6 +67,10 @@ impl DatabaseDriver for SqliteDriver {
             .map_err(driver_err)?
     }
 
+    fn server_version(&self) -> String {
+        rusqlite::version().to_string()
+    }
+
     async fn open_cursor(&self, sql: &str, _opts: QueryOptions) -> Result<Box<dyn QueryCursor>> {
         let path = self.path.clone();
         let read_only = self.read_only;

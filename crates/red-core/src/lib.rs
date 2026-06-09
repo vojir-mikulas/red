@@ -8,6 +8,7 @@ use std::fmt;
 
 /// Which database engine a connection targets. Drives driver selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum DbKind {
     Sqlite,
     Postgres,
@@ -25,6 +26,7 @@ impl fmt::Display for DbKind {
 /// A saved connection target. `dsn` is the SQLite file path or the Postgres URL.
 /// `read_only` reflects RED's read-mostly safety posture (enforced by the driver).
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ConnectionConfig {
     pub name: String,
     pub kind: DbKind,

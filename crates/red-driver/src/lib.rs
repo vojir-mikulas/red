@@ -24,6 +24,10 @@ pub trait DatabaseDriver: Send + Sync {
     /// Cheap liveness probe — opens/touches the underlying connection.
     async fn ping(&self) -> Result<()>;
 
+    /// Engine version string (e.g. `"3.46.0"`), for the status bar. Cheap and
+    /// synchronous — drivers report a compiled-in or already-known value.
+    fn server_version(&self) -> String;
+
     /// Prepare `sql`, read column metadata, and return a live cursor. Cheap by
     /// design: this does NOT step rows — the first (potentially expensive) step
     /// happens on the first `next_window`, which is the cancellable path.

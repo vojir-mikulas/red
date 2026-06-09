@@ -22,9 +22,15 @@ anyhow.workspace = true
 rust-embed.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-# red-core / red-service join here when the UI is wired to the backend (the
-# first real task on top of this scaffold) — they build + are tested in the
-# workspace already.
+
+# Backend + domain types. `serde` on red-core powers config persistence, which
+# lives at the app edge (config.rs).
+red-core = { workspace = true, features = ["serde"] }
+red-service.workspace = true
+futures.workspace = true
+serde.workspace = true
+toml.workspace = true
+dirs.workspace = true
 
 # macOS uses font-kit (CoreText) for font loading; Windows/Linux use GPUI's own
 # backend. Features are additive, so this only adds to the base workspace deps.

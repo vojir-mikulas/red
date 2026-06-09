@@ -39,13 +39,20 @@ pub enum Command {
     },
     /// Abort the active query / drop its cursor.
     Cancel,
+    /// Drop the active session and any cursor; return to a disconnected state.
+    Disconnect,
     Shutdown,
 }
 
 /// service → UI. Streamed into the UI's async loop.
 #[derive(Debug)]
 pub enum Event {
-    Connected,
+    /// A session opened. `version` is the engine version for the status bar.
+    Connected {
+        version: String,
+    },
+    /// The session was dropped (in response to `Disconnect`).
+    Disconnected,
     /// A query opened; column metadata is known before any rows arrive.
     QueryStarted {
         columns: Vec<Column>,
@@ -124,11 +131,18 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
                 active = None; // a new connection abandons any in-flight cursor
                 match connect(&config).await {
                     Ok(driver) => {
+                        let version = driver.server_version();
                         session = Some(driver);
-                        emit(&events, Event::Connected);
+                        emit(&events, Event::Connected { version });
                     }
                     Err(message) => emit(&events, Event::Error(message)),
                 }
+            }
+
+            Command::Disconnect => {
+                active = None;
+                session = None;
+                emit(&events, Event::Disconnected);
             }
 
             Command::Query { sql, opts } => {
@@ -314,7 +328,7 @@ mod tests {
         let mut handle = spawn();
         let mut events = handle.take_events().expect("event stream");
         handle.send(Command::Connect(sqlite(":memory:", true)));
-        assert!(matches!(events.next().await, Some(Event::Connected)));
+        assert!(matches!(events.next().await, Some(Event::Connected { .. })));
 
         handle.send(Command::Query {
             sql: counting_sql(25_000),
@@ -356,7 +370,7 @@ mod tests {
         let mut handle = spawn();
         let mut events = handle.take_events().expect("event stream");
         handle.send(Command::Connect(sqlite(":memory:", true)));
-        assert!(matches!(events.next().await, Some(Event::Connected)));
+        assert!(matches!(events.next().await, Some(Event::Connected { .. })));
 
         handle.send(Command::Query {
             sql: counting_sql(1_000_000_000),
@@ -384,7 +398,7 @@ mod tests {
         let mut handle = spawn();
         let mut events = handle.take_events().expect("event stream");
         handle.send(Command::Connect(sqlite(":memory:", true)));
-        assert!(matches!(events.next().await, Some(Event::Connected)));
+        assert!(matches!(events.next().await, Some(Event::Connected { .. })));
 
         handle.send(Command::Query {
             sql: counting_sql(1_000_000_000),
@@ -406,6 +420,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disconnect_drops_session() {
+        let mut handle = spawn();
+        let mut events = handle.take_events().expect("event stream");
+        handle.send(Command::Connect(sqlite(":memory:", true)));
+        assert!(matches!(events.next().await, Some(Event::Connected { .. })));
+
+        handle.send(Command::Disconnect);
+        assert!(matches!(events.next().await, Some(Event::Disconnected)));
+
+        // A query after disconnect must report "not connected", not crash.
+        handle.send(Command::Query {
+            sql: "SELECT 1".into(),
+            opts: QueryOptions::default(),
+        });
+        match events.next().await {
+            Some(Event::Error(msg)) => assert!(msg.contains("not connected")),
+            other => panic!("expected not-connected error, got {other:?}"),
+        }
+        handle.send(Command::Shutdown);
+    }
+
+    #[tokio::test]
     async fn connect_and_query_roundtrip() {
         let mut handle = spawn();
         let mut events = handle.take_events().expect("event stream");
@@ -415,7 +451,7 @@ mod tests {
             opts: QueryOptions::default(),
         });
 
-        assert!(matches!(events.next().await, Some(Event::Connected)));
+        assert!(matches!(events.next().await, Some(Event::Connected { .. })));
         assert!(matches!(
             events.next().await,
             Some(Event::QueryStarted { .. })

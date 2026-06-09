@@ -8,8 +8,12 @@
 
 mod app;
 mod assets;
+mod config;
+mod connect;
+mod shell;
 
 use flint::prelude::*;
+use flint::TextInput;
 use gpui::{prelude::*, App, Bounds, TitlebarOptions, WindowBounds, WindowOptions};
 use gpui_platform::application;
 
@@ -24,6 +28,12 @@ fn main() {
         if let Err(err) = Assets::load_fonts(cx) {
             eprintln!("warning: failed to load vendored fonts: {err}");
         }
+        // The connection form's text fields need the editing key bindings.
+        TextInput::bind_keys(cx);
+
+        // Spawn the Tokio backend and hand its event stream to the root view.
+        let mut service = red_service::spawn();
+        let events = service.take_events().expect("service event stream");
 
         let bounds = Bounds::centered(None, gpui::size(gpui::px(1100.0), gpui::px(720.0)), cx);
         cx.open_window(
@@ -36,7 +46,7 @@ fn main() {
                 }),
                 ..Default::default()
             },
-            |_, cx| cx.new(AppState::new),
+            |_, cx| cx.new(|cx| AppState::new(cx, service, events)),
         )
         .expect("failed to open RED window");
 
