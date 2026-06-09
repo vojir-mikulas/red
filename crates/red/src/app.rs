@@ -7,6 +7,7 @@
 //! the service drives UI state. Screen rendering lives in `connect.rs` / `shell.rs`.
 
 use flint::prelude::*;
+use flint::{CodeEditor, CodeEditorEvent};
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use gpui::{
@@ -50,10 +51,26 @@ pub(crate) struct ActiveConn {
     pub editor_drag: Option<DragAnchor>,
     pub schema: SchemaState,
     pub preview: Option<Preview>,
+    /// The SQL editor surface (M4), with the RED highlighter installed.
+    pub editor: Entity<CodeEditor>,
+    /// Recent queries (newest first), for re-run from the history popover.
+    pub history: Vec<String>,
+    pub history_open: bool,
 }
 
 impl ActiveConn {
     fn new(config: ConnectionConfig, version: String, cx: &mut Context<AppState>) -> Self {
+        let editor = cx.new(|cx| {
+            CodeEditor::new(cx)
+                .highlighter(crate::sql::tokenize)
+                .with_content("-- Write SQL, ⌘↵ to run\n")
+        });
+        // ⌘↵ in the editor runs the current statement / selection.
+        cx.subscribe(&editor, |this, _editor, _event: &CodeEditorEvent, cx| {
+            this.run_editor_query(cx)
+        })
+        .detach();
+
         Self {
             config,
             version,
@@ -63,6 +80,9 @@ impl ActiveConn {
             editor_drag: None,
             schema: SchemaState::new(cx),
             preview: None,
+            editor,
+            history: Vec::new(),
+            history_open: false,
         }
     }
 }
@@ -139,6 +159,7 @@ impl AppState {
                 if let Phase::Connected(active) = &mut self.phase {
                     active.schema.apply_objects(schemas);
                 }
+                self.refresh_completions(cx);
             }
             Event::TableDescribed {
                 schema,
@@ -148,6 +169,7 @@ impl AppState {
                 if let Phase::Connected(active) = &mut self.phase {
                     active.schema.details.insert((schema, table), detail);
                 }
+                self.refresh_completions(cx);
             }
 
             // --- table preview (M3 interim; the streaming grid is M5) ---

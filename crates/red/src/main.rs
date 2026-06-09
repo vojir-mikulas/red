@@ -10,11 +10,13 @@ mod app;
 mod assets;
 mod config;
 mod connect;
+mod editor;
 mod schema;
 mod shell;
+mod sql;
 
 use flint::prelude::*;
-use flint::TextInput;
+use flint::{CodeEditor, TextInput};
 use gpui::{prelude::*, App, Bounds, TitlebarOptions, WindowBounds, WindowOptions};
 use gpui_platform::application;
 
@@ -29,8 +31,10 @@ fn main() {
         if let Err(err) = Assets::load_fonts(cx) {
             eprintln!("warning: failed to load vendored fonts: {err}");
         }
-        // The connection form's text fields need the editing key bindings.
+        // The connection form's text fields and the SQL editor need their
+        // editing key bindings installed once at startup.
         TextInput::bind_keys(cx);
+        CodeEditor::bind_keys(cx);
 
         // Spawn the Tokio backend and hand its event stream to the root view.
         let mut service = red_service::spawn();

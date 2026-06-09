@@ -1,35 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! The connected shell: top bar · nested resizable split (schema | editor /
-//! results) · status bar. The panes are labeled placeholders in M2 — their
-//! contents arrive in M3 (schema tree), M4 (SQL editor), M5 (result grid). The
-//! split sizes are caller-owned state on [`ActiveConn`].
+//! results) · status bar. The pane contents are live: schema tree (M3), SQL
+//! editor (M4), interim result grid (M3, real grid in M5). The split sizes are
+//! caller-owned state on [`ActiveConn`].
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Axis, Context, Hsla};
+use gpui::{div, prelude::*, px, Axis, Context};
 
 use crate::app::{ActiveConn, AppState, Phase};
 use crate::assets::{FONT_MONO, FONT_UI};
-
-/// A labeled placeholder pane for a feature that lands in a later milestone.
-fn placeholder(
-    title: &'static str,
-    milestone: &'static str,
-    bg: Hsla,
-    muted: Hsla,
-    faint: Hsla,
-) -> impl IntoElement {
-    div()
-        .size_full()
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .gap_1()
-        .bg(bg)
-        .child(div().text_sm().text_color(muted).child(title))
-        .child(div().text_xs().text_color(faint).child(milestone))
-}
 
 impl AppState {
     pub(crate) fn render_shell(
@@ -40,12 +20,12 @@ impl AppState {
         // Owned snapshot so building the pane contents below (which borrow `cx`
         // mutably) doesn't clash with the theme tokens used throughout this fn.
         let theme = cx.theme().clone();
-        let bg_app = theme.bg_app;
-        let (muted, faint) = (theme.text_muted, theme.text_faint);
         let view = cx.entity().downgrade();
 
-        // Live pane contents (M3): the schema explorer + the interim preview grid.
+        // Live pane contents: schema explorer (M3) · SQL editor (M4) · interim
+        // preview grid (M3, replaced by the real grid in M5).
         let schema_pane = self.render_schema(active, cx);
+        let editor_pane = self.render_editor(active, cx);
         let results_pane = self.render_results(active, cx);
 
         let config = &active.config;
@@ -155,7 +135,7 @@ impl AppState {
                     })
                     .ok();
                 })
-                .first(placeholder("SQL editor", "(M4)", bg_app, muted, faint))
+                .first(editor_pane)
                 .second(results_pane)
         };
 
