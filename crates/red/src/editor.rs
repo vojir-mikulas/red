@@ -8,6 +8,7 @@
 
 use flint::prelude::*;
 use gpui::{div, prelude::*, px, Context, SharedString};
+use red_service::Command;
 
 use crate::app::{ActiveConn, AppState, Phase};
 use crate::assets::FONT_MONO;
@@ -137,10 +138,7 @@ impl AppState {
                     ),
             );
 
-        let surface = div()
-            .flex_1()
-            .min_h(px(0.))
-            .child(active.editor.clone());
+        let surface = div().flex_1().min_h(px(0.)).child(active.editor.clone());
 
         let history = active.history_open.then(|| {
             let list: Vec<_> = active.history.clone();
@@ -224,7 +222,24 @@ impl AppState {
             }
             active.history_open = false;
         }
-        self.open_result("query", sql, cx);
+
+        // Row-returning statements stream into the grid; writes execute in a
+        // transaction; destructive writes ask for confirmation first.
+        match crate::sql::classify(&sql) {
+            crate::sql::StatementKind::Query => self.open_result("query", sql, cx),
+            crate::sql::StatementKind::Write => self.execute_sql(sql, cx),
+            crate::sql::StatementKind::Destructive => {
+                self.confirm_exec = Some(sql);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Run a write/DDL statement in a transaction; refresh the schema tree after,
+    /// since it may have created or dropped objects.
+    pub(crate) fn execute_sql(&mut self, sql: String, cx: &mut Context<Self>) {
+        self.service.send(Command::Execute { sql });
+        cx.notify();
     }
 
     pub(crate) fn toggle_history(&mut self, cx: &mut Context<Self>) {
@@ -250,9 +265,7 @@ impl AppState {
     /// when the skeleton or a table's detail arrives.
     pub(crate) fn refresh_completions(&mut self, cx: &mut Context<Self>) {
         let (editor, candidates) = match &self.phase {
-            Phase::Connected(active) => {
-                (active.editor.clone(), build_candidates(&active.schema))
-            }
+            Phase::Connected(active) => (active.editor.clone(), build_candidates(&active.schema)),
             _ => return,
         };
         editor.update(cx, |editor, cx| {

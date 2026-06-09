@@ -79,7 +79,6 @@ impl SchemaState {
     }
 }
 
-
 /// What a flattened visible row carries for rendering.
 enum RowContent {
     Schema {

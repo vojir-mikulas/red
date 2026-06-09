@@ -11,9 +11,12 @@
 
 use std::sync::Arc;
 
+use std::path::Path;
+
 use async_trait::async_trait;
 use red_core::{
-    Column, QueryOptions, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail,
+    Column, ExportFormat, QueryOptions, RedError, Result, ResultPage, RowWindow, SchemaMeta,
+    TableDetail,
 };
 
 mod sqlite;
@@ -52,6 +55,14 @@ pub trait DatabaseDriver: Send + Sync {
     /// load-on-scroll so memory stays flat: only the pages around the viewport are
     /// ever resident.
     async fn fetch_page(&self, sql: &str, offset: usize, limit: usize) -> Result<ResultPage>;
+
+    /// Run a non-row-returning statement wrapped in a transaction, returning the
+    /// number of rows affected. A read-only driver rejects the write at the engine.
+    async fn execute(&self, sql: &str) -> Result<u64>;
+
+    /// Stream `sql`'s result straight to `path` in `format`, row-by-row — never
+    /// materializing the whole result. Returns the number of data rows written.
+    async fn export(&self, sql: &str, path: &Path, format: ExportFormat) -> Result<u64>;
 }
 
 /// A live, windowed result cursor. Object-safe; the service holds it as

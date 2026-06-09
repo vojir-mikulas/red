@@ -14,12 +14,14 @@
 //! raced against incoming commands so a `Cancel` — or a `timeout` — can abort an
 //! in-flight query out-of-band rather than dropping a future.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use red_core::{
-    Column, ConnectionConfig, DbKind, QueryOptions, RedError, RowWindow, SchemaMeta, TableDetail,
+    Column, ConnectionConfig, DbKind, ExportFormat, QueryOptions, RedError, RowWindow, SchemaMeta,
+    TableDetail,
 };
 use red_driver::{CancelToken, DatabaseDriver, QueryCursor, SqliteDriver};
 use tokio::sync::mpsc::{
@@ -55,6 +57,15 @@ pub enum Command {
     FetchPage {
         offset: usize,
         limit: usize,
+    },
+    /// Run a non-row-returning statement (write/DDL) in a transaction.
+    Execute {
+        sql: String,
+    },
+    /// Stream the open result to `path` in `format`, row-by-row.
+    Export {
+        format: ExportFormat,
+        path: PathBuf,
     },
     /// Abort the active query / drop its cursor.
     Cancel,
@@ -106,6 +117,15 @@ pub enum Event {
     ResultPageLoaded {
         offset: usize,
         rows: Vec<Vec<red_core::Value>>,
+    },
+    /// A write/DDL statement committed; `affected` rows changed.
+    Executed {
+        affected: usize,
+    },
+    /// A streamed export finished: `rows` rows written to `path`.
+    ExportFinished {
+        path: String,
+        rows: usize,
     },
     Error(String),
 }
@@ -310,6 +330,43 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
                         Event::ResultPageLoaded {
                             offset,
                             rows: page.rows,
+                        },
+                    ),
+                    Err(e) => emit(&events, Event::Error(e.to_string())),
+                }
+            }
+
+            Command::Execute { sql } => {
+                let Some(driver) = session.clone() else {
+                    emit(&events, Event::Error("not connected".into()));
+                    continue;
+                };
+                match driver.execute(&sql).await {
+                    Ok(affected) => emit(
+                        &events,
+                        Event::Executed {
+                            affected: affected as usize,
+                        },
+                    ),
+                    Err(e) => emit(&events, Event::Error(e.to_string())),
+                }
+            }
+
+            Command::Export { format, path } => {
+                let Some(driver) = session.clone() else {
+                    emit(&events, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(sql) = result_sql.clone() else {
+                    emit(&events, Event::Error("no open result to export".into()));
+                    continue;
+                };
+                match driver.export(&sql, &path, format).await {
+                    Ok(rows) => emit(
+                        &events,
+                        Event::ExportFinished {
+                            path: path.to_string_lossy().into_owned(),
+                            rows: rows as usize,
                         },
                     ),
                     Err(e) => emit(&events, Event::Error(e.to_string())),

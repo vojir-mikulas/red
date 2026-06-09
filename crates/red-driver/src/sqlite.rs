@@ -6,12 +6,14 @@
 //! blocking-pool thread that owns that stack for the cursor's lifetime and serves
 //! bounded row windows over channels; the async side holds only a thin handle.
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ColumnMeta, ForeignKeyMeta, IndexMeta, ObjectKind, ObjectMeta, QueryOptions, RedError,
-    Result, ResultPage, RowWindow, SchemaMeta, TableDetail, Value,
+    Column, ColumnMeta, ExportFormat, ForeignKeyMeta, IndexMeta, ObjectKind, ObjectMeta,
+    QueryOptions, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail, Value,
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, ErrorCode, OpenFlags};
@@ -146,6 +148,163 @@ impl DatabaseDriver for SqliteDriver {
             .await
             .map_err(driver_err)?
     }
+
+    async fn execute(&self, sql: &str) -> Result<u64> {
+        let path = self.path.clone();
+        let read_only = self.read_only;
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || execute_blocking(&path, read_only, &sql))
+            .await
+            .map_err(driver_err)?
+    }
+
+    async fn export(&self, sql: &str, path: &Path, format: ExportFormat) -> Result<u64> {
+        let db_path = self.path.clone();
+        let read_only = self.read_only;
+        let out_path = path.to_path_buf();
+        let sql = format!("SELECT * FROM ({})", strip_trailing(sql));
+        tokio::task::spawn_blocking(move || {
+            export_blocking(&db_path, read_only, &sql, &out_path, format)
+        })
+        .await
+        .map_err(driver_err)?
+    }
+}
+
+/// Run one statement inside a transaction: commit on success, roll back on error.
+fn execute_blocking(path: &Path, read_only: bool, sql: &str) -> Result<u64> {
+    let conn = SqliteDriver::open(path, read_only)?;
+    conn.execute_batch("BEGIN").map_err(driver_err)?;
+    match conn.execute(sql, []) {
+        Ok(affected) => {
+            conn.execute_batch("COMMIT").map_err(driver_err)?;
+            Ok(affected as u64)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(map_step_err(e))
+        }
+    }
+}
+
+/// Stream the result of `sql` to `path`, one row at a time — never collecting the
+/// whole result in memory.
+fn export_blocking(
+    path: &Path,
+    read_only: bool,
+    sql: &str,
+    out_path: &Path,
+    format: ExportFormat,
+) -> Result<u64> {
+    let conn = SqliteDriver::open(path, read_only)?;
+    let mut stmt = conn.prepare(sql).map_err(driver_err)?;
+    let column_count = stmt.column_count();
+    let names: Vec<String> = stmt
+        .columns()
+        .iter()
+        .map(|c| c.name().to_string())
+        .collect();
+
+    let file = File::create(out_path).map_err(driver_err)?;
+    let mut out = BufWriter::new(file);
+    let mut rows_iter = stmt.query([]).map_err(driver_err)?;
+    let mut written: u64 = 0;
+
+    match format {
+        ExportFormat::Csv => {
+            writeln!(out, "{}", csv_record(names.iter().map(|s| s.as_str())))
+                .map_err(driver_err)?;
+            while let Some(row) = rows_iter.next().map_err(map_step_err)? {
+                let cells = extract_row(row, column_count)?;
+                let line = csv_record(
+                    cells
+                        .iter()
+                        .map(csv_cell)
+                        .collect::<Vec<_>>()
+                        .iter()
+                        .map(String::as_str),
+                );
+                writeln!(out, "{line}").map_err(driver_err)?;
+                written += 1;
+            }
+        }
+        ExportFormat::Json => {
+            write!(out, "[").map_err(driver_err)?;
+            while let Some(row) = rows_iter.next().map_err(map_step_err)? {
+                let cells = extract_row(row, column_count)?;
+                if written > 0 {
+                    write!(out, ",").map_err(driver_err)?;
+                }
+                write!(out, "\n  {{").map_err(driver_err)?;
+                for (i, value) in cells.iter().enumerate() {
+                    if i > 0 {
+                        write!(out, ",").map_err(driver_err)?;
+                    }
+                    write!(out, "{}:{}", json_string(&names[i]), json_value(value))
+                        .map_err(driver_err)?;
+                }
+                write!(out, "}}").map_err(driver_err)?;
+                written += 1;
+            }
+            write!(out, "\n]\n").map_err(driver_err)?;
+        }
+    }
+    out.flush().map_err(driver_err)?;
+    Ok(written)
+}
+
+/// Join fields into one RFC-4180 CSV record (no trailing newline).
+fn csv_record<'a>(fields: impl Iterator<Item = &'a str>) -> String {
+    fields.map(csv_escape).collect::<Vec<_>>().join(",")
+}
+
+/// Quote a CSV field only when it contains a delimiter, quote, or newline.
+fn csv_escape(field: &str) -> String {
+    if field.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+/// A cell as a CSV field value (NULL → empty; blob → byte-length marker).
+fn csv_cell(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Integer(n) => n.to_string(),
+        Value::Real(x) => x.to_string(),
+        Value::Text(s) => s.clone(),
+        Value::Blob(b) => format!("<{} bytes>", b.len()),
+    }
+}
+
+fn json_value(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Integer(n) => n.to_string(),
+        Value::Real(x) => x.to_string(),
+        Value::Text(s) => json_string(s),
+        Value::Blob(b) => json_string(&format!("<{} bytes>", b.len())),
+    }
+}
+
+/// A JSON string literal with the mandatory escapes.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Trim trailing whitespace and a single statement terminator so the SQL can be
@@ -599,6 +758,49 @@ mod tests {
             .any(|i| i.columns == vec!["author_id".to_string()]));
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn executes_in_transaction_and_exports() {
+        let path = temp_db_path("exec");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE t(id INTEGER, name TEXT);")
+                .unwrap();
+        }
+        let driver = SqliteDriver::new(&path, false);
+
+        let affected = driver
+            .execute("INSERT INTO t VALUES (1, 'a,b'), (2, NULL)")
+            .await
+            .unwrap();
+        assert_eq!(affected, 2);
+
+        let csv_path = temp_db_path("exp-csv").with_extension("csv");
+        let rows = driver
+            .export("SELECT * FROM t ORDER BY id", &csv_path, ExportFormat::Csv)
+            .await
+            .unwrap();
+        assert_eq!(rows, 2);
+        let csv = std::fs::read_to_string(&csv_path).unwrap();
+        assert!(csv.starts_with("id,name\n"));
+        assert!(csv.contains("\"a,b\""), "comma field is quoted: {csv}");
+
+        let json_path = temp_db_path("exp-json").with_extension("json");
+        driver
+            .export(
+                "SELECT * FROM t ORDER BY id",
+                &json_path,
+                ExportFormat::Json,
+            )
+            .await
+            .unwrap();
+        let json = std::fs::read_to_string(&json_path).unwrap();
+        assert!(json.contains("\"name\":null"), "NULL → json null: {json}");
+
+        for p in [path, csv_path, json_path] {
+            std::fs::remove_file(p).ok();
+        }
     }
 
     #[tokio::test]

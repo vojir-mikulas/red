@@ -16,7 +16,7 @@ use gpui::{
 use red_core::{ConnectionConfig, DbKind};
 use red_service::{Command, Event, ServiceHandle};
 
-use crate::assets::FONT_UI;
+use crate::assets::{FONT_MONO, FONT_UI};
 use crate::config::{self, StoredConnection};
 use crate::result::ResultGrid;
 use crate::schema::SchemaState;
@@ -97,6 +97,8 @@ pub struct AppState {
     pub(crate) dsn_input: Entity<TextInput>,
     pub(crate) form: Option<FormState>,
     pub(crate) toast: Option<(SharedString, ToastVariant)>,
+    /// A destructive statement awaiting the user's confirmation before it runs.
+    pub(crate) confirm_exec: Option<String>,
 }
 
 impl AppState {
@@ -127,6 +129,7 @@ impl AppState {
             dsn_input: cx.new(TextInput::new),
             form: None,
             toast: None,
+            confirm_exec: None,
         }
     }
 
@@ -172,6 +175,22 @@ impl AppState {
             // --- result grid (M5) ---
             Event::ResultReady { columns, total } => self.on_result_ready(columns, total, cx),
             Event::ResultPageLoaded { offset, rows } => self.on_result_page(offset, rows, cx),
+
+            // --- export & writes (M6) ---
+            Event::Executed { affected } => {
+                self.toast = Some((
+                    format!("{affected} row(s) affected").into(),
+                    ToastVariant::Success,
+                ));
+                // A write may have changed the schema (CREATE/DROP) — refresh the tree.
+                self.service.send(Command::LoadObjects);
+            }
+            Event::ExportFinished { path, rows } => {
+                self.toast = Some((
+                    format!("Exported {rows} row(s) to {path}").into(),
+                    ToastVariant::Success,
+                ));
+            }
 
             // The streaming `Query`/`FetchMore` path stays in the protocol for
             // headless use + tests; the UI now drives results via `OpenResult`.
@@ -302,6 +321,19 @@ impl AppState {
         cx.notify();
     }
 
+    /// Run the destructive statement the user confirmed.
+    pub(crate) fn confirm_destructive(&mut self, cx: &mut Context<Self>) {
+        if let Some(sql) = self.confirm_exec.take() {
+            self.execute_sql(sql, cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_destructive(&mut self, cx: &mut Context<Self>) {
+        self.confirm_exec = None;
+        cx.notify();
+    }
+
     pub(crate) fn toggle_theme(&mut self, cx: &mut Context<Self>) {
         let next = match cx.theme().name.as_str() {
             "One Dark" => Theme::github_dark(),
@@ -372,6 +404,11 @@ impl Render for AppState {
                 )
         });
 
+        let confirm = self
+            .confirm_exec
+            .clone()
+            .map(|sql| self.render_confirm(sql, cx));
+
         let theme = cx.theme();
         div()
             .size_full()
@@ -381,5 +418,58 @@ impl Render for AppState {
             .font_family(FONT_UI)
             .child(screen)
             .children(toast)
+            .children(confirm)
+    }
+}
+
+impl AppState {
+    /// The destructive-statement confirmation modal (M6 safety rail).
+    fn render_confirm(&self, sql: String, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let close_view = cx.entity().downgrade();
+        let preview: String = sql.chars().take(200).collect();
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_color(theme.text_muted)
+                    .child("This statement modifies data and can't be undone. Run it?"),
+            )
+            .child(
+                div()
+                    .p_2()
+                    .rounded(theme.radius_sm)
+                    .bg(theme.bg_input)
+                    .font_family(FONT_MONO)
+                    .text_size(px(12.))
+                    .text_color(theme.text)
+                    .child(preview),
+            );
+        let footer = div()
+            .flex()
+            .justify_end()
+            .gap_2()
+            .child(
+                Button::new("confirm-cancel", "Cancel")
+                    .variant(ButtonVariant::Secondary)
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel_destructive(cx))),
+            )
+            .child(
+                Button::new("confirm-run", "Run statement")
+                    .variant(ButtonVariant::Danger)
+                    .on_click(cx.listener(|this, _, _, cx| this.confirm_destructive(cx))),
+            );
+        Modal::new("confirm-destructive")
+            .title("Confirm destructive statement")
+            .width(px(440.))
+            .footer(footer)
+            .on_close(move |_, cx| {
+                close_view
+                    .update(cx, |this, cx| this.cancel_destructive(cx))
+                    .ok();
+            })
+            .child(body)
     }
 }

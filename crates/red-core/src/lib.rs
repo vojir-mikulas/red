@@ -149,6 +149,14 @@ pub struct ResultPage {
     pub rows: Vec<Vec<Value>>,
 }
 
+/// A streamed-export target format. The driver writes rows straight to disk
+/// row-by-row, never materializing the whole result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Csv,
+    Json,
+}
+
 /// Per-query knobs carried UI → service → driver.
 #[derive(Debug, Clone)]
 pub struct QueryOptions {

@@ -11,9 +11,11 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 
+use std::path::PathBuf;
+
 use flint::prelude::*;
 use gpui::{div, prelude::*, px, ClipboardItem, Context, Hsla, UniformListScrollHandle};
-use red_core::{Column as ResultColumn, Value};
+use red_core::{Column as ResultColumn, ExportFormat, Value};
 use red_service::{Command, CommandSender};
 
 use crate::app::{ActiveConn, AppState, Phase};
@@ -190,8 +192,14 @@ fn render_cell(value: Option<&Value>, text: Hsla, num: Hsla, faint: Hsla) -> gpu
             .text_color(faint)
             .child("NULL")
             .into_any_element(),
-        Some(Value::Integer(n)) => div().text_color(num).child(n.to_string()).into_any_element(),
-        Some(Value::Real(x)) => div().text_color(num).child(x.to_string()).into_any_element(),
+        Some(Value::Integer(n)) => div()
+            .text_color(num)
+            .child(n.to_string())
+            .into_any_element(),
+        Some(Value::Real(x)) => div()
+            .text_color(num)
+            .child(x.to_string())
+            .into_any_element(),
         Some(Value::Text(s)) => div().text_color(text).child(s.clone()).into_any_element(),
         Some(Value::Blob(b)) => div()
             .text_color(faint)
@@ -317,6 +325,33 @@ impl AppState {
         cx.notify();
     }
 
+    /// Prompt for a save path, then stream the open result there in `format`.
+    pub(crate) fn export_result(&mut self, format: ExportFormat, cx: &mut Context<Self>) {
+        let open = matches!(&self.phase, Phase::Connected(a) if a.result.is_some());
+        if !open {
+            return;
+        }
+        let name = match format {
+            ExportFormat::Csv => "red-export.csv",
+            ExportFormat::Json => "red-export.json",
+        };
+        let dir = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let rx = cx.prompt_for_new_path(&dir, Some(name));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(path))) = rx.await {
+                this.update(cx, |this, cx| {
+                    this.service.send(Command::Export { format, path });
+                    this.toast = Some(("Exporting…".into(), ToastVariant::Info));
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     pub(crate) fn copy_result_selection(&mut self, cx: &mut Context<Self>) {
         let tsv = match &self.phase {
             Phase::Connected(active) => active.result.as_ref().and_then(ResultGrid::selection_tsv),
@@ -385,12 +420,33 @@ impl AppState {
             .child(div().text_color(muted).child(grid.label.clone()))
             .child(status)
             .child(
-                div().ml_auto().child(
-                    Button::new("result-copy", "Copy")
-                        .variant(ButtonVariant::Ghost)
-                        .size(ButtonSize::Sm)
-                        .on_click(cx.listener(|this, _, _, cx| this.copy_result_selection(cx))),
-                ),
+                div()
+                    .ml_auto()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Button::new("result-copy", "Copy")
+                            .variant(ButtonVariant::Ghost)
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_result_selection(cx))),
+                    )
+                    .child(
+                        Button::new("result-csv", "CSV")
+                            .variant(ButtonVariant::Ghost)
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.export_result(ExportFormat::Csv, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("result-json", "JSON")
+                            .variant(ButtonVariant::Ghost)
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.export_result(ExportFormat::Json, cx)
+                            })),
+                    ),
             );
 
         if !grid.ready {
@@ -428,7 +484,9 @@ impl AppState {
             .on_cell_click(move |row, table_col, event, _, cx| {
                 let extend = event.modifiers().shift;
                 cell_view
-                    .update(cx, |this, cx| this.result_select(row, table_col, extend, cx))
+                    .update(cx, |this, cx| {
+                        this.result_select(row, table_col, extend, cx)
+                    })
                     .ok();
             })
             .render_row(move |ix, _, _| {

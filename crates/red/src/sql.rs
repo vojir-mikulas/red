@@ -12,13 +12,78 @@ use flint::TokenStyle;
 
 /// SQL keywords, lowercase. Drives both highlighting and (upper-cased) completion.
 pub const KEYWORDS: &[&str] = &[
-    "select", "from", "where", "insert", "into", "values", "update", "set", "delete", "create",
-    "table", "drop", "alter", "add", "column", "join", "left", "right", "inner", "outer", "full",
-    "cross", "on", "using", "group", "by", "order", "asc", "desc", "limit", "offset", "as", "and",
-    "or", "not", "null", "is", "in", "like", "ilike", "between", "distinct", "case", "when",
-    "then", "else", "end", "union", "intersect", "except", "all", "having", "primary", "key",
-    "foreign", "references", "default", "unique", "check", "constraint", "index", "view", "with",
-    "exists", "cast", "begin", "commit", "rollback", "transaction", "if", "returning", "true",
+    "select",
+    "from",
+    "where",
+    "insert",
+    "into",
+    "values",
+    "update",
+    "set",
+    "delete",
+    "create",
+    "table",
+    "drop",
+    "alter",
+    "add",
+    "column",
+    "join",
+    "left",
+    "right",
+    "inner",
+    "outer",
+    "full",
+    "cross",
+    "on",
+    "using",
+    "group",
+    "by",
+    "order",
+    "asc",
+    "desc",
+    "limit",
+    "offset",
+    "as",
+    "and",
+    "or",
+    "not",
+    "null",
+    "is",
+    "in",
+    "like",
+    "ilike",
+    "between",
+    "distinct",
+    "case",
+    "when",
+    "then",
+    "else",
+    "end",
+    "union",
+    "intersect",
+    "except",
+    "all",
+    "having",
+    "primary",
+    "key",
+    "foreign",
+    "references",
+    "default",
+    "unique",
+    "check",
+    "constraint",
+    "index",
+    "view",
+    "with",
+    "exists",
+    "cast",
+    "begin",
+    "commit",
+    "rollback",
+    "transaction",
+    "if",
+    "returning",
+    "true",
     "false",
 ];
 
@@ -134,6 +199,50 @@ pub fn tokenize(src: &str) -> Vec<(Range<usize>, TokenStyle)> {
     }
 
     out
+}
+
+/// What kind of statement the editor is about to run — drives whether it streams
+/// into the result grid, executes in a transaction, or first asks for confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatementKind {
+    /// Row-returning — opens in the result grid.
+    Query,
+    /// A write/DDL that's safe to run after a plain transaction (INSERT, CREATE…).
+    Write,
+    /// A write that destroys or rewrites existing data — confirm before running.
+    Destructive,
+}
+
+/// Classify a statement by its leading keyword (comments + whitespace skipped).
+pub fn classify(sql: &str) -> StatementKind {
+    match first_keyword(sql).to_ascii_uppercase().as_str() {
+        "SELECT" | "WITH" | "PRAGMA" | "EXPLAIN" | "VALUES" => StatementKind::Query,
+        "DROP" | "DELETE" | "UPDATE" | "ALTER" | "TRUNCATE" | "REPLACE" => {
+            StatementKind::Destructive
+        }
+        _ => StatementKind::Write,
+    }
+}
+
+/// The leading keyword of `sql`, skipping leading line/block comments + whitespace.
+pub fn first_keyword(sql: &str) -> String {
+    let mut s = sql.trim_start();
+    loop {
+        if let Some(rest) = s.strip_prefix("--") {
+            s = rest
+                .split_once('\n')
+                .map_or("", |(_, after)| after)
+                .trim_start();
+        } else if let Some(rest) = s.strip_prefix("/*") {
+            match rest.split_once("*/") {
+                Some((_, after)) => s = after.trim_start(),
+                None => return String::new(),
+            }
+        } else {
+            break;
+        }
+    }
+    s.chars().take_while(|c| c.is_ascii_alphabetic()).collect()
 }
 
 /// The identifier immediately before `cursor` (byte offset) — the token a
