@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use red_core::{
     Column, ColumnMeta, ForeignKeyMeta, IndexMeta, ObjectKind, ObjectMeta, QueryOptions, RedError,
-    Result, RowWindow, SchemaMeta, TableDetail, Value,
+    Result, ResultPage, RowWindow, SchemaMeta, TableDetail, Value,
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, ErrorCode, OpenFlags};
@@ -120,6 +120,58 @@ impl DatabaseDriver for SqliteDriver {
         .await
         .map_err(driver_err)?
     }
+
+    async fn count(&self, sql: &str) -> Result<i64> {
+        let path = self.path.clone();
+        let read_only = self.read_only;
+        let sql = format!("SELECT count(*) FROM ({})", strip_trailing(sql));
+        tokio::task::spawn_blocking(move || {
+            let conn = SqliteDriver::open(&path, read_only)?;
+            conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
+                .map_err(driver_err)
+        })
+        .await
+        .map_err(driver_err)?
+    }
+
+    async fn fetch_page(&self, sql: &str, offset: usize, limit: usize) -> Result<ResultPage> {
+        let path = self.path.clone();
+        let read_only = self.read_only;
+        // `limit`/`offset` are `usize`, so inlining them can't inject.
+        let sql = format!(
+            "SELECT * FROM ({}) LIMIT {limit} OFFSET {offset}",
+            strip_trailing(sql)
+        );
+        tokio::task::spawn_blocking(move || fetch_page_blocking(&path, read_only, &sql))
+            .await
+            .map_err(driver_err)?
+    }
+}
+
+/// Trim trailing whitespace and a single statement terminator so the SQL can be
+/// wrapped as a subquery (`SELECT * FROM (<sql>) …`).
+fn strip_trailing(sql: &str) -> &str {
+    sql.trim().strip_suffix(';').unwrap_or(sql.trim()).trim()
+}
+
+fn fetch_page_blocking(path: &Path, read_only: bool, sql: &str) -> Result<ResultPage> {
+    let conn = SqliteDriver::open(path, read_only)?;
+    let mut stmt = conn.prepare(sql).map_err(driver_err)?;
+    let column_count = stmt.column_count();
+    let columns: Vec<Column> = stmt
+        .columns()
+        .iter()
+        .map(|c| Column {
+            name: c.name().to_string(),
+            decl_type: c.decl_type().map(|t| t.to_string()),
+        })
+        .collect();
+    let mut rows_iter = stmt.query([]).map_err(driver_err)?;
+    let mut rows = Vec::new();
+    while let Some(row) = rows_iter.next().map_err(map_step_err)? {
+        rows.push(extract_row(row, column_count)?);
+    }
+    Ok(ResultPage { columns, rows })
 }
 
 /// Quote a SQLite identifier (schema/table) for safe interpolation into a PRAGMA

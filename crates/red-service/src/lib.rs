@@ -46,6 +46,16 @@ pub enum Command {
         schema: String,
         table: String,
     },
+    /// Open `sql` as the grid's result: count its rows and report column metadata
+    /// + the total. The result is then browsed page-by-page via `FetchPage`.
+    OpenResult {
+        sql: String,
+    },
+    /// Fetch one random-access page of the open result (grid load-on-scroll).
+    FetchPage {
+        offset: usize,
+        limit: usize,
+    },
     /// Abort the active query / drop its cursor.
     Cancel,
     /// Drop the active session and any cursor; return to a disconnected state.
@@ -86,6 +96,17 @@ pub enum Event {
         table: String,
         detail: TableDetail,
     },
+    /// A result opened: its columns and total row count (for `OpenResult`).
+    ResultReady {
+        columns: Vec<Column>,
+        total: usize,
+    },
+    /// One page of the open result. Echoes `offset` so the grid drops it into the
+    /// right slot of its window buffer regardless of arrival order.
+    ResultPageLoaded {
+        offset: usize,
+        rows: Vec<Vec<red_core::Value>>,
+    },
     Error(String),
 }
 
@@ -96,6 +117,18 @@ struct ActiveQuery {
     timeout: Option<Duration>,
     streamed: usize,
     started: Instant,
+}
+
+/// A cloneable handle that can only *send* commands. Handed to the result grid so
+/// its load-on-scroll callback can request pages mid-render without touching the
+/// (non-cloneable) `ServiceHandle` or the UI entity.
+#[derive(Clone)]
+pub struct CommandSender(CmdSender<Command>);
+
+impl CommandSender {
+    pub fn send(&self, command: Command) {
+        let _ = self.0.send(command);
+    }
 }
 
 /// The UI's handle on the backend: send commands, take the event stream once.
@@ -109,6 +142,11 @@ impl ServiceHandle {
     /// backend is gone the command is dropped.
     pub fn send(&self, command: Command) {
         let _ = self.commands.send(command);
+    }
+
+    /// A cloneable send-only handle (for the result grid's page requests).
+    pub fn command_sender(&self) -> CommandSender {
+        CommandSender(self.commands.clone())
     }
 
     /// Take the event stream. Call once; it moves into the UI's async loop.
@@ -144,11 +182,14 @@ pub fn spawn() -> ServiceHandle {
 async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Event>) {
     let mut session: Option<Arc<dyn DatabaseDriver>> = None;
     let mut active: Option<ActiveQuery> = None;
+    // The SQL backing the grid's paged result, re-fetched per `FetchPage`.
+    let mut result_sql: Option<String> = None;
 
     while let Some(command) = commands.recv().await {
         match command {
             Command::Connect(config) => {
                 active = None; // a new connection abandons any in-flight cursor
+                result_sql = None;
                 match connect(&config).await {
                     Ok(driver) => {
                         let version = driver.server_version();
@@ -161,6 +202,7 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
 
             Command::Disconnect => {
                 active = None;
+                result_sql = None;
                 session = None;
                 emit(&events, Event::Disconnected);
             }
@@ -226,6 +268,48 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
                             schema,
                             table,
                             detail,
+                        },
+                    ),
+                    Err(e) => emit(&events, Event::Error(e.to_string())),
+                }
+            }
+
+            Command::OpenResult { sql } => {
+                let Some(driver) = session.clone() else {
+                    emit(&events, Event::Error("not connected".into()));
+                    continue;
+                };
+                result_sql = Some(sql.clone());
+                // `LIMIT 0` reads column metadata without stepping rows.
+                let total = driver.count(&sql).await;
+                let columns = driver.fetch_page(&sql, 0, 0).await;
+                match (total, columns) {
+                    (Ok(total), Ok(page)) => emit(
+                        &events,
+                        Event::ResultReady {
+                            columns: page.columns,
+                            total: total.max(0) as usize,
+                        },
+                    ),
+                    (Err(e), _) | (_, Err(e)) => emit(&events, Event::Error(e.to_string())),
+                }
+            }
+
+            Command::FetchPage { offset, limit } => {
+                let Some(driver) = session.clone() else {
+                    emit(&events, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(sql) = result_sql.clone() else {
+                    emit(&events, Event::Error("no open result".into()));
+                    continue;
+                };
+                match driver.fetch_page(&sql, offset, limit).await {
+                    Ok(page) => emit(
+                        &events,
+                        Event::ResultPageLoaded {
+                            offset,
+                            rows: page.rows,
                         },
                     ),
                     Err(e) => emit(&events, Event::Error(e.to_string())),
@@ -541,6 +625,40 @@ mod tests {
 
         handle.send(Command::Shutdown);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Open a result and page through it — the grid's load-on-scroll path.
+    #[tokio::test]
+    async fn opens_and_pages_result() {
+        let mut handle = spawn();
+        let mut events = handle.take_events().expect("event stream");
+        handle.send(Command::Connect(sqlite(":memory:", true)));
+        assert!(matches!(events.next().await, Some(Event::Connected { .. })));
+
+        handle.send(Command::OpenResult {
+            sql: counting_sql(1000),
+        });
+        match events.next().await {
+            Some(Event::ResultReady { columns, total }) => {
+                assert_eq!(columns[0].name, "x");
+                assert_eq!(total, 1000);
+            }
+            other => panic!("expected ResultReady, got {other:?}"),
+        }
+
+        handle.send(Command::FetchPage {
+            offset: 998,
+            limit: 100,
+        });
+        match events.next().await {
+            Some(Event::ResultPageLoaded { offset, rows }) => {
+                assert_eq!(offset, 998);
+                assert_eq!(rows.len(), 2); // only rows 999 and 1000 remain
+                assert_eq!(rows[0][0], Value::Integer(999));
+            }
+            other => panic!("expected ResultPageLoaded, got {other:?}"),
+        }
+        handle.send(Command::Shutdown);
     }
 
     #[tokio::test]

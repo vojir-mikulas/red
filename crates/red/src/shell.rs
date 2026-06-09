@@ -26,7 +26,7 @@ impl AppState {
         // preview grid (M3, replaced by the real grid in M5).
         let schema_pane = self.render_schema(active, cx);
         let editor_pane = self.render_editor(active, cx);
-        let results_pane = self.render_results(active, cx);
+        let results_pane = self.render_result(active, cx);
 
         let config = &active.config;
 

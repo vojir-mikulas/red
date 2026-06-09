@@ -14,17 +14,11 @@ use std::rc::Rc;
 
 use flint::prelude::*;
 use gpui::{div, prelude::*, px, App, Context, Entity, Hsla};
-use red_core::{
-    Column as ResultColumn, ColumnMeta, ObjectKind, QueryOptions, SchemaMeta, TableDetail, Value,
-};
+use red_core::{ColumnMeta, ObjectKind, SchemaMeta, TableDetail};
 use red_service::Command;
 
 use crate::app::{ActiveConn, AppState, Phase};
 use crate::assets::FONT_MONO;
-
-/// Rows previewed when a table is double-clicked. Bounded by `LIMIT`, so the
-/// interim grid can hold them outright — the streaming, windowed grid is M5.
-const PREVIEW_LIMIT: usize = 500;
 
 /// A stable identity for a tree node, surviving re-render and filtering so
 /// expansion + selection track the right node regardless of row position.
@@ -85,16 +79,6 @@ impl SchemaState {
     }
 }
 
-/// The interim table preview (M3). `LIMIT`-bounded, so the rows are held outright;
-/// M5 replaces this with the streaming grid behind the same `Query` command.
-pub(crate) struct Preview {
-    /// `schema.table`, for the results-pane breadcrumb.
-    pub source: String,
-    pub columns: Vec<ResultColumn>,
-    pub rows: Vec<Vec<Value>>,
-    pub running: bool,
-    pub error: Option<String>,
-}
 
 /// What a flattened visible row carries for rendering.
 enum RowContent {
@@ -321,30 +305,6 @@ fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
     }
 }
 
-/// One preview cell, colored by value kind (NULL italic-faint, numbers accented).
-fn render_cell(value: Option<&Value>, text: Hsla, num: Hsla, faint: Hsla) -> gpui::AnyElement {
-    match value {
-        None | Some(Value::Null) => div()
-            .italic()
-            .text_color(faint)
-            .child("NULL")
-            .into_any_element(),
-        Some(Value::Integer(n)) => div()
-            .text_color(num)
-            .child(n.to_string())
-            .into_any_element(),
-        Some(Value::Real(x)) => div()
-            .text_color(num)
-            .child(format!("{x}"))
-            .into_any_element(),
-        Some(Value::Text(s)) => div().text_color(text).child(s.clone()).into_any_element(),
-        Some(Value::Blob(b)) => div()
-            .text_color(faint)
-            .child(format!("<{} bytes>", b.len()))
-            .into_any_element(),
-    }
-}
-
 /// Quote an identifier for the preview `SELECT` (PRAGMA-style: double quotes,
 /// embedded quotes doubled) so a table name can never break out of the SQL.
 fn quote_ident(ident: &str) -> String {
@@ -470,82 +430,6 @@ impl AppState {
             .child(footer)
     }
 
-    /// The interim results pane: a breadcrumb header + a bounded preview table.
-    pub(crate) fn render_results(
-        &self,
-        active: &ActiveConn,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = cx.theme();
-        let (bg, border, text, muted, faint, num) = (
-            theme.bg_panel,
-            theme.border,
-            theme.text,
-            theme.text_muted,
-            theme.text_faint,
-            theme.orange,
-        );
-
-        let container = div().size_full().flex().flex_col().bg(bg);
-
-        match &active.preview {
-            None => container.child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(12.))
-                    .text_color(faint)
-                    .child("Double-click a table to preview its rows"),
-            ),
-            Some(preview) => {
-                let status = if preview.running {
-                    "running…".to_string()
-                } else if let Some(err) = &preview.error {
-                    err.clone()
-                } else {
-                    format!("{} rows", preview.rows.len())
-                };
-                let header = div()
-                    .flex_shrink_0()
-                    .h(px(26.))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .border_b_1()
-                    .border_color(border)
-                    .font_family(FONT_MONO)
-                    .text_size(px(11.))
-                    .child(div().text_color(muted).child(preview.source.clone()))
-                    .child(div().text_color(faint).child(status));
-
-                let cols: Vec<Column> = preview
-                    .columns
-                    .iter()
-                    .map(|c| Column::new(c.name.clone()).flex())
-                    .collect();
-                let ncols = preview.columns.len();
-                let data = Rc::new(preview.rows.clone());
-
-                let table = Table::<()>::new("preview-grid", cols)
-                    .row_count(data.len())
-                    .row_height(px(24.))
-                    .render_row(move |ix, _window, _cx| {
-                        let row = &data[ix];
-                        (0..ncols)
-                            .map(|c| render_cell(row.get(c), text, num, faint))
-                            .collect()
-                    });
-
-                container
-                    .child(header)
-                    .child(div().flex_1().min_h(px(0.)).child(table))
-            }
-        }
-    }
-
     // --- tree interactions ---
 
     /// Toggle a node's expansion. Expanding an object whose detail isn't cached
@@ -576,35 +460,21 @@ impl AppState {
         cx.notify();
     }
 
-    /// Preview a table/view: a read-only `SELECT … LIMIT N` into the results pane.
-    /// The window is `LIMIT + 1` so the cursor sees the end and reports finished
-    /// in a single round-trip.
+    /// Preview a table/view: open `SELECT * FROM schema.table` in the result grid.
+    /// No `LIMIT` — the grid pages through it with flat memory.
     pub(crate) fn schema_preview(&mut self, schema: String, table: String, cx: &mut Context<Self>) {
         let sql = format!(
-            "SELECT * FROM {}.{} LIMIT {PREVIEW_LIMIT}",
+            "SELECT * FROM {}.{}",
             quote_ident(&schema),
-            quote_ident(&table),
+            quote_ident(&table)
         );
+        let label = format!("{schema}.{table}");
         if let Phase::Connected(active) = &mut self.phase {
             active.schema.selected = Some(NodeId::Object {
-                schema: schema.clone(),
-                name: table.clone(),
-            });
-            active.preview = Some(Preview {
-                source: format!("{schema}.{table}"),
-                columns: Vec::new(),
-                rows: Vec::new(),
-                running: true,
-                error: None,
+                schema,
+                name: table,
             });
         }
-        self.service.send(Command::Query {
-            sql,
-            opts: QueryOptions {
-                window: PREVIEW_LIMIT + 1,
-                timeout: None,
-            },
-        });
-        cx.notify();
+        self.open_result(label, sql, cx);
     }
 }

@@ -8,16 +8,10 @@
 
 use flint::prelude::*;
 use gpui::{div, prelude::*, px, Context, SharedString};
-use red_core::QueryOptions;
-use red_service::Command;
 
 use crate::app::{ActiveConn, AppState, Phase};
 use crate::assets::FONT_MONO;
-use crate::schema::{Preview, SchemaState};
-
-/// Rows shown for an editor query. Bounded (no `FetchMore`) so memory stays flat
-/// until M5 wires load-on-scroll to the streaming window.
-const QUERY_WINDOW: usize = 1000;
+use crate::schema::SchemaState;
 
 /// Completion candidates from the loaded schema: every object + every known
 /// column name, plus the upper-cased SQL keywords. Rebuilt as the schema grows.
@@ -229,22 +223,8 @@ impl AppState {
                 active.history.truncate(50);
             }
             active.history_open = false;
-            active.preview = Some(Preview {
-                source: "query".into(),
-                columns: Vec::new(),
-                rows: Vec::new(),
-                running: true,
-                error: None,
-            });
         }
-        self.service.send(Command::Query {
-            sql,
-            opts: QueryOptions {
-                window: QUERY_WINDOW,
-                timeout: None,
-            },
-        });
-        cx.notify();
+        self.open_result("query", sql, cx);
     }
 
     pub(crate) fn toggle_history(&mut self, cx: &mut Context<Self>) {

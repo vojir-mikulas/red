@@ -12,7 +12,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use red_core::{Column, QueryOptions, RedError, Result, RowWindow, SchemaMeta, TableDetail};
+use red_core::{
+    Column, QueryOptions, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail,
+};
 
 mod sqlite;
 pub use sqlite::SqliteDriver;
@@ -41,6 +43,15 @@ pub trait DatabaseDriver: Send + Sync {
     /// One object's columns, foreign keys, and indexes. Loaded on demand when the
     /// user expands a table, so the initial tree load stays light.
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableDetail>;
+
+    /// Total row count of `sql`'s result — one pass, no row materialization. Lets
+    /// the grid show a real scrollbar without holding every row.
+    async fn count(&self, sql: &str) -> Result<i64>;
+
+    /// A random-access `(offset, limit)` page of `sql`'s result. Backs the grid's
+    /// load-on-scroll so memory stays flat: only the pages around the viewport are
+    /// ever resident.
+    async fn fetch_page(&self, sql: &str, offset: usize, limit: usize) -> Result<ResultPage>;
 }
 
 /// A live, windowed result cursor. Object-safe; the service holds it as

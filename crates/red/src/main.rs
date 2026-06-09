@@ -11,6 +11,7 @@ mod assets;
 mod config;
 mod connect;
 mod editor;
+mod result;
 mod schema;
 mod shell;
 mod sql;

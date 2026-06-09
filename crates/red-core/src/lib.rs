@@ -139,6 +139,16 @@ pub struct RowWindow {
     pub exhausted: bool,
 }
 
+/// One random-access page of a result, fetched by `(offset, limit)`. Backs the
+/// result grid's load-on-scroll: a bounded window buffer requests the pages
+/// around the viewport and evicts the rest, so memory stays flat over a
+/// multi-million-row result. Columns ride along (stable, but cheap to repeat).
+#[derive(Debug, Clone, Default)]
+pub struct ResultPage {
+    pub columns: Vec<Column>,
+    pub rows: Vec<Vec<Value>>,
+}
+
 /// Per-query knobs carried UI → service → driver.
 #[derive(Debug, Clone)]
 pub struct QueryOptions {

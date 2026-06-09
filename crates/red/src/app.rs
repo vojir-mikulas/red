@@ -18,7 +18,8 @@ use red_service::{Command, Event, ServiceHandle};
 
 use crate::assets::FONT_UI;
 use crate::config::{self, StoredConnection};
-use crate::schema::{Preview, SchemaState};
+use crate::result::ResultGrid;
+use crate::schema::SchemaState;
 
 /// Which top-level screen is showing.
 pub(crate) enum Phase {
@@ -50,7 +51,8 @@ pub(crate) struct ActiveConn {
     pub editor_h: Pixels,
     pub editor_drag: Option<DragAnchor>,
     pub schema: SchemaState,
-    pub preview: Option<Preview>,
+    /// The open result browsed in the grid (M5): a table preview or an editor run.
+    pub result: Option<ResultGrid>,
     /// The SQL editor surface (M4), with the RED highlighter installed.
     pub editor: Entity<CodeEditor>,
     /// Recent queries (newest first), for re-run from the history popover.
@@ -79,7 +81,7 @@ impl ActiveConn {
             editor_h: px(300.),
             editor_drag: None,
             schema: SchemaState::new(cx),
-            preview: None,
+            result: None,
             editor,
             history: Vec::new(),
             history_open: false,
@@ -145,12 +147,7 @@ impl AppState {
                 if matches!(self.phase, Phase::Connecting { .. }) {
                     self.phase = Phase::Disconnected;
                 }
-                if let Phase::Connected(active) = &mut self.phase {
-                    if let Some(preview) = &mut active.preview {
-                        preview.running = false;
-                        preview.error = Some(message.clone());
-                    }
-                }
+                self.on_result_error(&message);
                 self.toast = Some((message.into(), ToastVariant::Error));
             }
 
@@ -172,31 +169,16 @@ impl AppState {
                 self.refresh_completions(cx);
             }
 
-            // --- table preview (M3 interim; the streaming grid is M5) ---
-            Event::QueryStarted { columns } => {
-                if let Phase::Connected(active) = &mut self.phase {
-                    if let Some(preview) = &mut active.preview {
-                        preview.columns = columns;
-                        preview.rows.clear();
-                        preview.running = true;
-                        preview.error = None;
-                    }
-                }
-            }
-            Event::QueryRows(window) => {
-                if let Phase::Connected(active) = &mut self.phase {
-                    if let Some(preview) = &mut active.preview {
-                        preview.rows.extend(window.rows);
-                    }
-                }
-            }
-            Event::QueryFinished { .. } | Event::QueryCancelled => {
-                if let Phase::Connected(active) = &mut self.phase {
-                    if let Some(preview) = &mut active.preview {
-                        preview.running = false;
-                    }
-                }
-            }
+            // --- result grid (M5) ---
+            Event::ResultReady { columns, total } => self.on_result_ready(columns, total, cx),
+            Event::ResultPageLoaded { offset, rows } => self.on_result_page(offset, rows, cx),
+
+            // The streaming `Query`/`FetchMore` path stays in the protocol for
+            // headless use + tests; the UI now drives results via `OpenResult`.
+            Event::QueryStarted { .. }
+            | Event::QueryRows(_)
+            | Event::QueryFinished { .. }
+            | Event::QueryCancelled => {}
         }
         cx.notify();
     }
