@@ -6,12 +6,20 @@
 //! from any thread) and `Event` out (service → UI, a `futures` mpsc the GPUI
 //! foreground executor can `await` as a `Stream`). The UI never blocks on the
 //! backend.
+//!
+//! Querying is **pull-based and windowed**: `Query` opens a streaming cursor and
+//! delivers the first window; each `FetchMore` pulls the next. This gives true
+//! end-to-end backpressure (the backend never races ahead of the consumer) and
+//! is the seam the result grid's lazy load-on-scroll plugs into. A fetch is
+//! raced against incoming commands so a `Cancel` — or a `timeout` — can abort an
+//! in-flight query out-of-band rather than dropping a future.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
-use red_core::{ConnectionConfig, DbKind, QueryResult};
-use red_driver::{DatabaseDriver, SqliteDriver};
+use red_core::{Column, ConnectionConfig, DbKind, QueryOptions, RedError, RowWindow};
+use red_driver::{CancelToken, DatabaseDriver, QueryCursor, SqliteDriver};
 use tokio::sync::mpsc::{
     unbounded_channel, UnboundedReceiver as CmdReceiver, UnboundedSender as CmdSender,
 };
@@ -20,7 +28,17 @@ use tokio::sync::mpsc::{
 #[derive(Debug)]
 pub enum Command {
     Connect(ConnectionConfig),
-    Query(String),
+    /// Open a cursor for `sql` and stream the first window.
+    Query {
+        sql: String,
+        opts: QueryOptions,
+    },
+    /// Pull the next window from the active cursor.
+    FetchMore {
+        max: usize,
+    },
+    /// Abort the active query / drop its cursor.
+    Cancel,
     Shutdown,
 }
 
@@ -28,8 +46,29 @@ pub enum Command {
 #[derive(Debug)]
 pub enum Event {
     Connected,
-    QueryComplete(QueryResult),
+    /// A query opened; column metadata is known before any rows arrive.
+    QueryStarted {
+        columns: Vec<Column>,
+    },
+    /// One bounded window of rows. `RowWindow::exhausted` marks the last one.
+    QueryRows(RowWindow),
+    /// The cursor reached the end of the result.
+    QueryFinished {
+        rows_streamed: usize,
+        elapsed: Duration,
+    },
+    /// The active query was cancelled (user `Cancel`).
+    QueryCancelled,
     Error(String),
+}
+
+/// The active query's cursor plus the bits needed to drive and abort it.
+struct ActiveQuery {
+    cursor: Box<dyn QueryCursor>,
+    cancel: CancelToken,
+    timeout: Option<Duration>,
+    streamed: usize,
+    started: Instant,
 }
 
 /// The UI's handle on the backend: send commands, take the event stream once.
@@ -62,6 +101,7 @@ pub fn spawn() -> ServiceHandle {
         .name("red-service".into())
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
                 .build()
                 .expect("build red-service tokio runtime");
             rt.block_on(dispatch(cmd_rx, evt_tx));
@@ -76,25 +116,155 @@ pub fn spawn() -> ServiceHandle {
 
 async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Event>) {
     let mut session: Option<Arc<dyn DatabaseDriver>> = None;
+    let mut active: Option<ActiveQuery> = None;
 
     while let Some(command) = commands.recv().await {
         match command {
-            Command::Connect(config) => match connect(&config).await {
-                Ok(driver) => {
-                    session = Some(driver);
-                    emit(&events, Event::Connected);
+            Command::Connect(config) => {
+                active = None; // a new connection abandons any in-flight cursor
+                match connect(&config).await {
+                    Ok(driver) => {
+                        session = Some(driver);
+                        emit(&events, Event::Connected);
+                    }
+                    Err(message) => emit(&events, Event::Error(message)),
                 }
-                Err(message) => emit(&events, Event::Error(message)),
-            },
-            Command::Query(sql) => match &session {
-                Some(driver) => match driver.query(&sql).await {
-                    Ok(result) => emit(&events, Event::QueryComplete(result)),
+            }
+
+            Command::Query { sql, opts } => {
+                active = None; // a new query supersedes the previous cursor
+                let Some(driver) = session.clone() else {
+                    emit(&events, Event::Error("not connected".into()));
+                    continue;
+                };
+                match driver.open_cursor(&sql, opts.clone()).await {
+                    Ok(cursor) => {
+                        let aq = ActiveQuery {
+                            cancel: cursor.cancel_token(),
+                            timeout: opts.timeout,
+                            streamed: 0,
+                            started: Instant::now(),
+                            cursor,
+                        };
+                        emit(
+                            &events,
+                            Event::QueryStarted {
+                                columns: aq.cursor.columns().to_vec(),
+                            },
+                        );
+                        if drive_fetch(aq, opts.window, &mut commands, &events, &mut active).await {
+                            break; // shutdown requested mid-fetch
+                        }
+                    }
                     Err(err) => emit(&events, Event::Error(err.to_string())),
-                },
-                None => emit(&events, Event::Error("not connected".into())),
+                }
+            }
+
+            Command::FetchMore { max } => match active.take() {
+                Some(aq) => {
+                    if drive_fetch(aq, max, &mut commands, &events, &mut active).await {
+                        break;
+                    }
+                }
+                None => emit(&events, Event::Error("no active query".into())),
             },
+
+            Command::Cancel => {
+                // No fetch is in flight here (pull protocol), so cancelling just
+                // drops the cursor; the in-flight case is handled inside
+                // `drive_fetch`.
+                if let Some(aq) = active.take() {
+                    aq.cancel.cancel();
+                    emit(&events, Event::QueryCancelled);
+                }
+            }
+
             Command::Shutdown => break,
         }
+    }
+}
+
+/// Run one window fetch while staying responsive to `Cancel` / `Shutdown` /
+/// timeout. On a full window the cursor is parked back into `active` for the next
+/// `FetchMore`; on the last window / cancel / error the cursor is dropped.
+/// Returns `true` if a `Shutdown` arrived during the fetch.
+async fn drive_fetch(
+    aq: ActiveQuery,
+    max: usize,
+    commands: &mut CmdReceiver<Command>,
+    events: &UnboundedSender<Event>,
+    active: &mut Option<ActiveQuery>,
+) -> bool {
+    let mut aq = aq;
+    let mut cancelled = false;
+    let mut timed_out = false;
+    let mut shutdown = false;
+
+    let outcome = {
+        let fetch = aq.cursor.next_window(max);
+        tokio::pin!(fetch);
+        loop {
+            tokio::select! {
+                res = &mut fetch => break res,
+                cmd = commands.recv(), if !shutdown => match cmd {
+                    Some(Command::Cancel) => { cancelled = true; aq.cancel.cancel(); }
+                    Some(Command::Shutdown) | None => { shutdown = true; aq.cancel.cancel(); }
+                    // Pull protocol: the consumer awaits each window before
+                    // sending the next command, so nothing else lands mid-fetch.
+                    _ => {}
+                },
+                _ = sleep_for(aq.timeout), if !timed_out && aq.timeout.is_some() => {
+                    timed_out = true;
+                    aq.cancel.cancel();
+                }
+            }
+        }
+    };
+
+    match outcome {
+        Ok(window) => {
+            // An interrupt can land between the last row and the channel reply,
+            // so honor a pending cancel/timeout even on an Ok window.
+            if shutdown || cancelled {
+                emit(events, Event::QueryCancelled);
+            } else if timed_out {
+                emit(events, Event::Error(RedError::Timeout.to_string()));
+            } else {
+                aq.streamed += window.rows.len();
+                let done = window.exhausted;
+                emit(events, Event::QueryRows(window));
+                if done {
+                    emit(
+                        events,
+                        Event::QueryFinished {
+                            rows_streamed: aq.streamed,
+                            elapsed: aq.started.elapsed(),
+                        },
+                    );
+                } else {
+                    *active = Some(aq);
+                }
+            }
+        }
+        Err(RedError::Interrupted) => {
+            if timed_out {
+                emit(events, Event::Error(RedError::Timeout.to_string()));
+            } else {
+                emit(events, Event::QueryCancelled);
+            }
+        }
+        Err(e) => emit(events, Event::Error(e.to_string())),
+    }
+
+    shutdown
+}
+
+/// A timeout future that never fires when no timeout is set, so the `select!`
+/// branch can be a stable shape.
+async fn sleep_for(timeout: Option<Duration>) {
+    match timeout {
+        Some(d) => tokio::time::sleep(d).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -121,26 +291,146 @@ mod tests {
     use futures::StreamExt;
     use red_core::Value;
 
+    fn sqlite(dsn: &str, read_only: bool) -> ConnectionConfig {
+        ConnectionConfig {
+            name: "scratch".into(),
+            kind: DbKind::Sqlite,
+            dsn: dsn.into(),
+            read_only,
+        }
+    }
+
+    fn counting_sql(n: i64) -> String {
+        format!(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < {n}) SELECT x FROM c"
+        )
+    }
+
+    /// Connect, run a windowed query, and drain it — proving the start → rows →
+    /// finished lifecycle and that windows stay bounded (memory flat: only one
+    /// window is ever resident).
+    #[tokio::test]
+    async fn streams_query_in_bounded_windows() {
+        let mut handle = spawn();
+        let mut events = handle.take_events().expect("event stream");
+        handle.send(Command::Connect(sqlite(":memory:", true)));
+        assert!(matches!(events.next().await, Some(Event::Connected)));
+
+        handle.send(Command::Query {
+            sql: counting_sql(25_000),
+            opts: QueryOptions {
+                window: 1000,
+                timeout: None,
+            },
+        });
+
+        match events.next().await {
+            Some(Event::QueryStarted { columns }) => assert_eq!(columns[0].name, "x"),
+            other => panic!("expected QueryStarted, got {other:?}"),
+        }
+
+        let mut total = 0usize;
+        loop {
+            match events.next().await {
+                Some(Event::QueryRows(window)) => {
+                    assert!(window.rows.len() <= 1000);
+                    total += window.rows.len();
+                    if !window.exhausted {
+                        handle.send(Command::FetchMore { max: 1000 });
+                    }
+                }
+                Some(Event::QueryFinished { rows_streamed, .. }) => {
+                    assert_eq!(rows_streamed, 25_000);
+                    break;
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert_eq!(total, 25_000);
+        handle.send(Command::Shutdown);
+    }
+
+    /// Cancel a long-running query mid-flight and get a prompt `QueryCancelled`.
+    #[tokio::test]
+    async fn cancels_query_mid_flight() {
+        let mut handle = spawn();
+        let mut events = handle.take_events().expect("event stream");
+        handle.send(Command::Connect(sqlite(":memory:", true)));
+        assert!(matches!(events.next().await, Some(Event::Connected)));
+
+        handle.send(Command::Query {
+            sql: counting_sql(1_000_000_000),
+            opts: QueryOptions {
+                window: 1_000_000_000,
+                timeout: None,
+            },
+        });
+        assert!(matches!(
+            events.next().await,
+            Some(Event::QueryStarted { .. })
+        ));
+
+        // Let the first step get underway, then cancel out-of-band.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.send(Command::Cancel);
+
+        assert!(matches!(events.next().await, Some(Event::QueryCancelled)));
+        handle.send(Command::Shutdown);
+    }
+
+    /// A tiny timeout aborts a runaway first step and surfaces an error.
+    #[tokio::test]
+    async fn query_times_out() {
+        let mut handle = spawn();
+        let mut events = handle.take_events().expect("event stream");
+        handle.send(Command::Connect(sqlite(":memory:", true)));
+        assert!(matches!(events.next().await, Some(Event::Connected)));
+
+        handle.send(Command::Query {
+            sql: counting_sql(1_000_000_000),
+            opts: QueryOptions {
+                window: 1_000_000_000,
+                timeout: Some(Duration::from_millis(50)),
+            },
+        });
+        assert!(matches!(
+            events.next().await,
+            Some(Event::QueryStarted { .. })
+        ));
+
+        match events.next().await {
+            Some(Event::Error(msg)) => assert!(msg.contains("timed out"), "got: {msg}"),
+            other => panic!("expected timeout error, got {other:?}"),
+        }
+        handle.send(Command::Shutdown);
+    }
+
     #[tokio::test]
     async fn connect_and_query_roundtrip() {
         let mut handle = spawn();
-        handle.send(Command::Connect(ConnectionConfig {
-            name: "scratch".into(),
-            kind: DbKind::Sqlite,
-            dsn: ":memory:".into(),
-            read_only: false,
-        }));
-        handle.send(Command::Query("SELECT 42 AS answer".into()));
         let mut events = handle.take_events().expect("event stream");
+        handle.send(Command::Connect(sqlite(":memory:", false)));
+        handle.send(Command::Query {
+            sql: "SELECT 42 AS answer".into(),
+            opts: QueryOptions::default(),
+        });
 
         assert!(matches!(events.next().await, Some(Event::Connected)));
+        assert!(matches!(
+            events.next().await,
+            Some(Event::QueryStarted { .. })
+        ));
         match events.next().await {
-            Some(Event::QueryComplete(result)) => {
-                assert_eq!(result.rows[0][0], Value::Integer(42));
+            Some(Event::QueryRows(window)) => {
+                assert_eq!(window.rows[0][0], Value::Integer(42));
+                assert!(window.exhausted);
             }
-            other => panic!("expected QueryComplete, got {other:?}"),
+            other => panic!("expected QueryRows, got {other:?}"),
         }
-
+        assert!(matches!(
+            events.next().await,
+            Some(Event::QueryFinished { .. })
+        ));
         handle.send(Command::Shutdown);
     }
 }

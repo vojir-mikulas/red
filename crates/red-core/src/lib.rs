@@ -55,18 +55,41 @@ impl fmt::Display for Value {
     }
 }
 
-/// A materialized query result. NOTE: this is the eager shape for the scaffold;
-/// the streaming/windowed cursor (the real performance story) replaces this for
-/// large result sets — see docs/plans in the Nyx repo (red-db-explorer.md).
-#[derive(Debug, Clone, Default)]
-pub struct QueryResult {
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<Value>>,
+/// Column metadata for a result set. `name` is always present; `decl_type` is the
+/// engine's declared type (best-effort — `None` for computed expressions) and
+/// feeds type-aware cell rendering later (M5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Column {
+    pub name: String,
+    pub decl_type: Option<String>,
 }
 
-impl QueryResult {
-    pub fn row_count(&self) -> usize {
-        self.rows.len()
+/// One bounded window of rows pulled from a streaming cursor. The streaming path
+/// never materializes a whole result — it yields these fixed-size windows.
+#[derive(Debug, Clone, Default)]
+pub struct RowWindow {
+    pub rows: Vec<Vec<Value>>,
+    /// `true` once this window reaches the end of the result — no more fetches.
+    pub exhausted: bool,
+}
+
+/// Per-query knobs carried UI → service → driver.
+#[derive(Debug, Clone)]
+pub struct QueryOptions {
+    /// Max rows per fetched window.
+    pub window: usize,
+    /// Abort a single fetch that stalls longer than this — guards a runaway
+    /// query that computes a huge intermediate before yielding row 1.
+    /// `None` = no cap.
+    pub timeout: Option<std::time::Duration>,
+}
+
+impl Default for QueryOptions {
+    fn default() -> Self {
+        Self {
+            window: 1000,
+            timeout: None,
+        }
     }
 }
 
@@ -79,6 +102,13 @@ pub enum RedError {
     Query(String),
     #[error("driver error: {0}")]
     Driver(String),
+    /// A fetch was aborted out-of-band (user cancel). Distinct from a failure so
+    /// the service can emit a clean "cancelled" rather than an error.
+    #[error("query cancelled")]
+    Interrupted,
+    /// A fetch exceeded its configured timeout.
+    #[error("query timed out")]
+    Timeout,
 }
 
 pub type Result<T> = std::result::Result<T, RedError>;

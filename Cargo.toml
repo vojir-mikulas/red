@@ -30,7 +30,7 @@ async-trait = "0.1"
 
 # --- Database drivers ---
 # v0.1 target: SQLite (bundled C lib, no system dep) + PostgreSQL (later).
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
 
 # --- Errors / logging ---
 anyhow = "1"

@@ -9,8 +9,10 @@
 //! top of this seam — the trait is shaped to grow a `stream`/`cancel` surface
 //! without disturbing callers.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use red_core::{QueryResult, RedError, Result};
+use red_core::{Column, QueryOptions, RedError, Result, RowWindow};
 
 mod sqlite;
 pub use sqlite::SqliteDriver;
@@ -22,9 +24,45 @@ pub trait DatabaseDriver: Send + Sync {
     /// Cheap liveness probe — opens/touches the underlying connection.
     async fn ping(&self) -> Result<()>;
 
-    /// Execute SQL and return the full result. Large result sets will move to a
-    /// streamed cursor; this eager form is the scaffold baseline.
-    async fn query(&self, sql: &str) -> Result<QueryResult>;
+    /// Prepare `sql`, read column metadata, and return a live cursor. Cheap by
+    /// design: this does NOT step rows — the first (potentially expensive) step
+    /// happens on the first `next_window`, which is the cancellable path.
+    async fn open_cursor(&self, sql: &str, opts: QueryOptions) -> Result<Box<dyn QueryCursor>>;
+}
+
+/// A live, windowed result cursor. Object-safe; the service holds it as
+/// `Box<dyn QueryCursor>`. `next_window` takes `&self` — all mutable cursor state
+/// lives on the driver's blocking thread — so the returned future is
+/// `Send + 'static` and can be raced against incoming commands for cancellation.
+#[async_trait]
+pub trait QueryCursor: Send {
+    /// Column metadata, known up front (read at `open_cursor` without stepping).
+    fn columns(&self) -> &[Column];
+
+    /// Fetch up to `max` more rows. `RowWindow::exhausted` marks the end of the
+    /// result; once `true`, no further `next_window` calls should be made.
+    async fn next_window(&self, max: usize) -> Result<RowWindow>;
+
+    /// A clone-able, thread-safe handle that aborts an in-flight fetch
+    /// out-of-band (user cancel / timeout).
+    fn cancel_token(&self) -> CancelToken;
+}
+
+/// Engine-agnostic cancel handle. SQLite wraps `rusqlite`'s `InterruptHandle`;
+/// Postgres (M7) will wrap its out-of-band cancel request. Cloning is cheap and
+/// the token is safe to call from any thread.
+#[derive(Clone)]
+pub struct CancelToken(Arc<dyn Fn() + Send + Sync>);
+
+impl CancelToken {
+    pub(crate) fn new(f: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    /// Signal the in-flight fetch to abort. Idempotent and non-blocking.
+    pub fn cancel(&self) {
+        (self.0)()
+    }
 }
 
 /// Map any error carrying a message into a driver error. Small helper so impls
