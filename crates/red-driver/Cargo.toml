@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "red-driver"
+description = "RED database driver abstraction (DatabaseDriver) + the SQLite implementation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+red-core.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+rusqlite.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

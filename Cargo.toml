@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/vojir-mikulas/red"
+authors = ["vojir-mikulas <vojir.mikulas@gmail.com>"]
+
+[workspace.dependencies]
+# --- GPUI (pinned to the SAME Zed rev as Flint and Nyx) ---
+# This rev is a shared contract: Cargo unifies two git deps only at the same
+# URL+rev, so RED must resolve gpui to exactly this rev (Flint re-exports it as
+# `flint::gpui`) or it gets a second, incompatible gpui copy. Bumping is a
+# coordinated event across flint + nyx + red. Per-OS features live in consuming
+# crates because Cargo features are additive.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "137e677a0561eb7284cfad1bedccea70155e2473", default-features = false }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "137e677a0561eb7284cfad1bedccea70155e2473", default-features = false }
+
+# --- Shared UI (the extracted in-house component library) ---
+flint = { path = "../flint" }
+
+# --- Async / backend bridge (mirrors Nyx: Tokio backend ↔ GPUI over channels) ---
+tokio = { version = "1", default-features = false }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+async-trait = "0.1"
+
+# --- Database drivers ---
+# v0.1 target: SQLite (bundled C lib, no system dep) + PostgreSQL (later).
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# --- Errors / logging ---
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- Embedded assets (fonts baked into the binary) ---
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+
+# --- Internal crates ---
+red-core = { path = "crates/red-core" }
+red-driver = { path = "crates/red-driver" }
+red-service = { path = "crates/red-service" }
+
+[profile.dev]
+# GPUI's dep tree is large; a touch of opt on deps keeps debug builds usable.
+[profile.dev.package."*"]
+opt-level = 2

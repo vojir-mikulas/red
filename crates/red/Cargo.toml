@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "red"
+description = "RED — Roughly Enough Data. A fast, simple database explorer. The GPUI application binary."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+default-run = "red"
+
+[[bin]]
+name = "red"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+gpui_platform.workspace = true
+flint.workspace = true
+anyhow.workspace = true
+rust-embed.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# red-core / red-service join here when the UI is wired to the backend (the
+# first real task on top of this scaffold) — they build + are tested in the
+# workspace already.
+
+# macOS uses font-kit (CoreText) for font loading; Windows/Linux use GPUI's own
+# backend. Features are additive, so this only adds to the base workspace deps.
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui = { workspace = true, features = ["font-kit"] }
+gpui_platform = { workspace = true, features = ["font-kit"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui = { workspace = true, features = ["x11", "wayland"] }
+gpui_platform = { workspace = true, features = ["x11", "wayland"] }

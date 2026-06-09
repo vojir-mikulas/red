@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "red-service"
+description = "RED backend: a Tokio thread that owns DB sessions and talks to the UI over Command/Event channels."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+red-core.workspace = true
+red-driver.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+futures.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }

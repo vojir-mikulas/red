@@ -1,0 +1,22 @@
+RED — Roughly Enough Data
+Copyright 2026 Mikuláš Vojíř (vojir-mikulas)
+
+This program is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See the LICENSE file for the full text.
+
+------------------------------------------------------------------------------
+Third-party components and why this project is GPL-3.0-or-later
+------------------------------------------------------------------------------
+
+RED is built on GPUI (via the in-house Flint component library), the UI
+framework from the Zed project (https://github.com/zed-industries/zed). GPUI's
+dependency tree pulls in utility crates from the Zed monorepo licensed
+GPL-3.0-or-later (zlog, ztracing, ztracing_macro), which are linked into the RED
+binary. The combined work is therefore GPL-3.0-or-later; RED's own source is
+GPL-3.0-or-later to match. Apache-2.0 is one-way compatible into GPLv3, so the
+Apache-2.0 components are included under the terms of the combined work.
+
+Vendored fonts under assets/fonts/ (IBM Plex Sans, JetBrains Mono) are licensed
+under the SIL Open Font License — see the LICENSE-*.txt files alongside them.
