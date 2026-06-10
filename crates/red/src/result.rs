@@ -1092,9 +1092,42 @@ impl AppState {
         };
 
         let elapsed = format_duration(grid.query_time());
-        let status = if let Some(err) = &grid.error {
-            div().text_color(red).child(err.clone())
-        } else if !grid.ready {
+
+        // A failed query gets a full-pane panel rather than the cramped toolbar
+        // status slot — syntax errors are multi-line and would otherwise clip.
+        if let Some(err) = &grid.error {
+            return container.child(
+                div()
+                    .id("result-error")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_4()
+                    .overflow_y_scroll()
+                    .font_family(FONT_MONO)
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(11.))
+                            .text_color(red)
+                            .child("Query failed")
+                            .child(div().text_color(faint).child(format!("· {elapsed}"))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(text)
+                            .child(err.clone()),
+                    ),
+            );
+        }
+
+        let status = if !grid.ready {
             div()
                 .text_color(faint)
                 .child(format!("running… {elapsed}"))
@@ -1106,7 +1139,7 @@ impl AppState {
         let view = cx.entity().downgrade();
         let toolbar = div()
             .flex_shrink_0()
-            .h(px(26.))
+            .h(px(30.))
             .flex()
             .items_center()
             .gap_2()

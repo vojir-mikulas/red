@@ -26,30 +26,18 @@ cargo clippy --workspace --all-targets -- -D warnings  # lint (warnings = errors
 cargo fmt --all
 ```
 
-## Hard rules
-
-- **Use Flint for UI.** Components + theme tokens come from `flint`. Don't add raw
-  hex colors in app code — use a semantic token (`cx.theme().bg_app`). New shared
-  components belong in Flint, not here (and must stay domain-free) — see the Flint
-  workflow note below.
-- **Single GPUI.** RED resolves one `gpui`, pinned to the same Zed rev as Flint
-  and Nyx. Flint re-exports it (`flint::gpui`). Never bump gpui casually — it's a
-  cross-repo contract (flint → nyx → red).
-- **UI independent from drivers.** The UI speaks `red-core` types and Commands/
-  Events, never driver internals. Keep `DatabaseDriver` the only seam to engines.
-- **Read-only friendly / safe by default.** Confirm destructive queries, support
-  read-only connections and query timeouts (see the plan).
-
 ## Conventions
 
-- **Errors:** `thiserror` in libraries (`red_core::RedError`), `anyhow` at the app
-  edge.
-- **Logging:** `tracing`.
-- **Large result sets:** never materialize a whole result by default — the goal is
-  a streamed, windowed cursor behind `DatabaseDriver`. The scaffold's eager
-  `QueryResult` is a placeholder to replace, not a pattern to spread.
-- **Comments minimal** — explain a non-obvious *why* or an invariant, not the
-  next line.
+**`docs/conventions.md` is the canonical coding guide — read it.** It covers
+comments, file size & module layout, errors/logging, the Flint and single-gpui
+rules, and the safe-by-default behaviour. The load-bearing project invariants:
+
+- **UI independent from drivers.** The UI speaks `red-core` types and Commands/
+  Events, never driver internals. `DatabaseDriver` is the only seam to engines.
+- **Single gpui**, pinned to the same Zed rev as Flint and Nyx — a cross-repo
+  contract, never bumped casually.
+- **Never materialize a whole result by default** — stream through a windowed
+  cursor behind `DatabaseDriver`.
 
 ## Working with Flint
 
