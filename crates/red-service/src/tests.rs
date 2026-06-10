@@ -585,3 +585,38 @@ async fn connect_and_query_roundtrip() {
     ));
     handle.send(Command::Shutdown);
 }
+
+#[test]
+fn panic_message_recovers_common_payloads() {
+    // `&str` and `String` panic payloads round-trip; anything else degrades to a
+    // placeholder rather than losing the crash report entirely.
+    let from_str = std::panic::catch_unwind(|| panic!("boom")).unwrap_err();
+    assert_eq!(panic_message(from_str.as_ref()), "boom");
+
+    let owned = String::from("owned boom");
+    let from_string = std::panic::catch_unwind(move || panic!("{owned}")).unwrap_err();
+    assert_eq!(panic_message(from_string.as_ref()), "owned boom");
+
+    let from_other = std::panic::catch_unwind(|| std::panic::panic_any(42u8)).unwrap_err();
+    assert_eq!(panic_message(from_other.as_ref()), "unknown panic");
+}
+
+#[test]
+fn lock_recovers_from_a_poisoned_mutex() {
+    use crate::dispatch::lock;
+    use std::sync::{Arc, Mutex};
+
+    let m = Arc::new(Mutex::new(0u32));
+    let poisoner = Arc::clone(&m);
+    // Poison the mutex by panicking while holding the guard.
+    let _ = std::thread::spawn(move || {
+        let _guard = poisoner.lock().unwrap();
+        panic!("poison");
+    })
+    .join();
+    assert!(m.lock().is_err(), "mutex should be poisoned");
+
+    // The helper still hands back a usable guard despite the poison.
+    *lock(&m) += 1;
+    assert_eq!(*lock(&m), 1);
+}

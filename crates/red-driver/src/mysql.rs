@@ -579,7 +579,9 @@ fn group_indexes(rows: &[Row]) -> Vec<IndexMeta> {
     order
         .into_iter()
         .map(|name| {
-            let (unique, mut cols) = by_name.remove(&name).unwrap();
+            let (unique, mut cols) = by_name
+                .remove(&name)
+                .expect("invariant: every name in `order` was inserted into `by_name`");
             cols.sort_by_key(|(seq, _)| *seq);
             IndexMeta {
                 name,

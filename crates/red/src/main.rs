@@ -1,6 +1,6 @@
-//! The RED application binary. Opens the GPUI window and mounts the root view.
-//! The Tokio backend (`red-service`) and database drivers (`red-driver`) exist
-//! and are tested; wiring them into this UI is the next step.
+//! The RED application binary. Initialises logging, spawns the `red-service`
+//! backend thread, opens the GPUI window, and mounts the root view onto the
+//! service's command channel and event stream.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -98,4 +98,10 @@ fn init_tracing() {
         .with(filter)
         .with(fmt::layer().with_writer(std::io::stderr))
         .init();
+
+    // Route panics on any thread (the GPUI main thread included) through tracing,
+    // so a crash lands in the same log as everything else rather than bare stderr.
+    std::panic::set_hook(Box::new(|info| {
+        tracing::error!("panic: {info}");
+    }));
 }

@@ -4,7 +4,7 @@
 //! incoming commands so a cancel or timeout can abort one in flight.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::UnboundedSender;
@@ -39,6 +39,14 @@ struct OpenSpec {
 /// bounds/total after the fact and read specs without round-tripping commands).
 type ResultMap = Arc<Mutex<HashMap<u64, OpenSpec>>>;
 
+/// Lock a mutex, tolerating poison. A detached page-fetch task can panic while
+/// holding `results`; recovering the guard keeps one bad task from bricking the
+/// whole backend. The worst case is a half-written entry, which dispatch already
+/// tolerates — a fetch for an epoch absent or stale in the map is dropped.
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The active query's cursor plus the bits needed to drive and abort it.
 struct ActiveQuery {
     cursor: Box<dyn QueryCursor>,
@@ -66,7 +74,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
         match command {
             Command::Connect(config) => {
                 active = None; // a new connection abandons any in-flight cursor
-                results.lock().unwrap().clear();
+                lock(&results).clear();
                 match connect(&config).await {
                     Ok(driver) => {
                         let version = driver.server_version();
@@ -93,7 +101,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
 
             Command::Disconnect => {
                 active = None;
-                results.lock().unwrap().clear();
+                lock(&results).clear();
                 session = None;
                 emit(&events, Event::Disconnected);
             }
@@ -172,7 +180,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 };
                 // Registered before the (slow) open task so an early fetch for
                 // this epoch isn't mistaken for a stale one.
-                results.lock().unwrap().insert(
+                lock(&results).insert(
                     epoch,
                     OpenSpec {
                         sql: sql.clone(),
@@ -229,7 +237,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                         (Ok(total), Ok(page)) => {
                             let total = total.max(0) as usize;
                             // Fill the spec in only if the result is still open.
-                            if let Some(spec) = results.lock().unwrap().get_mut(&epoch) {
+                            if let Some(spec) = lock(&results).get_mut(&epoch) {
                                 spec.key = key.clone();
                                 spec.bounds = bounds;
                                 spec.total = Some(total);
@@ -261,7 +269,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 // The tab closed or re-sorted (its epoch is gone); skip the stale
                 // request rather than running an expensive query whose result
                 // would be discarded.
-                let Some(sql) = results.lock().unwrap().get(&epoch).map(|s| s.sql.clone()) else {
+                let Some(sql) = lock(&results).get(&epoch).map(|s| s.sql.clone()) else {
                     continue;
                 };
                 // Pages fetch concurrently (the driver pools connections) and off
@@ -297,7 +305,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                     continue;
                 };
                 // Stale epoch (tab closed / re-sorted) — drop, like `FetchPage`.
-                let Some(spec) = results.lock().unwrap().get(&epoch).cloned() else {
+                let Some(spec) = lock(&results).get(&epoch).cloned() else {
                     continue;
                 };
                 let Some(key) = spec.key.clone() else {
@@ -328,7 +336,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
             }
 
             Command::CloseResult { epoch } => {
-                results.lock().unwrap().remove(&epoch);
+                lock(&results).remove(&epoch);
             }
 
             Command::Execute { sql } => {
@@ -356,7 +364,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                     emit(&events, Event::Error("not connected".into()));
                     continue;
                 };
-                let Some(sql) = results.lock().unwrap().get(&epoch).map(|s| s.sql.clone()) else {
+                let Some(sql) = lock(&results).get(&epoch).map(|s| s.sql.clone()) else {
                     emit(&events, Event::Error("no open result to export".into()));
                     continue;
                 };

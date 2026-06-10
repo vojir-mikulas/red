@@ -76,12 +76,37 @@ pub fn spawn() -> ServiceHandle {
                 .enable_all()
                 .build()
                 .expect("build red-service tokio runtime");
-            rt.block_on(dispatch::dispatch(cmd_rx, evt_tx));
+            // A panic in the dispatch loop (e.g. a driver bug) would otherwise just
+            // drop the event sender, leaving the UI to wonder why the backend went
+            // silent. Catch it, log it, and surface a clean error so the user sees
+            // *something* before the thread exits. `report` keeps a live sender for
+            // that final message even as the unwinding loop drops its own.
+            let report = evt_tx.clone();
+            let run =
+                std::panic::AssertUnwindSafe(|| rt.block_on(dispatch::dispatch(cmd_rx, evt_tx)));
+            if let Err(panic) = std::panic::catch_unwind(run) {
+                let detail = panic_message(panic.as_ref());
+                tracing::error!(detail, "red-service dispatch loop panicked");
+                let _ = report.unbounded_send(Event::Error(format!("backend crashed: {detail}")));
+            }
         })
         .expect("spawn red-service thread");
 
     ServiceHandle {
         commands: cmd_tx,
         events: Some(evt_rx),
+    }
+}
+
+/// Best-effort message from a caught panic payload. Payloads are `dyn Any`, so
+/// only the common `&str`/`String` forms are recoverable; anything else reports a
+/// placeholder.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }
