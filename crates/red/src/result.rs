@@ -10,6 +10,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use std::path::PathBuf;
 
@@ -25,6 +26,16 @@ use crate::assets::FONT_MONO;
 /// evicting. The buffer holds at most ~`2*MARGIN` rows regardless of total.
 const PAGE: usize = 200;
 const MARGIN: usize = 400;
+
+/// Monotonic id for each opened result. Tags `OpenResult`/`FetchPage` so the
+/// backend can drop stale page fetches and the grid can ignore late replies for
+/// a result it has already replaced (table switch / re-sort). Starts at 1 — `0`
+/// is the backend's "no live result" sentinel.
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+fn next_epoch() -> u64 {
+    NEXT_EPOCH.fetch_add(1, Ordering::Relaxed)
+}
 
 /// The sparse row buffer: absolute row index → cells, plus the set of in-flight
 /// page requests (so the same page isn't fetched twice).
@@ -46,7 +57,7 @@ impl GridBuffer {
     /// Ensure the pages covering `range` are loaded, evict everything beyond a
     /// margin around it, and request any missing pages. Called per paint with the
     /// about-to-render window, so the buffer tracks the viewport.
-    fn ensure(&mut self, range: Range<usize>, total: usize, sender: &CommandSender) {
+    fn ensure(&mut self, range: Range<usize>, total: usize, epoch: u64, sender: &CommandSender) {
         let lo = range.start.saturating_sub(MARGIN);
         let hi = (range.end + MARGIN).min(total);
         self.rows.retain(|k, _| *k >= lo && *k < hi);
@@ -71,6 +82,7 @@ impl GridBuffer {
             sender.send(Command::FetchPage {
                 offset,
                 limit: PAGE,
+                epoch,
             });
         }
     }
@@ -92,6 +104,9 @@ pub(crate) struct ResultGrid {
     buffer: Rc<RefCell<GridBuffer>>,
     sender: CommandSender,
     scroll: UniformListScrollHandle,
+    /// Identifies the current open SQL; bumped on every (re)open so stale page
+    /// fetches and late `ResultReady`/`ResultPageLoaded` replies are ignored.
+    epoch: u64,
 }
 
 impl ResultGrid {
@@ -108,6 +123,7 @@ impl ResultGrid {
             buffer: Rc::new(RefCell::new(GridBuffer::default())),
             sender,
             scroll: UniformListScrollHandle::new(),
+            epoch: next_epoch(),
         }
     }
 
@@ -258,16 +274,17 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let sender = self.service.command_sender();
-        let sql = match &mut self.phase {
+        let opened = match &mut self.phase {
             Phase::Connected(active) => {
                 let grid = ResultGrid::new(label.into(), base_sql, sender);
-                let sql = grid.effective_sql();
+                let opened = (grid.effective_sql(), grid.epoch);
                 active.result = Some(grid);
-                sql
+                opened
             }
             _ => return,
         };
-        self.service.send(Command::OpenResult { sql });
+        let (sql, epoch) = opened;
+        self.service.send(Command::OpenResult { sql, epoch });
         cx.notify();
     }
 
@@ -276,10 +293,15 @@ impl AppState {
         &mut self,
         columns: Vec<ResultColumn>,
         total: usize,
+        epoch: u64,
         cx: &mut Context<Self>,
     ) {
         if let Phase::Connected(active) = &mut self.phase {
             if let Some(grid) = &mut active.result {
+                // Ignore a late reply for a result we've already replaced.
+                if grid.epoch != epoch {
+                    return;
+                }
                 grid.reset_buffer();
                 grid.on_ready(columns, total);
             }
@@ -292,10 +314,15 @@ impl AppState {
         &mut self,
         offset: usize,
         rows: Vec<Vec<Value>>,
+        epoch: u64,
         cx: &mut Context<Self>,
     ) {
         if let Phase::Connected(active) = &self.phase {
             if let Some(grid) = &active.result {
+                // A page for a superseded result would land in the wrong rows.
+                if grid.epoch != epoch {
+                    return;
+                }
                 grid.buffer.borrow_mut().insert_page(offset, rows);
             }
         }
@@ -318,7 +345,7 @@ impl AppState {
             return; // the row-number gutter isn't sortable
         }
         let dcol = table_col - 1;
-        let sql = match &mut self.phase {
+        let reopen = match &mut self.phase {
             Phase::Connected(active) => match &mut active.result {
                 Some(grid) => {
                     grid.sort = match grid.sort {
@@ -328,14 +355,17 @@ impl AppState {
                     grid.selection = None;
                     grid.ready = false;
                     grid.reset_buffer();
-                    Some(grid.effective_sql())
+                    // New SQL → new epoch, so pages still in flight for the old
+                    // ordering are dropped rather than landing in the wrong rows.
+                    grid.epoch = next_epoch();
+                    Some((grid.effective_sql(), grid.epoch))
                 }
                 None => None,
             },
             _ => None,
         };
-        if let Some(sql) = sql {
-            self.service.send(Command::OpenResult { sql });
+        if let Some((sql, epoch)) = reopen {
+            self.service.send(Command::OpenResult { sql, epoch });
         }
         cx.notify();
     }
@@ -523,6 +553,7 @@ impl AppState {
         let buffer_range = grid.buffer.clone();
         let buffer_row = grid.buffer.clone();
         let sender = grid.sender.clone();
+        let epoch = grid.epoch;
         let (sort_view, cell_view) = (view.clone(), view.clone());
 
         let table = Table::<()>::new("result-grid", columns)
@@ -539,7 +570,9 @@ impl AppState {
                 move || crate::icons::icon("sort-desc", px(9.), accent).into_any_element(),
             )
             .on_visible_range(move |range, _, _| {
-                buffer_range.borrow_mut().ensure(range, total, &sender)
+                buffer_range
+                    .borrow_mut()
+                    .ensure(range, total, epoch, &sender)
             })
             .on_sort(move |table_col, _, cx| {
                 sort_view

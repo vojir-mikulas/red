@@ -259,8 +259,16 @@ impl AppState {
             }
 
             // --- result grid (M5) ---
-            Event::ResultReady { columns, total } => self.on_result_ready(columns, total, cx),
-            Event::ResultPageLoaded { offset, rows } => self.on_result_page(offset, rows, cx),
+            Event::ResultReady {
+                columns,
+                total,
+                epoch,
+            } => self.on_result_ready(columns, total, epoch, cx),
+            Event::ResultPageLoaded {
+                offset,
+                rows,
+                epoch,
+            } => self.on_result_page(offset, rows, epoch, cx),
 
             // --- export & writes (M6) ---
             Event::Executed { affected } => {

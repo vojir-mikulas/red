@@ -55,13 +55,19 @@ pub enum Command {
     },
     /// Open `sql` as the grid's result: count its rows and report column metadata
     /// + the total. The result is then browsed page-by-page via `FetchPage`.
+    ///
+    /// `epoch` identifies this open result so stale pages from a previous one
+    /// (e.g. after switching tables) can be dropped.
     OpenResult {
         sql: String,
+        epoch: u64,
     },
     /// Fetch one random-access page of the open result (grid load-on-scroll).
+    /// `epoch` must match the current open result or the page is ignored.
     FetchPage {
         offset: usize,
         limit: usize,
+        epoch: u64,
     },
     /// Run a non-row-returning statement (write/DDL) in a transaction.
     Execute {
@@ -122,15 +128,20 @@ pub enum Event {
         detail: TableDetail,
     },
     /// A result opened: its columns and total row count (for `OpenResult`).
+    /// Echoes the open `epoch` so the grid can ignore a late reply for a result
+    /// it has already replaced.
     ResultReady {
         columns: Vec<Column>,
         total: usize,
+        epoch: u64,
     },
     /// One page of the open result. Echoes `offset` so the grid drops it into the
-    /// right slot of its window buffer regardless of arrival order.
+    /// right slot of its window buffer regardless of arrival order, and `epoch`
+    /// so a page for a superseded result is discarded.
     ResultPageLoaded {
         offset: usize,
         rows: Vec<Vec<red_core::Value>>,
+        epoch: u64,
     },
     /// A write/DDL statement committed; `affected` rows changed.
     Executed {
@@ -219,12 +230,18 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
     let mut active: Option<ActiveQuery> = None;
     // The SQL backing the grid's paged result, re-fetched per `FetchPage`.
     let mut result_sql: Option<String> = None;
+    // The current open result's epoch. Page fetches run as detached tasks (so a
+    // slow `count`/deep page never stalls the dispatch loop); a fetch whose epoch
+    // no longer matches is stale — the grid has moved on — and is dropped. `0` is
+    // the "no live result" sentinel (UI epochs start at 1).
+    let mut result_epoch: u64 = 0;
 
     while let Some(command) = commands.recv().await {
         match command {
             Command::Connect(config) => {
                 active = None; // a new connection abandons any in-flight cursor
                 result_sql = None;
+                result_epoch = 0;
                 match connect(&config).await {
                     Ok(driver) => {
                         let version = driver.server_version();
@@ -252,6 +269,7 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
             Command::Disconnect => {
                 active = None;
                 result_sql = None;
+                result_epoch = 0;
                 session = None;
                 emit(&events, Event::Disconnected);
             }
@@ -323,28 +341,47 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
                 }
             }
 
-            Command::OpenResult { sql } => {
+            Command::OpenResult { sql, epoch } => {
                 let Some(driver) = session.clone() else {
                     emit(&events, Event::Error("not connected".into()));
                     continue;
                 };
                 result_sql = Some(sql.clone());
-                // `LIMIT 0` reads column metadata without stepping rows.
-                let total = driver.count(&sql).await;
-                let columns = driver.fetch_page(&sql, 0, 0).await;
-                match (total, columns) {
-                    (Ok(total), Ok(page)) => emit(
-                        &events,
-                        Event::ResultReady {
-                            columns: page.columns,
-                            total: total.max(0) as usize,
-                        },
-                    ),
-                    (Err(e), _) | (_, Err(e)) => emit(&events, Event::Error(e.to_string())),
-                }
+                result_epoch = epoch;
+                // Count + column metadata can be slow (a full `COUNT(*)` over a
+                // large table); run them off the dispatch loop so switching to
+                // another table stays instant.
+                let events = events.clone();
+                tokio::spawn(async move {
+                    // `LIMIT 0` reads column metadata without stepping rows;
+                    // counting runs concurrently with it.
+                    let (total, columns) =
+                        tokio::join!(driver.count(&sql), driver.fetch_page(&sql, 0, 0));
+                    match (total, columns) {
+                        (Ok(total), Ok(page)) => emit(
+                            &events,
+                            Event::ResultReady {
+                                columns: page.columns,
+                                total: total.max(0) as usize,
+                                epoch,
+                            },
+                        ),
+                        (Err(e), _) | (_, Err(e)) => emit(&events, Event::Error(e.to_string())),
+                    }
+                });
             }
 
-            Command::FetchPage { offset, limit } => {
+            Command::FetchPage {
+                offset,
+                limit,
+                epoch,
+            } => {
+                // The grid has moved on (table switched / re-sorted); skip the
+                // stale request rather than running an expensive query whose
+                // result would be discarded.
+                if epoch != result_epoch {
+                    continue;
+                }
                 let Some(driver) = session.clone() else {
                     emit(&events, Event::Error("not connected".into()));
                     continue;
@@ -353,16 +390,23 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
                     emit(&events, Event::Error("no open result".into()));
                     continue;
                 };
-                match driver.fetch_page(&sql, offset, limit).await {
-                    Ok(page) => emit(
-                        &events,
-                        Event::ResultPageLoaded {
-                            offset,
-                            rows: page.rows,
-                        },
-                    ),
-                    Err(e) => emit(&events, Event::Error(e.to_string())),
-                }
+                // Pages fetch concurrently (the driver pools connections) and off
+                // the dispatch loop, so a deep-`OFFSET` page never blocks the next
+                // command or another page.
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver.fetch_page(&sql, offset, limit).await {
+                        Ok(page) => emit(
+                            &events,
+                            Event::ResultPageLoaded {
+                                offset,
+                                rows: page.rows,
+                                epoch,
+                            },
+                        ),
+                        Err(e) => emit(&events, Event::Error(e.to_string())),
+                    }
+                });
             }
 
             Command::Execute { sql } => {
@@ -738,11 +782,17 @@ mod tests {
 
         handle.send(Command::OpenResult {
             sql: counting_sql(1000),
+            epoch: 1,
         });
         match events.next().await {
-            Some(Event::ResultReady { columns, total }) => {
+            Some(Event::ResultReady {
+                columns,
+                total,
+                epoch,
+            }) => {
                 assert_eq!(columns[0].name, "x");
                 assert_eq!(total, 1000);
+                assert_eq!(epoch, 1);
             }
             other => panic!("expected ResultReady, got {other:?}"),
         }
@@ -750,12 +800,18 @@ mod tests {
         handle.send(Command::FetchPage {
             offset: 998,
             limit: 100,
+            epoch: 1,
         });
         match events.next().await {
-            Some(Event::ResultPageLoaded { offset, rows }) => {
+            Some(Event::ResultPageLoaded {
+                offset,
+                rows,
+                epoch,
+            }) => {
                 assert_eq!(offset, 998);
                 assert_eq!(rows.len(), 2); // only rows 999 and 1000 remain
                 assert_eq!(rows[0][0], Value::Integer(999));
+                assert_eq!(epoch, 1);
             }
             other => panic!("expected ResultPageLoaded, got {other:?}"),
         }
