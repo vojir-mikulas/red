@@ -24,6 +24,12 @@ use crate::{Command, Event, RunFetch};
 /// this is the backstop.
 const MAX_CONCURRENT_PAGE_FETCHES: usize = 6;
 
+/// Cap on how long one connect attempt may run before the backend gives up and
+/// reports a timeout. Bounds a hung connect (a black-hole host) so the dispatch
+/// loop frees up for the next command — the UI drives retry/backoff and cancel
+/// on top of this, but those only work if the loop isn't wedged awaiting a dial.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// What the backend remembers about one open result: the SQL it re-fetches per
 /// page/run, the resolved seek key, and — for interpolated jumps — the key's
 /// min/max and the result's total.
@@ -75,7 +81,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
             Command::Connect(config) => {
                 active = None; // a new connection abandons any in-flight cursor
                 lock(&results).clear();
-                match connect(&config).await {
+                match attempt_connect(&config).await {
                     Ok(driver) => {
                         let version = driver.server_version();
                         session = Some(driver);
@@ -88,7 +94,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
             Command::TestConnection(config) => {
                 // A throwaway probe: connect, report, and let the driver drop. The
                 // active session is untouched.
-                match connect(&config).await {
+                match attempt_connect(&config).await {
                     Ok(driver) => emit(
                         &events,
                         Event::TestSucceeded {
@@ -536,6 +542,18 @@ async fn sleep_for(timeout: Option<Duration>) {
     match timeout {
         Some(d) => tokio::time::sleep(d).await,
         None => std::future::pending().await,
+    }
+}
+
+/// [`connect`] bounded by [`CONNECT_TIMEOUT`]. A timeout surfaces as a connect
+/// error like any other failure, so the UI's retry/backoff path handles it.
+async fn attempt_connect(config: &ConnectionConfig) -> Result<Arc<dyn DatabaseDriver>, String> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, connect(config)).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "connection timed out after {}s",
+            CONNECT_TIMEOUT.as_secs()
+        )),
     }
 }
 

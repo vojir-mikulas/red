@@ -9,6 +9,8 @@
 mod form;
 mod render;
 
+use std::time::Duration;
+
 use flint::prelude::*;
 use flint::{CodeEditor, CodeEditorEvent};
 use futures::channel::mpsc::UnboundedReceiver;
@@ -26,10 +28,33 @@ use crate::settings_ui::SettingsTab;
 /// Which top-level screen is showing.
 pub(crate) enum Phase {
     Disconnected,
-    Connecting { config: ConnectionConfig },
+    Connecting(Connecting),
     // Boxed: `ActiveConn` carries the whole schema model, dwarfing the other
     // variants — box it to keep `Phase` small.
     Connected(Box<ActiveConn>),
+}
+
+/// State of an in-progress connection: which config we're dialing, how many
+/// attempts we've made, and whether an attempt is in flight or we're waiting
+/// out a backoff before the next retry. Drives the connecting splash (progress
+/// bar / error / retry / cancel). See [`AppState::start_connect`].
+pub(crate) struct Connecting {
+    pub config: ConnectionConfig,
+    /// 1-based number of the attempt currently in flight or just failed.
+    pub attempt: u32,
+    pub status: ConnectStatus,
+}
+
+/// Where a [`Connecting`] is in its attempt/backoff cycle.
+pub(crate) enum ConnectStatus {
+    /// An attempt is in flight — the indeterminate progress bar sweeps.
+    InProgress,
+    /// The last attempt failed; we're waiting `delay` before the next retry,
+    /// showing the error. `delay` is the wait we scheduled (shown to the user).
+    Backoff {
+        error: SharedString,
+        delay: Duration,
+    },
 }
 
 /// The result of the latest "Test connection" probe, shown in the form footer.
@@ -180,6 +205,10 @@ pub struct AppState {
     /// Whether a repaint ticker is already running for the live query timer, so
     /// concurrent opens don't stack duplicate tickers.
     pub(crate) query_ticking: bool,
+    /// Monotonic token for the current connect session. Bumped on every connect,
+    /// retry, and cancel; a pending backoff timer only fires if its captured
+    /// value still matches, so a cancel or manual retry abandons stale timers.
+    pub(crate) connect_gen: u64,
 }
 impl AppState {
     pub fn new(
@@ -264,6 +293,7 @@ impl AppState {
             settings_open: false,
             settings_tab: SettingsTab::Appearance,
             query_ticking: false,
+            connect_gen: 0,
         }
     }
 
@@ -310,10 +340,13 @@ impl AppState {
     fn on_event(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
             Event::Connected { version } => {
-                if let Phase::Connecting { config } =
+                if let Phase::Connecting(conn) =
                     std::mem::replace(&mut self.phase, Phase::Disconnected)
                 {
-                    self.phase = Phase::Connected(Box::new(ActiveConn::new(config, version, cx)));
+                    // Invalidate any pending backoff timer from a prior attempt.
+                    self.connect_gen += 1;
+                    self.phase =
+                        Phase::Connected(Box::new(ActiveConn::new(conn.config, version, cx)));
                     // Kick off the schema-tree skeleton load for the sidebar.
                     self.service.send(Command::LoadObjects);
                 }
@@ -330,11 +363,15 @@ impl AppState {
                 }
             }
             Event::Error(message) => {
-                if matches!(self.phase, Phase::Connecting { .. }) {
-                    self.phase = Phase::Disconnected;
+                // While connecting, the only thing in flight is the connect — so
+                // an error is a failed attempt: keep the splash and schedule a
+                // backoff retry instead of dropping to the connect screen.
+                if matches!(self.phase, Phase::Connecting(_)) {
+                    self.on_connect_failed(message, cx);
+                } else {
+                    self.on_result_error(&message);
+                    self.toast = Some((message.into(), ToastVariant::Error));
                 }
-                self.on_result_error(&message);
-                self.toast = Some((message.into(), ToastVariant::Error));
             }
 
             // --- schema explorer ---
@@ -420,8 +457,98 @@ impl AppState {
         stored.last_accessed = Some(config::now());
         let config = stored.config.clone();
         self.persist();
+        self.start_connect(config, cx);
+    }
+
+    /// Open a fresh connect session: bump the generation (abandoning any pending
+    /// retry from a previous session), show the splash, and fire the first
+    /// attempt.
+    fn start_connect(&mut self, config: ConnectionConfig, cx: &mut Context<Self>) {
+        self.connect_gen += 1;
         self.service.send(Command::Connect(config.clone()));
-        self.phase = Phase::Connecting { config };
+        self.phase = Phase::Connecting(Connecting {
+            config,
+            attempt: 1,
+            status: ConnectStatus::InProgress,
+        });
+        cx.notify();
+    }
+
+    /// Exponential backoff between connect retries: 1s, 2s, 4s, 8s, 16s, then
+    /// capped at 30s. `attempt` is the number of the attempt that just failed.
+    fn backoff_delay(attempt: u32) -> Duration {
+        let secs = 1u64 << attempt.saturating_sub(1).min(5);
+        Duration::from_secs(secs.min(30))
+    }
+
+    /// A connect attempt failed: record the error on the splash and schedule a
+    /// backoff retry. No-op if we've left the connecting phase meanwhile.
+    fn on_connect_failed(&mut self, message: String, cx: &mut Context<Self>) {
+        let delay = match &mut self.phase {
+            Phase::Connecting(conn) => {
+                let delay = Self::backoff_delay(conn.attempt);
+                conn.status = ConnectStatus::Backoff {
+                    error: message.into(),
+                    delay,
+                };
+                delay
+            }
+            _ => return,
+        };
+        self.schedule_retry(delay, cx);
+    }
+
+    /// Arm a one-shot timer that retries the connection after `delay`, unless a
+    /// newer generation (cancel, manual retry, or a fresh connect) supersedes it.
+    fn schedule_retry(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        let generation = self.connect_gen;
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |this, cx| this.retry_connect(generation, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// A backoff timer fired — start the next attempt if its generation is still
+    /// current (i.e. not cancelled or already retried via "Retry now").
+    fn retry_connect(&mut self, generation: u64, cx: &mut Context<Self>) {
+        if generation == self.connect_gen {
+            self.begin_attempt(cx);
+        }
+    }
+
+    /// "Retry now" on the splash — skip the remaining backoff wait.
+    pub(crate) fn retry_now(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.phase, Phase::Connecting(_)) {
+            self.begin_attempt(cx);
+        }
+    }
+
+    /// Fire the next attempt for the in-flight connection: bump the generation
+    /// (abandoning any pending backoff timer), advance the counter, and re-send
+    /// the Connect command.
+    fn begin_attempt(&mut self, cx: &mut Context<Self>) {
+        let config = match &mut self.phase {
+            Phase::Connecting(conn) => {
+                conn.attempt += 1;
+                conn.status = ConnectStatus::InProgress;
+                conn.config.clone()
+            }
+            _ => return,
+        };
+        self.connect_gen += 1;
+        self.service.send(Command::Connect(config));
+        cx.notify();
+    }
+
+    /// Abandon an in-progress connection (the splash "Cancel" button): bump the
+    /// generation so any pending retry is dropped, tell the backend to discard
+    /// the session it may still be opening, and return to the connect screen.
+    pub(crate) fn cancel_connect(&mut self, cx: &mut Context<Self>) {
+        self.connect_gen += 1;
+        self.service.send(Command::Disconnect);
+        self.phase = Phase::Disconnected;
         cx.notify();
     }
 

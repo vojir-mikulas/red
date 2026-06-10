@@ -3,28 +3,77 @@
 //! close-with-unsaved-work).
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Render, SharedString, Window};
+use gpui::{div, prelude::*, px, Render, Window};
 
-use super::{AppState, Phase};
+use super::{AppState, ConnectStatus, Connecting, Phase};
 use crate::assets::{FONT_MONO, FONT_UI};
 
 impl AppState {
-    fn render_connecting(&self, name: SharedString, cx: &Context<Self>) -> impl IntoElement {
+    /// The connecting splash: an indeterminate progress bar while an attempt is
+    /// in flight, the error plus a backoff countdown between retries, and always
+    /// a Cancel (quit-the-load) button — with "Retry now" while backing off.
+    fn render_connecting(&self, conn: &Connecting, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let name = conn.config.name.clone();
+
+        let status = div().flex().flex_col().items_center().gap_2().w(px(360.));
+        let status = match &conn.status {
+            ConnectStatus::InProgress => {
+                let label = if conn.attempt > 1 {
+                    format!("Connecting to {name}… (attempt {})", conn.attempt)
+                } else {
+                    format!("Connecting to {name}…")
+                };
+                status
+                    .child(div().text_color(theme.text).child(label))
+                    .child(ProgressBar::new("connect-progress", 0.0).indeterminate(true))
+            }
+            ConnectStatus::Backoff { error, delay } => status
+                .child(
+                    div()
+                        .text_color(theme.text)
+                        .child(format!("Couldn't connect to {name}")),
+                )
+                .child(
+                    div()
+                        .text_color(theme.text_muted)
+                        .text_size(px(12.))
+                        .child(error.clone()),
+                )
+                .child(
+                    div()
+                        .text_color(theme.text_muted)
+                        .text_size(px(12.))
+                        .child(format!("Retrying in {}s…", delay.as_secs())),
+                )
+                .child(ProgressBar::new("connect-progress", 0.0).indeterminate(true)),
+        };
+
+        let mut actions = div().flex().justify_center().gap_2();
+        if matches!(conn.status, ConnectStatus::Backoff { .. }) {
+            actions = actions.child(
+                Button::new("connect-retry", "Retry now")
+                    .variant(ButtonVariant::Secondary)
+                    .on_click(cx.listener(|this, _, _, cx| this.retry_now(cx))),
+            );
+        }
+        actions = actions.child(
+            Button::new("connect-cancel", "Cancel")
+                .variant(ButtonVariant::Secondary)
+                .on_click(cx.listener(|this, _, _, cx| this.cancel_connect(cx))),
+        );
+
         div()
             .size_full()
             .flex()
             .flex_col()
             .items_center()
             .justify_center()
-            .gap_2()
+            .gap_4()
             .bg(theme.bg_app)
             .font_family(FONT_UI)
-            .child(
-                div()
-                    .text_color(theme.text)
-                    .child(format!("Connecting to {name}…")),
-            )
+            .child(status)
+            .child(actions)
     }
 }
 
@@ -32,9 +81,7 @@ impl Render for AppState {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let screen = match &self.phase {
             Phase::Disconnected => self.render_connect(cx).into_any_element(),
-            Phase::Connecting { config } => self
-                .render_connecting(config.name.clone().into(), cx)
-                .into_any_element(),
+            Phase::Connecting(conn) => self.render_connecting(conn, cx).into_any_element(),
             Phase::Connected(active) => self.render_shell(active, cx).into_any_element(),
         };
 
