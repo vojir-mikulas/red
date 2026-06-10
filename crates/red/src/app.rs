@@ -54,9 +54,56 @@ pub(crate) struct FormState {
     pub test: TestState,
 }
 
+/// The default editor stub a fresh query tab opens with. A tab still holding
+/// exactly this (and no result) is "pristine" — closing it needs no confirmation.
+pub(crate) const EMPTY_QUERY: &str = "-- Write SQL, ⌘↵ to run\n";
+
+/// One query tab: its own SQL editor, result grid, and history. A connection
+/// holds several of these (M9); the schema sidebar and split sizes are shared.
+pub(crate) struct QueryTab {
+    /// Tab label: "query N" for a blank tab, or "schema.table" for a preview.
+    pub title: String,
+    /// The SQL editor surface (M4), with the RED highlighter installed.
+    pub editor: Entity<CodeEditor>,
+    /// The open result browsed in the grid (M5): a table preview or an editor run.
+    pub result: Option<ResultGrid>,
+    /// Recent queries (newest first), for re-run from the history popover.
+    pub history: Vec<String>,
+    pub history_open: bool,
+}
+
+impl QueryTab {
+    pub(crate) fn new(title: String, cx: &mut Context<AppState>) -> Self {
+        let editor = cx.new(|cx| {
+            CodeEditor::new(cx)
+                .highlighter(crate::sql::tokenize)
+                .with_content(EMPTY_QUERY)
+        });
+        // ⌘↵ in the (focused) editor runs the active tab's statement / selection.
+        cx.subscribe(&editor, |this, _editor, _event: &CodeEditorEvent, cx| {
+            this.run_editor_query(cx)
+        })
+        .detach();
+
+        Self {
+            title,
+            editor,
+            result: None,
+            history: Vec::new(),
+            history_open: false,
+        }
+    }
+
+    /// A blank tab the user hasn't touched — no result and the default stub still
+    /// in the editor. Closing one of these doesn't warrant a confirmation.
+    pub(crate) fn is_pristine(&self, cx: &Context<AppState>) -> bool {
+        self.result.is_none() && self.editor.read(cx).content() == EMPTY_QUERY
+    }
+}
+
 /// The live-connection view state: which connection, its engine version, the
 /// resizable split sizes (caller-owned, per `SplitPane`'s stateless contract),
-/// the schema explorer (M3), and the current table preview (M3 interim results).
+/// the schema explorer (M3), and the open query tabs (M9).
 pub(crate) struct ActiveConn {
     pub config: ConnectionConfig,
     pub version: String,
@@ -65,28 +112,16 @@ pub(crate) struct ActiveConn {
     pub editor_h: Pixels,
     pub editor_drag: Option<DragAnchor>,
     pub schema: SchemaState,
-    /// The open result browsed in the grid (M5): a table preview or an editor run.
-    pub result: Option<ResultGrid>,
-    /// The SQL editor surface (M4), with the RED highlighter installed.
-    pub editor: Entity<CodeEditor>,
-    /// Recent queries (newest first), for re-run from the history popover.
-    pub history: Vec<String>,
-    pub history_open: bool,
+    /// Open query tabs (never empty), and the index of the focused one.
+    pub tabs: Vec<QueryTab>,
+    pub active_tab: usize,
+    /// Monotonic counter for naming blank tabs ("query 1", "query 2", …).
+    pub query_seq: usize,
 }
 
 impl ActiveConn {
     fn new(config: ConnectionConfig, version: String, cx: &mut Context<AppState>) -> Self {
-        let editor = cx.new(|cx| {
-            CodeEditor::new(cx)
-                .highlighter(crate::sql::tokenize)
-                .with_content("-- Write SQL, ⌘↵ to run\n")
-        });
-        // ⌘↵ in the editor runs the current statement / selection.
-        cx.subscribe(&editor, |this, _editor, _event: &CodeEditorEvent, cx| {
-            this.run_editor_query(cx)
-        })
-        .detach();
-
+        let tab = QueryTab::new("query 1".to_string(), cx);
         Self {
             config,
             version,
@@ -95,11 +130,28 @@ impl ActiveConn {
             editor_h: px(300.),
             editor_drag: None,
             schema: SchemaState::new(cx),
-            result: None,
-            editor,
-            history: Vec::new(),
-            history_open: false,
+            tabs: vec![tab],
+            active_tab: 0,
+            query_seq: 1,
         }
+    }
+
+    /// The focused tab. `active_tab` is kept in range, so these never panic.
+    pub(crate) fn active(&self) -> &QueryTab {
+        &self.tabs[self.active_tab]
+    }
+
+    pub(crate) fn active_mut(&mut self) -> &mut QueryTab {
+        &mut self.tabs[self.active_tab]
+    }
+
+    /// Find the open result whose grid carries `epoch`, across all tabs — result
+    /// events route by epoch so a background tab's query still populates.
+    pub(crate) fn result_by_epoch(&mut self, epoch: u64) -> Option<&mut ResultGrid> {
+        self.tabs
+            .iter_mut()
+            .filter_map(|t| t.result.as_mut())
+            .find(|g| g.epoch == epoch)
     }
 }
 
@@ -118,6 +170,8 @@ pub struct AppState {
     pub(crate) toast: Option<(SharedString, ToastVariant)>,
     /// A destructive statement awaiting the user's confirmation before it runs.
     pub(crate) confirm_exec: Option<String>,
+    /// A non-pristine query tab the user asked to close, awaiting confirmation.
+    pub(crate) confirm_close_tab: Option<usize>,
     /// Persisted UI preferences (theme, grid density, the safety rail) + their store.
     pub(crate) settings: Settings,
     pub(crate) settings_store: Option<FileSettingsStore>,
@@ -202,6 +256,7 @@ impl AppState {
             form: None,
             toast: None,
             confirm_exec: None,
+            confirm_close_tab: None,
             settings,
             settings_store,
             settings_open: false,
@@ -587,6 +642,112 @@ impl AppState {
         cx.notify();
     }
 
+    // --- query tabs (M9) ---
+
+    /// Focus tab `index`. Its editor and result become the visible ones.
+    pub(crate) fn set_active_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase {
+            if index < active.tabs.len() {
+                active.active_tab = index;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Push a freshly-built tab, focus it, and seed its completions. Returns the
+    /// new index. Callers supply the tab (a blank query or a table preview).
+    pub(crate) fn push_tab(&mut self, tab: QueryTab, cx: &mut Context<Self>) -> usize {
+        let index = match &mut self.phase {
+            Phase::Connected(active) => {
+                active.tabs.push(tab);
+                active.active_tab = active.tabs.len() - 1;
+                active.active_tab
+            }
+            _ => return 0,
+        };
+        // New editor needs the current schema's completion candidates installed.
+        self.refresh_completions(cx);
+        index
+    }
+
+    /// Open a blank query tab (the tab-strip "＋" action).
+    pub(crate) fn new_query(&mut self, cx: &mut Context<Self>) {
+        let tab = match &mut self.phase {
+            Phase::Connected(active) => {
+                active.query_seq += 1;
+                QueryTab::new(format!("query {}", active.query_seq), cx)
+            }
+            _ => return,
+        };
+        self.push_tab(tab, cx);
+        cx.notify();
+    }
+
+    /// The tab-strip "×": close immediately if pristine, else ask first.
+    pub(crate) fn request_close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        let pristine = match &self.phase {
+            Phase::Connected(active) => active
+                .tabs
+                .get(index)
+                .map(|t| t.is_pristine(cx))
+                .unwrap_or(true),
+            _ => return,
+        };
+        if pristine {
+            self.close_tab(index, cx);
+        } else {
+            self.confirm_close_tab = Some(index);
+            cx.notify();
+        }
+    }
+
+    /// Confirmation accepted — close the tab that was awaiting it.
+    pub(crate) fn confirm_close(&mut self, cx: &mut Context<Self>) {
+        if let Some(index) = self.confirm_close_tab.take() {
+            self.close_tab(index, cx);
+        }
+    }
+
+    pub(crate) fn cancel_close(&mut self, cx: &mut Context<Self>) {
+        self.confirm_close_tab = None;
+        cx.notify();
+    }
+
+    /// Drop tab `index`, freeing its backend result. The last tab never vanishes —
+    /// closing it leaves one fresh blank tab behind, so the shell always has one.
+    fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.confirm_close_tab = None;
+        let (closed_epoch, replace) = match &mut self.phase {
+            Phase::Connected(active) if index < active.tabs.len() => {
+                let removed = active.tabs.remove(index);
+                let closed_epoch = removed.result.map(|g| g.epoch);
+                let replace = if active.tabs.is_empty() {
+                    active.query_seq = 1;
+                    true
+                } else {
+                    // Keep the focus stable: clamp, and shift left if we removed a
+                    // tab at or before the focused one.
+                    if active.active_tab >= index && active.active_tab > 0 {
+                        active.active_tab -= 1;
+                    }
+                    active.active_tab = active.active_tab.min(active.tabs.len() - 1);
+                    false
+                };
+                (closed_epoch, replace)
+            }
+            _ => return,
+        };
+        // Free the backend result that backed the closed tab's grid.
+        if let Some(epoch) = closed_epoch {
+            self.service.send(Command::CloseResult { epoch });
+        }
+        if replace {
+            let tab = QueryTab::new("query 1".to_string(), cx);
+            self.push_tab(tab, cx);
+        }
+        cx.notify();
+    }
+
     // --- settings panel ---
 
     pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
@@ -700,6 +861,11 @@ impl Render for AppState {
             .clone()
             .map(|sql| self.render_confirm(sql, cx));
 
+        let confirm_close = self
+            .confirm_close_tab
+            .and_then(|i| self.tab_title(i))
+            .map(|title| self.render_confirm_close(title, cx));
+
         let settings = self
             .settings_open
             .then(|| self.render_settings(cx).into_any_element());
@@ -717,11 +883,52 @@ impl Render for AppState {
             .child(screen)
             .children(toast)
             .children(confirm)
+            .children(confirm_close)
             .children(settings)
     }
 }
 
 impl AppState {
+    /// The title of tab `index`, if it exists — for the close-confirm prompt.
+    fn tab_title(&self, index: usize) -> Option<String> {
+        match &self.phase {
+            Phase::Connected(active) => active.tabs.get(index).map(|t| t.title.clone()),
+            _ => None,
+        }
+    }
+
+    /// Confirmation before closing a tab that holds real work (M9). Mirrors the
+    /// destructive-statement modal's shape.
+    fn render_confirm_close(&self, title: String, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let close_view = cx.entity().downgrade();
+        let body = div().text_color(theme.text_muted).child(format!(
+            "“{title}” has a query or result that will be lost. Close it?"
+        ));
+        let footer = div()
+            .flex()
+            .justify_end()
+            .gap_2()
+            .child(
+                Button::new("close-cancel", "Keep tab")
+                    .variant(ButtonVariant::Secondary)
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel_close(cx))),
+            )
+            .child(
+                Button::new("close-confirm", "Close tab")
+                    .variant(ButtonVariant::Danger)
+                    .on_click(cx.listener(|this, _, _, cx| this.confirm_close(cx))),
+            );
+        Modal::new("confirm-close-tab")
+            .title("Close tab")
+            .width(px(420.))
+            .footer(footer)
+            .on_close(move |_, cx| {
+                close_view.update(cx, |this, cx| this.cancel_close(cx)).ok();
+            })
+            .child(body)
+    }
+
     /// The destructive-statement confirmation modal (M6 safety rail).
     fn render_confirm(&self, sql: String, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();

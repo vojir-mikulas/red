@@ -106,7 +106,7 @@ pub(crate) struct ResultGrid {
     scroll: UniformListScrollHandle,
     /// Identifies the current open SQL; bumped on every (re)open so stale page
     /// fetches and late `ResultReady`/`ResultPageLoaded` replies are ignored.
-    epoch: u64,
+    pub(crate) epoch: u64,
 }
 
 impl ResultGrid {
@@ -293,7 +293,7 @@ impl AppState {
             Phase::Connected(active) => {
                 let grid = ResultGrid::new(label.into(), base_sql, sender);
                 let opened = (grid.effective_sql(), grid.epoch);
-                active.result = Some(grid);
+                active.active_mut().result = Some(grid);
                 opened
             }
             _ => return,
@@ -312,11 +312,9 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         if let Phase::Connected(active) = &mut self.phase {
-            if let Some(grid) = &mut active.result {
-                // Ignore a late reply for a result we've already replaced.
-                if grid.epoch != epoch {
-                    return;
-                }
+            // Route by epoch: the result may belong to a background tab. A late
+            // reply for a replaced/closed result finds no match and is dropped.
+            if let Some(grid) = active.result_by_epoch(epoch) {
                 grid.reset_buffer();
                 grid.on_ready(columns, total);
             }
@@ -332,22 +330,21 @@ impl AppState {
         epoch: u64,
         cx: &mut Context<Self>,
     ) {
-        if let Phase::Connected(active) = &self.phase {
-            if let Some(grid) = &active.result {
-                // A page for a superseded result would land in the wrong rows.
-                if grid.epoch != epoch {
-                    return;
-                }
+        if let Phase::Connected(active) = &mut self.phase {
+            // Route by epoch so a background tab's page lands in its own grid; a
+            // page for a superseded result finds no match and is dropped.
+            if let Some(grid) = active.result_by_epoch(epoch) {
                 grid.buffer.borrow_mut().insert_page(offset, rows);
             }
         }
         cx.notify();
     }
 
-    /// Record a result error against the open grid (also surfaced as a toast).
+    /// Record a result error against the active tab's grid (also surfaced as a
+    /// toast). Errors aren't epoch-tagged yet, so they attach to the focused tab.
     pub(crate) fn on_result_error(&mut self, message: &str) {
         if let Phase::Connected(active) = &mut self.phase {
-            if let Some(grid) = &mut active.result {
+            if let Some(grid) = &mut active.active_mut().result {
                 grid.error = Some(message.to_string());
                 grid.ready = true;
             }
@@ -361,8 +358,9 @@ impl AppState {
         }
         let dcol = table_col - 1;
         let reopen = match &mut self.phase {
-            Phase::Connected(active) => match &mut active.result {
+            Phase::Connected(active) => match &mut active.active_mut().result {
                 Some(grid) => {
+                    let old_epoch = grid.epoch;
                     grid.sort = match grid.sort {
                         Some((c, asc)) if c == dcol => Some((c, !asc)),
                         _ => Some((dcol, true)),
@@ -373,13 +371,15 @@ impl AppState {
                     // New SQL → new epoch, so pages still in flight for the old
                     // ordering are dropped rather than landing in the wrong rows.
                     grid.epoch = next_epoch();
-                    Some((grid.effective_sql(), grid.epoch))
+                    Some((grid.effective_sql(), grid.epoch, old_epoch))
                 }
                 None => None,
             },
             _ => None,
         };
-        if let Some((sql, epoch)) = reopen {
+        if let Some((sql, epoch, old_epoch)) = reopen {
+            // Evict the superseded SQL so the backend's result map can't grow.
+            self.service.send(Command::CloseResult { epoch: old_epoch });
             self.service.send(Command::OpenResult { sql, epoch });
         }
         cx.notify();
@@ -397,7 +397,7 @@ impl AppState {
             return;
         }
         if let Phase::Connected(active) = &mut self.phase {
-            if let Some(grid) = &mut active.result {
+            if let Some(grid) = &mut active.active_mut().result {
                 grid.selection = match (extend, grid.selection) {
                     (true, Some(mut range)) => {
                         range.focus = (row, table_col);
@@ -410,12 +410,15 @@ impl AppState {
         cx.notify();
     }
 
-    /// Prompt for a save path, then stream the open result there in `format`.
+    /// Prompt for a save path, then stream the active tab's result there in `format`.
     pub(crate) fn export_result(&mut self, format: ExportFormat, cx: &mut Context<Self>) {
-        let open = matches!(&self.phase, Phase::Connected(a) if a.result.is_some());
-        if !open {
+        let epoch = match &self.phase {
+            Phase::Connected(a) => a.active().result.as_ref().map(|g| g.epoch),
+            _ => None,
+        };
+        let Some(epoch) = epoch else {
             return;
-        }
+        };
         let name = match format {
             ExportFormat::Csv => "red-export.csv",
             ExportFormat::Json => "red-export.json",
@@ -427,7 +430,11 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(path))) = rx.await {
                 this.update(cx, |this, cx| {
-                    this.service.send(Command::Export { format, path });
+                    this.service.send(Command::Export {
+                        format,
+                        path,
+                        epoch,
+                    });
                     this.toast = Some(("Exporting…".into(), ToastVariant::Info));
                     cx.notify();
                 })
@@ -439,7 +446,9 @@ impl AppState {
 
     pub(crate) fn copy_result_selection(&mut self, cx: &mut Context<Self>) {
         let tsv = match &self.phase {
-            Phase::Connected(active) => active.result.as_ref().and_then(ResultGrid::selection_tsv),
+            Phase::Connected(active) => {
+                active.active().result.as_ref().and_then(ResultGrid::selection_tsv)
+            }
             _ => None,
         };
         if let Some(tsv) = tsv {
@@ -476,7 +485,7 @@ impl AppState {
         };
         let container = div().size_full().flex().flex_col().bg(bg);
 
-        let grid = match &active.result {
+        let grid = match &active.active().result {
             Some(grid) => grid,
             None => {
                 return container.child(

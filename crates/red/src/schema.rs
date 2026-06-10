@@ -453,24 +453,42 @@ impl AppState {
         cx.notify();
     }
 
-    /// Preview a table/view: open `SELECT * FROM schema.table` in the result grid.
-    /// No `LIMIT` — the grid pages through it with flat memory.
+    /// Preview a table/view: open `SELECT * FROM schema.table` in a **new** query
+    /// tab so the user's current query and result are preserved. No `LIMIT` — the
+    /// grid pages through it with flat memory. The new tab's editor is pre-filled.
     pub(crate) fn schema_preview(&mut self, schema: String, table: String, cx: &mut Context<Self>) {
-        let Phase::Connected(active) = &mut self.phase else {
-            return;
+        let (sql, label) = match &mut self.phase {
+            Phase::Connected(active) => {
+                let kind = active.config.kind;
+                let sql = format!(
+                    "SELECT * FROM {}.{}",
+                    quote_ident(&schema, kind),
+                    quote_ident(&table, kind)
+                );
+                let label = format!("{schema}.{table}");
+                active.schema.selected = Some(NodeId::Object {
+                    schema,
+                    name: table,
+                });
+                (sql, label)
+            }
+            _ => return,
         };
-        let kind = active.config.kind;
-        let sql = format!(
-            "SELECT * FROM {}.{}",
-            quote_ident(&schema, kind),
-            quote_ident(&table, kind)
-        );
-        let label = format!("{schema}.{table}");
-        active.schema.selected = Some(NodeId::Object {
-            schema,
-            name: table,
-        });
-        let editor = active.editor.clone();
+        // Reuse the focused tab only if it's untouched; otherwise open a new one
+        // so the user's current query and result are preserved.
+        let reuse = matches!(&self.phase, Phase::Connected(a) if a.active().is_pristine(cx));
+        if reuse {
+            if let Phase::Connected(active) = &mut self.phase {
+                active.active_mut().title = label.clone();
+            }
+        } else {
+            let tab = crate::app::QueryTab::new(label.clone(), cx);
+            self.push_tab(tab, cx);
+        }
+        let editor = match &self.phase {
+            Phase::Connected(active) => active.active().editor.clone(),
+            _ => return,
+        };
         editor.update(cx, |editor, cx| editor.set_content(sql.clone(), cx));
         self.open_result(label, sql, cx);
     }

@@ -98,23 +98,52 @@ impl AppState {
         let (yellow, green, on_accent) = (theme.yellow, theme.green, theme.on_accent);
         let view = cx.entity().downgrade();
 
-        // --- tab strip: the active query tab + a "new query" affordance ---
-        let tab = div()
-            .flex()
-            .items_center()
-            .gap_1p5()
-            .px_2p5()
-            .bg(bg_app)
-            .border_r_1()
-            .border_color(border)
-            .child(crate::icons::icon("play", px(10.), green))
-            .child(
-                div()
-                    .font_family(FONT_MONO)
-                    .text_size(px(12.))
-                    .text_color(text)
-                    .child("query"),
-            );
+        // --- tab strip: one tab per open query + a "new query" affordance ---
+        let active_idx = active.active_tab;
+        let tabs = active.tabs.iter().enumerate().map(|(i, t)| {
+            let is_active = i == active_idx;
+            let (tab_bg, tab_text, icon_color) = if is_active {
+                (bg_app, text, green)
+            } else {
+                (bg_panel, muted, dim)
+            };
+            div()
+                .id(("sql-tab", i))
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .px_2p5()
+                .bg(tab_bg)
+                .border_r_1()
+                .border_color(border)
+                .cursor_pointer()
+                .when(!is_active, |d| d.hover(|s| s.bg(bg_elevated)))
+                .on_click(cx.listener(move |this, _, _, cx| this.set_active_tab(i, cx)))
+                .child(crate::icons::icon("play", px(10.), icon_color))
+                .child(
+                    div()
+                        .font_family(FONT_MONO)
+                        .text_size(px(12.))
+                        .text_color(tab_text)
+                        .child(t.title.clone()),
+                )
+                .child(
+                    div()
+                        .id(("sql-tab-close", i))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(15.))
+                        .rounded(px(3.))
+                        .text_color(faint)
+                        .hover(|s| s.bg(bg_hover).text_color(text))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.request_close_tab(i, cx);
+                        }))
+                        .child(crate::icons::icon("close", px(9.), faint)),
+                )
+        });
         let tabstrip = div()
             .flex_shrink_0()
             .h(px(35.))
@@ -123,7 +152,7 @@ impl AppState {
             .bg(bg_panel)
             .border_b_1()
             .border_color(border)
-            .child(tab)
+            .children(tabs)
             .child(
                 div()
                     .id("sql-new")
@@ -154,9 +183,12 @@ impl AppState {
             .text_color(muted)
             .child(active.config.name.clone())
             .child(div().text_color(dim).child("/"))
-            .child(div().text_color(text).child("query"));
+            .child(div().text_color(text).child(active.active().title.clone()));
 
-        let surface = div().flex_1().min_h(px(0.)).child(active.editor.clone());
+        let surface = div()
+            .flex_1()
+            .min_h(px(0.))
+            .child(active.active().editor.clone());
 
         // --- bottom run bar: Run · history · hint · read-only · endpoint ---
         let ro_chip = active.config.read_only.then(|| {
@@ -212,8 +244,8 @@ impl AppState {
                     .child(active.config.display_target()),
             );
 
-        let history = active.history_open.then(|| {
-            let list: Vec<_> = active.history.clone();
+        let history = active.active().history_open.then(|| {
+            let list: Vec<_> = active.active().history.clone();
             let inner = if list.is_empty() {
                 div()
                     .px_2()
@@ -274,24 +306,12 @@ impl AppState {
             .children(history)
     }
 
-    /// Reset the editor to a fresh, empty query (the tab-strip "＋" action).
-    pub(crate) fn new_query(&mut self, cx: &mut Context<Self>) {
-        let editor = match &self.phase {
-            Phase::Connected(active) => active.editor.clone(),
-            _ => return,
-        };
-        editor.update(cx, |editor, cx| {
-            editor.set_content("-- Write SQL, ⌘↵ to run\n".to_string(), cx)
-        });
-        cx.notify();
-    }
-
     /// Run the selection if any, else the whole buffer. Pushes to history and
     /// streams the first window into the results pane.
     pub(crate) fn run_editor_query(&mut self, cx: &mut Context<Self>) {
         let sql = match &self.phase {
             Phase::Connected(active) => {
-                let editor = active.editor.read(cx);
+                let editor = active.active().editor.read(cx);
                 editor.selected_text().unwrap_or_else(|| editor.content())
             }
             _ => return,
@@ -302,12 +322,13 @@ impl AppState {
         }
 
         if let Phase::Connected(active) = &mut self.phase {
+            let tab = active.active_mut();
             // De-dupe consecutive identical runs at the head of the history.
-            if active.history.first() != Some(&sql) {
-                active.history.insert(0, sql.clone());
-                active.history.truncate(50);
+            if tab.history.first() != Some(&sql) {
+                tab.history.insert(0, sql.clone());
+                tab.history.truncate(50);
             }
-            active.history_open = false;
+            tab.history_open = false;
         }
 
         // Row-returning statements stream into the grid; writes execute in a
@@ -336,7 +357,8 @@ impl AppState {
 
     pub(crate) fn toggle_history(&mut self, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase {
-            active.history_open = !active.history_open;
+            let tab = active.active_mut();
+            tab.history_open = !tab.history_open;
         }
         cx.notify();
     }
@@ -344,8 +366,9 @@ impl AppState {
     pub(crate) fn load_history(&mut self, sql: String, cx: &mut Context<Self>) {
         let editor = match &mut self.phase {
             Phase::Connected(active) => {
-                active.history_open = false;
-                active.editor.clone()
+                let tab = active.active_mut();
+                tab.history_open = false;
+                tab.editor.clone()
             }
             _ => return,
         };
@@ -353,15 +376,21 @@ impl AppState {
         cx.notify();
     }
 
-    /// Rebuild the editor's completion candidates from the current schema. Called
-    /// when the skeleton or a table's detail arrives.
+    /// Rebuild every tab's editor completion candidates from the current schema.
+    /// Called when the skeleton or a table's detail arrives, or a tab is opened.
     pub(crate) fn refresh_completions(&mut self, cx: &mut Context<Self>) {
-        let (editor, candidates) = match &self.phase {
-            Phase::Connected(active) => (active.editor.clone(), build_candidates(&active.schema)),
+        let (editors, candidates) = match &self.phase {
+            Phase::Connected(active) => (
+                active.tabs.iter().map(|t| t.editor.clone()).collect::<Vec<_>>(),
+                build_candidates(&active.schema),
+            ),
             _ => return,
         };
-        editor.update(cx, |editor, cx| {
-            editor.set_completions(completion_provider(candidates), cx)
-        });
+        for editor in editors {
+            let candidates = candidates.clone();
+            editor.update(cx, |editor, cx| {
+                editor.set_completions(completion_provider(candidates), cx)
+            });
+        }
     }
 }

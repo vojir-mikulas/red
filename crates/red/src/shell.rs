@@ -194,7 +194,7 @@ impl AppState {
 
         // --- status bar: endpoint · db · read-only | rows · cols · UTF-8 · SQL ·
         // engine · theme — the design's information-dense bottom strip ---
-        let counts = active.result.as_ref().and_then(|g| g.status_counts());
+        let counts = active.active().result.as_ref().and_then(|g| g.status_counts());
 
         let status_left = div()
             .flex()

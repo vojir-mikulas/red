@@ -239,9 +239,9 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        // The tinted icon square uses the app accent (the engine is conveyed by the
-        // badge beside the name, not by the icon color).
-        let accent = theme.accent;
+        // The tinted icon square is colored with the connection's label color (the
+        // engine is conveyed by the badge beside the name, not by the icon color).
+        let accent = label_color(config.color, theme);
         let (badge_variant, badge_label) = match config.kind {
             DbKind::Sqlite => (BadgeVariant::Info, "SQLite"),
             DbKind::Postgres => (BadgeVariant::Special, "Postgres"),

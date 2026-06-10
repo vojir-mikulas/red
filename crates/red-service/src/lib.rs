@@ -14,6 +14,7 @@
 //! raced against incoming commands so a `Cancel` — or a `timeout` — can abort an
 //! in-flight query out-of-band rather than dropping a future.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -53,30 +54,39 @@ pub enum Command {
         schema: String,
         table: String,
     },
-    /// Open `sql` as the grid's result: count its rows and report column metadata
-    /// + the total. The result is then browsed page-by-page via `FetchPage`.
+    /// Open `sql` as a grid result: count its rows and report column metadata +
+    /// the total. The result is then browsed page-by-page via `FetchPage`.
     ///
-    /// `epoch` identifies this open result so stale pages from a previous one
-    /// (e.g. after switching tables) can be dropped.
+    /// `epoch` identifies this open result. Several results can be open at once
+    /// (one per query tab), each keyed by its epoch; a page or export names the
+    /// epoch it wants. `CloseResult` drops one when its tab closes.
     OpenResult {
         sql: String,
         epoch: u64,
     },
-    /// Fetch one random-access page of the open result (grid load-on-scroll).
-    /// `epoch` must match the current open result or the page is ignored.
+    /// Fetch one random-access page of an open result (grid load-on-scroll).
+    /// `epoch` selects which open result; an unknown epoch is ignored (the tab
+    /// closed or re-sorted).
     FetchPage {
         offset: usize,
         limit: usize,
+        epoch: u64,
+    },
+    /// Drop an open result (its query tab closed, or it was re-sorted into a new
+    /// epoch). Unknown epochs are a no-op.
+    CloseResult {
         epoch: u64,
     },
     /// Run a non-row-returning statement (write/DDL) in a transaction.
     Execute {
         sql: String,
     },
-    /// Stream the open result to `path` in `format`, row-by-row.
+    /// Stream an open result to `path` in `format`, row-by-row. `epoch` selects
+    /// which open result (the active tab's grid).
     Export {
         format: ExportFormat,
         path: PathBuf,
+        epoch: u64,
     },
     /// Abort the active query / drop its cursor.
     Cancel,
@@ -228,20 +238,19 @@ pub fn spawn() -> ServiceHandle {
 async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Event>) {
     let mut session: Option<Arc<dyn DatabaseDriver>> = None;
     let mut active: Option<ActiveQuery> = None;
-    // The SQL backing the grid's paged result, re-fetched per `FetchPage`.
-    let mut result_sql: Option<String> = None;
-    // The current open result's epoch. Page fetches run as detached tasks (so a
-    // slow `count`/deep page never stalls the dispatch loop); a fetch whose epoch
-    // no longer matches is stale — the grid has moved on — and is dropped. `0` is
-    // the "no live result" sentinel (UI epochs start at 1).
-    let mut result_epoch: u64 = 0;
+    // The SQL backing each open result, keyed by epoch and re-fetched per
+    // `FetchPage`. One entry per live query tab (plus a transient extra while a
+    // re-sort swaps a tab to a new epoch). Page fetches run as detached tasks (so
+    // a slow `count`/deep page never stalls the dispatch loop); a fetch for an
+    // epoch absent from the map is stale — the tab closed or moved on — and is
+    // dropped. UI epochs start at 1, so an empty map means "no live result".
+    let mut result_sql: HashMap<u64, String> = HashMap::new();
 
     while let Some(command) = commands.recv().await {
         match command {
             Command::Connect(config) => {
                 active = None; // a new connection abandons any in-flight cursor
-                result_sql = None;
-                result_epoch = 0;
+                result_sql.clear();
                 match connect(&config).await {
                     Ok(driver) => {
                         let version = driver.server_version();
@@ -268,8 +277,7 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
 
             Command::Disconnect => {
                 active = None;
-                result_sql = None;
-                result_epoch = 0;
+                result_sql.clear();
                 session = None;
                 emit(&events, Event::Disconnected);
             }
@@ -346,8 +354,7 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
                     emit(&events, Event::Error("not connected".into()));
                     continue;
                 };
-                result_sql = Some(sql.clone());
-                result_epoch = epoch;
+                result_sql.insert(epoch, sql.clone());
                 // Count + column metadata can be slow (a full `COUNT(*)` over a
                 // large table); run them off the dispatch loop so switching to
                 // another table stays instant.
@@ -376,18 +383,14 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
                 limit,
                 epoch,
             } => {
-                // The grid has moved on (table switched / re-sorted); skip the
-                // stale request rather than running an expensive query whose
-                // result would be discarded.
-                if epoch != result_epoch {
-                    continue;
-                }
                 let Some(driver) = session.clone() else {
                     emit(&events, Event::Error("not connected".into()));
                     continue;
                 };
-                let Some(sql) = result_sql.clone() else {
-                    emit(&events, Event::Error("no open result".into()));
+                // The tab closed or re-sorted (its epoch is gone); skip the stale
+                // request rather than running an expensive query whose result
+                // would be discarded.
+                let Some(sql) = result_sql.get(&epoch).cloned() else {
                     continue;
                 };
                 // Pages fetch concurrently (the driver pools connections) and off
@@ -409,6 +412,10 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
                 });
             }
 
+            Command::CloseResult { epoch } => {
+                result_sql.remove(&epoch);
+            }
+
             Command::Execute { sql } => {
                 let Some(driver) = session.clone() else {
                     emit(&events, Event::Error("not connected".into()));
@@ -425,12 +432,16 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
                 }
             }
 
-            Command::Export { format, path } => {
+            Command::Export {
+                format,
+                path,
+                epoch,
+            } => {
                 let Some(driver) = session.clone() else {
                     emit(&events, Event::Error("not connected".into()));
                     continue;
                 };
-                let Some(sql) = result_sql.clone() else {
+                let Some(sql) = result_sql.get(&epoch).cloned() else {
                     emit(&events, Event::Error("no open result to export".into()));
                     continue;
                 };
