@@ -205,7 +205,11 @@ impl AppState {
         });
         let run_bar = div()
             .flex_shrink_0()
-            .h(px(34.))
+            // No fixed height: the 24px buttons define the strip and the equal
+            // padding brackets them evenly. A fixed height taller than the
+            // buttons left slack that GPUI distributed unevenly, sinking the
+            // buttons off-center.
+            .py(px(5.))
             .flex()
             .items_center()
             .gap_2()
