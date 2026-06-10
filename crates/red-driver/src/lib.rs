@@ -76,6 +76,23 @@ pub trait DatabaseDriver: Send + Sync {
         limit: usize,
     ) -> Result<ResultPage>;
 
+    /// One keyset page from an inclusive lower bound with a bounded `skip`:
+    /// rows with `key >= from`, ordered by `key`, skipping `skip` then taking
+    /// `limit`. `from = None` starts at the result's first row. The lower bound
+    /// is an *indexed* seek, so the `OFFSET skip` only walks within the
+    /// post-seek window — O(skip), not O(offset-from-row-0). Backs exact "go to
+    /// row N" jumps and the checkpoint-index build, which both seek to a known
+    /// key and then step a bounded number of rows. `from` is bound as a real
+    /// parameter, never string-interpolated.
+    async fn fetch_seek_skip(
+        &self,
+        sql: &str,
+        key: &KeySpec,
+        from: Option<&Value>,
+        skip: usize,
+        limit: usize,
+    ) -> Result<ResultPage>;
+
     /// `MIN`/`MAX` of `key` over `sql`'s result — one indexed probe, backing
     /// key-space interpolation for fraction jumps. `None` when the result is
     /// empty or the key isn't an integer (not interpolable).

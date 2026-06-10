@@ -325,6 +325,41 @@ impl DatabaseDriver for MysqlDriver {
         })
     }
 
+    async fn fetch_seek_skip(
+        &self,
+        sql: &str,
+        key: &KeySpec,
+        from: Option<&Value>,
+        skip: usize,
+        limit: usize,
+    ) -> Result<ResultPage> {
+        let col = format!("`{}`", quote_ident(&key.column));
+        let base = strip_trailing(sql);
+        let sql = match from {
+            Some(_) => format!(
+                "SELECT * FROM ({base}) AS _red WHERE {col} >= ? \
+                 ORDER BY {col} ASC LIMIT {limit} OFFSET {skip}"
+            ),
+            None => format!(
+                "SELECT * FROM ({base}) AS _red ORDER BY {col} ASC LIMIT {limit} OFFSET {skip}"
+            ),
+        };
+        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let stmt = conn.prep(&sql).await.map_err(map_my_err)?;
+        let columns: Vec<Column> = stmt.columns().iter().map(col_meta).collect();
+        let rows: Vec<Row> = match from {
+            Some(value) => conn
+                .exec(&stmt, (to_my(value),))
+                .await
+                .map_err(map_my_err)?,
+            None => conn.exec(&stmt, ()).await.map_err(map_my_err)?,
+        };
+        Ok(ResultPage {
+            columns,
+            rows: rows.iter().map(my_row).collect(),
+        })
+    }
+
     async fn key_bounds(&self, sql: &str, key: &KeySpec) -> Result<Option<(i64, i64)>> {
         let col = format!("`{}`", quote_ident(&key.column));
         let sql = format!(

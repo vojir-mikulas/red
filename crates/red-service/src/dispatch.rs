@@ -30,15 +30,53 @@ const MAX_CONCURRENT_PAGE_FETCHES: usize = 6;
 /// on top of this, but those only work if the loop isn't wedged awaiting a dial.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Rows between checkpoints in the index (see [`CheckpointIndex`]). Serving an
+/// exact jump seeks to the nearest checkpoint then skips at most this many rows,
+/// so it stays O(stride) regardless of depth.
+const CHECKPOINT_STRIDE: usize = 10_000;
+
+/// An exact "go to row N" deeper than this kicks off a checkpoint-index build.
+/// Shallower jumps are served by a plain `OFFSET` (already fast), so tables
+/// nobody jumps deep into are never scanned.
+const BUILD_TRIGGER_DEPTH: usize = 100_000;
+
+/// A sparse `ordinal → key` index over an open keyset result: one entry every
+/// [`CHECKPOINT_STRIDE`] rows, built by a single background ordered traversal.
+/// Lets an exact jump to row N seek to the nearest checkpoint and skip `< stride`
+/// rows — O(stride), not O(N). Shared via `Arc<Mutex<…>>` so the build task fills
+/// it incrementally while fetches read it.
+#[derive(Debug, Default)]
+struct CheckpointIndex {
+    /// `(ordinal, key)` pairs, ascending by ordinal. `points[0]` is `(0, first_key)`.
+    points: Vec<(usize, Value)>,
+    status: BuildStatus,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+enum BuildStatus {
+    /// Not yet built (or invalidated by a write) — eligible to start.
+    #[default]
+    Idle,
+    /// A background build is in flight; don't start another.
+    Building,
+    /// Fully built to the end of the result.
+    Done,
+}
+
 /// What the backend remembers about one open result: the SQL it re-fetches per
-/// page/run, the resolved seek key, and — for interpolated jumps — the key's
-/// min/max and the result's total.
+/// page/run, the resolved seek key (+ its column index, for the checkpoint
+/// build), the key's min/max and total (for interpolated jumps), and the
+/// checkpoint index for exact jumps.
 #[derive(Debug, Clone)]
 struct OpenSpec {
     sql: String,
     key: Option<KeySpec>,
+    /// Position of the key column within a result row — the checkpoint build
+    /// reads each checkpoint's key out of the row at that index.
+    key_col: Option<usize>,
     bounds: Option<(i64, i64)>,
     total: Option<usize>,
+    checkpoints: Arc<Mutex<CheckpointIndex>>,
 }
 
 /// The open-result map, shared with the spawned open/fetch tasks (they fill in
@@ -191,8 +229,10 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                     OpenSpec {
                         sql: sql.clone(),
                         key: None,
+                        key_col: None,
                         bounds: None,
                         total: None,
+                        checkpoints: Arc::new(Mutex::new(CheckpointIndex::default())),
                     },
                 );
                 // Count + column metadata can be slow (a full `COUNT(*)` over a
@@ -243,8 +283,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                         (Ok(total), Ok(page)) => {
                             let total = total.max(0) as usize;
                             // Fill the spec in only if the result is still open.
+                            // `key_col` locates the key within a row so the
+                            // checkpoint build can read each checkpoint's key.
+                            let key_col = key
+                                .as_ref()
+                                .and_then(|k| page.columns.iter().position(|c| c.name == k.column));
                             if let Some(spec) = lock(&results).get_mut(&epoch) {
                                 spec.key = key.clone();
+                                spec.key_col = key_col;
                                 spec.bounds = bounds;
                                 spec.total = Some(total);
                             }
@@ -317,6 +363,22 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 let Some(key) = spec.key.clone() else {
                     continue; // a keyless result never gets `FetchRun`s
                 };
+                // A deep exact jump kicks off the checkpoint index (once) so the
+                // *next* deep jump is O(stride). This one still serves via OFFSET.
+                if let RunFetch::Jump {
+                    ordinal,
+                    exact: true,
+                } = &fetch
+                {
+                    if claim_build(&spec, *ordinal) {
+                        tokio::spawn(build_checkpoints(
+                            driver.clone(),
+                            spec.clone(),
+                            results.clone(),
+                            epoch,
+                        ));
+                    }
+                }
                 let events = events.clone();
                 let limit_src = page_fetch_limit.clone();
                 tokio::spawn(async move {
@@ -351,12 +413,22 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                     continue;
                 };
                 match driver.execute(&sql).await {
-                    Ok(affected) => emit(
-                        &events,
-                        Event::Executed {
-                            affected: affected as usize,
-                        },
-                    ),
+                    Ok(affected) => {
+                        // A write may have shifted rows under any open result, so
+                        // drop the checkpoint indexes — they rebuild lazily on the
+                        // next deep jump rather than serving from stale keys.
+                        for spec in lock(&results).values() {
+                            let mut idx = lock(&spec.checkpoints);
+                            idx.points.clear();
+                            idx.status = BuildStatus::Idle;
+                        }
+                        emit(
+                            &events,
+                            Event::Executed {
+                                affected: affected as usize,
+                            },
+                        );
+                    }
                     Err(e) => emit(&events, Event::Error(e.to_string())),
                 }
             }
@@ -530,12 +602,107 @@ async fn run_fetch(
                     }
                 }
             }
-            // Non-interpolable key (or unknown bounds): one `OFFSET` page —
-            // O(ordinal), but a one-off; ordinals stay exact.
+            // Exact jump: serve from the checkpoint index when it reaches this
+            // depth — seek to the nearest checkpoint, then skip `< stride` rows
+            // (O(stride), exact). The build is kicked off by the `FetchRun` arm.
+            if *exact {
+                if let Some((cp_ordinal, cp_key)) = nearest_checkpoint(spec, *ordinal) {
+                    let skip = *ordinal - cp_ordinal;
+                    if skip <= CHECKPOINT_STRIDE {
+                        let page = driver
+                            .fetch_seek_skip(&spec.sql, key, Some(&cp_key), skip, limit)
+                            .await?;
+                        return Ok((page.rows, false));
+                    }
+                }
+            }
+            // No usable key/bounds/index: one `OFFSET` page — O(ordinal), but a
+            // one-off; ordinals stay exact.
             let page = driver.fetch_page(&spec.sql, *ordinal, limit).await?;
             Ok((page.rows, false))
         }
     }
+}
+
+/// Claim the right to build `spec`'s checkpoint index: true only for a keyset
+/// result, a jump deep enough to be worth it, and an index not already built or
+/// building. Flips the status to `Building` under the lock so two concurrent deep
+/// jumps can't both spawn a build.
+fn claim_build(spec: &OpenSpec, ordinal: usize) -> bool {
+    if spec.key.is_none() || spec.key_col.is_none() || ordinal <= BUILD_TRIGGER_DEPTH {
+        return false;
+    }
+    let mut idx = lock(&spec.checkpoints);
+    if idx.status == BuildStatus::Idle {
+        idx.status = BuildStatus::Building;
+        true
+    } else {
+        false
+    }
+}
+
+/// The greatest checkpoint `(ordinal, key)` at or before `target`, if the index
+/// has reached that far. Points are ascending, so the last one `<= target` wins.
+fn nearest_checkpoint(spec: &OpenSpec, target: usize) -> Option<(usize, Value)> {
+    let idx = lock(&spec.checkpoints);
+    idx.points.iter().rev().find(|(o, _)| *o <= target).cloned()
+}
+
+/// Build `spec`'s checkpoint index: walk the result in `CHECKPOINT_STRIDE`-sized
+/// strides via an indexed seek + bounded skip, recording one `(ordinal, key)` per
+/// stride. One row transfers per checkpoint (just its key), so it's a background
+/// O(total)-server-work scan with flat memory. Bails if the result closes.
+async fn build_checkpoints(
+    driver: Arc<dyn DatabaseDriver>,
+    spec: OpenSpec,
+    results: ResultMap,
+    epoch: u64,
+) {
+    let (Some(key), Some(key_col)) = (spec.key.clone(), spec.key_col) else {
+        lock(&spec.checkpoints).status = BuildStatus::Idle;
+        return;
+    };
+    let total = spec.total.unwrap_or(0);
+
+    // First checkpoint: ordinal 0, seeking from the result's start. Each later
+    // step seeks from the previous checkpoint key (inclusive) and skips a stride.
+    let mut ordinal = 0usize;
+    let mut from: Option<Value> = None;
+    let mut skip = 0usize;
+
+    loop {
+        // The tab closed or re-sorted — abandon the scan.
+        if !lock(&results).contains_key(&epoch) {
+            return;
+        }
+        let page = match driver
+            .fetch_seek_skip(&spec.sql, &key, from.as_ref(), skip, 1)
+            .await
+        {
+            Ok(page) => page,
+            Err(e) => {
+                tracing::warn!(%epoch, "checkpoint build failed: {e}");
+                lock(&spec.checkpoints).status = BuildStatus::Idle; // allow a later retry
+                return;
+            }
+        };
+        let Some(cp_key) = page.rows.first().and_then(|row| row.get(key_col).cloned()) else {
+            break; // walked past the last row
+        };
+        lock(&spec.checkpoints)
+            .points
+            .push((ordinal, cp_key.clone()));
+
+        from = Some(cp_key);
+        skip = CHECKPOINT_STRIDE;
+        ordinal += CHECKPOINT_STRIDE;
+        if total > 0 && ordinal >= total {
+            break;
+        }
+        // Yield so a burst of interactive fetches isn't starved by the scan.
+        tokio::task::yield_now().await;
+    }
+    lock(&spec.checkpoints).status = BuildStatus::Done;
 }
 
 /// A timeout future that never fires when no timeout is set, so the `select!`
@@ -588,4 +755,105 @@ async fn connect(config: &ConnectionConfig) -> Result<Arc<dyn DatabaseDriver>, S
 /// expected shutdown path, not an error.
 fn emit(events: &UnboundedSender<Event>, event: Event) {
     let _ = events.unbounded_send(event);
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    use red_core::KeyKind;
+    use red_driver::SqliteDriver;
+
+    /// Build an `id 1..=n` table in a fresh temp DB and return a driver over it.
+    fn driver_with(n: i64, tag: &str) -> (std::path::PathBuf, Arc<dyn DatabaseDriver>) {
+        let path = std::env::temp_dir().join(format!("red_ckpt_{tag}_{}.db", std::process::id()));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE t(x INTEGER PRIMARY KEY NOT NULL);
+             WITH RECURSIVE c(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM c WHERE v < {n})
+             INSERT INTO t SELECT v FROM c;"
+        ))
+        .unwrap();
+        let driver: Arc<dyn DatabaseDriver> = Arc::new(SqliteDriver::new(path.clone(), true));
+        (path, driver)
+    }
+
+    fn spec_for(checkpoints: &Arc<Mutex<CheckpointIndex>>, total: usize) -> OpenSpec {
+        OpenSpec {
+            sql: "SELECT * FROM t".into(),
+            key: Some(KeySpec {
+                column: "x".into(),
+                kind: KeyKind::Int,
+            }),
+            key_col: Some(0),
+            bounds: None,
+            total: Some(total),
+            checkpoints: checkpoints.clone(),
+        }
+    }
+
+    /// The build walks the result in `CHECKPOINT_STRIDE` strides, recording the
+    /// key at each — and an exact jump is then served from the nearest one.
+    #[tokio::test]
+    async fn builds_index_and_serves_exact_jump() {
+        let (path, driver) = driver_with(25_000, "build");
+        let checkpoints = Arc::new(Mutex::new(CheckpointIndex::default()));
+        let spec = spec_for(&checkpoints, 25_000);
+
+        // The build aborts unless the result is still open, so register it.
+        let results: ResultMap = Arc::new(Mutex::new(HashMap::new()));
+        lock(&results).insert(1, spec.clone());
+
+        build_checkpoints(driver.clone(), spec.clone(), results, 1).await;
+
+        // Checkpoints every 10k rows: ids are 1-based, so ordinal N → id N+1.
+        // Scoped so the guard is dropped before the `await` below.
+        {
+            let idx = lock(&checkpoints);
+            assert_eq!(idx.status, BuildStatus::Done);
+            assert_eq!(
+                idx.points,
+                vec![
+                    (0, Value::Integer(1)),
+                    (10_000, Value::Integer(10_001)),
+                    (20_000, Value::Integer(20_001)),
+                ]
+            );
+        }
+
+        // The nearest checkpoint at/under a target, and a bounded-skip serve.
+        assert_eq!(
+            nearest_checkpoint(&spec, 20_500),
+            Some((20_000, Value::Integer(20_001)))
+        );
+        let (rows, estimated) = run_fetch(
+            &*driver,
+            &spec,
+            spec.key.as_ref().unwrap(),
+            &RunFetch::Jump {
+                ordinal: 20_500,
+                exact: true,
+            },
+            5,
+        )
+        .await
+        .unwrap();
+        assert!(!estimated, "an exact jump reports exact ordinals");
+        assert_eq!(rows[0][0], Value::Integer(20_501));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `claim_build` only fires for a deep jump on a keyed result, and only once.
+    #[tokio::test]
+    async fn claim_build_is_deep_and_one_shot() {
+        let checkpoints = Arc::new(Mutex::new(CheckpointIndex::default()));
+        let spec = spec_for(&checkpoints, 1_000_000);
+
+        // Shallow jumps don't trigger a build (OFFSET is already fast there).
+        assert!(!claim_build(&spec, 50));
+        // A deep jump claims it once; a second claim is refused (build in flight).
+        assert!(claim_build(&spec, 500_000));
+        assert!(!claim_build(&spec, 600_000));
+        assert_eq!(lock(&checkpoints).status, BuildStatus::Building);
+    }
 }

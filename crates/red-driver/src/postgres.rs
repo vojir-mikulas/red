@@ -335,6 +335,42 @@ impl DatabaseDriver for PostgresDriver {
         })
     }
 
+    async fn fetch_seek_skip(
+        &self,
+        sql: &str,
+        key: &KeySpec,
+        from: Option<&Value>,
+        skip: usize,
+        limit: usize,
+    ) -> Result<ResultPage> {
+        let col = pg_quote(&key.column);
+        let base = strip_trailing(sql);
+        let sql = match from {
+            Some(value) => format!(
+                "SELECT * FROM ({base}) AS _red WHERE {col} >= $1{cast} \
+                 ORDER BY {col} ASC LIMIT {limit} OFFSET {skip}",
+                cast = pg_cast(value)
+            ),
+            None => format!(
+                "SELECT * FROM ({base}) AS _red ORDER BY {col} ASC LIMIT {limit} OFFSET {skip}"
+            ),
+        };
+        let (stmt, columns) = self.prepare_columns(&sql).await?;
+        let rows = match from {
+            Some(Value::Integer(n)) => self.client.query(&stmt, &[n]).await,
+            Some(Value::Real(x)) => self.client.query(&stmt, &[x]).await,
+            Some(Value::Text(s)) => self.client.query(&stmt, &[s]).await,
+            Some(Value::Blob(b)) => self.client.query(&stmt, &[b]).await,
+            Some(Value::Null) => return Err(RedError::Query("null seek bound".into())),
+            None => self.client.query(&stmt, &[]).await,
+        }
+        .map_err(map_pg_err)?;
+        Ok(ResultPage {
+            columns,
+            rows: rows.iter().map(pg_row).collect(),
+        })
+    }
+
     async fn key_bounds(&self, sql: &str, key: &KeySpec) -> Result<Option<(i64, i64)>> {
         let col = pg_quote(&key.column);
         let sql = format!(

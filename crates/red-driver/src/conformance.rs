@@ -197,6 +197,26 @@ pub(crate) async fn seeks_forward_backward_and_reads_bounds(
         vec![Value::Integer(3), Value::Integer(2), Value::Integer(1)]
     );
 
+    // Seek + bounded skip (the exact-jump / checkpoint primitive): an inclusive
+    // `>=` lower bound, then OFFSET within the post-seek window.
+    let from_start = driver.fetch_seek_skip(sql, key, None, 10, 3).await.unwrap();
+    assert_eq!(
+        ids(&from_start, 0),
+        vec![Value::Integer(11), Value::Integer(12), Value::Integer(13)]
+    );
+    // `>=` includes the bound itself (skip 0 lands on it).
+    let inclusive = driver
+        .fetch_seek_skip(sql, key, Some(&Value::Integer(500)), 0, 1)
+        .await
+        .unwrap();
+    assert_eq!(ids(&inclusive, 0), vec![Value::Integer(500)]);
+    // The bound is ordinal 0 of the window; skipping 10 lands on id 510.
+    let skipped = driver
+        .fetch_seek_skip(sql, key, Some(&Value::Integer(500)), 10, 1)
+        .await
+        .unwrap();
+    assert_eq!(ids(&skipped, 0), vec![Value::Integer(510)]);
+
     assert_eq!(driver.key_bounds(sql, key).await.unwrap(), Some((1, 1000)));
 }
 

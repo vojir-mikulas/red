@@ -176,6 +176,33 @@ impl DatabaseDriver for SqliteDriver {
             .map_err(driver_err)?
     }
 
+    async fn fetch_seek_skip(
+        &self,
+        sql: &str,
+        key: &KeySpec,
+        from: Option<&Value>,
+        skip: usize,
+        limit: usize,
+    ) -> Result<ResultPage> {
+        let path = self.path.clone();
+        let read_only = self.read_only;
+        let col = quote_ident(&key.column);
+        let base = strip_trailing(sql);
+        // `skip`/`limit` are `usize`, so inlining them can't inject.
+        let sql = match from {
+            Some(_) => format!(
+                "SELECT * FROM ({base}) WHERE {col} >= ? ORDER BY {col} ASC LIMIT {limit} OFFSET {skip}"
+            ),
+            None => {
+                format!("SELECT * FROM ({base}) ORDER BY {col} ASC LIMIT {limit} OFFSET {skip}")
+            }
+        };
+        let params: Vec<rusqlite::types::Value> = from.into_iter().map(to_sqlite).collect();
+        tokio::task::spawn_blocking(move || fetch_page_blocking(&path, read_only, &sql, params))
+            .await
+            .map_err(driver_err)?
+    }
+
     async fn key_bounds(&self, sql: &str, key: &KeySpec) -> Result<Option<(i64, i64)>> {
         let path = self.path.clone();
         let read_only = self.read_only;
