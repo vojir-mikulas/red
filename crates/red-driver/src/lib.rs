@@ -17,6 +17,8 @@ use red_core::{
     SchemaMeta, TableDetail, Value,
 };
 
+#[cfg(test)]
+mod conformance;
 mod format;
 mod mysql;
 mod postgres;

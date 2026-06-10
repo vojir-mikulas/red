@@ -710,6 +710,8 @@ impl QueryCursor for SqliteCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conformance as battery;
+    use red_core::KeyKind;
 
     /// Generate `n` rows (1..=n) without needing a fixture table; SQLite streams
     /// the recursive CTE incrementally, which is exactly what we want to test.
@@ -719,50 +721,6 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn streams_in_bounded_windows() {
-        let driver = SqliteDriver::new(":memory:", true);
-        let cursor = driver
-            .open_cursor(&counting_sql(100_000), QueryOptions::default())
-            .await
-            .unwrap();
-        assert_eq!(cursor.columns().len(), 1);
-        assert_eq!(cursor.columns()[0].name, "x");
-
-        let mut total = 0usize;
-        loop {
-            let window = cursor.next_window(1000).await.unwrap();
-            assert!(window.rows.len() <= 1000, "windows stay bounded");
-            total += window.rows.len();
-            if window.exhausted {
-                break;
-            }
-        }
-        assert_eq!(total, 100_000);
-    }
-
-    #[tokio::test]
-    async fn cancel_aborts_in_flight_fetch() {
-        let driver = SqliteDriver::new(":memory:", true);
-        // Huge bound so the first step runs long enough to interrupt.
-        let cursor = driver
-            .open_cursor(&counting_sql(1_000_000_000), QueryOptions::default())
-            .await
-            .unwrap();
-        let cancel = cursor.cancel_token();
-
-        let fetch = tokio::spawn(async move { cursor.next_window(1_000_000_000).await });
-        // `sqlite3_interrupt` is a no-op if no step is running yet, so let the
-        // first step get well underway before interrupting out-of-band.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        cancel.cancel();
-
-        match fetch.await.unwrap() {
-            Err(RedError::Interrupted) => {}
-            other => panic!("expected Interrupted, got {other:?}"),
-        }
-    }
-
     /// A unique temp-file path so introspection runs against a real on-disk DB —
     /// `:memory:` can't be used because each `open` would see a fresh empty DB.
     fn temp_db_path(tag: &str) -> PathBuf {
@@ -770,6 +728,26 @@ mod tests {
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("red_{tag}_{}_{n}.db", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn streams_in_bounded_windows() {
+        let driver = SqliteDriver::new(":memory:", true);
+        battery::streams_in_bounded_windows(&driver, &counting_sql(100_000), 100_000).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_aborts_in_flight_fetch() {
+        let driver = SqliteDriver::new(":memory:", true);
+        // `sqlite3_interrupt` is a no-op if no step is running yet, so the battery
+        // lets the first step get under way before interrupting; the huge bound
+        // keeps it busy until then.
+        battery::cancel_aborts_in_flight_fetch(
+            &driver,
+            &counting_sql(1_000_000_000),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -791,39 +769,21 @@ mod tests {
         }
         let driver = SqliteDriver::new(&path, true);
 
-        let schemas = driver.list_objects().await.unwrap();
-        let main = schemas.iter().find(|s| s.name == "main").unwrap();
-        let objects: Vec<_> = main
-            .objects
-            .iter()
-            .map(|o| (o.name.as_str(), o.kind))
-            .collect();
-        assert!(objects.contains(&("authors", ObjectKind::Table)));
-        assert!(objects.contains(&("books", ObjectKind::Table)));
-        assert!(objects.contains(&("recent_books", ObjectKind::View)));
+        battery::introspects_tables_columns_fks_and_indexes(
+            &driver,
+            "main",
+            "authors",
+            "books",
+            "recent_books",
+        )
+        .await;
 
+        // SQLite-specific extras the shared battery doesn't assert: the column
+        // default and the declared type round-trip through introspection.
         let books = driver.describe_table("main", "books").await.unwrap();
         let col = |n: &str| books.columns.iter().find(|c| c.name == n).unwrap();
-        assert!(col("id").primary_key);
-        assert!(col("title").not_null);
         assert_eq!(col("title").default.as_deref(), Some("'untitled'"));
         assert_eq!(col("author_id").type_name.as_deref(), Some("INTEGER"));
-
-        assert_eq!(books.foreign_keys.len(), 1);
-        let fk = &books.foreign_keys[0];
-        assert_eq!(
-            (
-                fk.column.as_str(),
-                fk.ref_table.as_str(),
-                fk.ref_column.as_str()
-            ),
-            ("author_id", "authors", "id")
-        );
-
-        assert!(books
-            .indexes
-            .iter()
-            .any(|i| i.columns == vec!["author_id".to_string()]));
 
         std::fs::remove_file(&path).ok();
     }
@@ -842,38 +802,15 @@ mod tests {
             .execute("INSERT INTO t VALUES (1, 'a,b'), (2, NULL)")
             .await
             .unwrap();
-        assert_eq!(affected, 2);
+        assert_eq!(affected, 2, "execute reports rows affected");
 
-        let csv_path = temp_db_path("exp-csv").with_extension("csv");
-        let rows = driver
-            .export("SELECT * FROM t ORDER BY id", &csv_path, ExportFormat::Csv)
-            .await
-            .unwrap();
-        assert_eq!(rows, 2);
-        let csv = std::fs::read_to_string(&csv_path).unwrap();
-        assert!(csv.starts_with("id,name\n"));
-        assert!(csv.contains("\"a,b\""), "comma field is quoted: {csv}");
+        battery::exports_csv_and_json(&driver, "SELECT * FROM t ORDER BY id", "sqlite_exec").await;
 
-        let json_path = temp_db_path("exp-json").with_extension("json");
-        driver
-            .export(
-                "SELECT * FROM t ORDER BY id",
-                &json_path,
-                ExportFormat::Json,
-            )
-            .await
-            .unwrap();
-        let json = std::fs::read_to_string(&json_path).unwrap();
-        assert!(json.contains("\"name\":null"), "NULL → json null: {json}");
-
-        for p in [path, csv_path, json_path] {
-            std::fs::remove_file(p).ok();
-        }
+        std::fs::remove_file(&path).ok();
     }
 
     #[tokio::test]
     async fn seeks_forward_backward_and_reads_bounds() {
-        use red_core::KeyKind;
         let path = temp_db_path("seek");
         {
             let conn = Connection::open(&path).unwrap();
@@ -891,38 +828,9 @@ mod tests {
         };
         let sql = "SELECT * FROM t";
 
-        // First page: no bound, ascending from the start.
-        let first = driver.fetch_seek(sql, &key, None, false, 5).await.unwrap();
-        assert_eq!(first.rows.len(), 5);
-        assert_eq!(first.rows[0][0], Value::Integer(1));
+        battery::seeks_forward_backward_and_reads_bounds(&driver, sql, &key).await;
 
-        // Forward: strictly after a bound.
-        let fwd = driver
-            .fetch_seek(sql, &key, Some(&Value::Integer(997)), false, 5)
-            .await
-            .unwrap();
-        assert_eq!(
-            fwd.rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
-            vec![
-                Value::Integer(998),
-                Value::Integer(999),
-                Value::Integer(1000)
-            ]
-        );
-
-        // Backward: strictly before a bound, returned descending.
-        let back = driver
-            .fetch_seek(sql, &key, Some(&Value::Integer(4)), true, 5)
-            .await
-            .unwrap();
-        assert_eq!(
-            back.rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
-            vec![Value::Integer(3), Value::Integer(2), Value::Integer(1)]
-        );
-
-        assert_eq!(driver.key_bounds(sql, &key).await.unwrap(), Some((1, 1000)));
-
-        // A non-integer key has no interpolable bounds.
+        // SQLite-specific extra: a non-integer key has no interpolable bounds.
         let text_key = KeySpec {
             column: "name".into(),
             kind: KeyKind::Other,
@@ -935,15 +843,6 @@ mod tests {
     #[tokio::test]
     async fn read_only_rejects_writes() {
         let driver = SqliteDriver::new(":memory:", true);
-        // The write is rejected when the statement steps, which (for a cheap
-        // `open_cursor`) is the first `next_window` — accept rejection at either.
-        let outcome = match driver
-            .open_cursor("CREATE TABLE t(x)", QueryOptions::default())
-            .await
-        {
-            Err(_) => return,
-            Ok(cursor) => cursor.next_window(1).await,
-        };
-        assert!(outcome.is_err(), "read-only connection must reject DDL/DML");
+        battery::read_only_rejects_write(&driver, "CREATE TABLE t(x)").await;
     }
 }

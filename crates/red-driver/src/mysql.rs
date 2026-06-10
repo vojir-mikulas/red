@@ -617,6 +617,7 @@ fn map_my_err(e: MyError) -> RedError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conformance as battery;
 
     fn test_url() -> Option<String> {
         std::env::var("RED_TEST_MYSQL_URL").ok()
@@ -656,22 +657,7 @@ mod tests {
         // source without needing to seed a fixture; LIMIT pins the exact count.
         let sql = "SELECT a.ORDINAL_POSITION FROM information_schema.columns a \
                    CROSS JOIN information_schema.columns b LIMIT 100000";
-        let cursor = driver
-            .open_cursor(sql, QueryOptions::default())
-            .await
-            .unwrap();
-        assert_eq!(cursor.columns().len(), 1);
-
-        let mut total = 0usize;
-        loop {
-            let window = cursor.next_window(1000).await.unwrap();
-            assert!(window.rows.len() <= 1000, "windows stay bounded");
-            total += window.rows.len();
-            if window.exhausted {
-                break;
-            }
-        }
-        assert_eq!(total, 100_000);
+        battery::streams_in_bounded_windows(&driver, sql, 100_000).await;
     }
 
     #[tokio::test]
@@ -683,20 +669,8 @@ mod tests {
         let sql = "SELECT a.ORDINAL_POSITION FROM information_schema.columns a \
                    CROSS JOIN information_schema.columns b \
                    CROSS JOIN information_schema.columns c";
-        let cursor = driver
-            .open_cursor(sql, QueryOptions::default())
-            .await
-            .unwrap();
-        let cancel = cursor.cancel_token();
-
-        let fetch = tokio::spawn(async move { cursor.next_window(100_000_000).await });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        cancel.cancel();
-
-        match fetch.await.unwrap() {
-            Err(RedError::Interrupted) => {}
-            other => panic!("expected Interrupted, got {other:?}"),
-        }
+        battery::cancel_aborts_in_flight_fetch(&driver, sql, std::time::Duration::from_millis(200))
+            .await;
     }
 
     #[tokio::test]
@@ -732,34 +706,10 @@ mod tests {
             .unwrap();
 
         let schema = current_schema(&driver).await;
-        let schemas = driver.list_objects().await.unwrap();
-        let objects: Vec<(String, ObjectKind)> = schemas
-            .iter()
-            .find(|s| s.name == schema)
-            .unwrap()
-            .objects
-            .iter()
-            .map(|o| (o.name.clone(), o.kind))
-            .collect();
-        assert!(objects.contains(&(authors.clone(), ObjectKind::Table)));
-        assert!(objects.contains(&(books.clone(), ObjectKind::Table)));
-        assert!(objects.contains(&(recent.clone(), ObjectKind::View)));
-
-        let detail = driver.describe_table(&schema, &books).await.unwrap();
-        let col = |n: &str| detail.columns.iter().find(|c| c.name == n).unwrap();
-        assert!(col("id").primary_key);
-        assert!(col("title").not_null);
-
-        assert_eq!(detail.foreign_keys.len(), 1);
-        let fk = &detail.foreign_keys[0];
-        assert_eq!(fk.column, "author_id");
-        assert_eq!(fk.ref_table, authors);
-        assert_eq!(fk.ref_column, "id");
-
-        assert!(detail
-            .indexes
-            .iter()
-            .any(|i| i.columns == vec!["author_id".to_string()]));
+        battery::introspects_tables_columns_fks_and_indexes(
+            &driver, &schema, &authors, &books, &recent,
+        )
+        .await;
 
         for obj in [
             format!("VIEW `{recent}`"),
@@ -784,36 +734,11 @@ mod tests {
             .execute(&format!("INSERT INTO `{t}` VALUES (1, 'a,b'), (2, NULL)"))
             .await
             .unwrap();
-        assert_eq!(affected, 2);
+        assert_eq!(affected, 2, "execute reports rows affected");
 
-        let csv_path = std::env::temp_dir().join(format!("{t}.csv"));
-        let rows = driver
-            .export(
-                &format!("SELECT * FROM `{t}` ORDER BY id"),
-                &csv_path,
-                ExportFormat::Csv,
-            )
-            .await
-            .unwrap();
-        assert_eq!(rows, 2);
-        let csv = std::fs::read_to_string(&csv_path).unwrap();
-        assert!(csv.starts_with("id,name\n"));
-        assert!(csv.contains("\"a,b\""), "comma field is quoted: {csv}");
+        battery::exports_csv_and_json(&driver, &format!("SELECT * FROM `{t}` ORDER BY id"), &t)
+            .await;
 
-        let json_path = std::env::temp_dir().join(format!("{t}.json"));
-        driver
-            .export(
-                &format!("SELECT * FROM `{t}` ORDER BY id"),
-                &json_path,
-                ExportFormat::Json,
-            )
-            .await
-            .unwrap();
-        let json = std::fs::read_to_string(&json_path).unwrap();
-        assert!(json.contains("\"name\":null"), "NULL → json null: {json}");
-
-        std::fs::remove_file(&csv_path).ok();
-        std::fs::remove_file(&json_path).ok();
         driver.execute(&format!("DROP TABLE `{t}`")).await.unwrap();
     }
 
@@ -821,13 +746,7 @@ mod tests {
     async fn read_only_rejects_writes() {
         let url = url_or_skip!();
         let driver = MysqlDriver::connect(&url, true).await.unwrap();
-        let outcome = driver
-            .execute("CREATE TABLE red_ro_should_fail (x INT)")
-            .await;
-        assert!(
-            outcome.is_err(),
-            "read-only connection must reject DDL/DML at the engine"
-        );
+        battery::read_only_rejects_write(&driver, "CREATE TABLE red_ro_should_fail (x INT)").await;
     }
 
     /// The connection's current database — fixtures live here, so introspection

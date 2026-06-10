@@ -569,3 +569,189 @@ fn parse_index_columns(def: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .collect()
 }
+
+// Tests run against a live PostgreSQL provided via `RED_TEST_POSTGRES_URL`, so CI
+// without a server skips cleanly. Spin one up with:
+//
+//   docker run --rm -d -p 5432:5432 -e POSTGRES_PASSWORD=red \
+//     -e POSTGRES_DB=red_test --name red-pg postgres:16
+//   export RED_TEST_POSTGRES_URL='host=127.0.0.1 user=postgres password=red dbname=red_test'
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conformance as battery;
+    use red_core::KeyKind;
+
+    fn test_url() -> Option<String> {
+        std::env::var("RED_TEST_POSTGRES_URL").ok()
+    }
+
+    /// A unique fixture-name suffix so concurrent tests don't collide on a shared
+    /// server. Postgres lowercases unquoted identifiers, so keep it lowercase.
+    fn tag(name: &str) -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        format!("red_{name}_{}_{n}", std::process::id())
+    }
+
+    macro_rules! url_or_skip {
+        () => {
+            match test_url() {
+                Some(u) => u,
+                None => return,
+            }
+        };
+    }
+
+    /// The connection's current schema — unqualified fixtures land here, so
+    /// introspection filters to it. Read through the public API rather than the
+    /// private client.
+    async fn current_schema(driver: &PostgresDriver) -> String {
+        let page = driver
+            .fetch_page("SELECT current_schema()", 0, 1)
+            .await
+            .unwrap();
+        match &page.rows[0][0] {
+            Value::Text(s) => s.clone(),
+            other => panic!("current_schema() returned {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_reports_version() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, true).await.unwrap();
+        assert!(!driver.server_version().is_empty());
+        driver.ping().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streams_in_bounded_windows() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, true).await.unwrap();
+        // `generate_series` is a server-side streaming row source — no fixture, and
+        // it never materializes server-side, mirroring the windowed read.
+        battery::streams_in_bounded_windows(&driver, "SELECT generate_series(1, 100000)", 100_000)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn cancel_aborts_in_flight_fetch() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, true).await.unwrap();
+        // A large cross join keeps the server streaming long enough to cancel
+        // out-of-band; Postgres maps the cancel to `QUERY_CANCELED` → Interrupted.
+        let sql = "SELECT a FROM generate_series(1, 100000) a \
+                   CROSS JOIN generate_series(1, 100000) b";
+        battery::cancel_aborts_in_flight_fetch(&driver, sql, std::time::Duration::from_millis(200))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn introspects_tables_columns_fks_and_indexes() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, false).await.unwrap();
+        let authors = tag("authors");
+        let books = tag("books");
+        let recent = tag("recent");
+        let idx = tag("idx");
+        let schema = current_schema(&driver).await;
+
+        // Postgres `execute` runs a single statement, so issue the DDL one at a time.
+        driver
+            .execute(&format!(
+                "CREATE TABLE {authors} (id INT PRIMARY KEY, name TEXT NOT NULL)"
+            ))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!(
+                "CREATE TABLE {books} (\
+                   id INT PRIMARY KEY, \
+                   title TEXT NOT NULL DEFAULT 'untitled', \
+                   author_id INT REFERENCES {authors}(id))"
+            ))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!("CREATE INDEX {idx} ON {books}(author_id)"))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!("CREATE VIEW {recent} AS SELECT * FROM {books}"))
+            .await
+            .unwrap();
+
+        battery::introspects_tables_columns_fks_and_indexes(
+            &driver, &schema, &authors, &books, &recent,
+        )
+        .await;
+
+        for obj in [
+            format!("VIEW {recent}"),
+            format!("TABLE {books}"),
+            format!("TABLE {authors}"),
+        ] {
+            driver.execute(&format!("DROP {obj}")).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn executes_in_transaction_and_exports() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, false).await.unwrap();
+        let t = tag("t");
+        driver
+            .execute(&format!("CREATE TABLE {t} (id INT, name TEXT)"))
+            .await
+            .unwrap();
+
+        let affected = driver
+            .execute(&format!("INSERT INTO {t} VALUES (1, 'a,b'), (2, NULL)"))
+            .await
+            .unwrap();
+        assert_eq!(affected, 2, "execute reports rows affected");
+
+        battery::exports_csv_and_json(&driver, &format!("SELECT * FROM {t} ORDER BY id"), &t).await;
+
+        driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn seeks_forward_backward_and_reads_bounds() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, false).await.unwrap();
+        let t = tag("seek");
+        driver
+            .execute(&format!("CREATE TABLE {t} (id INT PRIMARY KEY, name TEXT)"))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!(
+                "INSERT INTO {t} SELECT g, 'row ' || g FROM generate_series(1, 1000) g"
+            ))
+            .await
+            .unwrap();
+
+        let key = KeySpec {
+            column: "id".into(),
+            kind: KeyKind::Int,
+        };
+        battery::seeks_forward_backward_and_reads_bounds(
+            &driver,
+            &format!("SELECT * FROM {t}"),
+            &key,
+        )
+        .await;
+
+        driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_only_rejects_writes() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, true).await.unwrap();
+        battery::read_only_rejects_write(&driver, "CREATE TABLE red_ro_should_fail (x INT)").await;
+    }
+}
