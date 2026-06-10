@@ -9,11 +9,12 @@ same way [Nyx](https://github.com/vojir-mikulas/nyx) is built — no web stack, 
 > complexity and overhead of full IDE-style database tools.
 
 Explore schemas · run SQL · browse large tables · export · inspect production
-databases safely. v0.1 targets **SQLite** and **PostgreSQL**.
+databases safely. v0.1 ships drivers for **SQLite**, **PostgreSQL**, and
+**MySQL/MariaDB**.
 
-> ⚠️ Early scaffold. Today this opens a window and proves the architecture; the
-> connection manager, schema explorer, SQL editor, and result grid are in
-> progress.
+> **Status: MVP.** The connection manager, schema explorer, SQL editor, and
+> windowed result grid work end to end. APIs and UI are still moving — expect
+> rough edges and breaking changes before a tagged release.
 
 ## Architecture
 
@@ -26,8 +27,9 @@ over channels — `Command` (UI → service) and `Event` (service → UI).
 - `red-driver` — the `DatabaseDriver` abstraction + the SQLite implementation
 - `red-service` — the backend thread and the Command/Event bridge
 
-UI components and theme come from **Flint** (`flint = { path = "../flint" }`),
-which pins and re-exports GPUI so RED resolves a single shared `gpui`.
+UI components and theme come from **Flint**, pinned as a git dependency by rev so
+a fresh clone builds with no sibling checkout. Flint pins and re-exports GPUI, so
+RED resolves a single shared `gpui`.
 
 ## Develop
 
@@ -41,6 +43,9 @@ cargo fmt --all
 > Builds need a full Xcode toolchain on macOS (Metal shader compile). If
 > `xcode-select` points at the Command Line Tools, set
 > `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the dev setup, the pre-push gate, and
+how to work on Flint and RED together.
 
 ## License
 
