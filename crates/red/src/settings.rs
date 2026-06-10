@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Persisted UI preferences — theme, result-grid density, and the
 //! destructive-statement safety rail.
 //!

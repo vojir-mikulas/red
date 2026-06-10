@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! The settings panel — a Zed-style left category nav beside a scrolling content
 //! pane, ported from Nyx's `settings_modal`. Built as a custom scrim + card (not
 //! the shared `Modal`) so the nav stays fixed while only the page scrolls. Pure

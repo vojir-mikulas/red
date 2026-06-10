@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! The connected shell: top bar · nested resizable split (schema | editor /
 //! results) · status bar. The pane contents are live: schema tree (M3), SQL
 //! editor (M4), interim result grid (M3, real grid in M5). The split sizes are

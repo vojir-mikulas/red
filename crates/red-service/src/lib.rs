@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! The backend thread. Mirrors `nyx-service`: a dedicated OS thread runs its own
 //! Tokio runtime, owns the active database session, and communicates with the
 //! GPUI UI over two channels — `Command` in (UI → service, a Tokio mpsc usable

@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Embedded fonts and the [`gpui::AssetSource`] that serves them. Everything
 //! under the workspace `assets/` dir is baked into the binary at compile time,
 //! so the shipped app needs no sidecar files.

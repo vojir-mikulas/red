@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! PostgreSQL driver — the second source of `DatabaseDriver`, proving the
 //! abstraction on a real network engine. Built on `tokio-postgres`: a live
 //! `Client` (its connection driven by a background task), a streaming cursor over

@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! The schema explorer (M3): the left-sidebar tree of namespaces → tables/views →
 //! columns, plus the interim table preview rendered in the results pane.
 //!

@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Vector icons. The design uses lucide-style line icons; the SVGs are vendored
 //! under `assets/icons/` and rendered through GPUI's `svg()`, which masks each
 //! icon to the current `text_color` — so the icon files are monochrome templates

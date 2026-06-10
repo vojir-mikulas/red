@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! The database abstraction layer. `DatabaseDriver` is RED's analogue of Nyx's
 //! `RemoteClient`: an object-safe trait the service holds as `Arc<dyn …>` and
 //! drives across many commands, with one impl per engine.

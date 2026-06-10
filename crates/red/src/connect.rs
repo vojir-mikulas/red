@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! The connection manager — the disconnected landing screen: a card listing
 //! saved connections (click to connect, edit/delete actions) plus the add/edit
 //! modal form. Pure assembly over Flint components; all state + actions live on

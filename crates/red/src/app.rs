@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! The root view and app state machine. `AppState` owns the backend handle, the
 //! persisted connection list, and the current `Phase` (disconnected connect
 //! screen ↔ connecting ↔ connected shell). Backend events are drained on a

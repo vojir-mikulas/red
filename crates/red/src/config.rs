@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Connection-list persistence. File IO + `serde` live here at the app edge
 //! (`anyhow`), keeping `red-core` runtime-free. The list round-trips to a TOML
 //! file in the platform config dir; a missing or malformed file degrades to an

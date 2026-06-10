@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Engine-agnostic value/string formatters shared by the network drivers'
 //! `export` path. These are pure [`Value`] → text functions with zero engine
 //! knowledge, lifted here so every driver writes byte-identical CSV/JSON and a

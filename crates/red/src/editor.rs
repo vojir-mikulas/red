@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! The SQL editor pane (M4): a toolbar (Run · history · read-only badge) over
 //! Flint's `CodeEditor`. RED owns the domain bits — the SQL highlighter, the
 //! completion candidates fed into the editor's generic completion seam, running

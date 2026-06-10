@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! SQLite driver. `rusqlite` is synchronous and its `Connection`/`Statement`/
 //! `Rows` form a `!Send`, self-referential stack that can't cross an `.await` or
 //! move between threads. So a live cursor lives entirely on one dedicated

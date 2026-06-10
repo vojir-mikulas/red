@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! Shared domain types for RED. No UI, no async runtime, no driver knowledge —
 //! the protocol/service/UI layers all speak in these types. Mirrors the role of
 //! `nyx-core` in the Nyx codebase.

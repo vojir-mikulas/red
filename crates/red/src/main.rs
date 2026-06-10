@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! The RED application binary. Opens the GPUI window and mounts the root view.
 //! The Tokio backend (`red-service`) and database drivers (`red-driver`) exist
 //! and are tested; wiring them into this UI is the next step.

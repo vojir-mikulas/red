@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! RED's theme palette. The surfaces, text, and state colors come straight from
 //! Flint's stock themes (the cross-repo contract: same tokens Nyx uses), but RED
 //! has its own identity — a **blue** accent, not Flint's green. The design's

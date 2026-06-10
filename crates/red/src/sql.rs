@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! RED's SQL domain logic for the editor: a hand-rolled tokenizer feeding Flint's
 //! generic `Highlighter` seam, plus the keyword set and word-prefix helper the
 //! completion provider uses. SQL-dialect knowledge stays here (Flint stays

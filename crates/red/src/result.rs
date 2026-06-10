@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! The result grid (M5): a virtualized, horizontally-scrolling table backed by a
 //! random-access window buffer. The grid never holds the whole result — its
 //! load-on-scroll callback fetches the pages around the viewport and evicts the

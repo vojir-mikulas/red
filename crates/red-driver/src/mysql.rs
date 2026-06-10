@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 //! MySQL / MariaDB driver — the third source of `DatabaseDriver`, proving the
 //! abstraction across a second network engine. Built on `mysql_async`: a pooled
 //! async connection, a streaming cursor, and **out-of-band cancel** via
