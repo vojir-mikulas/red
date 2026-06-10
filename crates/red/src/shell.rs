@@ -254,12 +254,11 @@ impl AppState {
                     .id("status-settings")
                     .flex()
                     .items_center()
-                    .gap_1p5()
                     .px_2()
                     .cursor_pointer()
+                    .text_color(theme.text_muted)
                     .hover(|s| s.text_color(theme.text))
-                    .child(crate::icons::icon("settings", px(12.), theme.text_muted))
-                    .child("Settings")
+                    .child(crate::icons::icon("settings", px(13.), theme.text_muted))
                     .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx))),
             );
 

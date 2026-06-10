@@ -32,15 +32,6 @@ pub(crate) enum Phase {
     Connected(Box<ActiveConn>),
 }
 
-/// Which entry mode the connection form is showing.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FormTab {
-    /// Structured host/port/user/password/database (or file path) fields.
-    Fields,
-    /// A single connection-string input that parses back into the fields.
-    ConnectionString,
-}
-
 /// The result of the latest "Test connection" probe, shown in the form footer.
 pub(crate) enum TestState {
     Idle,
@@ -50,10 +41,11 @@ pub(crate) enum TestState {
 }
 
 /// Add/edit connection form state. The field text lives in the shared `TextInput`
-/// entities on `AppState`; this holds the rest (engine, mode, label, flags).
+/// entities on `AppState`; this holds the rest (engine, label, flags). The
+/// structured fields and the connection-string mirror are kept in sync live (see
+/// `AppState::sync_conn_str_from_fields` / `sync_fields_from_conn_str`).
 pub(crate) struct FormState {
     pub kind: DbKind,
-    pub tab: FormTab,
     /// Label-palette index (see `connect::label_color`).
     pub color: u8,
     pub read_only: bool,
@@ -162,18 +154,51 @@ impl AppState {
             .unwrap_or_default();
         cx.set_global(crate::theme::by_name(&settings.theme));
 
+        let name_input = cx.new(|cx| TextInput::new(cx).with_placeholder("my database"));
+        let host_input = cx.new(|cx| TextInput::new(cx).with_placeholder("localhost"));
+        let port_input = cx.new(TextInput::new);
+        let user_input = cx.new(|cx| TextInput::new(cx).with_placeholder("postgres"));
+        let password_input = cx.new(|cx| TextInput::new(cx).obscured());
+        let database_input = cx.new(|cx| TextInput::new(cx).with_placeholder("analytics_prod"));
+        let conn_str_input =
+            cx.new(|cx| TextInput::new(cx).with_placeholder("postgres://user:pass@host:5432/db"));
+
+        // Live two-way sync: editing any structured field rebuilds the connection
+        // string, and editing the string parses it back into the fields. Only user
+        // edits emit `Change`; the programmatic `set_content` used by the sync does
+        // not, so the mirror can't echo back into an infinite loop.
+        for field in [
+            &host_input,
+            &port_input,
+            &user_input,
+            &password_input,
+            &database_input,
+        ] {
+            cx.subscribe(field, |this, _, event: &TextInputEvent, cx| {
+                if matches!(event, TextInputEvent::Change) {
+                    this.sync_conn_str_from_fields(cx);
+                }
+            })
+            .detach();
+        }
+        cx.subscribe(&conn_str_input, |this, _, event: &TextInputEvent, cx| {
+            if matches!(event, TextInputEvent::Change) {
+                this.sync_fields_from_conn_str(cx);
+            }
+        })
+        .detach();
+
         Self {
             service,
             connections: config::load(),
             phase: Phase::Disconnected,
-            name_input: cx.new(|cx| TextInput::new(cx).with_placeholder("my database")),
-            host_input: cx.new(|cx| TextInput::new(cx).with_placeholder("localhost")),
-            port_input: cx.new(TextInput::new),
-            user_input: cx.new(|cx| TextInput::new(cx).with_placeholder("postgres")),
-            password_input: cx.new(|cx| TextInput::new(cx).obscured()),
-            database_input: cx.new(|cx| TextInput::new(cx).with_placeholder("analytics_prod")),
-            conn_str_input: cx
-                .new(|cx| TextInput::new(cx).with_placeholder("postgres://user:pass@host:5432/db")),
+            name_input,
+            host_input,
+            port_input,
+            user_input,
+            password_input,
+            database_input,
+            conn_str_input,
             form: None,
             toast: None,
             confirm_exec: None,
@@ -279,8 +304,15 @@ impl AppState {
             .update(cx, |i, cx| i.set_content(config.password.clone(), cx));
         self.database_input
             .update(cx, |i, cx| i.set_content(config.database.clone(), cx));
+        // Seed the connection-string mirror for network engines once host/db are
+        // set (an empty new form leaves it blank so the placeholder shows).
+        let conn_str = if config.kind.is_file() || config.host.is_empty() {
+            String::new()
+        } else {
+            config.dsn()
+        };
         self.conn_str_input
-            .update(cx, |i, cx| i.set_content("", cx));
+            .update(cx, |i, cx| i.set_content(conn_str, cx));
     }
 
     pub(crate) fn open_new_form(&mut self, cx: &mut Context<Self>) {
@@ -295,7 +327,6 @@ impl AppState {
         );
         self.form = Some(FormState {
             kind,
-            tab: FormTab::Fields,
             color: 3,
             // Read-only by default — RED's safe-by-default posture.
             read_only: true,
@@ -313,7 +344,6 @@ impl AppState {
         self.fill_form_inputs(&config, cx);
         self.form = Some(FormState {
             kind: config.kind,
-            tab: FormTab::Fields,
             color: config.color,
             read_only: config.read_only,
             editing: Some(index),
@@ -347,14 +377,30 @@ impl AppState {
         })
     }
 
-    /// Whether `config` has the minimum to attempt a connection (mirrors the form's
-    /// Save/Connect enablement): a file needs a path; a server needs host + db.
-    pub(crate) fn form_valid(config: &ConnectionConfig) -> bool {
+    /// Whether `config` has the minimum to attempt a connection — `None` when ok,
+    /// else the reason to surface. A file needs a path; a server needs a host; a
+    /// Postgres connection also needs a database (it connects to one), while MySQL
+    /// can browse the whole server so its database is optional.
+    pub(crate) fn form_invalid_reason(config: &ConnectionConfig) -> Option<&'static str> {
         if config.kind.is_file() {
-            !config.database.is_empty()
-        } else {
-            !config.host.is_empty() && !config.database.is_empty()
+            return config
+                .database
+                .is_empty()
+                .then_some("A database file path is required");
         }
+        if config.host.is_empty() {
+            return Some("Host is required");
+        }
+        if config.kind == DbKind::Postgres && config.database.is_empty() {
+            return Some("Database is required");
+        }
+        None
+    }
+
+    /// Convenience predicate over [`Self::form_invalid_reason`] for Save/Connect
+    /// button enablement.
+    pub(crate) fn form_valid(config: &ConnectionConfig) -> bool {
+        Self::form_invalid_reason(config).is_none()
     }
 
     /// Persist the form. `connect` also opens the connection on success. On a
@@ -367,13 +413,8 @@ impl AppState {
             self.form_error("A name is required", cx);
             return;
         }
-        if !Self::form_valid(&config) {
-            let msg = if config.kind.is_file() {
-                "A database file path is required"
-            } else {
-                "Host and database are required"
-            };
-            self.form_error(msg, cx);
+        if let Some(reason) = Self::form_invalid_reason(&config) {
+            self.form_error(reason, cx);
             return;
         }
 
@@ -417,12 +458,52 @@ impl AppState {
             .map(|p| p.to_string())
             .unwrap_or_default();
         self.port_input.update(cx, |i, cx| i.set_content(port, cx));
+        // The scheme changed, so refresh the connection-string mirror.
+        self.sync_conn_str_from_fields(cx);
         cx.notify();
     }
 
-    pub(crate) fn set_form_tab(&mut self, tab: FormTab, cx: &mut Context<Self>) {
+    /// Rebuild the connection-string mirror from the structured field inputs.
+    /// Network engines only; a no-op while the form is closed or file-based.
+    fn sync_conn_str_from_fields(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.form.as_ref() else {
+            return;
+        };
+        if form.kind.is_file() {
+            return;
+        }
+        let Some(config) = self.form_config(cx) else {
+            return;
+        };
+        let dsn = config.dsn();
+        self.conn_str_input
+            .update(cx, |i, cx| i.set_content(dsn, cx));
+    }
+
+    /// Parse the connection-string mirror back into the structured field inputs.
+    /// Leaves the fields untouched while the string isn't yet a recognizable URL,
+    /// so partial typing doesn't wipe them.
+    fn sync_fields_from_conn_str(&mut self, cx: &mut Context<Self>) {
+        if self.form.is_none() {
+            return;
+        }
+        let raw = self.conn_str_input.read(cx).content().to_string();
+        let Some(parsed) = ConnectionConfig::parse_conn_str(&raw) else {
+            return;
+        };
+        let port = parsed.port.map(|p| p.to_string()).unwrap_or_default();
+        self.host_input
+            .update(cx, |i, cx| i.set_content(parsed.host, cx));
+        self.port_input.update(cx, |i, cx| i.set_content(port, cx));
+        self.user_input
+            .update(cx, |i, cx| i.set_content(parsed.user, cx));
+        self.password_input
+            .update(cx, |i, cx| i.set_content(parsed.password, cx));
+        self.database_input
+            .update(cx, |i, cx| i.set_content(parsed.database, cx));
         if let Some(form) = &mut self.form {
-            form.tab = tab;
+            form.kind = parsed.kind;
+            form.test = TestState::Idle;
         }
         cx.notify();
     }
@@ -441,50 +522,14 @@ impl AppState {
         cx.notify();
     }
 
-    /// Parse the connection-string input into the structured fields, then flip back
-    /// to the Fields tab. A parse failure shows in the test/result line.
-    pub(crate) fn apply_conn_str(&mut self, cx: &mut Context<Self>) {
-        let raw = self.conn_str_input.read(cx).content().to_string();
-        let Some(parsed) = ConnectionConfig::parse_conn_str(&raw) else {
-            if let Some(form) = &mut self.form {
-                form.test = TestState::Fail("Could not parse connection string".into());
-            }
-            cx.notify();
-            return;
-        };
-        let port = parsed.port.map(|p| p.to_string()).unwrap_or_default();
-        self.host_input
-            .update(cx, |i, cx| i.set_content(parsed.host, cx));
-        self.port_input.update(cx, |i, cx| i.set_content(port, cx));
-        self.user_input
-            .update(cx, |i, cx| i.set_content(parsed.user, cx));
-        self.password_input
-            .update(cx, |i, cx| i.set_content(parsed.password, cx));
-        self.database_input
-            .update(cx, |i, cx| i.set_content(parsed.database, cx));
-        if let Some(form) = &mut self.form {
-            form.kind = parsed.kind;
-            form.tab = FormTab::Fields;
-            form.test = TestState::Idle;
-        }
-        cx.notify();
-    }
-
     /// Fire a throwaway connection probe for the current form values.
     pub(crate) fn test_connection(&mut self, cx: &mut Context<Self>) {
         let Some(config) = self.form_config(cx) else {
             return;
         };
-        if !Self::form_valid(&config) {
+        if let Some(reason) = Self::form_invalid_reason(&config) {
             if let Some(form) = &mut self.form {
-                form.test = TestState::Fail(
-                    if config.kind.is_file() {
-                        "A database file path is required"
-                    } else {
-                        "Host and database are required"
-                    }
-                    .into(),
-                );
+                form.test = TestState::Fail(reason.into());
             }
             cx.notify();
             return;

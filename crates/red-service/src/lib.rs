@@ -515,9 +515,12 @@ async fn connect(config: &ConnectionConfig) -> Result<Arc<dyn DatabaseDriver>, S
             Ok(Arc::new(driver))
         }
         DbKind::Mysql => {
+            // A MySQL connection can see every database on the server; scope the
+            // schema tree to the chosen one when the connection names a database.
             let driver = MysqlDriver::connect(&config.dsn(), config.read_only)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
+                .with_scope(Some(config.database.clone()));
             Ok(Arc::new(driver))
         }
     }

@@ -43,6 +43,10 @@ use crate::{driver_err, CancelToken, DatabaseDriver, QueryCursor};
 pub struct MysqlDriver {
     pool: Pool,
     version: String,
+    /// When set, the schema tree is restricted to this one database — the
+    /// connection's chosen `database`. `None` lists every non-system database on
+    /// the server (a MySQL connection can see them all). See [`Self::with_scope`].
+    scope: Option<String>,
 }
 
 impl MysqlDriver {
@@ -71,7 +75,15 @@ impl MysqlDriver {
         Ok(Self {
             pool,
             version: version.unwrap_or_default(),
+            scope: None,
         })
+    }
+
+    /// Restrict the schema tree to a single database. An empty name clears the
+    /// scope (browse all databases). See the `scope` field.
+    pub fn with_scope(mut self, database: Option<String>) -> Self {
+        self.scope = database.filter(|d| !d.is_empty());
+        self
     }
 }
 
@@ -143,15 +155,26 @@ impl DatabaseDriver for MysqlDriver {
 
     async fn list_objects(&self) -> Result<Vec<SchemaMeta>> {
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
-        let schema_names: Vec<String> = conn
-            .query(
+        // Scoped to one database → just that name (empty tree if it doesn't exist);
+        // otherwise every non-system database the connection can see.
+        let schema_names: Vec<String> = if let Some(scope) = &self.scope {
+            conn.exec(
+                "SELECT schema_name FROM information_schema.schemata \
+                 WHERE schema_name = ?",
+                (scope.clone(),),
+            )
+            .await
+            .map_err(driver_err)?
+        } else {
+            conn.query(
                 "SELECT schema_name FROM information_schema.schemata \
                  WHERE schema_name NOT IN \
                    ('information_schema', 'performance_schema', 'mysql', 'sys') \
                  ORDER BY schema_name",
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(driver_err)?
+        };
 
         let mut schemas = Vec::with_capacity(schema_names.len());
         for schema in schema_names {
@@ -748,5 +771,49 @@ mod tests {
         let mut conn = driver.pool.get_conn().await.unwrap();
         let db: Option<String> = conn.query_first("SELECT DATABASE()").await.unwrap();
         db.expect("connection must target a database")
+    }
+
+    #[tokio::test]
+    async fn scope_restricts_schema_tree() {
+        let url = url_or_skip!();
+        let driver = MysqlDriver::connect(&url, false).await.unwrap();
+        let schema = current_schema(&driver).await;
+
+        // Unscoped: the current database is one of several visible namespaces.
+        let unscoped = driver.list_objects().await.unwrap();
+        assert!(unscoped.iter().any(|s| s.name == schema));
+
+        // Scoped to the current database: exactly that one namespace.
+        let scoped = MysqlDriver::connect(&url, false)
+            .await
+            .unwrap()
+            .with_scope(Some(schema.clone()));
+        let names: Vec<String> = scoped
+            .list_objects()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec![schema.clone()]);
+
+        // A scope that names no real database yields an empty tree, not an error.
+        let missing = MysqlDriver::connect(&url, false)
+            .await
+            .unwrap()
+            .with_scope(Some("red_no_such_db_xyz".into()));
+        assert!(missing.list_objects().await.unwrap().is_empty());
+
+        // An empty scope clears it — the current database is visible again.
+        let cleared = MysqlDriver::connect(&url, false)
+            .await
+            .unwrap()
+            .with_scope(Some(String::new()));
+        assert!(cleared
+            .list_objects()
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.name == schema));
     }
 }

@@ -12,7 +12,7 @@ use gpui::{
 };
 use red_core::DbKind;
 
-use crate::app::{AppState, FormState, FormTab, TestState};
+use crate::app::{AppState, FormState, TestState};
 use crate::assets::{FONT_MONO, FONT_UI};
 
 /// The six label colors a connection can be tagged with, mapped onto semantic
@@ -239,13 +239,9 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        // Each card carries its engine color on the tinted icon square: SQLite →
-        // cyan, Postgres → blue.
-        let accent = match config.kind {
-            DbKind::Sqlite => theme.cyan,
-            DbKind::Postgres => theme.blue,
-            DbKind::Mysql => theme.orange,
-        };
+        // The tinted icon square uses the app accent (the engine is conveyed by the
+        // badge beside the name, not by the icon color).
+        let accent = theme.accent;
         let (badge_variant, badge_label) = match config.kind {
             DbKind::Sqlite => (BadgeVariant::Info, "SQLite"),
             DbKind::Postgres => (BadgeVariant::Special, "Postgres"),
@@ -448,31 +444,10 @@ impl AppState {
             "New connection"
         };
 
-        // Entry-mode tabs (Fields ↔ Connection string).
-        let tab_ix = match form.tab {
-            FormTab::Fields => 0,
-            FormTab::ConnectionString => 1,
-        };
-        let tabs = Tabs::new("conn-form-tabs")
-            .tab("Fields", None)
-            .tab("Connection string", None)
-            .selected(tab_ix)
-            .on_select({
-                let view = view.clone();
-                move |ix, _, cx| {
-                    let tab = if ix == 0 {
-                        FormTab::Fields
-                    } else {
-                        FormTab::ConnectionString
-                    };
-                    view.update(cx, |this, cx| this.set_form_tab(tab, cx)).ok();
-                }
-            });
-
-        let body = match form.tab {
-            FormTab::ConnectionString => self.render_conn_str_tab(theme, cx),
-            FormTab::Fields => self.render_fields_tab(form, is_file, theme, cx),
-        };
+        // Network engines get a live connection-string field that mirrors — and is
+        // mirrored by — the structured fields. File engines have only a path.
+        let conn_str_field = (!is_file)
+            .then(|| labeled_field("Connection string", theme).child(self.conn_str_input.clone()));
 
         let footer = self.render_form_footer(form, valid, cx);
 
@@ -484,100 +459,83 @@ impl AppState {
             .on_close(move |_, cx| {
                 close_view.update(cx, |this, cx| this.close_form(cx)).ok();
             })
-            .child(div().flex().flex_col().gap_3().child(tabs).child(body))
-    }
-
-    /// The "Connection string" tab: one input plus a parse-into-fields action.
-    fn render_conn_str_tab(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap_1p5()
-            .child(field_label("Connection string", theme))
-            .child(self.conn_str_input.clone())
-            .child(
-                div().flex().justify_end().child(
-                    Button::new("parse-conn-str", "Parse into fields →")
-                        .variant(ButtonVariant::Ghost)
-                        .size(ButtonSize::Sm)
-                        .on_click(cx.listener(|this, _, _, cx| this.apply_conn_str(cx))),
-                ),
-            )
             .child(
                 div()
-                    .text_xs()
-                    .text_color(theme.text_faint)
-                    .child("Supports postgres://, mysql://, and sqlite:/// schemes."),
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(labeled_field("Name", theme).child(self.name_input.clone()))
+                    .child(
+                        labeled_field("Engine", theme)
+                            .child(self.render_engine_picker(form.kind, theme, cx)),
+                    )
+                    .children(conn_str_field)
+                    .child(self.render_connection_fields(form, is_file, theme))
+                    .child(self.render_label_access_row(form, theme, cx)),
             )
-            .into_any_element()
     }
 
-    /// The "Fields" tab: name, engine picker, per-engine connection fields, and the
-    /// label/access row.
-    fn render_fields_tab(
+    /// The per-engine connection fields: a file path, or host/port/database/
+    /// user/password for a network engine.
+    fn render_connection_fields(
         &self,
         form: &FormState,
         is_file: bool,
         theme: &Theme,
-        cx: &mut Context<Self>,
     ) -> AnyElement {
-        let fields = if is_file {
-            div()
-                .flex()
-                .flex_col()
-                .gap_1p5()
-                .child(field_label("Database file", theme))
+        if is_file {
+            return labeled_field("Database file", theme)
                 .child(self.database_input.clone())
-        } else {
-            div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(
-                    div()
-                        .flex()
-                        .gap_3()
-                        .child(
-                            labeled_field("Host", theme)
-                                .flex_1()
-                                .child(self.host_input.clone()),
-                        )
-                        .child(
-                            labeled_field("Port", theme)
-                                .w(px(88.))
-                                .flex_none()
-                                .child(self.port_input.clone()),
-                        ),
-                )
-                .child(labeled_field("Database", theme).child(self.database_input.clone()))
-                .child(
-                    div()
-                        .flex()
-                        .gap_3()
-                        .child(
-                            labeled_field("User", theme)
-                                .flex_1()
-                                .child(self.user_input.clone()),
-                        )
-                        .child(
-                            labeled_field("Password", theme)
-                                .flex_1()
-                                .child(self.password_input.clone()),
-                        ),
-                )
-        };
-
+                .into_any_element();
+        }
         div()
             .flex()
             .flex_col()
             .gap_3()
-            .child(labeled_field("Name", theme).child(self.name_input.clone()))
             .child(
-                labeled_field("Engine", theme)
-                    .child(self.render_engine_picker(form.kind, theme, cx)),
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(
+                        labeled_field("Host", theme)
+                            .flex_1()
+                            .child(self.host_input.clone()),
+                    )
+                    .child(
+                        labeled_field("Port", theme)
+                            .w(px(88.))
+                            .flex_none()
+                            .child(self.port_input.clone()),
+                    ),
             )
-            .child(fields)
-            .child(self.render_label_access_row(form, theme, cx))
+            .child(
+                labeled_field(
+                    // MySQL can browse the whole server, so its database is
+                    // optional — blank shows every database.
+                    if form.kind == DbKind::Mysql {
+                        "Database (optional)"
+                    } else {
+                        "Database"
+                    },
+                    theme,
+                )
+                .child(self.database_input.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(
+                        labeled_field("User", theme)
+                            .flex_1()
+                            .child(self.user_input.clone()),
+                    )
+                    .child(
+                        labeled_field("Password", theme)
+                            .flex_1()
+                            .child(self.password_input.clone()),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -775,16 +733,16 @@ impl AppState {
 }
 
 /// A small uppercase field caption, matching the design's form labels.
-fn field_label(text: &'static str, theme: &Theme) -> impl IntoElement {
+fn field_label(text: impl Into<String>, theme: &Theme) -> impl IntoElement {
     div()
         .text_size(px(10.5))
         .font_weight(FontWeight::MEDIUM)
         .text_color(theme.text_faint)
-        .child(text.to_uppercase())
+        .child(text.into().to_uppercase())
 }
 
 /// A labeled form field column: the caption above its control (passed as a child).
-fn labeled_field(label: &'static str, theme: &Theme) -> gpui::Div {
+fn labeled_field(label: impl Into<String>, theme: &Theme) -> gpui::Div {
     div()
         .flex()
         .flex_col()
