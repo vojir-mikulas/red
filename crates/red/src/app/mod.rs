@@ -393,6 +393,7 @@ impl AppState {
                 if let Phase::Connected(active) = &mut self.phase {
                     active.schema.apply_objects(schemas);
                 }
+                self.prefetch_table_details();
                 self.refresh_completions(cx);
             }
             Event::TableDescribed {
@@ -613,6 +614,34 @@ impl AppState {
 
     /// Push a freshly-built tab, focus it, and seed its completions. Returns the
     /// new index. Callers supply the tab (a blank query or a table preview).
+    /// Eagerly describe every table once the skeleton lands, so column and
+    /// `table.` completion covers the whole schema without the user expanding
+    /// each node first. Details arrive as `TableDescribed` events that refresh the
+    /// completion index. Capped so a pathological schema can't flood the backend —
+    /// past the cap, tables still load lazily on tree expansion.
+    pub(crate) fn prefetch_table_details(&mut self) {
+        const MAX_PREFETCH: usize = 200;
+        let pending: Vec<(String, String)> = match &self.phase {
+            Phase::Connected(active) => {
+                let s = &active.schema;
+                s.schemas
+                    .iter()
+                    .flat_map(|sc| {
+                        sc.objects
+                            .iter()
+                            .map(move |obj| (sc.name.clone(), obj.name.clone()))
+                    })
+                    .filter(|key| !s.details.contains_key(key))
+                    .take(MAX_PREFETCH)
+                    .collect()
+            }
+            _ => return,
+        };
+        for (schema, table) in pending {
+            self.service.send(Command::DescribeTable { schema, table });
+        }
+    }
+
     pub(crate) fn push_tab(&mut self, tab: QueryTab, cx: &mut Context<Self>) -> usize {
         let index = match &mut self.phase {
             Phase::Connected(active) => {

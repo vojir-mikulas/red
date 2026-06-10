@@ -4,6 +4,9 @@
 //! the current statement (or selection), and the query history. Results land in
 //! the result grid.
 
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
 use flint::prelude::*;
 use gpui::{div, prelude::*, px, Context, SharedString};
 use red_service::Command;
@@ -11,48 +14,131 @@ use red_service::Command;
 use crate::app::{ActiveConn, AppState, Phase};
 use crate::assets::FONT_MONO;
 use crate::schema::SchemaState;
+use crate::sql::CompletionContext;
 
-/// Completion candidates from the loaded schema: every object + every known
-/// column name, plus the upper-cased SQL keywords. Rebuilt as the schema grows.
-fn build_candidates(schema: &SchemaState) -> Vec<SharedString> {
-    let mut out: Vec<SharedString> = Vec::new();
-    for sc in &schema.schemas {
-        for obj in &sc.objects {
-            out.push(obj.name.clone().into());
-        }
-    }
-    for detail in schema.details.values() {
-        for col in &detail.columns {
-            out.push(col.name.clone().into());
-        }
-    }
-    for kw in crate::sql::KEYWORDS {
-        out.push(kw.to_uppercase().into());
-    }
-    out.sort();
-    out.dedup();
-    out
+/// How many candidates the popup ever shows — the editor renders at most 8, but
+/// we hand it a few more so prefix-narrowing has headroom.
+const MAX_CANDIDATES: usize = 20;
+
+/// The completion candidates derived from the loaded schema, grouped so the
+/// provider can rank them by the cursor's context. Rebuilt as the schema grows.
+struct CompletionIndex {
+    /// Every object (table/view) name, sorted + deduped.
+    tables: Vec<SharedString>,
+    /// Columns keyed by lower-cased table name, for `table.`/`alias.` completion.
+    columns_by_table: HashMap<String, Vec<SharedString>>,
+    /// Every column name across the schema, sorted + deduped.
+    all_columns: Vec<SharedString>,
+    /// The upper-cased SQL keywords.
+    keywords: Vec<SharedString>,
 }
 
-/// The provider closure handed to the editor's completion seam: filter the
-/// candidate snapshot by the word under the cursor (case-insensitive prefix).
+fn build_index(schema: &SchemaState) -> CompletionIndex {
+    let mut tables: Vec<SharedString> = Vec::new();
+    for sc in &schema.schemas {
+        for obj in &sc.objects {
+            tables.push(obj.name.clone().into());
+        }
+    }
+
+    let mut columns_by_table: HashMap<String, Vec<SharedString>> = HashMap::new();
+    let mut all_columns: Vec<SharedString> = Vec::new();
+    for ((_, table), detail) in &schema.details {
+        let entry = columns_by_table.entry(table.to_lowercase()).or_default();
+        for col in &detail.columns {
+            entry.push(col.name.clone().into());
+            all_columns.push(col.name.clone().into());
+        }
+    }
+
+    tables.sort();
+    tables.dedup();
+    all_columns.sort();
+    all_columns.dedup();
+    for cols in columns_by_table.values_mut() {
+        cols.sort();
+        cols.dedup();
+    }
+
+    let keywords = crate::sql::KEYWORDS
+        .iter()
+        .map(|kw| SharedString::from(kw.to_uppercase()))
+        .collect();
+
+    CompletionIndex {
+        tables,
+        columns_by_table,
+        all_columns,
+        keywords,
+    }
+}
+
+/// The provider closure handed to the editor's completion seam. It reads the
+/// cursor's context (member access, a table position, a column expression, or a
+/// statement start) and offers the matching candidates, most-relevant first.
 fn completion_provider(
-    candidates: Vec<SharedString>,
+    index: Rc<CompletionIndex>,
 ) -> impl Fn(&str, usize) -> Vec<SharedString> + 'static {
     move |content, cursor| {
-        let prefix = crate::sql::word_prefix(content, cursor);
-        if prefix.is_empty() {
+        let prefix = crate::sql::word_prefix(content, cursor).to_lowercase();
+        let context = crate::sql::analyze(content, cursor);
+
+        // Only member access (`table.`) suggests with nothing typed; elsewhere we
+        // wait for a prefix so the popup doesn't open on every space.
+        if prefix.is_empty() && !matches!(context, CompletionContext::Dot { .. }) {
             return Vec::new();
         }
-        let lower = prefix.to_lowercase();
-        candidates
-            .iter()
+
+        // Candidate sources in priority order — earlier groups win ties.
+        let mut ordered: Vec<SharedString> = Vec::new();
+        match &context {
+            CompletionContext::Dot { qualifier } => {
+                let q = qualifier.to_lowercase();
+                let real = crate::sql::referenced_tables_at(content, cursor)
+                    .into_iter()
+                    .find(|(alias, _)| *alias == q)
+                    .map(|(_, table)| table.to_lowercase())
+                    .or_else(|| {
+                        index
+                            .tables
+                            .iter()
+                            .find(|t| t.to_lowercase() == q)
+                            .map(|t| t.to_lowercase())
+                    });
+                if let Some(cols) = real.and_then(|r| index.columns_by_table.get(&r)) {
+                    ordered.extend(cols.iter().cloned());
+                }
+            }
+            CompletionContext::Table => ordered.extend(index.tables.iter().cloned()),
+            CompletionContext::Column => {
+                // Columns of the tables this statement actually references rank
+                // first, then the rest of the schema, then tables and keywords.
+                for (_, table) in crate::sql::referenced_tables_at(content, cursor) {
+                    if let Some(cols) = index.columns_by_table.get(&table.to_lowercase()) {
+                        ordered.extend(cols.iter().cloned());
+                    }
+                }
+                ordered.extend(index.all_columns.iter().cloned());
+                ordered.extend(index.tables.iter().cloned());
+                ordered.extend(index.keywords.iter().cloned());
+            }
+            CompletionContext::Keyword => {
+                ordered.extend(index.keywords.iter().cloned());
+                ordered.extend(index.tables.iter().cloned());
+            }
+        }
+
+        let mut seen: HashSet<String> = HashSet::new();
+        ordered
+            .into_iter()
             .filter(|c| {
                 let cl = c.to_lowercase();
-                cl.starts_with(&lower) && cl != lower
+                if !cl.starts_with(&prefix) || (!prefix.is_empty() && cl == prefix) {
+                    return false;
+                }
+                seen.insert(cl)
             })
-            .take(20)
-            .cloned()
+            .take(MAX_CANDIDATES)
             .collect()
     }
 }
@@ -381,21 +467,21 @@ impl AppState {
     /// Rebuild every tab's editor completion candidates from the current schema.
     /// Called when the skeleton or a table's detail arrives, or a tab is opened.
     pub(crate) fn refresh_completions(&mut self, cx: &mut Context<Self>) {
-        let (editors, candidates) = match &self.phase {
+        let (editors, index) = match &self.phase {
             Phase::Connected(active) => (
                 active
                     .tabs
                     .iter()
                     .map(|t| t.editor.clone())
                     .collect::<Vec<_>>(),
-                build_candidates(&active.schema),
+                Rc::new(build_index(&active.schema)),
             ),
             _ => return,
         };
         for editor in editors {
-            let candidates = candidates.clone();
+            let index = index.clone();
             editor.update(cx, |editor, cx| {
-                editor.set_completions(completion_provider(candidates), cx)
+                editor.set_completions(completion_provider(index), cx)
             });
         }
     }
