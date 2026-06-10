@@ -28,6 +28,7 @@ use tokio::sync::Mutex;
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, NoTls, Row, RowStream};
 
+use crate::format::{csv_cell, csv_record, json_string, json_value, strip_trailing};
 use crate::{driver_err, CancelToken, DatabaseDriver, QueryCursor};
 
 /// A live PostgreSQL session. Holds the shared `Client`; the connection future
@@ -494,58 +495,4 @@ fn parse_index_columns(def: &str) -> Vec<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
-}
-
-fn strip_trailing(sql: &str) -> &str {
-    sql.trim().strip_suffix(';').unwrap_or(sql.trim()).trim()
-}
-
-fn csv_record<'a>(fields: impl Iterator<Item = &'a str>) -> String {
-    fields.map(csv_escape).collect::<Vec<_>>().join(",")
-}
-
-fn csv_escape(field: &str) -> String {
-    if field.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", field.replace('"', "\"\""))
-    } else {
-        field.to_string()
-    }
-}
-
-fn csv_cell(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::Integer(n) => n.to_string(),
-        Value::Real(x) => x.to_string(),
-        Value::Text(s) => s.clone(),
-        Value::Blob(b) => format!("<{} bytes>", b.len()),
-    }
-}
-
-fn json_value(value: &Value) -> String {
-    match value {
-        Value::Null => "null".to_string(),
-        Value::Integer(n) => n.to_string(),
-        Value::Real(x) => x.to_string(),
-        Value::Text(s) => json_string(s),
-        Value::Blob(b) => json_string(&format!("<{} bytes>", b.len())),
-    }
-}
-
-fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }

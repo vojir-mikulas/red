@@ -13,6 +13,19 @@
 use flint::Theme;
 use gpui::{rgb, Hsla};
 
+/// The built-in themes the settings panel offers, in display order. Each name
+/// round-trips through [`by_name`] and matches the underlying Flint theme's name.
+pub const THEMES: &[&str] = &["One Dark", "GitHub Dark"];
+
+/// Resolve a persisted theme name to its blue-accented RED variant, defaulting to
+/// One Dark for an unknown name (e.g. a settings file from a newer build).
+pub fn by_name(name: &str) -> Theme {
+    match name {
+        "GitHub Dark" => github_dark(),
+        _ => one_dark(),
+    }
+}
+
 /// Hex (`0xRRGGBB`) → opaque [`Hsla`].
 fn h(hex: u32) -> Hsla {
     rgb(hex).into()

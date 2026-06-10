@@ -358,11 +358,7 @@ impl AppState {
                 d.child(crate::icons::icon("lock", px(12.), yellow))
             });
 
-        let filter_row = div()
-            .flex_shrink_0()
-            .px_2()
-            .pb_1()
-            .child(s.filter.clone());
+        let filter_row = div().flex_shrink_0().px_2().pb_1().child(s.filter.clone());
 
         // Capture the flattened rows per handler so each can map its click index
         // back to the node it represents.

@@ -74,6 +74,12 @@ impl AppState {
             .collect();
         let modal = self.form.as_ref().map(|form| self.render_form(form, cx));
         let new_button = self.new_button(cx);
+        let settings_gear = IconButton::new(
+            "connect-settings",
+            crate::icons::icon("settings", px(16.), cx.theme().text_muted),
+        )
+        .size(IconButtonSize::Sm)
+        .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
 
         let theme = cx.theme();
 
@@ -94,13 +100,9 @@ impl AppState {
                     .mt_3()
                     .child("Roughly Enough Data"),
             )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.text_faint)
-                    .mt_1()
-                    .child("A fast, native database explorer. Pick a connection below, or create a new one."),
-            );
+            .child(div().text_sm().text_color(theme.text_faint).mt_1().child(
+                "A fast, native database explorer. Pick a connection below, or create a new one.",
+            ));
 
         let saved: AnyElement = if self.connections.is_empty() {
             div()
@@ -148,7 +150,19 @@ impl AppState {
             .font_family(FONT_UI)
             .child(column);
 
-        div().size_full().child(screen).children(modal)
+        // Settings gear floats top-right (the disconnected screen has no top bar).
+        let gear = div()
+            .absolute()
+            .top(px(14.))
+            .right(px(16.))
+            .child(settings_gear);
+
+        div()
+            .size_full()
+            .relative()
+            .child(screen)
+            .child(gear)
+            .children(modal)
     }
 
     fn new_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -204,10 +218,12 @@ impl AppState {
         let accent = match config.kind {
             DbKind::Sqlite => theme.cyan,
             DbKind::Postgres => theme.blue,
+            DbKind::Mysql => theme.orange,
         };
         let (badge_variant, badge_label) = match config.kind {
             DbKind::Sqlite => (BadgeVariant::Info, "SQLite"),
             DbKind::Postgres => (BadgeVariant::Special, "Postgres"),
+            DbKind::Mysql => (BadgeVariant::Warning, "MySQL"),
         };
         let group = SharedString::from(format!("connect-card-{index}"));
 
@@ -308,10 +324,12 @@ impl AppState {
                                     crate::icons::icon("edit", px(14.), theme.text_muted),
                                 )
                                 .size(IconButtonSize::Sm)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.open_edit_form(index, cx);
-                                })),
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.open_edit_form(index, cx);
+                                    },
+                                )),
                             )
                             .child(
                                 IconButton::new(
@@ -319,10 +337,12 @@ impl AppState {
                                     crate::icons::icon("trash", px(14.), theme.red),
                                 )
                                 .size(IconButtonSize::Sm)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.delete_connection(index, cx);
-                                })),
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.delete_connection(index, cx);
+                                    },
+                                )),
                             ),
                     ),
             )
@@ -384,10 +404,12 @@ impl AppState {
         let kind_ix = match form.kind {
             DbKind::Sqlite => 0,
             DbKind::Postgres => 1,
+            DbKind::Mysql => 2,
         };
         let dsn_label = match form.kind {
             DbKind::Sqlite => "Database file",
             DbKind::Postgres => "Connection URL",
+            DbKind::Mysql => "Connection URL",
         };
         let title = if form.editing.is_some() {
             "Edit connection"
@@ -404,6 +426,7 @@ impl AppState {
             Select::new("engine")
                 .option("SQLite")
                 .option("PostgreSQL")
+                .option("MySQL/MariaDB")
                 .selected(kind_ix)
                 .open(form.kind_open)
                 .on_toggle(move |_, cx| {
@@ -412,10 +435,10 @@ impl AppState {
                         .ok();
                 })
                 .on_select(move |ix, _, cx| {
-                    let kind = if ix == 0 {
-                        DbKind::Sqlite
-                    } else {
-                        DbKind::Postgres
+                    let kind = match ix {
+                        0 => DbKind::Sqlite,
+                        1 => DbKind::Postgres,
+                        _ => DbKind::Mysql,
                     };
                     select_view
                         .update(cx, |this, cx| this.set_form_kind(kind, cx))

@@ -244,19 +244,23 @@ impl AppState {
             })
             .child(div().px_2().child("UTF-8"))
             .child(div().px_2().child("SQL"))
-            .child(div().px_2().child(format!("{} {}", config.kind, active.version)))
             .child(
                 div()
-                    .id("theme-swatch")
+                    .px_2()
+                    .child(format!("{} {}", config.kind, active.version)),
+            )
+            .child(
+                div()
+                    .id("status-settings")
                     .flex()
                     .items_center()
                     .gap_1p5()
                     .px_2()
                     .cursor_pointer()
                     .hover(|s| s.text_color(theme.text))
-                    .child(div().size(px(9.)).rounded_full().bg(theme.accent))
-                    .child(cx.theme().name.clone())
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx))),
+                    .child(crate::icons::icon("settings", px(12.), theme.text_muted))
+                    .child("Settings")
+                    .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx))),
             );
 
         let statusbar = div()

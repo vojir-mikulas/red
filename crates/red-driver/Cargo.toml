@@ -15,6 +15,7 @@ async-trait.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }
 rusqlite.workspace = true
 tokio-postgres.workspace = true
+mysql_async.workspace = true
 futures-util.workspace = true
 
 [dev-dependencies]

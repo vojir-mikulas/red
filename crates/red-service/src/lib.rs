@@ -23,7 +23,9 @@ use red_core::{
     Column, ConnectionConfig, DbKind, ExportFormat, QueryOptions, RedError, RowWindow, SchemaMeta,
     TableDetail,
 };
-use red_driver::{CancelToken, DatabaseDriver, PostgresDriver, QueryCursor, SqliteDriver};
+use red_driver::{
+    CancelToken, DatabaseDriver, MysqlDriver, PostgresDriver, QueryCursor, SqliteDriver,
+};
 use tokio::sync::mpsc::{
     unbounded_channel, UnboundedReceiver as CmdReceiver, UnboundedSender as CmdSender,
 };
@@ -482,6 +484,12 @@ async fn connect(config: &ConnectionConfig) -> Result<Arc<dyn DatabaseDriver>, S
         }
         DbKind::Postgres => {
             let driver = PostgresDriver::connect(&config.dsn, config.read_only)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(Arc::new(driver))
+        }
+        DbKind::Mysql => {
+            let driver = MysqlDriver::connect(&config.dsn, config.read_only)
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(Arc::new(driver))

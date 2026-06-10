@@ -407,10 +407,18 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let (bg, bg_app, border, border_soft) =
-            (theme.bg_panel, theme.bg_app, theme.border, theme.border_soft);
-        let (muted, faint, dim, text) =
-            (theme.text_muted, theme.text_faint, theme.text_dim, theme.text);
+        let (bg, bg_app, border, border_soft) = (
+            theme.bg_panel,
+            theme.bg_app,
+            theme.border,
+            theme.border_soft,
+        );
+        let (muted, faint, dim, text) = (
+            theme.text_muted,
+            theme.text_faint,
+            theme.text_dim,
+            theme.text,
+        );
         let (num, cyan, red, accent) = (theme.orange, theme.cyan, theme.red, theme.accent);
         let cell_colors = CellColors {
             text,
@@ -517,7 +525,7 @@ impl AppState {
 
         let table = Table::<()>::new("result-grid", columns)
             .row_count(total)
-            .row_height(px(25.))
+            .row_height(self.settings.density().row_height())
             .font_family(FONT_MONO)
             .grid_lines(true)
             .track_scroll(&grid.scroll)
@@ -582,20 +590,11 @@ impl AppState {
             .border_color(border)
             .font_family(FONT_MONO)
             .text_size(px(11.))
-            .child(
-                div()
-                    .text_color(text)
-                    .child(format!("{}", grid.total)),
-            )
+            .child(div().text_color(text).child(format!("{}", grid.total)))
             .child(div().text_color(dim).child("rows"))
             .child(div().text_color(border_soft).child("·"))
             .child(div().text_color(dim).child(format!("{ncols} columns")))
-            .child(
-                div()
-                    .ml_auto()
-                    .text_color(dim)
-                    .child(grid.label.clone()),
-            );
+            .child(div().ml_auto().text_color(dim).child(grid.label.clone()));
 
         container
             .child(toolbar)

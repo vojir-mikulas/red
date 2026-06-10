@@ -20,6 +20,8 @@ use crate::assets::{FONT_MONO, FONT_UI};
 use crate::config::{self, StoredConnection};
 use crate::result::ResultGrid;
 use crate::schema::SchemaState;
+use crate::settings::{Density, FileSettingsStore, Settings};
+use crate::settings_ui::SettingsTab;
 
 /// Which top-level screen is showing.
 pub(crate) enum Phase {
@@ -99,6 +101,11 @@ pub struct AppState {
     pub(crate) toast: Option<(SharedString, ToastVariant)>,
     /// A destructive statement awaiting the user's confirmation before it runs.
     pub(crate) confirm_exec: Option<String>,
+    /// Persisted UI preferences (theme, grid density, the safety rail) + their store.
+    pub(crate) settings: Settings,
+    pub(crate) settings_store: Option<FileSettingsStore>,
+    pub(crate) settings_open: bool,
+    pub(crate) settings_tab: SettingsTab,
 }
 
 impl AppState {
@@ -121,6 +128,15 @@ impl AppState {
         })
         .detach();
 
+        // Load persisted preferences and apply the saved theme over the default
+        // installed in `main` (a missing/malformed file degrades to defaults).
+        let settings_store = FileSettingsStore::open_default();
+        let settings = settings_store
+            .as_ref()
+            .map(FileSettingsStore::load)
+            .unwrap_or_default();
+        cx.set_global(crate::theme::by_name(&settings.theme));
+
         Self {
             service,
             connections: config::load(),
@@ -130,6 +146,10 @@ impl AppState {
             form: None,
             toast: None,
             confirm_exec: None,
+            settings,
+            settings_store,
+            settings_open: false,
+            settings_tab: SettingsTab::Appearance,
         }
     }
 
@@ -334,13 +354,51 @@ impl AppState {
         cx.notify();
     }
 
-    pub(crate) fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        let next = match cx.theme().name.as_str() {
-            "One Dark" => crate::theme::github_dark(),
-            _ => crate::theme::one_dark(),
-        };
-        cx.set_global(next);
+    // --- settings panel ---
+
+    pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = true;
         cx.notify();
+    }
+
+    pub(crate) fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = false;
+        cx.notify();
+    }
+
+    pub(crate) fn set_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
+        self.settings_tab = tab;
+        cx.notify();
+    }
+
+    /// Make `name` the active theme, persist the choice, and re-render.
+    pub(crate) fn select_theme(&mut self, name: &str, cx: &mut Context<Self>) {
+        cx.set_global(crate::theme::by_name(name));
+        self.settings.theme = name.to_string();
+        self.save_settings();
+        cx.notify();
+    }
+
+    pub(crate) fn set_density(&mut self, density: Density, cx: &mut Context<Self>) {
+        self.settings.density = density.index() as u8;
+        self.save_settings();
+        cx.notify();
+    }
+
+    pub(crate) fn set_confirm_destructive(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.confirm_destructive = on;
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Persist the current preferences. A write failure is logged, not surfaced —
+    /// preferences are convenience, and the in-memory value already took effect.
+    fn save_settings(&self) {
+        if let Some(store) = &self.settings_store {
+            if let Err(e) = store.save(&self.settings) {
+                tracing::warn!("failed to save settings: {e}");
+            }
+        }
     }
 
     /// Save the connection list, surfacing a write failure as a toast.
@@ -409,6 +467,10 @@ impl Render for AppState {
             .clone()
             .map(|sql| self.render_confirm(sql, cx));
 
+        let settings = self
+            .settings_open
+            .then(|| self.render_settings(cx).into_any_element());
+
         let theme = cx.theme();
         div()
             .size_full()
@@ -422,6 +484,7 @@ impl Render for AppState {
             .child(screen)
             .children(toast)
             .children(confirm)
+            .children(settings)
     }
 }
 

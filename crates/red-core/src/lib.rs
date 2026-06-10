@@ -12,6 +12,7 @@ use std::fmt;
 pub enum DbKind {
     Sqlite,
     Postgres,
+    Mysql,
 }
 
 impl fmt::Display for DbKind {
@@ -19,6 +20,7 @@ impl fmt::Display for DbKind {
         match self {
             DbKind::Sqlite => write!(f, "SQLite"),
             DbKind::Postgres => write!(f, "PostgreSQL"),
+            DbKind::Mysql => write!(f, "MySQL/MariaDB"),
         }
     }
 }

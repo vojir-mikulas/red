@@ -19,8 +19,11 @@ use red_core::{
     TableDetail,
 };
 
+mod format;
+mod mysql;
 mod postgres;
 mod sqlite;
+pub use mysql::MysqlDriver;
 pub use postgres::PostgresDriver;
 pub use sqlite::SqliteDriver;
 

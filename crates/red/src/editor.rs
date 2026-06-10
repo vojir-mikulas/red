@@ -89,8 +89,12 @@ impl AppState {
             theme.bg_hover,
         );
         let (border, border_soft, radius) = (theme.border, theme.border_soft, theme.radius);
-        let (text, muted, faint, dim) =
-            (theme.text, theme.text_muted, theme.text_faint, theme.text_dim);
+        let (text, muted, faint, dim) = (
+            theme.text,
+            theme.text_muted,
+            theme.text_faint,
+            theme.text_dim,
+        );
         let (yellow, green, on_accent) = (theme.yellow, theme.green, theme.on_accent);
         let view = cx.entity().downgrade();
 
@@ -312,8 +316,13 @@ impl AppState {
             crate::sql::StatementKind::Query => self.open_result("query", sql, cx),
             crate::sql::StatementKind::Write => self.execute_sql(sql, cx),
             crate::sql::StatementKind::Destructive => {
-                self.confirm_exec = Some(sql);
-                cx.notify();
+                // The safety rail is opt-out in settings; when off, run immediately.
+                if self.settings.confirm_destructive {
+                    self.confirm_exec = Some(sql);
+                    cx.notify();
+                } else {
+                    self.execute_sql(sql, cx);
+                }
             }
         }
     }

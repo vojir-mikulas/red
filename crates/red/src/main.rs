@@ -14,6 +14,8 @@ mod editor;
 mod icons;
 mod result;
 mod schema;
+mod settings;
+mod settings_ui;
 mod shell;
 mod sql;
 mod theme;
