@@ -19,7 +19,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use red_core::{
-    Column, ColumnMeta, ExportFormat, ForeignKeyMeta, IndexMeta, ObjectKind, ObjectMeta,
+    Column, ColumnMeta, ExportFormat, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta,
     QueryOptions, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail, Value,
 };
 use std::fs::File;
@@ -295,6 +295,64 @@ impl DatabaseDriver for PostgresDriver {
         })
     }
 
+    async fn fetch_seek(
+        &self,
+        sql: &str,
+        key: &KeySpec,
+        bound: Option<&Value>,
+        descending: bool,
+        limit: usize,
+    ) -> Result<ResultPage> {
+        let col = pg_quote(&key.column);
+        let base = strip_trailing(sql);
+        let (cmp, ord) = if descending {
+            ("<", "DESC")
+        } else {
+            (">", "ASC")
+        };
+        // The placeholder carries an explicit cast: the parameter's wire type is
+        // fixed by the Rust value (i64 → int8), and without the cast Postgres
+        // would infer the column's narrower type (int4) and reject the bind.
+        let sql = match bound {
+            Some(value) => format!(
+                "SELECT * FROM ({base}) AS _red WHERE {col} {cmp} $1{cast} \
+                 ORDER BY {col} {ord} LIMIT {limit}",
+                cast = pg_cast(value)
+            ),
+            None => format!("SELECT * FROM ({base}) AS _red ORDER BY {col} {ord} LIMIT {limit}"),
+        };
+        let (stmt, columns) = self.prepare_columns(&sql).await?;
+        let rows = match bound {
+            Some(Value::Integer(n)) => self.client.query(&stmt, &[n]).await,
+            Some(Value::Real(x)) => self.client.query(&stmt, &[x]).await,
+            Some(Value::Text(s)) => self.client.query(&stmt, &[s]).await,
+            Some(Value::Blob(b)) => self.client.query(&stmt, &[b]).await,
+            Some(Value::Null) => return Err(RedError::Query("null seek bound".into())),
+            None => self.client.query(&stmt, &[]).await,
+        }
+        .map_err(map_pg_err)?;
+        Ok(ResultPage {
+            columns,
+            rows: rows.iter().map(pg_row).collect(),
+        })
+    }
+
+    async fn key_bounds(&self, sql: &str, key: &KeySpec) -> Result<Option<(i64, i64)>> {
+        let col = pg_quote(&key.column);
+        let sql = format!(
+            "SELECT min({col}), max({col}) FROM ({}) AS _red",
+            strip_trailing(sql)
+        );
+        let rows = self.client.query(&sql, &[]).await.map_err(driver_err)?;
+        Ok(rows
+            .first()
+            .map(pg_row)
+            .and_then(|cells| match (cells.first(), cells.get(1)) {
+                (Some(Value::Integer(min)), Some(Value::Integer(max))) => Some((*min, *max)),
+                _ => None,
+            }))
+    }
+
     async fn execute(&self, sql: &str) -> Result<u64> {
         self.client
             .batch_execute("BEGIN")
@@ -408,6 +466,23 @@ impl QueryCursor for PgCursor {
 
     fn cancel_token(&self) -> CancelToken {
         self.cancel.clone()
+    }
+}
+
+/// Double-quote an identifier for interpolation (doubling embedded quotes).
+fn pg_quote(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// The explicit cast for a seek-bound placeholder, from the bound value's wire
+/// type (see `fetch_seek`).
+fn pg_cast(value: &Value) -> &'static str {
+    match value {
+        Value::Integer(_) => "::int8",
+        Value::Real(_) => "::float8",
+        Value::Text(_) => "::text",
+        Value::Blob(_) => "::bytea",
+        Value::Null => "",
     }
 }
 

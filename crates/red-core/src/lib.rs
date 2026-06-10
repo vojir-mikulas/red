@@ -362,6 +362,86 @@ pub struct IndexMeta {
     pub columns: Vec<String>,
 }
 
+/// How a result's rows are keyed for seek (keyset) pagination (M10): a stable,
+/// orderable, effectively-unique column. Present only for a plain table browse
+/// whose introspected detail yields a usable key (see [`KeySpec::from_detail`]);
+/// arbitrary editor SQL has no key and pages by `OFFSET`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeySpec {
+    /// The key column's name, as it appears in the result set.
+    pub column: String,
+    pub kind: KeyKind,
+}
+
+/// Whether the key is numerically interpolable. `Int` keys support key-space
+/// seek (jump to a fraction via `min + f·(max − min)`); `Other` keys still get
+/// keyset scroll but fall back to `OFFSET` for far jumps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    Int,
+    Other,
+}
+
+impl KeySpec {
+    /// Resolve a table's seek key from its introspected detail: a single-column
+    /// primary key, or failing that a single-column unique not-null index.
+    /// `None` (composite or nullable key, or no key at all) means the result
+    /// isn't keyset-eligible and pages by `OFFSET`.
+    pub fn from_detail(detail: &TableDetail) -> Option<KeySpec> {
+        let pks: Vec<&ColumnMeta> = detail.columns.iter().filter(|c| c.primary_key).collect();
+        let candidate = match pks.as_slice() {
+            [single] => Some(*single),
+            [] => detail
+                .indexes
+                .iter()
+                .filter(|i| i.unique && i.columns.len() == 1)
+                .find_map(|i| {
+                    detail
+                        .columns
+                        .iter()
+                        .find(|c| c.name == i.columns[0] && c.not_null)
+                }),
+            _ => None,
+        };
+        let column = candidate?;
+        let kind = if column.type_name.as_deref().is_some_and(is_int_type) {
+            KeyKind::Int
+        } else {
+            KeyKind::Other
+        };
+        // SQLite reports `INTEGER PRIMARY KEY` (the rowid alias, never null) as
+        // nullable, so an integer key passes without `not_null`; any other
+        // nullable key disqualifies keyset (NULLs don't order reliably).
+        (column.not_null || kind == KeyKind::Int).then(|| KeySpec {
+            column: column.name.clone(),
+            kind,
+        })
+    }
+}
+
+/// Whether a declared type names an integer column across the three engines
+/// (`INTEGER`, `bigint`, `int(11)`, `serial`, …). Deliberately a whitelist of
+/// the base token — `interval`/`point` must not match.
+fn is_int_type(type_name: &str) -> bool {
+    let t = type_name.to_ascii_lowercase();
+    let base = t.split(['(', ' ']).next().unwrap_or("");
+    matches!(
+        base,
+        "int"
+            | "integer"
+            | "int2"
+            | "int4"
+            | "int8"
+            | "tinyint"
+            | "smallint"
+            | "mediumint"
+            | "bigint"
+            | "serial"
+            | "smallserial"
+            | "bigserial"
+    )
+}
+
 /// One bounded window of rows pulled from a streaming cursor. The streaming path
 /// never materializes a whole result — it yields these fixed-size windows.
 #[derive(Debug, Clone, Default)]
@@ -428,6 +508,103 @@ pub enum RedError {
 }
 
 pub type Result<T> = std::result::Result<T, RedError>;
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    fn col(name: &str, type_name: &str, not_null: bool, primary_key: bool) -> ColumnMeta {
+        ColumnMeta {
+            name: name.into(),
+            type_name: Some(type_name.into()),
+            not_null,
+            primary_key,
+            default: None,
+        }
+    }
+
+    #[test]
+    fn single_int_pk_is_the_key() {
+        // SQLite-style: INTEGER PRIMARY KEY reports notnull = 0 but still counts.
+        let detail = TableDetail {
+            columns: vec![
+                col("id", "INTEGER", false, true),
+                col("name", "TEXT", true, false),
+            ],
+            ..Default::default()
+        };
+        let key = KeySpec::from_detail(&detail).unwrap();
+        assert_eq!(key.column, "id");
+        assert_eq!(key.kind, KeyKind::Int);
+    }
+
+    #[test]
+    fn text_pk_needs_not_null() {
+        let nullable = TableDetail {
+            columns: vec![col("id", "TEXT", false, true)],
+            ..Default::default()
+        };
+        assert!(KeySpec::from_detail(&nullable).is_none());
+
+        let not_null = TableDetail {
+            columns: vec![col("id", "TEXT", true, true)],
+            ..Default::default()
+        };
+        let key = KeySpec::from_detail(&not_null).unwrap();
+        assert_eq!(key.kind, KeyKind::Other);
+    }
+
+    #[test]
+    fn composite_pk_is_ineligible() {
+        let detail = TableDetail {
+            columns: vec![
+                col("a", "INTEGER", true, true),
+                col("b", "INTEGER", true, true),
+            ],
+            ..Default::default()
+        };
+        assert!(KeySpec::from_detail(&detail).is_none());
+    }
+
+    #[test]
+    fn unique_not_null_index_substitutes_for_a_pk() {
+        let detail = TableDetail {
+            columns: vec![
+                col("email", "varchar", true, false),
+                col("name", "text", false, false),
+            ],
+            indexes: vec![IndexMeta {
+                name: "uq_email".into(),
+                unique: true,
+                columns: vec!["email".into()],
+            }],
+            ..Default::default()
+        };
+        let key = KeySpec::from_detail(&detail).unwrap();
+        assert_eq!(key.column, "email");
+        assert_eq!(key.kind, KeyKind::Other);
+    }
+
+    #[test]
+    fn no_key_at_all_is_ineligible() {
+        let detail = TableDetail {
+            columns: vec![col("x", "INTEGER", true, false)],
+            ..Default::default()
+        };
+        assert!(KeySpec::from_detail(&detail).is_none());
+    }
+
+    #[test]
+    fn int_detection_is_a_whitelist() {
+        assert!(is_int_type("INTEGER"));
+        assert!(is_int_type("bigint"));
+        assert!(is_int_type("int(11) unsigned"));
+        assert!(is_int_type("serial"));
+        assert!(!is_int_type("interval"));
+        assert!(!is_int_type("point"));
+        assert!(!is_int_type("text"));
+    }
+}
 
 #[cfg(test)]
 mod conn_tests {

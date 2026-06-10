@@ -15,8 +15,8 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ExportFormat, QueryOptions, RedError, Result, ResultPage, RowWindow, SchemaMeta,
-    TableDetail,
+    Column, ExportFormat, KeySpec, QueryOptions, RedError, Result, ResultPage, RowWindow,
+    SchemaMeta, TableDetail, Value,
 };
 
 mod format;
@@ -60,6 +60,26 @@ pub trait DatabaseDriver: Send + Sync {
     /// load-on-scroll so memory stays flat: only the pages around the viewport are
     /// ever resident.
     async fn fetch_page(&self, sql: &str, offset: usize, limit: usize) -> Result<ResultPage>;
+
+    /// One keyset (seek) page of `sql`'s result, ordered by `key`: the rows
+    /// strictly after (`descending = false`) or strictly before (`descending =
+    /// true`, returned in reverse order — the caller flips) `bound`; `None`
+    /// starts from the result's first/last row. An indexed seek, so it costs the
+    /// same at row 200 or 46,000,000 — unlike `fetch_page`'s O(offset). `bound`
+    /// is bound as a real parameter, never string-interpolated.
+    async fn fetch_seek(
+        &self,
+        sql: &str,
+        key: &KeySpec,
+        bound: Option<&Value>,
+        descending: bool,
+        limit: usize,
+    ) -> Result<ResultPage>;
+
+    /// `MIN`/`MAX` of `key` over `sql`'s result — one indexed probe, backing
+    /// key-space interpolation for fraction jumps. `None` when the result is
+    /// empty or the key isn't an integer (not interpolable).
+    async fn key_bounds(&self, sql: &str, key: &KeySpec) -> Result<Option<(i64, i64)>>;
 
     /// Run a non-row-returning statement wrapped in a transaction, returning the
     /// number of rows affected. A read-only driver rejects the write at the engine.

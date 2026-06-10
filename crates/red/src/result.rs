@@ -7,7 +7,7 @@
 //! and copy as TSV; clicking a column header sorts (re-running with `ORDER BY`).
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,10 +16,11 @@ use std::path::PathBuf;
 
 use flint::prelude::*;
 use gpui::{
-    div, prelude::*, px, ClipboardItem, Context, Hsla, ScrollHandle, UniformListScrollHandle,
+    div, prelude::*, px, ClipboardItem, Context, Hsla, ScrollHandle, ScrollStrategy,
+    UniformListScrollHandle,
 };
-use red_core::{Column as ResultColumn, ExportFormat, Value};
-use red_service::{Command, CommandSender};
+use red_core::{Column as ResultColumn, ExportFormat, KeySpec, Value};
+use red_service::{Command, CommandSender, RunFetch};
 
 use crate::app::{ActiveConn, AppState, Phase};
 use crate::assets::FONT_MONO;
@@ -36,6 +37,11 @@ const MARGIN: usize = 400;
 /// its resting position. A deliberate drag moves far fewer rows/frame than this.
 const FLING_ROWS: usize = 3 * PAGE;
 
+/// In keyed mode: a viewport landing this far beyond the resident run abandons
+/// run-extension (which would chain seeks across the gap) and jumps — one
+/// key-space interpolated seek that replaces the run.
+const JUMP_GAP: usize = 2 * PAGE;
+
 /// Monotonic id for each opened result. Tags `OpenResult`/`FetchPage` so the
 /// backend can drop stale page fetches and the grid can ignore late replies for
 /// a result it has already replaced (table switch / re-sort). Starts at 1 — `0`
@@ -46,28 +52,317 @@ fn next_epoch() -> u64 {
     NEXT_EPOCH.fetch_add(1, Ordering::Relaxed)
 }
 
-/// The sparse row buffer: absolute row index → cells, plus the set of in-flight
-/// page requests (so the same page isn't fetched twice).
+/// The row buffer behind the grid. Two modes, chosen per open result:
+///
+/// - **Offset** (no seek key — editor SQL, sorted re-opens): a sparse map of
+///   `(offset, limit)` pages, the pre-M10 behavior. Deep pages are O(offset).
+/// - **Keyed** (a table browse with a resolved [`KeySpec`]): one contiguous
+///   *run* of rows extended from its boundary keys by indexed seeks — O(page)
+///   at any depth — and relocated by key-space jumps for far scrolls.
+///
+/// Either way the buffer holds at most ~`2*MARGIN` rows; everything beyond the
+/// viewport margin is evicted each paint.
 #[derive(Default)]
 struct GridBuffer {
-    rows: HashMap<usize, Vec<Value>>,
-    requested: HashSet<usize>,
+    mode: BufferMode,
     /// The previous paint's first visible row, to gauge scroll velocity (see
     /// `FLING_ROWS`). `None` until the first paint.
     last_start: Option<usize>,
 }
 
-impl GridBuffer {
-    /// Drop a freshly-arrived page in and clear its in-flight mark.
-    fn insert_page(&mut self, offset: usize, rows: Vec<Vec<Value>>) {
-        self.requested.remove(&(offset / PAGE));
-        for (i, row) in rows.into_iter().enumerate() {
-            self.rows.insert(offset + i, row);
+enum BufferMode {
+    Offset(OffsetPages),
+    Keyed(KeyedRun),
+}
+
+impl Default for BufferMode {
+    fn default() -> Self {
+        BufferMode::Offset(OffsetPages::default())
+    }
+}
+
+/// Offset mode: absolute row index → cells, plus the set of in-flight page
+/// requests (so the same page isn't fetched twice).
+#[derive(Default)]
+struct OffsetPages {
+    rows: HashMap<usize, Vec<Value>>,
+    requested: HashSet<usize>,
+}
+
+/// Keyed mode: one contiguous run of rows, `anchor..anchor + rows.len()` in
+/// ordinal space. Extension is run-relative — a forward fetch appends rows
+/// strictly after the run's last key, a backward fetch prepends before its
+/// first — so ordinals are counted from the anchor, not refetched by offset.
+struct KeyedRun {
+    /// Index of the key column within a row (for reading boundary keys).
+    key_col: usize,
+    /// Ordinal of the run's first row. Exact after contiguous scroll from a
+    /// known end; an estimate (`estimated`) after an interpolated jump.
+    anchor: usize,
+    rows: VecDeque<Vec<Value>>,
+    /// Ordinals are interpolation estimates (the gutter renders them with `≈`).
+    /// Cleared whenever the run touches a true end of the result, which pins
+    /// the anchor exactly again.
+    estimated: bool,
+    /// The run's first row is the result's true first row.
+    at_start: bool,
+    /// The run's last row is the result's true last row.
+    at_end: bool,
+    /// Monotonic per-request id; a reply whose `seq` isn't the latest in-flight
+    /// one is stale and dropped.
+    seq: u64,
+    pending: Option<u64>,
+    /// Set when the in-flight fetch failed: hold off re-issuing (a
+    /// deterministic error would otherwise retry — and toast — every paint)
+    /// until the viewport moves again.
+    halted: bool,
+}
+
+impl KeyedRun {
+    fn new(key_col: usize) -> Self {
+        Self {
+            key_col,
+            anchor: 0,
+            rows: VecDeque::new(),
+            estimated: false,
+            at_start: false,
+            at_end: false,
+            seq: 0,
+            pending: None,
+            halted: false,
         }
     }
 
-    /// Ensure the pages covering `range` are loaded, evict everything beyond a
-    /// margin around it, and request any missing pages. Called per paint with the
+    fn key_of(&self, row: &[Value]) -> Value {
+        row.get(self.key_col).cloned().unwrap_or(Value::Null)
+    }
+
+    fn first_key(&self) -> Option<Value> {
+        self.rows.front().map(|r| self.key_of(r))
+    }
+
+    fn last_key(&self) -> Option<Value> {
+        self.rows.back().map(|r| self.key_of(r))
+    }
+
+    /// Trim the run to `lo..hi`. Popping an end forfeits its `at_*` flag — the
+    /// run no longer touches that end of the result.
+    fn evict(&mut self, lo: usize, hi: usize) {
+        while self.anchor < lo && !self.rows.is_empty() {
+            self.rows.pop_front();
+            self.anchor += 1;
+            self.at_start = false;
+        }
+        while self.anchor + self.rows.len() > hi && !self.rows.is_empty() {
+            self.rows.pop_back();
+            self.at_end = false;
+        }
+    }
+
+    fn issue(&mut self, fetch: RunFetch, epoch: u64, sender: &CommandSender) {
+        self.seq += 1;
+        self.pending = Some(self.seq);
+        sender.send(Command::FetchRun {
+            epoch,
+            fetch,
+            limit: PAGE,
+            seq: self.seq,
+        });
+    }
+
+    /// Issue (at most) one fetch toward covering `range` plus its margins. One
+    /// request in flight at a time — a seek's start is the previous reply's
+    /// boundary key, so they can't pipeline anyway.
+    fn request(&mut self, range: Range<usize>, total: usize, epoch: u64, sender: &CommandSender) {
+        if self.pending.is_some() || self.halted {
+            return;
+        }
+        let lo = range.start.saturating_sub(MARGIN);
+        let hi = (range.end + MARGIN).min(total);
+
+        if self.rows.is_empty() {
+            if range.start == 0 {
+                self.issue(RunFetch::Forward { after: None }, epoch, sender);
+            } else if !self.at_end {
+                // `at_end` with no rows means a jump found nothing there (the
+                // data shrank under the estimate) — don't re-jump every paint.
+                self.issue(
+                    RunFetch::Jump {
+                        ordinal: range.start,
+                    },
+                    epoch,
+                    sender,
+                );
+            }
+            return;
+        }
+
+        let run_start = self.anchor;
+        let run_end = self.anchor + self.rows.len();
+
+        // Far from the run → relocate it rather than chain seeks across the gap.
+        if range.start >= run_end + JUMP_GAP || range.end + JUMP_GAP <= run_start {
+            self.issue(
+                RunFetch::Jump {
+                    ordinal: range.start,
+                },
+                epoch,
+                sender,
+            );
+            return;
+        }
+
+        let need_fwd = run_end < hi && !self.at_end;
+        let need_back = run_start > lo && !self.at_start;
+        // The direction still uncovered inside the viewport goes first; margins
+        // prefetch after.
+        let fetch = if range.start < run_start && need_back {
+            self.first_key().map(|before| RunFetch::Backward { before })
+        } else if need_fwd {
+            self.last_key()
+                .map(|after| RunFetch::Forward { after: Some(after) })
+        } else if need_back {
+            self.first_key().map(|before| RunFetch::Backward { before })
+        } else {
+            None
+        };
+        if let Some(fetch) = fetch {
+            self.issue(fetch, epoch, sender);
+        }
+    }
+
+    /// Land one `ResultRunLoaded` reply. The echoed `seq` must be the in-flight
+    /// one and (for extensions) the echoed boundary must still be the run's —
+    /// eviction may have moved it since the request, in which case the reply is
+    /// dropped and the next paint re-requests from the new boundary.
+    fn apply(
+        &mut self,
+        fetch: RunFetch,
+        rows: Vec<Vec<Value>>,
+        estimated: bool,
+        seq: u64,
+        total: usize,
+    ) {
+        if self.pending != Some(seq) {
+            return;
+        }
+        self.pending = None;
+        let n = rows.len();
+        let short = n < PAGE;
+        match fetch {
+            RunFetch::Forward { after } => {
+                if after != self.last_key() {
+                    return;
+                }
+                if self.rows.is_empty() {
+                    // Seeded from the result's start: ordinal 0, exact.
+                    self.anchor = 0;
+                    self.at_start = true;
+                    self.estimated = false;
+                }
+                self.rows.extend(rows);
+                self.at_end = short;
+                if short {
+                    // The run now touches the true last row, so its ordinals
+                    // count back from `total` — exact again.
+                    self.anchor = total.saturating_sub(self.rows.len());
+                    self.estimated = false;
+                }
+            }
+            RunFetch::Backward { before } => {
+                if self.rows.is_empty() || Some(before) != self.first_key() {
+                    return;
+                }
+                // Rows arrive descending; pushing each to the front restores
+                // ascending order.
+                for row in rows {
+                    self.rows.push_front(row);
+                }
+                self.anchor = self.anchor.saturating_sub(n);
+                if short || self.anchor == 0 {
+                    // Touched the true first row: pin the anchor at 0, exact.
+                    self.at_start = true;
+                    self.anchor = 0;
+                    self.estimated = false;
+                }
+            }
+            RunFetch::Jump { ordinal } => {
+                self.rows = rows.into();
+                self.at_end = short;
+                self.estimated = estimated;
+                self.anchor = if short {
+                    self.estimated = false;
+                    total.saturating_sub(self.rows.len())
+                } else {
+                    ordinal.min(total.saturating_sub(self.rows.len()))
+                };
+                self.at_start = self.anchor == 0;
+            }
+        }
+    }
+}
+
+impl GridBuffer {
+    /// The cells at ordinal `ix`, if resident.
+    fn row(&self, ix: usize) -> Option<&Vec<Value>> {
+        match &self.mode {
+            BufferMode::Offset(pages) => pages.rows.get(&ix),
+            BufferMode::Keyed(run) => ix.checked_sub(run.anchor).and_then(|i| run.rows.get(i)),
+        }
+    }
+
+    /// Whether the resident rows' ordinals are interpolation estimates.
+    fn is_estimated(&self) -> bool {
+        match &self.mode {
+            BufferMode::Offset(_) => false,
+            BufferMode::Keyed(run) => run.estimated,
+        }
+    }
+
+    /// Whether this result pages by keyset runs (vs. `OFFSET`) — shown in the
+    /// footer so the active paging mode is visible at a glance.
+    fn is_keyed(&self) -> bool {
+        matches!(&self.mode, BufferMode::Keyed(_))
+    }
+
+    /// The in-flight run fetch failed: free the slot so fetching can resume,
+    /// but hold off until the viewport moves (see `KeyedRun::halted`).
+    fn run_failed(&mut self, seq: u64) {
+        if let BufferMode::Keyed(run) = &mut self.mode {
+            if run.pending == Some(seq) {
+                run.pending = None;
+                run.halted = true;
+            }
+        }
+    }
+
+    /// Drop a freshly-arrived `OFFSET` page in and clear its in-flight mark.
+    /// A no-op in keyed mode (keyed grids never request pages).
+    fn insert_page(&mut self, offset: usize, rows: Vec<Vec<Value>>) {
+        if let BufferMode::Offset(pages) = &mut self.mode {
+            pages.requested.remove(&(offset / PAGE));
+            for (i, row) in rows.into_iter().enumerate() {
+                pages.rows.insert(offset + i, row);
+            }
+        }
+    }
+
+    /// Land a keyset run reply (keyed mode only).
+    fn apply_run(
+        &mut self,
+        fetch: RunFetch,
+        rows: Vec<Vec<Value>>,
+        estimated: bool,
+        seq: u64,
+        total: usize,
+    ) {
+        if let BufferMode::Keyed(run) = &mut self.mode {
+            run.apply(fetch, rows, estimated, seq, total);
+        }
+    }
+
+    /// Ensure the rows covering `range` are loaded (or requested), evicting
+    /// everything beyond a margin around it. Called per paint with the
     /// about-to-render window, so the buffer tracks the viewport.
     ///
     /// Returns `false` when fetching was skipped because the viewport is flinging
@@ -82,17 +377,30 @@ impl GridBuffer {
     ) -> bool {
         let lo = range.start.saturating_sub(MARGIN);
         let hi = (range.end + MARGIN).min(total);
-        self.rows.retain(|k, _| *k >= lo && *k < hi);
-        self.requested
-            .retain(|p| p * PAGE + PAGE > lo && p * PAGE < hi);
+        match &mut self.mode {
+            BufferMode::Offset(pages) => {
+                pages.rows.retain(|k, _| *k >= lo && *k < hi);
+                pages
+                    .requested
+                    .retain(|p| p * PAGE + PAGE > lo && p * PAGE < hi);
+            }
+            BufferMode::Keyed(run) => run.evict(lo, hi),
+        }
 
         if range.is_empty() {
             return true;
         }
 
+        // A failed fetch halts re-issuing; movement is the retry signal.
+        if let BufferMode::Keyed(run) = &mut self.mode {
+            if run.halted && self.last_start != Some(range.start) {
+                run.halted = false;
+            }
+        }
+
         // While the viewport is flying past rows the user won't dwell on, don't
-        // spawn a (potentially expensive deep-`OFFSET`) fetch for each one; wait
-        // until the scroll slows near its destination.
+        // spawn a fetch for each one; wait until the scroll slows near its
+        // destination.
         let settled = self
             .last_start
             .is_none_or(|prev| range.start.abs_diff(prev) <= FLING_ROWS);
@@ -101,6 +409,17 @@ impl GridBuffer {
             return false;
         }
 
+        match &mut self.mode {
+            BufferMode::Offset(pages) => pages.request(range, total, epoch, sender),
+            BufferMode::Keyed(run) => run.request(range, total, epoch, sender),
+        }
+        true
+    }
+}
+
+impl OffsetPages {
+    /// Request any missing pages covering `range` (the pre-M10 path).
+    fn request(&mut self, range: Range<usize>, total: usize, epoch: u64, sender: &CommandSender) {
         let first = range.start / PAGE;
         let last = (range.end - 1) / PAGE;
         for page in first..=last {
@@ -119,7 +438,6 @@ impl GridBuffer {
                 epoch,
             });
         }
-        true
     }
 }
 
@@ -136,17 +454,28 @@ pub(crate) struct ResultGrid {
     /// `(data column, ascending)` — `None` is unsorted.
     sort: Option<(usize, bool)>,
     selection: Option<CellRange>,
+    /// The `(schema, table)` this result browses, when it's a plain table
+    /// preview — sent with `OpenResult` so the backend can resolve a seek key.
+    /// `None` for editor SQL and for sorted re-opens (which wrap the SQL).
+    table: Option<(String, String)>,
     buffer: Rc<RefCell<GridBuffer>>,
     sender: CommandSender,
     scroll: UniformListScrollHandle,
     h_scroll: ScrollHandle,
+    /// The overlay scrollbar's in-flight drag (M10 Phase 3).
+    scrollbar: ScrollbarState,
     /// Identifies the current open SQL; bumped on every (re)open so stale page
     /// fetches and late `ResultReady`/`ResultPageLoaded` replies are ignored.
     pub(crate) epoch: u64,
 }
 
 impl ResultGrid {
-    pub fn new(label: String, base_sql: String, sender: CommandSender) -> Self {
+    pub fn new(
+        label: String,
+        base_sql: String,
+        table: Option<(String, String)>,
+        sender: CommandSender,
+    ) -> Self {
         Self {
             label,
             base_sql,
@@ -156,10 +485,12 @@ impl ResultGrid {
             error: None,
             sort: None,
             selection: None,
+            table,
             buffer: Rc::new(RefCell::new(GridBuffer::default())),
             sender,
             scroll: UniformListScrollHandle::new(),
             h_scroll: ScrollHandle::new(),
+            scrollbar: ScrollbarState::new(),
             epoch: next_epoch(),
         }
     }
@@ -187,17 +518,24 @@ impl ResultGrid {
             .filter(|_| self.error.is_none())
     }
 
-    fn on_ready(&mut self, columns: Vec<ResultColumn>, total: usize) {
+    /// Install the open result's metadata and reset the buffer into the right
+    /// mode: keyed when the backend resolved a seek key that names a result
+    /// column, offset otherwise.
+    fn on_ready(&mut self, columns: Vec<ResultColumn>, total: usize, key: Option<KeySpec>) {
+        let key_col = key.and_then(|k| columns.iter().position(|c| c.name == k.column));
         self.columns = columns;
         self.total = total;
         self.ready = true;
         self.error = None;
+        let mut buffer = self.buffer.borrow_mut();
+        *buffer = GridBuffer::default();
+        if let Some(key_col) = key_col {
+            buffer.mode = BufferMode::Keyed(KeyedRun::new(key_col));
+        }
     }
 
     fn reset_buffer(&mut self) {
-        let mut buffer = self.buffer.borrow_mut();
-        buffer.rows.clear();
-        buffer.requested.clear();
+        *self.buffer.borrow_mut() = GridBuffer::default();
     }
 
     /// The current selection as TSV (NULL → empty), skipping the gutter column.
@@ -220,7 +558,7 @@ impl ResultGrid {
                 if i > 0 {
                     out.push('\t');
                 }
-                if let Some(value) = buffer.rows.get(&r).and_then(|row| row.get(dcol)) {
+                if let Some(value) = buffer.row(r).and_then(|row| row.get(dcol)) {
                     out.push_str(&cell_string(value));
                 }
             }
@@ -318,42 +656,76 @@ fn render_cell(value: Option<&Value>, c: CellColors) -> gpui::AnyElement {
 
 impl AppState {
     /// Open `base_sql` as the grid's result (preview or editor run). Resets sort +
-    /// selection and asks the backend for the row count + columns.
+    /// selection and asks the backend for the row count + columns. `table` names
+    /// the browsed `(schema, table)` for a plain preview, so the backend can
+    /// resolve a keyset seek key; editor runs pass `None`.
     pub(crate) fn open_result(
         &mut self,
         label: impl Into<String>,
         base_sql: String,
+        table: Option<(String, String)>,
         cx: &mut Context<Self>,
     ) {
         let sender = self.service.command_sender();
         let opened = match &mut self.phase {
             Phase::Connected(active) => {
-                let grid = ResultGrid::new(label.into(), base_sql, sender);
-                let opened = (grid.effective_sql(), grid.epoch);
+                let grid = ResultGrid::new(label.into(), base_sql, table, sender);
+                let opened = (grid.effective_sql(), grid.epoch, grid.table.clone());
                 active.active_mut().result = Some(grid);
                 opened
             }
             _ => return,
         };
-        let (sql, epoch) = opened;
-        self.service.send(Command::OpenResult { sql, epoch });
+        let (sql, epoch, table) = opened;
+        self.service.send(Command::OpenResult { sql, epoch, table });
         cx.notify();
     }
 
-    /// Backend reported the open result's columns + total.
+    /// Backend reported the open result's columns + total (+ resolved seek key).
     pub(crate) fn on_result_ready(
         &mut self,
         columns: Vec<ResultColumn>,
         total: usize,
         epoch: u64,
+        key: Option<KeySpec>,
         cx: &mut Context<Self>,
     ) {
         if let Phase::Connected(active) = &mut self.phase {
             // Route by epoch: the result may belong to a background tab. A late
             // reply for a replaced/closed result finds no match and is dropped.
             if let Some(grid) = active.result_by_epoch(epoch) {
-                grid.reset_buffer();
-                grid.on_ready(columns, total);
+                grid.on_ready(columns, total, key);
+            }
+        }
+        cx.notify();
+    }
+
+    /// A keyset run fetch failed — free the grid's in-flight slot so scrolling
+    /// can fetch again (the error itself arrives separately as a toast).
+    pub(crate) fn on_result_run_failed(&mut self, epoch: u64, seq: u64) {
+        if let Phase::Connected(active) = &mut self.phase {
+            if let Some(grid) = active.result_by_epoch(epoch) {
+                grid.buffer.borrow_mut().run_failed(seq);
+            }
+        }
+    }
+
+    /// A keyset run window arrived — extend/relocate the grid's run and repaint.
+    pub(crate) fn on_result_run(
+        &mut self,
+        epoch: u64,
+        fetch: RunFetch,
+        rows: Vec<Vec<Value>>,
+        estimated: bool,
+        seq: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if let Phase::Connected(active) = &mut self.phase {
+            if let Some(grid) = active.result_by_epoch(epoch) {
+                let total = grid.total;
+                grid.buffer
+                    .borrow_mut()
+                    .apply_run(fetch, rows, estimated, seq, total);
             }
         }
         cx.notify();
@@ -417,7 +789,13 @@ impl AppState {
         if let Some((sql, epoch, old_epoch)) = reopen {
             // Evict the superseded SQL so the backend's result map can't grow.
             self.service.send(Command::CloseResult { epoch: old_epoch });
-            self.service.send(Command::OpenResult { sql, epoch });
+            // No `table`: sorted SQL isn't ordered by the PK, so it pages by
+            // `OFFSET` (composite `(sort_col, pk)` seek is a later milestone).
+            self.service.send(Command::OpenResult {
+                sql,
+                epoch,
+                table: None,
+            });
         }
         cx.notify();
     }
@@ -658,14 +1036,16 @@ impl AppState {
             })
             .render_row(move |ix, _, _| {
                 let mut out = Vec::with_capacity(ncols + 1);
-                out.push(
-                    div()
-                        .text_color(faint)
-                        .child(group_digits(ix + 1))
-                        .into_any_element(),
-                );
                 let buffer = buffer_row.borrow();
-                match buffer.rows.get(&ix) {
+                // After an interpolated jump the run's ordinals are estimates;
+                // the gutter marks them `≈` until a true end pins them exact.
+                let gutter = if buffer.is_estimated() {
+                    format!("≈{}", group_digits(ix + 1))
+                } else {
+                    group_digits(ix + 1)
+                };
+                out.push(div().text_color(faint).child(gutter).into_any_element());
+                match buffer.row(ix) {
                     Some(row) => {
                         for c in 0..ncols {
                             out.push(render_cell(row.get(c), cell_colors));
@@ -698,11 +1078,230 @@ impl AppState {
             .child(div().text_color(dim).child("rows"))
             .child(div().text_color(border_soft).child("·"))
             .child(div().text_color(dim).child(format!("{ncols} columns")))
+            .child(div().text_color(border_soft).child("·"))
+            // Which paging mode this result got (keyset = seek key resolved;
+            // offset = the O(offset) fallback) — the at-a-glance diagnostic.
+            .child(
+                div()
+                    .text_color(dim)
+                    .child(if grid.buffer.borrow().is_keyed() {
+                        "keyset"
+                    } else {
+                        "offset"
+                    }),
+            )
             .child(div().ml_auto().text_color(dim).child(grid.label.clone()));
+
+        // The draggable, fraction-mapped scrollbar (M10 Phase 3): the thumb
+        // mirrors the list's position; a scrub jumps the viewport, and the
+        // buffer's `ensure` turns the far jump into one key-space seek (keyed
+        // results) or one OFFSET page (fallback).
+        let scrub_scroll = grid.scroll.clone();
+        let scrub_view = view.clone();
+        let scrollbar = Scrollbar::new("result-scrollbar", &grid.scrollbar)
+            .track_list(&grid.scroll)
+            .on_scrub(move |fraction, _, cx| {
+                let target = (fraction as f64 * total.saturating_sub(1) as f64).round() as usize;
+                scrub_scroll.scroll_to_item_strict(target, ScrollStrategy::Top);
+                scrub_view.update(cx, |_, cx| cx.notify()).ok();
+            });
 
         container
             .child(toolbar)
-            .child(div().flex_1().min_h(px(0.)).bg(bg_app).child(table))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .bg(bg_app)
+                    .relative()
+                    .child(table)
+                    .child(scrollbar),
+            )
             .child(footer)
+    }
+}
+
+#[cfg(test)]
+mod keyed_run_tests {
+    use super::*;
+
+    /// A run row whose key (column 0) is `id`.
+    fn row(id: i64) -> Vec<Value> {
+        vec![Value::Integer(id), Value::Text(format!("row {id}"))]
+    }
+
+    fn rows(ids: impl IntoIterator<Item = i64>) -> Vec<Vec<Value>> {
+        ids.into_iter().map(row).collect()
+    }
+
+    /// A run pretending its in-flight request is `seq` (as `issue` would set).
+    fn pending(mut run: KeyedRun, seq: u64) -> KeyedRun {
+        run.seq = seq;
+        run.pending = Some(seq);
+        run
+    }
+
+    const TOTAL: usize = 10_000;
+
+    #[test]
+    fn forward_from_start_is_exact() {
+        let mut run = pending(KeyedRun::new(0), 1);
+        run.apply(
+            RunFetch::Forward { after: None },
+            rows(1..=PAGE as i64),
+            false,
+            1,
+            TOTAL,
+        );
+        assert_eq!(run.anchor, 0);
+        assert!(run.at_start && !run.at_end && !run.estimated);
+        assert_eq!(run.rows.len(), PAGE);
+
+        // Extend forward from the boundary key.
+        run = pending(run, 2);
+        run.apply(
+            RunFetch::Forward {
+                after: Some(Value::Integer(PAGE as i64)),
+            },
+            rows(PAGE as i64 + 1..=2 * PAGE as i64),
+            false,
+            2,
+            TOTAL,
+        );
+        assert_eq!(run.rows.len(), 2 * PAGE);
+        assert_eq!(run.anchor, 0);
+    }
+
+    #[test]
+    fn short_forward_pins_the_run_to_the_end() {
+        let mut run = pending(KeyedRun::new(0), 1);
+        // An estimated run near the bottom gets a short (final) page: the
+        // anchor re-pins so the run ends exactly at `total`.
+        run.anchor = 9_950;
+        run.estimated = true;
+        run.rows = rows(99_001..=99_010).into();
+        run.apply(
+            RunFetch::Forward {
+                after: Some(Value::Integer(99_010)),
+            },
+            rows(99_011..=99_015), // short: the result ends here
+            false,
+            1,
+            TOTAL,
+        );
+        assert!(run.at_end);
+        assert!(!run.estimated, "touching the true end makes ordinals exact");
+        assert_eq!(run.anchor + run.rows.len(), TOTAL);
+    }
+
+    #[test]
+    fn backward_prepends_descending_rows_in_order() {
+        let mut run = pending(KeyedRun::new(0), 1);
+        run.anchor = 500;
+        run.rows = rows(501..=700).into();
+        let page = 501 - PAGE as i64..=500;
+        run.apply(
+            RunFetch::Backward {
+                before: Value::Integer(501),
+            },
+            rows(page.rev()), // a full page, arriving descending: 500, 499, …
+            false,
+            1,
+            TOTAL,
+        );
+        assert_eq!(run.anchor, 500 - PAGE);
+        assert!(!run.at_start, "a full page doesn't touch the start");
+        let head: Vec<_> = run.rows.iter().take(2).map(|r| r[0].clone()).collect();
+        assert_eq!(
+            head,
+            vec![
+                Value::Integer(501 - PAGE as i64),
+                Value::Integer(502 - PAGE as i64)
+            ]
+        );
+        // The run stays contiguous across the seam.
+        assert_eq!(run.rows[PAGE - 1][0], Value::Integer(500));
+        assert_eq!(run.rows[PAGE][0], Value::Integer(501));
+    }
+
+    #[test]
+    fn short_backward_pins_the_run_to_the_start() {
+        let mut run = pending(KeyedRun::new(0), 1);
+        run.anchor = 80; // estimate was high — only 3 rows actually precede
+        run.estimated = true;
+        run.rows = rows(4..=10).into();
+        run.apply(
+            RunFetch::Backward {
+                before: Value::Integer(4),
+            },
+            rows((1..=3).rev()),
+            false,
+            1,
+            TOTAL,
+        );
+        assert!(run.at_start && !run.estimated);
+        assert_eq!(run.anchor, 0);
+    }
+
+    #[test]
+    fn jump_replaces_the_run_with_estimated_ordinals() {
+        let mut run = pending(KeyedRun::new(0), 1);
+        run.anchor = 0;
+        run.rows = rows(1..=200).into();
+        run.apply(
+            RunFetch::Jump { ordinal: 6_700 },
+            rows(66_000..66_000 + PAGE as i64),
+            true,
+            1,
+            TOTAL,
+        );
+        assert_eq!(run.anchor, 6_700);
+        assert!(run.estimated && !run.at_start && !run.at_end);
+        assert_eq!(run.rows.len(), PAGE);
+    }
+
+    #[test]
+    fn stale_replies_are_dropped() {
+        let mut run = pending(KeyedRun::new(0), 2);
+        run.rows = rows(1..=10).into();
+
+        // Wrong seq: a reply for a superseded request.
+        run.apply(
+            RunFetch::Jump { ordinal: 50 },
+            rows(51..=60),
+            true,
+            1,
+            TOTAL,
+        );
+        assert_eq!(run.anchor, 0);
+        assert_eq!(run.rows.len(), 10);
+
+        // Right seq but the boundary moved (eviction): dropped too.
+        run = pending(run, 3);
+        run.apply(
+            RunFetch::Forward {
+                after: Some(Value::Integer(999)),
+            },
+            rows(1_000..=1_004),
+            false,
+            3,
+            TOTAL,
+        );
+        assert_eq!(run.rows.len(), 10, "mismatched boundary reply is dropped");
+        assert!(run.pending.is_none(), "but the in-flight slot frees up");
+    }
+
+    #[test]
+    fn eviction_trims_the_run_and_forfeits_end_flags() {
+        let mut run = KeyedRun::new(0);
+        run.anchor = 0;
+        run.at_start = true;
+        run.rows = rows(1..=1000).into();
+        run.evict(300, 800);
+        assert_eq!(run.anchor, 300);
+        assert_eq!(run.rows.len(), 500);
+        assert!(!run.at_start && !run.at_end);
+        assert_eq!(run.first_key(), Some(Value::Integer(301)));
+        assert_eq!(run.last_key(), Some(Value::Integer(800)));
     }
 }

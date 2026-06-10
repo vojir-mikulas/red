@@ -318,12 +318,22 @@ impl AppState {
                 columns,
                 total,
                 epoch,
-            } => self.on_result_ready(columns, total, epoch, cx),
+                key,
+            } => self.on_result_ready(columns, total, epoch, key, cx),
             Event::ResultPageLoaded {
                 offset,
                 rows,
                 epoch,
             } => self.on_result_page(offset, rows, epoch, cx),
+            // Keyset runs (M10): extend/relocate a grid's resident row run.
+            Event::ResultRunLoaded {
+                epoch,
+                fetch,
+                rows,
+                estimated,
+                seq,
+            } => self.on_result_run(epoch, fetch, rows, estimated, seq, cx),
+            Event::ResultRunFailed { epoch, seq } => self.on_result_run_failed(epoch, seq),
 
             // --- export & writes (M6) ---
             Event::Executed { affected } => {

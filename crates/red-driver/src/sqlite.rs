@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ColumnMeta, ExportFormat, ForeignKeyMeta, IndexMeta, ObjectKind, ObjectMeta,
+    Column, ColumnMeta, ExportFormat, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta,
     QueryOptions, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail, Value,
 };
 use rusqlite::types::ValueRef;
@@ -144,9 +144,60 @@ impl DatabaseDriver for SqliteDriver {
             "SELECT * FROM ({}) LIMIT {limit} OFFSET {offset}",
             strip_trailing(sql)
         );
-        tokio::task::spawn_blocking(move || fetch_page_blocking(&path, read_only, &sql))
+        tokio::task::spawn_blocking(move || fetch_page_blocking(&path, read_only, &sql, Vec::new()))
             .await
             .map_err(driver_err)?
+    }
+
+    async fn fetch_seek(
+        &self,
+        sql: &str,
+        key: &KeySpec,
+        bound: Option<&Value>,
+        descending: bool,
+        limit: usize,
+    ) -> Result<ResultPage> {
+        let path = self.path.clone();
+        let read_only = self.read_only;
+        let col = quote_ident(&key.column);
+        let base = strip_trailing(sql);
+        let (cmp, ord) = if descending {
+            ("<", "DESC")
+        } else {
+            (">", "ASC")
+        };
+        let sql = match bound {
+            Some(_) => format!(
+                "SELECT * FROM ({base}) WHERE {col} {cmp} ? ORDER BY {col} {ord} LIMIT {limit}"
+            ),
+            None => format!("SELECT * FROM ({base}) ORDER BY {col} {ord} LIMIT {limit}"),
+        };
+        let params: Vec<rusqlite::types::Value> = bound.into_iter().map(to_sqlite).collect();
+        tokio::task::spawn_blocking(move || fetch_page_blocking(&path, read_only, &sql, params))
+            .await
+            .map_err(driver_err)?
+    }
+
+    async fn key_bounds(&self, sql: &str, key: &KeySpec) -> Result<Option<(i64, i64)>> {
+        let path = self.path.clone();
+        let read_only = self.read_only;
+        let col = quote_ident(&key.column);
+        let sql = format!(
+            "SELECT min({col}), max({col}) FROM ({})",
+            strip_trailing(sql)
+        );
+        tokio::task::spawn_blocking(move || {
+            let conn = SqliteDriver::open(&path, read_only)?;
+            conn.query_row(&sql, [], |row| {
+                Ok(match (row.get_ref(0)?, row.get_ref(1)?) {
+                    (ValueRef::Integer(min), ValueRef::Integer(max)) => Some((min, max)),
+                    _ => None,
+                })
+            })
+            .map_err(driver_err)
+        })
+        .await
+        .map_err(driver_err)?
     }
 
     async fn execute(&self, sql: &str) -> Result<u64> {
@@ -313,7 +364,24 @@ fn strip_trailing(sql: &str) -> &str {
     sql.trim().strip_suffix(';').unwrap_or(sql.trim()).trim()
 }
 
-fn fetch_page_blocking(path: &Path, read_only: bool, sql: &str) -> Result<ResultPage> {
+/// A cell value as a bindable SQLite parameter (for seek bounds).
+fn to_sqlite(value: &Value) -> rusqlite::types::Value {
+    use rusqlite::types::Value as Sq;
+    match value {
+        Value::Null => Sq::Null,
+        Value::Integer(n) => Sq::Integer(*n),
+        Value::Real(x) => Sq::Real(*x),
+        Value::Text(s) => Sq::Text(s.clone()),
+        Value::Blob(b) => Sq::Blob(b.clone()),
+    }
+}
+
+fn fetch_page_blocking(
+    path: &Path,
+    read_only: bool,
+    sql: &str,
+    params: Vec<rusqlite::types::Value>,
+) -> Result<ResultPage> {
     let conn = SqliteDriver::open(path, read_only)?;
     let mut stmt = conn.prepare(sql).map_err(driver_err)?;
     let column_count = stmt.column_count();
@@ -325,7 +393,9 @@ fn fetch_page_blocking(path: &Path, read_only: bool, sql: &str) -> Result<Result
             decl_type: c.decl_type().map(|t| t.to_string()),
         })
         .collect();
-    let mut rows_iter = stmt.query([]).map_err(driver_err)?;
+    let mut rows_iter = stmt
+        .query(rusqlite::params_from_iter(params))
+        .map_err(driver_err)?;
     let mut rows = Vec::new();
     while let Some(row) = rows_iter.next().map_err(map_step_err)? {
         rows.push(extract_row(row, column_count)?);
@@ -801,6 +871,67 @@ mod tests {
         for p in [path, csv_path, json_path] {
             std::fs::remove_file(p).ok();
         }
+    }
+
+    #[tokio::test]
+    async fn seeks_forward_backward_and_reads_bounds() {
+        use red_core::KeyKind;
+        let path = temp_db_path("seek");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+                 WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 1000)
+                 INSERT INTO t SELECT x, 'row ' || x FROM c;",
+            )
+            .unwrap();
+        }
+        let driver = SqliteDriver::new(&path, true);
+        let key = KeySpec {
+            column: "id".into(),
+            kind: KeyKind::Int,
+        };
+        let sql = "SELECT * FROM t";
+
+        // First page: no bound, ascending from the start.
+        let first = driver.fetch_seek(sql, &key, None, false, 5).await.unwrap();
+        assert_eq!(first.rows.len(), 5);
+        assert_eq!(first.rows[0][0], Value::Integer(1));
+
+        // Forward: strictly after a bound.
+        let fwd = driver
+            .fetch_seek(sql, &key, Some(&Value::Integer(997)), false, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            fwd.rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+            vec![
+                Value::Integer(998),
+                Value::Integer(999),
+                Value::Integer(1000)
+            ]
+        );
+
+        // Backward: strictly before a bound, returned descending.
+        let back = driver
+            .fetch_seek(sql, &key, Some(&Value::Integer(4)), true, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            back.rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+            vec![Value::Integer(3), Value::Integer(2), Value::Integer(1)]
+        );
+
+        assert_eq!(driver.key_bounds(sql, &key).await.unwrap(), Some((1, 1000)));
+
+        // A non-integer key has no interpolable bounds.
+        let text_key = KeySpec {
+            column: "name".into(),
+            kind: KeyKind::Other,
+        };
+        assert_eq!(driver.key_bounds(sql, &text_key).await.unwrap(), None);
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[tokio::test]

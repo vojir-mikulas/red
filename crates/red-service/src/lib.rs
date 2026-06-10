@@ -16,13 +16,13 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use red_core::{
-    Column, ConnectionConfig, DbKind, ExportFormat, QueryOptions, RedError, RowWindow, SchemaMeta,
-    TableDetail,
+    Column, ConnectionConfig, DbKind, ExportFormat, KeyKind, KeySpec, QueryOptions, RedError,
+    RowWindow, SchemaMeta, TableDetail, Value,
 };
 use red_driver::{
     CancelToken, DatabaseDriver, MysqlDriver, PostgresDriver, QueryCursor, SqliteDriver,
@@ -63,14 +63,21 @@ pub enum Command {
         table: String,
     },
     /// Open `sql` as a grid result: count its rows and report column metadata +
-    /// the total. The result is then browsed page-by-page via `FetchPage`.
+    /// the total. The result is then browsed page-by-page via `FetchPage`, or —
+    /// when a seek key resolves — run-by-run via `FetchRun`.
     ///
     /// `epoch` identifies this open result. Several results can be open at once
     /// (one per query tab), each keyed by its epoch; a page or export names the
     /// epoch it wants. `CloseResult` drops one when its tab closes.
+    ///
+    /// `table` names the `(schema, table)` when `sql` is a plain table browse:
+    /// the backend introspects it for a keyset seek key (single-column PK or
+    /// unique not-null index) and echoes the resolved [`KeySpec`] in
+    /// `ResultReady`. `None` (editor SQL, sorted re-opens) pages by `OFFSET`.
     OpenResult {
         sql: String,
         epoch: u64,
+        table: Option<(String, String)>,
     },
     /// Fetch one random-access page of an open result (grid load-on-scroll).
     /// `epoch` selects which open result; an unknown epoch is ignored (the tab
@@ -79,6 +86,16 @@ pub enum Command {
         offset: usize,
         limit: usize,
         epoch: u64,
+    },
+    /// Fetch one run window of a keyset-keyed open result (M10): extend the
+    /// grid's resident run from a boundary key, or jump to an ordinal. Replied
+    /// with `ResultRunLoaded`, echoing `fetch`/`seq` so the grid can drop a
+    /// reply its buffer has moved past.
+    FetchRun {
+        epoch: u64,
+        fetch: RunFetch,
+        limit: usize,
+        seq: u64,
     },
     /// Drop an open result (its query tab closed, or it was re-sorted into a new
     /// epoch). Unknown epochs are a no-op.
@@ -147,11 +164,14 @@ pub enum Event {
     },
     /// A result opened: its columns and total row count (for `OpenResult`).
     /// Echoes the open `epoch` so the grid can ignore a late reply for a result
-    /// it has already replaced.
+    /// it has already replaced. `key` is the seek key the backend resolved for
+    /// a table browse — present, the grid pages by keyset runs (`FetchRun`)
+    /// instead of `OFFSET`.
     ResultReady {
         columns: Vec<Column>,
         total: usize,
         epoch: u64,
+        key: Option<KeySpec>,
     },
     /// One page of the open result. Echoes `offset` so the grid drops it into the
     /// right slot of its window buffer regardless of arrival order, and `epoch`
@@ -160,6 +180,25 @@ pub enum Event {
         offset: usize,
         rows: Vec<Vec<red_core::Value>>,
         epoch: u64,
+    },
+    /// One run window of a keyset result, in response to `FetchRun`. Echoes the
+    /// request (`fetch`, `seq`) so the grid can match it against its in-flight
+    /// state. `estimated` is `true` when a `Jump` landed by key-space
+    /// interpolation — its ordinals are approximate until the run touches a
+    /// true end of the result.
+    ResultRunLoaded {
+        epoch: u64,
+        fetch: RunFetch,
+        rows: Vec<Vec<red_core::Value>>,
+        estimated: bool,
+        seq: u64,
+    },
+    /// A `FetchRun` failed (the error itself is also surfaced via `Error`).
+    /// Echoed so the grid can free its in-flight slot — without this a single
+    /// failed seek would wedge the run buffer and freeze all further fetching.
+    ResultRunFailed {
+        epoch: u64,
+        seq: u64,
     },
     /// A write/DDL statement committed; `affected` rows changed.
     Executed {
@@ -172,6 +211,37 @@ pub enum Event {
     },
     Error(String),
 }
+
+/// One `FetchRun` shape: how to extend or relocate the grid's resident run of
+/// a keyset-keyed result.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunFetch {
+    /// Rows strictly after `after`, ascending. `None` starts from the result's
+    /// first row.
+    Forward { after: Option<Value> },
+    /// Rows strictly before `before`, delivered descending (the grid prepends
+    /// them in arrival order, which restores ascending).
+    Backward { before: Value },
+    /// Replace the run near row `ordinal`: a key-space interpolated seek when
+    /// the key is an integer with known bounds (`estimated` reply), else one
+    /// `OFFSET` page (exact, but O(ordinal) — the one-off fallback).
+    Jump { ordinal: usize },
+}
+
+/// What the backend remembers about one open result: the SQL it re-fetches per
+/// page/run, the resolved seek key, and — for interpolated jumps — the key's
+/// min/max and the result's total.
+#[derive(Debug, Clone)]
+struct OpenSpec {
+    sql: String,
+    key: Option<KeySpec>,
+    bounds: Option<(i64, i64)>,
+    total: Option<usize>,
+}
+
+/// The open-result map, shared with the spawned open/fetch tasks (they fill in
+/// bounds/total after the fact and read specs without round-tripping commands).
+type ResultMap = Arc<Mutex<HashMap<u64, OpenSpec>>>;
 
 /// The active query's cursor plus the bits needed to drive and abort it.
 struct ActiveQuery {
@@ -246,13 +316,14 @@ pub fn spawn() -> ServiceHandle {
 async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Event>) {
     let mut session: Option<Arc<dyn DatabaseDriver>> = None;
     let mut active: Option<ActiveQuery> = None;
-    // The SQL backing each open result, keyed by epoch and re-fetched per
-    // `FetchPage`. One entry per live query tab (plus a transient extra while a
-    // re-sort swaps a tab to a new epoch). Page fetches run as detached tasks (so
-    // a slow `count`/deep page never stalls the dispatch loop); a fetch for an
-    // epoch absent from the map is stale — the tab closed or moved on — and is
-    // dropped. UI epochs start at 1, so an empty map means "no live result".
-    let mut result_sql: HashMap<u64, String> = HashMap::new();
+    // The spec backing each open result, keyed by epoch and re-fetched per
+    // `FetchPage`/`FetchRun`. One entry per live query tab (plus a transient
+    // extra while a re-sort swaps a tab to a new epoch). Fetches run as detached
+    // tasks (so a slow `count`/deep page never stalls the dispatch loop); a
+    // fetch for an epoch absent from the map is stale — the tab closed or moved
+    // on — and is dropped. UI epochs start at 1, so an empty map means "no live
+    // result".
+    let results: ResultMap = Arc::new(Mutex::new(HashMap::new()));
     // Bounds how many page fetches hit the server concurrently (see the const).
     let page_fetch_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_PAGE_FETCHES));
 
@@ -260,7 +331,7 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
         match command {
             Command::Connect(config) => {
                 active = None; // a new connection abandons any in-flight cursor
-                result_sql.clear();
+                results.lock().unwrap().clear();
                 match connect(&config).await {
                     Ok(driver) => {
                         let version = driver.server_version();
@@ -287,7 +358,7 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
 
             Command::Disconnect => {
                 active = None;
-                result_sql.clear();
+                results.lock().unwrap().clear();
                 session = None;
                 emit(&events, Event::Disconnected);
             }
@@ -359,30 +430,85 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
                 }
             }
 
-            Command::OpenResult { sql, epoch } => {
+            Command::OpenResult { sql, epoch, table } => {
                 let Some(driver) = session.clone() else {
                     emit(&events, Event::Error("not connected".into()));
                     continue;
                 };
-                result_sql.insert(epoch, sql.clone());
+                // Registered before the (slow) open task so an early fetch for
+                // this epoch isn't mistaken for a stale one.
+                results.lock().unwrap().insert(
+                    epoch,
+                    OpenSpec {
+                        sql: sql.clone(),
+                        key: None,
+                        bounds: None,
+                        total: None,
+                    },
+                );
                 // Count + column metadata can be slow (a full `COUNT(*)` over a
                 // large table); run them off the dispatch loop so switching to
                 // another table stays instant.
                 let events = events.clone();
+                let results = results.clone();
                 tokio::spawn(async move {
+                    // A table browse resolves its seek key from the table's
+                    // introspected detail; a resolution failure just means the
+                    // `OFFSET` fallback (never an error).
+                    let key = match &table {
+                        Some((schema, table)) => match driver.describe_table(schema, table).await {
+                            Ok(detail) => {
+                                let key = KeySpec::from_detail(&detail);
+                                match &key {
+                                    Some(k) => tracing::info!(
+                                        %schema, %table, column = %k.column,
+                                        "keyset key resolved"
+                                    ),
+                                    None => tracing::info!(
+                                        %schema, %table,
+                                        "no usable key (composite/nullable/no PK) — OFFSET paging"
+                                    ),
+                                }
+                                key
+                            }
+                            Err(e) => {
+                                tracing::warn!(%schema, %table, "keyset describe failed: {e}");
+                                None
+                            }
+                        },
+                        None => None,
+                    };
                     // `LIMIT 0` reads column metadata without stepping rows;
-                    // counting runs concurrently with it.
-                    let (total, columns) =
-                        tokio::join!(driver.count(&sql), driver.fetch_page(&sql, 0, 0));
+                    // counting and the key-bounds probe run concurrently with it.
+                    let bounds = async {
+                        match &key {
+                            Some(k) if k.kind == KeyKind::Int => {
+                                driver.key_bounds(&sql, k).await.ok().flatten()
+                            }
+                            _ => None,
+                        }
+                    };
+                    let (total, columns, bounds) =
+                        tokio::join!(driver.count(&sql), driver.fetch_page(&sql, 0, 0), bounds);
                     match (total, columns) {
-                        (Ok(total), Ok(page)) => emit(
-                            &events,
-                            Event::ResultReady {
-                                columns: page.columns,
-                                total: total.max(0) as usize,
-                                epoch,
-                            },
-                        ),
+                        (Ok(total), Ok(page)) => {
+                            let total = total.max(0) as usize;
+                            // Fill the spec in only if the result is still open.
+                            if let Some(spec) = results.lock().unwrap().get_mut(&epoch) {
+                                spec.key = key.clone();
+                                spec.bounds = bounds;
+                                spec.total = Some(total);
+                            }
+                            emit(
+                                &events,
+                                Event::ResultReady {
+                                    columns: page.columns,
+                                    total,
+                                    epoch,
+                                    key,
+                                },
+                            );
+                        }
                         (Err(e), _) | (_, Err(e)) => emit(&events, Event::Error(e.to_string())),
                     }
                 });
@@ -400,7 +526,7 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
                 // The tab closed or re-sorted (its epoch is gone); skip the stale
                 // request rather than running an expensive query whose result
                 // would be discarded.
-                let Some(sql) = result_sql.get(&epoch).cloned() else {
+                let Some(sql) = results.lock().unwrap().get(&epoch).map(|s| s.sql.clone()) else {
                     continue;
                 };
                 // Pages fetch concurrently (the driver pools connections) and off
@@ -425,8 +551,49 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
                 });
             }
 
+            Command::FetchRun {
+                epoch,
+                fetch,
+                limit,
+                seq,
+            } => {
+                let Some(driver) = session.clone() else {
+                    emit(&events, Event::Error("not connected".into()));
+                    continue;
+                };
+                // Stale epoch (tab closed / re-sorted) — drop, like `FetchPage`.
+                let Some(spec) = results.lock().unwrap().get(&epoch).cloned() else {
+                    continue;
+                };
+                let Some(key) = spec.key.clone() else {
+                    continue; // a keyless result never gets `FetchRun`s
+                };
+                let events = events.clone();
+                let limit_src = page_fetch_limit.clone();
+                tokio::spawn(async move {
+                    let _permit = limit_src.acquire_owned().await;
+                    match run_fetch(&*driver, &spec, &key, &fetch, limit).await {
+                        Ok((rows, estimated)) => emit(
+                            &events,
+                            Event::ResultRunLoaded {
+                                epoch,
+                                fetch,
+                                rows,
+                                estimated,
+                                seq,
+                            },
+                        ),
+                        Err(e) => {
+                            tracing::warn!(%epoch, ?fetch, "run fetch failed: {e}");
+                            emit(&events, Event::ResultRunFailed { epoch, seq });
+                            emit(&events, Event::Error(e.to_string()));
+                        }
+                    }
+                });
+            }
+
             Command::CloseResult { epoch } => {
-                result_sql.remove(&epoch);
+                results.lock().unwrap().remove(&epoch);
             }
 
             Command::Execute { sql } => {
@@ -454,7 +621,7 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
                     emit(&events, Event::Error("not connected".into()));
                     continue;
                 };
-                let Some(sql) = result_sql.get(&epoch).cloned() else {
+                let Some(sql) = results.lock().unwrap().get(&epoch).map(|s| s.sql.clone()) else {
                     emit(&events, Event::Error("no open result to export".into()));
                     continue;
                 };
@@ -558,6 +725,66 @@ async fn drive_fetch(
     }
 
     shutdown
+}
+
+/// Serve one `FetchRun` (see [`RunFetch`]). Returns the rows plus whether
+/// their ordinals are interpolated estimates (only an interpolated `Jump`).
+async fn run_fetch(
+    driver: &dyn DatabaseDriver,
+    spec: &OpenSpec,
+    key: &KeySpec,
+    fetch: &RunFetch,
+    limit: usize,
+) -> red_core::Result<(Vec<Vec<Value>>, bool)> {
+    match fetch {
+        RunFetch::Forward { after } => {
+            let page = driver
+                .fetch_seek(&spec.sql, key, after.as_ref(), false, limit)
+                .await?;
+            Ok((page.rows, false))
+        }
+        RunFetch::Backward { before } => {
+            let page = driver
+                .fetch_seek(&spec.sql, key, Some(before), true, limit)
+                .await?;
+            Ok((page.rows, false))
+        }
+        RunFetch::Jump { ordinal } => {
+            // Key-space interpolation: land near `ordinal / total` of the key
+            // range in one indexed seek. Approximate (exact only for dense,
+            // uniform keys) — the grid renders the run's ordinals with a `≈`.
+            if key.kind == KeyKind::Int {
+                if let (Some((min, max)), Some(total)) = (spec.bounds, spec.total) {
+                    if total > 1 && max > min {
+                        let fraction = (*ordinal as f64 / (total - 1) as f64).clamp(0.0, 1.0);
+                        let target = (min as f64 + (max as f64 - min as f64) * fraction)
+                            .clamp(min as f64, max as f64)
+                            as i64;
+                        let page = driver
+                            .fetch_seek(
+                                &spec.sql,
+                                key,
+                                // `>=` via a strict `>` on the predecessor.
+                                Some(&Value::Integer(target.saturating_sub(1))),
+                                false,
+                                limit,
+                            )
+                            .await?;
+                        // Jumping to ordinal 0 seeks from the true start — exact.
+                        if !page.rows.is_empty() {
+                            return Ok((page.rows, *ordinal != 0));
+                        }
+                        // An empty interpolated window (data shrank underneath)
+                        // falls through to the exact `OFFSET` page.
+                    }
+                }
+            }
+            // Non-interpolable key (or unknown bounds): one `OFFSET` page —
+            // O(ordinal), but a one-off; ordinals stay exact.
+            let page = driver.fetch_page(&spec.sql, *ordinal, limit).await?;
+            Ok((page.rows, false))
+        }
+    }
 }
 
 /// A timeout future that never fires when no timeout is set, so the `select!`
@@ -807,16 +1034,19 @@ mod tests {
         handle.send(Command::OpenResult {
             sql: counting_sql(1000),
             epoch: 1,
+            table: None,
         });
         match events.next().await {
             Some(Event::ResultReady {
                 columns,
                 total,
                 epoch,
+                key,
             }) => {
                 assert_eq!(columns[0].name, "x");
                 assert_eq!(total, 1000);
                 assert_eq!(epoch, 1);
+                assert_eq!(key, None, "editor SQL resolves no seek key");
             }
             other => panic!("expected ResultReady, got {other:?}"),
         }
@@ -840,6 +1070,322 @@ mod tests {
             other => panic!("expected ResultPageLoaded, got {other:?}"),
         }
         handle.send(Command::Shutdown);
+    }
+
+    /// The keyset path end-to-end: a table browse resolves its PK as the seek
+    /// key, contiguous runs extend from boundary keys, and a far jump lands by
+    /// key-space interpolation with estimated ordinals.
+    #[tokio::test]
+    async fn resolves_key_and_serves_runs() {
+        use red_core::KeyKind;
+        let path = std::env::temp_dir().join(format!("red_svc_runs_{}.db", std::process::id()));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+                 WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 1000)
+                 INSERT INTO t SELECT x, 'row ' || x FROM c;",
+            )
+            .unwrap();
+        }
+
+        let mut handle = spawn();
+        let mut events = handle.take_events().expect("event stream");
+        handle.send(Command::Connect(sqlite(path.to_str().unwrap(), true)));
+        assert!(matches!(events.next().await, Some(Event::Connected { .. })));
+
+        handle.send(Command::OpenResult {
+            sql: "SELECT * FROM t".into(),
+            epoch: 7,
+            table: Some(("main".into(), "t".into())),
+        });
+        match events.next().await {
+            Some(Event::ResultReady { total, key, .. }) => {
+                assert_eq!(total, 1000);
+                let key = key.expect("table browse resolves its PK");
+                assert_eq!(key.column, "id");
+                assert_eq!(key.kind, KeyKind::Int);
+            }
+            other => panic!("expected ResultReady, got {other:?}"),
+        }
+
+        // Forward from the start, then forward from a boundary key.
+        handle.send(Command::FetchRun {
+            epoch: 7,
+            fetch: RunFetch::Forward { after: None },
+            limit: 3,
+            seq: 1,
+        });
+        match events.next().await {
+            Some(Event::ResultRunLoaded {
+                rows,
+                estimated,
+                seq,
+                ..
+            }) => {
+                assert_eq!(seq, 1);
+                assert!(!estimated);
+                assert_eq!(rows[0][0], Value::Integer(1));
+                assert_eq!(rows.len(), 3);
+            }
+            other => panic!("expected ResultRunLoaded, got {other:?}"),
+        }
+        handle.send(Command::FetchRun {
+            epoch: 7,
+            fetch: RunFetch::Forward {
+                after: Some(Value::Integer(3)),
+            },
+            limit: 3,
+            seq: 2,
+        });
+        match events.next().await {
+            Some(Event::ResultRunLoaded { rows, .. }) => {
+                assert_eq!(rows[0][0], Value::Integer(4));
+            }
+            other => panic!("expected ResultRunLoaded, got {other:?}"),
+        }
+
+        // Backward: rows strictly before the bound, delivered descending.
+        handle.send(Command::FetchRun {
+            epoch: 7,
+            fetch: RunFetch::Backward {
+                before: Value::Integer(4),
+            },
+            limit: 5,
+            seq: 3,
+        });
+        match events.next().await {
+            Some(Event::ResultRunLoaded { rows, .. }) => {
+                assert_eq!(
+                    rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+                    vec![Value::Integer(3), Value::Integer(2), Value::Integer(1)]
+                );
+            }
+            other => panic!("expected ResultRunLoaded, got {other:?}"),
+        }
+
+        // A far jump interpolates the key space: ~halfway lands near id 500,
+        // flagged estimated.
+        handle.send(Command::FetchRun {
+            epoch: 7,
+            fetch: RunFetch::Jump { ordinal: 499 },
+            limit: 3,
+            seq: 4,
+        });
+        match events.next().await {
+            Some(Event::ResultRunLoaded {
+                rows, estimated, ..
+            }) => {
+                assert!(estimated, "interpolated jump reports estimated ordinals");
+                match &rows[0][0] {
+                    Value::Integer(id) => {
+                        assert!((495..=505).contains(id), "landed at id {id}")
+                    }
+                    other => panic!("expected an integer id, got {other:?}"),
+                }
+            }
+            other => panic!("expected ResultRunLoaded, got {other:?}"),
+        }
+
+        // A jump to ordinal 0 seeks from the true start — exact, not estimated.
+        handle.send(Command::FetchRun {
+            epoch: 7,
+            fetch: RunFetch::Jump { ordinal: 0 },
+            limit: 3,
+            seq: 5,
+        });
+        match events.next().await {
+            Some(Event::ResultRunLoaded {
+                rows, estimated, ..
+            }) => {
+                assert!(!estimated);
+                assert_eq!(rows[0][0], Value::Integer(1));
+            }
+            other => panic!("expected ResultRunLoaded, got {other:?}"),
+        }
+
+        handle.send(Command::Shutdown);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The full app flow against a live MariaDB/MySQL (`RED_TEST_MYSQL_URL`,
+    /// skipped without one): open a 1M-row table browse, resolve the PK as the
+    /// seek key, then deep-seek and jump — each fetch must come back fast
+    /// (indexed), proving the derived-table wrapper merges on the server.
+    #[tokio::test]
+    async fn mariadb_keyset_end_to_end() {
+        use red_core::KeyKind;
+        let Ok(url) = std::env::var("RED_TEST_MYSQL_URL") else {
+            return;
+        };
+        let p = ConnectionConfig::parse_conn_str(&url).expect("parsable test url");
+        let config = ConnectionConfig {
+            name: "maria-test".into(),
+            kind: DbKind::Mysql,
+            host: p.host,
+            port: p.port,
+            user: p.user,
+            password: p.password,
+            database: p.database.clone(),
+            ..Default::default()
+        };
+        let table = format!("red_keyset_{}", std::process::id());
+
+        let mut handle = spawn();
+        let mut events = handle.take_events().expect("event stream");
+        handle.send(Command::Connect(config));
+        assert!(matches!(events.next().await, Some(Event::Connected { .. })));
+
+        // Seed 1M rows (MariaDB's sequence engine; the test targets MariaDB).
+        handle.send(Command::Execute {
+            sql: format!("CREATE TABLE `{table}`(id BIGINT PRIMARY KEY, name VARCHAR(64))"),
+        });
+        assert!(matches!(events.next().await, Some(Event::Executed { .. })));
+        handle.send(Command::Execute {
+            sql: format!(
+                "INSERT INTO `{table}` SELECT seq, CONCAT('row ', seq) FROM seq_1_to_1000000"
+            ),
+        });
+        match events.next().await {
+            Some(Event::Executed { affected }) => assert_eq!(affected, 1_000_000),
+            other => panic!("seeding failed: {other:?}"),
+        }
+
+        handle.send(Command::OpenResult {
+            sql: format!("SELECT * FROM `{}`.`{table}`", p.database),
+            epoch: 1,
+            table: Some((p.database.clone(), table.clone())),
+        });
+        match events.next().await {
+            Some(Event::ResultReady { total, key, .. }) => {
+                assert_eq!(total, 1_000_000);
+                let key = key.expect("PK resolves as the seek key");
+                assert_eq!(key.column, "id");
+                assert_eq!(key.kind, KeyKind::Int);
+            }
+            other => panic!("expected ResultReady, got {other:?}"),
+        }
+
+        // Deep forward seek near the bottom — must be indexed-fast.
+        let started = Instant::now();
+        handle.send(Command::FetchRun {
+            epoch: 1,
+            fetch: RunFetch::Forward {
+                after: Some(Value::Integer(999_000)),
+            },
+            limit: 200,
+            seq: 1,
+        });
+        match events.next().await {
+            Some(Event::ResultRunLoaded { rows, .. }) => {
+                assert_eq!(rows.len(), 200);
+                assert_eq!(rows[0][0], Value::Integer(999_001));
+            }
+            other => panic!("expected ResultRunLoaded, got {other:?}"),
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "deep seek took {elapsed:?} — the derived-table wrapper isn't merging"
+        );
+
+        // Interpolated jump to ~50%.
+        handle.send(Command::FetchRun {
+            epoch: 1,
+            fetch: RunFetch::Jump { ordinal: 500_000 },
+            limit: 200,
+            seq: 2,
+        });
+        match events.next().await {
+            Some(Event::ResultRunLoaded {
+                rows, estimated, ..
+            }) => {
+                assert!(estimated);
+                match &rows[0][0] {
+                    Value::Integer(id) => {
+                        assert!((499_000..=501_000).contains(id), "jump landed at id {id}")
+                    }
+                    other => panic!("expected integer id, got {other:?}"),
+                }
+            }
+            other => panic!("expected ResultRunLoaded, got {other:?}"),
+        }
+
+        // Backward from the middle (scrolling up).
+        handle.send(Command::FetchRun {
+            epoch: 1,
+            fetch: RunFetch::Backward {
+                before: Value::Integer(500_000),
+            },
+            limit: 200,
+            seq: 3,
+        });
+        match events.next().await {
+            Some(Event::ResultRunLoaded { rows, .. }) => {
+                assert_eq!(rows[0][0], Value::Integer(499_999));
+                assert_eq!(rows.len(), 200);
+            }
+            other => panic!("expected ResultRunLoaded, got {other:?}"),
+        }
+
+        handle.send(Command::Execute {
+            sql: format!("DROP TABLE `{table}`"),
+        });
+        assert!(matches!(events.next().await, Some(Event::Executed { .. })));
+        handle.send(Command::Shutdown);
+    }
+
+    /// A non-interpolable (text) key still gets keyset scroll, and its jumps
+    /// fall back to one exact `OFFSET` page.
+    #[tokio::test]
+    async fn text_key_jump_falls_back_to_offset() {
+        use red_core::KeyKind;
+        let path = std::env::temp_dir().join(format!("red_svc_text_{}.db", std::process::id()));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t(code TEXT PRIMARY KEY NOT NULL);
+                 WITH RECURSIVE c(x) AS (SELECT 100 UNION ALL SELECT x+1 FROM c WHERE x < 199)
+                 INSERT INTO t SELECT 'c' || x FROM c;",
+            )
+            .unwrap();
+        }
+
+        let mut handle = spawn();
+        let mut events = handle.take_events().expect("event stream");
+        handle.send(Command::Connect(sqlite(path.to_str().unwrap(), true)));
+        assert!(matches!(events.next().await, Some(Event::Connected { .. })));
+
+        handle.send(Command::OpenResult {
+            sql: "SELECT * FROM t".into(),
+            epoch: 9,
+            table: Some(("main".into(), "t".into())),
+        });
+        match events.next().await {
+            Some(Event::ResultReady { key, .. }) => {
+                assert_eq!(key.map(|k| k.kind), Some(KeyKind::Other));
+            }
+            other => panic!("expected ResultReady, got {other:?}"),
+        }
+
+        handle.send(Command::FetchRun {
+            epoch: 9,
+            fetch: RunFetch::Jump { ordinal: 50 },
+            limit: 5,
+            seq: 1,
+        });
+        match events.next().await {
+            Some(Event::ResultRunLoaded {
+                rows, estimated, ..
+            }) => {
+                assert!(!estimated, "OFFSET fallback is exact");
+                assert_eq!(rows.len(), 5);
+            }
+            other => panic!("expected ResultRunLoaded, got {other:?}"),
+        }
+
+        handle.send(Command::Shutdown);
+        std::fs::remove_file(&path).ok();
     }
 
     #[tokio::test]

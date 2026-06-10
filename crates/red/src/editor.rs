@@ -334,7 +334,7 @@ impl AppState {
         // Row-returning statements stream into the grid; writes execute in a
         // transaction; destructive writes ask for confirmation first.
         match crate::sql::classify(&sql) {
-            crate::sql::StatementKind::Query => self.open_result("query", sql, cx),
+            crate::sql::StatementKind::Query => self.open_result("query", sql, None, cx),
             crate::sql::StatementKind::Write => self.execute_sql(sql, cx),
             crate::sql::StatementKind::Destructive => {
                 // The safety rail is opt-out in settings; when off, run immediately.

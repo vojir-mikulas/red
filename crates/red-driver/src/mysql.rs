@@ -29,7 +29,7 @@ use mysql_async::{
     Column as MyColumn, Error as MyError, Opts, OptsBuilder, Pool, Row, Value as MyValue,
 };
 use red_core::{
-    Column, ColumnMeta, ExportFormat, ForeignKeyMeta, IndexMeta, ObjectKind, ObjectMeta,
+    Column, ColumnMeta, ExportFormat, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta,
     QueryOptions, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail, Value,
 };
 use tokio::sync::{mpsc, Mutex};
@@ -291,6 +291,61 @@ impl DatabaseDriver for MysqlDriver {
         })
     }
 
+    async fn fetch_seek(
+        &self,
+        sql: &str,
+        key: &KeySpec,
+        bound: Option<&Value>,
+        descending: bool,
+        limit: usize,
+    ) -> Result<ResultPage> {
+        let col = format!("`{}`", quote_ident(&key.column));
+        let base = strip_trailing(sql);
+        let (cmp, ord) = if descending {
+            ("<", "DESC")
+        } else {
+            (">", "ASC")
+        };
+        let sql = match bound {
+            Some(_) => format!(
+                "SELECT * FROM ({base}) AS _red WHERE {col} {cmp} ? ORDER BY {col} {ord} LIMIT {limit}"
+            ),
+            None => format!("SELECT * FROM ({base}) AS _red ORDER BY {col} {ord} LIMIT {limit}"),
+        };
+        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let stmt = conn.prep(&sql).await.map_err(map_my_err)?;
+        let columns: Vec<Column> = stmt.columns().iter().map(col_meta).collect();
+        let rows: Vec<Row> = match bound {
+            Some(value) => conn
+                .exec(&stmt, (to_my(value),))
+                .await
+                .map_err(map_my_err)?,
+            None => conn.exec(&stmt, ()).await.map_err(map_my_err)?,
+        };
+        Ok(ResultPage {
+            columns,
+            rows: rows.iter().map(my_row).collect(),
+        })
+    }
+
+    async fn key_bounds(&self, sql: &str, key: &KeySpec) -> Result<Option<(i64, i64)>> {
+        let col = format!("`{}`", quote_ident(&key.column));
+        let sql = format!(
+            "SELECT min({col}), max({col}) FROM ({}) AS _red",
+            strip_trailing(sql)
+        );
+        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let stmt = conn.prep(&sql).await.map_err(map_my_err)?;
+        let rows: Vec<Row> = conn.exec(&stmt, ()).await.map_err(map_my_err)?;
+        Ok(rows
+            .first()
+            .map(my_row)
+            .and_then(|cells| match (cells.first(), cells.get(1)) {
+                (Some(Value::Integer(min)), Some(Value::Integer(max))) => Some((*min, *max)),
+                _ => None,
+            }))
+    }
+
     async fn execute(&self, sql: &str) -> Result<u64> {
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
         conn.query_drop("BEGIN").await.map_err(map_my_err)?;
@@ -414,6 +469,17 @@ fn my_row(row: &Row) -> Vec<Value> {
     (0..row.len())
         .map(|i| my_value(row.as_ref(i), &cols[i]))
         .collect()
+}
+
+/// A cell value as a bindable MySQL parameter (for seek bounds).
+fn to_my(value: &Value) -> MyValue {
+    match value {
+        Value::Null => MyValue::NULL,
+        Value::Integer(n) => MyValue::Int(*n),
+        Value::Real(x) => MyValue::Double(*x),
+        Value::Text(s) => MyValue::Bytes(s.clone().into_bytes()),
+        Value::Blob(b) => MyValue::Bytes(b.clone()),
+    }
 }
 
 fn my_value(value: Option<&MyValue>, col: &MyColumn) -> Value {

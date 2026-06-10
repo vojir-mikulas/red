@@ -457,7 +457,7 @@ impl AppState {
     /// tab so the user's current query and result are preserved. No `LIMIT` — the
     /// grid pages through it with flat memory. The new tab's editor is pre-filled.
     pub(crate) fn schema_preview(&mut self, schema: String, table: String, cx: &mut Context<Self>) {
-        let (sql, label) = match &mut self.phase {
+        let (sql, label, table_ref) = match &mut self.phase {
             Phase::Connected(active) => {
                 let kind = active.config.kind;
                 let sql = format!(
@@ -466,11 +466,14 @@ impl AppState {
                     quote_ident(&table, kind)
                 );
                 let label = format!("{schema}.{table}");
+                // The browsed table rides along so the backend can resolve a
+                // keyset seek key for it (M10).
+                let table_ref = (schema.clone(), table.clone());
                 active.schema.selected = Some(NodeId::Object {
                     schema,
                     name: table,
                 });
-                (sql, label)
+                (sql, label, table_ref)
             }
             _ => return,
         };
@@ -490,6 +493,6 @@ impl AppState {
             _ => return,
         };
         editor.update(cx, |editor, cx| editor.set_content(sql.clone(), cx));
-        self.open_result(label, sql, cx);
+        self.open_result(label, sql, Some(table_ref), cx);
     }
 }
