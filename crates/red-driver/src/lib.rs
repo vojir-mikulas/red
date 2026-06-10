@@ -2,10 +2,10 @@
 //! `RemoteClient`: an object-safe trait the service holds as `Arc<dyn …>` and
 //! drives across many commands, with one impl per engine.
 //!
-//! Scaffold scope: `query` materializes the whole result. The streaming/windowed
-//! cursor that the performance goals require is the first real piece of work on
-//! top of this seam — the trait is shaped to grow a `stream`/`cancel` surface
-//! without disturbing callers.
+//! Nothing here materializes a whole result: queries run behind a windowed
+//! [`QueryCursor`], paging is random-access (`fetch_page`) or indexed-seek
+//! (`fetch_seek`), and `export` streams row-by-row. This keeps memory flat over
+//! results of any size, the layer's central performance contract.
 
 use std::sync::Arc;
 
@@ -107,8 +107,8 @@ pub trait QueryCursor: Send {
 }
 
 /// Engine-agnostic cancel handle. SQLite wraps `rusqlite`'s `InterruptHandle`;
-/// Postgres (M7) will wrap its out-of-band cancel request. Cloning is cheap and
-/// the token is safe to call from any thread.
+/// Postgres wraps its out-of-band cancel request. Cloning is cheap and the token
+/// is safe to call from any thread.
 #[derive(Clone)]
 pub struct CancelToken(Arc<dyn Fn() + Send + Sync>);
 

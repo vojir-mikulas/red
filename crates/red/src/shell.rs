@@ -1,7 +1,6 @@
 //! The connected shell: top bar · nested resizable split (schema | editor /
-//! results) · status bar. The pane contents are live: schema tree (M3), SQL
-//! editor (M4), interim result grid (M3, real grid in M5). The split sizes are
-//! caller-owned state on [`ActiveConn`].
+//! results) · status bar. The panes are the schema tree, the SQL editor, and the
+//! result grid. The split sizes are caller-owned state on [`ActiveConn`].
 
 use flint::prelude::*;
 use gpui::{div, prelude::*, px, Axis, Context, WindowControlArea};
@@ -28,8 +27,7 @@ impl AppState {
         let theme = cx.theme().clone();
         let view = cx.entity().downgrade();
 
-        // Live pane contents: schema explorer (M3) · SQL editor (M4) · interim
-        // preview grid (M3, replaced by the real grid in M5).
+        // Pane contents: schema explorer · SQL editor · result grid.
         let schema_pane = self.render_schema(active, cx);
         let editor_pane = self.render_editor(active, cx);
         let results_pane = self.render_result(active, cx);

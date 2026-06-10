@@ -1,5 +1,5 @@
-//! The schema explorer (M3): the left-sidebar tree of namespaces → tables/views →
-//! columns, plus the interim table preview rendered in the results pane.
+//! The schema explorer: the left-sidebar tree of namespaces → tables/views →
+//! columns, plus the table preview rendered in the results pane.
 //!
 //! The generic, virtualized tree lives in Flint; the *domain* logic is here — the
 //! schema model fetched over `Command`/`Event`, lazy column loading on expand,
@@ -465,7 +465,7 @@ impl AppState {
                 );
                 let label = format!("{schema}.{table}");
                 // The browsed table rides along so the backend can resolve a
-                // keyset seek key for it (M10).
+                // keyset seek key for it.
                 let table_ref = (schema.clone(), table.clone());
                 active.schema.selected = Some(NodeId::Object {
                     schema,

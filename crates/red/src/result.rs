@@ -1,4 +1,4 @@
-//! The result grid (M5): a virtualized, horizontally-scrolling table backed by a
+//! The result grid: a virtualized, horizontally-scrolling table backed by a
 //! random-access window buffer. The grid never holds the whole result — its
 //! load-on-scroll callback fetches the pages around the viewport and evicts the
 //! rest, so memory stays flat over a multi-million-row result. Cell ranges select
@@ -69,7 +69,7 @@ fn next_epoch() -> u64 {
 /// The row buffer behind the grid. Two modes, chosen per open result:
 ///
 /// - **Offset** (no seek key — editor SQL, sorted re-opens): a sparse map of
-///   `(offset, limit)` pages, the pre-M10 behavior. Deep pages are O(offset).
+///   `(offset, limit)` pages. Deep pages are O(offset).
 /// - **Keyed** (a table browse with a resolved [`KeySpec`]): one contiguous
 ///   *run* of rows extended from its boundary keys by indexed seeks — O(page)
 ///   at any depth — and relocated by key-space jumps for far scrolls.
@@ -432,7 +432,7 @@ impl GridBuffer {
 }
 
 impl OffsetPages {
-    /// Request any missing pages covering `range` (the pre-M10 path).
+    /// Request any missing pages covering `range` (the offset path).
     fn request(&mut self, range: Range<usize>, total: usize, epoch: u64, sender: &CommandSender) {
         let first = range.start / PAGE;
         let last = (range.end - 1) / PAGE;
@@ -520,7 +520,7 @@ pub(crate) struct ResultGrid {
     sender: CommandSender,
     scroll: UniformListScrollHandle,
     h_scroll: ScrollHandle,
-    /// The overlay scrollbar's in-flight drag (M10 Phase 3).
+    /// The overlay scrollbar's in-flight drag.
     scrollbar: ScrollbarState,
     /// Virtual-scroll window: the absolute ordinal that list-local index 0 maps
     /// to. `Rc` so the scrollbar's scrub closure can move it; `Cell` because
@@ -960,7 +960,7 @@ impl AppState {
             // Evict the superseded SQL so the backend's result map can't grow.
             self.service.send(Command::CloseResult { epoch: old_epoch });
             // No `table`: sorted SQL isn't ordered by the PK, so it pages by
-            // `OFFSET` (composite `(sort_col, pk)` seek is a later milestone).
+            // `OFFSET` — composite `(sort_col, pk)` seek isn't implemented.
             self.service.send(Command::OpenResult {
                 sql,
                 epoch,
@@ -1318,7 +1318,7 @@ impl AppState {
             )
             .child(div().ml_auto().text_color(dim).child(grid.label.clone()));
 
-        // The draggable, fraction-mapped scrollbar (M10 Phase 3): the thumb
+        // The draggable, fraction-mapped scrollbar: the thumb
         // mirrors the list's position; a scrub jumps the viewport, and the
         // buffer's `ensure` turns the far jump into one key-space seek (keyed
         // results) or one OFFSET page (fallback).

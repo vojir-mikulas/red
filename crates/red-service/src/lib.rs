@@ -85,7 +85,7 @@ pub enum Command {
         limit: usize,
         epoch: u64,
     },
-    /// Fetch one run window of a keyset-keyed open result (M10): extend the
+    /// Fetch one run window of a keyset-keyed open result: extend the
     /// grid's resident run from a boundary key, or jump to an ordinal. Replied
     /// with `ResultRunLoaded`, echoing `fetch`/`seq` so the grid can drop a
     /// reply its buffer has moved past.
@@ -969,7 +969,7 @@ mod tests {
     }
 
     /// Connect, load the skeleton, then describe a table — the schema-explorer
-    /// round-trip the sidebar drives (M3).
+    /// round-trip the sidebar drives.
     #[tokio::test]
     async fn loads_and_describes_schema() {
         // A unique temp file so the service's own connections see a populated DB.

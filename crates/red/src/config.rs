@@ -3,8 +3,8 @@
 //! file in the platform config dir; a missing or malformed file degrades to an
 //! empty list (never a panic), so a corrupt config can't brick launch.
 //!
-//! NOTE: passwords are persisted in **plaintext** in this file for now (v0.1).
-//! Route credentials through the OS keyring before shipping (v0.2).
+//! SECURITY: passwords are persisted in **plaintext** in this file. Credentials
+//! should route through the OS keyring instead.
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};

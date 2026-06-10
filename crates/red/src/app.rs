@@ -52,18 +52,18 @@ pub(crate) struct FormState {
     pub test: TestState,
 }
 
-/// The default editor stub a fresh query tab opens with. A tab still holding
+/// The default editor text a fresh query tab opens with. A tab still holding
 /// exactly this (and no result) is "pristine" — closing it needs no confirmation.
 pub(crate) const EMPTY_QUERY: &str = "-- Write SQL, ⌘↵ to run\n";
 
 /// One query tab: its own SQL editor, result grid, and history. A connection
-/// holds several of these (M9); the schema sidebar and split sizes are shared.
+/// holds several of these; the schema sidebar and split sizes are shared.
 pub(crate) struct QueryTab {
     /// Tab label: "query N" for a blank tab, or "schema.table" for a preview.
     pub title: String,
-    /// The SQL editor surface (M4), with the RED highlighter installed.
+    /// The SQL editor surface, with the RED highlighter installed.
     pub editor: Entity<CodeEditor>,
-    /// The open result browsed in the grid (M5): a table preview or an editor run.
+    /// The open result browsed in the grid: a table preview or an editor run.
     pub result: Option<ResultGrid>,
     /// Recent queries (newest first), for re-run from the history popover.
     pub history: Vec<String>,
@@ -92,7 +92,7 @@ impl QueryTab {
         }
     }
 
-    /// A blank tab the user hasn't touched — no result and the default stub still
+    /// A blank tab the user hasn't touched — no result and the default text still
     /// in the editor. Closing one of these doesn't warrant a confirmation.
     pub(crate) fn is_pristine(&self, cx: &Context<AppState>) -> bool {
         self.result.is_none() && self.editor.read(cx).content() == EMPTY_QUERY
@@ -101,7 +101,7 @@ impl QueryTab {
 
 /// The live-connection view state: which connection, its engine version, the
 /// resizable split sizes (caller-owned, per `SplitPane`'s stateless contract),
-/// the schema explorer (M3), and the open query tabs (M9).
+/// the schema explorer, and the open query tabs.
 pub(crate) struct ActiveConn {
     pub config: ConnectionConfig,
     pub version: String,
@@ -336,7 +336,7 @@ impl AppState {
                 self.toast = Some((message.into(), ToastVariant::Error));
             }
 
-            // --- schema explorer (M3) ---
+            // --- schema explorer ---
             Event::ObjectsLoaded { schemas } => {
                 if let Phase::Connected(active) = &mut self.phase {
                     active.schema.apply_objects(schemas);
@@ -354,7 +354,7 @@ impl AppState {
                 self.refresh_completions(cx);
             }
 
-            // --- result grid (M5) ---
+            // --- result grid ---
             Event::ResultReady {
                 columns,
                 total,
@@ -366,7 +366,7 @@ impl AppState {
                 rows,
                 epoch,
             } => self.on_result_page(offset, rows, epoch, cx),
-            // Keyset runs (M10): extend/relocate a grid's resident row run.
+            // Keyset runs: extend/relocate a grid's resident row run.
             Event::ResultRunLoaded {
                 epoch,
                 fetch,
@@ -376,7 +376,7 @@ impl AppState {
             } => self.on_result_run(epoch, fetch, rows, estimated, seq, cx),
             Event::ResultRunFailed { epoch, seq } => self.on_result_run_failed(epoch, seq),
 
-            // --- export & writes (M6) ---
+            // --- export & writes ---
             Event::Executed { affected } => {
                 self.toast = Some((
                     format!("{affected} row(s) affected").into(),
@@ -693,7 +693,7 @@ impl AppState {
         cx.notify();
     }
 
-    // --- query tabs (M9) ---
+    // --- query tabs ---
 
     /// Focus tab `index`. Its editor and result become the visible ones.
     pub(crate) fn set_active_tab(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -948,7 +948,7 @@ impl AppState {
         }
     }
 
-    /// Confirmation before closing a tab that holds real work (M9). Mirrors the
+    /// Confirmation before closing a tab that holds real work. Mirrors the
     /// destructive-statement modal's shape.
     fn render_confirm_close(&self, title: String, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
@@ -980,7 +980,7 @@ impl AppState {
             .child(body)
     }
 
-    /// The destructive-statement confirmation modal (M6 safety rail).
+    /// The destructive-statement confirmation modal — the write safety rail.
     fn render_confirm(&self, sql: String, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let close_view = cx.entity().downgrade();

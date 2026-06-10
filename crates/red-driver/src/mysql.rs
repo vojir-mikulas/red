@@ -10,9 +10,8 @@
 //! bounded channel — capacity provides natural backpressure, so memory stays flat
 //! over a large result and `next_window(&self)` simply drains the receiver.
 //!
-//! Caveats for v0.1: value mapping covers the common scalar types — int/float/
-//! text/blob — with date/time/decimal/json/enum/set rendered as text (typed
-//! rendering is a later, cross-engine concern). Read-only sets
+//! Value mapping covers the common scalar types — int/float/text/blob — with
+//! date/time/decimal/json/enum/set rendered as text. Read-only sets
 //! `SESSION TRANSACTION READ ONLY` on every pooled connection.
 
 use std::collections::HashMap;
@@ -528,7 +527,7 @@ fn fmt_time(neg: bool, days: u32, h: u8, mi: u8, s: u8, us: u32) -> String {
     }
 }
 
-/// A best-effort declared-type name for a result column (feeds later type-aware
+/// A best-effort declared-type name for a result column (feeds type-aware
 /// rendering). Text fallback for the internal/replication-only types.
 fn col_type_name(ct: ColumnType) -> &'static str {
     use ColumnType::*;

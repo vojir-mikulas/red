@@ -1,8 +1,8 @@
-//! The SQL editor pane (M4): a toolbar (Run · history · read-only badge) over
+//! The SQL editor pane: a toolbar (Run · history · read-only badge) over
 //! Flint's `CodeEditor`. RED owns the domain bits — the SQL highlighter, the
 //! completion candidates fed into the editor's generic completion seam, running
 //! the current statement (or selection), and the query history. Results land in
-//! the same interim grid the schema preview uses (M5 replaces that renderer).
+//! the result grid.
 
 use flint::prelude::*;
 use gpui::{div, prelude::*, px, Context, SharedString};

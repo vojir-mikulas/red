@@ -1,8 +1,7 @@
 //! RED's SQL domain logic for the editor: a hand-rolled tokenizer feeding Flint's
 //! generic `Highlighter` seam, plus the keyword set and word-prefix helper the
-//! completion provider uses. SQL-dialect knowledge stays here (Flint stays
-//! domain-free); `tree-sitter-sql` is an optional later upgrade behind the same
-//! highlighter seam.
+//! completion provider uses. SQL-dialect knowledge stays here, behind the
+//! highlighter seam, so Flint stays domain-free.
 
 use std::ops::Range;
 

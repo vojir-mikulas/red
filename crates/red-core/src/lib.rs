@@ -289,14 +289,14 @@ impl fmt::Display for Value {
 
 /// Column metadata for a result set. `name` is always present; `decl_type` is the
 /// engine's declared type (best-effort — `None` for computed expressions) and
-/// feeds type-aware cell rendering later (M5).
+/// feeds type-aware cell rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
     pub name: String,
     pub decl_type: Option<String>,
 }
 
-/// What a schema object is. SQLite has tables and views; Postgres (M7) maps onto
+/// What a schema object is. SQLite has tables and views; Postgres maps onto
 /// the same two for the explorer's purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectKind {
@@ -306,7 +306,7 @@ pub enum ObjectKind {
 
 /// A namespace of objects — the top level of the schema tree. For SQLite this is
 /// a database from `PRAGMA database_list` (`main` / `temp` / an attached DB); for
-/// Postgres (M7) it's a real schema. One level so both engines fit the same tree.
+/// Postgres it's a real schema. One level so both engines fit the same tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaMeta {
     pub name: String,
@@ -360,7 +360,7 @@ pub struct IndexMeta {
     pub columns: Vec<String>,
 }
 
-/// How a result's rows are keyed for seek (keyset) pagination (M10): a stable,
+/// How a result's rows are keyed for seek (keyset) pagination: a stable,
 /// orderable, effectively-unique column. Present only for a plain table browse
 /// whose introspected detail yields a usable key (see [`KeySpec::from_detail`]);
 /// arbitrary editor SQL has no key and pages by `OFFSET`.
