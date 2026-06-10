@@ -193,6 +193,21 @@ impl ResultGrid {
     }
 }
 
+/// Group a number's digits in threes (`1234567` → `1,234,567`) so large row
+/// numbers and totals read at a glance.
+pub(crate) fn group_digits(n: usize) -> String {
+    let digits = n.to_string();
+    let bytes = digits.as_bytes();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
 /// Trim trailing whitespace + a single terminator, so the SQL nests as a subquery.
 fn strip_trailing(sql: &str) -> &str {
     sql.trim().strip_suffix(';').unwrap_or(sql.trim()).trim()
@@ -592,7 +607,7 @@ impl AppState {
                 out.push(
                     div()
                         .text_color(faint)
-                        .child((ix + 1).to_string())
+                        .child(group_digits(ix + 1))
                         .into_any_element(),
                 );
                 let buffer = buffer_row.borrow();

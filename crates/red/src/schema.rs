@@ -470,6 +470,8 @@ impl AppState {
             schema,
             name: table,
         });
+        let editor = active.editor.clone();
+        editor.update(cx, |editor, cx| editor.set_content(sql.clone(), cx));
         self.open_result(label, sql, cx);
     }
 }

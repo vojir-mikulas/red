@@ -238,7 +238,7 @@ impl AppState {
                     div()
                         .px_2()
                         .text_color(theme.text)
-                        .child(format!("{rows} rows")),
+                        .child(format!("{} rows", crate::result::group_digits(rows))),
                 )
                 .child(div().px_2().child(format!("{cols} columns")))
             })
