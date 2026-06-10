@@ -1,0 +1,55 @@
+# cargo-deny configuration — supply-chain gate for CI.
+# Run locally with `cargo deny check`. See https://embarkstudios.github.io/cargo-deny.
+
+[advisories]
+yanked = "deny"
+# Flag "unmaintained" crates only when WE depend on them directly — the GPUI git
+# tree drags in a few transitively that we can't fix and that are not
+# vulnerabilities. A vulnerability anywhere still fails the build.
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+# RED is licensed GPL-3.0-or-later (see LICENSE / NOTICE): GPUI's tree pulls in
+# GPL-3.0-or-later utility crates from the Zed repo, and RED's own crates inherit
+# that license to match. Everything else is the permissive set GPUI + the
+# dependency graph use. Anything NOT listed (a stricter copyleft like AGPL, an
+# unknown license) still fails the build.
+allow = [
+    "GPL-3.0-or-later",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "NCSA",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+    "Zlib",
+    "bzip2-1.0.6",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate versions are unavoidable in a large git dep tree — warn, don't fail.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# GPUI (and its forked deps) plus Flint are pinned to git revs — see root
+# Cargo.toml. Anything outside this list fails the source check.
+allow-git = [
+    "https://github.com/vojir-mikulas/flint",
+    "https://github.com/zed-industries/zed",
+    "https://github.com/zed-industries/wgpu",
+    "https://github.com/zed-industries/font-kit",
+    "https://github.com/zed-industries/scap",
+    "https://github.com/zed-industries/xim-rs",
+]

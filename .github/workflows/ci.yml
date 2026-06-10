@@ -39,3 +39,21 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  deny:
+    name: cargo-deny (supply chain)
+    # No compile needed — cargo-deny reads the dependency graph — so the cheap
+    # Linux runner is fine and runs in parallel with the macOS build.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Supply-chain gate: security advisories, license policy, and the
+      # git-source allow-list (see deny.toml).
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Cargo deny
+        run: cargo deny check
