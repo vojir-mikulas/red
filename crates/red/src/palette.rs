@@ -20,7 +20,6 @@ actions!(red, [ToggleCommandPalette, GoToRow]);
 /// A command the palette can run. Each maps to one existing `AppState` action.
 #[derive(Clone, Copy)]
 pub(crate) enum Cmd {
-    NewConnection,
     OpenSettings,
     /// Connect to the saved connection at this index (disconnected phase).
     Connect(usize),
@@ -37,8 +36,8 @@ impl AppState {
     /// ⌘K: open the command palette, or close it if it's already open. The
     /// palette focuses its own field on first paint, so no `Window` is needed.
     pub(crate) fn toggle_palette(&mut self, cx: &mut Context<Self>) {
-        if self.palette.take().is_some() {
-            self.palette_cmds.clear();
+        if self.palette.is_some() {
+            self.close_palette();
             cx.notify();
             return;
         }
@@ -87,10 +86,14 @@ impl AppState {
         }
     }
 
-    /// Close whichever palette (command or prompt) is open.
+    /// Close whichever palette (command or prompt) is open, and ask the next
+    /// render to pull focus back to the root. Without that, the just-dropped
+    /// palette input leaves `window.focused()` dangling, so the *next* global
+    /// ⌘K finds no dispatch target and the palette won't reopen.
     fn close_palette(&mut self) {
         self.palette = None;
         self.palette_cmds.clear();
+        self.refocus_root = true;
     }
 
     fn on_palette_event(
@@ -139,7 +142,6 @@ impl AppState {
 
     fn run_command(&mut self, cmd: Cmd, cx: &mut Context<Self>) {
         match cmd {
-            Cmd::NewConnection => self.open_new_form(cx),
             Cmd::OpenSettings => self.open_settings(cx),
             Cmd::Connect(index) => self.connect(index, cx),
             Cmd::RunQuery => self.run_editor_query(cx),
@@ -200,10 +202,6 @@ impl AppState {
             Phase::Connecting(_) => {}
         }
 
-        out.push((
-            PaletteItem::new("cmd:new-connection", "connection: new").hint("⌘N"),
-            Cmd::NewConnection,
-        ));
         out.push((
             PaletteItem::new("cmd:settings", "view: settings").hint("⌘,"),
             Cmd::OpenSettings,

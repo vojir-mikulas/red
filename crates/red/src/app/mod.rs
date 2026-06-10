@@ -220,6 +220,9 @@ pub struct AppState {
     /// commands it's currently showing (so an activation routes to the right one).
     pub(crate) palette: Option<Entity<Palette>>,
     pub(crate) palette_cmds: Vec<(ElementId, Cmd)>,
+    /// Set when an overlay closed: the next render pulls focus back to the root
+    /// so the global ⌘K keeps dispatching (see `close_palette`).
+    pub(crate) refocus_root: bool,
 }
 impl AppState {
     pub fn new(
@@ -308,6 +311,8 @@ impl AppState {
             root_focus: cx.focus_handle(),
             palette: None,
             palette_cmds: Vec::new(),
+            // Focus the root on first paint so the very first ⌘K dispatches.
+            refocus_root: true,
         }
     }
 

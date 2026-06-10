@@ -35,35 +35,6 @@ impl AppState {
         let config = &active.config;
 
         // --- top bar ---
-        // ⌘K palette is out of v0.1 scope — an inert search pill (styled to match
-        // the design) with the keyboard hint, so the chrome reads complete.
-        let kbd = div()
-            .px_1p5()
-            .rounded(px(4.))
-            .bg(theme.bg_elevated)
-            .border_1()
-            .border_color(theme.border_soft)
-            .font_family(FONT_MONO)
-            .text_size(px(10.))
-            .text_color(theme.text_muted)
-            .child("⌘K");
-        let omni = div()
-            .w(px(440.))
-            .h(px(24.))
-            .px_2p5()
-            .rounded(px(6.))
-            .bg(theme.bg_input)
-            .border_1()
-            .border_color(theme.border_soft)
-            .flex()
-            .items_center()
-            .gap_2()
-            .text_size(px(12.))
-            .text_color(theme.text_faint)
-            .child(crate::icons::icon("search", px(13.), theme.text_dim))
-            .child(div().flex_1().child("Search tables and commands"))
-            .child(kbd);
-
         let disconnect = div()
             .id("disconnect")
             .flex()
@@ -99,7 +70,8 @@ impl AppState {
             .bg(theme.bg_panel)
             .border_b_1()
             .border_color(theme.border)
-            .child(div().flex_1().flex().justify_center().child(omni))
+            // Spacer keeps the disconnect control flush right.
+            .child(div().flex_1())
             .child(topbar_right);
 
         // --- nested split: schema | (editor / results) ---

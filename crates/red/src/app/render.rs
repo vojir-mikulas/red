@@ -79,7 +79,14 @@ impl AppState {
 }
 
 impl Render for AppState {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // An overlay just closed (or we're starting up): reclaim focus so the
+        // global ⌘K binding has a live dispatch target again.
+        if self.refocus_root {
+            self.refocus_root = false;
+            window.focus(&self.root_focus, cx);
+        }
+
         let screen = match &self.phase {
             Phase::Disconnected => self.render_connect(cx).into_any_element(),
             Phase::Connecting(conn) => self.render_connecting(conn, cx).into_any_element(),
