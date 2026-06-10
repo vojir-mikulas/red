@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::PathBuf;
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, ClipboardItem, Context, Hsla, UniformListScrollHandle};
+use gpui::{
+    div, prelude::*, px, ClipboardItem, Context, Hsla, ScrollHandle, UniformListScrollHandle,
+};
 use red_core::{Column as ResultColumn, ExportFormat, Value};
 use red_service::{Command, CommandSender};
 
@@ -26,6 +28,13 @@ use crate::assets::FONT_MONO;
 /// evicting. The buffer holds at most ~`2*MARGIN` rows regardless of total.
 const PAGE: usize = 200;
 const MARGIN: usize = 400;
+
+/// Skip fetching while the viewport is moving faster than this many rows per
+/// paint — a flung scrollbar across a multi-million-row result would otherwise
+/// spawn a deep-`OFFSET` page query every frame at a different offset, none of
+/// which the user ever dwells on. Fetching resumes once the scroll slows to near
+/// its resting position. A deliberate drag moves far fewer rows/frame than this.
+const FLING_ROWS: usize = 3 * PAGE;
 
 /// Monotonic id for each opened result. Tags `OpenResult`/`FetchPage` so the
 /// backend can drop stale page fetches and the grid can ignore late replies for
@@ -43,6 +52,9 @@ fn next_epoch() -> u64 {
 struct GridBuffer {
     rows: HashMap<usize, Vec<Value>>,
     requested: HashSet<usize>,
+    /// The previous paint's first visible row, to gauge scroll velocity (see
+    /// `FLING_ROWS`). `None` until the first paint.
+    last_start: Option<usize>,
 }
 
 impl GridBuffer {
@@ -57,7 +69,17 @@ impl GridBuffer {
     /// Ensure the pages covering `range` are loaded, evict everything beyond a
     /// margin around it, and request any missing pages. Called per paint with the
     /// about-to-render window, so the buffer tracks the viewport.
-    fn ensure(&mut self, range: Range<usize>, total: usize, epoch: u64, sender: &CommandSender) {
+    ///
+    /// Returns `false` when fetching was skipped because the viewport is flinging
+    /// (see `FLING_ROWS`) — the caller schedules another paint so the resting
+    /// window still loads once the scroll settles.
+    fn ensure(
+        &mut self,
+        range: Range<usize>,
+        total: usize,
+        epoch: u64,
+        sender: &CommandSender,
+    ) -> bool {
         let lo = range.start.saturating_sub(MARGIN);
         let hi = (range.end + MARGIN).min(total);
         self.rows.retain(|k, _| *k >= lo && *k < hi);
@@ -65,8 +87,20 @@ impl GridBuffer {
             .retain(|p| p * PAGE + PAGE > lo && p * PAGE < hi);
 
         if range.is_empty() {
-            return;
+            return true;
         }
+
+        // While the viewport is flying past rows the user won't dwell on, don't
+        // spawn a (potentially expensive deep-`OFFSET`) fetch for each one; wait
+        // until the scroll slows near its destination.
+        let settled = self
+            .last_start
+            .is_none_or(|prev| range.start.abs_diff(prev) <= FLING_ROWS);
+        self.last_start = Some(range.start);
+        if !settled {
+            return false;
+        }
+
         let first = range.start / PAGE;
         let last = (range.end - 1) / PAGE;
         for page in first..=last {
@@ -85,6 +119,7 @@ impl GridBuffer {
                 epoch,
             });
         }
+        true
     }
 }
 
@@ -104,6 +139,7 @@ pub(crate) struct ResultGrid {
     buffer: Rc<RefCell<GridBuffer>>,
     sender: CommandSender,
     scroll: UniformListScrollHandle,
+    h_scroll: ScrollHandle,
     /// Identifies the current open SQL; bumped on every (re)open so stale page
     /// fetches and late `ResultReady`/`ResultPageLoaded` replies are ignored.
     pub(crate) epoch: u64,
@@ -123,6 +159,7 @@ impl ResultGrid {
             buffer: Rc::new(RefCell::new(GridBuffer::default())),
             sender,
             scroll: UniformListScrollHandle::new(),
+            h_scroll: ScrollHandle::new(),
             epoch: next_epoch(),
         }
     }
@@ -446,9 +483,11 @@ impl AppState {
 
     pub(crate) fn copy_result_selection(&mut self, cx: &mut Context<Self>) {
         let tsv = match &self.phase {
-            Phase::Connected(active) => {
-                active.active().result.as_ref().and_then(ResultGrid::selection_tsv)
-            }
+            Phase::Connected(active) => active
+                .active()
+                .result
+                .as_ref()
+                .and_then(ResultGrid::selection_tsv),
             _ => None,
         };
         if let Some(tsv) = tsv {
@@ -586,6 +625,7 @@ impl AppState {
             .font_family(FONT_MONO)
             .grid_lines(true)
             .track_scroll(&grid.scroll)
+            .track_horizontal_scroll(&grid.h_scroll)
             .horizontal(true)
             .selected_cells(grid.selection)
             .sort(sort)
@@ -593,10 +633,15 @@ impl AppState {
                 move || crate::icons::icon("sort-asc", px(9.), accent).into_any_element(),
                 move || crate::icons::icon("sort-desc", px(9.), accent).into_any_element(),
             )
-            .on_visible_range(move |range, _, _| {
-                buffer_range
+            .on_visible_range(move |range, window, _| {
+                let settled = buffer_range
                     .borrow_mut()
-                    .ensure(range, total, epoch, &sender)
+                    .ensure(range, total, epoch, &sender);
+                // Mid-fling we skipped fetching; ask for another paint so the
+                // window that the scroll settles on still gets loaded.
+                if !settled {
+                    window.refresh();
+                }
             })
             .on_sort(move |table_col, _, cx| {
                 sort_view

@@ -381,7 +381,11 @@ impl AppState {
     pub(crate) fn refresh_completions(&mut self, cx: &mut Context<Self>) {
         let (editors, candidates) = match &self.phase {
             Phase::Connected(active) => (
-                active.tabs.iter().map(|t| t.editor.clone()).collect::<Vec<_>>(),
+                active
+                    .tabs
+                    .iter()
+                    .map(|t| t.editor.clone())
+                    .collect::<Vec<_>>(),
                 build_candidates(&active.schema),
             ),
             _ => return,

@@ -30,6 +30,14 @@ use red_driver::{
 use tokio::sync::mpsc::{
     unbounded_channel, UnboundedReceiver as CmdReceiver, UnboundedSender as CmdSender,
 };
+use tokio::sync::Semaphore;
+
+/// Cap on page fetches running at once. The grid can request a burst of pages
+/// (several tabs, or a viewport spanning page boundaries); without a cap a flung
+/// scrollbar could otherwise fan out dozens of simultaneous deep-`OFFSET` scans
+/// and saturate the server. The UI also throttles requests (see `FLING_ROWS`);
+/// this is the backstop.
+const MAX_CONCURRENT_PAGE_FETCHES: usize = 6;
 
 /// UI → service. One active session at a time, driven across many commands.
 #[derive(Debug)]
@@ -245,6 +253,8 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
     // epoch absent from the map is stale — the tab closed or moved on — and is
     // dropped. UI epochs start at 1, so an empty map means "no live result".
     let mut result_sql: HashMap<u64, String> = HashMap::new();
+    // Bounds how many page fetches hit the server concurrently (see the const).
+    let page_fetch_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_PAGE_FETCHES));
 
     while let Some(command) = commands.recv().await {
         match command {
@@ -395,9 +405,12 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
                 };
                 // Pages fetch concurrently (the driver pools connections) and off
                 // the dispatch loop, so a deep-`OFFSET` page never blocks the next
-                // command or another page.
+                // command or another page — but no more than `page_fetch_limit` at
+                // once, so a burst can't saturate the server.
                 let events = events.clone();
+                let limit_src = page_fetch_limit.clone();
                 tokio::spawn(async move {
+                    let _permit = limit_src.acquire_owned().await;
                     match driver.fetch_page(&sql, offset, limit).await {
                         Ok(page) => emit(
                             &events,
