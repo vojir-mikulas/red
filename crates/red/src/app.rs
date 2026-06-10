@@ -32,14 +32,34 @@ pub(crate) enum Phase {
     Connected(Box<ActiveConn>),
 }
 
-/// Add/edit connection form state. The name + DSN text live in the shared
-/// `TextInput` entities on `AppState`; this holds the rest.
+/// Which entry mode the connection form is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FormTab {
+    /// Structured host/port/user/password/database (or file path) fields.
+    Fields,
+    /// A single connection-string input that parses back into the fields.
+    ConnectionString,
+}
+
+/// The result of the latest "Test connection" probe, shown in the form footer.
+pub(crate) enum TestState {
+    Idle,
+    Testing,
+    Ok(SharedString),
+    Fail(SharedString),
+}
+
+/// Add/edit connection form state. The field text lives in the shared `TextInput`
+/// entities on `AppState`; this holds the rest (engine, mode, label, flags).
 pub(crate) struct FormState {
     pub kind: DbKind,
-    pub kind_open: bool,
+    pub tab: FormTab,
+    /// Label-palette index (see `connect::label_color`).
+    pub color: u8,
     pub read_only: bool,
     /// `Some(index)` when editing an existing connection, `None` when adding.
     pub editing: Option<usize>,
+    pub test: TestState,
 }
 
 /// The live-connection view state: which connection, its engine version, the
@@ -96,7 +116,12 @@ pub struct AppState {
     pub(crate) connections: Vec<StoredConnection>,
     pub(crate) phase: Phase,
     pub(crate) name_input: Entity<TextInput>,
-    pub(crate) dsn_input: Entity<TextInput>,
+    pub(crate) host_input: Entity<TextInput>,
+    pub(crate) port_input: Entity<TextInput>,
+    pub(crate) user_input: Entity<TextInput>,
+    pub(crate) password_input: Entity<TextInput>,
+    pub(crate) database_input: Entity<TextInput>,
+    pub(crate) conn_str_input: Entity<TextInput>,
     pub(crate) form: Option<FormState>,
     pub(crate) toast: Option<(SharedString, ToastVariant)>,
     /// A destructive statement awaiting the user's confirmation before it runs.
@@ -141,8 +166,14 @@ impl AppState {
             service,
             connections: config::load(),
             phase: Phase::Disconnected,
-            name_input: cx.new(|cx| TextInput::new(cx).with_placeholder("My database")),
-            dsn_input: cx.new(TextInput::new),
+            name_input: cx.new(|cx| TextInput::new(cx).with_placeholder("my database")),
+            host_input: cx.new(|cx| TextInput::new(cx).with_placeholder("localhost")),
+            port_input: cx.new(TextInput::new),
+            user_input: cx.new(|cx| TextInput::new(cx).with_placeholder("postgres")),
+            password_input: cx.new(|cx| TextInput::new(cx).obscured()),
+            database_input: cx.new(|cx| TextInput::new(cx).with_placeholder("analytics_prod")),
+            conn_str_input: cx
+                .new(|cx| TextInput::new(cx).with_placeholder("postgres://user:pass@host:5432/db")),
             form: None,
             toast: None,
             confirm_exec: None,
@@ -166,6 +197,16 @@ impl AppState {
                 }
             }
             Event::Disconnected => self.phase = Phase::Disconnected,
+            Event::TestSucceeded { version } => {
+                if let Some(form) = &mut self.form {
+                    form.test = TestState::Ok(format!("Connection successful · {version}").into());
+                }
+            }
+            Event::TestFailed { message } => {
+                if let Some(form) = &mut self.form {
+                    form.test = TestState::Fail(message.into());
+                }
+            }
             Event::Error(message) => {
                 if matches!(self.phase, Phase::Connecting { .. }) {
                     self.phase = Phase::Disconnected;
@@ -224,14 +265,42 @@ impl AppState {
 
     // --- connection-manager actions ---
 
+    /// Set every form text input in one go.
+    fn fill_form_inputs(&mut self, config: &ConnectionConfig, cx: &mut Context<Self>) {
+        let port = config.port.map(|p| p.to_string()).unwrap_or_default();
+        self.name_input
+            .update(cx, |i, cx| i.set_content(config.name.clone(), cx));
+        self.host_input
+            .update(cx, |i, cx| i.set_content(config.host.clone(), cx));
+        self.port_input.update(cx, |i, cx| i.set_content(port, cx));
+        self.user_input
+            .update(cx, |i, cx| i.set_content(config.user.clone(), cx));
+        self.password_input
+            .update(cx, |i, cx| i.set_content(config.password.clone(), cx));
+        self.database_input
+            .update(cx, |i, cx| i.set_content(config.database.clone(), cx));
+        self.conn_str_input
+            .update(cx, |i, cx| i.set_content("", cx));
+    }
+
     pub(crate) fn open_new_form(&mut self, cx: &mut Context<Self>) {
-        self.name_input.update(cx, |i, cx| i.set_content("", cx));
-        self.dsn_input.update(cx, |i, cx| i.set_content("", cx));
+        let kind = DbKind::Postgres;
+        self.fill_form_inputs(
+            &ConnectionConfig {
+                kind,
+                port: kind.default_port(),
+                ..Default::default()
+            },
+            cx,
+        );
         self.form = Some(FormState {
-            kind: DbKind::Sqlite,
-            kind_open: false,
-            read_only: false,
+            kind,
+            tab: FormTab::Fields,
+            color: 3,
+            // Read-only by default — RED's safe-by-default posture.
+            read_only: true,
             editing: None,
+            test: TestState::Idle,
         });
         cx.notify();
     }
@@ -241,15 +310,14 @@ impl AppState {
             return;
         };
         let config = stored.config.clone();
-        self.name_input
-            .update(cx, |i, cx| i.set_content(config.name.clone(), cx));
-        self.dsn_input
-            .update(cx, |i, cx| i.set_content(config.dsn.clone(), cx));
+        self.fill_form_inputs(&config, cx);
         self.form = Some(FormState {
             kind: config.kind,
-            kind_open: false,
+            tab: FormTab::Fields,
+            color: config.color,
             read_only: config.read_only,
             editing: Some(index),
+            test: TestState::Idle,
         });
         cx.notify();
     }
@@ -259,52 +327,109 @@ impl AppState {
         cx.notify();
     }
 
-    pub(crate) fn save_form(&mut self, cx: &mut Context<Self>) {
-        let Some(form) = self.form.take() else {
+    /// Read the form's inputs + state into a `ConnectionConfig`. Unused fields for
+    /// the current engine (host/port for SQLite) come through empty/`None`.
+    pub(crate) fn form_config(&self, cx: &Context<Self>) -> Option<ConnectionConfig> {
+        let form = self.form.as_ref()?;
+        let read = |input: &Entity<TextInput>| input.read(cx).content().trim().to_string();
+        let port = read(&self.port_input).parse::<u16>().ok();
+        Some(ConnectionConfig {
+            name: read(&self.name_input),
+            kind: form.kind,
+            host: read(&self.host_input),
+            port: if form.kind.is_file() { None } else { port },
+            user: read(&self.user_input),
+            // Passwords may legitimately contain leading/trailing spaces — don't trim.
+            password: self.password_input.read(cx).content().to_string(),
+            database: read(&self.database_input),
+            color: form.color,
+            read_only: form.read_only,
+        })
+    }
+
+    /// Whether `config` has the minimum to attempt a connection (mirrors the form's
+    /// Save/Connect enablement): a file needs a path; a server needs host + db.
+    pub(crate) fn form_valid(config: &ConnectionConfig) -> bool {
+        if config.kind.is_file() {
+            !config.database.is_empty()
+        } else {
+            !config.host.is_empty() && !config.database.is_empty()
+        }
+    }
+
+    /// Persist the form. `connect` also opens the connection on success. On a
+    /// validation miss the modal stays open with a toast so the user can fix it.
+    pub(crate) fn save_form(&mut self, connect: bool, cx: &mut Context<Self>) {
+        let Some(config) = self.form_config(cx) else {
             return;
         };
-        let name = self.name_input.read(cx).content().to_string();
-        let dsn = self.dsn_input.read(cx).content().to_string();
-        if name.trim().is_empty() || dsn.trim().is_empty() {
-            self.toast = Some((
-                "Name and connection target are required".into(),
-                ToastVariant::Error,
-            ));
-            self.form = Some(form); // keep the modal open so the user can fix it
-            cx.notify();
+        if config.name.is_empty() {
+            self.form_error("A name is required", cx);
+            return;
+        }
+        if !Self::form_valid(&config) {
+            let msg = if config.kind.is_file() {
+                "A database file path is required"
+            } else {
+                "Host and database are required"
+            };
+            self.form_error(msg, cx);
             return;
         }
 
-        let config = ConnectionConfig {
-            name,
-            kind: form.kind,
-            dsn,
-            read_only: form.read_only,
-        };
-        match form.editing {
+        let editing = self.form.as_ref().and_then(|f| f.editing);
+        let index = match editing {
             Some(index) if index < self.connections.len() => {
                 self.connections[index].config = config;
+                index
             }
-            _ => self.connections.push(StoredConnection {
-                config,
-                last_accessed: None,
-            }),
-        }
+            _ => {
+                self.connections.push(StoredConnection {
+                    config,
+                    last_accessed: None,
+                });
+                self.connections.len() - 1
+            }
+        };
+        self.form = None;
         self.persist();
+        if connect {
+            self.connect(index, cx);
+        }
+        cx.notify();
+    }
+
+    /// Surface a form validation error without closing the modal.
+    fn form_error(&mut self, message: &str, cx: &mut Context<Self>) {
+        self.toast = Some((message.to_string().into(), ToastVariant::Error));
         cx.notify();
     }
 
     pub(crate) fn set_form_kind(&mut self, kind: DbKind, cx: &mut Context<Self>) {
         if let Some(form) = &mut self.form {
             form.kind = kind;
-            form.kind_open = false;
+            form.test = TestState::Idle;
+        }
+        // Reset the port to the engine default so switching engines doesn't leave a
+        // stale port behind (matches the design).
+        let port = kind
+            .default_port()
+            .map(|p| p.to_string())
+            .unwrap_or_default();
+        self.port_input.update(cx, |i, cx| i.set_content(port, cx));
+        cx.notify();
+    }
+
+    pub(crate) fn set_form_tab(&mut self, tab: FormTab, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.form {
+            form.tab = tab;
         }
         cx.notify();
     }
 
-    pub(crate) fn toggle_form_kind_open(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn set_form_color(&mut self, color: u8, cx: &mut Context<Self>) {
         if let Some(form) = &mut self.form {
-            form.kind_open = !form.kind_open;
+            form.color = color;
         }
         cx.notify();
     }
@@ -313,6 +438,61 @@ impl AppState {
         if let Some(form) = &mut self.form {
             form.read_only = read_only;
         }
+        cx.notify();
+    }
+
+    /// Parse the connection-string input into the structured fields, then flip back
+    /// to the Fields tab. A parse failure shows in the test/result line.
+    pub(crate) fn apply_conn_str(&mut self, cx: &mut Context<Self>) {
+        let raw = self.conn_str_input.read(cx).content().to_string();
+        let Some(parsed) = ConnectionConfig::parse_conn_str(&raw) else {
+            if let Some(form) = &mut self.form {
+                form.test = TestState::Fail("Could not parse connection string".into());
+            }
+            cx.notify();
+            return;
+        };
+        let port = parsed.port.map(|p| p.to_string()).unwrap_or_default();
+        self.host_input
+            .update(cx, |i, cx| i.set_content(parsed.host, cx));
+        self.port_input.update(cx, |i, cx| i.set_content(port, cx));
+        self.user_input
+            .update(cx, |i, cx| i.set_content(parsed.user, cx));
+        self.password_input
+            .update(cx, |i, cx| i.set_content(parsed.password, cx));
+        self.database_input
+            .update(cx, |i, cx| i.set_content(parsed.database, cx));
+        if let Some(form) = &mut self.form {
+            form.kind = parsed.kind;
+            form.tab = FormTab::Fields;
+            form.test = TestState::Idle;
+        }
+        cx.notify();
+    }
+
+    /// Fire a throwaway connection probe for the current form values.
+    pub(crate) fn test_connection(&mut self, cx: &mut Context<Self>) {
+        let Some(config) = self.form_config(cx) else {
+            return;
+        };
+        if !Self::form_valid(&config) {
+            if let Some(form) = &mut self.form {
+                form.test = TestState::Fail(
+                    if config.kind.is_file() {
+                        "A database file path is required"
+                    } else {
+                        "Host and database are required"
+                    }
+                    .into(),
+                );
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(form) = &mut self.form {
+            form.test = TestState::Testing;
+        }
+        self.service.send(Command::TestConnection(config));
         cx.notify();
     }
 

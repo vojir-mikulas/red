@@ -34,6 +34,9 @@ use tokio::sync::mpsc::{
 #[derive(Debug)]
 pub enum Command {
     Connect(ConnectionConfig),
+    /// Open a throwaway session to validate a config, then drop it. Reports back
+    /// via `TestSucceeded`/`TestFailed` without disturbing the active session.
+    TestConnection(ConnectionConfig),
     /// Open a cursor for `sql` and stream the first window.
     Query {
         sql: String,
@@ -85,6 +88,15 @@ pub enum Event {
     },
     /// The session was dropped (in response to `Disconnect`).
     Disconnected,
+    /// A `TestConnection` probe opened a session successfully; `version` is the
+    /// engine version it reported.
+    TestSucceeded {
+        version: String,
+    },
+    /// A `TestConnection` probe failed; `message` is the driver error.
+    TestFailed {
+        message: String,
+    },
     /// A query opened; column metadata is known before any rows arrive.
     QueryStarted {
         columns: Vec<Column>,
@@ -220,6 +232,20 @@ async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Ev
                         emit(&events, Event::Connected { version });
                     }
                     Err(message) => emit(&events, Event::Error(message)),
+                }
+            }
+
+            Command::TestConnection(config) => {
+                // A throwaway probe: connect, report, and let the driver drop. The
+                // active session is untouched.
+                match connect(&config).await {
+                    Ok(driver) => emit(
+                        &events,
+                        Event::TestSucceeded {
+                            version: driver.server_version(),
+                        },
+                    ),
+                    Err(message) => emit(&events, Event::TestFailed { message }),
                 }
             }
 
@@ -478,18 +504,18 @@ async fn sleep_for(timeout: Option<Duration>) {
 async fn connect(config: &ConnectionConfig) -> Result<Arc<dyn DatabaseDriver>, String> {
     match config.kind {
         DbKind::Sqlite => {
-            let driver = SqliteDriver::new(config.dsn.clone(), config.read_only);
+            let driver = SqliteDriver::new(config.dsn(), config.read_only);
             driver.ping().await.map_err(|e| e.to_string())?;
             Ok(Arc::new(driver))
         }
         DbKind::Postgres => {
-            let driver = PostgresDriver::connect(&config.dsn, config.read_only)
+            let driver = PostgresDriver::connect(&config.dsn(), config.read_only)
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(Arc::new(driver))
         }
         DbKind::Mysql => {
-            let driver = MysqlDriver::connect(&config.dsn, config.read_only)
+            let driver = MysqlDriver::connect(&config.dsn(), config.read_only)
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(Arc::new(driver))
@@ -513,8 +539,9 @@ mod tests {
         ConnectionConfig {
             name: "scratch".into(),
             kind: DbKind::Sqlite,
-            dsn: dsn.into(),
+            database: dsn.into(),
             read_only,
+            ..Default::default()
         }
     }
 

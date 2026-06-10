@@ -14,7 +14,7 @@ use std::rc::Rc;
 
 use flint::prelude::*;
 use gpui::{div, prelude::*, px, App, Context, Entity};
-use red_core::{ColumnMeta, ObjectKind, SchemaMeta, TableDetail};
+use red_core::{ColumnMeta, DbKind, ObjectKind, SchemaMeta, TableDetail};
 use red_service::Command;
 
 use crate::app::{ActiveConn, AppState, Phase};
@@ -294,10 +294,15 @@ fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
     }
 }
 
-/// Quote an identifier for the preview `SELECT` (PRAGMA-style: double quotes,
-/// embedded quotes doubled) so a table name can never break out of the SQL.
-fn quote_ident(ident: &str) -> String {
-    format!("\"{}\"", ident.replace('"', "\"\""))
+/// Quote an identifier for the preview `SELECT` so a table name can never break
+/// out of the SQL. MySQL/MariaDB use backticks (double quotes are string literals
+/// there unless `ANSI_QUOTES` is set); SQLite/Postgres use the SQL-standard double
+/// quote. Embedded quote chars are doubled either way.
+fn quote_ident(ident: &str, kind: DbKind) -> String {
+    match kind {
+        DbKind::Mysql => format!("`{}`", ident.replace('`', "``")),
+        _ => format!("\"{}\"", ident.replace('"', "\"\"")),
+    }
 }
 
 impl AppState {
@@ -451,18 +456,20 @@ impl AppState {
     /// Preview a table/view: open `SELECT * FROM schema.table` in the result grid.
     /// No `LIMIT` — the grid pages through it with flat memory.
     pub(crate) fn schema_preview(&mut self, schema: String, table: String, cx: &mut Context<Self>) {
+        let Phase::Connected(active) = &mut self.phase else {
+            return;
+        };
+        let kind = active.config.kind;
         let sql = format!(
             "SELECT * FROM {}.{}",
-            quote_ident(&schema),
-            quote_ident(&table)
+            quote_ident(&schema, kind),
+            quote_ident(&table, kind)
         );
         let label = format!("{schema}.{table}");
-        if let Phase::Connected(active) = &mut self.phase {
-            active.schema.selected = Some(NodeId::Object {
-                schema,
-                name: table,
-            });
-        }
+        active.schema.selected = Some(NodeId::Object {
+            schema,
+            name: table,
+        });
         self.open_result(label, sql, cx);
     }
 }

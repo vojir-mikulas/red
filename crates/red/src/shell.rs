@@ -206,7 +206,7 @@ impl AppState {
                     .gap_1p5()
                     .px_2()
                     .child(div().size(px(6.)).rounded_full().bg(theme.green))
-                    .child(config.dsn.clone()),
+                    .child(config.display_target()),
             )
             .child(div().px_2().child(config.name.clone()))
             .child(

@@ -6,11 +6,37 @@
 //! [`AppState`] (`app.rs`).
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, SharedString, WindowControlArea};
+use flint::Theme;
+use gpui::{
+    div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, SharedString, WindowControlArea,
+};
 use red_core::DbKind;
 
-use crate::app::{AppState, FormState};
+use crate::app::{AppState, FormState, FormTab, TestState};
 use crate::assets::{FONT_MONO, FONT_UI};
+
+/// The six label colors a connection can be tagged with, mapped onto semantic
+/// theme tokens so they track the active theme. A connection stores the index.
+pub(crate) fn label_color(index: u8, theme: &Theme) -> Hsla {
+    let palette = [
+        theme.red,
+        theme.yellow,
+        theme.green,
+        theme.blue,
+        theme.purple,
+        theme.text_muted,
+    ];
+    palette[(index as usize).min(palette.len() - 1)]
+}
+
+/// The accent tint for an engine, used on the engine picker's dots and cards.
+fn engine_tint(kind: DbKind, theme: &Theme) -> Hsla {
+    match kind {
+        DbKind::Postgres => theme.blue,
+        DbKind::Sqlite => theme.cyan,
+        DbKind::Mysql => theme.orange,
+    }
+}
 
 /// A connection's last-used time as a coarse relative label ("just now", "5m
 /// ago", "never") — the per-card recency the design shows on the right.
@@ -243,6 +269,14 @@ impl AppState {
             .hover(|s| s.border_color(theme.border_strong).bg(theme.bg_active))
             .child(
                 div()
+                    .w(px(3.))
+                    .h(px(30.))
+                    .rounded_full()
+                    .flex_none()
+                    .bg(label_color(config.color, theme)),
+            )
+            .child(
+                div()
                     .flex()
                     .items_center()
                     .justify_center()
@@ -292,7 +326,7 @@ impl AppState {
                             .text_color(theme.text_faint)
                             .font_family(FONT_MONO)
                             .truncate()
-                            .child(config.dsn.clone()),
+                            .child(config.display_target()),
                     ),
             )
             // Chevron by default, swapped for Edit / Remove on hover (the buttons
@@ -399,121 +433,361 @@ impl AppState {
     }
 
     fn render_form(&self, form: &FormState, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
+        // Owned clone so the theme doesn't hold an immutable borrow of `cx` across
+        // the `&mut cx` helper calls below.
+        let theme = cx.theme().clone();
+        let theme = &theme;
         let view = cx.entity().downgrade();
-        let kind_ix = match form.kind {
-            DbKind::Sqlite => 0,
-            DbKind::Postgres => 1,
-            DbKind::Mysql => 2,
-        };
-        let dsn_label = match form.kind {
-            DbKind::Sqlite => "Database file",
-            DbKind::Postgres => "Connection URL",
-            DbKind::Mysql => "Connection URL",
-        };
+        let is_file = form.kind.is_file();
+        let valid = self
+            .form_config(cx)
+            .is_some_and(|c| AppState::form_valid(&c));
         let title = if form.editing.is_some() {
             "Edit connection"
         } else {
             "New connection"
         };
 
-        let field_label =
-            |text: &'static str| div().text_xs().text_color(cx.theme().text_dim).child(text);
-
-        let engine_select = {
-            let toggle_view = view.clone();
-            let select_view = view.clone();
-            Select::new("engine")
-                .option("SQLite")
-                .option("PostgreSQL")
-                .option("MySQL/MariaDB")
-                .selected(kind_ix)
-                .open(form.kind_open)
-                .on_toggle(move |_, cx| {
-                    toggle_view
-                        .update(cx, |this, cx| this.toggle_form_kind_open(cx))
-                        .ok();
-                })
-                .on_select(move |ix, _, cx| {
-                    let kind = match ix {
-                        0 => DbKind::Sqlite,
-                        1 => DbKind::Postgres,
-                        _ => DbKind::Mysql,
+        // Entry-mode tabs (Fields ↔ Connection string).
+        let tab_ix = match form.tab {
+            FormTab::Fields => 0,
+            FormTab::ConnectionString => 1,
+        };
+        let tabs = Tabs::new("conn-form-tabs")
+            .tab("Fields", None)
+            .tab("Connection string", None)
+            .selected(tab_ix)
+            .on_select({
+                let view = view.clone();
+                move |ix, _, cx| {
+                    let tab = if ix == 0 {
+                        FormTab::Fields
+                    } else {
+                        FormTab::ConnectionString
                     };
-                    select_view
-                        .update(cx, |this, cx| this.set_form_kind(kind, cx))
-                        .ok();
-                })
+                    view.update(cx, |this, cx| this.set_form_tab(tab, cx)).ok();
+                }
+            });
+
+        let body = match form.tab {
+            FormTab::ConnectionString => self.render_conn_str_tab(theme, cx),
+            FormTab::Fields => self.render_fields_tab(form, is_file, theme, cx),
         };
 
-        let body = div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(field_label("Name"))
-                    .child(self.name_input.clone()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(field_label("Engine"))
-                    .child(engine_select),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(field_label(dsn_label))
-                    .child(self.dsn_input.clone()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Toggle::new("read-only", form.read_only).on_change(cx.listener(
-                            |this, checked: &bool, _, cx| this.set_form_read_only(*checked, cx),
-                        )),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.text_muted)
-                            .child("Read-only connection"),
-                    ),
-            );
-
-        let footer = div()
-            .flex()
-            .gap_2()
-            .child(
-                Button::new("form-cancel", "Cancel")
-                    .variant(ButtonVariant::Secondary)
-                    .on_click(cx.listener(|this, _, _, cx| this.close_form(cx))),
-            )
-            .child(
-                Button::new("form-save", "Save")
-                    .variant(ButtonVariant::Primary)
-                    .on_click(cx.listener(|this, _, _, cx| this.save_form(cx))),
-            );
+        let footer = self.render_form_footer(form, valid, cx);
 
         let close_view = view.clone();
         Modal::new("connection-form")
             .title(title)
-            .width(px(440.))
+            .width(px(520.))
             .footer(footer)
             .on_close(move |_, cx| {
                 close_view.update(cx, |this, cx| this.close_form(cx)).ok();
             })
-            .child(body)
+            .child(div().flex().flex_col().gap_3().child(tabs).child(body))
     }
+
+    /// The "Connection string" tab: one input plus a parse-into-fields action.
+    fn render_conn_str_tab(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .child(field_label("Connection string", theme))
+            .child(self.conn_str_input.clone())
+            .child(
+                div().flex().justify_end().child(
+                    Button::new("parse-conn-str", "Parse into fields →")
+                        .variant(ButtonVariant::Ghost)
+                        .size(ButtonSize::Sm)
+                        .on_click(cx.listener(|this, _, _, cx| this.apply_conn_str(cx))),
+                ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.text_faint)
+                    .child("Supports postgres://, mysql://, and sqlite:/// schemes."),
+            )
+            .into_any_element()
+    }
+
+    /// The "Fields" tab: name, engine picker, per-engine connection fields, and the
+    /// label/access row.
+    fn render_fields_tab(
+        &self,
+        form: &FormState,
+        is_file: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let fields = if is_file {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .child(field_label("Database file", theme))
+                .child(self.database_input.clone())
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .gap_3()
+                        .child(
+                            labeled_field("Host", theme)
+                                .flex_1()
+                                .child(self.host_input.clone()),
+                        )
+                        .child(
+                            labeled_field("Port", theme)
+                                .w(px(88.))
+                                .flex_none()
+                                .child(self.port_input.clone()),
+                        ),
+                )
+                .child(labeled_field("Database", theme).child(self.database_input.clone()))
+                .child(
+                    div()
+                        .flex()
+                        .gap_3()
+                        .child(
+                            labeled_field("User", theme)
+                                .flex_1()
+                                .child(self.user_input.clone()),
+                        )
+                        .child(
+                            labeled_field("Password", theme)
+                                .flex_1()
+                                .child(self.password_input.clone()),
+                        ),
+                )
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(labeled_field("Name", theme).child(self.name_input.clone()))
+            .child(
+                labeled_field("Engine", theme)
+                    .child(self.render_engine_picker(form.kind, theme, cx)),
+            )
+            .child(fields)
+            .child(self.render_label_access_row(form, theme, cx))
+            .into_any_element()
+    }
+
+    /// The engine segmented control — one cell per `DbKind`, with the engine tint
+    /// dot. Data-driven off `DbKind::all`, so a new driver appears automatically.
+    fn render_engine_picker(
+        &self,
+        selected: DbKind,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let cells = DbKind::all().iter().map(|&kind| {
+            let on = kind == selected;
+            let (bg, border, text) = if on {
+                (theme.accent_ghost, theme.accent, theme.text)
+            } else {
+                (theme.bg_input, theme.border_soft, theme.text_muted)
+            };
+            div()
+                .id(SharedString::from(format!("engine-{}", kind.url_scheme())))
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_1p5()
+                .h(px(32.))
+                .rounded(theme.radius)
+                .bg(bg)
+                .border_1()
+                .border_color(border)
+                .text_size(px(12.))
+                .text_color(text)
+                .cursor_pointer()
+                .hover(|s| s.text_color(theme.text))
+                .child(
+                    div()
+                        .size(px(8.))
+                        .rounded_full()
+                        .flex_none()
+                        .bg(engine_tint(kind, theme)),
+                )
+                .child(kind.to_string())
+                .on_click(cx.listener(move |this, _, _, cx| this.set_form_kind(kind, cx)))
+        });
+        div().flex().gap_1p5().children(cells)
+    }
+
+    /// The label-color swatches + the read-only access toggle, sharing one row.
+    fn render_label_access_row(
+        &self,
+        form: &FormState,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let swatches = (0..6u8).map(|i| {
+            let color = label_color(i, theme);
+            let on = i == form.color;
+            div()
+                .id(SharedString::from(format!("swatch-{i}")))
+                .size(px(20.))
+                .rounded_full()
+                .bg(color)
+                .cursor_pointer()
+                .border_2()
+                .border_color(if on { color } else { theme.bg_elevated })
+                .when(on, |s| s.shadow_sm())
+                .on_click(cx.listener(move |this, _, _, cx| this.set_form_color(i, cx)))
+        });
+
+        div()
+            .flex()
+            .items_start()
+            .gap_3()
+            .child(
+                labeled_field("Label", theme).child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(7.))
+                        .h(px(32.))
+                        .children(swatches),
+                ),
+            )
+            .child(
+                labeled_field("Access", theme).ml_auto().flex_none().child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .h(px(32.))
+                        .child(
+                            Toggle::new("read-only", form.read_only).on_change(cx.listener(
+                                |this, checked: &bool, _, cx| this.set_form_read_only(*checked, cx),
+                            )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .text_size(px(12.5))
+                                .text_color(if form.read_only {
+                                    theme.accent
+                                } else {
+                                    theme.text_muted
+                                })
+                                .child(crate::icons::icon(
+                                    "lock",
+                                    px(12.),
+                                    if form.read_only {
+                                        theme.accent
+                                    } else {
+                                        theme.text_muted
+                                    },
+                                ))
+                                .child("Read-only"),
+                        ),
+                ),
+            )
+    }
+
+    /// The modal footer: a Test-connection action with its result on the left, and
+    /// Cancel / Save / Connect on the right.
+    fn render_form_footer(
+        &self,
+        form: &FormState,
+        valid: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let testing = matches!(form.test, TestState::Testing);
+        let result = match &form.test {
+            TestState::Idle | TestState::Testing => None,
+            TestState::Ok(msg) => Some((msg.clone(), theme.green)),
+            TestState::Fail(msg) => Some((msg.clone(), theme.red)),
+        };
+
+        let test_side = div()
+            .flex()
+            .items_center()
+            .gap_2p5()
+            .flex_1()
+            .min_w_0()
+            .child(
+                Button::new(
+                    "test-conn",
+                    if testing {
+                        "Testing…"
+                    } else {
+                        "Test connection"
+                    },
+                )
+                .variant(ButtonVariant::Ghost)
+                .icon(crate::icons::icon("play", px(13.), theme.text_muted))
+                .disabled(testing)
+                .on_click(cx.listener(|this, _, _, cx| this.test_connection(cx))),
+            )
+            .when_some(result, |row, (msg, color)| {
+                row.child(
+                    div()
+                        .min_w_0()
+                        .text_size(px(11.5))
+                        .text_color(color)
+                        .font_family(FONT_MONO)
+                        .truncate()
+                        .child(msg),
+                )
+            });
+
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .child(test_side)
+            .child(
+                Button::new("form-cancel", "Cancel")
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(cx.listener(|this, _, _, cx| this.close_form(cx))),
+            )
+            .child(
+                Button::new("form-save", "Save")
+                    .variant(ButtonVariant::Secondary)
+                    .disabled(!valid)
+                    .on_click(cx.listener(|this, _, _, cx| this.save_form(false, cx))),
+            )
+            .child(
+                Button::new("form-connect", "Connect")
+                    .variant(ButtonVariant::Primary)
+                    .icon(crate::icons::icon("power", px(14.), theme.on_accent))
+                    .disabled(!valid)
+                    .on_click(cx.listener(|this, _, _, cx| this.save_form(true, cx))),
+            )
+    }
+}
+
+/// A small uppercase field caption, matching the design's form labels.
+fn field_label(text: &'static str, theme: &Theme) -> impl IntoElement {
+    div()
+        .text_size(px(10.5))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme.text_faint)
+        .child(text.to_uppercase())
+}
+
+/// A labeled form field column: the caption above its control (passed as a child).
+fn labeled_field(label: &'static str, theme: &Theme) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1p5()
+        .child(field_label(label, theme))
 }

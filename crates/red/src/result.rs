@@ -115,8 +115,10 @@ impl ResultGrid {
     /// Ordering by output position is robust to column-name quoting/aliases.
     fn effective_sql(&self) -> String {
         match self.sort {
+            // The derived table needs an alias — MySQL and Postgres both reject an
+            // unaliased subquery in `FROM`.
             Some((col, asc)) => format!(
-                "SELECT * FROM ({}) ORDER BY {} {}",
+                "SELECT * FROM ({}) AS _red_sort ORDER BY {} {}",
                 strip_trailing(&self.base_sql),
                 col + 1,
                 if asc { "ASC" } else { "DESC" }

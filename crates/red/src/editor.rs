@@ -209,7 +209,7 @@ impl AppState {
                     .font_family(FONT_MONO)
                     .text_size(px(11.))
                     .text_color(dim)
-                    .child(active.config.dsn.clone()),
+                    .child(active.config.display_target()),
             );
 
         let history = active.history_open.then(|| {
