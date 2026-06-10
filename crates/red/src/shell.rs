@@ -6,7 +6,15 @@
 //! caller-owned state on [`ActiveConn`].
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Axis, Context};
+use gpui::{div, prelude::*, px, Axis, Context, WindowControlArea};
+
+/// Left inset of the top bar. On macOS it clears the seamless traffic lights
+/// overlapping this strip; elsewhere the native caption bar is separate, so only
+/// normal padding is needed. Mirrors Nyx.
+#[cfg(target_os = "macos")]
+const TITLEBAR_LEFT_INSET: f32 = 72.;
+#[cfg(not(target_os = "macos"))]
+const TITLEBAR_LEFT_INSET: f32 = 12.;
 
 use crate::app::{ActiveConn, AppState, Phase};
 use crate::assets::{FONT_MONO, FONT_UI};
@@ -31,69 +39,70 @@ impl AppState {
         let config = &active.config;
 
         // --- top bar ---
-        let brand = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .font_family(FONT_MONO)
-                    .text_size(px(14.))
-                    .text_color(theme.red)
-                    .child("RED"),
-            )
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(theme.text_faint)
-                    .child("Roughly Enough Data"),
-            );
-
-        // ⌘K palette is out of v0.1 scope — an inert visual placeholder only.
+        // ⌘K palette is out of v0.1 scope — an inert search pill (styled to match
+        // the design) with the keyboard hint, so the chrome reads complete.
+        let kbd = div()
+            .px_1p5()
+            .rounded(px(4.))
+            .bg(theme.bg_elevated)
+            .border_1()
+            .border_color(theme.border_soft)
+            .font_family(FONT_MONO)
+            .text_size(px(10.))
+            .text_color(theme.text_muted)
+            .child("⌘K");
         let omni = div()
-            .w(px(420.))
+            .w(px(440.))
             .h(px(24.))
             .px_2p5()
             .rounded(px(6.))
             .bg(theme.bg_input)
             .border_1()
-            .border_color(theme.border)
-            .flex()
-            .items_center()
-            .text_size(px(12.))
-            .text_color(theme.text_faint)
-            .child("Search tables and commands  (⌘K — coming soon)");
-
-        let topbar_right = div()
+            .border_color(theme.border_soft)
             .flex()
             .items_center()
             .gap_2()
-            .child(Badge::new(config.kind.to_string()))
-            .child(
-                div()
-                    .font_family(FONT_MONO)
-                    .text_size(px(12.))
-                    .text_color(theme.text)
-                    .child(config.name.clone()),
-            )
-            .child(
-                Button::new("disconnect", "Disconnect")
-                    .variant(ButtonVariant::Ghost)
-                    .size(ButtonSize::Sm)
-                    .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx))),
-            );
+            .text_size(px(12.))
+            .text_color(theme.text_faint)
+            .child(crate::icons::icon("search", px(13.), theme.text_dim))
+            .child(div().flex_1().child("Search tables and commands"))
+            .child(kbd);
 
+        let disconnect = div()
+            .id("disconnect")
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .h(px(24.))
+            .px_2p5()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme.border_soft)
+            .text_size(px(11.5))
+            .text_color(theme.text_muted)
+            .cursor_pointer()
+            .hover(|s| s.border_color(theme.red).text_color(theme.red))
+            .child(crate::icons::icon("power", px(13.), theme.text_muted))
+            .child("Disconnect")
+            .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx)));
+
+        let topbar_right = div().flex().items_center().child(disconnect);
+
+        // The top bar doubles as the window drag region (seamless traffic lights
+        // sit in the left inset); interactive children keep their own hitboxes.
         let topbar = div()
+            .id("topbar")
+            .window_control_area(WindowControlArea::Drag)
             .flex_shrink_0()
             .h(px(38.))
             .flex()
             .items_center()
             .gap_3()
-            .px_3()
+            .pl(px(TITLEBAR_LEFT_INSET))
+            .pr_3()
             .bg(theme.bg_panel)
             .border_b_1()
             .border_color(theme.border)
-            .child(brand)
             .child(div().flex_1().flex().justify_center().child(omni))
             .child(topbar_right);
 
@@ -183,27 +192,70 @@ impl AppState {
 
         let body = div().flex_1().min_h(px(0.)).child(outer);
 
-        // --- status bar ---
+        // --- status bar: endpoint · db · read-only | rows · cols · UTF-8 · SQL ·
+        // engine · theme — the design's information-dense bottom strip ---
+        let counts = active.result.as_ref().and_then(|g| g.status_counts());
+
         let status_left = div()
             .flex()
             .items_center()
-            .gap_2()
-            .child(div().size(px(6.)).rounded_full().bg(theme.green))
-            .child(config.name.clone())
-            .when(config.read_only, |row| {
-                row.child(div().text_color(theme.yellow).child("read-only"))
-            });
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .px_2()
+                    .child(div().size(px(6.)).rounded_full().bg(theme.green))
+                    .child(config.dsn.clone()),
+            )
+            .child(div().px_2().child(config.name.clone()))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .text_color(if config.read_only {
+                        theme.yellow
+                    } else {
+                        theme.text_muted
+                    })
+                    .when(config.read_only, |d| {
+                        d.child(crate::icons::icon("lock", px(11.), theme.yellow))
+                    })
+                    .child(if config.read_only {
+                        "Read-only"
+                    } else {
+                        "Read/Write"
+                    }),
+            );
 
         let status_right = div()
             .flex()
             .items_center()
-            .gap_3()
-            .child(format!("{} {}", config.kind, active.version))
+            .when_some(counts, |row, (rows, cols)| {
+                row.child(
+                    div()
+                        .px_2()
+                        .text_color(theme.text)
+                        .child(format!("{rows} rows")),
+                )
+                .child(div().px_2().child(format!("{cols} columns")))
+            })
+            .child(div().px_2().child("UTF-8"))
+            .child(div().px_2().child("SQL"))
+            .child(div().px_2().child(format!("{} {}", config.kind, active.version)))
             .child(
                 div()
                     .id("theme-swatch")
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .px_2()
                     .cursor_pointer()
-                    .child("Theme")
+                    .hover(|s| s.text_color(theme.text))
+                    .child(div().size(px(9.)).rounded_full().bg(theme.accent))
+                    .child(cx.theme().name.clone())
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx))),
             );
 
@@ -213,7 +265,7 @@ impl AppState {
             .flex()
             .items_center()
             .justify_between()
-            .px_2()
+            .px_1()
             .bg(theme.bg_panel_2)
             .border_t_1()
             .border_color(theme.border)

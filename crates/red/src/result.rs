@@ -125,6 +125,13 @@ impl ResultGrid {
         }
     }
 
+    /// `(rows, columns)` once the result is ready — for the shell's status bar.
+    pub fn status_counts(&self) -> Option<(usize, usize)> {
+        self.ready
+            .then_some((self.total, self.columns.len()))
+            .filter(|_| self.error.is_none())
+    }
+
     fn on_ready(&mut self, columns: Vec<ResultColumn>, total: usize) {
         self.columns = columns;
         self.total = total;
@@ -184,25 +191,56 @@ fn cell_string(value: &Value) -> String {
     }
 }
 
-/// One grid cell, colored by value kind (NULL italic-faint, numbers accented).
-fn render_cell(value: Option<&Value>, text: Hsla, num: Hsla, faint: Hsla) -> gpui::AnyElement {
+/// Colors a result cell carries, keyed by value kind (so the grid reads at a
+/// glance the way the design does: numbers orange, UUIDs dimmed, JSON cyan).
+#[derive(Clone, Copy)]
+struct CellColors {
+    text: Hsla,
+    muted: Hsla,
+    num: Hsla,
+    cyan: Hsla,
+    faint: Hsla,
+}
+
+/// True for a canonical `8-4-4-4-12` hex UUID — dimmed like the design's id columns.
+fn is_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.as_bytes().iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+/// One grid cell, colored by value kind (NULL italic-faint, numbers accented,
+/// UUIDs dimmed, JSON-ish text cyan — mirroring the design's typed cells).
+fn render_cell(value: Option<&Value>, c: CellColors) -> gpui::AnyElement {
     match value {
         None | Some(Value::Null) => div()
             .italic()
-            .text_color(faint)
+            .text_color(c.faint)
             .child("NULL")
             .into_any_element(),
         Some(Value::Integer(n)) => div()
-            .text_color(num)
+            .text_color(c.num)
             .child(n.to_string())
             .into_any_element(),
         Some(Value::Real(x)) => div()
-            .text_color(num)
+            .text_color(c.num)
             .child(x.to_string())
             .into_any_element(),
-        Some(Value::Text(s)) => div().text_color(text).child(s.clone()).into_any_element(),
+        Some(Value::Text(s)) => {
+            let trimmed = s.trim_start();
+            let color = if is_uuid(s) {
+                c.muted
+            } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                c.cyan
+            } else {
+                c.text
+            };
+            div().text_color(color).child(s.clone()).into_any_element()
+        }
         Some(Value::Blob(b)) => div()
-            .text_color(faint)
+            .text_color(c.faint)
             .child(format!("<{} bytes>", b.len()))
             .into_any_element(),
     }
@@ -369,15 +407,18 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let (bg, border, muted, faint, text, num, red) = (
-            theme.bg_panel,
-            theme.border,
-            theme.text_muted,
-            theme.text_faint,
-            theme.text,
-            theme.orange,
-            theme.red,
-        );
+        let (bg, bg_app, border, border_soft) =
+            (theme.bg_panel, theme.bg_app, theme.border, theme.border_soft);
+        let (muted, faint, dim, text) =
+            (theme.text_muted, theme.text_faint, theme.text_dim, theme.text);
+        let (num, cyan, red, accent) = (theme.orange, theme.cyan, theme.red, theme.accent);
+        let cell_colors = CellColors {
+            text,
+            muted,
+            num,
+            cyan,
+            faint,
+        };
         let container = div().size_full().flex().flex_col().bg(bg);
 
         let grid = match &active.result {
@@ -454,9 +495,17 @@ impl AppState {
         }
 
         // Row-number gutter + one fixed-width, sortable column per result column.
+        // Each header carries the engine's declared type as a dim subtitle, like
+        // the design's typed headers (`email` + `text`).
         let mut columns = vec![Column::new("#").width(px(56.)).align_end()];
         for c in &grid.columns {
-            columns.push(Column::new(c.name.clone()).width(px(180.)).sortable());
+            let mut col = Column::new(c.name.clone()).width(px(180.)).sortable();
+            if let Some(t) = &c.decl_type {
+                if !t.is_empty() {
+                    col = col.subtitle(t.to_lowercase());
+                }
+            }
+            columns.push(col);
         }
         let sort = grid.sort.map(|(c, asc)| (c + 1, asc));
         let total = grid.total;
@@ -468,11 +517,17 @@ impl AppState {
 
         let table = Table::<()>::new("result-grid", columns)
             .row_count(total)
-            .row_height(px(24.))
+            .row_height(px(25.))
+            .font_family(FONT_MONO)
+            .grid_lines(true)
             .track_scroll(&grid.scroll)
             .horizontal(true)
             .selected_cells(grid.selection)
             .sort(sort)
+            .sort_carets(
+                move || crate::icons::icon("sort-asc", px(9.), accent).into_any_element(),
+                move || crate::icons::icon("sort-desc", px(9.), accent).into_any_element(),
+            )
             .on_visible_range(move |range, _, _| {
                 buffer_range.borrow_mut().ensure(range, total, &sender)
             })
@@ -501,7 +556,7 @@ impl AppState {
                 match buffer.rows.get(&ix) {
                     Some(row) => {
                         for c in 0..ncols {
-                            out.push(render_cell(row.get(c), text, num, faint));
+                            out.push(render_cell(row.get(c), cell_colors));
                         }
                     }
                     None => {
@@ -513,8 +568,38 @@ impl AppState {
                 out
             });
 
+        // Footer: a strong row count, the column count, and the result's label —
+        // the design's "N rows · K columns" status strip under the grid.
+        let footer = div()
+            .flex_shrink_0()
+            .h(px(28.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3p5()
+            .bg(bg)
+            .border_t_1()
+            .border_color(border)
+            .font_family(FONT_MONO)
+            .text_size(px(11.))
+            .child(
+                div()
+                    .text_color(text)
+                    .child(format!("{}", grid.total)),
+            )
+            .child(div().text_color(dim).child("rows"))
+            .child(div().text_color(border_soft).child("·"))
+            .child(div().text_color(dim).child(format!("{ncols} columns")))
+            .child(
+                div()
+                    .ml_auto()
+                    .text_color(dim)
+                    .child(grid.label.clone()),
+            );
+
         container
             .child(toolbar)
-            .child(div().flex_1().min_h(px(0.)).child(table))
+            .child(div().flex_1().min_h(px(0.)).bg(bg_app).child(table))
+            .child(footer)
     }
 }

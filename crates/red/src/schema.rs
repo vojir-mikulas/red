@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, App, Context, Entity, Hsla};
+use gpui::{div, prelude::*, px, App, Context, Entity};
 use red_core::{ColumnMeta, ObjectKind, SchemaMeta, TableDetail};
 use red_service::Command;
 
@@ -207,16 +207,6 @@ fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
     out
 }
 
-/// A small colored tag (PK / FK) shown after a column name.
-fn tag(text: &'static str, color: Hsla) -> impl IntoElement {
-    div()
-        .px(px(3.))
-        .rounded(px(3.))
-        .text_size(px(9.))
-        .text_color(color)
-        .child(text)
-}
-
 /// Build the content right of the chevron for one tree row.
 fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
     let theme = cx.theme();
@@ -228,7 +218,7 @@ fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
             .flex_1()
             .items_center()
             .gap_1p5()
-            .child(div().text_size(px(11.)).text_color(muted).child("▣"))
+            .child(crate::icons::icon("schema", px(14.), muted))
             .child(
                 div()
                     .text_size(px(12.5))
@@ -241,20 +231,20 @@ fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
                     .font_family(FONT_MONO)
                     .text_size(px(10.))
                     .text_color(faint)
-                    .child(format!("{count}")),
+                    .child(format!("{count} tables")),
             )
             .into_any_element(),
 
         RowContent::Object { kind, name } => {
-            let (glyph, color) = match kind {
-                ObjectKind::Table => ("▦", muted),
-                ObjectKind::View => ("◫", theme.cyan),
+            let (name_icon, color) = match kind {
+                ObjectKind::Table => ("table", muted),
+                ObjectKind::View => ("view", theme.cyan),
             };
             div()
                 .flex()
                 .items_center()
                 .gap_1p5()
-                .child(div().text_size(px(11.)).text_color(color).child(glyph))
+                .child(crate::icons::icon(name_icon, px(14.), color))
                 .child(
                     div()
                         .font_family(FONT_MONO)
@@ -270,7 +260,7 @@ fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(div().text_size(px(10.)).text_color(faint).child("▪"))
+                .child(crate::icons::icon("col", px(13.), faint))
                 .child(
                     div()
                         .font_family(FONT_MONO)
@@ -288,10 +278,10 @@ fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
                 );
             }
             if meta.primary_key {
-                row = row.child(tag("PK", theme.yellow));
+                row = row.child(crate::icons::icon("key", px(12.), theme.yellow));
             }
             if *is_fk {
-                row = row.child(tag("FK", theme.accent));
+                row = row.child(crate::icons::icon("link", px(12.), theme.accent));
             }
             row.into_any_element()
         }
@@ -318,13 +308,14 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let (bg_panel, text, faint, green, yellow) = (
+        let (bg_panel, bg_elevated, border, radius) = (
             theme.bg_panel,
-            theme.text,
-            theme.text_faint,
-            theme.green,
-            theme.yellow,
+            theme.bg_elevated,
+            theme.border,
+            theme.radius,
         );
+        let (text, faint, green, yellow) =
+            (theme.text, theme.text_faint, theme.green, theme.yellow);
         let view = cx.entity().downgrade();
         let s = &active.schema;
         let filter_text = s.filter.read(cx).content().to_string();
@@ -342,32 +333,34 @@ impl AppState {
 
         let pill = div()
             .flex_shrink_0()
+            .mx_2()
+            .mt_2()
+            .mb_1()
             .h(px(26.))
             .flex()
             .items_center()
-            .gap_2()
+            .gap_1p5()
             .px_2()
+            .rounded(radius)
+            .bg(bg_elevated)
+            .border_1()
+            .border_color(border)
             .child(div().size(px(7.)).rounded_full().bg(green))
             .child(
                 div()
+                    .flex_1()
                     .font_family(FONT_MONO)
                     .text_size(px(12.))
                     .text_color(text)
                     .child(active.config.name.clone()),
             )
             .when(active.config.read_only, |d| {
-                d.child(
-                    div()
-                        .ml_auto()
-                        .text_size(px(10.))
-                        .text_color(yellow)
-                        .child("read-only"),
-                )
+                d.child(crate::icons::icon("lock", px(12.), yellow))
             });
 
         let filter_row = div()
             .flex_shrink_0()
-            .px_1p5()
+            .px_2()
             .pb_1()
             .child(s.filter.clone());
 

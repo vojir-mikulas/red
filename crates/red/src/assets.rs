@@ -12,22 +12,24 @@ use rust_embed::RustEmbed;
 
 /// The UI (sans) font family, as registered with the text system.
 pub const FONT_UI: &str = "IBM Plex Sans";
-/// The monospace font family (for SQL, values, sizes).
-pub const FONT_MONO: &str = "JetBrains Mono";
+/// The monospace font family (for SQL, values, sizes) — IBM Plex Mono, the
+/// family the design specifies (`--mono`).
+pub const FONT_MONO: &str = "IBM Plex Mono";
 
 const FONT_FILES: &[&str] = &[
     "fonts/IBMPlexSans-Regular.ttf",
     "fonts/IBMPlexSans-Medium.ttf",
     "fonts/IBMPlexSans-SemiBold.ttf",
     "fonts/IBMPlexSans-Bold.ttf",
-    "fonts/JetBrainsMono-Regular.ttf",
-    "fonts/JetBrainsMono-Medium.ttf",
-    "fonts/JetBrainsMono-Bold.ttf",
+    "fonts/IBMPlexMono-Regular.ttf",
+    "fonts/IBMPlexMono-Medium.ttf",
+    "fonts/IBMPlexMono-SemiBold.ttf",
 ];
 
 #[derive(RustEmbed)]
 #[folder = "$CARGO_MANIFEST_DIR/../../assets"]
 #[include = "fonts/*"]
+#[include = "icons/*"]
 pub struct Assets;
 
 impl AssetSource for Assets {

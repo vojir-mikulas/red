@@ -336,8 +336,8 @@ impl AppState {
 
     pub(crate) fn toggle_theme(&mut self, cx: &mut Context<Self>) {
         let next = match cx.theme().name.as_str() {
-            "One Dark" => Theme::github_dark(),
-            _ => Theme::one_dark(),
+            "One Dark" => crate::theme::github_dark(),
+            _ => crate::theme::one_dark(),
         };
         cx.set_global(next);
         cx.notify();
@@ -416,6 +416,9 @@ impl Render for AppState {
             .bg(theme.bg_app)
             .text_color(theme.text)
             .font_family(FONT_UI)
+            // The design's base font size is 13px; GPUI defaults to 16px, so set
+            // it once at the root and any unsized text inherits the right scale.
+            .text_size(px(13.))
             .child(screen)
             .children(toast)
             .children(confirm)
