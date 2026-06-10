@@ -177,6 +177,9 @@ pub struct AppState {
     pub(crate) settings_store: Option<FileSettingsStore>,
     pub(crate) settings_open: bool,
     pub(crate) settings_tab: SettingsTab,
+    /// Whether a repaint ticker is already running for the live query timer, so
+    /// concurrent opens don't stack duplicate tickers.
+    pub(crate) query_ticking: bool,
 }
 
 impl AppState {
@@ -261,7 +264,47 @@ impl AppState {
             settings_store,
             settings_open: false,
             settings_tab: SettingsTab::Appearance,
+            query_ticking: false,
         }
+    }
+
+    /// True while any open result grid is still running its query.
+    fn any_query_running(&self) -> bool {
+        matches!(&self.phase, Phase::Connected(active)
+            if active
+                .tabs
+                .iter()
+                .any(|t| t.result.as_ref().is_some_and(|g| !g.is_ready())))
+    }
+
+    /// Drive ~10 Hz repaints while a query runs so the live timer counts up.
+    /// Self-terminating: the loop stops once no grid is running, and the guard
+    /// prevents a second ticker stacking on top of a live one.
+    pub(crate) fn start_query_ticker(&mut self, cx: &mut Context<Self>) {
+        if self.query_ticking || !self.any_query_running() {
+            return;
+        }
+        self.query_ticking = true;
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(100))
+                    .await;
+                let running = this.update(cx, |this, cx| {
+                    let running = this.any_query_running();
+                    if running {
+                        cx.notify();
+                    } else {
+                        this.query_ticking = false;
+                    }
+                    running
+                });
+                if !matches!(running, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// The single point where backend events drive UI state.

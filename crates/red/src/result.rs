@@ -6,17 +6,18 @@
 //! rest, so memory stays flat over a multi-million-row result. Cell ranges select
 //! and copy as TSV; clicking a column header sorts (re-running with `ORDER BY`).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use std::path::PathBuf;
 
 use flint::prelude::*;
 use gpui::{
-    div, prelude::*, px, ClipboardItem, Context, Hsla, ScrollHandle, ScrollStrategy,
+    div, point, prelude::*, px, ClipboardItem, Context, Hsla, Pixels, ScrollHandle,
     UniformListScrollHandle,
 };
 use red_core::{Column as ResultColumn, ExportFormat, KeySpec, Value};
@@ -41,6 +42,21 @@ const FLING_ROWS: usize = 3 * PAGE;
 /// run-extension (which would chain seeks across the gap) and jumps — one
 /// key-space interpolated seek that replaces the run.
 const JUMP_GAP: usize = 2 * PAGE;
+
+/// Physical rows the list (`uniform_list`) is laid out over at once. GPUI places
+/// each row at `index * row_height` in `f32`, which is only exact up to 2^24
+/// (~16.7M) px; past that, positions quantize — rows overlap, double up, and the
+/// wheel sticks. So the list never spans the whole result: it lays out at most
+/// `WINDOW` rows (a `WINDOW * row_height` canvas, well under the ceiling), and
+/// `window_base` slides that window across a result of any size (tens of
+/// millions of rows). The fraction-mapped scrollbar drives long jumps; wheel
+/// scrolling re-centers the window near its edges (see `prepare_window`).
+const WINDOW: usize = 100_000;
+
+/// When the viewport scrolls within this many rows of a window edge — and more
+/// result exists beyond that edge — the window re-centers on the viewport,
+/// compensating the list's pixel offset so the visible rows don't move.
+const REANCHOR_MARGIN: usize = 5_000;
 
 /// Monotonic id for each opened result. Tags `OpenResult`/`FetchPage` so the
 /// backend can drop stale page fetches and the grid can ignore late replies for
@@ -441,6 +457,50 @@ impl OffsetPages {
     }
 }
 
+/// The virtual-scroll window resolved for one render (see
+/// [`ResultGrid::prepare_window`]).
+struct WindowView {
+    /// Absolute ordinal of list-local index 0.
+    base: usize,
+    /// Physical rows fed to `uniform_list` this frame (`total.min(WINDOW)`).
+    len: usize,
+    /// Scrollbar thumb position, 0..=1, over the *whole* result.
+    fraction: f32,
+    /// Scrollbar thumb size (viewport / total).
+    thumb: f32,
+}
+
+/// Pure window arithmetic, factored out of [`ResultGrid::prepare_window`] for
+/// testing. Given the result `total`, the current window `base`, the viewport's
+/// top row in list-local coordinates, and the viewport height in rows, returns
+/// the base to use this frame and — when it changed — the list-local row the
+/// pixel offset must be re-anchored onto so the visible rows don't move.
+///
+/// The window re-centers on the viewport once it scrolls within
+/// [`REANCHOR_MARGIN`] of an edge that has more result beyond it.
+fn window_decision(
+    total: usize,
+    base: usize,
+    local_first: usize,
+    viewport_rows: usize,
+) -> (usize, Option<usize>) {
+    if total <= WINDOW {
+        return (0, None);
+    }
+    let max_base = total - WINDOW;
+    let base = base.min(max_base);
+    let abs_first = base + local_first;
+    let near_top = base > 0 && local_first < REANCHOR_MARGIN;
+    let near_bottom = base < max_base && local_first + viewport_rows + REANCHOR_MARGIN > WINDOW;
+    if near_top || near_bottom {
+        let desired = abs_first.saturating_sub(WINDOW / 2).min(max_base);
+        if desired != base {
+            return (desired, Some(abs_first - desired));
+        }
+    }
+    (base, None)
+}
+
 /// All the state for one open result. The grid columns include a leading row-
 /// number gutter, so table-column index `0` is the gutter and data column `n` is
 /// table column `n + 1`.
@@ -464,9 +524,19 @@ pub(crate) struct ResultGrid {
     h_scroll: ScrollHandle,
     /// The overlay scrollbar's in-flight drag (M10 Phase 3).
     scrollbar: ScrollbarState,
+    /// Virtual-scroll window: the absolute ordinal that list-local index 0 maps
+    /// to. `Rc` so the scrollbar's scrub closure can move it; `Cell` because
+    /// `Table`/`uniform_list` are stateless across frames, so the base lives
+    /// here. See `WINDOW` and `prepare_window`.
+    window_base: Rc<Cell<usize>>,
     /// Identifies the current open SQL; bumped on every (re)open so stale page
     /// fetches and late `ResultReady`/`ResultPageLoaded` replies are ignored.
     pub(crate) epoch: u64,
+    /// When the current query was issued — drives the live "running…" timer.
+    query_started: Instant,
+    /// Frozen wall-clock time the query took, set once it lands (ready or error).
+    /// `None` while still running, so the elapsed time keeps counting up.
+    query_elapsed: Option<Duration>,
 }
 
 impl ResultGrid {
@@ -491,7 +561,30 @@ impl ResultGrid {
             scroll: UniformListScrollHandle::new(),
             h_scroll: ScrollHandle::new(),
             scrollbar: ScrollbarState::new(),
+            window_base: Rc::new(Cell::new(0)),
             epoch: next_epoch(),
+            query_started: Instant::now(),
+            query_elapsed: None,
+        }
+    }
+
+    /// Wall-clock time the query has taken: frozen once it lands, otherwise the
+    /// live elapsed time since it was issued (the running counter).
+    fn query_time(&self) -> Duration {
+        self.query_elapsed
+            .unwrap_or_else(|| self.query_started.elapsed())
+    }
+
+    /// Restart the timer for a re-run (re-sort) of the same grid.
+    fn restart_timer(&mut self) {
+        self.query_started = Instant::now();
+        self.query_elapsed = None;
+    }
+
+    /// Freeze the elapsed time — the query has landed (ready or error).
+    fn stop_timer(&mut self) {
+        if self.query_elapsed.is_none() {
+            self.query_elapsed = Some(self.query_started.elapsed());
         }
     }
 
@@ -511,6 +604,12 @@ impl ResultGrid {
         }
     }
 
+    /// Whether the open query has landed (ready or errored) vs. still running —
+    /// drives the shell's live query-timer ticker.
+    pub(crate) fn is_ready(&self) -> bool {
+        self.ready
+    }
+
     /// `(rows, columns)` once the result is ready — for the shell's status bar.
     pub fn status_counts(&self) -> Option<(usize, usize)> {
         self.ready
@@ -527,6 +626,8 @@ impl ResultGrid {
         self.total = total;
         self.ready = true;
         self.error = None;
+        self.stop_timer();
+        self.window_base.set(0);
         let mut buffer = self.buffer.borrow_mut();
         *buffer = GridBuffer::default();
         if let Some(key_col) = key_col {
@@ -534,8 +635,65 @@ impl ResultGrid {
         }
     }
 
+    /// The current virtual-scroll window. Recenters it on the viewport when the
+    /// scroll nears a window edge (compensating the list's pixel offset so the
+    /// visible rows hold still), and returns the base + length to feed the list
+    /// plus the scrollbar's fraction/thumb. Call once per render, *before*
+    /// building the `Table`, so `row_count`, `window_base`, and the list's pixel
+    /// offset all agree within the frame.
+    fn prepare_window(&self, row_height: Pixels) -> WindowView {
+        let total = self.total;
+        let rh = f32::from(row_height).max(1.0);
+
+        let (offset_x, offset_y, viewport_h) = {
+            let st = self.scroll.0.borrow();
+            let off = st.base_handle.offset();
+            let vh = st
+                .last_item_size
+                .map(|s| f32::from(s.item.height))
+                .unwrap_or(0.0);
+            (off.x, f32::from(off.y), vh)
+        };
+        let viewport_rows = (viewport_h / rh).ceil() as usize;
+
+        let len = total.min(WINDOW);
+        // The viewport's top row, in list-local then absolute coordinates.
+        let local_first = (-offset_y / rh).round().max(0.0) as usize;
+        let abs_first = self.window_base.get().min(total.saturating_sub(len)) + local_first;
+
+        let (base, reanchor) =
+            window_decision(total, self.window_base.get(), local_first, viewport_rows);
+        if let Some(new_local_first) = reanchor {
+            // The window slid; shift the list's pixel offset by the same amount
+            // so the rows on screen don't move — the user only ever sees one
+            // continuous scroll.
+            let st = self.scroll.0.borrow();
+            st.base_handle
+                .set_offset(point(offset_x, px(-(new_local_first as f32 * rh))));
+        }
+        self.window_base.set(base);
+
+        // Scrollbar position is absolute (fraction of the whole result), not of
+        // the window — so the thumb reflects where we are in all 50M rows.
+        let denom = total.saturating_sub(viewport_rows).max(1) as f32;
+        let fraction = (abs_first as f32 / denom).clamp(0.0, 1.0);
+        let thumb = if total > 0 {
+            (viewport_rows as f32 / total as f32).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+
+        WindowView {
+            base,
+            len,
+            fraction,
+            thumb,
+        }
+    }
+
     fn reset_buffer(&mut self) {
         *self.buffer.borrow_mut() = GridBuffer::default();
+        self.window_base.set(0);
     }
 
     /// The current selection as TSV (NULL → empty), skipping the gutter column.
@@ -581,6 +739,17 @@ pub(crate) fn group_digits(n: usize) -> String {
         out.push(*b as char);
     }
     out
+}
+
+/// A query duration as a compact label: sub-second in milliseconds, otherwise
+/// seconds with two decimals (`842 ms`, `1.27 s`).
+fn format_duration(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 {
+        format!("{ms} ms")
+    } else {
+        format!("{:.2} s", d.as_secs_f64())
+    }
 }
 
 /// Trim trailing whitespace + a single terminator, so the SQL nests as a subquery.
@@ -678,6 +847,7 @@ impl AppState {
         };
         let (sql, epoch, table) = opened;
         self.service.send(Command::OpenResult { sql, epoch, table });
+        self.start_query_ticker(cx);
         cx.notify();
     }
 
@@ -756,6 +926,7 @@ impl AppState {
             if let Some(grid) = &mut active.active_mut().result {
                 grid.error = Some(message.to_string());
                 grid.ready = true;
+                grid.stop_timer();
             }
         }
     }
@@ -776,6 +947,7 @@ impl AppState {
                     };
                     grid.selection = None;
                     grid.ready = false;
+                    grid.restart_timer();
                     grid.reset_buffer();
                     // New SQL → new epoch, so pages still in flight for the old
                     // ordering are dropped rather than landing in the wrong rows.
@@ -796,6 +968,7 @@ impl AppState {
                 epoch,
                 table: None,
             });
+            self.start_query_ticker(cx);
         }
         cx.notify();
     }
@@ -918,14 +1091,17 @@ impl AppState {
             }
         };
 
+        let elapsed = format_duration(grid.query_time());
         let status = if let Some(err) = &grid.error {
             div().text_color(red).child(err.clone())
         } else if !grid.ready {
-            div().text_color(faint).child("running…".to_string())
+            div()
+                .text_color(faint)
+                .child(format!("running… {elapsed}"))
         } else {
             div()
                 .text_color(faint)
-                .child(format!("{} rows", grid.total))
+                .child(format!("{} rows · {elapsed}", grid.total))
         };
         let view = cx.entity().downgrade();
         let toolbar = div()
@@ -997,24 +1173,40 @@ impl AppState {
         let epoch = grid.epoch;
         let (sort_view, cell_view) = (view.clone(), view.clone());
 
+        // Resolve (and possibly re-center) the virtual-scroll window for this
+        // frame; everything below works in list-local coordinates offset by
+        // `base`, so the list only ever lays out `win.len` rows.
+        let row_height = self.settings.density().row_height();
+        let win = grid.prepare_window(row_height);
+        let base = win.base;
+        // The selection is stored in absolute ordinals; translate it into the
+        // window's local rows for highlighting (off-window rows just aren't
+        // painted). The TSV copy reads the buffer in absolute space, so it stays
+        // correct regardless.
+        let local_selection = grid.selection.map(|mut r| {
+            r.anchor.0 = r.anchor.0.saturating_sub(base);
+            r.focus.0 = r.focus.0.saturating_sub(base);
+            r
+        });
+
         let table = Table::<()>::new("result-grid", columns)
-            .row_count(total)
-            .row_height(self.settings.density().row_height())
+            .row_count(win.len)
+            .row_height(row_height)
             .font_family(FONT_MONO)
             .grid_lines(true)
             .track_scroll(&grid.scroll)
             .track_horizontal_scroll(&grid.h_scroll)
             .horizontal(true)
-            .selected_cells(grid.selection)
+            .selected_cells(local_selection)
             .sort(sort)
             .sort_carets(
                 move || crate::icons::icon("sort-asc", px(9.), accent).into_any_element(),
                 move || crate::icons::icon("sort-desc", px(9.), accent).into_any_element(),
             )
             .on_visible_range(move |range, window, _| {
-                let settled = buffer_range
-                    .borrow_mut()
-                    .ensure(range, total, epoch, &sender);
+                // `range` is list-local; the buffer is keyed by absolute ordinal.
+                let abs = (base + range.start)..(base + range.end);
+                let settled = buffer_range.borrow_mut().ensure(abs, total, epoch, &sender);
                 // Mid-fling we skipped fetching; ask for another paint so the
                 // window that the scroll settles on still gets loaded.
                 if !settled {
@@ -1028,24 +1220,27 @@ impl AppState {
             })
             .on_cell_click(move |row, table_col, event, _, cx| {
                 let extend = event.modifiers().shift;
+                let abs_row = base + row;
                 cell_view
                     .update(cx, |this, cx| {
-                        this.result_select(row, table_col, extend, cx)
+                        this.result_select(abs_row, table_col, extend, cx)
                     })
                     .ok();
             })
             .render_row(move |ix, _, _| {
+                // `ix` is list-local; the gutter and buffer are absolute.
+                let abs = base + ix;
                 let mut out = Vec::with_capacity(ncols + 1);
                 let buffer = buffer_row.borrow();
                 // After an interpolated jump the run's ordinals are estimates;
                 // the gutter marks them `≈` until a true end pins them exact.
                 let gutter = if buffer.is_estimated() {
-                    format!("≈{}", group_digits(ix + 1))
+                    format!("≈{}", group_digits(abs + 1))
                 } else {
-                    group_digits(ix + 1)
+                    group_digits(abs + 1)
                 };
                 out.push(div().text_color(faint).child(gutter).into_any_element());
-                match buffer.row(ix) {
+                match buffer.row(abs) {
                     Some(row) => {
                         for c in 0..ncols {
                             out.push(render_cell(row.get(c), cell_colors));
@@ -1097,12 +1292,32 @@ impl AppState {
         // buffer's `ensure` turns the far jump into one key-space seek (keyed
         // results) or one OFFSET page (fallback).
         let scrub_scroll = grid.scroll.clone();
+        let scrub_window = grid.window_base.clone();
         let scrub_view = view.clone();
+        let rh = f32::from(row_height);
         let scrollbar = Scrollbar::new("result-scrollbar", &grid.scrollbar)
-            .track_list(&grid.scroll)
+            // Position is computed over the whole result (not the f32-bounded
+            // window the list lays out), so the thumb is honest at 50M rows.
+            .fraction(win.fraction)
+            .thumb(win.thumb)
             .on_scrub(move |fraction, _, cx| {
                 let target = (fraction as f64 * total.saturating_sub(1) as f64).round() as usize;
-                scrub_scroll.scroll_to_item_strict(target, ScrollStrategy::Top);
+                // Re-center the window on the target, then place it at the top of
+                // the viewport by setting the list's pixel offset directly — no
+                // `scroll_to_item` into a multi-million-row (f32-degenerate)
+                // canvas.
+                let base = if total > WINDOW {
+                    target.saturating_sub(WINDOW / 2).min(total - WINDOW)
+                } else {
+                    0
+                };
+                scrub_window.set(base);
+                let local = target - base;
+                let st = scrub_scroll.0.borrow();
+                let x = st.base_handle.offset().x;
+                st.base_handle
+                    .set_offset(point(x, px(-(local as f32 * rh))));
+                drop(st);
                 scrub_view.update(cx, |_, cx| cx.notify()).ok();
             });
 
@@ -1118,6 +1333,83 @@ impl AppState {
                     .child(scrollbar),
             )
             .child(footer)
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    /// A small result fits in one window: never windowed, never re-anchored.
+    #[test]
+    fn small_result_is_never_windowed() {
+        assert_eq!(window_decision(WINDOW, 0, 0, 30), (0, None));
+        assert_eq!(window_decision(WINDOW, 0, WINDOW - 1, 30), (0, None));
+        assert_eq!(window_decision(500, 0, 400, 30), (0, None));
+    }
+
+    /// At rest in the middle of a window, with margins on both sides, nothing
+    /// moves.
+    #[test]
+    fn mid_window_holds_still() {
+        let total = 50_000_000;
+        assert_eq!(
+            window_decision(total, 1_000_000, WINDOW / 2, 30),
+            (1_000_000, None)
+        );
+    }
+
+    /// Scrolling near the bottom edge re-centers the window forward and reports
+    /// the local row to pin the offset to (so the visible rows don't jump).
+    #[test]
+    fn near_bottom_recenters_forward() {
+        let total = 50_000_000;
+        let base = 1_000_000;
+        let local_first = WINDOW - 100; // viewport top is 100 rows from the edge
+        let (new_base, reanchor) = window_decision(total, base, local_first, 30);
+        let abs_first = base + local_first;
+        // The window slid forward and the viewport sits near its middle again.
+        assert!(new_base > base);
+        assert_eq!(reanchor, Some(abs_first - new_base));
+        assert_eq!(new_base + reanchor.unwrap(), abs_first); // same absolute row
+        assert_eq!(reanchor.unwrap(), WINDOW / 2);
+    }
+
+    /// Scrolling back near the top edge re-centers the window backward.
+    #[test]
+    fn near_top_recenters_backward() {
+        let total = 50_000_000;
+        let base = 1_000_000;
+        let local_first = 100;
+        let (new_base, reanchor) = window_decision(total, base, local_first, 30);
+        let abs_first = base + local_first;
+        assert!(new_base < base);
+        assert_eq!(new_base + reanchor.unwrap(), abs_first);
+        assert_eq!(reanchor.unwrap(), WINDOW / 2);
+    }
+
+    /// Near the result's true start the window can't slide further: clamps to 0,
+    /// and once the viewport is genuinely at the top it stays put.
+    #[test]
+    fn clamps_at_result_start() {
+        let total = 50_000_000;
+        // base small, viewport near window top: desired base clamps at 0.
+        let (new_base, _) = window_decision(total, 10_000, 100, 30);
+        assert_eq!(new_base, 0);
+        // base 0 with the viewport at the very top: nothing to do.
+        assert_eq!(window_decision(total, 0, 0, 30), (0, None));
+    }
+
+    /// Near the result's true end the base clamps to `total - WINDOW`.
+    #[test]
+    fn clamps_at_result_end() {
+        let total = 50_000_000;
+        let max_base = total - WINDOW;
+        // Already at the last window, viewport near the bottom: no further slide.
+        assert_eq!(
+            window_decision(total, max_base, WINDOW - 50, 30),
+            (max_base, None)
+        );
     }
 }
 
