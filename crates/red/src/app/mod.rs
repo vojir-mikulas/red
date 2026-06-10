@@ -15,11 +15,15 @@ use flint::prelude::*;
 use flint::{CodeEditor, CodeEditorEvent};
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
-use gpui::{prelude::*, px, AsyncApp, Context, Entity, Pixels, SharedString, WeakEntity};
+use gpui::{
+    prelude::*, px, AsyncApp, Context, ElementId, Entity, FocusHandle, Pixels, SharedString,
+    WeakEntity,
+};
 use red_core::{ConnectionConfig, DbKind};
 use red_service::{Command, Event, ServiceHandle};
 
 use crate::config::{self, StoredConnection};
+use crate::palette::Cmd;
 use crate::result::ResultGrid;
 use crate::schema::SchemaState;
 use crate::settings::{Density, FileSettingsStore, Settings};
@@ -209,6 +213,13 @@ pub struct AppState {
     /// retry, and cancel; a pending backoff timer only fires if its captured
     /// value still matches, so a cancel or manual retry abandons stale timers.
     pub(crate) connect_gen: u64,
+    /// Focus anchor for the root view, so the global ⌘K binding dispatches even
+    /// when nothing else is focused.
+    pub(crate) root_focus: FocusHandle,
+    /// The command palette overlay, when open, plus the `id → Cmd` map for the
+    /// commands it's currently showing (so an activation routes to the right one).
+    pub(crate) palette: Option<Entity<Palette>>,
+    pub(crate) palette_cmds: Vec<(ElementId, Cmd)>,
 }
 impl AppState {
     pub fn new(
@@ -294,6 +305,9 @@ impl AppState {
             settings_tab: SettingsTab::Appearance,
             query_ticking: false,
             connect_gen: 0,
+            root_focus: cx.focus_handle(),
+            palette: None,
+            palette_cmds: Vec::new(),
         }
     }
 

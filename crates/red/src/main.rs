@@ -10,6 +10,7 @@ mod config;
 mod connect;
 mod editor;
 mod icons;
+mod palette;
 mod result;
 mod schema;
 mod secrets;
@@ -19,12 +20,13 @@ mod shell;
 mod sql;
 mod theme;
 
-use flint::{CodeEditor, TextInput};
-use gpui::{prelude::*, App, Bounds, TitlebarOptions, WindowBounds, WindowOptions};
+use flint::{CodeEditor, Palette, TextInput};
+use gpui::{prelude::*, App, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions};
 use gpui_platform::application;
 
 use crate::app::AppState;
 use crate::assets::Assets;
+use crate::palette::ToggleCommandPalette;
 
 fn main() {
     init_tracing();
@@ -38,6 +40,9 @@ fn main() {
         // editing key bindings installed once at startup.
         TextInput::bind_keys(cx);
         CodeEditor::bind_keys(cx);
+        Palette::bind_keys(cx);
+        // Global ⌘K toggles the command palette (handled at the root view).
+        cx.bind_keys([KeyBinding::new("cmd-k", ToggleCommandPalette, None)]);
 
         // Spawn the Tokio backend and hand its event stream to the root view.
         let mut service = red_service::spawn();

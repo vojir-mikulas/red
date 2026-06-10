@@ -7,6 +7,7 @@ use gpui::{div, prelude::*, px, Render, Window};
 
 use super::{AppState, ConnectStatus, Connecting, Phase};
 use crate::assets::{FONT_MONO, FONT_UI};
+use crate::palette::ToggleCommandPalette;
 
 impl AppState {
     /// The connecting splash: an indeterminate progress bar while an attempt is
@@ -124,6 +125,13 @@ impl Render for AppState {
         div()
             .size_full()
             .relative()
+            // Anchor focus + the global ⌘K binding here so the palette toggles
+            // from any phase, even when no field or editor is focused.
+            .key_context("RedRoot")
+            .track_focus(&self.root_focus)
+            .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
+                this.toggle_palette(window, cx)
+            }))
             .bg(theme.bg_app)
             .text_color(theme.text)
             .font_family(FONT_UI)
@@ -135,6 +143,8 @@ impl Render for AppState {
             .children(confirm)
             .children(confirm_close)
             .children(settings)
+            // The palette renders its own full-screen overlay; last = on top.
+            .children(self.palette.clone())
     }
 }
 
