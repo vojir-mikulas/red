@@ -12,6 +12,7 @@ mod editor;
 mod icons;
 mod result;
 mod schema;
+mod secrets;
 mod settings;
 mod settings_ui;
 mod shell;

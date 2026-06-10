@@ -62,7 +62,18 @@ impl AppState {
         let Some(stored) = self.connections.get(index) else {
             return;
         };
-        let config = stored.config.clone();
+        let id = stored.id.clone();
+        let mut config = stored.config.clone();
+        // Materialize the stored password from the keychain so the form shows it
+        // (and the Test/Save paths, which read the input, reuse it). A read miss
+        // or denial just leaves the field blank — the user can re-enter it.
+        if config.password.is_empty() && !config.kind.is_file() {
+            match crate::secrets::get_password(&id) {
+                Ok(Some(pw)) => config.password = pw,
+                Ok(None) => {}
+                Err(e) => tracing::warn!("failed to read credential from keychain: {e}"),
+            }
+        }
         self.fill_form_inputs(&config, cx);
         self.form = Some(FormState {
             kind: config.kind,
@@ -128,7 +139,7 @@ impl AppState {
     /// Persist the form. `connect` also opens the connection on success. On a
     /// validation miss the modal stays open with a toast so the user can fix it.
     pub(crate) fn save_form(&mut self, connect: bool, cx: &mut Context<Self>) {
-        let Some(config) = self.form_config(cx) else {
+        let Some(mut config) = self.form_config(cx) else {
             return;
         };
         if config.name.is_empty() {
@@ -140,6 +151,11 @@ impl AppState {
             return;
         }
 
+        // Split the secret off the stored config: the password goes to the OS
+        // keychain (below), never the config file or long-term memory.
+        let password = std::mem::take(&mut config.password);
+        let is_file = config.kind.is_file();
+
         let editing = self.form.as_ref().and_then(|f| f.editing);
         let index = match editing {
             Some(index) if index < self.connections.len() => {
@@ -148,18 +164,45 @@ impl AppState {
             }
             _ => {
                 self.connections.push(StoredConnection {
+                    id: crate::config::new_id(),
                     config,
                     last_accessed: None,
                 });
                 self.connections.len() - 1
             }
         };
+
+        self.store_credential(index, &password, is_file);
+
         self.form = None;
         self.persist();
         if connect {
+            // connect() re-materializes the password from the keychain (or the
+            // in-memory fallback kept when a keychain write fails).
             self.connect(index, cx);
         }
         cx.notify();
+    }
+
+    /// Route a saved connection's password to the OS keychain, keyed by its id.
+    /// A blank password (or a file engine, which has none) clears any prior
+    /// entry. If the keychain write fails we keep the password in memory for this
+    /// session and warn, so the connection still works until next launch.
+    fn store_credential(&mut self, index: usize, password: &str, is_file: bool) {
+        let id = self.connections[index].id.clone();
+        if !is_file && !password.is_empty() {
+            if let Err(e) = crate::secrets::set_password(&id, password) {
+                tracing::warn!("failed to store credential in keychain: {e}");
+                self.toast = Some((
+                    "Couldn't save the password to the OS keychain — it won't be remembered."
+                        .into(),
+                    ToastVariant::Error,
+                ));
+                self.connections[index].config.password = password.to_string();
+            }
+        } else if let Err(e) = crate::secrets::delete_password(&id) {
+            tracing::warn!("failed to clear keychain credential: {e}");
+        }
     }
 
     /// Surface a form validation error without closing the modal.

@@ -34,10 +34,20 @@ dirs.workspace = true
 
 # macOS uses font-kit (CoreText) for font loading; Windows/Linux use GPUI's own
 # backend. Features are additive, so this only adds to the base workspace deps.
+# The keychain backend is also chosen per-OS here (Cargo features being additive,
+# the backend can't be picked in the workspace dep without leaking to every
+# platform): macOS → Keychain, Windows → Credential Manager, Linux → freedesktop
+# Secret Service over D-Bus (`crypto-rust` keeps the encrypted session pure-Rust,
+# so no OpenSSL native dep leaks into a portable Linux build).
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui = { workspace = true, features = ["font-kit"] }
 gpui_platform = { workspace = true, features = ["font-kit"] }
+keyring = { workspace = true, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { workspace = true, features = ["windows-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui = { workspace = true, features = ["x11", "wayland"] }
 gpui_platform = { workspace = true, features = ["x11", "wayland"] }
+keyring = { workspace = true, features = ["sync-secret-service", "crypto-rust"] }

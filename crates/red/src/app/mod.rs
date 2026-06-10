@@ -444,7 +444,12 @@ impl AppState {
 
     pub(crate) fn delete_connection(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.connections.len() {
-            self.connections.remove(index);
+            let removed = self.connections.remove(index);
+            // Drop the connection's keychain credential too, so deleting a
+            // connection doesn't orphan its password.
+            if let Err(e) = crate::secrets::delete_password(&removed.id) {
+                tracing::warn!("failed to remove keychain credential: {e}");
+            }
             self.persist();
             cx.notify();
         }
@@ -455,8 +460,18 @@ impl AppState {
             return;
         };
         stored.last_accessed = Some(config::now());
-        let config = stored.config.clone();
+        let id = stored.id.clone();
+        let mut config = stored.config.clone();
         self.persist();
+        // Materialize the password from the keychain unless we already hold it in
+        // memory (a keychain write that failed earlier this session keeps it there).
+        if config.password.is_empty() && !config.kind.is_file() {
+            match crate::secrets::get_password(&id) {
+                Ok(Some(pw)) => config.password = pw,
+                Ok(None) => {}
+                Err(e) => tracing::warn!("failed to read credential from keychain: {e}"),
+            }
+        }
         self.start_connect(config, cx);
     }
 

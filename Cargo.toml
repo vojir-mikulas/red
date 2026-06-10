@@ -44,6 +44,10 @@ futures-util = { version = "0.3", default-features = false }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "5"
+# OS keychain for connection credentials — passwords never hit connections.toml.
+# Backend features are additive and per-OS, so the consuming crate selects them
+# per target (see crates/red/Cargo.toml); the public API is backend-agnostic.
+keyring = "3"
 
 # --- Errors / logging ---
 anyhow = "1"

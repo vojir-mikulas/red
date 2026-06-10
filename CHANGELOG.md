@@ -19,6 +19,10 @@ export — fast, native, low-memory.
   results through a keyset cursor without materializing them.
 - CSV and JSON export, streamed row-by-row.
 - Read-only connections and query timeouts; cancellable in-flight queries.
+- Connection passwords are stored in the OS keychain (Keychain / Credential
+  Manager / Secret Service) instead of the config file; an existing plaintext
+  `connections.toml` is migrated into the keychain on first launch and rewritten
+  without secrets.
 - Backend-thread panic isolation: a driver panic is logged and surfaced to the UI
   as an error rather than silently killing the service.
 - Shared, engine-agnostic driver conformance battery exercised by every driver.
