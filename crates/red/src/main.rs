@@ -26,7 +26,7 @@ use gpui_platform::application;
 
 use crate::app::AppState;
 use crate::assets::Assets;
-use crate::palette::ToggleCommandPalette;
+use crate::palette::{GoToRow, ToggleCommandPalette};
 
 fn main() {
     init_tracing();
@@ -41,8 +41,12 @@ fn main() {
         TextInput::bind_keys(cx);
         CodeEditor::bind_keys(cx);
         Palette::bind_keys(cx);
-        // Global ⌘K toggles the command palette (handled at the root view).
-        cx.bind_keys([KeyBinding::new("cmd-k", ToggleCommandPalette, None)]);
+        // Global ⌘K toggles the command palette; ⌃G opens "go to row" (both
+        // handled at the root view).
+        cx.bind_keys([
+            KeyBinding::new("cmd-k", ToggleCommandPalette, None),
+            KeyBinding::new("ctrl-g", GoToRow, None),
+        ]);
 
         // Spawn the Tokio backend and hand its event stream to the root view.
         let mut service = red_service::spawn();

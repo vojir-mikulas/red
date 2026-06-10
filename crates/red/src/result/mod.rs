@@ -135,6 +135,12 @@ impl ResultGrid {
         self.ready
     }
 
+    /// Total rows in the open result (0 until `ResultReady`) — for the
+    /// go-to-row prompt's range hint and bound.
+    pub(crate) fn total_rows(&self) -> usize {
+        self.total
+    }
+
     /// `(rows, columns)` once the result is ready — for the shell's status bar.
     pub fn status_counts(&self) -> Option<(usize, usize)> {
         self.ready
@@ -221,6 +227,25 @@ impl ResultGrid {
         self.window_base.set(0);
     }
 
+    /// Jump the grid to `ordinal` (0-based) — the explicit "go to row N". Places
+    /// the virtual-scroll window so the row sits at the viewport top, then, for a
+    /// keyed result, forces an **exact** relocation (keyset auto-jumps would only
+    /// interpolate). An offset result needs no special fetch: positioning alone
+    /// makes the next paint request the exact `OFFSET` page at `ordinal`.
+    pub(in crate::result) fn go_to_row(&self, ordinal: usize, row_height: f32) {
+        let target = ordinal.min(self.total.saturating_sub(1));
+        place_window(
+            &self.window_base,
+            &self.scroll,
+            self.total,
+            target,
+            row_height,
+        );
+        if let BufferMode::Keyed(run) = &mut self.buffer.borrow_mut().mode {
+            run.jump_exact(target, self.epoch, &self.sender);
+        }
+    }
+
     /// The current selection as TSV (NULL → empty), skipping the gutter column.
     /// Unloaded cells contribute blanks rather than blocking the copy.
     fn selection_tsv(&self) -> Option<String> {
@@ -249,6 +274,30 @@ impl ResultGrid {
         }
         Some(out)
     }
+}
+
+/// Position the virtual-scroll window so absolute ordinal `target` sits at the
+/// viewport top: re-center the window on it and set the list's pixel offset
+/// directly (no `scroll_to_item`, which degenerates on a multi-million-row f32
+/// canvas). Shared by the scrollbar scrub and the explicit "go to row" jump.
+pub(in crate::result) fn place_window(
+    window_base: &Cell<usize>,
+    scroll: &UniformListScrollHandle,
+    total: usize,
+    target: usize,
+    row_height: f32,
+) {
+    let base = if total > WINDOW {
+        target.saturating_sub(WINDOW / 2).min(total - WINDOW)
+    } else {
+        0
+    };
+    window_base.set(base);
+    let local = target - base;
+    let st = scroll.0.borrow();
+    let x = st.base_handle.offset().x;
+    st.base_handle
+        .set_offset(point(x, px(-(local as f32 * row_height))));
 }
 
 /// Trim trailing whitespace + a single terminator, so the SQL nests as a subquery.
@@ -474,6 +523,19 @@ impl AppState {
             }
         })
         .detach();
+    }
+
+    /// "Go to row N" from the palette prompt — `one_based` is the row number the
+    /// user typed (1-based). Scrolls the active result's grid to that exact row,
+    /// clamped to the result's bounds. No-op when no result is open.
+    pub(crate) fn go_to_row(&mut self, one_based: usize, cx: &mut Context<Self>) {
+        let row_height = f32::from(self.settings.density().row_height());
+        if let Phase::Connected(active) = &self.phase {
+            if let Some(grid) = active.active().result.as_ref() {
+                grid.go_to_row(one_based.saturating_sub(1), row_height);
+            }
+        }
+        cx.notify();
     }
 
     pub(crate) fn copy_result_selection(&mut self, cx: &mut Context<Self>) {

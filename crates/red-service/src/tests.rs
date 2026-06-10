@@ -339,7 +339,10 @@ async fn resolves_key_and_serves_runs() {
     // flagged estimated.
     handle.send(Command::FetchRun {
         epoch: 7,
-        fetch: RunFetch::Jump { ordinal: 499 },
+        fetch: RunFetch::Jump {
+            ordinal: 499,
+            exact: false,
+        },
         limit: 3,
         seq: 4,
     });
@@ -361,7 +364,10 @@ async fn resolves_key_and_serves_runs() {
     // A jump to ordinal 0 seeks from the true start — exact, not estimated.
     handle.send(Command::FetchRun {
         epoch: 7,
-        fetch: RunFetch::Jump { ordinal: 0 },
+        fetch: RunFetch::Jump {
+            ordinal: 0,
+            exact: false,
+        },
         limit: 3,
         seq: 5,
     });
@@ -458,10 +464,13 @@ async fn mariadb_keyset_end_to_end() {
         "deep seek took {elapsed:?} — the derived-table wrapper isn't merging"
     );
 
-    // Interpolated jump to ~50%.
+    // Interpolated jump to ~50% — fast but approximate, flagged estimated.
     handle.send(Command::FetchRun {
         epoch: 1,
-        fetch: RunFetch::Jump { ordinal: 500_000 },
+        fetch: RunFetch::Jump {
+            ordinal: 500_000,
+            exact: false,
+        },
         limit: 200,
         seq: 2,
     });
@@ -480,6 +489,28 @@ async fn mariadb_keyset_end_to_end() {
         other => panic!("expected ResultRunLoaded, got {other:?}"),
     }
 
+    // Exact jump to row 500_000 ("go to row N"): interpolation is skipped, so
+    // ordinals are exact (not estimated) and the row is precisely id 500_001
+    // (ids are 1-based; ordinal 500_000 is the 500_001st row).
+    handle.send(Command::FetchRun {
+        epoch: 1,
+        fetch: RunFetch::Jump {
+            ordinal: 500_000,
+            exact: true,
+        },
+        limit: 200,
+        seq: 3,
+    });
+    match events.next().await {
+        Some(Event::ResultRunLoaded {
+            rows, estimated, ..
+        }) => {
+            assert!(!estimated, "an exact jump reports exact ordinals");
+            assert_eq!(rows[0][0], Value::Integer(500_001));
+        }
+        other => panic!("expected ResultRunLoaded, got {other:?}"),
+    }
+
     // Backward from the middle (scrolling up).
     handle.send(Command::FetchRun {
         epoch: 1,
@@ -487,7 +518,7 @@ async fn mariadb_keyset_end_to_end() {
             before: Value::Integer(500_000),
         },
         limit: 200,
-        seq: 3,
+        seq: 4,
     });
     match events.next().await {
         Some(Event::ResultRunLoaded { rows, .. }) => {
@@ -539,7 +570,10 @@ async fn text_key_jump_falls_back_to_offset() {
 
     handle.send(Command::FetchRun {
         epoch: 9,
-        fetch: RunFetch::Jump { ordinal: 50 },
+        fetch: RunFetch::Jump {
+            ordinal: 50,
+            exact: false,
+        },
         limit: 5,
         seq: 1,
     });

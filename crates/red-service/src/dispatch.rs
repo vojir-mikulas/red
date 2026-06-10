@@ -498,11 +498,13 @@ async fn run_fetch(
                 .await?;
             Ok((page.rows, false))
         }
-        RunFetch::Jump { ordinal } => {
+        RunFetch::Jump { ordinal, exact } => {
             // Key-space interpolation: land near `ordinal / total` of the key
             // range in one indexed seek. Approximate (exact only for dense,
             // uniform keys) — the grid renders the run's ordinals with a `≈`.
-            if key.kind == KeyKind::Int {
+            // Skipped for an exact "go to row N": that wants the precise row, so
+            // it falls straight through to the exact `OFFSET` page below.
+            if !exact && key.kind == KeyKind::Int {
                 if let (Some((min, max)), Some(total)) = (spec.bounds, spec.total) {
                     if total > 1 && max > min {
                         let fraction = (*ordinal as f64 / (total - 1) as f64).clamp(0.0, 1.0);

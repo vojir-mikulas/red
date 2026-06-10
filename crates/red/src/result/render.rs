@@ -3,10 +3,9 @@
 //! toolbar · grid · footer · scrollbar that make up the pane.
 
 use flint::prelude::*;
-use gpui::{div, point, prelude::*, px, Hsla};
+use gpui::{div, prelude::*, px, Hsla};
 use red_core::{ExportFormat, Value};
 
-use super::buffer::WINDOW;
 use crate::app::{ActiveConn, AppState};
 use crate::assets::FONT_MONO;
 
@@ -378,22 +377,7 @@ impl AppState {
             .thumb(win.thumb)
             .on_scrub(move |fraction, _, cx| {
                 let target = (fraction as f64 * total.saturating_sub(1) as f64).round() as usize;
-                // Re-center the window on the target, then place it at the top of
-                // the viewport by setting the list's pixel offset directly — no
-                // `scroll_to_item` into a multi-million-row (f32-degenerate)
-                // canvas.
-                let base = if total > WINDOW {
-                    target.saturating_sub(WINDOW / 2).min(total - WINDOW)
-                } else {
-                    0
-                };
-                scrub_window.set(base);
-                let local = target - base;
-                let st = scrub_scroll.0.borrow();
-                let x = st.base_handle.offset().x;
-                st.base_handle
-                    .set_offset(point(x, px(-(local as f32 * rh))));
-                drop(st);
+                super::place_window(&scrub_window, &scrub_scroll, total, target, rh);
                 scrub_view.update(cx, |_, cx| cx.notify()).ok();
             });
 

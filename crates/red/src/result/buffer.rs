@@ -171,6 +171,27 @@ impl KeyedRun {
         });
     }
 
+    /// Relocate the run to *exactly* `ordinal` — the explicit "go to row N".
+    /// Clears the run (so the next paint can't extend a now-stale boundary) and
+    /// issues an **exact** jump that bypasses key-space interpolation, landing on
+    /// the true row with non-estimated ordinals. The pending mark it sets stops
+    /// `request` from racing an interpolated jump in before the reply lands.
+    pub(super) fn jump_exact(&mut self, ordinal: usize, epoch: u64, sender: &CommandSender) {
+        self.rows.clear();
+        self.at_start = false;
+        self.at_end = false;
+        self.estimated = false;
+        self.halted = false;
+        self.issue(
+            RunFetch::Jump {
+                ordinal,
+                exact: true,
+            },
+            epoch,
+            sender,
+        );
+    }
+
     /// Issue (at most) one fetch toward covering `range` plus its margins. One
     /// request in flight at a time — a seek's start is the previous reply's
     /// boundary key, so they can't pipeline anyway.
@@ -190,6 +211,7 @@ impl KeyedRun {
                 self.issue(
                     RunFetch::Jump {
                         ordinal: range.start,
+                        exact: false,
                     },
                     epoch,
                     sender,
@@ -206,6 +228,7 @@ impl KeyedRun {
             self.issue(
                 RunFetch::Jump {
                     ordinal: range.start,
+                    exact: false,
                 },
                 epoch,
                 sender,
@@ -287,7 +310,7 @@ impl KeyedRun {
                     self.estimated = false;
                 }
             }
-            RunFetch::Jump { ordinal } => {
+            RunFetch::Jump { ordinal, .. } => {
                 self.rows = rows.into();
                 self.at_end = short;
                 self.estimated = estimated;
@@ -691,7 +714,10 @@ mod keyed_run_tests {
         run.anchor = 0;
         run.rows = rows(1..=200).into();
         run.apply(
-            RunFetch::Jump { ordinal: 6_700 },
+            RunFetch::Jump {
+                ordinal: 6_700,
+                exact: false,
+            },
             rows(66_000..66_000 + PAGE as i64),
             true,
             1,
@@ -709,7 +735,10 @@ mod keyed_run_tests {
 
         // Wrong seq: a reply for a superseded request.
         run.apply(
-            RunFetch::Jump { ordinal: 50 },
+            RunFetch::Jump {
+                ordinal: 50,
+                exact: false,
+            },
             rows(51..=60),
             true,
             1,

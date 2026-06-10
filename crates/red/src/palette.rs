@@ -9,13 +9,13 @@
 //! back up and run the matching `AppState` method — the same one the equivalent
 //! button calls.
 
-use flint::{Palette, PaletteEvent, PaletteItem};
-use gpui::{actions, prelude::*, Context, ElementId, Entity, SharedString, Window};
+use flint::{Palette, PaletteEvent, PaletteItem, ToastVariant};
+use gpui::{actions, prelude::*, Context, ElementId, Entity, SharedString};
 use red_service::Command;
 
 use crate::app::{AppState, Phase};
 
-actions!(red, [ToggleCommandPalette]);
+actions!(red, [ToggleCommandPalette, GoToRow]);
 
 /// A command the palette can run. Each maps to one existing `AppState` action.
 #[derive(Clone, Copy)]
@@ -29,11 +29,14 @@ pub(crate) enum Cmd {
     ToggleHistory,
     RefreshSchema,
     Disconnect,
+    /// Open the "go to row…" prompt (only when a result is open).
+    GoToRow,
 }
 
 impl AppState {
-    /// ⌘K: open the palette, or close it if it's already open.
-    pub(crate) fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// ⌘K: open the command palette, or close it if it's already open. The
+    /// palette focuses its own field on first paint, so no `Window` is needed.
+    pub(crate) fn toggle_palette(&mut self, cx: &mut Context<Self>) {
         if self.palette.take().is_some() {
             self.palette_cmds.clear();
             cx.notify();
@@ -54,10 +57,40 @@ impl AppState {
             p
         });
         cx.subscribe(&palette, Self::on_palette_event).detach();
-        // Focus the search field so typing lands in the palette right away.
-        palette.update(cx, |p, cx| p.focus(window, cx));
         self.palette = Some(palette);
         cx.notify();
+    }
+
+    /// ⌃G (or the "go to row…" command): open a prompt for a row number. No-op
+    /// when no result is open — there's nothing to navigate.
+    pub(crate) fn open_goto_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(total) = self.active_result_total() else {
+            return;
+        };
+        let placeholder = format!("Go to row 1–{}", total.max(1));
+        let prompt = cx.new(|cx| {
+            let mut p = Palette::new(cx).prompt();
+            p.set_placeholder(placeholder, cx);
+            p
+        });
+        cx.subscribe(&prompt, Self::on_palette_event).detach();
+        self.palette = Some(prompt);
+        self.palette_cmds.clear();
+        cx.notify();
+    }
+
+    /// Total rows of the active tab's open result, if any.
+    fn active_result_total(&self) -> Option<usize> {
+        match &self.phase {
+            Phase::Connected(active) => active.active().result.as_ref().map(|g| g.total_rows()),
+            _ => None,
+        }
+    }
+
+    /// Close whichever palette (command or prompt) is open.
+    fn close_palette(&mut self) {
+        self.palette = None;
+        self.palette_cmds.clear();
     }
 
     fn on_palette_event(
@@ -66,20 +99,42 @@ impl AppState {
         event: &PaletteEvent,
         cx: &mut Context<Self>,
     ) {
-        let cmd = match event {
-            PaletteEvent::Activate(id) => self
-                .palette_cmds
-                .iter()
-                .find(|(eid, _)| eid == id)
-                .map(|(_, cmd)| *cmd),
-            PaletteEvent::Dismiss => None,
-        };
-        self.palette = None;
-        self.palette_cmds.clear();
-        if let Some(cmd) = cmd {
-            self.run_command(cmd, cx);
+        match event {
+            PaletteEvent::Activate(id) => {
+                let cmd = self
+                    .palette_cmds
+                    .iter()
+                    .find(|(eid, _)| eid == id)
+                    .map(|(_, cmd)| *cmd);
+                self.close_palette();
+                if let Some(cmd) = cmd {
+                    self.run_command(cmd, cx);
+                }
+            }
+            // Prompt mode (the "go to row" input) submits free text.
+            PaletteEvent::Submit(text) => {
+                self.close_palette();
+                self.submit_goto(text, cx);
+            }
+            PaletteEvent::Dismiss => self.close_palette(),
         }
         cx.notify();
+    }
+
+    /// Parse the go-to-row prompt's text and navigate, or toast on bad input.
+    /// Digit separators (`,` `_` spaces) are tolerated so a pasted "1,000" works.
+    fn submit_goto(&mut self, text: &str, cx: &mut Context<Self>) {
+        let cleaned: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
+        match cleaned.parse::<usize>() {
+            Ok(n) if n >= 1 => self.go_to_row(n, cx),
+            _ => {
+                self.toast = Some((
+                    format!("“{}” isn't a valid row number", text.trim()).into(),
+                    ToastVariant::Error,
+                ));
+                cx.notify();
+            }
+        }
     }
 
     fn run_command(&mut self, cmd: Cmd, cx: &mut Context<Self>) {
@@ -92,6 +147,7 @@ impl AppState {
             Cmd::ToggleHistory => self.toggle_history(cx),
             Cmd::RefreshSchema => self.service.send(Command::LoadObjects),
             Cmd::Disconnect => self.disconnect(cx),
+            Cmd::GoToRow => self.open_goto_prompt(cx),
         }
     }
 
@@ -102,7 +158,7 @@ impl AppState {
         let mut out: Vec<(PaletteItem, Cmd)> = Vec::new();
 
         match &self.phase {
-            Phase::Connected(_) => {
+            Phase::Connected(active) => {
                 out.push((
                     PaletteItem::new("cmd:run", "query: run").hint("⌘↵"),
                     Cmd::RunQuery,
@@ -111,6 +167,13 @@ impl AppState {
                     PaletteItem::new("cmd:new-tab", "query: new tab"),
                     Cmd::NewTab,
                 ));
+                // Only meaningful with rows on screen to navigate.
+                if active.active().result.is_some() {
+                    out.push((
+                        PaletteItem::new("cmd:goto-row", "go to row…").hint("⌃G"),
+                        Cmd::GoToRow,
+                    ));
+                }
                 out.push((
                     PaletteItem::new("cmd:history", "query: toggle history"),
                     Cmd::ToggleHistory,

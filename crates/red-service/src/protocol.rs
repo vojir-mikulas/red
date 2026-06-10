@@ -194,8 +194,11 @@ pub enum RunFetch {
     /// Rows strictly before `before`, delivered descending (the grid prepends
     /// them in arrival order, which restores ascending).
     Backward { before: Value },
-    /// Replace the run near row `ordinal`: a key-space interpolated seek when
-    /// the key is an integer with known bounds (`estimated` reply), else one
-    /// `OFFSET` page (exact, but O(ordinal) — the one-off fallback).
-    Jump { ordinal: usize },
+    /// Replace the run near row `ordinal`. When `exact` is `false` (scroll /
+    /// scrollbar relocations), an integer key with known bounds is served by a
+    /// key-space interpolated seek (`estimated` reply) — fast but approximate.
+    /// When `exact` is `true` ("go to row N"), interpolation is skipped and the
+    /// row is served precisely (one `OFFSET` page — O(ordinal), but the reply's
+    /// ordinals are exact), so the gutter shows the true row number.
+    Jump { ordinal: usize, exact: bool },
 }

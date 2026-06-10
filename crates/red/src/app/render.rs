@@ -7,7 +7,7 @@ use gpui::{div, prelude::*, px, Render, Window};
 
 use super::{AppState, ConnectStatus, Connecting, Phase};
 use crate::assets::{FONT_MONO, FONT_UI};
-use crate::palette::ToggleCommandPalette;
+use crate::palette::{GoToRow, ToggleCommandPalette};
 
 impl AppState {
     /// The connecting splash: an indeterminate progress bar while an attempt is
@@ -129,9 +129,8 @@ impl Render for AppState {
             // from any phase, even when no field or editor is focused.
             .key_context("RedRoot")
             .track_focus(&self.root_focus)
-            .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
-                this.toggle_palette(window, cx)
-            }))
+            .on_action(cx.listener(|this, _: &ToggleCommandPalette, _, cx| this.toggle_palette(cx)))
+            .on_action(cx.listener(|this, _: &GoToRow, _, cx| this.open_goto_prompt(cx)))
             .bg(theme.bg_app)
             .text_color(theme.text)
             .font_family(FONT_UI)
