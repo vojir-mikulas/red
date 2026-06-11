@@ -421,12 +421,33 @@ impl AppState {
 
         // Row-returning statements stream into the grid; writes execute in a
         // transaction; destructive writes ask for confirmation first.
-        match crate::sql::classify(&sql) {
-            crate::sql::StatementKind::Query => self.open_result("query", sql, None, cx),
+        let kind = crate::sql::classify(&sql);
+
+        // On a read-only connection, refuse writes up front instead of letting
+        // them round-trip to the engine and bounce back as a cryptic error. The
+        // engine still rejects writes as a backstop; this is the friendly gate.
+        let read_only = matches!(&self.phase, Phase::Connected(active) if active.config.read_only);
+        if read_only && !matches!(kind, crate::sql::StatementKind::Query) {
+            self.toast = Some((
+                "Connection is read-only — write statements are disabled.".into(),
+                ToastVariant::Error,
+            ));
+            cx.notify();
+            return;
+        }
+
+        match kind {
+            crate::sql::StatementKind::Query => {
+                // Guard a bare `SELECT *` against flooding the grid: append the
+                // configured `LIMIT` unless the user wrote their own.
+                let sql =
+                    crate::sql::auto_limit(&sql, self.settings.query.auto_limit).unwrap_or(sql);
+                self.open_result("query", sql, None, cx)
+            }
             crate::sql::StatementKind::Write => self.execute_sql(sql, cx),
             crate::sql::StatementKind::Destructive => {
                 // The safety rail is opt-out in settings; when off, run immediately.
-                if self.settings.confirm_destructive {
+                if self.settings.query.confirm_destructive {
                     self.confirm_exec = Some(sql);
                     cx.notify();
                 } else {
@@ -437,8 +458,18 @@ impl AppState {
     }
 
     /// Run a write/DDL statement in a transaction; refresh the schema tree after,
-    /// since it may have created or dropped objects.
+    /// since it may have created or dropped objects. The single seam through which
+    /// writes leave the UI — so it also enforces the read-only gate, catching any
+    /// caller that didn't pre-check (e.g. future inline-edit paths).
     pub(crate) fn execute_sql(&mut self, sql: String, cx: &mut Context<Self>) {
+        if matches!(&self.phase, Phase::Connected(active) if active.config.read_only) {
+            self.toast = Some((
+                "Connection is read-only — write statements are disabled.".into(),
+                ToastVariant::Error,
+            ));
+            cx.notify();
+            return;
+        }
         self.service.send(Command::Execute { sql });
         cx.notify();
     }

@@ -3,7 +3,7 @@
 //! toolbar · grid · footer · scrollbar that make up the pane.
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Hsla};
+use gpui::{div, prelude::*, px, Hsla, SharedString};
 use red_core::ExportFormat;
 
 use super::buffer::{CellKind, DisplayCell};
@@ -52,7 +52,7 @@ struct CellColors {
 /// typed cells). The display string and kind were computed once when the row
 /// landed in the buffer, so this only picks a color and clones a `SharedString`
 /// (an `Arc` bump) — no per-frame formatting, copying, or classification.
-fn render_cell(cell: &DisplayCell, c: CellColors) -> gpui::AnyElement {
+fn render_cell(cell: &DisplayCell, c: CellColors, null_display: &SharedString) -> gpui::AnyElement {
     let color = match cell.kind {
         CellKind::Null | CellKind::Blob => c.faint,
         CellKind::Num => c.num,
@@ -60,10 +60,17 @@ fn render_cell(cell: &DisplayCell, c: CellColors) -> gpui::AnyElement {
         CellKind::Uuid => c.muted,
         CellKind::Json => c.cyan,
     };
+    // The buffer stores a placeholder for NULL; the user's chosen rendering (`∅`,
+    // `NULL`, blank, …) is substituted here so it stays a settings concern only.
+    let text = if cell.kind == CellKind::Null {
+        null_display.clone()
+    } else {
+        cell.text.clone()
+    };
     div()
         .text_color(color)
         .when(cell.kind == CellKind::Null, |d| d.italic())
-        .child(cell.text.clone())
+        .child(text)
         .into_any_element()
 }
 
@@ -228,7 +235,8 @@ impl AppState {
         // Resolve (and possibly re-center) the virtual-scroll window for this
         // frame; everything below works in list-local coordinates offset by
         // `base`, so the list only ever lays out `win.len` rows.
-        let row_height = self.settings.density().row_height();
+        let row_height = self.settings.grid.density.row_height();
+        let null_display: SharedString = self.settings.grid.null_display.clone().into();
         let win = grid.prepare_window(row_height);
         let base = win.base;
         // The selection is stored in absolute ordinals; translate it into the
@@ -296,9 +304,12 @@ impl AppState {
                     Some(row) => {
                         for c in 0..ncols {
                             match row.display.get(c) {
-                                Some(cell) => out.push(render_cell(cell, cell_colors)),
-                                None => out
-                                    .push(div().text_color(faint).child("·").into_any_element()),
+                                Some(cell) => {
+                                    out.push(render_cell(cell, cell_colors, &null_display))
+                                }
+                                None => {
+                                    out.push(div().text_color(faint).child("·").into_any_element())
+                                }
                             }
                         }
                     }

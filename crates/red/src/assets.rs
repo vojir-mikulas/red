@@ -30,6 +30,11 @@ const FONT_FILES: &[&str] = &[
 #[include = "icons/*"]
 pub struct Assets;
 
+/// The bundled, fully-commented reference settings — RED's settings docs. Baked
+/// into the binary so "open default settings" works in a shipped app, and copied
+/// into a fresh `settings.toml` on first open.
+pub const DEFAULT_SETTINGS: &str = include_str!("../../../assets/default-settings.toml");
+
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         Ok(Self::get(path).map(|file| file.data))

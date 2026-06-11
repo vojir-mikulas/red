@@ -58,6 +58,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # --- Embedded assets (fonts baked into the binary) ---
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 
+# --- Live config reload (watch settings.toml, re-apply without a restart) ---
+notify = "6"
+
 # --- Internal crates ---
 red-core = { path = "crates/red-core" }
 red-driver = { path = "crates/red-driver" }

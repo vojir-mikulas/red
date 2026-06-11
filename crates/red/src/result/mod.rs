@@ -542,7 +542,7 @@ impl AppState {
     /// user typed (1-based). Scrolls the active result's grid to that exact row,
     /// clamped to the result's bounds. No-op when no result is open.
     pub(crate) fn go_to_row(&mut self, one_based: usize, cx: &mut Context<Self>) {
-        let row_height = f32::from(self.settings.density().row_height());
+        let row_height = f32::from(self.settings.grid.density.row_height());
         if let Phase::Connected(active) = &self.phase {
             if let Some(grid) = active.active().result.as_ref() {
                 grid.go_to_row(one_based.saturating_sub(1), row_height);

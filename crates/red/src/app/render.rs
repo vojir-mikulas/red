@@ -92,6 +92,10 @@ impl Render for AppState {
             window.focus(&self.root_focus, cx);
         }
 
+        // First paint: install the OS-appearance observer and the settings
+        // file-watcher (both need a live `Window`).
+        self.ensure_observers(window, cx);
+
         let screen = match &self.phase {
             Phase::Disconnected => self.render_connect(cx).into_any_element(),
             Phase::Connecting(conn) => self.render_connecting(conn, cx).into_any_element(),

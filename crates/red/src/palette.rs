@@ -21,6 +21,10 @@ actions!(red, [ToggleCommandPalette, GoToRow]);
 #[derive(Clone, Copy)]
 pub(crate) enum Cmd {
     OpenSettings,
+    /// Open `settings.toml` in the user's editor (file-first workflow).
+    OpenSettingsFile,
+    /// Open the bundled, commented reference defaults (RED's settings docs).
+    OpenDefaultSettings,
     /// Connect to the saved connection at this index (disconnected phase).
     Connect(usize),
     RunQuery,
@@ -143,6 +147,8 @@ impl AppState {
     fn run_command(&mut self, cmd: Cmd, cx: &mut Context<Self>) {
         match cmd {
             Cmd::OpenSettings => self.open_settings(cx),
+            Cmd::OpenSettingsFile => self.open_settings_file(cx),
+            Cmd::OpenDefaultSettings => self.open_default_settings(cx),
             Cmd::Connect(index) => self.connect(index, cx),
             Cmd::RunQuery => self.run_editor_query(cx),
             Cmd::NewTab => self.new_query(cx),
@@ -205,6 +211,14 @@ impl AppState {
         out.push((
             PaletteItem::new("cmd:settings", "view: settings").hint("⌘,"),
             Cmd::OpenSettings,
+        ));
+        out.push((
+            PaletteItem::new("cmd:settings-file", "settings: open file"),
+            Cmd::OpenSettingsFile,
+        ));
+        out.push((
+            PaletteItem::new("cmd:settings-default", "settings: open default settings"),
+            Cmd::OpenDefaultSettings,
         ));
         out
     }

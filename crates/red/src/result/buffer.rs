@@ -840,7 +840,9 @@ mod keyed_run_tests {
     /// The same rows as resident [`Row`]s — for seeding a run's buffer directly,
     /// as an arrived page would after `Row::new`.
     fn run_rows(ids: impl IntoIterator<Item = i64>) -> VecDeque<Row> {
-        ids.into_iter().map(|id| Row::new(row(id), Some(0))).collect()
+        ids.into_iter()
+            .map(|id| Row::new(row(id), Some(0)))
+            .collect()
     }
 
     /// A run pretending its in-flight request is `seq` (as `issue` would set).
@@ -920,7 +922,12 @@ mod keyed_run_tests {
         );
         assert_eq!(run.anchor, 500 - PAGE);
         assert!(!run.at_start, "a full page doesn't touch the start");
-        let head: Vec<_> = run.rows.iter().take(2).map(|r| r.values[0].clone()).collect();
+        let head: Vec<_> = run
+            .rows
+            .iter()
+            .take(2)
+            .map(|r| r.values[0].clone())
+            .collect();
         assert_eq!(
             head,
             vec![

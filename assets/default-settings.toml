@@ -1,0 +1,72 @@
+# RED settings — the reference defaults.
+#
+# This is RED's settings documentation: every key, with its default and a one-line
+# note. Copy what you want into your own settings.toml (open it from the command
+# palette — ⌘K → "settings: open file"). Edits there apply live, no restart.
+#
+# The file degrades per section: a single bad value defaults just its own section
+# and shows a banner — it never resets the whole file. A missing file is fine; RED
+# launches on these defaults.
+#
+# Location:
+#   macOS    ~/Library/Application Support/red/settings.toml
+#   Linux    ~/.config/red/settings.toml          (XDG)
+#   Windows  %APPDATA%\red\settings.toml
+
+[appearance]
+# The color theme. Either a single name…
+theme = "One Dark"
+#   …or a mode-aware pair that follows the OS (or forces light / dark):
+# theme = { mode = "system", light = "Ayu Light", dark = "One Dark" }
+#   mode = "system" | "light" | "dark"
+# Built-in themes: "One Dark", "GitHub Dark", "Ayu Light". Drop your own theme
+# files into <config>/red/themes/*.toml (or import them from the settings panel):
+#
+#   name = "My Theme"
+#   appearance = "dark"      # "dark" | "light"
+#   base = "One Dark"        # built-in to inherit unset tokens from (optional)
+#   accent = "#ff8800"       # override any token by name, as #RRGGBB
+#   bg_app = "#101013"
+#
+# The accent is whatever the theme defines — there is no separate accent override.
+
+# UI font (not yet applied — pending Flint font tokens).
+# ui_font_family = "IBM Plex Sans"
+# ui_font_size = 14
+
+[editor]
+# SQL editor typography (not yet applied — pending Flint font tokens).
+# font_family = "IBM Plex Mono"
+# font_size = 13
+# line_height = 1.5
+# tab_width = 2
+
+[grid]
+# Row spacing: "compact" | "comfortable" | "spacious".
+density = "comfortable"
+
+# What a SQL NULL renders as in a cell (e.g. "∅", "NULL", or "" for blank).
+null_display = "NULL"
+
+# Show the leading row-number gutter (not yet applied).
+# row_numbers = true
+
+# Hard cap on the characters of any one cell kept resident — the fat-cell memory
+# rail (not yet applied; the built-in 4096 cap is in effect).
+# max_cell_chars = 4096
+
+# Rows pulled per page as you scroll — the keyset fetch window (not yet applied;
+# the built-in 200-row window is in effect).
+# page_size = 200
+
+[query]
+# Append LIMIT n to a bare `SELECT *` so a fat table can't flood the grid.
+# Set to 0 to disable. Queries that write their own LIMIT are left untouched.
+auto_limit = 1000
+
+# Ask before running DROP / TRUNCATE / DELETE-without-WHERE and similar.
+confirm_destructive = true
+
+[behavior]
+# Reconnect to the last session on launch (not yet applied — needs the keychain).
+# restore_last_session = false

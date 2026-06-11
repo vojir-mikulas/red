@@ -16,8 +16,8 @@ use flint::{CodeEditor, CodeEditorEvent};
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use gpui::{
-    prelude::*, px, AsyncApp, Context, ElementId, Entity, FocusHandle, Pixels, SharedString,
-    WeakEntity,
+    prelude::*, px, AsyncApp, Context, ElementId, Entity, FocusHandle, PathPromptOptions, Pixels,
+    SharedString, WeakEntity, Window, WindowAppearance,
 };
 use red_core::{ConnectionConfig, DbKind};
 use red_service::{Command, Event, ServiceHandle};
@@ -26,8 +26,16 @@ use crate::config::{self, StoredConnection};
 use crate::palette::Cmd;
 use crate::result::ResultGrid;
 use crate::schema::SchemaState;
-use crate::settings::{Density, FileSettingsStore, Settings};
+use crate::settings::{Density, FileSettingsStore, Settings, ThemeMode, ThemeSetting};
 use crate::settings_ui::SettingsTab;
+use crate::theme::ThemeRegistry;
+
+/// Which theme picker (light / dark) is open in the settings panel, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThemeSelect {
+    Light,
+    Dark,
+}
 
 /// Which top-level screen is showing.
 pub(crate) enum Phase {
@@ -201,11 +209,31 @@ pub struct AppState {
     pub(crate) confirm_exec: Option<String>,
     /// A non-pristine query tab the user asked to close, awaiting confirmation.
     pub(crate) confirm_close_tab: Option<usize>,
-    /// Persisted UI preferences (theme, grid density, the safety rail) + their store.
+    /// Persisted UI preferences (theme, grid, query, the safety rail) + their store.
     pub(crate) settings: Settings,
     pub(crate) settings_store: Option<FileSettingsStore>,
     pub(crate) settings_open: bool,
     pub(crate) settings_tab: SettingsTab,
+    /// Non-fatal problems from the last settings load (an unreadable section, a
+    /// bad value) — surfaced as a dismissible banner so a hand-edit gets feedback
+    /// instead of a silent reset.
+    pub(crate) settings_warnings: Vec<String>,
+    /// Whether the OS is in a dark appearance, for `theme = { mode = "system" }`.
+    pub(crate) os_dark: bool,
+    /// Installed once on first render: keeps the OS-appearance observer alive so
+    /// `mode = system` re-themes when the user flips light/dark.
+    pub(crate) appearance_sub: Option<gpui::Subscription>,
+    /// Live-reload watcher over `settings.toml`, plus the self-write guard that
+    /// suppresses the reload our own atomic save would otherwise trigger.
+    pub(crate) settings_watcher: Option<crate::settings_watch::SettingsWatcher>,
+    /// One-shot guard so the appearance observer + file-watcher install on the
+    /// first render (when a `Window` exists) rather than on every frame.
+    pub(crate) observers_installed: bool,
+    /// Built-in + imported themes, resolved for the light/dark pickers and the
+    /// theme manager. Rebuilt on import / remove.
+    pub(crate) themes: ThemeRegistry,
+    /// Which theme picker dropdown is open in the panel, if any.
+    pub(crate) theme_select_open: Option<ThemeSelect>,
     /// Whether a repaint ticker is already running for the live query timer, so
     /// concurrent opens don't stack duplicate tickers.
     pub(crate) query_ticking: bool,
@@ -249,13 +277,27 @@ impl AppState {
         .detach();
 
         // Load persisted preferences and apply the saved theme over the default
-        // installed in `main` (a missing/malformed file degrades to defaults).
+        // installed in `main` (a missing/malformed file degrades to defaults; a
+        // legacy flat file is migrated and re-saved once into the new sections).
         let settings_store = FileSettingsStore::open_default();
-        let settings = settings_store
+        let report = settings_store
             .as_ref()
-            .map(FileSettingsStore::load)
+            .map(FileSettingsStore::load_report)
             .unwrap_or_default();
-        cx.set_global(crate::theme::by_name(&settings.theme));
+        let settings = report.settings;
+        if report.migrated {
+            if let Some(store) = &settings_store {
+                if let Err(e) = store.save(&settings) {
+                    tracing::warn!("failed to re-save migrated settings: {e}");
+                }
+            }
+        }
+        let os_dark = matches!(
+            cx.window_appearance(),
+            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+        );
+        let themes = ThemeRegistry::load();
+        cx.set_global(themes.resolve(&settings.appearance.theme, os_dark));
 
         let name_input = cx.new(|cx| TextInput::new(cx).with_placeholder("my database"));
         let host_input = cx.new(|cx| TextInput::new(cx).with_placeholder("localhost"));
@@ -310,6 +352,13 @@ impl AppState {
             settings_store,
             settings_open: false,
             settings_tab: SettingsTab::Appearance,
+            settings_warnings: report.warnings,
+            os_dark,
+            appearance_sub: None,
+            settings_watcher: None,
+            observers_installed: false,
+            themes,
+            theme_select_open: None,
             query_ticking: false,
             connect_gen: 0,
             root_focus: cx.focus_handle(),
@@ -752,6 +801,124 @@ impl AppState {
         cx.notify();
     }
 
+    // --- settings: live observers ---
+
+    /// Install the OS-appearance observer and the `settings.toml` file-watcher on
+    /// the first render, when a `Window` is available. The appearance observer
+    /// keeps `mode = system` honest; the watcher re-applies hand edits live.
+    pub(crate) fn ensure_observers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.observers_installed {
+            return;
+        }
+        self.observers_installed = true;
+
+        let weak = cx.entity().downgrade();
+        let sub = window.observe_window_appearance(move |window, cx| {
+            let dark = matches!(
+                window.appearance(),
+                WindowAppearance::Dark | WindowAppearance::VibrantDark
+            );
+            weak.update(cx, |this, cx| {
+                if dark != this.os_dark {
+                    this.os_dark = dark;
+                    this.apply_theme(cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        self.appearance_sub = Some(sub);
+
+        if let Some(store) = &self.settings_store {
+            if let Some((watcher, mut rx)) =
+                crate::settings_watch::SettingsWatcher::start(store.path().to_path_buf())
+            {
+                self.settings_watcher = Some(watcher);
+                cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                    while rx.next().await.is_some() {
+                        if this
+                            .update(cx, |this, cx| this.reload_settings(cx))
+                            .is_err()
+                        {
+                            break; // view dropped — window closed
+                        }
+                    }
+                })
+                .detach();
+            }
+        }
+    }
+
+    /// Re-read `settings.toml` after an external edit and re-apply. Theme is
+    /// reinstalled here; per-frame settings (density, null display, page size)
+    /// take effect on the next render via `cx.notify`.
+    pub(crate) fn reload_settings(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = &self.settings_store else {
+            return;
+        };
+        let report = store.load_report();
+        self.settings = report.settings;
+        self.settings_warnings = report.warnings;
+        self.apply_theme(cx);
+        cx.notify();
+    }
+
+    // --- settings: file-first workflow ---
+
+    /// Open `settings.toml` in the user's editor, seeding it with the commented
+    /// reference defaults on first open so there's a full key set to edit.
+    pub(crate) fn open_settings_file(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = &self.settings_store else {
+            self.toast = Some((
+                "No config directory available on this platform.".into(),
+                ToastVariant::Error,
+            ));
+            cx.notify();
+            return;
+        };
+        let path = store.path().to_path_buf();
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // Announce the seed so the watcher doesn't echo it back as an edit.
+            if let Some(watcher) = &self.settings_watcher {
+                watcher.note_self_write(crate::assets::DEFAULT_SETTINGS);
+            }
+            if let Err(e) = std::fs::write(&path, crate::assets::DEFAULT_SETTINGS) {
+                tracing::warn!("failed to seed settings file: {e}");
+            }
+        }
+        self.reveal_path(&path, cx);
+    }
+
+    /// Open the bundled, fully-commented reference defaults — RED's settings docs.
+    pub(crate) fn open_default_settings(&mut self, cx: &mut Context<Self>) {
+        let path = std::env::temp_dir().join("red-default-settings.toml");
+        if let Err(e) = std::fs::write(&path, crate::assets::DEFAULT_SETTINGS) {
+            tracing::warn!("failed to materialize default settings: {e}");
+            self.toast = Some((
+                format!("Couldn't open default settings: {e}").into(),
+                ToastVariant::Error,
+            ));
+            cx.notify();
+            return;
+        }
+        self.reveal_path(&path, cx);
+    }
+
+    /// Hand `path` to the OS to open with its default handler (best-effort).
+    fn reveal_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        if let Err(e) = open_in_os(path) {
+            tracing::warn!("failed to open {}: {e}", path.display());
+            self.toast = Some((
+                format!("Couldn't open {}: {e}", path.display()).into(),
+                ToastVariant::Error,
+            ));
+        }
+        cx.notify();
+    }
+
     // --- settings panel ---
 
     pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
@@ -769,33 +936,202 @@ impl AppState {
         cx.notify();
     }
 
-    /// Make `name` the active theme, persist the choice, and re-render.
-    pub(crate) fn select_theme(&mut self, name: &str, cx: &mut Context<Self>) {
-        cx.set_global(crate::theme::by_name(name));
-        self.settings.theme = name.to_string();
+    /// Re-resolve the active theme from settings + OS appearance and install it.
+    pub(crate) fn apply_theme(&self, cx: &mut Context<Self>) {
+        cx.set_global(
+            self.themes
+                .resolve(&self.settings.appearance.theme, self.os_dark),
+        );
+    }
+
+    /// The `(mode, light, dark)` the current setting implies. The panel always
+    /// edits a light/dark pair, so a bare named theme is decomposed into one
+    /// (filling the other slot from the registry's default for that family).
+    fn theme_decompose(&self) -> (ThemeMode, String, String) {
+        match &self.settings.appearance.theme {
+            ThemeSetting::Modal { mode, light, dark } => (*mode, light.clone(), dark.clone()),
+            ThemeSetting::Named(name) if self.themes.is_light(name) => (
+                ThemeMode::Light,
+                name.clone(),
+                self.themes.default_name(false),
+            ),
+            ThemeSetting::Named(name) => (
+                ThemeMode::Dark,
+                self.themes.default_name(true),
+                name.clone(),
+            ),
+        }
+    }
+
+    /// The active appearance mode (System / Light / Dark) — drives the segmented.
+    pub(crate) fn theme_mode(&self) -> ThemeMode {
+        self.theme_decompose().0
+    }
+
+    /// The currently-selected theme name for a family — drives the pickers.
+    pub(crate) fn selected_theme(&self, light: bool) -> String {
+        let (_, l, d) = self.theme_decompose();
+        if light {
+            l
+        } else {
+            d
+        }
+    }
+
+    /// Store a full `(mode, light, dark)` pair, apply it, and persist.
+    fn set_theme_pair(
+        &mut self,
+        mode: ThemeMode,
+        light: String,
+        dark: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.appearance.theme = ThemeSetting::Modal { mode, light, dark };
+        self.apply_theme(cx);
         self.save_settings();
         cx.notify();
     }
 
+    /// Switch how the theme tracks the OS — `System` follows the OS light/dark,
+    /// `Light`/`Dark` pin that family. The pair carries across so the user's two
+    /// choices survive a mode flip.
+    pub(crate) fn set_theme_mode(&mut self, mode: ThemeMode, cx: &mut Context<Self>) {
+        let (_, light, dark) = self.theme_decompose();
+        self.set_theme_pair(mode, light, dark, cx);
+    }
+
+    /// Choose the light-appearance theme (used in Light and System-on-light modes).
+    pub(crate) fn set_light_theme(&mut self, name: &str, cx: &mut Context<Self>) {
+        let (mode, _, dark) = self.theme_decompose();
+        self.theme_select_open = None;
+        self.set_theme_pair(mode, name.to_string(), dark, cx);
+    }
+
+    /// Choose the dark-appearance theme (used in Dark and System-on-dark modes).
+    pub(crate) fn set_dark_theme(&mut self, name: &str, cx: &mut Context<Self>) {
+        let (mode, light, _) = self.theme_decompose();
+        self.theme_select_open = None;
+        self.set_theme_pair(mode, light, name.to_string(), cx);
+    }
+
+    /// Open/close a theme picker dropdown (the panel owns the open flag).
+    pub(crate) fn toggle_theme_select(&mut self, which: ThemeSelect, cx: &mut Context<Self>) {
+        self.theme_select_open = if self.theme_select_open == Some(which) {
+            None
+        } else {
+            Some(which)
+        };
+        cx.notify();
+    }
+
+    /// Pick a theme file from disk, validate + copy it into the user themes dir,
+    /// then reload the registry. Async (the native file dialog runs off-thread).
+    pub(crate) fn import_theme(&mut self, cx: &mut Context<Self>) {
+        self.theme_select_open = None;
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import theme".into()),
+        });
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            if let Ok(Ok(Some(paths))) = paths.await {
+                if let Some(path) = paths.into_iter().next() {
+                    this.update(cx, |this, cx| this.finish_import(&path, cx))
+                        .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Land an imported theme file: refresh the registry and re-apply (in case the
+    /// import re-skinned the active theme). Toasts success or the validation error.
+    fn finish_import(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        match ThemeRegistry::import(path) {
+            Ok(name) => {
+                self.themes = ThemeRegistry::load();
+                self.apply_theme(cx);
+                self.toast = Some((
+                    format!("Imported theme “{name}”").into(),
+                    ToastVariant::Success,
+                ));
+            }
+            Err(e) => {
+                self.toast = Some((
+                    format!("Couldn't import theme: {e}").into(),
+                    ToastVariant::Error,
+                ));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Delete a user theme, reload the registry, and re-apply — a removed active
+    /// theme falls back to the default rather than leaving a dangling reference.
+    pub(crate) fn remove_theme(&mut self, name: &str, cx: &mut Context<Self>) {
+        if let Err(e) = self.themes.remove(name) {
+            self.toast = Some((
+                format!("Couldn't remove theme: {e}").into(),
+                ToastVariant::Error,
+            ));
+            cx.notify();
+            return;
+        }
+        self.themes = ThemeRegistry::load();
+        self.apply_theme(cx);
+        self.toast = Some((
+            format!("Removed theme “{name}”").into(),
+            ToastVariant::Success,
+        ));
+        cx.notify();
+    }
+
     pub(crate) fn set_density(&mut self, density: Density, cx: &mut Context<Self>) {
-        self.settings.density = density.index() as u8;
+        self.settings.grid.density = density;
+        self.save_settings();
+        cx.notify();
+    }
+
+    pub(crate) fn set_null_display(&mut self, value: &str, cx: &mut Context<Self>) {
+        self.settings.grid.null_display = value.to_string();
+        self.save_settings();
+        cx.notify();
+    }
+
+    pub(crate) fn set_auto_limit(&mut self, n: u32, cx: &mut Context<Self>) {
+        self.settings.query.auto_limit = n;
         self.save_settings();
         cx.notify();
     }
 
     pub(crate) fn set_confirm_destructive(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.settings.confirm_destructive = on;
+        self.settings.query.confirm_destructive = on;
         self.save_settings();
+        cx.notify();
+    }
+
+    /// Dismiss the settings-warning banner until the next problematic load.
+    pub(crate) fn dismiss_settings_warnings(&mut self, cx: &mut Context<Self>) {
+        self.settings_warnings.clear();
         cx.notify();
     }
 
     /// Persist the current preferences. A write failure is logged, not surfaced —
     /// preferences are convenience, and the in-memory value already took effect.
-    fn save_settings(&self) {
-        if let Some(store) = &self.settings_store {
-            if let Err(e) = store.save(&self.settings) {
-                tracing::warn!("failed to save settings: {e}");
+    /// The bytes are announced to the watcher first so the reload this write
+    /// triggers is suppressed (no self-inflicted reload storm).
+    pub(crate) fn save_settings(&self) {
+        let Some(store) = &self.settings_store else {
+            return;
+        };
+        if let Some(watcher) = &self.settings_watcher {
+            if let Ok(serialized) = toml::to_string_pretty(&self.settings) {
+                watcher.note_self_write(&serialized);
             }
+        }
+        if let Err(e) = store.save(&self.settings) {
+            tracing::warn!("failed to save settings: {e}");
         }
     }
 
@@ -809,4 +1145,30 @@ impl AppState {
             ));
         }
     }
+}
+
+/// Open `path` with the OS's default handler — the file-first "open in editor"
+/// seam. Platform shell-out lives at the app edge; the UI never blocks on it.
+fn open_in_os(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg(path);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        // The empty "" is `start`'s window-title argument, so a quoted path isn't
+        // mistaken for the title.
+        c.args(["/C", "start", ""]).arg(path);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(path);
+        c
+    };
+    cmd.status().map(|_| ())
 }

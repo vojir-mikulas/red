@@ -221,6 +221,35 @@ pub fn classify(sql: &str) -> StatementKind {
     }
 }
 
+/// Append `LIMIT n` to a bare row-returning `SELECT` that doesn't already limit
+/// itself, so a fat table can't flood the grid — RED's big-result safety rail.
+/// Returns `None` (leave the SQL untouched) when `n` is 0, the statement isn't a
+/// plain `SELECT`, it already has a `LIMIT`, or it's a multi-statement batch.
+/// Deliberately conservative: anything it isn't sure about, it leaves alone.
+pub fn auto_limit(sql: &str, n: u32) -> Option<String> {
+    if n == 0 || !first_keyword(sql).eq_ignore_ascii_case("select") {
+        return None;
+    }
+    if has_limit_clause(sql) {
+        return None;
+    }
+    let trimmed = sql.trim_end().trim_end_matches(';').trim_end();
+    // A `;` left after stripping the trailing one means several statements — don't
+    // rewrite, since the `LIMIT` would bind only to the last one.
+    if trimmed.contains(';') {
+        return None;
+    }
+    Some(format!("{trimmed} LIMIT {n}"))
+}
+
+/// Whether `sql` already carries a `LIMIT` keyword. Word-boundary, case-insensitive
+/// scan; a false positive (a column literally named `limit`, or `limit` inside a
+/// string) only *suppresses* the auto-limit, which is the safe direction.
+fn has_limit_clause(sql: &str) -> bool {
+    sql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|word| word.eq_ignore_ascii_case("limit"))
+}
+
 /// The leading keyword of `sql`, skipping leading line/block comments + whitespace.
 pub fn first_keyword(sql: &str) -> String {
     let mut s = sql.trim_start();
@@ -529,6 +558,32 @@ mod tests {
     fn refs(src: &str) -> Vec<(String, String)> {
         let (content, cursor) = at(src);
         referenced_tables_at(&content, cursor)
+    }
+
+    #[test]
+    fn auto_limit_appends_to_bare_select() {
+        assert_eq!(
+            auto_limit("SELECT * FROM users", 1000).as_deref(),
+            Some("SELECT * FROM users LIMIT 1000")
+        );
+        // A trailing terminator is stripped before the LIMIT is appended.
+        assert_eq!(
+            auto_limit("select id from t ;", 50).as_deref(),
+            Some("select id from t LIMIT 50")
+        );
+    }
+
+    #[test]
+    fn auto_limit_leaves_self_limited_and_non_selects_alone() {
+        assert_eq!(auto_limit("SELECT * FROM t LIMIT 5", 1000), None);
+        assert_eq!(
+            auto_limit("WITH x AS (SELECT 1) SELECT * FROM x", 1000),
+            None
+        );
+        assert_eq!(auto_limit("UPDATE t SET a = 1", 1000), None);
+        // Disabled by a zero limit, and skipped for multi-statement batches.
+        assert_eq!(auto_limit("SELECT * FROM t", 0), None);
+        assert_eq!(auto_limit("SELECT 1; SELECT 2", 1000), None);
     }
 
     #[test]

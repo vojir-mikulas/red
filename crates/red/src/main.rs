@@ -18,6 +18,7 @@ mod schema;
 mod secrets;
 mod settings;
 mod settings_ui;
+mod settings_watch;
 mod shell;
 mod sql;
 mod theme;

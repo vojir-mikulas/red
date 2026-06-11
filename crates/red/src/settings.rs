@@ -1,57 +1,185 @@
-//! Persisted UI preferences — theme, result-grid density, and the
-//! destructive-statement safety rail.
+//! Persisted UI preferences — a structured, hand-editable, Zed-style config.
 //!
 //! These are app-wide presentation settings, not per-connection data, so they
 //! live in their own `settings.toml` beside `connections.toml` in the platform
-//! config dir. Values are stored as provider-agnostic primitives (a theme
-//! *name*, a density *index*) and mapped to concrete UI types in the app.
+//! config dir. The flat key set grew into nested sections ([`AppearanceSettings`],
+//! [`GridSettings`], …); each is `#[serde(default)]` so a partial — or slightly
+//! wrong — file keeps every key it *can* read and defaults only the rest. A single
+//! bad key must never reset the whole file.
 //!
-//! Mirrors Nyx's settings store: writes go through a temp-file + atomic rename,
-//! but reads **never** fail — a missing or malformed file degrades to
-//! [`Settings::default`], because preferences are convenience, not user data,
-//! and a bad file must never block launch.
+//! Writes go through a temp-file + atomic rename; reads **never** fail — a missing
+//! or malformed file degrades to [`Settings::default`], because preferences are
+//! convenience, not user data, and a bad file must never block launch. A
+//! recoverable problem (one unreadable section, a typo'd value) surfaces as a
+//! warning in [`LoadReport`] for a non-blocking banner, while last-good defaults
+//! stay applied.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use gpui::{px, Pixels};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-/// Persisted UI preferences.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+use crate::assets::{FONT_MONO, FONT_UI};
+
+/// Persisted UI preferences, grouped into hand-editable sections.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// The active theme's human-readable name (e.g. `"One Dark"`); mapped to a
-    /// concrete `Theme` via [`crate::theme::by_name`].
-    pub theme: String,
-    /// Result-grid row density as an index into [`Density::ALL`] (0/1/2).
-    pub density: u8,
-    /// Whether destructive statements (DROP/TRUNCATE/…) prompt for confirmation
-    /// before they run — RED's read-mostly safety rail.
-    pub confirm_destructive: bool,
+    pub appearance: AppearanceSettings,
+    pub editor: EditorSettings,
+    pub grid: GridSettings,
+    pub query: QuerySettings,
+    pub behavior: BehaviorSettings,
 }
 
-impl Default for Settings {
+// --- appearance --------------------------------------------------------------
+
+/// Theme and fonts. The accent is purely theme-defined (a theme file may set it);
+/// the font knobs are modeled for forward compatibility — live application of
+/// UI/editor fonts depends on Flint font tokens (a follow-up), while `theme` is
+/// applied today.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppearanceSettings {
+    pub theme: ThemeSetting,
+    pub ui_font_family: String,
+    pub ui_font_size: f32,
+}
+
+impl Default for AppearanceSettings {
     fn default() -> Self {
         Self {
-            theme: "One Dark".to_string(),
-            density: 1,
-            confirm_destructive: true,
+            theme: ThemeSetting::default(),
+            ui_font_family: FONT_UI.to_string(),
+            ui_font_size: 14.0,
         }
     }
 }
 
-impl Settings {
-    /// The configured row density, clamped to a valid variant.
-    pub fn density(&self) -> Density {
-        Density::ALL[(self.density as usize).min(Density::ALL.len() - 1)]
+/// How the theme is chosen: a single named theme, or a mode-aware pair that
+/// follows the OS appearance (or a forced light/dark).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ThemeSetting {
+    /// One theme name applied regardless of OS appearance (`theme = "One Dark"`).
+    Named(String),
+    /// Mode-aware (`theme = { mode = "system", light = "Ayu Light", dark = "One Dark" }`).
+    Modal {
+        #[serde(default)]
+        mode: ThemeMode,
+        #[serde(default = "default_light")]
+        light: String,
+        #[serde(default = "default_dark")]
+        dark: String,
+    },
+}
+
+impl Default for ThemeSetting {
+    fn default() -> Self {
+        ThemeSetting::Named(default_dark())
     }
 }
 
-/// Result-grid row spacing. Stored as the index of its position in [`Self::ALL`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+fn default_light() -> String {
+    "Ayu Light".to_string()
+}
+fn default_dark() -> String {
+    "One Dark".to_string()
+}
+
+impl ThemeSetting {
+    /// The concrete theme name to apply, given whether the OS is in dark mode.
+    pub fn resolve(&self, os_dark: bool) -> &str {
+        match self {
+            ThemeSetting::Named(name) => name,
+            ThemeSetting::Modal { mode, light, dark } => match mode {
+                ThemeMode::Light => light,
+                ThemeMode::Dark => dark,
+                ThemeMode::System => {
+                    if os_dark {
+                        dark
+                    } else {
+                        light
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// Which theme of a [`ThemeSetting::Modal`] pair to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    /// Follow the OS light/dark appearance.
+    System,
+    Light,
+    #[default]
+    Dark,
+}
+
+// --- editor ------------------------------------------------------------------
+
+/// SQL editor typography. Modeled for forward compatibility; live application
+/// depends on Flint exposing editor font tokens (a follow-up).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EditorSettings {
+    pub font_family: String,
+    pub font_size: f32,
+    pub line_height: f32,
+    pub tab_width: u8,
+}
+
+impl Default for EditorSettings {
+    fn default() -> Self {
+        Self {
+            font_family: FONT_MONO.to_string(),
+            font_size: 13.0,
+            line_height: 1.5,
+            tab_width: 2,
+        }
+    }
+}
+
+// --- grid --------------------------------------------------------------------
+
+/// Result-grid behaviour, tuned for fast browsing of large result sets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GridSettings {
+    pub density: Density,
+    /// Show the leading row-number gutter.
+    pub row_numbers: bool,
+    /// What a SQL `NULL` renders as (e.g. `∅`, `NULL`, or blank).
+    pub null_display: String,
+    /// Hard cap on the characters of any one cell the grid keeps resident — the
+    /// fat-cell memory rail. Clamped to a sane floor on load.
+    pub max_cell_chars: usize,
+    /// The streaming/keyset fetch window: how many rows a page request pulls.
+    pub page_size: usize,
+}
+
+impl Default for GridSettings {
+    fn default() -> Self {
+        Self {
+            density: Density::default(),
+            row_numbers: true,
+            null_display: "NULL".to_string(),
+            max_cell_chars: 4096,
+            page_size: 200,
+        }
+    }
+}
+
+/// Result-grid row spacing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Density {
     Compact,
+    #[default]
     Comfortable,
     Spacious,
 }
@@ -59,13 +187,18 @@ pub enum Density {
 impl Density {
     pub const ALL: [Density; 3] = [Density::Compact, Density::Comfortable, Density::Spacious];
 
-    /// Index into [`Self::ALL`] — what gets persisted and drives the segmented control.
+    /// Index into [`Self::ALL`] — drives the segmented control.
     pub fn index(self) -> usize {
         match self {
             Density::Compact => 0,
             Density::Comfortable => 1,
             Density::Spacious => 2,
         }
+    }
+
+    /// Map a legacy persisted index (`0`/`1`/`2`) onto a variant for migration.
+    pub fn from_index(index: usize) -> Self {
+        Self::ALL[index.min(Self::ALL.len() - 1)]
     }
 
     /// The grid row height for this density.
@@ -76,6 +209,51 @@ impl Density {
             Density::Spacious => px(30.),
         }
     }
+}
+
+// --- query -------------------------------------------------------------------
+
+/// Query-execution safety rails — RED's on-brand big-result defaults.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QuerySettings {
+    /// Append `LIMIT n` to a bare `SELECT *` so a fat table can't flood the grid.
+    /// `0` disables the auto-limit.
+    pub auto_limit: u32,
+    /// Confirm destructive statements (DROP/TRUNCATE/…) before they run.
+    pub confirm_destructive: bool,
+}
+
+impl Default for QuerySettings {
+    fn default() -> Self {
+        Self {
+            auto_limit: 1000,
+            confirm_destructive: true,
+        }
+    }
+}
+
+// --- behavior ----------------------------------------------------------------
+
+/// Session behaviour. `restore_last_session` is modeled but not yet wired (it
+/// touches the connection lifecycle + keychain — a follow-up). `false` is the
+/// derived default.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BehaviorSettings {
+    pub restore_last_session: bool,
+}
+
+// --- store -------------------------------------------------------------------
+
+/// The outcome of a load: the resolved settings, plus any non-fatal warnings to
+/// surface (an unreadable section, a value out of range) and whether a legacy
+/// flat file was migrated and should be re-saved in the new shape.
+#[derive(Debug, Clone, Default)]
+pub struct LoadReport {
+    pub settings: Settings,
+    pub warnings: Vec<String>,
+    pub migrated: bool,
 }
 
 /// Local on-disk settings store over a single `settings.toml`.
@@ -101,12 +279,44 @@ impl FileSettingsStore {
         Self { path: path.into() }
     }
 
-    /// Read the settings, falling back to [`Settings::default`] for a missing or
-    /// malformed file (preferences must never block startup).
-    pub fn load(&self) -> Settings {
-        match std::fs::read_to_string(&self.path) {
-            Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
-            Err(_) => Settings::default(),
+    /// The backing file path, for the "open settings file" workflow.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Read with diagnostics: resolves each section independently so one bad
+    /// section can't reset the rest, and lifts any legacy top-level keys.
+    pub fn load_report(&self) -> LoadReport {
+        let Ok(contents) = std::fs::read_to_string(&self.path) else {
+            return LoadReport::default();
+        };
+        let value: toml::Value = match contents.parse() {
+            Ok(v) => v,
+            Err(e) => {
+                return LoadReport {
+                    settings: Settings::default(),
+                    warnings: vec![format!(
+                        "settings.toml isn't valid TOML ({e}) — using defaults"
+                    )],
+                    migrated: false,
+                };
+            }
+        };
+
+        let mut warnings = Vec::new();
+        let mut settings = Settings {
+            appearance: section(&value, "appearance", &mut warnings),
+            editor: section(&value, "editor", &mut warnings),
+            grid: section(&value, "grid", &mut warnings),
+            query: section(&value, "query", &mut warnings),
+            behavior: section(&value, "behavior", &mut warnings),
+        };
+        let migrated = apply_legacy(&mut settings, &value);
+
+        LoadReport {
+            settings,
+            warnings,
+            migrated,
         }
     }
 
@@ -130,6 +340,50 @@ impl FileSettingsStore {
         std::fs::rename(&tmp, &self.path).context("renaming the settings temp file")?;
         Ok(())
     }
+}
+
+/// Deserialize one named section independently, defaulting (with a warning) if it
+/// is present but unreadable — so a single mistyped value degrades just its own
+/// section, never the whole file.
+fn section<T: Default + DeserializeOwned>(
+    value: &toml::Value,
+    key: &str,
+    warnings: &mut Vec<String>,
+) -> T {
+    match value.get(key) {
+        None => T::default(),
+        Some(v) => match v.clone().try_into() {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                warnings.push(format!(
+                    "settings.toml: couldn't read [{key}] ({e}) — keeping defaults for that section"
+                ));
+                T::default()
+            }
+        },
+    }
+}
+
+/// Lift the legacy flat keys (`theme` / `density` / `confirm_destructive`) into
+/// the new sections once, so an old file upgrades cleanly. Returns `true` when
+/// anything was migrated (the caller re-saves in the new shape). These keys only
+/// existed at the top level in the old format; the new nested keys live under
+/// their sections, so reading them here is unambiguous.
+fn apply_legacy(settings: &mut Settings, value: &toml::Value) -> bool {
+    let mut migrated = false;
+    if let Some(theme) = value.get("theme").and_then(|v| v.as_str()) {
+        settings.appearance.theme = ThemeSetting::Named(theme.to_string());
+        migrated = true;
+    }
+    if let Some(density) = value.get("density").and_then(|v| v.as_integer()) {
+        settings.grid.density = Density::from_index(density.max(0) as usize);
+        migrated = true;
+    }
+    if let Some(confirm) = value.get("confirm_destructive").and_then(|v| v.as_bool()) {
+        settings.query.confirm_destructive = confirm;
+        migrated = true;
+    }
+    migrated
 }
 
 #[cfg(test)]
@@ -160,42 +414,101 @@ mod tests {
         TempStore { dir, store }
     }
 
+    fn write(store: &FileSettingsStore, contents: &str) {
+        std::fs::write(store.path(), contents).unwrap();
+    }
+
     #[test]
     fn missing_file_is_default() {
         let t = temp_store();
-        assert_eq!(t.store.load(), Settings::default());
+        assert_eq!(t.store.load_report().settings, Settings::default());
     }
 
     #[test]
     fn round_trip() {
         let t = temp_store();
-        let settings = Settings {
-            theme: "GitHub Dark".to_string(),
-            density: 0,
-            confirm_destructive: false,
-        };
+        let mut settings = Settings::default();
+        settings.appearance.theme = ThemeSetting::Named("GitHub Dark".into());
+        settings.grid.density = Density::Compact;
+        settings.query.confirm_destructive = false;
+        settings.grid.null_display = "∅".into();
         t.store.save(&settings).unwrap();
-        assert_eq!(t.store.load(), settings);
+        assert_eq!(t.store.load_report().settings, settings);
     }
 
     #[test]
-    fn malformed_file_is_default() {
+    fn malformed_file_is_default_with_warning() {
         let t = temp_store();
-        std::fs::write(t.store.path.as_path(), "this is = not valid toml ][").unwrap();
-        assert_eq!(t.store.load(), Settings::default());
+        write(&t.store, "this is = not valid toml ][");
+        let report = t.store.load_report();
+        assert_eq!(report.settings, Settings::default());
+        assert_eq!(report.warnings.len(), 1);
     }
 
     #[test]
-    fn partial_file_takes_field_defaults() {
-        // A file with only `theme` set keeps the default density / confirm flag.
+    fn partial_section_takes_field_defaults() {
+        // A file with only one grid key keeps every other default, in every section.
         let t = temp_store();
-        std::fs::write(t.store.path.as_path(), "theme = \"GitHub Dark\"\n").unwrap();
-        let loaded = t.store.load();
-        assert_eq!(loaded.theme, "GitHub Dark");
-        assert_eq!(loaded.density, Settings::default().density);
-        assert_eq!(
-            loaded.confirm_destructive,
-            Settings::default().confirm_destructive
+        write(&t.store, "[grid]\nnull_display = \"—\"\n");
+        let loaded = t.store.load_report().settings;
+        assert_eq!(loaded.grid.null_display, "—");
+        assert_eq!(loaded.grid.density, Density::default());
+        assert_eq!(loaded.grid.page_size, GridSettings::default().page_size);
+        assert_eq!(loaded.query, QuerySettings::default());
+        assert_eq!(loaded.appearance, AppearanceSettings::default());
+    }
+
+    #[test]
+    fn one_bad_section_does_not_reset_the_rest() {
+        // `density` wants a string; an integer fails *only* the grid section.
+        let t = temp_store();
+        write(
+            &t.store,
+            "[grid]\ndensity = 7\n\n[query]\nauto_limit = 50\n",
         );
+        let report = t.store.load_report();
+        assert_eq!(report.settings.grid, GridSettings::default());
+        assert_eq!(report.settings.query.auto_limit, 50);
+        assert_eq!(report.warnings.len(), 1);
+    }
+
+    #[test]
+    fn theme_parses_both_shapes() {
+        let named: AppearanceSettings =
+            toml::from_str("theme = \"GitHub Dark\"").expect("named theme");
+        assert_eq!(named.theme, ThemeSetting::Named("GitHub Dark".into()));
+
+        let modal: AppearanceSettings = toml::from_str(
+            "theme = { mode = \"system\", light = \"Ayu Light\", dark = \"One Dark\" }",
+        )
+        .expect("modal theme");
+        assert_eq!(
+            modal.theme,
+            ThemeSetting::Modal {
+                mode: ThemeMode::System,
+                light: "Ayu Light".into(),
+                dark: "One Dark".into(),
+            }
+        );
+        assert_eq!(modal.theme.resolve(true), "One Dark");
+        assert_eq!(modal.theme.resolve(false), "Ayu Light");
+    }
+
+    #[test]
+    fn migrates_legacy_flat_file() {
+        // The old shape: bare top-level theme/density/confirm_destructive.
+        let t = temp_store();
+        write(
+            &t.store,
+            "theme = \"GitHub Dark\"\ndensity = 0\nconfirm_destructive = false\n",
+        );
+        let report = t.store.load_report();
+        assert!(report.migrated);
+        assert_eq!(
+            report.settings.appearance.theme,
+            ThemeSetting::Named("GitHub Dark".into())
+        );
+        assert_eq!(report.settings.grid.density, Density::Compact);
+        assert!(!report.settings.query.confirm_destructive);
     }
 }
