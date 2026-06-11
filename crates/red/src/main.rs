@@ -36,6 +36,10 @@ use crate::palette::{GoToRow, ToggleCommandPalette};
 #[global_allocator]
 static GLOBAL: dev_stats::Counting = dev_stats::Counting;
 
+// The dev perf HUD's toggle action (⌥⌘P), bound only under the feature.
+#[cfg(feature = "dev-stats")]
+gpui::actions!(red, [ToggleDevStats]);
+
 fn main() {
     init_tracing();
 
@@ -55,6 +59,9 @@ fn main() {
             KeyBinding::new("cmd-k", ToggleCommandPalette, None),
             KeyBinding::new("ctrl-g", GoToRow, None),
         ]);
+        // Dev-only: ⌥⌘P toggles the perf HUD overlay.
+        #[cfg(feature = "dev-stats")]
+        cx.bind_keys([KeyBinding::new("cmd-alt-p", ToggleDevStats, None)]);
 
         // Spawn the Tokio backend and hand its event stream to the root view.
         let mut service = red_service::spawn();

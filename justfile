@@ -9,6 +9,13 @@ default:
 run:
     cargo run -p red
 
+# Release build only — debug timings are several× slower and lie, so only
+# optimized numbers are honest. The on-screen HUD lands in Tier 2
+# (docs/plans/dev-perf-hud.md); for now this installs the counting allocator.
+# Run with dev perf instrumentation (optimized + counting allocator).
+run-stats:
+    cargo run -p red --release --features dev-stats
+
 # Run the Flint component gallery ("storybook"). Lives in the sibling Flint repo.
 gallery:
     cargo run --manifest-path ../flint/Cargo.toml --example gallery

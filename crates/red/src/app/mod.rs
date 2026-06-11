@@ -223,6 +223,10 @@ pub struct AppState {
     /// Set when an overlay closed: the next render pulls focus back to the root
     /// so the global ⌘K keeps dispatching (see `close_palette`).
     pub(crate) refocus_root: bool,
+    /// Dev-only perf HUD collector — brackets `render` to read build time and
+    /// allocation churn. Compiled only under the `dev-stats` feature.
+    #[cfg(feature = "dev-stats")]
+    pub(crate) dev_stats: crate::dev_stats::DevStats,
 }
 impl AppState {
     pub fn new(
@@ -313,7 +317,16 @@ impl AppState {
             palette_cmds: Vec::new(),
             // Focus the root on first paint so the very first ⌘K dispatches.
             refocus_root: true,
+            #[cfg(feature = "dev-stats")]
+            dev_stats: crate::dev_stats::DevStats::default(),
         }
+    }
+
+    /// Toggle the dev perf HUD overlay (the `cmd-alt-p` dev keybinding).
+    #[cfg(feature = "dev-stats")]
+    pub(crate) fn toggle_dev_stats(&mut self, cx: &mut Context<Self>) {
+        self.dev_stats.toggle();
+        cx.notify();
     }
 
     /// True while any open result grid is still running its query.

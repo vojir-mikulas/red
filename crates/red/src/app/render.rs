@@ -80,6 +80,11 @@ impl AppState {
 
 impl Render for AppState {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Dev perf HUD: time this render and tally its allocation churn. No-op
+        // (compiled out) in a normal build.
+        #[cfg(feature = "dev-stats")]
+        self.dev_stats.begin_frame();
+
         // An overlay just closed (or we're starting up): reclaim focus so the
         // global ⌘K binding has a live dispatch target again.
         if self.refocus_root {
@@ -129,7 +134,7 @@ impl Render for AppState {
             .then(|| self.render_settings(cx).into_any_element());
 
         let theme = cx.theme();
-        div()
+        let root = div()
             .size_full()
             .relative()
             // Anchor focus + the global ⌘K binding here so the palette toggles
@@ -150,7 +155,21 @@ impl Render for AppState {
             .children(confirm_close)
             .children(settings)
             // The palette renders its own full-screen overlay; last = on top.
-            .children(self.palette.clone())
+            .children(self.palette.clone());
+
+        // Dev perf HUD: register its toggle, overlay the panel last (on top), and
+        // close the frame so the rings capture this render's cost.
+        #[cfg(feature = "dev-stats")]
+        let root = {
+            let root = root.on_action(
+                cx.listener(|this, _: &crate::ToggleDevStats, _, cx| this.toggle_dev_stats(cx)),
+            );
+            let panel = self.render_dev_panel(cx);
+            self.dev_stats.end_frame();
+            root.children(panel)
+        };
+
+        root
     }
 }
 
@@ -243,5 +262,70 @@ impl AppState {
                     .ok();
             })
             .child(body)
+    }
+}
+
+#[cfg(feature = "dev-stats")]
+impl AppState {
+    /// The dev perf HUD overlay: a small bottom-right mono panel with the budget
+    /// readouts (build time, allocs/frame, live + RSS bytes, the grid footprint).
+    /// `None` while toggled off. Kept deliberately trivial — building it allocates
+    /// and takes time, so it lightly perturbs its own reading (see the plan).
+    fn render_dev_panel(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.dev_stats.visible() {
+            return None;
+        }
+        let theme = cx.theme();
+        let ds = &self.dev_stats;
+        let mb = |bytes: usize| format!("{} MB", bytes / (1024 * 1024));
+        let rss = ds.rss().map(&mb).unwrap_or_else(|| "—".into());
+        // `gap` is the interval between renders — the repaint cadence during
+        // interaction. Idle is notify-gated (no frame stream), so a large gap at
+        // rest is correct, not a stall (see the plan's fps caveat).
+        let line1 = format!(
+            "build {:.2} ms · gap {:.0} ms · {:.0} allocs/f · live {} · rss {}",
+            ds.build_ms(),
+            ds.interval_ms(),
+            ds.allocs_per_frame(),
+            mb(ds.live_bytes()),
+            rss,
+        );
+
+        let grid = match &self.phase {
+            Phase::Connected(active) => active.active().result.as_ref().map(|g| g.dev_snapshot()),
+            _ => None,
+        };
+        let line2 = match grid {
+            Some(g) => format!(
+                "grid {} rows · {} · {} in-flight · q {:.0} ms",
+                crate::result::group_digits(g.resident_rows),
+                g.mode,
+                g.in_flight,
+                g.last_query_ms,
+            ),
+            None => "grid —".to_string(),
+        };
+
+        Some(
+            div()
+                .absolute()
+                .bottom_2()
+                .right_2()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded(theme.radius_sm)
+                .bg(theme.bg_panel)
+                .border_1()
+                .border_color(theme.border)
+                .font_family(FONT_MONO)
+                .text_size(px(10.))
+                .text_color(theme.text_muted)
+                .child(div().child(line1))
+                .child(div().text_color(theme.text_faint).child(line2))
+                .into_any_element(),
+        )
     }
 }

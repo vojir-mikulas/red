@@ -508,6 +508,35 @@ impl GridBuffer {
         matches!(&self.mode, BufferMode::Keyed(_))
     }
 
+    /// Rows held resident right now — bounded by the window margin regardless of
+    /// result size. For the dev perf HUD (see `dev_stats`).
+    #[cfg(feature = "dev-stats")]
+    pub(super) fn resident_rows(&self) -> usize {
+        match &self.mode {
+            BufferMode::Offset(pages) => pages.rows.len(),
+            BufferMode::Keyed(run) => run.rows.len(),
+        }
+    }
+
+    /// `"keyed"` / `"offset"` — the active paging mode, for the HUD.
+    #[cfg(feature = "dev-stats")]
+    pub(super) fn mode_label(&self) -> &'static str {
+        match &self.mode {
+            BufferMode::Offset(_) => "offset",
+            BufferMode::Keyed(_) => "keyed",
+        }
+    }
+
+    /// Fetches in flight right now — keyed mode runs one at a time (0/1), offset
+    /// mode may have several pages queued. For the HUD.
+    #[cfg(feature = "dev-stats")]
+    pub(super) fn in_flight(&self) -> usize {
+        match &self.mode {
+            BufferMode::Offset(pages) => pages.requested.len(),
+            BufferMode::Keyed(run) => run.pending.is_some() as usize,
+        }
+    }
+
     /// The in-flight run fetch failed: free the slot so fetching can resume,
     /// but hold off until the viewport moves (see `KeyedRun::halted`).
     pub(super) fn run_failed(&mut self, seq: u64) {

@@ -246,6 +246,19 @@ impl ResultGrid {
         }
     }
 
+    /// A glance at this grid's footprint for the dev perf HUD: resident rows,
+    /// paging mode, in-flight fetches, and the last query's wall-clock time.
+    #[cfg(feature = "dev-stats")]
+    pub(crate) fn dev_snapshot(&self) -> crate::dev_stats::GridSnapshot {
+        let buffer = self.buffer.borrow();
+        crate::dev_stats::GridSnapshot {
+            resident_rows: buffer.resident_rows(),
+            mode: buffer.mode_label(),
+            in_flight: buffer.in_flight(),
+            last_query_ms: self.query_time().as_secs_f32() * 1000.0,
+        }
+    }
+
     /// The current selection as TSV (NULL → empty), skipping the gutter column.
     /// Unloaded cells contribute blanks rather than blocking the copy.
     fn selection_tsv(&self) -> Option<String> {
