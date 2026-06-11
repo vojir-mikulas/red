@@ -30,16 +30,19 @@ theme = "One Dark"
 #
 # The accent is whatever the theme defines — there is no separate accent override.
 
-# UI font (not yet applied — pending Flint font tokens).
-# ui_font_family = "IBM Plex Sans"
-# ui_font_size = 14
+# UI font: the interface font family and base size (px). Any installed family
+# works; size is clamped to 8–32. Also settable from the Appearance panel.
+ui_font_family = "IBM Plex Sans"
+ui_font_size = 13
 
 [editor]
-# SQL editor typography (not yet applied — pending Flint font tokens).
-# font_family = "IBM Plex Mono"
-# font_size = 13
-# line_height = 1.5
-# tab_width = 2
+# SQL editor typography. A monospace family is recommended. `line_height` is a
+# multiple of the font size (clamped to 1.0–3.0). Family + size are also in the
+# Appearance panel; line_height and tab_width live here.
+font_family = "IBM Plex Mono"
+font_size = 13
+line_height = 1.5
+tab_width = 2
 
 [grid]
 # Row spacing: "compact" | "comfortable" | "spacious".

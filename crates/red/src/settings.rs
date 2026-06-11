@@ -37,9 +37,8 @@ pub struct Settings {
 // --- appearance --------------------------------------------------------------
 
 /// Theme and fonts. The accent is purely theme-defined (a theme file may set it);
-/// the font knobs are modeled for forward compatibility — live application of
-/// UI/editor fonts depends on Flint font tokens (a follow-up), while `theme` is
-/// applied today.
+/// the UI font family + size are applied live to the whole interface (the editor
+/// has its own family/size under `[editor]`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppearanceSettings {
@@ -53,7 +52,8 @@ impl Default for AppearanceSettings {
         Self {
             theme: ThemeSetting::default(),
             ui_font_family: FONT_UI.to_string(),
-            ui_font_size: 14.0,
+            // The design's base UI size (the root previously hard-coded this).
+            ui_font_size: 13.0,
         }
     }
 }
@@ -122,8 +122,8 @@ pub enum ThemeMode {
 
 // --- editor ------------------------------------------------------------------
 
-/// SQL editor typography. Modeled for forward compatibility; live application
-/// depends on Flint exposing editor font tokens (a follow-up).
+/// SQL editor typography, applied live to the `CodeEditor` surface (which
+/// inherits the family / size / line-height set on its container).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EditorSettings {
@@ -313,6 +313,16 @@ impl FileSettingsStore {
         };
         let migrated = apply_legacy(&mut settings, &value);
 
+        // Keep typography in a sane range so a stray hand-edit (0, negative, NaN,
+        // absurdly large) can't break layout. Silent — clamping isn't an "error".
+        settings.appearance.ui_font_size = clamp_font_size(settings.appearance.ui_font_size);
+        settings.editor.font_size = clamp_font_size(settings.editor.font_size);
+        settings.editor.line_height = if settings.editor.line_height.is_finite() {
+            settings.editor.line_height.clamp(1.0, 3.0)
+        } else {
+            1.5
+        };
+
         LoadReport {
             settings,
             warnings,
@@ -339,6 +349,19 @@ impl FileSettingsStore {
         drop(file);
         std::fs::rename(&tmp, &self.path).context("renaming the settings temp file")?;
         Ok(())
+    }
+}
+
+/// The font sizes (px) the UI will accept. A value outside this range — or a NaN
+/// / infinity — falls back to the safe floor rather than breaking layout.
+pub const MIN_FONT_SIZE: f32 = 8.0;
+pub const MAX_FONT_SIZE: f32 = 32.0;
+
+fn clamp_font_size(size: f32) -> f32 {
+    if size.is_finite() {
+        size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+    } else {
+        13.0
     }
 }
 

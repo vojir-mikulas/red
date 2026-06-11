@@ -269,9 +269,17 @@ impl AppState {
             .child(div().text_color(dim).child("/"))
             .child(div().text_color(text).child(active.active().title.clone()));
 
+        // The editor's own typography, applied here: the `CodeEditor` shapes its
+        // text with `window.text_style()` / `window.line_height()`, both inherited
+        // from this container — so setting them here drives the editor font without
+        // it (or Flint) knowing about settings.
+        let ed = &self.settings.editor;
         let surface = div()
             .flex_1()
             .min_h(px(0.))
+            .font_family(ed.font_family.clone())
+            .text_size(px(ed.font_size))
+            .line_height(px(ed.font_size * ed.line_height))
             .child(active.active().editor.clone());
 
         // --- bottom run bar: Run · history · hint · read-only · endpoint ---

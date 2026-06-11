@@ -37,6 +37,13 @@ pub(crate) enum ThemeSelect {
     Dark,
 }
 
+/// Which font-family picker (UI / editor) is open in the settings panel, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FontSelect {
+    Ui,
+    Editor,
+}
+
 /// Which top-level screen is showing.
 pub(crate) enum Phase {
     Disconnected,
@@ -234,6 +241,8 @@ pub struct AppState {
     pub(crate) themes: ThemeRegistry,
     /// Which theme picker dropdown is open in the panel, if any.
     pub(crate) theme_select_open: Option<ThemeSelect>,
+    /// Which font-family picker dropdown is open in the panel, if any.
+    pub(crate) font_select_open: Option<FontSelect>,
     /// Whether a repaint ticker is already running for the live query timer, so
     /// concurrent opens don't stack duplicate tickers.
     pub(crate) query_ticking: bool,
@@ -359,6 +368,7 @@ impl AppState {
             observers_installed: false,
             themes,
             theme_select_open: None,
+            font_select_open: None,
             query_ticking: false,
             connect_gen: 0,
             root_focus: cx.focus_handle(),
@@ -1108,6 +1118,44 @@ impl AppState {
     pub(crate) fn set_confirm_destructive(&mut self, on: bool, cx: &mut Context<Self>) {
         self.settings.query.confirm_destructive = on;
         self.save_settings();
+        cx.notify();
+    }
+
+    pub(crate) fn set_ui_font_family(&mut self, family: &str, cx: &mut Context<Self>) {
+        self.settings.appearance.ui_font_family = family.to_string();
+        self.font_select_open = None;
+        self.save_settings();
+        cx.notify();
+    }
+
+    pub(crate) fn set_ui_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
+        self.settings.appearance.ui_font_size =
+            size.clamp(crate::settings::MIN_FONT_SIZE, crate::settings::MAX_FONT_SIZE);
+        self.save_settings();
+        cx.notify();
+    }
+
+    pub(crate) fn set_editor_font_family(&mut self, family: &str, cx: &mut Context<Self>) {
+        self.settings.editor.font_family = family.to_string();
+        self.font_select_open = None;
+        self.save_settings();
+        cx.notify();
+    }
+
+    pub(crate) fn set_editor_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
+        self.settings.editor.font_size =
+            size.clamp(crate::settings::MIN_FONT_SIZE, crate::settings::MAX_FONT_SIZE);
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Open/close a font-family picker dropdown (the panel owns the open flag).
+    pub(crate) fn toggle_font_select(&mut self, which: FontSelect, cx: &mut Context<Self>) {
+        self.font_select_open = if self.font_select_open == Some(which) {
+            None
+        } else {
+            Some(which)
+        };
         cx.notify();
     }
 

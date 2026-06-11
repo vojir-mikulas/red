@@ -149,10 +149,11 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &GoToRow, _, cx| this.open_goto_prompt(cx)))
             .bg(theme.bg_app)
             .text_color(theme.text)
-            .font_family(FONT_UI)
-            // The design's base font size is 13px; GPUI defaults to 16px, so set
-            // it once at the root and any unsized text inherits the right scale.
-            .text_size(px(13.))
+            // The UI font + size from settings, set once at the root so any unsized
+            // text inherits the right family/scale (GPUI otherwise defaults to 16px
+            // Helvetica). The editor overrides both on its own surface.
+            .font_family(self.settings.appearance.ui_font_family.clone())
+            .text_size(px(self.settings.appearance.ui_font_size))
             .child(screen)
             .children(toast)
             .children(confirm)

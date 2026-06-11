@@ -9,13 +9,19 @@
 
 use flint::prelude::*;
 use flint::Theme;
-use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, MouseButton, SharedString};
+use gpui::{
+    div, prelude::*, px, AnyElement, Context, Entity, FontWeight, MouseButton, SharedString,
+};
 
-use crate::app::AppState;
+use crate::app::{AppState, FontSelect};
 use crate::settings::{Density, ThemeMode};
 
-/// The settings categories, in nav order. Editor-font and behavior knobs live in
-/// the file (see the footer's "Open settings file"), so they get no panel tab.
+/// The font sizes (px) offered as panel presets. Any other value (set in the
+/// file) leaves the segmented control with nothing selected.
+const FONT_SIZE_PRESETS: [f32; 6] = [11.0, 12.0, 13.0, 14.0, 15.0, 16.0];
+
+/// The settings categories, in nav order. Behavior knobs live in the file (see
+/// the footer's "Open settings file"), so they get no panel tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingsTab {
     Appearance,
@@ -251,6 +257,41 @@ fn appearance_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 theme_picker(state, false, cx),
                 &theme,
             ))
+            .child(settings_header("Typography", &theme))
+            .child(setting_row(
+                "UI font",
+                "The interface font family — applied everywhere but the SQL editor.",
+                font_picker(state, FontSelect::Ui, cx),
+                &theme,
+            ))
+            .child(setting_row(
+                "UI font size",
+                "Base interface text size, in pixels.",
+                font_size_seg(
+                    "set-ui-font-size",
+                    state.settings.appearance.ui_font_size,
+                    view.clone(),
+                    AppState::set_ui_font_size,
+                ),
+                &theme,
+            ))
+            .child(setting_row(
+                "Editor font",
+                "The SQL editor font family — a monospace face is recommended.",
+                font_picker(state, FontSelect::Editor, cx),
+                &theme,
+            ))
+            .child(setting_row(
+                "Editor font size",
+                "SQL editor text size, in pixels.",
+                font_size_seg(
+                    "set-editor-font-size",
+                    state.settings.editor.font_size,
+                    view.clone(),
+                    AppState::set_editor_font_size,
+                ),
+                &theme,
+            ))
             .child(setting_block(
                 "Manage themes",
                 "Import theme files (.toml), or remove ones you've added.",
@@ -303,6 +344,79 @@ fn theme_picker(state: &AppState, light: bool, cx: &mut Context<AppState>) -> im
                 });
             }
         })
+}
+
+/// A dropdown of the installed font families, selecting the one for either the
+/// UI or the editor. Mirrors [`theme_picker`]: the panel owns the open flag.
+fn font_picker(state: &AppState, which: FontSelect, cx: &mut Context<AppState>) -> impl IntoElement {
+    let current = match which {
+        FontSelect::Ui => state.settings.appearance.ui_font_family.clone(),
+        FontSelect::Editor => state.settings.editor.font_family.clone(),
+    };
+
+    let mut names = cx.text_system().all_font_names();
+    names.sort_unstable();
+    names.dedup();
+    // The configured family may not be installed (a file edit referencing a font
+    // from another machine) — keep it selectable so it isn't silently dropped.
+    if !names.contains(&current) {
+        names.insert(0, current.clone());
+    }
+    let selected = names
+        .iter()
+        .position(|n| *n == current)
+        .unwrap_or(usize::MAX);
+
+    let id = match which {
+        FontSelect::Ui => "pick-ui-font",
+        FontSelect::Editor => "pick-editor-font",
+    };
+    let mut select = Select::new(id)
+        .placeholder("Select a font…")
+        .selected(selected)
+        .open(state.font_select_open == Some(which));
+    for name in &names {
+        select = select.option(name.clone());
+    }
+
+    let toggle_view = cx.entity();
+    let pick_view = cx.entity();
+    let pick_names = names;
+    select
+        .on_toggle(move |_, cx| {
+            toggle_view.update(cx, |this, cx| this.toggle_font_select(which, cx));
+        })
+        .on_select(move |ix, _, cx| {
+            if let Some(name) = pick_names.get(ix).cloned() {
+                pick_view.update(cx, |this, cx| match which {
+                    FontSelect::Ui => this.set_ui_font_family(&name, cx),
+                    FontSelect::Editor => this.set_editor_font_family(&name, cx),
+                });
+            }
+        })
+}
+
+/// A segmented control of the [`FONT_SIZE_PRESETS`]. `set` is the [`AppState`]
+/// setter to apply the chosen size (it clamps to the supported range).
+fn font_size_seg(
+    id: &'static str,
+    current: f32,
+    view: Entity<AppState>,
+    set: fn(&mut AppState, f32, &mut Context<AppState>),
+) -> impl IntoElement {
+    let selected = FONT_SIZE_PRESETS
+        .iter()
+        .position(|s| (*s - current).abs() < 0.5)
+        .unwrap_or(usize::MAX);
+    let mut seg = Segmented::new(id).selected(selected);
+    for s in FONT_SIZE_PRESETS {
+        seg = seg.segment(format!("{}", s as i32));
+    }
+    seg.on_select(move |ix, _, cx| {
+        if let Some(size) = FONT_SIZE_PRESETS.get(ix).copied() {
+            view.update(cx, |this, cx| set(this, size, cx));
+        }
+    })
 }
 
 /// The theme manager: an Import button, then every theme as a row — built-ins
