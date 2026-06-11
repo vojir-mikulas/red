@@ -376,6 +376,10 @@ impl AppState {
             .row_height(px(24.))
             .indent(px(14.))
             .selected(selected_ix)
+            .disclosure(|expanded, _window, cx| {
+                let name = if expanded { "chevron-down" } else { "chevron" };
+                crate::icons::icon(name, px(12.), cx.theme().text_faint).into_any_element()
+            })
             .render_row(move |ix, _window, cx| render_node(&rows_render[ix], cx))
             .on_toggle(move |ix, _window, cx| {
                 if let Some(node) = rows_toggle[ix].node.clone() {

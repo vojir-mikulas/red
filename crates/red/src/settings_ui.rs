@@ -348,7 +348,11 @@ fn theme_picker(state: &AppState, light: bool, cx: &mut Context<AppState>) -> im
 
 /// A dropdown of the installed font families, selecting the one for either the
 /// UI or the editor. Mirrors [`theme_picker`]: the panel owns the open flag.
-fn font_picker(state: &AppState, which: FontSelect, cx: &mut Context<AppState>) -> impl IntoElement {
+fn font_picker(
+    state: &AppState,
+    which: FontSelect,
+    cx: &mut Context<AppState>,
+) -> impl IntoElement {
     let current = match which {
         FontSelect::Ui => state.settings.appearance.ui_font_family.clone(),
         FontSelect::Editor => state.settings.editor.font_family.clone(),

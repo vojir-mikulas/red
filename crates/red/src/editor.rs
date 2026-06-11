@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Context, SharedString};
+use gpui::{div, prelude::*, px, Context, Hsla, Pixels, Point, SharedString, Window};
 use red_service::Command;
 
 use crate::app::{ActiveConn, AppState, Phase};
@@ -19,6 +19,44 @@ use crate::sql::CompletionContext;
 /// How many candidates the popup ever shows — the editor renders at most 8, but
 /// we hand it a few more so prefix-narrowing has headroom.
 const MAX_CANDIDATES: usize = 20;
+
+/// In-app drag payload for the tab strip: the source tab's index. A tab drop
+/// target reads it to reorder via [`AppState::move_tab`].
+#[derive(Clone, Copy)]
+struct TabDrag(usize);
+
+/// The floating chip rendered under the cursor while a tab is being dragged.
+/// GPUI's `on_drag` wants an `Entity<impl Render>`, so the tab strip mints one
+/// of these with the dragged tab's label.
+struct TabDragPreview {
+    title: SharedString,
+    /// Grab offset within the tab, so the chip tracks the pointer (not the
+    /// tab's top-left, where GPUI anchors the preview).
+    offset: Point<Pixels>,
+    bg: Hsla,
+    border: Hsla,
+    text: Hsla,
+}
+
+impl Render for TabDragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().pl(self.offset.x).pt(self.offset.y).child(
+            div()
+                .flex()
+                .items_center()
+                .h(px(28.))
+                .px_2p5()
+                .bg(self.bg)
+                .border_1()
+                .border_color(self.border)
+                .rounded(px(4.))
+                .font_family(FONT_MONO)
+                .text_size(px(12.))
+                .text_color(self.text)
+                .child(self.title.clone()),
+        )
+    }
+}
 
 /// The completion candidates derived from the loaded schema, grouped so the
 /// provider can rank them by the cursor's context. Rebuilt as the schema grows.
@@ -184,6 +222,11 @@ impl AppState {
 
         // --- tab strip: one tab per open query + a "new query" affordance ---
         let active_idx = active.active_tab;
+        // Drop-indicator state: the gap a dragged tab would land in, gated on an
+        // actual drag so a stale target never paints once the drag ends.
+        let tab_count = active.tabs.len();
+        let drop_target = active.tab_drop_target;
+        let dragging = cx.has_active_drag();
         let tabs = active.tabs.iter().enumerate().map(|(i, t)| {
             let is_active = i == active_idx;
             let (tab_bg, tab_text, icon_color) = if is_active {
@@ -191,9 +234,18 @@ impl AppState {
             } else {
                 (bg_panel, muted, dim)
             };
+            let drag_title: SharedString = t.title.clone().into();
+            let drop_view = view.clone();
+            let move_view = view.clone();
+            // The dragged tab lands before this tab (gap == i) or after it
+            // (gap == i+1); the bar paints on whichever edge the gap names.
+            let bar_before = dragging && drop_target == Some(i);
+            let bar_after = dragging && i + 1 == tab_count && drop_target == Some(tab_count);
             div()
                 .id(("sql-tab", i))
+                .relative()
                 .flex()
+                .flex_shrink_0()
                 .items_center()
                 .gap_1p5()
                 .px_2p5()
@@ -203,6 +255,66 @@ impl AppState {
                 .cursor_pointer()
                 .when(!is_active, |d| d.hover(|s| s.bg(bg_elevated)))
                 .on_click(cx.listener(move |this, _, _, cx| this.set_active_tab(i, cx)))
+                // Drag this tab to reorder; the chip below tracks the cursor.
+                .on_drag(TabDrag(i), move |_, offset, _window, cx| {
+                    let title = drag_title.clone();
+                    cx.new(move |_| TabDragPreview {
+                        title,
+                        offset,
+                        bg: bg_elevated,
+                        border,
+                        text,
+                    })
+                })
+                // Track the cursor across this tab to aim the drop gap at the
+                // nearer edge, then commit the reorder on release. GPUI fires
+                // this on *every* tab per mouse move (capture phase, no hover
+                // gate), so we ignore moves whose cursor isn't over this tab —
+                // only the hovered tab gets to set the gap.
+                .on_drag_move::<TabDrag>(move |e, _window, cx| {
+                    let left = e.bounds.origin.x;
+                    let right = left + e.bounds.size.width;
+                    let x = e.event.position.x;
+                    if x < left || x >= right {
+                        return;
+                    }
+                    let gap = if x < left + e.bounds.size.width / 2. {
+                        i
+                    } else {
+                        i + 1
+                    };
+                    move_view
+                        .update(cx, |this, cx| this.set_tab_drop_target(gap, cx))
+                        .ok();
+                })
+                .on_drop::<TabDrag>(move |drag, _window, cx| {
+                    let from = drag.0;
+                    drop_view
+                        .update(cx, |this, cx| this.drop_tab(from, cx))
+                        .ok();
+                })
+                .when(bar_before, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(2.))
+                            .bg(green),
+                    )
+                })
+                .when(bar_after, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .right_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(2.))
+                            .bg(green),
+                    )
+                })
                 .child(crate::icons::icon("play", px(10.), icon_color))
                 .child(
                     div()
@@ -228,7 +340,10 @@ impl AppState {
                         .child(crate::icons::icon("close", px(9.), faint)),
                 )
         });
+        let strip_drop_view = view.clone();
+        let strip_move_view = view.clone();
         let tabstrip = div()
+            .id("sql-tabstrip")
             .flex_shrink_0()
             .h(px(35.))
             .flex()
@@ -236,6 +351,32 @@ impl AppState {
             .bg(bg_panel)
             .border_b_1()
             .border_color(border)
+            // Capture phase runs the strip before its tabs, so this clears the
+            // indicator whenever the cursor isn't over the strip; a tab the
+            // cursor *is* over then re-sets the gap. Net: the indicator only
+            // shows while dragging within the tab bar.
+            .on_drag_move::<TabDrag>(move |e, _window, cx| {
+                let b = e.bounds;
+                let p = e.event.position;
+                let outside = p.x < b.origin.x
+                    || p.x >= b.origin.x + b.size.width
+                    || p.y < b.origin.y
+                    || p.y >= b.origin.y + b.size.height;
+                if outside {
+                    strip_move_view
+                        .update(cx, |this, cx| this.clear_tab_drop_target(cx))
+                        .ok();
+                }
+            })
+            // Release anywhere in the strip (over the "＋" or trailing space)
+            // commits using the gap the hovered tab last set. Harmless if a tab
+            // already handled the drop — `drop_tab` consumes the target once.
+            .on_drop::<TabDrag>(move |drag, _window, cx| {
+                let from = drag.0;
+                strip_drop_view
+                    .update(cx, |this, cx| this.drop_tab(from, cx))
+                    .ok();
+            })
             .children(tabs)
             .child(
                 div()

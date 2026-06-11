@@ -17,7 +17,7 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use gpui::{
     prelude::*, px, AsyncApp, Context, ElementId, Entity, FocusHandle, PathPromptOptions, Pixels,
-    SharedString, WeakEntity, Window, WindowAppearance,
+    ScrollHandle, SharedString, WeakEntity, Window, WindowAppearance,
 };
 use red_core::{ConnectionConfig, DbKind};
 use red_service::{Command, Event, ServiceHandle};
@@ -161,6 +161,13 @@ pub(crate) struct ActiveConn {
     pub active_tab: usize,
     /// Monotonic counter for naming blank tabs ("query 1", "query 2", …).
     pub query_seq: usize,
+    /// While a tab is being dragged, the gap (insertion index `0..=tabs.len()`)
+    /// where it would land — drives the drop indicator. Only meaningful when a
+    /// drag is active; the strip gates rendering on `has_active_drag`.
+    pub tab_drop_target: Option<usize>,
+    /// Horizontal scroll position of the tab strip, so a crowded strip scrolls
+    /// instead of squashing tabs. Persists across renders.
+    pub tab_scroll: ScrollHandle,
 }
 
 impl ActiveConn {
@@ -177,6 +184,8 @@ impl ActiveConn {
             tabs: vec![tab],
             active_tab: 0,
             query_seq: 1,
+            tab_drop_target: None,
+            tab_scroll: ScrollHandle::new(),
         }
     }
 
@@ -689,6 +698,48 @@ impl AppState {
         cx.notify();
     }
 
+    /// Point the drop indicator at `gap` (an insertion index `0..=tabs.len()`)
+    /// while a tab drag hovers the strip. Notifies only on change to keep the
+    /// per-move churn cheap.
+    pub(crate) fn set_tab_drop_target(&mut self, gap: usize, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase {
+            if active.tab_drop_target != Some(gap) {
+                active.tab_drop_target = Some(gap);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Drop the drop indicator (cursor left the tab strip mid-drag). Notifies
+    /// only when something was showing.
+    pub(crate) fn clear_tab_drop_target(&mut self, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase {
+            if active.tab_drop_target.take().is_some() {
+                cx.notify();
+            }
+        }
+    }
+
+    /// Finish a tab-strip drag: move the dragged tab (`from`) into the gap the
+    /// indicator settled on. The dragged tab follows the cursor and stays
+    /// focused. Clears the indicator regardless.
+    pub(crate) fn drop_tab(&mut self, from: usize, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase {
+            if let Some(gap) = active.tab_drop_target.take() {
+                if from < active.tabs.len() {
+                    // `gap` indexes the pre-removal strip; shift left when the
+                    // dragged tab sat before the gap.
+                    let dest = if from < gap { gap - 1 } else { gap };
+                    let dest = dest.min(active.tabs.len() - 1);
+                    let tab = active.tabs.remove(from);
+                    active.tabs.insert(dest, tab);
+                    active.active_tab = dest;
+                }
+            }
+        }
+        cx.notify();
+    }
+
     /// Push a freshly-built tab, focus it, and seed its completions. Returns the
     /// new index. Callers supply the tab (a blank query or a table preview).
     /// Eagerly describe every table once the skeleton lands, so column and
@@ -1129,8 +1180,10 @@ impl AppState {
     }
 
     pub(crate) fn set_ui_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
-        self.settings.appearance.ui_font_size =
-            size.clamp(crate::settings::MIN_FONT_SIZE, crate::settings::MAX_FONT_SIZE);
+        self.settings.appearance.ui_font_size = size.clamp(
+            crate::settings::MIN_FONT_SIZE,
+            crate::settings::MAX_FONT_SIZE,
+        );
         self.save_settings();
         cx.notify();
     }
@@ -1143,8 +1196,10 @@ impl AppState {
     }
 
     pub(crate) fn set_editor_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
-        self.settings.editor.font_size =
-            size.clamp(crate::settings::MIN_FONT_SIZE, crate::settings::MAX_FONT_SIZE);
+        self.settings.editor.font_size = size.clamp(
+            crate::settings::MIN_FONT_SIZE,
+            crate::settings::MAX_FONT_SIZE,
+        );
         self.save_settings();
         cx.notify();
     }
