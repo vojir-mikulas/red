@@ -245,31 +245,30 @@ impl AppState {
                 div()
                     .px_2()
                     .child(format!("{} {}", config.kind, active.version)),
-            )
-            // Sidebar collapse toggle, pinned to the far-right of the status bar so
-            // it stays reachable whether the schema pane is shown or hidden.
-            .child(
-                div()
-                    .id("toggle-sidebar")
-                    .ml_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .size(px(20.))
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.bg_elevated))
-                    .child(crate::icons::icon(
-                        if active.sidebar_collapsed {
-                            "panel-left-open"
-                        } else {
-                            "panel-left-close"
-                        },
-                        px(14.),
-                        theme.text_muted,
-                    ))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
             );
+
+        // Sidebar collapse toggle, pinned to the far-left of the status bar so it
+        // stays reachable whether the schema pane is shown or hidden.
+        let sidebar_toggle = div()
+            .id("toggle-sidebar")
+            .mr_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(20.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.bg_elevated))
+            .child(crate::icons::icon(
+                if active.sidebar_collapsed {
+                    "panel-left-open"
+                } else {
+                    "panel-left-close"
+                },
+                px(14.),
+                theme.text_muted,
+            ))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)));
 
         let statusbar = div()
             .flex_shrink_0()
@@ -284,7 +283,13 @@ impl AppState {
             .font_family(FONT_MONO)
             .text_size(px(11.))
             .text_color(theme.text_muted)
-            .child(status_left)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(sidebar_toggle)
+                    .child(status_left),
+            )
             .child(status_right);
 
         div()
