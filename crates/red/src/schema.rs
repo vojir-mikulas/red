@@ -276,7 +276,7 @@ fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
                 );
             }
             if meta.primary_key {
-                row = row.child(crate::icons::icon("key", px(12.), theme.yellow));
+                row = row.child(crate::icons::icon("key-round", px(12.), theme.yellow));
             }
             if *is_fk {
                 row = row.child(crate::icons::icon("link", px(12.), theme.accent));
@@ -311,14 +311,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let (bg_panel, bg_elevated, border, radius) = (
-            theme.bg_panel,
-            theme.bg_elevated,
-            theme.border,
-            theme.radius,
-        );
-        let (text, faint, green, yellow) =
-            (theme.text, theme.text_faint, theme.green, theme.yellow);
+        let (bg_panel, faint) = (theme.bg_panel, theme.text_faint);
         let view = cx.entity().downgrade();
         let s = &active.schema;
         let filter_text = s.filter.read(cx).content().to_string();
@@ -334,34 +327,12 @@ impl AppState {
         let schema_count = s.schemas.len();
         let object_count: usize = s.schemas.iter().map(|sc| sc.objects.len()).sum();
 
-        let pill = div()
+        let filter_row = div()
             .flex_shrink_0()
-            .mx_2()
-            .mt_2()
-            .mb_1()
-            .h(px(26.))
-            .flex()
-            .items_center()
-            .gap_1p5()
             .px_2()
-            .rounded(radius)
-            .bg(bg_elevated)
-            .border_1()
-            .border_color(border)
-            .child(div().size(px(7.)).rounded_full().bg(green))
-            .child(
-                div()
-                    .flex_1()
-                    .font_family(FONT_MONO)
-                    .text_size(px(12.))
-                    .text_color(text)
-                    .child(active.config.name.clone()),
-            )
-            .when(active.config.read_only, |d| {
-                d.child(crate::icons::icon("lock", px(12.), yellow))
-            });
-
-        let filter_row = div().flex_shrink_0().px_2().pb_1().child(s.filter.clone());
+            .pt_2()
+            .pb_1()
+            .child(s.filter.clone());
 
         // Capture the flattened rows per handler so each can map its click index
         // back to the node it represents.
@@ -419,7 +390,6 @@ impl AppState {
             .flex()
             .flex_col()
             .bg(bg_panel)
-            .child(pill)
             .child(filter_row)
             .child(div().flex_1().min_h(px(0.)).child(tree))
             .child(footer)

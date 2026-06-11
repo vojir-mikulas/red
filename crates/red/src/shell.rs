@@ -27,8 +27,8 @@ impl AppState {
         let theme = cx.theme().clone();
         let view = cx.entity().downgrade();
 
-        // Pane contents: schema explorer · SQL editor · result grid.
-        let schema_pane = self.render_schema(active, cx);
+        // Pane contents: SQL editor · result grid. The schema explorer is built
+        // below, only when the sidebar is shown.
         let editor_pane = self.render_editor(active, cx);
         let results_pane = self.render_result(active, cx);
 
@@ -140,11 +140,17 @@ impl AppState {
                 .second(results_pane)
         };
 
-        let outer = {
+        // When collapsed, the schema pane (and its resize split) drop out entirely
+        // and the editor/results fill the width; the status-bar toggle brings it
+        // back, restoring the retained `sidebar_w`.
+        let body = if active.sidebar_collapsed {
+            div().flex_1().min_h(px(0.)).child(inner)
+        } else {
+            let schema_pane = self.render_schema(active, cx);
             let start = view.clone();
             let resize = view.clone();
             let end = view.clone();
-            SplitPane::new("shell-split-h", Axis::Horizontal)
+            let outer = SplitPane::new("shell-split-h", Axis::Horizontal)
                 .size(active.sidebar_w)
                 .drag(active.sidebar_drag)
                 .min_first(px(160.))
@@ -179,10 +185,9 @@ impl AppState {
                     .ok();
                 })
                 .first(schema_pane)
-                .second(inner)
+                .second(inner);
+            div().flex_1().min_h(px(0.)).child(outer)
         };
-
-        let body = div().flex_1().min_h(px(0.)).child(outer);
 
         // --- status bar: endpoint · db · read-only | rows · cols · UTF-8 · SQL ·
         // engine — the design's information-dense bottom strip ---
@@ -240,6 +245,30 @@ impl AppState {
                 div()
                     .px_2()
                     .child(format!("{} {}", config.kind, active.version)),
+            )
+            // Sidebar collapse toggle, pinned to the far-right of the status bar so
+            // it stays reachable whether the schema pane is shown or hidden.
+            .child(
+                div()
+                    .id("toggle-sidebar")
+                    .ml_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(20.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.bg_elevated))
+                    .child(crate::icons::icon(
+                        if active.sidebar_collapsed {
+                            "panel-left-open"
+                        } else {
+                            "panel-left-close"
+                        },
+                        px(14.),
+                        theme.text_muted,
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
             );
 
         let statusbar = div()

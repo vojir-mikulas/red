@@ -153,6 +153,9 @@ pub(crate) struct ActiveConn {
     pub version: String,
     pub sidebar_w: Pixels,
     pub sidebar_drag: Option<DragAnchor>,
+    /// When set, the schema sidebar is hidden; `sidebar_w` is retained so toggling
+    /// it back restores the previous width.
+    pub sidebar_collapsed: bool,
     pub editor_h: Pixels,
     pub editor_drag: Option<DragAnchor>,
     pub schema: SchemaState,
@@ -178,6 +181,7 @@ impl ActiveConn {
             version,
             sidebar_w: px(240.),
             sidebar_drag: None,
+            sidebar_collapsed: false,
             editor_h: px(300.),
             editor_drag: None,
             schema: SchemaState::new(cx),
@@ -688,6 +692,14 @@ impl AppState {
     pub(crate) fn disconnect(&mut self, cx: &mut Context<Self>) {
         self.service.send(Command::Disconnect);
         cx.notify();
+    }
+
+    /// Show or hide the schema sidebar (toggled from the status-bar control).
+    pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        if let Phase::Connected(a) = &mut self.phase {
+            a.sidebar_collapsed = !a.sidebar_collapsed;
+            cx.notify();
+        }
     }
 
     /// Run the destructive statement the user confirmed.

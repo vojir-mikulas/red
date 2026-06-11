@@ -17,6 +17,7 @@ Cargo.lock
 /docs/codereview/
 /docs/security/
 .claude
+/docker
 
 # Local Claude/agent settings overrides
 .claude/settings.local.json

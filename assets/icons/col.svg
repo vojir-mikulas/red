@@ -3,11 +3,8 @@
   width="24"
   height="24"
   viewBox="0 0 24 24"
-  fill="none"
-  stroke="currentColor"
-  stroke-width="2"
-  stroke-linecap="round"
-  stroke-linejoin="round"
+  fill="currentColor"
+  stroke="none"
 >
-  <rect width="12" height="20" x="6" y="2" rx="2" />
+  <circle cx="12" cy="12" r="3" />
 </svg>
