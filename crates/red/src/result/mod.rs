@@ -21,7 +21,7 @@ use gpui::{point, px, ClipboardItem, Context, Pixels, ScrollHandle, UniformListS
 use red_core::{Column as ResultColumn, ExportFormat, KeySpec, Value};
 use red_service::{Command, CommandSender, RunFetch};
 
-use crate::app::{AppState, Phase};
+use crate::app::{AppState, ExportProgress, Notification, Phase};
 
 use buffer::{next_epoch, window_decision, BufferMode, GridBuffer, KeyedRun, WindowView, WINDOW};
 pub(crate) use render::group_digits;
@@ -524,19 +524,107 @@ impl AppState {
         let rx = cx.prompt_for_new_path(&dir, Some(name));
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(path))) = rx.await {
-                this.update(cx, |this, cx| {
-                    this.service.send(Command::Export {
-                        format,
-                        path,
-                        epoch,
-                    });
-                    this.toast = Some(("Exporting…".into(), ToastVariant::Info));
-                    cx.notify();
-                })
-                .ok();
+                this.update(cx, |this, cx| this.start_export(format, path, epoch, cx))
+                    .ok();
             }
         })
         .detach();
+    }
+
+    /// Begin an export once the save path is chosen: allocate its id, fire the
+    /// command off to the backend, and stand up the persistent progress toast
+    /// (its `✕` is a Cancel — see [`AppState::close_notification`]). The total is
+    /// the open result's row count, already known from `ResultReady`.
+    fn start_export(
+        &mut self,
+        format: ExportFormat,
+        path: PathBuf,
+        epoch: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let total = match &self.phase {
+            Phase::Connected(a) => a.active_result().map(|g| g.total_rows()).unwrap_or(0),
+            _ => 0,
+        };
+        let id = self.next_export_id;
+        self.next_export_id += 1;
+        self.service.send(Command::Export {
+            format,
+            path,
+            epoch,
+            id,
+        });
+        self.push_notification(
+            Notification {
+                id: 0,
+                variant: ToastVariant::Info,
+                message: "Exporting… 0%".into(),
+                auto_dismiss: None,
+                export: Some(ExportProgress {
+                    id,
+                    rows: 0,
+                    total,
+                }),
+            },
+            cx,
+        );
+    }
+
+    // --- export progress events ---
+
+    /// The notification id of the export toast carrying `export_id`, if it's still
+    /// on screen.
+    fn export_notification_id(&self, export_id: u64) -> Option<u64> {
+        self.notifications
+            .iter()
+            .find(|n| n.export.as_ref().is_some_and(|e| e.id == export_id))
+            .map(|n| n.id)
+    }
+
+    /// `ExportProgress`: advance the export toast's row count + percentage.
+    pub(crate) fn on_export_progress(&mut self, id: u64, rows: usize, cx: &mut Context<Self>) {
+        if let Some(n) = self
+            .notifications
+            .iter_mut()
+            .find(|n| n.export.as_ref().is_some_and(|e| e.id == id))
+        {
+            if let Some(export) = &mut n.export {
+                export.rows = rows;
+                let pct = rows
+                    .saturating_mul(100)
+                    .checked_div(export.total)
+                    .unwrap_or(0)
+                    .min(100);
+                n.message = format!("Exporting… {pct}%").into();
+            }
+        }
+        cx.notify();
+    }
+
+    /// `ExportFinished`: drop the progress toast, leave an auto-dismissing success.
+    pub(crate) fn on_export_finished(
+        &mut self,
+        id: u64,
+        path: String,
+        rows: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(nid) = self.export_notification_id(id) {
+            self.dismiss(nid, cx);
+        }
+        self.notify(
+            ToastVariant::Success,
+            format!("Exported {rows} row(s) to {path}"),
+            cx,
+        );
+    }
+
+    /// `ExportCancelled`: drop the progress toast, leave an auto-dismissing notice.
+    pub(crate) fn on_export_cancelled(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(nid) = self.export_notification_id(id) {
+            self.dismiss(nid, cx);
+        }
+        self.notify(ToastVariant::Info, "Export cancelled", cx);
     }
 
     /// "Go to row N" from the palette prompt — `one_based` is the row number the

@@ -102,26 +102,10 @@ impl Render for AppState {
             Phase::Connected(active) => self.render_shell(active, cx).into_any_element(),
         };
 
-        // Dismissible error toast, anchored bottom-center over whatever screen.
-        let toast = self.toast.clone().map(|(message, variant)| {
-            div()
-                .absolute()
-                .bottom_4()
-                .left_0()
-                .right_0()
-                .flex()
-                .justify_center()
-                .child(
-                    div()
-                        .id("toast-dismiss")
-                        .cursor_pointer()
-                        .child(Toast::new(message).variant(variant))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.toast = None;
-                            cx.notify();
-                        })),
-                )
-        });
+        // The notification stack, anchored bottom-right and growing upward:
+        // oldest first in the column, so the newest sits nearest the corner. At
+        // most `MAX_VISIBLE` show; the rest collapse into a "+N more" line on top.
+        let toast = (!self.notifications.is_empty()).then(|| self.render_notifications(cx));
 
         let confirm = self
             .confirm_exec
@@ -178,7 +162,57 @@ impl Render for AppState {
     }
 }
 
+/// How many toasts show at once; older ones beyond this collapse to "+N more".
+const MAX_VISIBLE_TOASTS: usize = 5;
+
 impl AppState {
+    /// The bottom-right notification stack: oldest first (top), newest last
+    /// (nearest the corner). Each toast carries a close `✕` wired to
+    /// [`AppState::close_notification`]; the export toast also shows its progress.
+    fn render_notifications(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let total = self.notifications.len();
+        let hidden = total.saturating_sub(MAX_VISIBLE_TOASTS);
+
+        let mut col = div()
+            .absolute()
+            .bottom_4()
+            .right_4()
+            .flex()
+            .flex_col()
+            .items_end()
+            .gap_2();
+
+        if hidden > 0 {
+            col = col.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.text_muted)
+                    .child(format!("+{hidden} more")),
+            );
+        }
+
+        for n in self.notifications.iter().skip(hidden) {
+            let id = n.id;
+            let mut toast = Toast::new(n.message.clone()).variant(n.variant);
+            if let Some(export) = &n.export {
+                let fraction = if export.total > 0 {
+                    export.rows as f32 / export.total as f32
+                } else {
+                    0.0
+                };
+                toast = toast.progress(fraction);
+            }
+            let weak = cx.entity().downgrade();
+            col = col.child(toast.on_close(move |_, cx| {
+                weak.update(cx, |this, cx| this.close_notification(id, cx))
+                    .ok();
+            }));
+        }
+
+        col
+    }
+
     /// The title of tab `index`, if it exists — for the close-confirm prompt.
     fn tab_title(&self, index: usize) -> Option<String> {
         match &self.phase {

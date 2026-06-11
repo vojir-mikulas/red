@@ -637,11 +637,11 @@ impl AppState {
         // engine still rejects writes as a backstop; this is the friendly gate.
         let read_only = matches!(&self.phase, Phase::Connected(active) if active.config.read_only);
         if read_only && !matches!(kind, crate::sql::StatementKind::Query) {
-            self.toast = Some((
-                "Connection is read-only — write statements are disabled.".into(),
+            self.notify(
                 ToastVariant::Error,
-            ));
-            cx.notify();
+                "Connection is read-only — write statements are disabled.",
+                cx,
+            );
             return;
         }
 
@@ -672,11 +672,11 @@ impl AppState {
     /// caller that didn't pre-check (e.g. future inline-edit paths).
     pub(crate) fn execute_sql(&mut self, sql: String, cx: &mut Context<Self>) {
         if matches!(&self.phase, Phase::Connected(active) if active.config.read_only) {
-            self.toast = Some((
-                "Connection is read-only — write statements are disabled.".into(),
+            self.notify(
                 ToastVariant::Error,
-            ));
-            cx.notify();
+                "Connection is read-only — write statements are disabled.",
+                cx,
+            );
             return;
         }
         self.service.send(Command::Execute { sql });

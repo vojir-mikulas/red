@@ -10,15 +10,11 @@
 use flint::prelude::*;
 use flint::Theme;
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, Entity, FontWeight, MouseButton, SharedString,
+    div, prelude::*, px, AnyElement, Context, FontWeight, MouseButton, SharedString,
 };
 
 use crate::app::{AppState, FontSelect};
 use crate::settings::{Density, ThemeMode};
-
-/// The font sizes (px) offered as panel presets. Any other value (set in the
-/// file) leaves the segmented control with nothing selected.
-const FONT_SIZE_PRESETS: [f32; 6] = [11.0, 12.0, 13.0, 14.0, 15.0, 16.0];
 
 /// The settings categories, in nav order. Behavior knobs live in the file (see
 /// the footer's "Open settings file"), so they get no panel tab.
@@ -267,12 +263,7 @@ fn appearance_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             .child(setting_row(
                 "UI font size",
                 "Base interface text size, in pixels.",
-                font_size_seg(
-                    "set-ui-font-size",
-                    state.settings.appearance.ui_font_size,
-                    view.clone(),
-                    AppState::set_ui_font_size,
-                ),
+                state.ui_font_size_input.clone(),
                 &theme,
             ))
             .child(setting_row(
@@ -284,12 +275,7 @@ fn appearance_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             .child(setting_row(
                 "Editor font size",
                 "SQL editor text size, in pixels.",
-                font_size_seg(
-                    "set-editor-font-size",
-                    state.settings.editor.font_size,
-                    view.clone(),
-                    AppState::set_editor_font_size,
-                ),
+                state.editor_font_size_input.clone(),
                 &theme,
             ))
             .child(setting_block(
@@ -318,10 +304,13 @@ fn theme_picker(state: &AppState, light: bool, cx: &mut Context<AppState>) -> im
         .position(|n| *n == current)
         .unwrap_or(usize::MAX);
 
+    let accent = cx.theme().accent;
     let mut select = Select::new(if light { "pick-light" } else { "pick-dark" })
         .placeholder("Select a theme…")
         .selected(selected)
-        .open(state.theme_select_open == Some(which));
+        .open(state.theme_select_open == Some(which))
+        .chevron(crate::icons::icon("chevron-down", px(14.), accent))
+        .check(crate::icons::icon("check", px(13.), accent));
     for name in &names {
         select = select.option(name.clone());
     }
@@ -376,10 +365,13 @@ fn font_picker(
         FontSelect::Ui => "pick-ui-font",
         FontSelect::Editor => "pick-editor-font",
     };
+    let accent = cx.theme().accent;
     let mut select = Select::new(id)
         .placeholder("Select a font…")
         .selected(selected)
-        .open(state.font_select_open == Some(which));
+        .open(state.font_select_open == Some(which))
+        .chevron(crate::icons::icon("chevron-down", px(14.), accent))
+        .check(crate::icons::icon("check", px(13.), accent));
     for name in &names {
         select = select.option(name.clone());
     }
@@ -399,29 +391,6 @@ fn font_picker(
                 });
             }
         })
-}
-
-/// A segmented control of the [`FONT_SIZE_PRESETS`]. `set` is the [`AppState`]
-/// setter to apply the chosen size (it clamps to the supported range).
-fn font_size_seg(
-    id: &'static str,
-    current: f32,
-    view: Entity<AppState>,
-    set: fn(&mut AppState, f32, &mut Context<AppState>),
-) -> impl IntoElement {
-    let selected = FONT_SIZE_PRESETS
-        .iter()
-        .position(|s| (*s - current).abs() < 0.5)
-        .unwrap_or(usize::MAX);
-    let mut seg = Segmented::new(id).selected(selected);
-    for s in FONT_SIZE_PRESETS {
-        seg = seg.segment(format!("{}", s as i32));
-    }
-    seg.on_select(move |ix, _, cx| {
-        if let Some(size) = FONT_SIZE_PRESETS.get(ix).copied() {
-            view.update(cx, |this, cx| set(this, size, cx));
-        }
-    })
 }
 
 /// The theme manager: an Import button, then every theme as a row — built-ins

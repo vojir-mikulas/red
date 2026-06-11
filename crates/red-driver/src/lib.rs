@@ -7,11 +7,12 @@
 //! (`fetch_seek`), and `export` streams row-by-row. This keeps memory flat over
 //! results of any size, the layer's central performance contract.
 
+use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use std::path::Path;
-
 use async_trait::async_trait;
+use tokio::sync::mpsc::UnboundedSender;
 use red_core::{
     Column, ExportFormat, KeySpec, QueryOptions, RedError, Result, ResultPage, RowWindow,
     SchemaMeta, TableDetail, Value,
@@ -104,7 +105,19 @@ pub trait DatabaseDriver: Send + Sync {
 
     /// Stream `sql`'s result straight to `path` in `format`, row-by-row — never
     /// materializing the whole result. Returns the number of data rows written.
-    async fn export(&self, sql: &str, path: &Path, format: ExportFormat) -> Result<u64>;
+    ///
+    /// `cancel` is checked per row: when it flips true the export bails early,
+    /// removes the partial file, and returns [`RedError::Interrupted`]. `progress`
+    /// receives the running row count, throttled (every N rows / ~50ms) so the
+    /// channel isn't flooded — the caller maps it to a progress event.
+    async fn export(
+        &self,
+        sql: &str,
+        path: &Path,
+        format: ExportFormat,
+        cancel: Arc<AtomicBool>,
+        progress: UnboundedSender<u64>,
+    ) -> Result<u64>;
 }
 
 /// A live, windowed result cursor. Object-safe; the service holds it as

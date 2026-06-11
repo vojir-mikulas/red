@@ -18,6 +18,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use mysql_async::consts::ColumnType;
@@ -29,9 +31,12 @@ use red_core::{
     Column, ColumnMeta, ExportFormat, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta,
     QueryOptions, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail, Value,
 };
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::format::{csv_cell, csv_record, json_string, json_value, strip_trailing};
+use crate::format::{
+    csv_cell, csv_record, json_string, json_value, strip_trailing, ProgressThrottle,
+};
 use crate::{driver_err, CancelToken, DatabaseDriver, QueryCursor};
 
 /// A live MySQL/MariaDB session. Holds a connection `Pool`: cursors take a
@@ -394,7 +399,14 @@ impl DatabaseDriver for MysqlDriver {
         }
     }
 
-    async fn export(&self, sql: &str, path: &Path, format: ExportFormat) -> Result<u64> {
+    async fn export(
+        &self,
+        sql: &str,
+        path: &Path,
+        format: ExportFormat,
+        cancel: Arc<AtomicBool>,
+        progress: UnboundedSender<u64>,
+    ) -> Result<u64> {
         let sql = format!("SELECT * FROM ({}) AS _red", strip_trailing(sql));
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
         let stmt = conn.prep(&sql).await.map_err(map_my_err)?;
@@ -408,22 +420,38 @@ impl DatabaseDriver for MysqlDriver {
         let file = File::create(path).map_err(driver_err)?;
         let mut out = BufWriter::new(file);
         let mut written: u64 = 0;
+        let mut throttle = ProgressThrottle::new(progress);
+
+        // Bail on cancel: drop the writer, remove the partial file, and report
+        // interruption — never leave a truncated CSV/JSON behind.
+        macro_rules! bail_if_cancelled {
+            () => {
+                if cancel.load(Ordering::Relaxed) {
+                    drop(out);
+                    let _ = std::fs::remove_file(path);
+                    return Err(RedError::Interrupted);
+                }
+            };
+        }
 
         match format {
             ExportFormat::Csv => {
                 writeln!(out, "{}", csv_record(names.iter().map(String::as_str)))
                     .map_err(driver_err)?;
                 while let Some(row) = result.next().await.map_err(map_my_err)? {
+                    bail_if_cancelled!();
                     let cells = my_row(&row);
                     let fields: Vec<String> = cells.iter().map(csv_cell).collect();
                     writeln!(out, "{}", csv_record(fields.iter().map(String::as_str)))
                         .map_err(driver_err)?;
                     written += 1;
+                    throttle.tick(written);
                 }
             }
             ExportFormat::Json => {
                 write!(out, "[").map_err(driver_err)?;
                 while let Some(row) = result.next().await.map_err(map_my_err)? {
+                    bail_if_cancelled!();
                     let cells = my_row(&row);
                     if written > 0 {
                         write!(out, ",").map_err(driver_err)?;
@@ -438,6 +466,7 @@ impl DatabaseDriver for MysqlDriver {
                     }
                     write!(out, "}}").map_err(driver_err)?;
                     written += 1;
+                    throttle.tick(written);
                 }
                 write!(out, "\n]\n").map_err(driver_err)?;
             }

@@ -172,10 +172,10 @@ impl AppState {
             }
         };
 
-        self.store_credential(index, &password, is_file);
+        self.store_credential(index, &password, is_file, cx);
 
         self.form = None;
-        self.persist();
+        self.persist(cx);
         if connect {
             // connect() re-materializes the password from the keychain (or the
             // in-memory fallback kept when a keychain write fails).
@@ -188,16 +188,22 @@ impl AppState {
     /// A blank password (or a file engine, which has none) clears any prior
     /// entry. If the keychain write fails we keep the password in memory for this
     /// session and warn, so the connection still works until next launch.
-    fn store_credential(&mut self, index: usize, password: &str, is_file: bool) {
+    fn store_credential(
+        &mut self,
+        index: usize,
+        password: &str,
+        is_file: bool,
+        cx: &mut Context<Self>,
+    ) {
         let id = self.connections[index].id.clone();
         if !is_file && !password.is_empty() {
             if let Err(e) = crate::secrets::set_password(&id, password) {
                 tracing::warn!("failed to store credential in keychain: {e}");
-                self.toast = Some((
-                    "Couldn't save the password to the OS keychain — it won't be remembered."
-                        .into(),
+                self.notify(
                     ToastVariant::Error,
-                ));
+                    "Couldn't save the password to the OS keychain — it won't be remembered.",
+                    cx,
+                );
                 self.connections[index].config.password = password.to_string();
             }
         } else if let Err(e) = crate::secrets::delete_password(&id) {
@@ -207,8 +213,7 @@ impl AppState {
 
     /// Surface a form validation error without closing the modal.
     fn form_error(&mut self, message: &str, cx: &mut Context<Self>) {
-        self.toast = Some((message.to_string().into(), ToastVariant::Error));
-        cx.notify();
+        self.notify(ToastVariant::Error, message.to_string(), cx);
     }
 
     pub(crate) fn set_form_kind(&mut self, kind: DbKind, cx: &mut Context<Self>) {

@@ -133,8 +133,13 @@ pub(crate) async fn exports_csv_and_json(driver: &dyn DatabaseDriver, select_sql
     let csv_path = dir.join(format!("red_conf_{tag}.csv"));
     let json_path = dir.join(format!("red_conf_{tag}.json"));
 
+    // A never-cancelled flag and a throwaway progress channel — the export's
+    // cancellation / progress plumbing is exercised separately.
+    let no_cancel = || std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drain = || tokio::sync::mpsc::unbounded_channel().0;
+
     let rows = driver
-        .export(select_sql, &csv_path, ExportFormat::Csv)
+        .export(select_sql, &csv_path, ExportFormat::Csv, no_cancel(), drain())
         .await
         .unwrap();
     assert_eq!(rows, 2, "two data rows written");
@@ -143,7 +148,7 @@ pub(crate) async fn exports_csv_and_json(driver: &dyn DatabaseDriver, select_sql
     assert!(csv.contains("\"a,b\""), "comma field is quoted: {csv}");
 
     driver
-        .export(select_sql, &json_path, ExportFormat::Json)
+        .export(select_sql, &json_path, ExportFormat::Json, no_cancel(), drain())
         .await
         .unwrap();
     let json = std::fs::read_to_string(&json_path).unwrap();

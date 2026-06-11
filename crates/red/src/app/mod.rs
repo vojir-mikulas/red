@@ -98,6 +98,31 @@ pub(crate) struct FormState {
     pub test: TestState,
 }
 
+/// How long a transient (info / success) toast stays up before it auto-dismisses.
+/// Errors and warnings (and a live export) have no timer — they persist until the
+/// user closes them or the operation resolves.
+const TOAST_AUTO_DISMISS: Duration = Duration::from_secs(4);
+
+/// The live state of the export-progress toast: how many rows have streamed out
+/// of the known `total`, keyed by the export `id` so a `CancelExport` / progress
+/// update targets the right one. Only the export toast carries this.
+pub(crate) struct ExportProgress {
+    pub id: u64,
+    pub rows: usize,
+    pub total: usize,
+}
+
+/// One notification in the bottom-right stack. The stack is newest-last (nearest
+/// the corner); `auto_dismiss` drives the per-toast timer (`None` = persists until
+/// closed); `export` is set only on the export-progress toast.
+pub(crate) struct Notification {
+    pub id: u64,
+    pub variant: ToastVariant,
+    pub message: SharedString,
+    pub auto_dismiss: Option<Duration>,
+    pub export: Option<ExportProgress>,
+}
+
 /// The default editor text a fresh query tab opens with. A tab still holding
 /// exactly this (and no result) is "pristine" — closing it needs no confirmation.
 pub(crate) const EMPTY_QUERY: &str = "-- Write SQL, ⌘↵ to run\n";
@@ -234,8 +259,21 @@ pub struct AppState {
     pub(crate) password_input: Entity<TextInput>,
     pub(crate) database_input: Entity<TextInput>,
     pub(crate) conn_str_input: Entity<TextInput>,
+    /// Numeric steppers for the two font sizes in the Appearance panel. Stateful
+    /// (they own an editable field), so the panel renders these rather than
+    /// rebuilding them per frame; `Change` writes straight through to settings.
+    pub(crate) ui_font_size_input: Entity<NumberInput>,
+    pub(crate) editor_font_size_input: Entity<NumberInput>,
     pub(crate) form: Option<FormState>,
-    pub(crate) toast: Option<(SharedString, ToastVariant)>,
+    /// The bottom-right notification stack, oldest first. Rendered newest-last
+    /// (nearest the corner) by `render`; capped on screen with a "+N more" line.
+    pub(crate) notifications: Vec<Notification>,
+    /// Monotonic id source for notifications, so a timer / close / export update
+    /// targets the right toast regardless of stack churn.
+    pub(crate) next_notification_id: u64,
+    /// Monotonic id source for exports, so progress / finished / cancelled events
+    /// and a `CancelExport` route to the right in-flight export.
+    pub(crate) next_export_id: u64,
     /// A destructive statement awaiting the user's confirmation before it runs.
     pub(crate) confirm_exec: Option<String>,
     /// A non-pristine query tab the user asked to close, awaiting confirmation.
@@ -371,6 +409,41 @@ impl AppState {
         })
         .detach();
 
+        // Font-size steppers, seeded from the loaded settings. A `Change` (typing,
+        // stepping, or Enter) writes straight through to the matching setter, which
+        // re-clamps, persists, and re-themes — a live preview as the user edits.
+        let font_size_input = |size: f32, cx: &mut Context<Self>| {
+            cx.new(|cx| {
+                let mut n = NumberInput::new("font-size", cx)
+                    .range(
+                        crate::settings::MIN_FONT_SIZE as f64,
+                        crate::settings::MAX_FONT_SIZE as f64,
+                    )
+                    .step(1.0)
+                    .decimals(0);
+                n.set_value(size as f64, cx);
+                n
+            })
+        };
+        let ui_font_size_input = font_size_input(settings.appearance.ui_font_size, cx);
+        let editor_font_size_input = font_size_input(settings.editor.font_size, cx);
+        cx.subscribe(
+            &ui_font_size_input,
+            |this, _, event: &NumberInputEvent, cx| {
+                let NumberInputEvent::Change(size) = event;
+                this.set_ui_font_size(*size as f32, cx);
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &editor_font_size_input,
+            |this, _, event: &NumberInputEvent, cx| {
+                let NumberInputEvent::Change(size) = event;
+                this.set_editor_font_size(*size as f32, cx);
+            },
+        )
+        .detach();
+
         Self {
             service,
             connections: config::load(),
@@ -382,8 +455,12 @@ impl AppState {
             password_input,
             database_input,
             conn_str_input,
+            ui_font_size_input,
+            editor_font_size_input,
             form: None,
-            toast: None,
+            notifications: Vec::new(),
+            next_notification_id: 0,
+            next_export_id: 0,
             confirm_exec: None,
             confirm_close_tab: None,
             settings,
@@ -457,6 +534,85 @@ impl AppState {
         .detach();
     }
 
+    // --- notifications ---
+
+    /// Push a notification onto the bottom-right stack and return its id. Info /
+    /// success toasts auto-dismiss after [`TOAST_AUTO_DISMISS`]; warnings and
+    /// errors persist until closed.
+    pub(crate) fn notify(
+        &mut self,
+        variant: ToastVariant,
+        message: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        let auto_dismiss = match variant {
+            ToastVariant::Info | ToastVariant::Success => Some(TOAST_AUTO_DISMISS),
+            ToastVariant::Warning | ToastVariant::Error => None,
+        };
+        self.push_notification(
+            Notification {
+                id: 0,
+                variant,
+                message: message.into(),
+                auto_dismiss,
+                export: None,
+            },
+            cx,
+        )
+    }
+
+    /// Assign `notification` a fresh id, push it, and — for a transient toast —
+    /// arm a `cx.spawn` timer that removes it by id once `auto_dismiss` elapses.
+    /// Returns the assigned id so callers (the export toast) can update it later.
+    pub(crate) fn push_notification(
+        &mut self,
+        mut notification: Notification,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        let id = self.next_notification_id;
+        self.next_notification_id += 1;
+        notification.id = id;
+        let auto_dismiss = notification.auto_dismiss;
+        self.notifications.push(notification);
+        if let Some(delay) = auto_dismiss {
+            cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                cx.background_executor().timer(delay).await;
+                this.update(cx, |this, cx| this.dismiss(id, cx)).ok();
+            })
+            .detach();
+        }
+        cx.notify();
+        id
+    }
+
+    /// Remove the notification with `id` (its close button, or a fired timer).
+    pub(crate) fn dismiss(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.notifications.retain(|n| n.id != id);
+        cx.notify();
+    }
+
+    /// The notification's `✕`: dismiss a plain toast, or — for the export toast —
+    /// abort the backend stream. The toast stays (now "Cancelling…") until the
+    /// `ExportCancelled` event swaps it for a transient one.
+    pub(crate) fn close_notification(&mut self, id: u64, cx: &mut Context<Self>) {
+        let export_id = self
+            .notifications
+            .iter()
+            .find(|n| n.id == id)
+            .and_then(|n| n.export.as_ref())
+            .map(|e| e.id);
+        match export_id {
+            Some(export_id) => {
+                self.service.send(Command::CancelExport { id: export_id });
+                if let Some(n) = self.notifications.iter_mut().find(|n| n.id == id) {
+                    n.message = "Cancelling export…".into();
+                }
+                cx.notify();
+            }
+            None => self.dismiss(id, cx),
+        }
+    }
+
     /// The single point where backend events drive UI state.
     fn on_event(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
@@ -491,7 +647,7 @@ impl AppState {
                     self.on_connect_failed(message, cx);
                 } else {
                     self.on_result_error(&message);
-                    self.toast = Some((message.into(), ToastVariant::Error));
+                    self.notify(ToastVariant::Error, message, cx);
                 }
             }
 
@@ -538,19 +694,17 @@ impl AppState {
 
             // --- export & writes ---
             Event::Executed { affected } => {
-                self.toast = Some((
-                    format!("{affected} row(s) affected").into(),
+                self.notify(
                     ToastVariant::Success,
-                ));
+                    format!("{affected} row(s) affected"),
+                    cx,
+                );
                 // A write may have changed the schema (CREATE/DROP) — refresh the tree.
                 self.service.send(Command::LoadObjects);
             }
-            Event::ExportFinished { path, rows } => {
-                self.toast = Some((
-                    format!("Exported {rows} row(s) to {path}").into(),
-                    ToastVariant::Success,
-                ));
-            }
+            Event::ExportProgress { id, rows } => self.on_export_progress(id, rows, cx),
+            Event::ExportFinished { id, path, rows } => self.on_export_finished(id, path, rows, cx),
+            Event::ExportCancelled { id } => self.on_export_cancelled(id, cx),
 
             // The streaming `Query`/`FetchMore` path stays in the protocol for
             // headless use + tests; the UI now drives results via `OpenResult`.
@@ -572,7 +726,7 @@ impl AppState {
             if let Err(e) = crate::secrets::delete_password(&removed.id) {
                 tracing::warn!("failed to remove keychain credential: {e}");
             }
-            self.persist();
+            self.persist(cx);
             cx.notify();
         }
     }
@@ -584,7 +738,7 @@ impl AppState {
         stored.last_accessed = Some(config::now());
         let id = stored.id.clone();
         let mut config = stored.config.clone();
-        self.persist();
+        self.persist(cx);
         // Materialize the password from the keychain unless we already hold it in
         // memory (a keychain write that failed earlier this session keeps it there).
         if config.password.is_empty() && !config.kind.is_file() {
@@ -945,6 +1099,14 @@ impl AppState {
         let report = store.load_report();
         self.settings = report.settings;
         self.settings_warnings = report.warnings;
+        // Push the reloaded sizes into the steppers so a hand-edit of the file is
+        // reflected in the panel (set_value doesn't emit, so no write-back loop).
+        let ui_size = self.settings.appearance.ui_font_size as f64;
+        let editor_size = self.settings.editor.font_size as f64;
+        self.ui_font_size_input
+            .update(cx, |n, cx| n.set_value(ui_size, cx));
+        self.editor_font_size_input
+            .update(cx, |n, cx| n.set_value(editor_size, cx));
         self.apply_theme(cx);
         cx.notify();
     }
@@ -955,11 +1117,11 @@ impl AppState {
     /// reference defaults on first open so there's a full key set to edit.
     pub(crate) fn open_settings_file(&mut self, cx: &mut Context<Self>) {
         let Some(store) = &self.settings_store else {
-            self.toast = Some((
-                "No config directory available on this platform.".into(),
+            self.notify(
                 ToastVariant::Error,
-            ));
-            cx.notify();
+                "No config directory available on this platform.",
+                cx,
+            );
             return;
         };
         let path = store.path().to_path_buf();
@@ -983,11 +1145,11 @@ impl AppState {
         let path = std::env::temp_dir().join("red-default-settings.toml");
         if let Err(e) = std::fs::write(&path, crate::assets::DEFAULT_SETTINGS) {
             tracing::warn!("failed to materialize default settings: {e}");
-            self.toast = Some((
-                format!("Couldn't open default settings: {e}").into(),
+            self.notify(
                 ToastVariant::Error,
-            ));
-            cx.notify();
+                format!("Couldn't open default settings: {e}"),
+                cx,
+            );
             return;
         }
         self.reveal_path(&path, cx);
@@ -997,10 +1159,11 @@ impl AppState {
     fn reveal_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
         if let Err(e) = open_in_os(path) {
             tracing::warn!("failed to open {}: {e}", path.display());
-            self.toast = Some((
-                format!("Couldn't open {}: {e}", path.display()).into(),
+            self.notify(
                 ToastVariant::Error,
-            ));
+                format!("Couldn't open {}: {e}", path.display()),
+                cx,
+            );
         }
         cx.notify();
     }
@@ -1151,16 +1314,10 @@ impl AppState {
             Ok(name) => {
                 self.themes = ThemeRegistry::load();
                 self.apply_theme(cx);
-                self.toast = Some((
-                    format!("Imported theme “{name}”").into(),
-                    ToastVariant::Success,
-                ));
+                self.notify(ToastVariant::Success, format!("Imported theme “{name}”"), cx);
             }
             Err(e) => {
-                self.toast = Some((
-                    format!("Couldn't import theme: {e}").into(),
-                    ToastVariant::Error,
-                ));
+                self.notify(ToastVariant::Error, format!("Couldn't import theme: {e}"), cx);
             }
         }
         cx.notify();
@@ -1170,20 +1327,12 @@ impl AppState {
     /// theme falls back to the default rather than leaving a dangling reference.
     pub(crate) fn remove_theme(&mut self, name: &str, cx: &mut Context<Self>) {
         if let Err(e) = self.themes.remove(name) {
-            self.toast = Some((
-                format!("Couldn't remove theme: {e}").into(),
-                ToastVariant::Error,
-            ));
-            cx.notify();
+            self.notify(ToastVariant::Error, format!("Couldn't remove theme: {e}"), cx);
             return;
         }
         self.themes = ThemeRegistry::load();
         self.apply_theme(cx);
-        self.toast = Some((
-            format!("Removed theme “{name}”").into(),
-            ToastVariant::Success,
-        ));
-        cx.notify();
+        self.notify(ToastVariant::Success, format!("Removed theme “{name}”"), cx);
     }
 
     pub(crate) fn set_density(&mut self, density: Density, cx: &mut Context<Self>) {
@@ -1277,13 +1426,14 @@ impl AppState {
     }
 
     /// Save the connection list, surfacing a write failure as a toast.
-    fn persist(&mut self) {
+    fn persist(&mut self, cx: &mut Context<Self>) {
         if let Err(e) = config::save(&self.connections) {
             tracing::warn!("failed to save connections: {e}");
-            self.toast = Some((
-                format!("Couldn't save connections: {e}").into(),
+            self.notify(
                 ToastVariant::Error,
-            ));
+                format!("Couldn't save connections: {e}"),
+                cx,
+            );
         }
     }
 }

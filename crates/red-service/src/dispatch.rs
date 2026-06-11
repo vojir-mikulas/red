@@ -4,6 +4,7 @@
 //! incoming commands so a cancel or timeout can abort one in flight.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -113,6 +114,11 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
     let results: ResultMap = Arc::new(Mutex::new(HashMap::new()));
     // Bounds how many page fetches hit the server concurrently (see the const).
     let page_fetch_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_PAGE_FETCHES));
+    // In-flight exports: `id → cancel flag`. An export runs as a detached task
+    // (so the loop stays responsive while it streams); `CancelExport` flips its
+    // flag and the task removes its own entry on completion. Shared so the task
+    // can self-clean without round-tripping a command.
+    let exports: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>> = Arc::new(Mutex::new(HashMap::new()));
 
     while let Some(command) = commands.recv().await {
         match command {
@@ -437,6 +443,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 format,
                 path,
                 epoch,
+                id,
             } => {
                 let Some(driver) = session.clone() else {
                     emit(&events, Event::Error("not connected".into()));
@@ -446,15 +453,60 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                     emit(&events, Event::Error("no open result to export".into()));
                     continue;
                 };
-                match driver.export(&sql, &path, format).await {
-                    Ok(rows) => emit(
-                        &events,
-                        Event::ExportFinished {
-                            path: path.to_string_lossy().into_owned(),
-                            rows: rows as usize,
-                        },
-                    ),
-                    Err(e) => emit(&events, Event::Error(e.to_string())),
+                // Register the cancel flag before the task starts, so a fast
+                // `CancelExport` can't race ahead of it.
+                let cancel = Arc::new(AtomicBool::new(false));
+                lock(&exports).insert(id, cancel.clone());
+
+                // Forward the driver's throttled row counts to the UI as progress
+                // events; the channel closes (loop ends) when the export drops its
+                // sender on completion.
+                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+                {
+                    let events = events.clone();
+                    tokio::spawn(async move {
+                        while let Some(rows) = progress_rx.recv().await {
+                            emit(
+                                &events,
+                                Event::ExportProgress {
+                                    id,
+                                    rows: rows as usize,
+                                },
+                            );
+                        }
+                    });
+                }
+
+                // Run the export off the dispatch loop so the loop keeps pumping
+                // (a `CancelExport` or any other command lands while it streams).
+                let events = events.clone();
+                let exports = exports.clone();
+                tokio::spawn(async move {
+                    let path_str = path.to_string_lossy().into_owned();
+                    let result = driver.export(&sql, &path, format, cancel, progress_tx).await;
+                    lock(&exports).remove(&id);
+                    match result {
+                        Ok(rows) => emit(
+                            &events,
+                            Event::ExportFinished {
+                                id,
+                                path: path_str,
+                                rows: rows as usize,
+                            },
+                        ),
+                        Err(RedError::Interrupted) => {
+                            emit(&events, Event::ExportCancelled { id })
+                        }
+                        Err(e) => emit(&events, Event::Error(e.to_string())),
+                    }
+                });
+            }
+
+            Command::CancelExport { id } => {
+                // Flip the flag; the export's per-row check picks it up, removes
+                // the partial file, and replies `ExportCancelled`.
+                if let Some(cancel) = lock(&exports).get(&id) {
+                    cancel.store(true, Ordering::Relaxed);
                 }
             }
 

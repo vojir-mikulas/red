@@ -12,10 +12,12 @@
 
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use tokio::sync::mpsc::UnboundedSender;
 use red_core::{
     Column, ColumnMeta, ExportFormat, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta,
     QueryOptions, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail, Value,
@@ -26,7 +28,9 @@ use tokio::sync::Mutex;
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, NoTls, Row, RowStream};
 
-use crate::format::{csv_cell, csv_record, json_string, json_value, strip_trailing};
+use crate::format::{
+    csv_cell, csv_record, json_string, json_value, strip_trailing, ProgressThrottle,
+};
 use crate::{driver_err, CancelToken, DatabaseDriver, QueryCursor};
 
 /// A live PostgreSQL session. Holds the shared `Client`; the connection future
@@ -407,7 +411,14 @@ impl DatabaseDriver for PostgresDriver {
         }
     }
 
-    async fn export(&self, sql: &str, path: &Path, format: ExportFormat) -> Result<u64> {
+    async fn export(
+        &self,
+        sql: &str,
+        path: &Path,
+        format: ExportFormat,
+        cancel: Arc<AtomicBool>,
+        progress: UnboundedSender<u64>,
+    ) -> Result<u64> {
         let sql = format!("SELECT * FROM ({}) AS _red", strip_trailing(sql));
         let (stmt, columns) = self.prepare_columns(&sql).await?;
         let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
@@ -422,23 +433,39 @@ impl DatabaseDriver for PostgresDriver {
         let file = File::create(path).map_err(driver_err)?;
         let mut out = BufWriter::new(file);
         let mut written: u64 = 0;
+        let mut throttle = ProgressThrottle::new(progress);
+
+        // Bail on cancel: drop the writer, remove the partial file, and report
+        // interruption — never leave a truncated CSV/JSON behind.
+        macro_rules! bail_if_cancelled {
+            () => {
+                if cancel.load(Ordering::Relaxed) {
+                    drop(out);
+                    let _ = std::fs::remove_file(path);
+                    return Err(RedError::Interrupted);
+                }
+            };
+        }
 
         match format {
             ExportFormat::Csv => {
                 writeln!(out, "{}", csv_record(names.iter().map(String::as_str)))
                     .map_err(driver_err)?;
                 while let Some(row) = stream.next().await {
+                    bail_if_cancelled!();
                     let row = row.map_err(map_pg_err)?;
                     let cells = pg_row(&row);
                     let fields: Vec<String> = cells.iter().map(csv_cell).collect();
                     writeln!(out, "{}", csv_record(fields.iter().map(String::as_str)))
                         .map_err(driver_err)?;
                     written += 1;
+                    throttle.tick(written);
                 }
             }
             ExportFormat::Json => {
                 write!(out, "[").map_err(driver_err)?;
                 while let Some(row) = stream.next().await {
+                    bail_if_cancelled!();
                     let row = row.map_err(map_pg_err)?;
                     let cells = pg_row(&row);
                     if written > 0 {
@@ -454,6 +481,7 @@ impl DatabaseDriver for PostgresDriver {
                     }
                     write!(out, "}}").map_err(driver_err)?;
                     written += 1;
+                    throttle.tick(written);
                 }
                 write!(out, "\n]\n").map_err(driver_err)?;
             }

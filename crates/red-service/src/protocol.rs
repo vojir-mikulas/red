@@ -79,11 +79,19 @@ pub enum Command {
         sql: String,
     },
     /// Stream an open result to `path` in `format`, row-by-row. `epoch` selects
-    /// which open result (the active tab's grid).
+    /// which open result (the active tab's grid); `id` identifies the export so
+    /// progress / completion events and a `CancelExport` route to it. The export
+    /// runs off the dispatch loop, so the loop stays responsive while it streams.
     Export {
         format: ExportFormat,
         path: PathBuf,
         epoch: u64,
+        id: u64,
+    },
+    /// Abort an in-flight export by `id` (the toast's Cancel). The partial file is
+    /// removed so no truncated CSV/JSON is left behind.
+    CancelExport {
+        id: u64,
     },
     /// Abort the active query / drop its cursor.
     Cancel,
@@ -176,10 +184,23 @@ pub enum Event {
     Executed {
         affected: usize,
     },
-    /// A streamed export finished: `rows` rows written to `path`.
+    /// A streamed export made progress: `rows` rows written so far (throttled,
+    /// not per-row). `id` selects the export's toast.
+    ExportProgress {
+        id: u64,
+        rows: usize,
+    },
+    /// A streamed export finished: `rows` rows written to `path`. `id` selects the
+    /// export's toast.
     ExportFinished {
+        id: u64,
         path: String,
         rows: usize,
+    },
+    /// An in-flight export was cancelled (its partial file removed). `id` selects
+    /// the export's toast.
+    ExportCancelled {
+        id: u64,
     },
     Error(String),
 }

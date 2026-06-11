@@ -7,6 +7,8 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use red_core::{
@@ -15,8 +17,10 @@ use red_core::{
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, ErrorCode, OpenFlags};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::format::ProgressThrottle;
 use crate::{driver_err, CancelToken, DatabaseDriver, QueryCursor};
 
 /// A SQLite connection target: a file path (or `:memory:`) plus the read-only
@@ -234,13 +238,22 @@ impl DatabaseDriver for SqliteDriver {
             .map_err(driver_err)?
     }
 
-    async fn export(&self, sql: &str, path: &Path, format: ExportFormat) -> Result<u64> {
+    async fn export(
+        &self,
+        sql: &str,
+        path: &Path,
+        format: ExportFormat,
+        cancel: Arc<AtomicBool>,
+        progress: UnboundedSender<u64>,
+    ) -> Result<u64> {
         let db_path = self.path.clone();
         let read_only = self.read_only;
         let out_path = path.to_path_buf();
         let sql = format!("SELECT * FROM ({})", strip_trailing(sql));
         tokio::task::spawn_blocking(move || {
-            export_blocking(&db_path, read_only, &sql, &out_path, format)
+            export_blocking(
+                &db_path, read_only, &sql, &out_path, format, &cancel, progress,
+            )
         })
         .await
         .map_err(driver_err)?
@@ -264,13 +277,17 @@ fn execute_blocking(path: &Path, read_only: bool, sql: &str) -> Result<u64> {
 }
 
 /// Stream the result of `sql` to `path`, one row at a time — never collecting the
-/// whole result in memory.
+/// whole result in memory. Checks `cancel` per row (bailing with the partial file
+/// removed) and reports the running row count through `progress` (throttled).
+#[allow(clippy::too_many_arguments)]
 fn export_blocking(
     path: &Path,
     read_only: bool,
     sql: &str,
     out_path: &Path,
     format: ExportFormat,
+    cancel: &AtomicBool,
+    progress: UnboundedSender<u64>,
 ) -> Result<u64> {
     let conn = SqliteDriver::open(path, read_only)?;
     let mut stmt = conn.prepare(sql).map_err(driver_err)?;
@@ -285,12 +302,26 @@ fn export_blocking(
     let mut out = BufWriter::new(file);
     let mut rows_iter = stmt.query([]).map_err(driver_err)?;
     let mut written: u64 = 0;
+    let mut throttle = ProgressThrottle::new(progress);
+
+    // Bail on cancel: drop the writer, remove the partial file, and report
+    // interruption — never leave a truncated CSV/JSON behind.
+    macro_rules! bail_if_cancelled {
+        () => {
+            if cancel.load(Ordering::Relaxed) {
+                drop(out);
+                let _ = std::fs::remove_file(out_path);
+                return Err(RedError::Interrupted);
+            }
+        };
+    }
 
     match format {
         ExportFormat::Csv => {
             writeln!(out, "{}", csv_record(names.iter().map(|s| s.as_str())))
                 .map_err(driver_err)?;
             while let Some(row) = rows_iter.next().map_err(map_step_err)? {
+                bail_if_cancelled!();
                 let cells = extract_row(row, column_count)?;
                 let line = csv_record(
                     cells
@@ -302,11 +333,13 @@ fn export_blocking(
                 );
                 writeln!(out, "{line}").map_err(driver_err)?;
                 written += 1;
+                throttle.tick(written);
             }
         }
         ExportFormat::Json => {
             write!(out, "[").map_err(driver_err)?;
             while let Some(row) = rows_iter.next().map_err(map_step_err)? {
+                bail_if_cancelled!();
                 let cells = extract_row(row, column_count)?;
                 if written > 0 {
                     write!(out, ",").map_err(driver_err)?;
@@ -321,6 +354,7 @@ fn export_blocking(
                 }
                 write!(out, "}}").map_err(driver_err)?;
                 written += 1;
+                throttle.tick(written);
             }
             write!(out, "\n]\n").map_err(driver_err)?;
         }
@@ -871,5 +905,46 @@ mod tests {
     async fn read_only_rejects_writes() {
         let driver = SqliteDriver::new(":memory:", true);
         battery::read_only_rejects_write(&driver, "CREATE TABLE t(x)").await;
+    }
+
+    /// A flagged cancel bails the export and removes the partial file, so no
+    /// truncated CSV is ever left behind.
+    #[tokio::test]
+    async fn export_cancel_removes_partial_file() {
+        let driver = SqliteDriver::new(":memory:", true);
+        let out = temp_db_path("export_cancel").with_extension("csv");
+        let cancel = Arc::new(AtomicBool::new(true)); // already cancelled
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let err = driver
+            .export(&counting_sql(100_000), &out, ExportFormat::Csv, cancel, tx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RedError::Interrupted), "cancel → Interrupted");
+        assert!(!out.exists(), "partial file removed on cancel");
+    }
+
+    /// A large export reports its running row count through the progress channel
+    /// and finishes with the full file intact.
+    #[tokio::test]
+    async fn export_reports_progress() {
+        let driver = SqliteDriver::new(":memory:", true);
+        let out = temp_db_path("export_progress").with_extension("csv");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rows = driver
+            .export(&counting_sql(5_000), &out, ExportFormat::Csv, cancel, tx)
+            .await
+            .unwrap();
+        assert_eq!(rows, 5_000);
+        let mut updates = Vec::new();
+        while let Ok(n) = rx.try_recv() {
+            updates.push(n);
+        }
+        assert!(!updates.is_empty(), "progress was reported");
+        assert!(
+            updates.iter().all(|&n| n <= 5_000),
+            "progress never exceeds the total: {updates:?}"
+        );
+        std::fs::remove_file(&out).ok();
     }
 }

@@ -135,11 +135,11 @@ impl AppState {
         match cleaned.parse::<usize>() {
             Ok(n) if n >= 1 => self.go_to_row(n, cx),
             _ => {
-                self.toast = Some((
-                    format!("“{}” isn't a valid row number", text.trim()).into(),
+                self.notify(
                     ToastVariant::Error,
-                ));
-                cx.notify();
+                    format!("“{}” isn't a valid row number", text.trim()),
+                    cx,
+                );
             }
         }
     }
