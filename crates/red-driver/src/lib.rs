@@ -12,11 +12,11 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::mpsc::UnboundedSender;
 use red_core::{
     Column, ExportFormat, KeySpec, QueryOptions, RedError, Result, ResultPage, RowWindow,
     SchemaMeta, TableDetail, Value,
 };
+use tokio::sync::mpsc::UnboundedSender;
 
 #[cfg(test)]
 mod conformance;

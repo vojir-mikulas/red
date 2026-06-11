@@ -483,7 +483,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 let exports = exports.clone();
                 tokio::spawn(async move {
                     let path_str = path.to_string_lossy().into_owned();
-                    let result = driver.export(&sql, &path, format, cancel, progress_tx).await;
+                    let result = driver
+                        .export(&sql, &path, format, cancel, progress_tx)
+                        .await;
                     lock(&exports).remove(&id);
                     match result {
                         Ok(rows) => emit(
@@ -494,9 +496,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                                 rows: rows as usize,
                             },
                         ),
-                        Err(RedError::Interrupted) => {
-                            emit(&events, Event::ExportCancelled { id })
-                        }
+                        Err(RedError::Interrupted) => emit(&events, Event::ExportCancelled { id }),
                         Err(e) => emit(&events, Event::Error(e.to_string())),
                     }
                 });

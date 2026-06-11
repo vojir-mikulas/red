@@ -44,6 +44,10 @@ pub struct Settings {
 pub struct AppearanceSettings {
     pub theme: ThemeSetting,
     pub ui_font_family: String,
+    /// The mono family for in-UI code + tabular data (result grid, schema
+    /// identifiers). Shares [`ui_font_size`](Self::ui_font_size) with the sans
+    /// family; the editor keeps its own family/size under `[editor]`.
+    pub ui_mono_family: String,
     pub ui_font_size: f32,
 }
 
@@ -52,6 +56,7 @@ impl Default for AppearanceSettings {
         Self {
             theme: ThemeSetting::default(),
             ui_font_family: FONT_UI.to_string(),
+            ui_mono_family: FONT_MONO.to_string(),
             // The design's base UI size (the root previously hard-coded this).
             ui_font_size: 13.0,
         }

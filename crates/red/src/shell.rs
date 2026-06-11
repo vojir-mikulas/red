@@ -14,7 +14,6 @@ const TITLEBAR_LEFT_INSET: f32 = 72.;
 const TITLEBAR_LEFT_INSET: f32 = 12.;
 
 use crate::app::{ActiveConn, AppState, Phase};
-use crate::assets::{FONT_MONO, FONT_UI};
 
 impl AppState {
     pub(crate) fn render_shell(
@@ -45,11 +44,15 @@ impl AppState {
             .rounded(px(6.))
             .border_1()
             .border_color(theme.border_soft)
-            .text_size(px(11.5))
+            .text_size(theme.scale(11.5))
             .text_color(theme.text_muted)
             .cursor_pointer()
             .hover(|s| s.border_color(theme.red).text_color(theme.red))
-            .child(crate::icons::icon("power", px(13.), theme.text_muted))
+            .child(crate::icons::icon(
+                "power",
+                theme.scale(13.),
+                theme.text_muted,
+            ))
             .child("Disconnect")
             .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx)));
 
@@ -57,7 +60,7 @@ impl AppState {
         // top-right placement) rather than the status strip.
         let settings_gear = IconButton::new(
             "shell-settings",
-            crate::icons::icon("settings", px(16.), theme.text_muted),
+            crate::icons::icon("settings", theme.scale(16.), theme.text_muted),
         )
         .size(IconButtonSize::Sm)
         .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
@@ -218,7 +221,7 @@ impl AppState {
                         theme.text_muted
                     })
                     .when(config.read_only, |d| {
-                        d.child(crate::icons::icon("lock", px(11.), theme.yellow))
+                        d.child(crate::icons::icon("lock", theme.scale(11.), theme.yellow))
                     })
                     .child(if config.read_only {
                         "Read-only"
@@ -265,7 +268,7 @@ impl AppState {
                 } else {
                     "panel-left-close"
                 },
-                px(14.),
+                theme.scale(14.),
                 theme.text_muted,
             ))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)));
@@ -280,8 +283,8 @@ impl AppState {
             .bg(theme.bg_panel_2)
             .border_t_1()
             .border_color(theme.border)
-            .font_family(FONT_MONO)
-            .text_size(px(11.))
+            .font_family(theme.font_family.clone())
+            .text_size(theme.scale(11.))
             .text_color(theme.text_muted)
             .child(
                 div()
@@ -297,7 +300,7 @@ impl AppState {
             .flex()
             .flex_col()
             .bg(theme.bg_app)
-            .font_family(FONT_UI)
+            .font_family(theme.font_family.clone())
             .child(topbar)
             .child(body)
             .child(statusbar)

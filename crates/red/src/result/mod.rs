@@ -560,11 +560,7 @@ impl AppState {
                 variant: ToastVariant::Info,
                 message: "Exporting… 0%".into(),
                 auto_dismiss: None,
-                export: Some(ExportProgress {
-                    id,
-                    rows: 0,
-                    total,
-                }),
+                export: Some(ExportProgress { id, rows: 0, total }),
             },
             cx,
         );

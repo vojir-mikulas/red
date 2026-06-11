@@ -30,9 +30,12 @@ theme = "One Dark"
 #
 # The accent is whatever the theme defines — there is no separate accent override.
 
-# UI font: the interface font family and base size (px). Any installed family
-# works; size is clamped to 8–32. Also settable from the Appearance panel.
+# Interface fonts: a sans family for chrome and a mono family for in-UI data
+# (result grid cells, schema identifiers). Both share `ui_font_size` (px, clamped
+# to 8–32); the whole UI scales from it. Match the two families for a uniform look.
+# Also settable from the Appearance panel. The SQL editor has its own [editor] font.
 ui_font_family = "IBM Plex Sans"
+ui_mono_family = "IBM Plex Mono"
 ui_font_size = 13
 
 [editor]

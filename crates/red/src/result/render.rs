@@ -8,7 +8,6 @@ use red_core::ExportFormat;
 
 use super::buffer::{CellKind, DisplayCell};
 use crate::app::{ActiveConn, AppState};
-use crate::assets::FONT_MONO;
 
 /// Group a number's digits in threes (`1234567` → `1,234,567`) so large row
 /// numbers and totals read at a glance.
@@ -95,6 +94,16 @@ impl AppState {
             theme.text,
         );
         let (num, cyan, red, accent) = (theme.orange, theme.cyan, theme.red, theme.accent);
+        // Scaled chrome sizes snapshotted here (Pixels is Copy) so the result
+        // pane's status/empty/error text tracks the UI font size even inside the
+        // `'static` row closures below.
+        let (size_11, size_12) = (theme.scale(11.), theme.scale(12.));
+        let caret_icon = theme.scale(9.);
+        // Chrome (toolbar/stats/footer) follows the sans UI font; the data grid
+        // cells follow the mono font, both rendered at the configured base size.
+        let ui_family = theme.font_family.clone();
+        let mono_family = theme.mono_family.clone();
+        let cell_size = theme.font_size;
         let cell_colors = CellColors {
             text,
             muted,
@@ -113,7 +122,7 @@ impl AppState {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(px(12.))
+                        .text_size(size_12)
                         .text_color(faint)
                         .child("Double-click a table or run a query to see rows"),
                 );
@@ -135,19 +144,19 @@ impl AppState {
                     .gap_2()
                     .p_4()
                     .overflow_y_scroll()
-                    .font_family(FONT_MONO)
+                    .font_family(mono_family.clone())
                     .child(
                         div()
                             .flex_shrink_0()
                             .flex()
                             .items_center()
                             .gap_2()
-                            .text_size(px(11.))
+                            .text_size(size_11)
                             .text_color(red)
                             .child("Query failed")
                             .child(div().text_color(faint).child(format!("· {elapsed}"))),
                     )
-                    .child(div().text_size(px(12.)).text_color(text).child(err.clone())),
+                    .child(div().text_size(size_12).text_color(text).child(err.clone())),
             );
         }
 
@@ -172,8 +181,8 @@ impl AppState {
             .px_2()
             .border_b_1()
             .border_color(border)
-            .font_family(FONT_MONO)
-            .text_size(px(11.))
+            .font_family(ui_family.clone())
+            .text_size(size_11)
             .child(div().text_color(muted).child(grid.label.clone()))
             .child(status)
             .child(
@@ -252,7 +261,8 @@ impl AppState {
         let table = Table::<()>::new("result-grid", columns)
             .row_count(win.len)
             .row_height(row_height)
-            .font_family(FONT_MONO)
+            .font_family(mono_family.clone())
+            .text_size(cell_size)
             .grid_lines(true)
             .track_scroll(&grid.scroll)
             .track_horizontal_scroll(&grid.h_scroll)
@@ -260,8 +270,8 @@ impl AppState {
             .selected_cells(local_selection)
             .sort(sort)
             .sort_carets(
-                move || crate::icons::icon("sort-asc", px(9.), accent).into_any_element(),
-                move || crate::icons::icon("sort-desc", px(9.), accent).into_any_element(),
+                move || crate::icons::icon("sort-asc", caret_icon, accent).into_any_element(),
+                move || crate::icons::icon("sort-desc", caret_icon, accent).into_any_element(),
             )
             .on_visible_range(move |range, window, _| {
                 // `range` is list-local; the buffer is keyed by absolute ordinal.
@@ -334,8 +344,8 @@ impl AppState {
             .bg(bg)
             .border_t_1()
             .border_color(border)
-            .font_family(FONT_MONO)
-            .text_size(px(11.))
+            .font_family(ui_family.clone())
+            .text_size(size_11)
             .child(div().text_color(text).child(format!("{}", grid.total)))
             .child(div().text_color(dim).child("rows"))
             .child(div().text_color(border_soft).child("·"))

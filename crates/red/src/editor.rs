@@ -12,7 +12,6 @@ use gpui::{div, prelude::*, px, Context, Hsla, Pixels, Point, SharedString, Wind
 use red_service::Command;
 
 use crate::app::{ActiveConn, AppState, Phase};
-use crate::assets::FONT_MONO;
 use crate::schema::SchemaState;
 use crate::sql::CompletionContext;
 
@@ -39,7 +38,8 @@ struct TabDragPreview {
 }
 
 impl Render for TabDragPreview {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
         div().pl(self.offset.x).pt(self.offset.y).child(
             div()
                 .flex()
@@ -50,8 +50,8 @@ impl Render for TabDragPreview {
                 .border_1()
                 .border_color(self.border)
                 .rounded(px(4.))
-                .font_family(FONT_MONO)
-                .text_size(px(12.))
+                .font_family(theme.font_family.clone())
+                .text_size(theme.scale(12.))
                 .text_color(self.text)
                 .child(self.title.clone()),
         )
@@ -218,6 +218,16 @@ impl AppState {
             theme.text_dim,
         );
         let (yellow, green, on_accent) = (theme.yellow, theme.green, theme.on_accent);
+        // UI-chrome icon size scaled with the general UI font (not the editor
+        // mono font). Snapshotted here (Pixels is Copy) so it survives into the
+        // lazy per-tab `.map` closure without re-borrowing `theme`.
+        let icon_close = theme.scale(9.);
+        // UI font + chrome sizes snapshotted (SharedString clones / Copy `Pixels`)
+        // so the tab + breadcrumb chrome tracks the UI font even inside the lazy
+        // per-tab `.map` closure. The editor *surface* keeps its own mono font.
+        let ui_family = theme.font_family.clone();
+        let mono_family = theme.mono_family.clone();
+        let (size_11, size_12) = (theme.scale(11.), theme.scale(12.));
         let view = cx.entity().downgrade();
 
         // --- tab strip: one tab per open query + a "new query" affordance ---
@@ -335,8 +345,8 @@ impl AppState {
                     div()
                         .min_w_0()
                         .truncate()
-                        .font_family(FONT_MONO)
-                        .text_size(px(12.))
+                        .font_family(ui_family.clone())
+                        .text_size(size_12)
                         .text_color(tab_text)
                         .child(t.title.clone()),
                 )
@@ -367,7 +377,7 @@ impl AppState {
                                     cx.stop_propagation();
                                     this.request_close_tab(i, cx);
                                 }))
-                                .child(crate::icons::icon("close", px(9.), faint)),
+                                .child(crate::icons::icon("close", icon_close, faint)),
                         ),
                 )
         });
@@ -436,7 +446,7 @@ impl AppState {
                     .text_color(faint)
                     .hover(|s| s.bg(bg_elevated).text_color(text))
                     .on_click(cx.listener(|this, _, _, cx| this.new_query(cx)))
-                    .child(crate::icons::icon("plus", px(13.), faint)),
+                    .child(crate::icons::icon("plus", theme.scale(13.), faint)),
             );
 
         // No open tab (user closed the last one): keep the strip — its ＋ opens
@@ -448,7 +458,7 @@ impl AppState {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(12.))
+                .text_size(size_12)
                 .text_color(faint)
                 .child("No query tab open — press ＋ to start");
             return div()
@@ -472,8 +482,8 @@ impl AppState {
             .bg(bg_app)
             .border_b_1()
             .border_color(border_soft)
-            .font_family(FONT_MONO)
-            .text_size(px(11.))
+            .font_family(ui_family.clone())
+            .text_size(size_11)
             .text_color(muted)
             .child(active.config.name.clone())
             .child(div().text_color(dim).child("/"))
@@ -503,9 +513,9 @@ impl AppState {
                 .gap_1()
                 .rounded(theme.radius_sm)
                 .bg(yellow.opacity(0.1))
-                .text_size(px(11.))
+                .text_size(size_11)
                 .text_color(yellow)
-                .child(crate::icons::icon("lock", px(11.), yellow))
+                .child(crate::icons::icon("lock", theme.scale(11.), yellow))
                 .child("read-only")
         });
         let run_bar = div()
@@ -526,7 +536,7 @@ impl AppState {
                 Button::new("sql-run", "Run  ⌘↵")
                     .variant(ButtonVariant::Primary)
                     .size(ButtonSize::Sm)
-                    .icon(crate::icons::icon("play", px(11.), on_accent))
+                    .icon(crate::icons::icon("play", theme.scale(11.), on_accent))
                     .on_click(cx.listener(|this, _, _, cx| this.run_editor_query(cx))),
             )
             .child(
@@ -543,7 +553,7 @@ impl AppState {
                 div()
                     .px_2()
                     .py_1()
-                    .text_size(px(11.))
+                    .text_size(size_11)
                     .text_color(faint)
                     .child("No history yet")
                     .into_any_element()
@@ -560,8 +570,8 @@ impl AppState {
                             .px_2()
                             .py_1()
                             .cursor_pointer()
-                            .font_family(FONT_MONO)
-                            .text_size(px(11.))
+                            .font_family(mono_family.clone())
+                            .text_size(size_11)
                             .text_color(text)
                             .hover(move |s| s.bg(bg_hover))
                             .on_click(move |_, _, cx| {

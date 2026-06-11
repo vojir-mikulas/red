@@ -17,13 +17,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use tokio::sync::mpsc::UnboundedSender;
 use red_core::{
     Column, ColumnMeta, ExportFormat, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta,
     QueryOptions, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail, Value,
 };
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, NoTls, Row, RowStream};

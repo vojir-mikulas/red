@@ -15,10 +15,23 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use flint::Theme;
-use gpui::{rgb, Hsla};
+use gpui::{px, rgb, Hsla};
 use serde::Deserialize;
 
-use crate::settings::ThemeSetting;
+use crate::settings::{AppearanceSettings, ThemeSetting};
+
+/// Overlay the user's configured UI fonts onto a resolved theme. Flint themes
+/// carry their own default typography (so the gallery renders standalone); RED
+/// drives the sans + mono families and the shared base size from
+/// [`AppearanceSettings`], so chrome and in-UI data each follow their own family
+/// picker but one size. The editor's font/size live under `[editor]` and stay
+/// out of the theme entirely.
+pub fn with_typography(mut theme: Theme, appearance: &AppearanceSettings) -> Theme {
+    theme.font_family = appearance.ui_font_family.clone().into();
+    theme.mono_family = appearance.ui_mono_family.clone().into();
+    theme.font_size = px(appearance.ui_font_size);
+    theme
+}
 
 /// One resolvable theme: its display name, light/dark family, whether it's a
 /// removable user theme (and the file backing it), and the built [`Theme`].

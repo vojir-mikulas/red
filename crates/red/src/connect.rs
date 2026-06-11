@@ -11,7 +11,7 @@ use gpui::{
 use red_core::DbKind;
 
 use crate::app::{AppState, FormState, TestState};
-use crate::assets::{FONT_MONO, FONT_UI};
+use crate::assets::FONT_MONO;
 
 /// The six label colors a connection can be tagged with, mapped onto semantic
 /// theme tokens so they track the active theme. A connection stores the index.
@@ -62,7 +62,7 @@ fn section_label(label: &'static str, theme: &flint::Theme) -> impl IntoElement 
         .mb_2()
         .child(
             div()
-                .text_xs()
+                .text_size(theme.scale(12.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.text_dim)
                 .child(label),
@@ -100,7 +100,7 @@ impl AppState {
         let new_button = self.new_button(cx);
         let settings_gear = IconButton::new(
             "connect-settings",
-            crate::icons::icon("settings", px(16.), cx.theme().text_muted),
+            crate::icons::icon("settings", cx.theme().scale(16.), cx.theme().text_muted),
         )
         .size(IconButtonSize::Sm)
         .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
@@ -114,24 +114,24 @@ impl AppState {
                 div()
                     .text_color(theme.red)
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_size(px(34.))
+                    .text_size(theme.scale(34.))
                     .child("RED"),
             )
             .child(
                 div()
-                    .text_xl()
+                    .text_size(theme.scale(20.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .mt_3()
                     .child("Roughly Enough Data"),
             )
-            .child(div().text_sm().text_color(theme.text_faint).mt_1().child(
+            .child(div().text_size(theme.scale(14.)).text_color(theme.text_faint).mt_1().child(
                 "A fast, native database explorer. Pick a connection below, or create a new one.",
             ));
 
         let saved: AnyElement = if self.connections.is_empty() {
             div()
                 .py_2()
-                .text_size(px(12.))
+                .text_size(theme.scale(12.))
                 .text_color(theme.text_faint)
                 .child("No saved connections yet.")
                 .into_any_element()
@@ -181,7 +181,7 @@ impl AppState {
             .items_center()
             .bg(theme.bg_app)
             .text_color(theme.text)
-            .font_family(FONT_UI)
+            .font_family(theme.font_family.clone())
             .child(column);
 
         // Settings gear floats top-right (the disconnected screen has no top bar).
@@ -214,7 +214,7 @@ impl AppState {
             .border_1()
             .border_dashed()
             .border_color(theme.border_strong)
-            .text_sm()
+            .text_size(theme.scale(14.))
             .text_color(theme.text_muted)
             .cursor_pointer()
             .hover(|s| {
@@ -222,14 +222,18 @@ impl AppState {
                     .text_color(theme.text)
                     .bg(theme.accent_ghost)
             })
-            .child(crate::icons::icon("plus", px(15.), theme.text_muted))
+            .child(crate::icons::icon(
+                "plus",
+                theme.scale(15.),
+                theme.text_muted,
+            ))
             .child("New connection")
             .child(
                 div()
                     .ml_1()
                     .px_1p5()
                     .rounded(px(4.))
-                    .text_xs()
+                    .text_size(theme.scale(12.))
                     .text_color(theme.text_faint)
                     .bg(theme.bg_input)
                     .border_1()
@@ -289,7 +293,7 @@ impl AppState {
                     .bg(accent.opacity(0.12))
                     .border_1()
                     .border_color(accent.opacity(0.35))
-                    .child(crate::icons::icon("db", px(17.), accent)),
+                    .child(crate::icons::icon("db", theme.scale(17.), accent)),
             )
             .child(
                 div()
@@ -302,7 +306,7 @@ impl AppState {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_sm()
+                                    .text_size(theme.scale(14.))
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(config.name.clone()),
                             )
@@ -317,16 +321,20 @@ impl AppState {
                                         .py(px(1.))
                                         .rounded(theme.radius_sm)
                                         .bg(theme.yellow.opacity(0.1))
-                                        .text_size(px(10.))
+                                        .text_size(theme.scale(10.))
                                         .text_color(theme.yellow)
-                                        .child(crate::icons::icon("lock", px(10.), theme.yellow))
+                                        .child(crate::icons::icon(
+                                            "lock",
+                                            theme.scale(10.),
+                                            theme.yellow,
+                                        ))
                                         .child("read-only"),
                                 )
                             }),
                     )
                     .child(
                         div()
-                            .text_xs()
+                            .text_size(theme.scale(12.))
                             .text_color(theme.text_faint)
                             .font_family(FONT_MONO)
                             .truncate()
@@ -342,11 +350,9 @@ impl AppState {
                     .items_center()
                     .justify_end()
                     .w(px(58.))
-                    .child(
-                        div()
-                            .group_hover(group.clone(), |s| s.invisible())
-                            .child(crate::icons::icon("chevron", px(16.), theme.text_dim)),
-                    )
+                    .child(div().group_hover(group.clone(), |s| s.invisible()).child(
+                        crate::icons::icon("chevron", theme.scale(16.), theme.text_dim),
+                    ))
                     .child(
                         div()
                             .absolute()
@@ -359,7 +365,7 @@ impl AppState {
                             .child(
                                 IconButton::new(
                                     SharedString::from(format!("edit-{index}")),
-                                    crate::icons::icon("edit", px(14.), theme.text_muted),
+                                    crate::icons::icon("edit", theme.scale(14.), theme.text_muted),
                                 )
                                 .size(IconButtonSize::Sm)
                                 .on_click(cx.listener(
@@ -372,7 +378,7 @@ impl AppState {
                             .child(
                                 IconButton::new(
                                     SharedString::from(format!("delete-{index}")),
-                                    crate::icons::icon("trash", px(14.), theme.red),
+                                    crate::icons::icon("trash", theme.scale(14.), theme.red),
                                 )
                                 .size(IconButtonSize::Sm)
                                 .on_click(cx.listener(
@@ -418,21 +424,34 @@ impl AppState {
                     .bg(theme.bg_input)
                     .border_1()
                     .border_color(theme.border_soft)
-                    .child(crate::icons::icon("clock", px(14.), theme.text_faint)),
+                    .child(crate::icons::icon(
+                        "clock",
+                        theme.scale(14.),
+                        theme.text_faint,
+                    )),
             )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(div().text_sm().truncate().child(config.name.clone()))
                     .child(
                         div()
-                            .text_xs()
+                            .text_size(theme.scale(14.))
+                            .truncate()
+                            .child(config.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme.scale(12.))
                             .text_color(theme.text_faint)
                             .child(fmt_ago(last_accessed)),
                     ),
             )
-            .child(crate::icons::icon("chevron", px(15.), theme.text_dim))
+            .child(crate::icons::icon(
+                "chevron",
+                theme.scale(15.),
+                theme.text_dim,
+            ))
             .on_click(cx.listener(move |this, _, _, cx| this.connect(index, cx)))
     }
 
@@ -574,7 +593,7 @@ impl AppState {
                 .bg(bg)
                 .border_1()
                 .border_color(border)
-                .text_size(px(12.))
+                .text_size(theme.scale(12.))
                 .text_color(text)
                 .cursor_pointer()
                 .hover(|s| s.text_color(theme.text))
@@ -644,7 +663,7 @@ impl AppState {
                                 .flex()
                                 .items_center()
                                 .gap_1()
-                                .text_size(px(12.5))
+                                .text_size(theme.scale(12.5))
                                 .text_color(if form.read_only {
                                     theme.accent
                                 } else {
@@ -652,7 +671,7 @@ impl AppState {
                                 })
                                 .child(crate::icons::icon(
                                     "lock",
-                                    px(12.),
+                                    theme.scale(12.),
                                     if form.read_only {
                                         theme.accent
                                     } else {
@@ -697,7 +716,11 @@ impl AppState {
                     },
                 )
                 .variant(ButtonVariant::Ghost)
-                .icon(crate::icons::icon("play", px(13.), theme.text_muted))
+                .icon(crate::icons::icon(
+                    "play",
+                    theme.scale(13.),
+                    theme.text_muted,
+                ))
                 .disabled(testing)
                 .on_click(cx.listener(|this, _, _, cx| this.test_connection(cx))),
             )
@@ -705,7 +728,7 @@ impl AppState {
                 row.child(
                     div()
                         .min_w_0()
-                        .text_size(px(11.5))
+                        .text_size(theme.scale(11.5))
                         .text_color(color)
                         .font_family(FONT_MONO)
                         .truncate()
@@ -733,7 +756,11 @@ impl AppState {
             .child(
                 Button::new("form-connect", "Connect")
                     .variant(ButtonVariant::Primary)
-                    .icon(crate::icons::icon("power", px(14.), theme.on_accent))
+                    .icon(crate::icons::icon(
+                        "power",
+                        theme.scale(14.),
+                        theme.on_accent,
+                    ))
                     .disabled(!valid)
                     .on_click(cx.listener(|this, _, _, cx| this.save_form(true, cx))),
             )
@@ -743,7 +770,7 @@ impl AppState {
 /// A small uppercase field caption, matching the design's form labels.
 fn field_label(text: impl Into<String>, theme: &Theme) -> impl IntoElement {
     div()
-        .text_size(px(10.5))
+        .text_size(theme.scale(10.5))
         .font_weight(FontWeight::MEDIUM)
         .text_color(theme.text_faint)
         .child(text.into().to_uppercase())

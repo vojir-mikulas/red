@@ -16,7 +16,6 @@ use red_core::{ColumnMeta, DbKind, ObjectKind, SchemaMeta, TableDetail};
 use red_service::Command;
 
 use crate::app::{ActiveConn, AppState, Phase};
-use crate::assets::FONT_MONO;
 
 /// A stable identity for a tree node, surviving re-render and filtering so
 /// expansion + selection track the right node regardless of row position.
@@ -216,18 +215,18 @@ fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
             .flex_1()
             .items_center()
             .gap_1p5()
-            .child(crate::icons::icon("schema", px(14.), muted))
+            .child(crate::icons::icon("schema", theme.scale(14.), muted))
             .child(
                 div()
-                    .text_size(px(12.5))
+                    .text_size(theme.scale(12.5))
                     .text_color(text)
                     .child(name.clone()),
             )
             .child(
                 div()
                     .ml_auto()
-                    .font_family(FONT_MONO)
-                    .text_size(px(10.))
+                    .font_family(theme.font_family.clone())
+                    .text_size(theme.scale(10.))
                     .text_color(faint)
                     .child(format!("{count} tables")),
             )
@@ -242,11 +241,11 @@ fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
                 .flex()
                 .items_center()
                 .gap_1p5()
-                .child(crate::icons::icon(name_icon, px(14.), color))
+                .child(crate::icons::icon(name_icon, theme.scale(14.), color))
                 .child(
                     div()
-                        .font_family(FONT_MONO)
-                        .text_size(px(12.))
+                        .font_family(theme.mono_family.clone())
+                        .text_size(theme.scale(12.))
                         .text_color(text)
                         .child(name.clone()),
                 )
@@ -258,34 +257,38 @@ fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(crate::icons::icon("col", px(13.), faint))
+                .child(crate::icons::icon("col", theme.scale(13.), faint))
                 .child(
                     div()
-                        .font_family(FONT_MONO)
-                        .text_size(px(11.5))
+                        .font_family(theme.mono_family.clone())
+                        .text_size(theme.scale(11.5))
                         .text_color(muted)
                         .child(meta.name.clone()),
                 );
             if let Some(type_name) = &meta.type_name {
                 row = row.child(
                     div()
-                        .font_family(FONT_MONO)
-                        .text_size(px(10.))
+                        .font_family(theme.mono_family.clone())
+                        .text_size(theme.scale(10.))
                         .text_color(faint)
                         .child(type_name.clone()),
                 );
             }
             if meta.primary_key {
-                row = row.child(crate::icons::icon("key-round", px(12.), theme.yellow));
+                row = row.child(crate::icons::icon(
+                    "key-round",
+                    theme.scale(12.),
+                    theme.yellow,
+                ));
             }
             if *is_fk {
-                row = row.child(crate::icons::icon("link", px(12.), theme.accent));
+                row = row.child(crate::icons::icon("link", theme.scale(12.), theme.accent));
             }
             row.into_any_element()
         }
 
         RowContent::Loading => div()
-            .text_size(px(11.))
+            .text_size(theme.scale(11.))
             .text_color(faint)
             .child("loading…")
             .into_any_element(),
@@ -312,6 +315,8 @@ impl AppState {
     ) -> impl IntoElement {
         let theme = cx.theme();
         let (bg_panel, faint) = (theme.bg_panel, theme.text_faint);
+        let footer_size = theme.scale(10.);
+        let footer_family = theme.font_family.clone();
         let view = cx.entity().downgrade();
         let s = &active.schema;
         let filter_text = s.filter.read(cx).content().to_string();
@@ -349,7 +354,8 @@ impl AppState {
             .selected(selected_ix)
             .disclosure(|expanded, _window, cx| {
                 let name = if expanded { "chevron-down" } else { "chevron" };
-                crate::icons::icon(name, px(12.), cx.theme().text_faint).into_any_element()
+                crate::icons::icon(name, cx.theme().scale(12.), cx.theme().text_faint)
+                    .into_any_element()
             })
             .render_row(move |ix, _window, cx| render_node(&rows_render[ix], cx))
             .on_toggle(move |ix, _window, cx| {
@@ -380,8 +386,8 @@ impl AppState {
             .flex()
             .items_center()
             .px_2()
-            .font_family(FONT_MONO)
-            .text_size(px(10.))
+            .font_family(footer_family)
+            .text_size(footer_size)
             .text_color(faint)
             .child(footer_text);
 

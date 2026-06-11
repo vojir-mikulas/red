@@ -37,10 +37,12 @@ pub(crate) enum ThemeSelect {
     Dark,
 }
 
-/// Which font-family picker (UI / editor) is open in the settings panel, if any.
+/// Which font-family picker (UI sans / UI mono / editor) is open in the settings
+/// panel, if any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FontSelect {
     Ui,
+    UiMono,
     Editor,
 }
 
@@ -373,7 +375,10 @@ impl AppState {
             gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
         );
         let themes = ThemeRegistry::load();
-        cx.set_global(themes.resolve(&settings.appearance.theme, os_dark));
+        cx.set_global(crate::theme::with_typography(
+            themes.resolve(&settings.appearance.theme, os_dark),
+            &settings.appearance,
+        ));
 
         let name_input = cx.new(|cx| TextInput::new(cx).with_placeholder("my database"));
         let host_input = cx.new(|cx| TextInput::new(cx).with_placeholder("localhost"));
@@ -1200,10 +1205,11 @@ impl AppState {
 
     /// Re-resolve the active theme from settings + OS appearance and install it.
     pub(crate) fn apply_theme(&self, cx: &mut Context<Self>) {
-        cx.set_global(
+        cx.set_global(crate::theme::with_typography(
             self.themes
                 .resolve(&self.settings.appearance.theme, self.os_dark),
-        );
+            &self.settings.appearance,
+        ));
     }
 
     /// The `(mode, light, dark)` the current setting implies. The panel always
@@ -1314,10 +1320,18 @@ impl AppState {
             Ok(name) => {
                 self.themes = ThemeRegistry::load();
                 self.apply_theme(cx);
-                self.notify(ToastVariant::Success, format!("Imported theme “{name}”"), cx);
+                self.notify(
+                    ToastVariant::Success,
+                    format!("Imported theme “{name}”"),
+                    cx,
+                );
             }
             Err(e) => {
-                self.notify(ToastVariant::Error, format!("Couldn't import theme: {e}"), cx);
+                self.notify(
+                    ToastVariant::Error,
+                    format!("Couldn't import theme: {e}"),
+                    cx,
+                );
             }
         }
         cx.notify();
@@ -1327,7 +1341,11 @@ impl AppState {
     /// theme falls back to the default rather than leaving a dangling reference.
     pub(crate) fn remove_theme(&mut self, name: &str, cx: &mut Context<Self>) {
         if let Err(e) = self.themes.remove(name) {
-            self.notify(ToastVariant::Error, format!("Couldn't remove theme: {e}"), cx);
+            self.notify(
+                ToastVariant::Error,
+                format!("Couldn't remove theme: {e}"),
+                cx,
+            );
             return;
         }
         self.themes = ThemeRegistry::load();
@@ -1363,6 +1381,7 @@ impl AppState {
         self.settings.appearance.ui_font_family = family.to_string();
         self.font_select_open = None;
         self.save_settings();
+        self.apply_theme(cx);
         cx.notify();
     }
 
@@ -1372,6 +1391,16 @@ impl AppState {
             crate::settings::MAX_FONT_SIZE,
         );
         self.save_settings();
+        self.apply_theme(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn set_ui_mono_family(&mut self, family: &str, cx: &mut Context<Self>) {
+        self.settings.appearance.ui_mono_family = family.to_string();
+        self.font_select_open = None;
+        self.save_settings();
+        // The UI mono family is a theme token (result grid, schema identifiers).
+        self.apply_theme(cx);
         cx.notify();
     }
 

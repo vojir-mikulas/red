@@ -139,7 +139,13 @@ pub(crate) async fn exports_csv_and_json(driver: &dyn DatabaseDriver, select_sql
     let drain = || tokio::sync::mpsc::unbounded_channel().0;
 
     let rows = driver
-        .export(select_sql, &csv_path, ExportFormat::Csv, no_cancel(), drain())
+        .export(
+            select_sql,
+            &csv_path,
+            ExportFormat::Csv,
+            no_cancel(),
+            drain(),
+        )
         .await
         .unwrap();
     assert_eq!(rows, 2, "two data rows written");
@@ -148,7 +154,13 @@ pub(crate) async fn exports_csv_and_json(driver: &dyn DatabaseDriver, select_sql
     assert!(csv.contains("\"a,b\""), "comma field is quoted: {csv}");
 
     driver
-        .export(select_sql, &json_path, ExportFormat::Json, no_cancel(), drain())
+        .export(
+            select_sql,
+            &json_path,
+            ExportFormat::Json,
+            no_cancel(),
+            drain(),
+        )
         .await
         .unwrap();
     let json = std::fs::read_to_string(&json_path).unwrap();

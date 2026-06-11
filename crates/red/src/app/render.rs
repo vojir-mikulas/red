@@ -6,7 +6,6 @@ use flint::prelude::*;
 use gpui::{div, prelude::*, px, Render, Window};
 
 use super::{AppState, ConnectStatus, Connecting, Phase};
-use crate::assets::{FONT_MONO, FONT_UI};
 use crate::palette::{GoToRow, ToggleCommandPalette};
 
 impl AppState {
@@ -38,13 +37,13 @@ impl AppState {
                 .child(
                     div()
                         .text_color(theme.text_muted)
-                        .text_size(px(12.))
+                        .text_size(theme.scale(12.))
                         .child(error.clone()),
                 )
                 .child(
                     div()
                         .text_color(theme.text_muted)
-                        .text_size(px(12.))
+                        .text_size(theme.scale(12.))
                         .child(format!("Retrying in {}s…", delay.as_secs())),
                 )
                 .child(ProgressBar::new("connect-progress", 0.0).indeterminate(true)),
@@ -72,7 +71,7 @@ impl AppState {
             .justify_center()
             .gap_4()
             .bg(theme.bg_app)
-            .font_family(FONT_UI)
+            .font_family(theme.font_family.clone())
             .child(status)
             .child(actions)
     }
@@ -186,7 +185,7 @@ impl AppState {
         if hidden > 0 {
             col = col.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(theme.scale(11.))
                     .text_color(theme.text_muted)
                     .child(format!("+{hidden} more")),
             );
@@ -272,8 +271,8 @@ impl AppState {
                     .p_2()
                     .rounded(theme.radius_sm)
                     .bg(theme.bg_input)
-                    .font_family(FONT_MONO)
-                    .text_size(px(12.))
+                    .font_family(theme.mono_family.clone())
+                    .text_size(theme.scale(12.))
                     .text_color(theme.text)
                     .child(preview),
             );
@@ -359,8 +358,8 @@ impl AppState {
                 .bg(theme.bg_panel)
                 .border_1()
                 .border_color(theme.border)
-                .font_family(FONT_MONO)
-                .text_size(px(10.))
+                .font_family(theme.mono_family.clone())
+                .text_size(theme.scale(10.))
                 .text_color(theme.text_muted)
                 .child(div().child(line1))
                 .child(div().text_color(theme.text_faint).child(line2))

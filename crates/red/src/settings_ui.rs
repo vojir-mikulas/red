@@ -9,9 +9,7 @@
 
 use flint::prelude::*;
 use flint::Theme;
-use gpui::{
-    div, prelude::*, px, AnyElement, Context, FontWeight, MouseButton, SharedString,
-};
+use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, MouseButton, SharedString};
 
 use crate::app::{AppState, FontSelect};
 use crate::settings::{Density, ThemeMode};
@@ -67,7 +65,7 @@ impl AppState {
                     .px_2()
                     .pt_1()
                     .pb_2()
-                    .text_xs()
+                    .text_size(theme.scale(12.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.text_faint)
                     .child("SETTINGS"),
@@ -147,12 +145,12 @@ fn settings_banner(
         .bg(theme.yellow.opacity(0.1))
         .border_b_1()
         .border_color(theme.border_soft)
-        .child(crate::icons::icon("lock", px(13.), theme.yellow))
+        .child(crate::icons::icon("lock", theme.scale(13.), theme.yellow))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
-                .text_xs()
+                .text_size(theme.scale(12.))
                 .text_color(theme.text_muted)
                 .child(SharedString::from(message)),
         )
@@ -161,7 +159,7 @@ fn settings_banner(
                 .id("settings-warn-dismiss")
                 .flex_shrink_0()
                 .cursor_pointer()
-                .text_xs()
+                .text_size(theme.scale(12.))
                 .text_color(theme.text_faint)
                 .hover(|s| s.text_color(theme.text))
                 .on_click(cx.listener(|this, _, _, cx| this.dismiss_settings_warnings(cx)))
@@ -184,7 +182,7 @@ fn settings_nav_item(
         .px_3()
         .py_1p5()
         .rounded(theme.radius_sm)
-        .text_sm()
+        .text_size(theme.scale(14.))
         .cursor_pointer()
         .when(is_active, |d| d.bg(theme.bg_active).text_color(theme.text))
         .when(!is_active, |d| {
@@ -255,26 +253,35 @@ fn appearance_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             ))
             .child(settings_header("Typography", &theme))
             .child(setting_row(
-                "UI font",
-                "The interface font family — applied everywhere but the SQL editor.",
+                "Interface font",
+                "The sans font for chrome — toolbars, tabs, sidebars, status bar, menus.",
                 font_picker(state, FontSelect::Ui, cx),
                 &theme,
             ))
             .child(setting_row(
-                "UI font size",
-                "Base interface text size, in pixels.",
+                "Interface mono font",
+                "The font for in-UI data — result grid cells and schema identifiers. \
+                 Shares the interface font size; match it to the interface font for a \
+                 uniform look.",
+                font_picker(state, FontSelect::UiMono, cx),
+                &theme,
+            ))
+            .child(setting_row(
+                "Interface font size",
+                "Base interface text size, in pixels. Both interface fonts scale from this.",
                 state.ui_font_size_input.clone(),
                 &theme,
             ))
             .child(setting_row(
                 "Editor font",
-                "The SQL editor font family — a monospace face is recommended.",
+                "The SQL editor font — independent of the interface. A monospace face is \
+                 recommended.",
                 font_picker(state, FontSelect::Editor, cx),
                 &theme,
             ))
             .child(setting_row(
                 "Editor font size",
-                "SQL editor text size, in pixels.",
+                "SQL editor text size, in pixels. Independent of the interface size.",
                 state.editor_font_size_input.clone(),
                 &theme,
             ))
@@ -304,13 +311,16 @@ fn theme_picker(state: &AppState, light: bool, cx: &mut Context<AppState>) -> im
         .position(|n| *n == current)
         .unwrap_or(usize::MAX);
 
-    let accent = cx.theme().accent;
+    let theme = cx.theme().clone();
+    let accent = theme.accent;
+    let chevron_sz = theme.scale(14.);
+    let check_sz = theme.scale(13.);
     let mut select = Select::new(if light { "pick-light" } else { "pick-dark" })
         .placeholder("Select a theme…")
         .selected(selected)
         .open(state.theme_select_open == Some(which))
-        .chevron(crate::icons::icon("chevron-down", px(14.), accent))
-        .check(crate::icons::icon("check", px(13.), accent));
+        .chevron(crate::icons::icon("chevron-down", chevron_sz, accent))
+        .check(crate::icons::icon("check", check_sz, accent));
     for name in &names {
         select = select.option(name.clone());
     }
@@ -344,6 +354,7 @@ fn font_picker(
 ) -> impl IntoElement {
     let current = match which {
         FontSelect::Ui => state.settings.appearance.ui_font_family.clone(),
+        FontSelect::UiMono => state.settings.appearance.ui_mono_family.clone(),
         FontSelect::Editor => state.settings.editor.font_family.clone(),
     };
 
@@ -363,15 +374,19 @@ fn font_picker(
 
     let id = match which {
         FontSelect::Ui => "pick-ui-font",
+        FontSelect::UiMono => "pick-ui-mono-font",
         FontSelect::Editor => "pick-editor-font",
     };
-    let accent = cx.theme().accent;
+    let theme = cx.theme().clone();
+    let accent = theme.accent;
+    let chevron_sz = theme.scale(14.);
+    let check_sz = theme.scale(13.);
     let mut select = Select::new(id)
         .placeholder("Select a font…")
         .selected(selected)
         .open(state.font_select_open == Some(which))
-        .chevron(crate::icons::icon("chevron-down", px(14.), accent))
-        .check(crate::icons::icon("check", px(13.), accent));
+        .chevron(crate::icons::icon("chevron-down", chevron_sz, accent))
+        .check(crate::icons::icon("check", check_sz, accent));
     for name in &names {
         select = select.option(name.clone());
     }
@@ -387,6 +402,7 @@ fn font_picker(
             if let Some(name) = pick_names.get(ix).cloned() {
                 pick_view.update(cx, |this, cx| match which {
                     FontSelect::Ui => this.set_ui_font_family(&name, cx),
+                    FontSelect::UiMono => this.set_ui_mono_family(&name, cx),
                     FontSelect::Editor => this.set_editor_font_family(&name, cx),
                 });
             }
@@ -438,13 +454,13 @@ fn theme_manage_row(
         .child(
             div()
                 .flex_1()
-                .text_sm()
+                .text_size(theme.scale(14.))
                 .text_color(theme.text)
                 .child(name_owned.clone()),
         )
         .child(
             div()
-                .text_xs()
+                .text_size(theme.scale(12.))
                 .text_color(theme.text_faint)
                 .child(if is_light { "light" } else { "dark" }),
         )
@@ -460,7 +476,11 @@ fn theme_manage_row(
                 .text_color(theme.text_faint)
                 .hover(|s| s.bg(theme.bg_hover).text_color(theme.red))
                 .on_click(cx.listener(move |this, _, _, cx| this.remove_theme(&name_owned, cx)))
-                .child(crate::icons::icon("trash", px(13.), theme.text_faint))
+                .child(crate::icons::icon(
+                    "trash",
+                    theme.scale(13.),
+                    theme.text_faint,
+                ))
                 .into_any_element()
         } else {
             div().w(px(20.)).into_any_element()
@@ -588,7 +608,7 @@ fn about_page(cx: &mut Context<AppState>) -> AnyElement {
             .child(
                 div()
                     .pb_2()
-                    .text_sm()
+                    .text_size(theme.scale(14.))
                     .text_color(theme.text_muted)
                     .child("RED — Roughly Enough Data, a fast, native database explorer."),
             )
@@ -597,7 +617,7 @@ fn about_page(cx: &mut Context<AppState>) -> AnyElement {
                 "Version",
                 "The installed application version.",
                 div()
-                    .text_sm()
+                    .text_size(theme.scale(14.))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(env!("CARGO_PKG_VERSION"))),
                 &theme,
@@ -612,7 +632,7 @@ fn about_page(cx: &mut Context<AppState>) -> AnyElement {
 fn file_hint(what: &str, theme: &Theme) -> impl IntoElement {
     div()
         .py_3()
-        .text_xs()
+        .text_size(theme.scale(12.))
         .text_color(theme.text_faint)
         .child(SharedString::from(format!(
             "{what} are configurable in settings.toml (Open settings file)."
@@ -627,7 +647,7 @@ fn settings_page_scaffold(title: &str, body: impl IntoElement, theme: &Theme) ->
         .child(
             div()
                 .pb_2()
-                .text_lg()
+                .text_size(theme.scale(18.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.text)
                 .child(SharedString::from(title.to_string())),
@@ -665,7 +685,7 @@ fn settings_header(title: &str, theme: &Theme) -> impl IntoElement {
     div()
         .pt_4()
         .pb_1()
-        .text_xs()
+        .text_size(theme.scale(12.))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(theme.text_faint)
         .child(SharedString::from(title.to_uppercase()))
@@ -723,14 +743,14 @@ fn setting_label(
         .min_w_0()
         .child(
             div()
-                .text_sm()
+                .text_size(theme.scale(14.))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme.text)
                 .child(title.into()),
         )
         .child(
             div()
-                .text_xs()
+                .text_size(theme.scale(12.))
                 .text_color(theme.text_muted)
                 .child(description.into()),
         )
