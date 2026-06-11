@@ -11,7 +11,6 @@ use gpui::{
 use red_core::DbKind;
 
 use crate::app::{AppState, FormState, TestState};
-use crate::assets::FONT_MONO;
 
 /// The six label colors a connection can be tagged with, mapped onto semantic
 /// theme tokens so they track the active theme. A connection stores the index.
@@ -238,7 +237,7 @@ impl AppState {
                     .bg(theme.bg_input)
                     .border_1()
                     .border_color(theme.border)
-                    .font_family(FONT_MONO)
+                    .font_family(theme.mono_family.clone())
                     .child("⌘N"),
             )
             .on_click(cx.listener(|this, _, _, cx| this.open_new_form(cx)))
@@ -336,7 +335,7 @@ impl AppState {
                         div()
                             .text_size(theme.scale(12.))
                             .text_color(theme.text_faint)
-                            .font_family(FONT_MONO)
+                            .font_family(theme.mono_family.clone())
                             .truncate()
                             .child(config.display_target()),
                     ),
@@ -730,7 +729,7 @@ impl AppState {
                         .min_w_0()
                         .text_size(theme.scale(11.5))
                         .text_color(color)
-                        .font_family(FONT_MONO)
+                        .font_family(theme.mono_family.clone())
                         .truncate()
                         .child(msg),
                 )
