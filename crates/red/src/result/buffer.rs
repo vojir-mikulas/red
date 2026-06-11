@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use gpui::SharedString;
 use red_core::Value;
 use red_service::{Command, CommandSender, RunFetch};
 
@@ -25,6 +26,30 @@ const FLING_ROWS: usize = 3 * PAGE;
 /// run-extension (which would chain seeks across the gap) and jumps — one
 /// key-space interpolated seek that replaces the run.
 const JUMP_GAP: usize = 2 * PAGE;
+
+/// Cap, in bytes, on a non-key cell's display text held resident in the buffer. A
+/// one-line grid cell only ever shows a few dozen characters, so a multi-megabyte
+/// `TEXT`/`JSON` column would otherwise pin hundreds of MB across the ~`2*MARGIN`
+/// resident rows for content no one can see. Over-cap text is truncated (with an
+/// ellipsis) and blobs are reduced to their `<N bytes>` summary the moment a row
+/// lands. The keyset key column is never capped — its value must round-trip
+/// exactly to seek the next page — and export streams from the driver untouched,
+/// so this bounds only what the grid keeps in RAM. Copying an over-cap cell yields
+/// the truncated text; for the full value, export.
+const CELL_DISPLAY_CAP: usize = 4096;
+
+/// Truncate `s` to at most [`CELL_DISPLAY_CAP`] bytes on a char boundary, marking
+/// the cut with an ellipsis.
+fn truncate_display(s: &str) -> String {
+    let mut end = CELL_DISPLAY_CAP.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + '…'.len_utf8());
+    out.push_str(&s[..end]);
+    out.push('…');
+    out
+}
 
 /// Physical rows the list (`uniform_list`) is laid out over at once. GPUI places
 /// each row at `index * row_height` in `f32`, which is only exact up to 2^24
@@ -49,6 +74,138 @@ static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn next_epoch() -> u64 {
     NEXT_EPOCH.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The value kind a result cell is painted as. Classified once when the row
+/// enters the buffer (not per frame), so the hot paint path only picks a color.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum CellKind {
+    /// NULL or an absent value — italic, faint.
+    Null,
+    /// Integer / real — accented (orange).
+    Num,
+    /// Plain text.
+    Text,
+    /// A canonical 8-4-4-4-12 hex UUID — dimmed like the design's id columns.
+    Uuid,
+    /// JSON-ish text (starts with `{` or `[`) — cyan.
+    Json,
+    /// A blob, rendered as its `<N bytes>` summary — faint.
+    Blob,
+}
+
+/// A render-ready cell: the display string (cheap to clone — an `Arc` bump, not a
+/// heap copy) plus its [`CellKind`] color tag. Built once per cell when its row
+/// lands in the buffer, so a repaint never re-formats a number, re-clones a
+/// string, or re-runs UUID/JSON classification.
+pub(super) struct DisplayCell {
+    pub(super) text: SharedString,
+    pub(super) kind: CellKind,
+}
+
+impl DisplayCell {
+    fn from_value(value: &Value) -> DisplayCell {
+        match value {
+            Value::Null => DisplayCell {
+                text: SharedString::new_static("NULL"),
+                kind: CellKind::Null,
+            },
+            Value::Integer(n) => DisplayCell {
+                text: n.to_string().into(),
+                kind: CellKind::Num,
+            },
+            Value::Real(x) => DisplayCell {
+                text: x.to_string().into(),
+                kind: CellKind::Num,
+            },
+            Value::Text(s) => {
+                let trimmed = s.trim_start();
+                let kind = if is_uuid(s) {
+                    CellKind::Uuid
+                } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                    CellKind::Json
+                } else {
+                    CellKind::Text
+                };
+                DisplayCell {
+                    text: s.clone().into(),
+                    kind,
+                }
+            }
+            Value::Blob(b) => DisplayCell {
+                text: format!("<{} bytes>", b.len()).into(),
+                kind: CellKind::Blob,
+            },
+        }
+    }
+}
+
+/// True for a canonical `8-4-4-4-12` hex UUID — dimmed like the design's id columns.
+fn is_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.as_bytes().iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+/// One buffered result row: the raw [`Value`]s (read for keyset seek bounds and
+/// TSV copy) alongside their pre-built [`DisplayCell`]s. The display is computed
+/// once here, on the page/run arrival, never on the paint path.
+pub(super) struct Row {
+    pub(super) values: Vec<Value>,
+    pub(super) display: Vec<DisplayCell>,
+}
+
+impl Row {
+    /// Build a resident row, classifying each cell's display once and bounding
+    /// the RAM a fat non-key cell can pin (see [`CELL_DISPLAY_CAP`]). `key_col`
+    /// names the keyset key column, whose value is kept verbatim so it can seek
+    /// the next page; in offset mode it is `None` and nothing is exempt.
+    fn new(values: Vec<Value>, key_col: Option<usize>) -> Row {
+        let mut stored = Vec::with_capacity(values.len());
+        let mut display = Vec::with_capacity(values.len());
+        for (i, value) in values.into_iter().enumerate() {
+            // The key column rides through untouched — its bytes round-trip as a
+            // seek bound, and it's never the megabyte payload we're guarding against.
+            if key_col == Some(i) {
+                display.push(DisplayCell::from_value(&value));
+                stored.push(value);
+                continue;
+            }
+            match value {
+                // A blob only ever renders as its byte count; drop the payload and
+                // keep just the summary (which is also what a copy yields).
+                Value::Blob(b) => {
+                    let summary = format!("<{} bytes>", b.len());
+                    display.push(DisplayCell {
+                        text: summary.clone().into(),
+                        kind: CellKind::Blob,
+                    });
+                    stored.push(Value::Text(summary));
+                }
+                // Oversized text: keep only the visible head, marked truncated.
+                Value::Text(s) if s.len() > CELL_DISPLAY_CAP => {
+                    let capped = Value::Text(truncate_display(&s));
+                    display.push(DisplayCell::from_value(&capped));
+                    stored.push(capped);
+                }
+                other => {
+                    display.push(DisplayCell::from_value(&other));
+                    stored.push(other);
+                }
+            }
+        }
+        Row {
+            values: stored,
+            display,
+        }
+    }
+
+    /// The value in column `col` (for reading a keyset boundary key).
+    fn key(&self, col: usize) -> Value {
+        self.values.get(col).cloned().unwrap_or(Value::Null)
+    }
 }
 
 /// The row buffer behind the grid. Two modes, chosen per open result:
@@ -86,7 +243,7 @@ impl Default for BufferMode {
 /// requests (so the same page isn't fetched twice).
 #[derive(Default)]
 pub(super) struct OffsetPages {
-    rows: HashMap<usize, Vec<Value>>,
+    rows: HashMap<usize, Row>,
     requested: HashSet<usize>,
 }
 
@@ -100,7 +257,7 @@ pub(super) struct KeyedRun {
     /// Ordinal of the run's first row. Exact after contiguous scroll from a
     /// known end; an estimate (`estimated`) after an interpolated jump.
     anchor: usize,
-    rows: VecDeque<Vec<Value>>,
+    rows: VecDeque<Row>,
     /// Ordinals are interpolation estimates (the gutter renders them with `≈`).
     /// Cleared whenever the run touches a true end of the result, which pins
     /// the anchor exactly again.
@@ -134,16 +291,12 @@ impl KeyedRun {
         }
     }
 
-    fn key_of(&self, row: &[Value]) -> Value {
-        row.get(self.key_col).cloned().unwrap_or(Value::Null)
-    }
-
     fn first_key(&self) -> Option<Value> {
-        self.rows.front().map(|r| self.key_of(r))
+        self.rows.front().map(|r| r.key(self.key_col))
     }
 
     fn last_key(&self) -> Option<Value> {
-        self.rows.back().map(|r| self.key_of(r))
+        self.rows.back().map(|r| r.key(self.key_col))
     }
 
     /// Trim the run to `lo..hi`. Popping an end forfeits its `at_*` flag — the
@@ -284,7 +437,9 @@ impl KeyedRun {
                     self.at_start = true;
                     self.estimated = false;
                 }
-                self.rows.extend(rows);
+                let key_col = self.key_col;
+                self.rows
+                    .extend(rows.into_iter().map(|r| Row::new(r, Some(key_col))));
                 self.at_end = short;
                 if short {
                     // The run now touches the true last row, so its ordinals
@@ -300,7 +455,7 @@ impl KeyedRun {
                 // Rows arrive descending; pushing each to the front restores
                 // ascending order.
                 for row in rows {
-                    self.rows.push_front(row);
+                    self.rows.push_front(Row::new(row, Some(self.key_col)));
                 }
                 self.anchor = self.anchor.saturating_sub(n);
                 if short || self.anchor == 0 {
@@ -311,7 +466,11 @@ impl KeyedRun {
                 }
             }
             RunFetch::Jump { ordinal, .. } => {
-                self.rows = rows.into();
+                let key_col = self.key_col;
+                self.rows = rows
+                    .into_iter()
+                    .map(|r| Row::new(r, Some(key_col)))
+                    .collect();
                 self.at_end = short;
                 self.estimated = estimated;
                 self.anchor = if short {
@@ -327,8 +486,8 @@ impl KeyedRun {
 }
 
 impl GridBuffer {
-    /// The cells at ordinal `ix`, if resident.
-    pub(super) fn row(&self, ix: usize) -> Option<&Vec<Value>> {
+    /// The row at ordinal `ix`, if resident.
+    pub(super) fn row(&self, ix: usize) -> Option<&Row> {
         match &self.mode {
             BufferMode::Offset(pages) => pages.rows.get(&ix),
             BufferMode::Keyed(run) => ix.checked_sub(run.anchor).and_then(|i| run.rows.get(i)),
@@ -366,7 +525,7 @@ impl GridBuffer {
         if let BufferMode::Offset(pages) = &mut self.mode {
             pages.requested.remove(&(offset / PAGE));
             for (i, row) in rows.into_iter().enumerate() {
-                pages.rows.insert(offset + i, row);
+                pages.rows.insert(offset + i, Row::new(row, None));
             }
         }
     }
@@ -587,6 +746,56 @@ mod window_tests {
 }
 
 #[cfg(test)]
+mod row_tests {
+    use super::*;
+
+    /// A fat non-key cell is truncated in the resident buffer, but the keyset key
+    /// column rides through verbatim so it can still seek the next page.
+    #[test]
+    fn caps_non_key_cells_but_keeps_the_key_exact() {
+        let big = "x".repeat(CELL_DISPLAY_CAP * 4);
+        let key = "k".repeat(CELL_DISPLAY_CAP * 4);
+        let row = Row::new(
+            vec![Value::Text(key.clone()), Value::Text(big.clone())],
+            Some(0),
+        );
+        // Key column (0): untouched — exact round-trip for seeks.
+        assert_eq!(row.key(0), Value::Text(key));
+        // Non-key column (1): truncated to the cap (+ ellipsis), under the original.
+        match &row.values[1] {
+            Value::Text(s) => {
+                assert!(s.len() <= CELL_DISPLAY_CAP + '…'.len_utf8());
+                assert!(s.ends_with('…'));
+            }
+            other => panic!("expected truncated text, got {other:?}"),
+        }
+    }
+
+    /// A blob is reduced to its byte-count summary the moment it lands — the bytes
+    /// never sit resident in the grid buffer.
+    #[test]
+    fn blobs_drop_to_their_byte_summary() {
+        let row = Row::new(vec![Value::Integer(1), Value::Blob(vec![0u8; 1_000])], None);
+        assert_eq!(row.display[1].kind, CellKind::Blob);
+        assert_eq!(row.display[1].text.as_ref(), "<1000 bytes>");
+        // The resident value carries only the summary string, not the payload.
+        assert_eq!(row.values[1], Value::Text("<1000 bytes>".into()));
+    }
+
+    /// Small cells pass through unchanged.
+    #[test]
+    fn small_cells_are_untouched() {
+        let row = Row::new(
+            vec![Value::Integer(7), Value::Text("hello".into())],
+            Some(0),
+        );
+        assert_eq!(row.values[1], Value::Text("hello".into()));
+        assert_eq!(row.display[1].text.as_ref(), "hello");
+        assert_eq!(row.display[1].kind, CellKind::Text);
+    }
+}
+
+#[cfg(test)]
 mod keyed_run_tests {
     use super::*;
 
@@ -597,6 +806,12 @@ mod keyed_run_tests {
 
     fn rows(ids: impl IntoIterator<Item = i64>) -> Vec<Vec<Value>> {
         ids.into_iter().map(row).collect()
+    }
+
+    /// The same rows as resident [`Row`]s — for seeding a run's buffer directly,
+    /// as an arrived page would after `Row::new`.
+    fn run_rows(ids: impl IntoIterator<Item = i64>) -> VecDeque<Row> {
+        ids.into_iter().map(|id| Row::new(row(id), Some(0))).collect()
     }
 
     /// A run pretending its in-flight request is `seq` (as `issue` would set).
@@ -644,7 +859,7 @@ mod keyed_run_tests {
         // anchor re-pins so the run ends exactly at `total`.
         run.anchor = 9_950;
         run.estimated = true;
-        run.rows = rows(99_001..=99_010).into();
+        run.rows = run_rows(99_001..=99_010);
         run.apply(
             RunFetch::Forward {
                 after: Some(Value::Integer(99_010)),
@@ -663,7 +878,7 @@ mod keyed_run_tests {
     fn backward_prepends_descending_rows_in_order() {
         let mut run = pending(KeyedRun::new(0), 1);
         run.anchor = 500;
-        run.rows = rows(501..=700).into();
+        run.rows = run_rows(501..=700);
         let page = 501 - PAGE as i64..=500;
         run.apply(
             RunFetch::Backward {
@@ -676,7 +891,7 @@ mod keyed_run_tests {
         );
         assert_eq!(run.anchor, 500 - PAGE);
         assert!(!run.at_start, "a full page doesn't touch the start");
-        let head: Vec<_> = run.rows.iter().take(2).map(|r| r[0].clone()).collect();
+        let head: Vec<_> = run.rows.iter().take(2).map(|r| r.values[0].clone()).collect();
         assert_eq!(
             head,
             vec![
@@ -685,8 +900,8 @@ mod keyed_run_tests {
             ]
         );
         // The run stays contiguous across the seam.
-        assert_eq!(run.rows[PAGE - 1][0], Value::Integer(500));
-        assert_eq!(run.rows[PAGE][0], Value::Integer(501));
+        assert_eq!(run.rows[PAGE - 1].values[0], Value::Integer(500));
+        assert_eq!(run.rows[PAGE].values[0], Value::Integer(501));
     }
 
     #[test]
@@ -694,7 +909,7 @@ mod keyed_run_tests {
         let mut run = pending(KeyedRun::new(0), 1);
         run.anchor = 80; // estimate was high — only 3 rows actually precede
         run.estimated = true;
-        run.rows = rows(4..=10).into();
+        run.rows = run_rows(4..=10);
         run.apply(
             RunFetch::Backward {
                 before: Value::Integer(4),
@@ -712,7 +927,7 @@ mod keyed_run_tests {
     fn jump_replaces_the_run_with_estimated_ordinals() {
         let mut run = pending(KeyedRun::new(0), 1);
         run.anchor = 0;
-        run.rows = rows(1..=200).into();
+        run.rows = run_rows(1..=200);
         run.apply(
             RunFetch::Jump {
                 ordinal: 6_700,
@@ -731,7 +946,7 @@ mod keyed_run_tests {
     #[test]
     fn stale_replies_are_dropped() {
         let mut run = pending(KeyedRun::new(0), 2);
-        run.rows = rows(1..=10).into();
+        run.rows = run_rows(1..=10);
 
         // Wrong seq: a reply for a superseded request.
         run.apply(
@@ -767,7 +982,7 @@ mod keyed_run_tests {
         let mut run = KeyedRun::new(0);
         run.anchor = 0;
         run.at_start = true;
-        run.rows = rows(1..=1000).into();
+        run.rows = run_rows(1..=1000);
         run.evict(300, 800);
         assert_eq!(run.anchor, 300);
         assert_eq!(run.rows.len(), 500);

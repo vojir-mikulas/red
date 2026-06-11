@@ -266,7 +266,7 @@ impl ResultGrid {
                 if i > 0 {
                     out.push('\t');
                 }
-                if let Some(value) = buffer.row(r).and_then(|row| row.get(dcol)) {
+                if let Some(value) = buffer.row(r).and_then(|row| row.values.get(dcol)) {
                     out.push_str(&cell_string(value));
                 }
             }

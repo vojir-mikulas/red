@@ -4,8 +4,9 @@
 
 use flint::prelude::*;
 use gpui::{div, prelude::*, px, Hsla};
-use red_core::{ExportFormat, Value};
+use red_core::ExportFormat;
 
+use super::buffer::{CellKind, DisplayCell};
 use crate::app::{ActiveConn, AppState};
 use crate::assets::FONT_MONO;
 
@@ -46,48 +47,24 @@ struct CellColors {
     faint: Hsla,
 }
 
-/// True for a canonical `8-4-4-4-12` hex UUID — dimmed like the design's id columns.
-fn is_uuid(s: &str) -> bool {
-    s.len() == 36
-        && s.as_bytes().iter().enumerate().all(|(i, b)| match i {
-            8 | 13 | 18 | 23 => *b == b'-',
-            _ => b.is_ascii_hexdigit(),
-        })
-}
-
-/// One grid cell, colored by value kind (NULL italic-faint, numbers accented,
-/// UUIDs dimmed, JSON-ish text cyan — mirroring the design's typed cells).
-fn render_cell(value: Option<&Value>, c: CellColors) -> gpui::AnyElement {
-    match value {
-        None | Some(Value::Null) => div()
-            .italic()
-            .text_color(c.faint)
-            .child("NULL")
-            .into_any_element(),
-        Some(Value::Integer(n)) => div()
-            .text_color(c.num)
-            .child(n.to_string())
-            .into_any_element(),
-        Some(Value::Real(x)) => div()
-            .text_color(c.num)
-            .child(x.to_string())
-            .into_any_element(),
-        Some(Value::Text(s)) => {
-            let trimmed = s.trim_start();
-            let color = if is_uuid(s) {
-                c.muted
-            } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
-                c.cyan
-            } else {
-                c.text
-            };
-            div().text_color(color).child(s.clone()).into_any_element()
-        }
-        Some(Value::Blob(b)) => div()
-            .text_color(c.faint)
-            .child(format!("<{} bytes>", b.len()))
-            .into_any_element(),
-    }
+/// One grid cell, colored by its pre-classified [`CellKind`] (NULL italic-faint,
+/// numbers accented, UUIDs dimmed, JSON-ish text cyan — mirroring the design's
+/// typed cells). The display string and kind were computed once when the row
+/// landed in the buffer, so this only picks a color and clones a `SharedString`
+/// (an `Arc` bump) — no per-frame formatting, copying, or classification.
+fn render_cell(cell: &DisplayCell, c: CellColors) -> gpui::AnyElement {
+    let color = match cell.kind {
+        CellKind::Null | CellKind::Blob => c.faint,
+        CellKind::Num => c.num,
+        CellKind::Text => c.text,
+        CellKind::Uuid => c.muted,
+        CellKind::Json => c.cyan,
+    };
+    div()
+        .text_color(color)
+        .when(cell.kind == CellKind::Null, |d| d.italic())
+        .child(cell.text.clone())
+        .into_any_element()
 }
 
 impl AppState {
@@ -318,7 +295,11 @@ impl AppState {
                 match buffer.row(abs) {
                     Some(row) => {
                         for c in 0..ncols {
-                            out.push(render_cell(row.get(c), cell_colors));
+                            match row.display.get(c) {
+                                Some(cell) => out.push(render_cell(cell, cell_colors)),
+                                None => out
+                                    .push(div().text_color(faint).child("·").into_any_element()),
+                            }
                         }
                     }
                     None => {
