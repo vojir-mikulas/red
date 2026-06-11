@@ -252,6 +252,11 @@ pub struct AppState {
     pub(crate) theme_select_open: Option<ThemeSelect>,
     /// Which font-family picker dropdown is open in the panel, if any.
     pub(crate) font_select_open: Option<FontSelect>,
+    /// Installed font families, sorted + deduped. Enumerating these hits the OS
+    /// text system (a CoreText scan of hundreds of faces) — far too slow to do
+    /// per render, so the Appearance panel reads this cache. Filled lazily when
+    /// the settings panel first opens; fonts don't change during a session.
+    pub(crate) font_names_cache: Option<Vec<String>>,
     /// Whether a repaint ticker is already running for the live query timer, so
     /// concurrent opens don't stack duplicate tickers.
     pub(crate) query_ticking: bool,
@@ -378,6 +383,7 @@ impl AppState {
             themes,
             theme_select_open: None,
             font_select_open: None,
+            font_names_cache: None,
             query_ticking: false,
             connect_gen: 0,
             root_focus: cx.focus_handle(),
@@ -984,7 +990,20 @@ impl AppState {
 
     pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = true;
+        // Warm the font-name cache once, off the render path (the Appearance tab
+        // would otherwise re-enumerate every installed face on every frame).
+        if self.font_names_cache.is_none() {
+            let mut names = cx.text_system().all_font_names();
+            names.sort_unstable();
+            names.dedup();
+            self.font_names_cache = Some(names);
+        }
         cx.notify();
+    }
+
+    /// The cached sorted/deduped installed font families (see [`Self::open_settings`]).
+    pub(crate) fn font_names(&self) -> &[String] {
+        self.font_names_cache.as_deref().unwrap_or(&[])
     }
 
     pub(crate) fn close_settings(&mut self, cx: &mut Context<Self>) {

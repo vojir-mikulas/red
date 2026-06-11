@@ -272,13 +272,19 @@ impl AppState {
                 // gate), so we ignore moves whose cursor isn't over this tab —
                 // only the hovered tab gets to set the gap.
                 .on_drag_move::<TabDrag>(move |e, _window, cx| {
-                    let left = e.bounds.origin.x;
-                    let right = left + e.bounds.size.width;
-                    let x = e.event.position.x;
-                    if x < left || x >= right {
+                    let b = e.bounds;
+                    let p = e.event.position;
+                    // Must be over this tab in *both* axes — checking x alone
+                    // would keep re-setting the gap while dragging straight down
+                    // off the strip, leaving a stale indicator.
+                    if p.x < b.origin.x
+                        || p.x >= b.origin.x + b.size.width
+                        || p.y < b.origin.y
+                        || p.y >= b.origin.y + b.size.height
+                    {
                         return;
                     }
-                    let gap = if x < left + e.bounds.size.width / 2. {
+                    let gap = if p.x < b.origin.x + b.size.width / 2. {
                         i
                     } else {
                         i + 1
@@ -342,17 +348,20 @@ impl AppState {
         });
         let strip_drop_view = view.clone();
         let strip_move_view = view.clone();
-        let tabstrip = div()
+        // The tabs live in a horizontally scrollable viewport, so a crowded
+        // strip scrolls instead of squashing the tabs. `min_w(0)` lets the
+        // flex child shrink below its content width so the overflow engages.
+        let tab_viewport = div()
             .id("sql-tabstrip")
-            .flex_shrink_0()
-            .h(px(35.))
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
             .flex()
             .items_stretch()
-            .bg(bg_panel)
-            .border_b_1()
-            .border_color(border)
-            // Capture phase runs the strip before its tabs, so this clears the
-            // indicator whenever the cursor isn't over the strip; a tab the
+            .overflow_x_scroll()
+            .track_scroll(&active.tab_scroll)
+            // Capture phase runs the viewport before its tabs, so this clears
+            // the indicator whenever the cursor isn't over the strip; a tab the
             // cursor *is* over then re-sets the gap. Net: the indicator only
             // shows while dragging within the tab bar.
             .on_drag_move::<TabDrag>(move |e, _window, cx| {
@@ -368,23 +377,36 @@ impl AppState {
                         .ok();
                 }
             })
-            // Release anywhere in the strip (over the "＋" or trailing space)
-            // commits using the gap the hovered tab last set. Harmless if a tab
-            // already handled the drop — `drop_tab` consumes the target once.
+            // Release anywhere in the strip (incl. the trailing space) commits
+            // using the gap the hovered tab last set. Harmless if a tab already
+            // handled the drop — `drop_tab` consumes the target once.
             .on_drop::<TabDrag>(move |drag, _window, cx| {
                 let from = drag.0;
                 strip_drop_view
                     .update(cx, |this, cx| this.drop_tab(from, cx))
                     .ok();
             })
-            .children(tabs)
+            .children(tabs);
+        // The "＋" stays pinned right of the scrolling tabs, always reachable.
+        let tabstrip = div()
+            .flex_shrink_0()
+            .h(px(35.))
+            .flex()
+            .items_stretch()
+            .bg(bg_panel)
+            .border_b_1()
+            .border_color(border)
+            .child(tab_viewport)
             .child(
                 div()
                     .id("sql-new")
+                    .flex_shrink_0()
                     .w(px(34.))
                     .flex()
                     .items_center()
                     .justify_center()
+                    .border_l_1()
+                    .border_color(border)
                     .cursor_pointer()
                     .text_color(faint)
                     .hover(|s| s.bg(bg_elevated).text_color(text))

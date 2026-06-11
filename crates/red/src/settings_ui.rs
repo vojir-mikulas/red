@@ -358,9 +358,10 @@ fn font_picker(
         FontSelect::Editor => state.settings.editor.font_family.clone(),
     };
 
-    let mut names = cx.text_system().all_font_names();
-    names.sort_unstable();
-    names.dedup();
+    // Read the warmed cache (see `AppState::open_settings`) — never re-enumerate
+    // the OS font list on the render path; it's a slow CoreText scan and the
+    // Appearance tab would pay it twice per frame while scrolling.
+    let mut names = state.font_names().to_vec();
     // The configured family may not be installed (a file edit referencing a font
     // from another machine) — keep it selectable so it isn't silently dropped.
     if !names.contains(&current) {
