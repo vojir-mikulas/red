@@ -445,9 +445,10 @@ impl AppState {
             .line_height(px(ed.font_size * ed.line_height))
             .child(active.active().editor.clone());
 
-        // --- bottom run bar: Run · history · hint · read-only · endpoint ---
+        // --- bottom run bar: Run · history · ……… · read-only ---
         let ro_chip = active.config.read_only.then(|| {
             div()
+                .ml_auto()
                 .flex()
                 .items_center()
                 .px_2()
@@ -487,21 +488,7 @@ impl AppState {
                     .size(ButtonSize::Sm)
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx))),
             )
-            .child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(dim)
-                    .child("Press ⌘↵ to execute"),
-            )
-            .children(ro_chip)
-            .child(
-                div()
-                    .ml_auto()
-                    .font_family(FONT_MONO)
-                    .text_size(px(11.))
-                    .text_color(dim)
-                    .child(active.config.display_target()),
-            );
+            .children(ro_chip);
 
         let history = active.active().history_open.then(|| {
             let list: Vec<_> = active.active().history.clone();
