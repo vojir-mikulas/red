@@ -259,23 +259,41 @@ impl ResultGrid {
         }
     }
 
-    /// The current selection as TSV (NULL → empty), skipping the gutter column.
-    /// Unloaded cells contribute blanks rather than blocking the copy.
-    fn selection_tsv(&self) -> Option<String> {
+    /// How to satisfy a copy of the current selection (NULL → empty, gutter
+    /// column skipped). When every selected cell is resident and untruncated the
+    /// clipboard text is built straight from the buffer ([`CopyPlan::Ready`]);
+    /// when the selection touches a cell the grid clipped for display, the rows
+    /// must be re-fetched in full first ([`CopyPlan::Refetch`]). `None` when the
+    /// selection is empty or covers only the gutter.
+    fn copy_plan(&self) -> Option<CopyPlan> {
         let (r0, c0, r1, c1) = self.selection?.bounds();
         let ncol = self.columns.len();
         let dc0 = c0.max(1);
         if dc0 > c1 {
             return None;
         }
+        let dcol_lo = dc0 - 1;
+        let dcol_hi = (c1 - 1).min(ncol.saturating_sub(1));
         let buffer = self.buffer.borrow();
+        // A selected, resident cell whose stored text is a clipped stand-in forces
+        // a full re-fetch; otherwise the buffer already holds the real values.
+        let clipped = (r0..=r1).any(|r| {
+            buffer
+                .row(r)
+                .is_some_and(|row| (dcol_lo..=dcol_hi).any(|c| row.is_truncated(c)))
+        });
+        if clipped {
+            return Some(CopyPlan::Refetch {
+                epoch: self.epoch,
+                offset: r0,
+                limit: r1 - r0 + 1,
+                dcol_lo,
+                dcol_hi,
+            });
+        }
         let mut out = String::new();
         for r in r0..=r1 {
-            for (i, tc) in (dc0..=c1).enumerate() {
-                let dcol = tc - 1;
-                if dcol >= ncol {
-                    continue;
-                }
+            for (i, dcol) in (dcol_lo..=dcol_hi).enumerate() {
                 if i > 0 {
                     out.push('\t');
                 }
@@ -285,8 +303,53 @@ impl ResultGrid {
             }
             out.push('\n');
         }
-        Some(out)
+        Some(CopyPlan::Ready(out))
     }
+}
+
+/// A copy awaiting its full-row re-fetch (see [`CopyPlan::Refetch`]). Holds the
+/// selected data-column span so the [`Event::CopyRowsLoaded`] reply can be turned
+/// into the clipboard text.
+///
+/// [`Event::CopyRowsLoaded`]: red_service::Event::CopyRowsLoaded
+pub(crate) struct PendingCopy {
+    pub(crate) id: u64,
+    pub(crate) dcol_lo: usize,
+    pub(crate) dcol_hi: usize,
+}
+
+/// How [`ResultGrid::copy_plan`] resolves a selection copy.
+pub(crate) enum CopyPlan {
+    /// Ready to copy now — the assembled TSV.
+    Ready(String),
+    /// The selection holds display-clipped cells; re-fetch the rows in full
+    /// (`CopyRows`) and assemble the clipboard text from the reply. `dcol_lo..=dcol_hi`
+    /// are the selected data columns (the re-fetched rows carry every column).
+    Refetch {
+        epoch: u64,
+        offset: usize,
+        limit: usize,
+        dcol_lo: usize,
+        dcol_hi: usize,
+    },
+}
+
+/// Assemble TSV from freshly re-fetched rows over data columns `dcol_lo..=dcol_hi`
+/// (NULL → empty) — the [`CopyPlan::Refetch`] counterpart to the buffer path.
+pub(crate) fn rows_tsv(rows: &[Vec<Value>], dcol_lo: usize, dcol_hi: usize) -> String {
+    let mut out = String::new();
+    for row in rows {
+        for (i, dcol) in (dcol_lo..=dcol_hi).enumerate() {
+            if i > 0 {
+                out.push('\t');
+            }
+            if let Some(value) = row.get(dcol) {
+                out.push_str(&cell_string(value));
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Position the virtual-scroll window so absolute ordinal `target` sits at the
@@ -637,12 +700,55 @@ impl AppState {
     }
 
     pub(crate) fn copy_result_selection(&mut self, cx: &mut Context<Self>) {
-        let tsv = match &self.phase {
-            Phase::Connected(active) => active.active_result().and_then(ResultGrid::selection_tsv),
+        let plan = match &self.phase {
+            Phase::Connected(active) => active.active_result().and_then(ResultGrid::copy_plan),
             _ => None,
         };
-        if let Some(tsv) = tsv {
-            cx.write_to_clipboard(ClipboardItem::new_string(tsv));
+        match plan {
+            // Everything selected is resident in full — copy straight away.
+            Some(CopyPlan::Ready(tsv)) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(tsv));
+            }
+            // The selection touches display-clipped text; re-fetch the rows in
+            // full, then `on_copy_rows` assembles the clipboard from the reply.
+            Some(CopyPlan::Refetch {
+                epoch,
+                offset,
+                limit,
+                dcol_lo,
+                dcol_hi,
+            }) => {
+                let id = self.next_copy_id;
+                self.next_copy_id += 1;
+                self.pending_copy = Some(PendingCopy {
+                    id,
+                    dcol_lo,
+                    dcol_hi,
+                });
+                self.service.send(Command::CopyRows {
+                    offset,
+                    limit,
+                    epoch,
+                    id,
+                });
+            }
+            None => {}
         }
+    }
+
+    /// A `CopyRows` reply landed: if it's the copy still pending, assemble the
+    /// untruncated selection and put it on the clipboard. A superseded reply (the
+    /// user copied again before this returned) finds a stale id and is dropped.
+    pub(crate) fn on_copy_rows(
+        &mut self,
+        id: u64,
+        rows: Vec<Vec<Value>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.pending_copy.take_if(|p| p.id == id) else {
+            return;
+        };
+        let tsv = rows_tsv(&rows, pending.dcol_lo, pending.dcol_hi);
+        cx.write_to_clipboard(ClipboardItem::new_string(tsv));
     }
 }

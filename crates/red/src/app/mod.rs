@@ -276,6 +276,13 @@ pub struct AppState {
     /// Monotonic id source for exports, so progress / finished / cancelled events
     /// and a `CancelExport` route to the right in-flight export.
     pub(crate) next_export_id: u64,
+    /// Monotonic id source for clipboard re-fetches, matching a `CopyRowsLoaded`
+    /// reply to the copy that asked for it.
+    pub(crate) next_copy_id: u64,
+    /// A copy of a selection that touches display-clipped text, waiting on its
+    /// full-row re-fetch (`CopyRows`). The latest copy wins; an earlier reply is
+    /// then stale and dropped.
+    pub(crate) pending_copy: Option<crate::result::PendingCopy>,
     /// A destructive statement awaiting the user's confirmation before it runs.
     pub(crate) confirm_exec: Option<String>,
     /// A non-pristine query tab the user asked to close, awaiting confirmation.
@@ -466,6 +473,8 @@ impl AppState {
             notifications: Vec::new(),
             next_notification_id: 0,
             next_export_id: 0,
+            next_copy_id: 0,
+            pending_copy: None,
             confirm_exec: None,
             confirm_close_tab: None,
             settings,
@@ -696,6 +705,7 @@ impl AppState {
                 seq,
             } => self.on_result_run(epoch, fetch, rows, estimated, seq, cx),
             Event::ResultRunFailed { epoch, seq } => self.on_result_run_failed(epoch, seq),
+            Event::CopyRowsLoaded { id, rows } => self.on_copy_rows(id, rows, cx),
 
             // --- export & writes ---
             Event::Executed { affected } => {

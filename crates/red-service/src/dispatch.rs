@@ -409,6 +409,33 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 });
             }
 
+            Command::CopyRows {
+                offset,
+                limit,
+                epoch,
+                id,
+            } => {
+                let Some(driver) = session.clone() else {
+                    emit(&events, Event::Error("not connected".into()));
+                    continue;
+                };
+                // Stale epoch (tab closed / re-sorted) — drop, like `FetchPage`.
+                let Some(sql) = lock(&results).get(&epoch).map(|s| s.sql.clone()) else {
+                    continue;
+                };
+                // Same windowed read as a page fetch, but the rows are full (the
+                // grid's display cap never reaches here) and routed to the clipboard.
+                let events = events.clone();
+                let limit_src = page_fetch_limit.clone();
+                tokio::spawn(async move {
+                    let _permit = limit_src.acquire_owned().await;
+                    match driver.fetch_page(&sql, offset, limit).await {
+                        Ok(page) => emit(&events, Event::CopyRowsLoaded { id, rows: page.rows }),
+                        Err(e) => emit(&events, Event::Error(e.to_string())),
+                    }
+                });
+            }
+
             Command::CloseResult { epoch } => {
                 lock(&results).remove(&epoch);
             }

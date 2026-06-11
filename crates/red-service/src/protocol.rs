@@ -69,6 +69,19 @@ pub enum Command {
         limit: usize,
         seq: u64,
     },
+    /// Re-fetch a contiguous row range of an open result *in full*, for a copy
+    /// whose selection holds cells the grid clipped for display. The grid buffer
+    /// caps fat text per resident row, so its copy would otherwise hand over the
+    /// clipped head; this pulls the rows fresh (like a page fetch, but routed to
+    /// the clipboard via `CopyRowsLoaded` rather than into the buffer). `id`
+    /// matches the reply to the pending copy. Like `FetchPage`, a stale epoch is
+    /// ignored.
+    CopyRows {
+        offset: usize,
+        limit: usize,
+        epoch: u64,
+        id: u64,
+    },
     /// Drop an open result (its query tab closed, or it was re-sorted into a new
     /// epoch). Unknown epochs are a no-op.
     CloseResult {
@@ -172,6 +185,12 @@ pub enum Event {
         rows: Vec<Vec<red_core::Value>>,
         estimated: bool,
         seq: u64,
+    },
+    /// The full rows for a `CopyRows` request. Echoes `id` so the UI matches it
+    /// to the pending copy and writes the untruncated selection to the clipboard.
+    CopyRowsLoaded {
+        id: u64,
+        rows: Vec<Vec<red_core::Value>>,
     },
     /// A `FetchRun` failed (the error itself is also surfaced via `Error`).
     /// Echoed so the grid can free its in-flight slot — without this a single

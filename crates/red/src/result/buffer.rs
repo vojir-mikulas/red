@@ -155,6 +155,11 @@ fn is_uuid(s: &str) -> bool {
 pub(super) struct Row {
     pub(super) values: Vec<Value>,
     pub(super) display: Vec<DisplayCell>,
+    /// Data-column indices whose stored value is a display stand-in, not the real
+    /// cell: text clipped to [`CELL_DISPLAY_CAP`]. Empty for the common row (no
+    /// allocation). A copy that touches one of these re-fetches the row in full
+    /// rather than handing over the clipped text (see `ResultGrid::copy_plan`).
+    pub(super) truncated: Vec<usize>,
 }
 
 impl Row {
@@ -165,6 +170,7 @@ impl Row {
     fn new(values: Vec<Value>, key_col: Option<usize>) -> Row {
         let mut stored = Vec::with_capacity(values.len());
         let mut display = Vec::with_capacity(values.len());
+        let mut truncated = Vec::new();
         for (i, value) in values.into_iter().enumerate() {
             // The key column rides through untouched — its bytes round-trip as a
             // seek bound, and it's never the megabyte payload we're guarding against.
@@ -184,11 +190,13 @@ impl Row {
                     });
                     stored.push(Value::Text(summary));
                 }
-                // Oversized text: keep only the visible head, marked truncated.
+                // Oversized text: keep only the visible head, marked truncated so
+                // a copy of this cell re-fetches the full value instead of the head.
                 Value::Text(s) if s.len() > CELL_DISPLAY_CAP => {
                     let capped = Value::Text(truncate_display(&s));
                     display.push(DisplayCell::from_value(&capped));
                     stored.push(capped);
+                    truncated.push(i);
                 }
                 other => {
                     display.push(DisplayCell::from_value(&other));
@@ -199,12 +207,19 @@ impl Row {
         Row {
             values: stored,
             display,
+            truncated,
         }
     }
 
     /// The value in column `col` (for reading a keyset boundary key).
     fn key(&self, col: usize) -> Value {
         self.values.get(col).cloned().unwrap_or(Value::Null)
+    }
+
+    /// Whether data column `col`'s stored value is a clipped display stand-in
+    /// rather than the real cell (see [`Row::truncated`]).
+    pub(super) fn is_truncated(&self, col: usize) -> bool {
+        self.truncated.contains(&col)
     }
 }
 
@@ -800,8 +815,28 @@ mod row_tests {
         }
     }
 
+    /// Only the clipped text cell is flagged truncated — that flag is what sends a
+    /// copy of it back to the driver for the full value (see `copy_plan`). The key
+    /// column rides through verbatim, so it is never flagged.
+    #[test]
+    fn only_clipped_text_is_flagged_truncated() {
+        let big = "x".repeat(CELL_DISPLAY_CAP * 4);
+        let row = Row::new(
+            vec![
+                Value::Text(big.clone()), // col 0: key — kept verbatim
+                Value::Text(big),         // col 1: clipped
+                Value::Text("small".into()),
+            ],
+            Some(0),
+        );
+        assert!(!row.is_truncated(0), "the key column is never clipped");
+        assert!(row.is_truncated(1), "the fat non-key cell is clipped");
+        assert!(!row.is_truncated(2), "a small cell is untouched");
+    }
+
     /// A blob is reduced to its byte-count summary the moment it lands — the bytes
-    /// never sit resident in the grid buffer.
+    /// never sit resident in the grid buffer. The summary is the intended clipboard
+    /// form, so a blob is not flagged for a full re-fetch.
     #[test]
     fn blobs_drop_to_their_byte_summary() {
         let row = Row::new(vec![Value::Integer(1), Value::Blob(vec![0u8; 1_000])], None);
@@ -809,6 +844,7 @@ mod row_tests {
         assert_eq!(row.display[1].text.as_ref(), "<1000 bytes>");
         // The resident value carries only the summary string, not the payload.
         assert_eq!(row.values[1], Value::Text("<1000 bytes>".into()));
+        assert!(!row.is_truncated(1), "a blob copies as its summary, not re-fetched");
     }
 
     /// Small cells pass through unchanged.
