@@ -3,7 +3,7 @@
 //! result grid. The split sizes are caller-owned state on [`ActiveConn`].
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Axis, Context, WindowControlArea};
+use gpui::{div, prelude::*, px, Axis, Context, Window, WindowControlArea};
 
 /// Left inset of the top bar. On macOS it clears the seamless traffic lights
 /// overlapping this strip; elsewhere the native caption bar is separate, so only
@@ -19,6 +19,7 @@ impl AppState {
     pub(crate) fn render_shell(
         &self,
         active: &ActiveConn,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         // Owned snapshot so building the pane contents below (which borrow `cx`
@@ -29,7 +30,7 @@ impl AppState {
         // Pane contents: SQL editor · result grid. The schema explorer is built
         // below, only when the sidebar is shown.
         let editor_pane = self.render_editor(active, cx);
-        let results_pane = self.render_result(active, cx);
+        let results_pane = self.render_result(active, window, cx);
 
         let config = &active.config;
 
@@ -149,7 +150,7 @@ impl AppState {
         let body = if active.sidebar_collapsed {
             div().flex_1().min_h(px(0.)).child(inner)
         } else {
-            let schema_pane = self.render_schema(active, cx);
+            let schema_pane = self.render_schema(active, window, cx);
             let start = view.clone();
             let resize = view.clone();
             let end = view.clone();

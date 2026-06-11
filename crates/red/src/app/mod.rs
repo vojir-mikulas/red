@@ -160,9 +160,14 @@ impl QueryTab {
                 .highlighter(crate::sql::tokenize)
                 .with_content(EMPTY_QUERY)
         });
-        // ⌘↵ in the (focused) editor runs the active tab's statement / selection.
-        cx.subscribe(&editor, |this, _editor, _event: &CodeEditorEvent, cx| {
-            this.run_editor_query(cx)
+        // ⌘↵ runs the active tab's statement / selection; Esc (with no completion
+        // open) jumps focus to the result grid, so run → inspect is a keyboard loop.
+        cx.subscribe(&editor, |this, _editor, event: &CodeEditorEvent, cx| match event {
+            CodeEditorEvent::Run => this.run_editor_query(cx),
+            CodeEditorEvent::Escape => {
+                this.pending_focus = Some(Pane::Grid);
+                cx.notify();
+            }
         })
         .detach();
 
@@ -215,6 +220,10 @@ pub(crate) struct ActiveConn {
     pub grid_focus: FocusHandle,
     /// Which pane currently holds focus — drives focus cycling and the pane ring.
     pub active_pane: Pane,
+    /// Focus anchor for the open history popover, and the keyboard-highlighted
+    /// entry within it.
+    pub history_focus: FocusHandle,
+    pub history_sel: usize,
 }
 
 impl ActiveConn {
@@ -237,6 +246,8 @@ impl ActiveConn {
             schema_focus: cx.focus_handle(),
             grid_focus: cx.focus_handle(),
             active_pane: Pane::Editor,
+            history_focus: cx.focus_handle(),
+            history_sel: 0,
         }
     }
 
@@ -358,6 +369,19 @@ pub struct AppState {
     pub(crate) refocus_root: bool,
     /// Whether the keyboard-shortcuts reference overlay (`⌘/`) is showing.
     pub(crate) shortcuts_open: bool,
+    /// Keyboard-highlighted saved-connection card on the disconnected screen.
+    pub(crate) connect_sel: usize,
+    /// A pane to focus on the next render, when the focus move originates from a
+    /// place without a `Window` (e.g. an editor `Escape` event). Drained in
+    /// `render`, which has the `Window` `focus` needs.
+    pub(crate) pending_focus: Option<Pane>,
+    /// Set when the connection form just opened: the next render focuses the name
+    /// field so the user can type straightaway (the form's `Window`-less opener
+    /// can't focus directly).
+    pub(crate) focus_name_field: bool,
+    /// Set when the history popover just opened: the next render focuses it so its
+    /// arrow-key navigation works.
+    pub(crate) focus_history: bool,
     /// Dev-only perf HUD collector — brackets `render` to read build time and
     /// allocation churn. Compiled only under the `dev-stats` feature.
     #[cfg(feature = "dev-stats")]
@@ -535,6 +559,10 @@ impl AppState {
             // Focus the root on first paint so the very first ⌘K dispatches.
             refocus_root: true,
             shortcuts_open: false,
+            connect_sel: 0,
+            pending_focus: None,
+            focus_name_field: false,
+            focus_history: false,
             #[cfg(feature = "dev-stats")]
             dev_stats: crate::dev_stats::DevStats::default(),
         }

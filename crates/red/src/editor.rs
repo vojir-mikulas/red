@@ -549,6 +549,7 @@ impl AppState {
 
         let history = tab.history_open.then(|| {
             let list: Vec<_> = tab.history.clone();
+            let selected = active.history_sel;
             let inner = if list.is_empty() {
                 div()
                     .px_2()
@@ -565,6 +566,7 @@ impl AppState {
                     .children(list.into_iter().enumerate().map(|(i, q)| {
                         let v = view.clone();
                         let sql = q.clone();
+                        let is_sel = i == selected;
                         div()
                             .id(("hist", i))
                             .px_2()
@@ -573,6 +575,7 @@ impl AppState {
                             .font_family(mono_family.clone())
                             .text_size(size_11)
                             .text_color(text)
+                            .when(is_sel, |d| d.bg(bg_hover))
                             .hover(move |s| s.bg(bg_hover))
                             .on_click(move |_, _, cx| {
                                 let sql = sql.clone();
@@ -582,8 +585,22 @@ impl AppState {
                     }))
                     .into_any_element()
             };
-            // Anchored to the bottom run bar, opening upward.
+            // Anchored to the bottom run bar, opening upward. Focusable so its
+            // ↑/↓ move the highlight, Enter loads it, Esc closes — back to editor.
             div()
+                .id("sql-history")
+                .key_context("History")
+                .track_focus(&active.history_focus)
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _w, cx| {
+                    match event.keystroke.key.as_str() {
+                        "up" => this.history_move(-1, cx),
+                        "down" => this.history_move(1, cx),
+                        "enter" => this.history_accept(cx),
+                        "escape" => this.close_history(cx),
+                        _ => return,
+                    }
+                    cx.stop_propagation();
+                }))
                 .absolute()
                 .bottom(px(38.))
                 .right(px(8.))
@@ -696,11 +713,67 @@ impl AppState {
     }
 
     pub(crate) fn toggle_history(&mut self, cx: &mut Context<Self>) {
+        let opened = if let Phase::Connected(active) = &mut self.phase {
+            let open = match active.active_mut() {
+                Some(tab) => {
+                    tab.history_open = !tab.history_open;
+                    Some(tab.history_open)
+                }
+                None => None,
+            };
+            // Reset the keyboard highlight to the top whenever it opens.
+            if open == Some(true) {
+                active.history_sel = 0;
+            }
+            open
+        } else {
+            None
+        };
+        match opened {
+            // Focus the popover so its arrow keys work; closing returns to the editor.
+            Some(true) => self.focus_history = true,
+            Some(false) => self.pending_focus = Some(crate::app::Pane::Editor),
+            None => {}
+        }
+        cx.notify();
+    }
+
+    /// Move the history popover's highlight (↑/↓). No-op with an empty history.
+    pub(crate) fn history_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase {
+            let len = active.active().map(|t| t.history.len()).unwrap_or(0);
+            if len == 0 {
+                return;
+            }
+            let sel = active.history_sel as isize + delta;
+            active.history_sel = sel.clamp(0, len as isize - 1) as usize;
+            cx.notify();
+        }
+    }
+
+    /// Load the highlighted history entry into the editor (Enter in the popover).
+    pub(crate) fn history_accept(&mut self, cx: &mut Context<Self>) {
+        let sql = match &self.phase {
+            Phase::Connected(active) => active
+                .active()
+                .and_then(|t| t.history.get(active.history_sel).cloned()),
+            _ => None,
+        };
+        if let Some(sql) = sql {
+            // `load_history` closes the popover and fills the editor.
+            self.load_history(sql, cx);
+        }
+        self.pending_focus = Some(crate::app::Pane::Editor);
+    }
+
+    /// Close the history popover (Esc) and return focus to the editor.
+    pub(crate) fn close_history(&mut self, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase {
             if let Some(tab) = active.active_mut() {
-                tab.history_open = !tab.history_open;
+                tab.history_open = false;
             }
         }
+        self.pending_focus = Some(crate::app::Pane::Editor);
         cx.notify();
     }
 

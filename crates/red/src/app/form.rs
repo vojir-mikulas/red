@@ -55,6 +55,7 @@ impl AppState {
             editing: None,
             test: TestState::Idle,
         });
+        self.focus_name_field = true;
         cx.notify();
     }
 
@@ -82,6 +83,7 @@ impl AppState {
             editing: Some(index),
             test: TestState::Idle,
         });
+        self.focus_name_field = true;
         cx.notify();
     }
 

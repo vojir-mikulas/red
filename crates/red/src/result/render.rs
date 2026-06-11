@@ -3,7 +3,7 @@
 //! toolbar · grid · footer · scrollbar that make up the pane.
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Hsla, KeyDownEvent, SharedString};
+use gpui::{div, prelude::*, px, Hsla, KeyDownEvent, SharedString, Window};
 use red_core::ExportFormat;
 
 use super::buffer::{CellKind, DisplayCell};
@@ -79,9 +79,11 @@ impl AppState {
     pub(crate) fn render_result(
         &self,
         active: &ActiveConn,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
+        let grid_focused = active.grid_focus.is_focused(window);
         let (bg, bg_app, border, border_soft) = (
             theme.bg_panel,
             theme.bg_app,
@@ -121,6 +123,11 @@ impl AppState {
             .flex_col()
             .key_context("Grid")
             .track_focus(&active.grid_focus)
+            // 1px transparent border reserves the focus ring's space (no layout
+            // shift); the accent ring marks the grid as the active pane.
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .when(grid_focused, |d| d.focus_ring(cx))
             // Cell-cursor navigation while the grid is focused. Handled here (not
             // via the global keymap) so arrows/Home/End mean "move the cursor"
             // only in this pane; Shift extends, ⌘ jumps to edges. Unrecognized

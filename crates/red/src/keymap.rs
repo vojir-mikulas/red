@@ -52,6 +52,10 @@ actions!(
         CycleFocusPrev,
         /// Open the keyboard-shortcuts reference overlay.
         ShowShortcuts,
+        /// Test the connection form (⌘↵ while a form field is focused).
+        TestConnection,
+        /// Open a new-connection form (the disconnected screen's ⌘N).
+        NewConnection,
     ]
 );
 
@@ -151,5 +155,10 @@ pub(crate) fn bind_all(cx: &mut App) {
         // Discoverability. `⌘/` (not `?`) so typing `?` into the editor or a field
         // still inserts the character — a global `?` binding would swallow it.
         KeyBinding::new("cmd-/", ShowShortcuts, Some("RedRoot")),
+        // Connection form / welcome screen. `⌘↵` reaches `RedRoot` from a focused
+        // form field (the editor's deeper `CodeEditor` context keeps its own ⌘↵
+        // for Run); both handlers no-op outside their screen.
+        KeyBinding::new("cmd-enter", TestConnection, Some("RedRoot")),
+        KeyBinding::new("cmd-n", NewConnection, Some("RedRoot")),
     ]);
 }

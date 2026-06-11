@@ -3,12 +3,12 @@
 //! close-with-unsaved-work).
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, KeyDownEvent, Render, Window};
+use gpui::{div, prelude::*, px, Focusable, KeyDownEvent, Render, Window};
 
 use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::keymap::{
-    CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusSchema, NewTab, NextTab,
-    PrevTab, RefreshSchema, ShowShortcuts, ToggleSidebar,
+    CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusSchema, NewConnection,
+    NewTab, NextTab, PrevTab, RefreshSchema, ShowShortcuts, TestConnection, ToggleSidebar,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
@@ -95,6 +95,27 @@ impl Render for AppState {
             window.focus(&self.root_focus, cx);
         }
 
+        // A focus move requested from a Window-less spot (e.g. the editor's Esc
+        // event) — apply it now that the Window is in hand.
+        if let Some(pane) = self.pending_focus.take() {
+            self.focus_pane(pane, window, cx);
+        }
+
+        // The connection form just opened — focus its name field so the user can
+        // type immediately (and Tab onward through the fields).
+        if self.focus_name_field {
+            self.focus_name_field = false;
+            window.focus(&self.name_input.focus_handle(cx), cx);
+        }
+
+        // The history popover just opened — focus it so its arrow keys work.
+        if self.focus_history {
+            self.focus_history = false;
+            if let Phase::Connected(active) = &self.phase {
+                window.focus(&active.history_focus.clone(), cx);
+            }
+        }
+
         // First paint: install the OS-appearance observer and the settings
         // file-watcher (both need a live `Window`).
         self.ensure_observers(window, cx);
@@ -102,7 +123,7 @@ impl Render for AppState {
         let screen = match &self.phase {
             Phase::Disconnected => self.render_connect(cx).into_any_element(),
             Phase::Connecting(conn) => self.render_connecting(conn, cx).into_any_element(),
-            Phase::Connected(active) => self.render_shell(active, cx).into_any_element(),
+            Phase::Connected(active) => self.render_shell(active, window, cx).into_any_element(),
         };
 
         // The notification stack, anchored bottom-right and growing upward:
@@ -162,6 +183,18 @@ impl Render for AppState {
                 this.cycle_focus(false, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| this.toggle_shortcuts(cx)))
+            // ⌘↵ in the connection form tests; ⌘N on the welcome screen adds one.
+            // Both no-op outside their screen.
+            .on_action(cx.listener(|this, _: &TestConnection, _, cx| {
+                if this.form.is_some() {
+                    this.test_connection(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &NewConnection, _, cx| {
+                if matches!(this.phase, Phase::Disconnected) && this.form.is_none() {
+                    this.open_new_form(cx);
+                }
+            }))
             // Keyboard close/confirm for the overlays that have no focus of their
             // own (the shortcuts reference and the two confirmation modals). They
             // open with focus reclaimed to the root, so these keys land here.

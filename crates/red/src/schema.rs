@@ -11,7 +11,9 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, App, Context, Entity, KeyDownEvent, UniformListScrollHandle};
+use gpui::{
+    div, prelude::*, px, App, Context, Entity, KeyDownEvent, UniformListScrollHandle, Window,
+};
 use red_core::{ColumnMeta, DbKind, ObjectKind, SchemaMeta, TableDetail};
 use red_service::Command;
 
@@ -342,10 +344,12 @@ impl AppState {
     pub(crate) fn render_schema(
         &self,
         active: &ActiveConn,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
         let (bg_panel, faint) = (theme.bg_panel, theme.text_faint);
+        let focused = active.schema_focus.is_focused(window);
         let footer_size = theme.scale(10.);
         let footer_family = theme.font_family.clone();
         let view = cx.entity().downgrade();
@@ -431,6 +435,11 @@ impl AppState {
             // its navigation keys; `Schema` scopes those keys to this pane.
             .key_context("Schema")
             .track_focus(&active.schema_focus)
+            // A 1px border (transparent until focused) reserves the ring's space so
+            // focus never nudges the layout; the accent ring shows the active pane.
+            .border_1()
+            .border_color(gpui::transparent_black())
+            .when(focused, |d| d.focus_ring(cx))
             // Tree navigation while the sidebar is focused: arrows move/expand,
             // Enter previews. Unrecognized keys fall through to ancestors.
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
