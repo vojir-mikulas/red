@@ -844,7 +844,10 @@ mod row_tests {
         assert_eq!(row.display[1].text.as_ref(), "<1000 bytes>");
         // The resident value carries only the summary string, not the payload.
         assert_eq!(row.values[1], Value::Text("<1000 bytes>".into()));
-        assert!(!row.is_truncated(1), "a blob copies as its summary, not re-fetched");
+        assert!(
+            !row.is_truncated(1),
+            "a blob copies as its summary, not re-fetched"
+        );
     }
 
     /// Small cells pass through unchanged.

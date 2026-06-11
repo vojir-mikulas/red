@@ -11,11 +11,24 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, App, Context, Entity};
+use gpui::{div, prelude::*, px, App, Context, Entity, KeyDownEvent, UniformListScrollHandle};
 use red_core::{ColumnMeta, DbKind, ObjectKind, SchemaMeta, TableDetail};
 use red_service::Command;
 
 use crate::app::{ActiveConn, AppState, Phase};
+
+/// A keyboard navigation step over the schema tree while the sidebar is focused.
+#[derive(Clone, Copy)]
+enum TreeNav {
+    Up,
+    Down,
+    /// Left — collapse an expanded node, else move to its parent.
+    Collapse,
+    /// Right — expand a collapsed node, else descend to its first child.
+    Expand,
+    /// Enter — preview a table/view, or toggle a namespace.
+    Activate,
+}
 
 /// A stable identity for a tree node, surviving re-render and filtering so
 /// expansion + selection track the right node regardless of row position.
@@ -42,6 +55,9 @@ pub(crate) struct SchemaState {
     pub expanded: HashSet<NodeId>,
     pub selected: Option<NodeId>,
     pub filter: Entity<TextInput>,
+    /// Scroll position of the tree's virtual list, so keyboard navigation can keep
+    /// the selected row in view (`scroll_to_item`).
+    pub tree_scroll: UniformListScrollHandle,
     /// True while the skeleton load is in flight.
     pub loading: bool,
 }
@@ -60,6 +76,7 @@ impl SchemaState {
             expanded: HashSet::new(),
             selected: None,
             filter,
+            tree_scroll: UniformListScrollHandle::new(),
             loading: true,
         }
     }
@@ -202,6 +219,20 @@ fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
         }
     }
     out
+}
+
+/// The next selectable row index in `flat`, stepping `forward` (or back) from
+/// `from`. Skips rows that carry no node (the "loading…" placeholder). Returns
+/// the first/last selectable row when `from` is `None`.
+fn next_navigable(flat: &[VisibleRow], from: Option<usize>, forward: bool) -> Option<usize> {
+    let len = flat.len();
+    let has_node = |i: usize| flat[i].node.is_some();
+    match (from, forward) {
+        (None, true) => (0..len).find(|&i| has_node(i)),
+        (None, false) => (0..len).rev().find(|&i| has_node(i)),
+        (Some(cur), true) => ((cur + 1)..len).find(|&i| has_node(i)),
+        (Some(cur), false) => (0..cur).rev().find(|&i| has_node(i)),
+    }
 }
 
 /// Build the content right of the chevron for one tree row.
@@ -351,6 +382,7 @@ impl AppState {
             .rows(items)
             .row_height(px(24.))
             .indent(px(14.))
+            .track_scroll(&s.tree_scroll)
             .selected(selected_ix)
             .disclosure(|expanded, _window, cx| {
                 let name = if expanded { "chevron-down" } else { "chevron" };
@@ -395,6 +427,24 @@ impl AppState {
             .size_full()
             .flex()
             .flex_col()
+            // Focusable so ⌘1 / focus-cycle can land here and the tree can take
+            // its navigation keys; `Schema` scopes those keys to this pane.
+            .key_context("Schema")
+            .track_focus(&active.schema_focus)
+            // Tree navigation while the sidebar is focused: arrows move/expand,
+            // Enter previews. Unrecognized keys fall through to ancestors.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                let nav = match event.keystroke.key.as_str() {
+                    "up" => TreeNav::Up,
+                    "down" => TreeNav::Down,
+                    "left" => TreeNav::Collapse,
+                    "right" => TreeNav::Expand,
+                    "enter" => TreeNav::Activate,
+                    _ => return,
+                };
+                cx.stop_propagation();
+                this.schema_nav(nav, cx);
+            }))
             .bg(bg_panel)
             .child(filter_row)
             .child(div().flex_1().min_h(px(0.)).child(tree))
@@ -427,6 +477,100 @@ impl AppState {
     pub(crate) fn schema_select(&mut self, node: NodeId, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase {
             active.schema.selected = Some(node);
+        }
+        cx.notify();
+    }
+
+    /// Drive the schema tree from the keyboard (the focused sidebar's arrows +
+    /// Enter). Recomputes the same flattened, filtered visible list the render
+    /// uses, then moves the selection, toggles expansion, or previews — reusing
+    /// the existing click/double-click handlers so keyboard and mouse stay in step.
+    fn schema_nav(&mut self, nav: TreeNav, cx: &mut Context<Self>) {
+        // Snapshot the visible rows (owned, so no borrow of `self` is held while
+        // the mutating handlers below run) and the selected row's position.
+        let (flat, sel) = match &self.phase {
+            Phase::Connected(active) => {
+                let s = &active.schema;
+                let filter = s.filter.read(cx).content().to_string();
+                let flat = flatten(s, &filter);
+                let sel = s
+                    .selected
+                    .as_ref()
+                    .and_then(|n| flat.iter().position(|r| r.node.as_ref() == Some(n)));
+                (flat, sel)
+            }
+            _ => return,
+        };
+        if flat.is_empty() {
+            return;
+        }
+
+        match nav {
+            TreeNav::Up => {
+                if let Some(ix) = next_navigable(&flat, sel, false) {
+                    self.schema_focus_row(&flat, ix, cx);
+                }
+            }
+            TreeNav::Down => {
+                if let Some(ix) = next_navigable(&flat, sel, true) {
+                    self.schema_focus_row(&flat, ix, cx);
+                }
+            }
+            TreeNav::Expand => {
+                let Some(i) = sel else { return };
+                let row = &flat[i];
+                if row.item.has_children && !row.item.expanded {
+                    if let Some(node) = row.node.clone() {
+                        self.schema_toggle(node, cx);
+                    }
+                } else if row.item.expanded {
+                    // Already open — descend to the first child (next row down).
+                    if let Some(ix) = next_navigable(&flat, sel, true) {
+                        self.schema_focus_row(&flat, ix, cx);
+                    }
+                }
+            }
+            TreeNav::Collapse => {
+                let Some(i) = sel else { return };
+                let row = &flat[i];
+                if row.item.has_children && row.item.expanded {
+                    if let Some(node) = row.node.clone() {
+                        self.schema_toggle(node, cx);
+                    }
+                } else if row.item.depth > 0 {
+                    // A leaf or collapsed node — jump to the parent (nearest row
+                    // above at a shallower depth).
+                    if let Some(p) = (0..i).rev().find(|&j| flat[j].item.depth < row.item.depth) {
+                        self.schema_focus_row(&flat, p, cx);
+                    }
+                }
+            }
+            TreeNav::Activate => {
+                let Some(i) = sel else { return };
+                let row = &flat[i];
+                if let Some((schema, table)) = row.preview.clone() {
+                    self.schema_preview(schema, table, cx);
+                } else if row.item.has_children {
+                    if let Some(node) = row.node.clone() {
+                        self.schema_toggle(node, cx);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Select the row at flat index `ix` and scroll it into view.
+    fn schema_focus_row(&mut self, flat: &[VisibleRow], ix: usize, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase {
+            if let Some(node) = flat[ix].node.clone() {
+                active.schema.selected = Some(node);
+            }
+            // Non-strict: only scrolls when the row is off-screen, so stepping
+            // through visible rows doesn't yank the list on every keypress.
+            active
+                .schema
+                .tree_scroll
+                .scroll_to_item(ix, gpui::ScrollStrategy::Top);
         }
         cx.notify();
     }

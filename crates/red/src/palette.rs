@@ -11,11 +11,10 @@
 
 use flint::{Palette, PaletteEvent, PaletteItem, ToastVariant};
 use gpui::{actions, prelude::*, Context, ElementId, Entity, SharedString};
-use red_service::Command;
 
 use crate::app::{AppState, Phase};
 
-actions!(red, [ToggleCommandPalette, GoToRow]);
+actions!(red, [ToggleCommandPalette, GoToRow, CopyResult]);
 
 /// A command the palette can run. Each maps to one existing `AppState` action.
 #[derive(Clone, Copy)]
@@ -30,10 +29,13 @@ pub(crate) enum Cmd {
     RunQuery,
     NewTab,
     ToggleHistory,
+    ToggleSidebar,
     RefreshSchema,
     Disconnect,
     /// Open the "go to row…" prompt (only when a result is open).
     GoToRow,
+    /// Open the keyboard-shortcuts reference overlay.
+    ShowShortcuts,
 }
 
 impl AppState {
@@ -153,9 +155,11 @@ impl AppState {
             Cmd::RunQuery => self.run_editor_query(cx),
             Cmd::NewTab => self.new_query(cx),
             Cmd::ToggleHistory => self.toggle_history(cx),
-            Cmd::RefreshSchema => self.service.send(Command::LoadObjects),
+            Cmd::ToggleSidebar => self.toggle_sidebar(cx),
+            Cmd::RefreshSchema => self.refresh_schema(),
             Cmd::Disconnect => self.disconnect(cx),
             Cmd::GoToRow => self.open_goto_prompt(cx),
+            Cmd::ShowShortcuts => self.toggle_shortcuts(cx),
         }
     }
 
@@ -172,7 +176,7 @@ impl AppState {
                     Cmd::RunQuery,
                 ));
                 out.push((
-                    PaletteItem::new("cmd:new-tab", "query: new tab"),
+                    PaletteItem::new("cmd:new-tab", "query: new tab").hint("⌘T"),
                     Cmd::NewTab,
                 ));
                 // Only meaningful with rows on screen to navigate.
@@ -187,7 +191,11 @@ impl AppState {
                     Cmd::ToggleHistory,
                 ));
                 out.push((
-                    PaletteItem::new("cmd:refresh", "schema: refresh"),
+                    PaletteItem::new("cmd:sidebar", "view: toggle sidebar").hint("⌘B"),
+                    Cmd::ToggleSidebar,
+                ));
+                out.push((
+                    PaletteItem::new("cmd:refresh", "schema: refresh").hint("⌘R"),
                     Cmd::RefreshSchema,
                 ));
                 out.push((
@@ -208,6 +216,10 @@ impl AppState {
             Phase::Connecting(_) => {}
         }
 
+        out.push((
+            PaletteItem::new("cmd:shortcuts", "view: keyboard shortcuts").hint("⌘/"),
+            Cmd::ShowShortcuts,
+        ));
         out.push((
             PaletteItem::new("cmd:settings", "view: settings").hint("⌘,"),
             Cmd::OpenSettings,

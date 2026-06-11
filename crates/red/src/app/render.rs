@@ -3,10 +3,14 @@
 //! close-with-unsaved-work).
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Render, Window};
+use gpui::{div, prelude::*, px, KeyDownEvent, Render, Window};
 
-use super::{AppState, ConnectStatus, Connecting, Phase};
-use crate::palette::{GoToRow, ToggleCommandPalette};
+use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
+use crate::keymap::{
+    CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusSchema, NewTab, NextTab,
+    PrevTab, RefreshSchema, ShowShortcuts, ToggleSidebar,
+};
+use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
 impl AppState {
     /// The connecting splash: an indeterminate progress bar while an attempt is
@@ -120,6 +124,8 @@ impl Render for AppState {
             .settings_open
             .then(|| self.render_settings(cx).into_any_element());
 
+        let shortcuts = self.shortcuts_open.then(|| self.render_shortcuts(cx));
+
         let theme = cx.theme();
         let root = div()
             .size_full()
@@ -130,6 +136,68 @@ impl Render for AppState {
             .track_focus(&self.root_focus)
             .on_action(cx.listener(|this, _: &ToggleCommandPalette, _, cx| this.toggle_palette(cx)))
             .on_action(cx.listener(|this, _: &GoToRow, _, cx| this.open_goto_prompt(cx)))
+            .on_action(cx.listener(|this, _: &CopyResult, _, cx| this.copy_result_selection(cx)))
+            // App-chrome actions (tabs · sidebar · schema reload), bound in the
+            // central keymap to `RedRoot` so they fire from any pane's focus.
+            .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_query(cx)))
+            .on_action(cx.listener(|this, _: &CloseTab, _, cx| this.close_active_tab(cx)))
+            .on_action(cx.listener(|this, _: &NextTab, _, cx| this.next_tab(cx)))
+            .on_action(cx.listener(|this, _: &PrevTab, _, cx| this.prev_tab(cx)))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &RefreshSchema, _, _| this.refresh_schema()))
+            // Pane focus jumps + cycle.
+            .on_action(cx.listener(|this, _: &FocusSchema, window, cx| {
+                this.focus_pane(Pane::Schema, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusEditor, window, cx| {
+                this.focus_pane(Pane::Editor, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusGrid, window, cx| {
+                this.focus_pane(Pane::Grid, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CycleFocusNext, window, cx| {
+                this.cycle_focus(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CycleFocusPrev, window, cx| {
+                this.cycle_focus(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| this.toggle_shortcuts(cx)))
+            // Keyboard close/confirm for the overlays that have no focus of their
+            // own (the shortcuts reference and the two confirmation modals). They
+            // open with focus reclaimed to the root, so these keys land here.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                let key = event.keystroke.key.as_str();
+                if this.shortcuts_open {
+                    if key == "escape" {
+                        this.shortcuts_open = false;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                    return;
+                }
+                if this.confirm_exec.is_none() && this.confirm_close_tab.is_none() {
+                    return;
+                }
+                match key {
+                    "escape" => {
+                        if this.confirm_exec.is_some() {
+                            this.cancel_destructive(cx);
+                        } else {
+                            this.cancel_close(cx);
+                        }
+                        cx.stop_propagation();
+                    }
+                    "enter" => {
+                        if this.confirm_exec.is_some() {
+                            this.confirm_destructive(cx);
+                        } else {
+                            this.confirm_close(cx);
+                        }
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
             .bg(theme.bg_app)
             .text_color(theme.text)
             // The UI font + size from settings, set once at the root so any unsized
@@ -142,6 +210,7 @@ impl Render for AppState {
             .children(confirm)
             .children(confirm_close)
             .children(settings)
+            .children(shortcuts)
             // The palette renders its own full-screen overlay; last = on top.
             .children(self.palette.clone());
 
@@ -248,6 +317,55 @@ impl AppState {
             .footer(footer)
             .on_close(move |_, cx| {
                 close_view.update(cx, |this, cx| this.cancel_close(cx)).ok();
+            })
+            .child(body)
+    }
+
+    /// The keyboard-shortcuts reference overlay (`⌘/`). Built from
+    /// [`crate::keymap::shortcuts`] so it never drifts from the real bindings.
+    fn render_shortcuts(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let close_view = cx.entity().downgrade();
+        let mut body = div().flex().flex_col().gap_4();
+        for (title, rows) in crate::keymap::shortcuts() {
+            let mut section = div().flex().flex_col().gap_1().child(
+                div()
+                    .pb_1()
+                    .text_size(theme.scale(10.5))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text_faint)
+                    .child(title.to_uppercase()),
+            );
+            for (keys, desc) in rows {
+                section = section.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .child(div().text_color(theme.text_muted).child(desc))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .font_family(theme.mono_family.clone())
+                                .text_size(theme.scale(11.5))
+                                .text_color(theme.text)
+                                .child(keys),
+                        ),
+                );
+            }
+            body = body.child(section);
+        }
+        Modal::new("keyboard-shortcuts")
+            .title("Keyboard shortcuts")
+            .width(px(460.))
+            .on_close(move |_, cx| {
+                close_view
+                    .update(cx, |this, cx| {
+                        this.shortcuts_open = false;
+                        cx.notify();
+                    })
+                    .ok();
             })
             .child(body)
     }

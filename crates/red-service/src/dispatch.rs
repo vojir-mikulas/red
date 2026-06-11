@@ -430,7 +430,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 tokio::spawn(async move {
                     let _permit = limit_src.acquire_owned().await;
                     match driver.fetch_page(&sql, offset, limit).await {
-                        Ok(page) => emit(&events, Event::CopyRowsLoaded { id, rows: page.rows }),
+                        Ok(page) => emit(
+                            &events,
+                            Event::CopyRowsLoaded {
+                                id,
+                                rows: page.rows,
+                            },
+                        ),
                         Err(e) => emit(&events, Event::Error(e.to_string())),
                     }
                 });

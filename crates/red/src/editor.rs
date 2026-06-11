@@ -668,6 +668,8 @@ impl AppState {
                 // The safety rail is opt-out in settings; when off, run immediately.
                 if self.settings.query.confirm_destructive {
                     self.confirm_exec = Some(sql);
+                    // Pull focus to the root so the modal's Enter/Esc are heard.
+                    self.refocus_root = true;
                     cx.notify();
                 } else {
                     self.execute_sql(sql, cx);

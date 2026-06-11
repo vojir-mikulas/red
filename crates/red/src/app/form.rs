@@ -136,6 +136,15 @@ impl AppState {
         Self::form_invalid_reason(config).is_none()
     }
 
+    /// Enter pressed in a form field — submit the connection form via its primary
+    /// action (Save & connect). No-op when the form isn't open; `save_form` itself
+    /// validates and keeps the modal up with a toast on a miss.
+    pub(crate) fn submit_form(&mut self, cx: &mut Context<Self>) {
+        if self.form.is_some() {
+            self.save_form(true, cx);
+        }
+    }
+
     /// Persist the form. `connect` also opens the connection on success. On a
     /// validation miss the modal stays open with a toast so the user can fix it.
     pub(crate) fn save_form(&mut self, connect: bool, cx: &mut Context<Self>) {

@@ -12,6 +12,7 @@ mod connect;
 mod dev_stats;
 mod editor;
 mod icons;
+mod keymap;
 mod palette;
 mod result;
 mod schema;
@@ -23,13 +24,11 @@ mod shell;
 mod sql;
 mod theme;
 
-use flint::{CodeEditor, Palette, TextInput};
-use gpui::{prelude::*, App, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions};
+use gpui::{prelude::*, App, Bounds, TitlebarOptions, WindowBounds, WindowOptions};
 use gpui_platform::application;
 
 use crate::app::AppState;
 use crate::assets::Assets;
-use crate::palette::{GoToRow, ToggleCommandPalette};
 
 // Dev builds count every allocation (see `dev_stats`); normal builds keep the
 // system allocator with zero overhead.
@@ -53,22 +52,13 @@ fn main() {
         if let Err(err) = Assets::load_fonts(cx) {
             eprintln!("warning: failed to load vendored fonts: {err}");
         }
-        // The connection form's text fields and the SQL editor need their
-        // editing key bindings installed once at startup.
-        TextInput::bind_keys(cx);
-        CodeEditor::bind_keys(cx);
-        Palette::bind_keys(cx);
-        // Global ⌘K toggles the command palette; ⌃G opens "go to row" (both
-        // handled at the root view). ⌘Q quits — handled globally below.
-        cx.bind_keys([
-            KeyBinding::new("cmd-k", ToggleCommandPalette, None),
-            KeyBinding::new("ctrl-g", GoToRow, None),
-            KeyBinding::new("cmd-q", Quit, None),
-        ]);
+        // Install every key binding (Flint component keymaps + RED's globals and
+        // app-chrome bindings) from the central keymap.
+        keymap::bind_all(cx);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         // Dev-only: ⌥⌘P toggles the perf HUD overlay.
         #[cfg(feature = "dev-stats")]
-        cx.bind_keys([KeyBinding::new("cmd-alt-p", ToggleDevStats, None)]);
+        cx.bind_keys([gpui::KeyBinding::new("cmd-alt-p", ToggleDevStats, None)]);
 
         // Spawn the Tokio backend and hand its event stream to the root view.
         let mut service = red_service::spawn();

@@ -3,11 +3,12 @@
 //! toolbar · grid · footer · scrollbar that make up the pane.
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Hsla, SharedString};
+use gpui::{div, prelude::*, px, Hsla, KeyDownEvent, SharedString};
 use red_core::ExportFormat;
 
 use super::buffer::{CellKind, DisplayCell};
-use crate::app::{ActiveConn, AppState};
+use super::GridMove;
+use crate::app::{ActiveConn, AppState, Pane};
 
 /// Group a number's digits in threes (`1234567` → `1,234,567`) so large row
 /// numbers and totals read at a glance.
@@ -111,7 +112,41 @@ impl AppState {
             cyan,
             faint,
         };
-        let container = div().size_full().flex().flex_col().bg(bg);
+        // Focusable so ⌘3 / focus-cycle can land here and the grid can take its
+        // cell-cursor keys; `Grid` scopes those keys to this pane. Every early
+        // return below builds on `container`, so all grid states stay focusable.
+        let container = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .key_context("Grid")
+            .track_focus(&active.grid_focus)
+            // Cell-cursor navigation while the grid is focused. Handled here (not
+            // via the global keymap) so arrows/Home/End mean "move the cursor"
+            // only in this pane; Shift extends, ⌘ jumps to edges. Unrecognized
+            // keys fall through (so ⌘C still bubbles to RedRoot's copy binding).
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                let ks = &event.keystroke;
+                let cmd = ks.modifiers.secondary();
+                let mv = match ks.key.as_str() {
+                    "up" if cmd => GridMove::First,
+                    "down" if cmd => GridMove::Last,
+                    "left" if cmd => GridMove::RowStart,
+                    "right" if cmd => GridMove::RowEnd,
+                    "up" => GridMove::Up,
+                    "down" => GridMove::Down,
+                    "left" => GridMove::Left,
+                    "right" => GridMove::Right,
+                    "home" => GridMove::RowStart,
+                    "end" => GridMove::RowEnd,
+                    "pageup" => GridMove::PageUp,
+                    "pagedown" => GridMove::PageDown,
+                    _ => return,
+                };
+                cx.stop_propagation();
+                this.result_cursor_move(mv, ks.modifiers.shift, cx);
+            }))
+            .bg(bg);
 
         let grid = match active.active_result() {
             Some(grid) => grid,
@@ -283,16 +318,34 @@ impl AppState {
                     window.refresh();
                 }
             })
-            .on_sort(move |table_col, _, cx| {
+            .on_sort(move |table_col, window, cx| {
+                // ⌘/Ctrl-click a header selects the whole column; add Shift to
+                // extend the column span; a plain click sorts. The header path has
+                // no click event, so the live modifier state is read off the window.
+                let mods = window.modifiers();
+                let select_column = mods.secondary();
+                let extend = mods.shift;
                 sort_view
-                    .update(cx, |this, cx| this.result_sort(table_col, cx))
+                    .update(cx, |this, cx| {
+                        if select_column {
+                            // Focus the grid so the cell cursor + ⌘C land on this
+                            // selection rather than a still-focused editor/field.
+                            this.focus_pane(Pane::Grid, window, cx);
+                            this.result_select_column(table_col, extend, cx);
+                        } else {
+                            this.result_sort(table_col, cx);
+                        }
+                    })
                     .ok();
             })
-            .on_cell_click(move |row, table_col, event, _, cx| {
+            .on_cell_click(move |row, table_col, event, window, cx| {
                 let extend = event.modifiers().shift;
                 let abs_row = base + row;
                 cell_view
                     .update(cx, |this, cx| {
+                        // Focus the grid so the cell cursor + ⌘C land on this
+                        // selection, not a still-focused editor/field.
+                        this.focus_pane(Pane::Grid, window, cx);
                         this.result_select(abs_row, table_col, extend, cx)
                     })
                     .ok();

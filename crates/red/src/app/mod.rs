@@ -16,8 +16,8 @@ use flint::{CodeEditor, CodeEditorEvent};
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use gpui::{
-    prelude::*, px, AsyncApp, Context, ElementId, Entity, FocusHandle, PathPromptOptions, Pixels,
-    ScrollHandle, SharedString, WeakEntity, Window, WindowAppearance,
+    prelude::*, px, AsyncApp, Context, ElementId, Entity, FocusHandle, Focusable,
+    PathPromptOptions, Pixels, ScrollHandle, SharedString, WeakEntity, Window, WindowAppearance,
 };
 use red_core::{ConnectionConfig, DbKind};
 use red_service::{Command, Event, ServiceHandle};
@@ -44,6 +44,16 @@ pub(crate) enum FontSelect {
     Ui,
     UiMono,
     Editor,
+}
+
+/// Which of the connected shell's three panes holds keyboard focus. Tracked on
+/// [`ActiveConn`] so the focus-cycling actions know where they are, and so the
+/// pane chrome can draw a focus ring on the active one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pane {
+    Schema,
+    Editor,
+    Grid,
 }
 
 /// Which top-level screen is showing.
@@ -198,6 +208,13 @@ pub(crate) struct ActiveConn {
     /// Horizontal scroll position of the tab strip, so a crowded strip scrolls
     /// instead of squashing tabs. Persists across renders.
     pub tab_scroll: ScrollHandle,
+    /// Focus anchors for the schema sidebar and result grid panes, so keyboard
+    /// focus can move between panes and each can receive its own navigation keys.
+    /// The editor pane focuses its own `CodeEditor` directly.
+    pub schema_focus: FocusHandle,
+    pub grid_focus: FocusHandle,
+    /// Which pane currently holds focus — drives focus cycling and the pane ring.
+    pub active_pane: Pane,
 }
 
 impl ActiveConn {
@@ -217,6 +234,9 @@ impl ActiveConn {
             query_seq: 1,
             tab_drop_target: None,
             tab_scroll: ScrollHandle::new(),
+            schema_focus: cx.focus_handle(),
+            grid_focus: cx.focus_handle(),
+            active_pane: Pane::Editor,
         }
     }
 
@@ -336,6 +356,8 @@ pub struct AppState {
     /// Set when an overlay closed: the next render pulls focus back to the root
     /// so the global ⌘K keeps dispatching (see `close_palette`).
     pub(crate) refocus_root: bool,
+    /// Whether the keyboard-shortcuts reference overlay (`⌘/`) is showing.
+    pub(crate) shortcuts_open: bool,
     /// Dev-only perf HUD collector — brackets `render` to read build time and
     /// allocation churn. Compiled only under the `dev-stats` feature.
     #[cfg(feature = "dev-stats")]
@@ -400,6 +422,8 @@ impl AppState {
         // string, and editing the string parses it back into the fields. Only user
         // edits emit `Change`; the programmatic `set_content` used by the sync does
         // not, so the mirror can't echo back into an infinite loop.
+        // Field events drive the live two-way mirror, plus form-wide keyboard
+        // submit/cancel: Enter (Submit) connects, Esc (Cancel) closes the modal.
         for field in [
             &host_input,
             &port_input,
@@ -407,18 +431,31 @@ impl AppState {
             &password_input,
             &database_input,
         ] {
-            cx.subscribe(field, |this, _, event: &TextInputEvent, cx| {
-                if matches!(event, TextInputEvent::Change) {
-                    this.sync_conn_str_from_fields(cx);
-                }
+            cx.subscribe(field, |this, _, event: &TextInputEvent, cx| match event {
+                TextInputEvent::Change => this.sync_conn_str_from_fields(cx),
+                TextInputEvent::Submit => this.submit_form(cx),
+                TextInputEvent::Cancel => this.close_form(cx),
             })
             .detach();
         }
-        cx.subscribe(&conn_str_input, |this, _, event: &TextInputEvent, cx| {
-            if matches!(event, TextInputEvent::Change) {
-                this.sync_fields_from_conn_str(cx);
-            }
-        })
+        cx.subscribe(
+            &conn_str_input,
+            |this, _, event: &TextInputEvent, cx| match event {
+                TextInputEvent::Change => this.sync_fields_from_conn_str(cx),
+                TextInputEvent::Submit => this.submit_form(cx),
+                TextInputEvent::Cancel => this.close_form(cx),
+            },
+        )
+        .detach();
+        // The name field doesn't mirror, but still submits/cancels the form.
+        cx.subscribe(
+            &name_input,
+            |this, _, event: &TextInputEvent, cx| match event {
+                TextInputEvent::Submit => this.submit_form(cx),
+                TextInputEvent::Cancel => this.close_form(cx),
+                TextInputEvent::Change => {}
+            },
+        )
         .detach();
 
         // Font-size steppers, seeded from the loaded settings. A `Change` (typing,
@@ -497,6 +534,7 @@ impl AppState {
             palette_cmds: Vec::new(),
             // Focus the root on first paint so the very first ⌘K dispatches.
             refocus_root: true,
+            shortcuts_open: false,
             #[cfg(feature = "dev-stats")]
             dev_stats: crate::dev_stats::DevStats::default(),
         }
@@ -987,6 +1025,113 @@ impl AppState {
         index
     }
 
+    /// Focus the next query tab, wrapping past the end. No-op with one tab.
+    pub(crate) fn next_tab(&mut self, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase {
+            let n = active.tabs.len();
+            if n > 1 {
+                active.active_tab = (active.active_tab + 1) % n;
+                active.tab_scroll.scroll_to_item(active.active_tab);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Focus the previous query tab, wrapping past the start. No-op with one tab.
+    pub(crate) fn prev_tab(&mut self, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase {
+            let n = active.tabs.len();
+            if n > 1 {
+                active.active_tab = (active.active_tab + n - 1) % n;
+                active.tab_scroll.scroll_to_item(active.active_tab);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Close the focused tab (the ⌘W binding) — routes through the same
+    /// pristine-or-confirm path as the tab's × button. No-op with no open tab.
+    pub(crate) fn close_active_tab(&mut self, cx: &mut Context<Self>) {
+        let index = match &self.phase {
+            Phase::Connected(active) if active.active().is_some() => active.active_tab,
+            _ => return,
+        };
+        self.request_close_tab(index, cx);
+    }
+
+    /// Reload the schema tree from the backend (the ⌘R binding / palette command).
+    pub(crate) fn refresh_schema(&mut self) {
+        self.service.send(Command::LoadObjects);
+    }
+
+    /// Open or close the keyboard-shortcuts overlay (`⌘/` / palette command).
+    /// Reclaims root focus so the overlay's Esc-to-close is heard.
+    pub(crate) fn toggle_shortcuts(&mut self, cx: &mut Context<Self>) {
+        self.shortcuts_open = !self.shortcuts_open;
+        self.refocus_root = true;
+        cx.notify();
+    }
+
+    // --- pane focus ---
+
+    /// Move keyboard focus to `pane` and remember it as the active pane (so the
+    /// next focus-cycle starts from here and the pane chrome draws its ring).
+    /// Focusing the schema pane also reveals the sidebar if it was collapsed.
+    /// No-op outside the connected shell, or when the editor pane has no open tab.
+    pub(crate) fn focus_pane(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
+        if pane == Pane::Schema {
+            if let Phase::Connected(active) = &mut self.phase {
+                active.sidebar_collapsed = false;
+            }
+        }
+        let handle = match &self.phase {
+            Phase::Connected(active) => match pane {
+                Pane::Schema => Some(active.schema_focus.clone()),
+                Pane::Grid => Some(active.grid_focus.clone()),
+                Pane::Editor => active.active().map(|t| t.editor.focus_handle(cx)),
+            },
+            _ => return,
+        };
+        let Some(handle) = handle else { return };
+        window.focus(&handle, cx);
+        if let Phase::Connected(active) = &mut self.phase {
+            active.active_pane = pane;
+        }
+        cx.notify();
+    }
+
+    /// Cycle focus to the next (or previous) pane in visual order
+    /// schema → editor → grid. A collapsed/absent sidebar drops out of the cycle.
+    pub(crate) fn cycle_focus(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (current, order) = match &self.phase {
+            Phase::Connected(active) => {
+                let mut order = Vec::with_capacity(3);
+                if !active.sidebar_collapsed {
+                    order.push(Pane::Schema);
+                }
+                order.push(Pane::Editor);
+                order.push(Pane::Grid);
+                (active.active_pane, order)
+            }
+            _ => return,
+        };
+        // Where the active pane sits in the cycle (default to the first if its
+        // pane just dropped out, e.g. the sidebar was collapsed while focused).
+        let at = order.iter().position(|p| *p == current).unwrap_or(0);
+        let n = order.len();
+        let next = if forward {
+            (at + 1) % n
+        } else {
+            (at + n - 1) % n
+        };
+        self.focus_pane(order[next], window, cx);
+    }
+
     /// Open a blank query tab (the tab-strip "＋" action).
     pub(crate) fn new_query(&mut self, cx: &mut Context<Self>) {
         let tab = match &mut self.phase {
@@ -1014,6 +1159,8 @@ impl AppState {
             self.close_tab(index, cx);
         } else {
             self.confirm_close_tab = Some(index);
+            // Pull focus to the root so the modal's Enter/Esc are heard.
+            self.refocus_root = true;
             cx.notify();
         }
     }

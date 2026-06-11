@@ -246,6 +246,66 @@ impl ResultGrid {
         }
     }
 
+    /// How many whole rows the on-screen viewport shows — the PageUp/PageDown
+    /// step. Reads the list's last measured viewport height (0 before first paint).
+    pub(in crate::result) fn viewport_rows(&self, row_height: f32) -> usize {
+        let rh = row_height.max(1.0);
+        let st = self.scroll.0.borrow();
+        let vh = st
+            .last_item_size
+            .map(|s| f32::from(s.item.height))
+            .unwrap_or(0.0);
+        (vh / rh).floor() as usize
+    }
+
+    /// The absolute ordinal of the first row currently visible at the viewport
+    /// top — where a fresh keyboard cursor starts when nothing is selected yet.
+    pub(in crate::result) fn first_visible_row(&self, row_height: f32) -> usize {
+        let rh = row_height.max(1.0);
+        let st = self.scroll.0.borrow();
+        let off_y = f32::from(st.base_handle.offset().y);
+        let local_first = (-off_y / rh).round().max(0.0) as usize;
+        (self.window_base.get() + local_first).min(self.total.saturating_sub(1))
+    }
+
+    /// Keep the keyboard cursor on screen after it moves to absolute ordinal
+    /// `abs_row`. Two regimes: if the row left the resident buffer window, reuse
+    /// the proven `go_to_row` jump (recenter + keyed exact relocation); if it's
+    /// still in the window but scrolled out of the viewport, nudge the list's
+    /// pixel offset by the minimum so the row sits at the near edge — no full
+    /// recenter, so a one-row step never restyles the whole window.
+    pub(in crate::result) fn scroll_cursor_into_view(&self, abs_row: usize, row_height: f32) {
+        if self.total == 0 {
+            return;
+        }
+        let rh = row_height.max(1.0);
+        let len = self.total.min(WINDOW);
+        let base = self.window_base.get();
+        if abs_row < base || abs_row >= base + len {
+            // Off the resident window — recenter (and, when keyed, fetch exactly).
+            self.go_to_row(abs_row, rh);
+            return;
+        }
+        let st = self.scroll.0.borrow();
+        let off = st.base_handle.offset();
+        let vh = st
+            .last_item_size
+            .map(|s| f32::from(s.item.height))
+            .unwrap_or(0.0);
+        let viewport_rows = (vh / rh).floor().max(1.0) as usize;
+        let local = abs_row - base;
+        let local_first = (-f32::from(off.y) / rh).round().max(0.0) as usize;
+        let new_first = if local < local_first {
+            local
+        } else if local >= local_first + viewport_rows {
+            local + 1 - viewport_rows
+        } else {
+            return; // already visible — leave the scroll untouched
+        };
+        st.base_handle
+            .set_offset(point(off.x, px(-(new_first as f32 * rh))));
+    }
+
     /// A glance at this grid's footprint for the dev perf HUD: resident rows,
     /// paging mode, in-flight fetches, and the last query's wall-clock time.
     #[cfg(feature = "dev-stats")]
@@ -262,9 +322,10 @@ impl ResultGrid {
     /// How to satisfy a copy of the current selection (NULL → empty, gutter
     /// column skipped). When every selected cell is resident and untruncated the
     /// clipboard text is built straight from the buffer ([`CopyPlan::Ready`]);
-    /// when the selection touches a cell the grid clipped for display, the rows
-    /// must be re-fetched in full first ([`CopyPlan::Refetch`]). `None` when the
-    /// selection is empty or covers only the gutter.
+    /// when the selection touches a cell the grid clipped for display, or reaches
+    /// rows scrolled out of the window (a whole-column select), those rows must be
+    /// re-fetched in full first ([`CopyPlan::Refetch`]). `None` when the selection
+    /// is empty or covers only the gutter.
     fn copy_plan(&self) -> Option<CopyPlan> {
         let (r0, c0, r1, c1) = self.selection?.bounds();
         let ncol = self.columns.len();
@@ -275,14 +336,15 @@ impl ResultGrid {
         let dcol_lo = dc0 - 1;
         let dcol_hi = (c1 - 1).min(ncol.saturating_sub(1));
         let buffer = self.buffer.borrow();
-        // A selected, resident cell whose stored text is a clipped stand-in forces
-        // a full re-fetch; otherwise the buffer already holds the real values.
-        let clipped = (r0..=r1).any(|r| {
-            buffer
-                .row(r)
-                .is_some_and(|row| (dcol_lo..=dcol_hi).any(|c| row.is_truncated(c)))
+        // Any selected row that's off-window (not resident) or holds a clipped
+        // display stand-in forces a full re-fetch; otherwise the buffer already
+        // has the real values. `any` short-circuits at the first such row, so a
+        // whole-column select doesn't scan the entire result here.
+        let needs_full = (r0..=r1).any(|r| match buffer.row(r) {
+            None => true,
+            Some(row) => (dcol_lo..=dcol_hi).any(|c| row.is_truncated(c)),
         });
-        if clipped {
+        if needs_full {
             return Some(CopyPlan::Refetch {
                 epoch: self.epoch,
                 offset: r0,
@@ -316,6 +378,26 @@ pub(crate) struct PendingCopy {
     pub(crate) id: u64,
     pub(crate) dcol_lo: usize,
     pub(crate) dcol_hi: usize,
+}
+
+/// A keyboard cursor move over the result grid — the move-selection *intent* the
+/// key handler translates into a new cursor cell (see [`AppState::result_cursor_move`]).
+#[derive(Clone, Copy)]
+pub(crate) enum GridMove {
+    Up,
+    Down,
+    Left,
+    Right,
+    /// Home / ⌘← — first data column of the row.
+    RowStart,
+    /// End / ⌘→ — last data column of the row.
+    RowEnd,
+    PageUp,
+    PageDown,
+    /// ⌘↑ — first row.
+    First,
+    /// ⌘↓ — last row.
+    Last,
 }
 
 /// How [`ResultGrid::copy_plan`] resolves a selection copy.
@@ -543,10 +625,107 @@ impl AppState {
         cx.notify();
     }
 
-    /// Cell click: set the selection anchor, or extend it on shift-click.
+    /// Cell click: set the selection anchor, or extend it on shift-click. A click
+    /// in the row-number gutter (table column `0`) selects the whole row (every
+    /// data column); shift-click there extends the block across rows.
     pub(crate) fn result_select(
         &mut self,
         row: usize,
+        table_col: usize,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Phase::Connected(active) = &mut self.phase {
+            if let Some(grid) = active.active_result_mut() {
+                let ncols = grid.columns.len();
+                grid.selection = if table_col == 0 {
+                    // Gutter: span all data columns (table cols `1..=ncols`); an
+                    // empty result has no columns to select.
+                    (ncols > 0).then(|| match (extend, grid.selection) {
+                        (true, Some(mut range)) => {
+                            range.focus = (row, ncols);
+                            range
+                        }
+                        _ => CellRange {
+                            anchor: (row, 1),
+                            focus: (row, ncols),
+                        },
+                    })
+                } else {
+                    Some(match (extend, grid.selection) {
+                        (true, Some(mut range)) => {
+                            range.focus = (row, table_col);
+                            range
+                        }
+                        _ => CellRange::single(row, table_col),
+                    })
+                };
+            }
+        }
+        cx.notify();
+    }
+
+    /// Move the keyboard cell cursor over the active grid (arrows, Home/End,
+    /// PageUp/Down, ⌘arrows). `extend` (Shift held) grows the selection from its
+    /// anchor; otherwise the cursor becomes a fresh single-cell selection. The
+    /// cursor lives in absolute ordinals while the list is windowed, so it then
+    /// re-centers the window to follow (see [`ResultGrid::scroll_cursor_into_view`]).
+    /// No-op until the result is ready and has columns.
+    pub(crate) fn result_cursor_move(
+        &mut self,
+        mv: GridMove,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let row_height = f32::from(self.settings.grid.density.row_height());
+        if let Phase::Connected(active) = &mut self.phase {
+            if let Some(grid) = active.active_result_mut() {
+                if !grid.ready || grid.error.is_some() || grid.columns.is_empty() {
+                    return;
+                }
+                let ncols = grid.columns.len();
+                let last_row = grid.total.saturating_sub(1);
+                let page = grid.viewport_rows(row_height).max(1);
+                // The cursor is the selection's focus; with nothing selected yet
+                // it starts at the first visible row's first data column.
+                let (row, col) = match grid.selection {
+                    Some(r) => r.focus,
+                    None => (grid.first_visible_row(row_height), 1),
+                };
+                let col = col.clamp(1, ncols);
+                let (new_row, new_col) = match mv {
+                    GridMove::Up => (row.saturating_sub(1), col),
+                    GridMove::Down => ((row + 1).min(last_row), col),
+                    GridMove::Left => (row, (col - 1).max(1)),
+                    GridMove::Right => (row, (col + 1).min(ncols)),
+                    GridMove::RowStart => (row, 1),
+                    GridMove::RowEnd => (row, ncols),
+                    GridMove::PageUp => (row.saturating_sub(page), col),
+                    GridMove::PageDown => ((row + page).min(last_row), col),
+                    GridMove::First => (0, col),
+                    GridMove::Last => (last_row, col),
+                };
+                grid.selection = Some(match (extend, grid.selection) {
+                    (true, Some(mut range)) => {
+                        range.focus = (new_row, new_col);
+                        range
+                    }
+                    _ => CellRange::single(new_row, new_col),
+                });
+                grid.scroll_cursor_into_view(new_row, row_height);
+            }
+        }
+        cx.notify();
+    }
+
+    /// ⌘/Ctrl-click on a header: select that whole data column (every row). With
+    /// `extend` (⌘/Ctrl+Shift-click), grow the existing selection to span every
+    /// column between its anchor and this one — full-height, so it reads as a
+    /// multi-column block. The selection spans the full result, so copying it
+    /// re-fetches the off-window rows in full (see [`ResultGrid::copy_plan`]). The
+    /// gutter isn't selectable.
+    pub(crate) fn result_select_column(
+        &mut self,
         table_col: usize,
         extend: bool,
         cx: &mut Context<Self>,
@@ -556,12 +735,19 @@ impl AppState {
         }
         if let Phase::Connected(active) = &mut self.phase {
             if let Some(grid) = active.active_result_mut() {
+                let last = grid.total.saturating_sub(1);
                 grid.selection = match (extend, grid.selection) {
+                    // Keep the anchor column, pull the focus to this one, and force
+                    // full height so the block stays a clean column span.
                     (true, Some(mut range)) => {
-                        range.focus = (row, table_col);
+                        range.anchor = (0, range.anchor.1.max(1));
+                        range.focus = (last, table_col);
                         Some(range)
                     }
-                    _ => Some(CellRange::single(row, table_col)),
+                    _ => Some(CellRange {
+                        anchor: (0, table_col),
+                        focus: (last, table_col),
+                    }),
                 };
             }
         }
@@ -739,12 +925,7 @@ impl AppState {
     /// A `CopyRows` reply landed: if it's the copy still pending, assemble the
     /// untruncated selection and put it on the clipboard. A superseded reply (the
     /// user copied again before this returned) finds a stale id and is dropped.
-    pub(crate) fn on_copy_rows(
-        &mut self,
-        id: u64,
-        rows: Vec<Vec<Value>>,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn on_copy_rows(&mut self, id: u64, rows: Vec<Vec<Value>>, cx: &mut Context<Self>) {
         let Some(pending) = self.pending_copy.take_if(|p| p.id == id) else {
             return;
         };
