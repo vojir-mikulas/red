@@ -484,9 +484,15 @@ impl AppState {
         let reuse = matches!(&self.phase, Phase::Connected(a) if a.active().is_some_and(|t| t.is_pristine(cx)));
         if reuse {
             if let Phase::Connected(active) = &mut self.phase {
-                if let Some(tab) = active.active_mut() {
-                    tab.title = label.clone();
-                }
+                // Repurpose the untouched tab, but relocate it to the end so a
+                // table preview always opens as the last (appended) tab rather
+                // than wherever the focus happened to sit.
+                let from = active.active_tab;
+                let mut tab = active.tabs.remove(from);
+                tab.title = label.clone();
+                active.tabs.push(tab);
+                active.active_tab = active.tabs.len() - 1;
+                active.tab_scroll.scroll_to_item(active.active_tab);
             }
         } else {
             // No pristine tab to reuse (incl. the empty-strip case) — open one.
