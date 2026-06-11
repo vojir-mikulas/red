@@ -8,6 +8,8 @@ mod app;
 mod assets;
 mod config;
 mod connect;
+#[cfg(feature = "dev-stats")]
+mod dev_stats;
 mod editor;
 mod icons;
 mod palette;
@@ -27,6 +29,12 @@ use gpui_platform::application;
 use crate::app::AppState;
 use crate::assets::Assets;
 use crate::palette::{GoToRow, ToggleCommandPalette};
+
+// Dev builds count every allocation (see `dev_stats`); normal builds keep the
+// system allocator with zero overhead.
+#[cfg(feature = "dev-stats")]
+#[global_allocator]
+static GLOBAL: dev_stats::Counting = dev_stats::Counting;
 
 fn main() {
     init_tracing();
