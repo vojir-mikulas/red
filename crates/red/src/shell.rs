@@ -60,6 +60,16 @@ impl AppState {
         let topbar = div()
             .id("topbar")
             .window_control_area(WindowControlArea::Drag)
+            // Double-clicking the drag region performs the native titlebar action
+            // (zoom/minimize per System Settings on macOS); other platforms zoom.
+            .on_click(|event, window, _| {
+                if event.click_count() == 2 {
+                    #[cfg(target_os = "macos")]
+                    window.titlebar_double_click();
+                    #[cfg(not(target_os = "macos"))]
+                    window.zoom_window();
+                }
+            })
             .flex_shrink_0()
             .h(px(38.))
             .flex()

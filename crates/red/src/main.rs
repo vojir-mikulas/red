@@ -37,6 +37,10 @@ use crate::palette::{GoToRow, ToggleCommandPalette};
 #[global_allocator]
 static GLOBAL: dev_stats::Counting = dev_stats::Counting;
 
+// ⌘Q quits the app. We render a seamless titlebar with no native app menu, so
+// the standard macOS quit shortcut has to be bound and handled ourselves.
+gpui::actions!(red, [Quit]);
+
 // The dev perf HUD's toggle action (⌥⌘P), bound only under the feature.
 #[cfg(feature = "dev-stats")]
 gpui::actions!(red, [ToggleDevStats]);
@@ -55,11 +59,13 @@ fn main() {
         CodeEditor::bind_keys(cx);
         Palette::bind_keys(cx);
         // Global ⌘K toggles the command palette; ⌃G opens "go to row" (both
-        // handled at the root view).
+        // handled at the root view). ⌘Q quits — handled globally below.
         cx.bind_keys([
             KeyBinding::new("cmd-k", ToggleCommandPalette, None),
             KeyBinding::new("ctrl-g", GoToRow, None),
+            KeyBinding::new("cmd-q", Quit, None),
         ]);
+        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         // Dev-only: ⌥⌘P toggles the perf HUD overlay.
         #[cfg(feature = "dev-stats")]
         cx.bind_keys([KeyBinding::new("cmd-alt-p", ToggleDevStats, None)]);
