@@ -85,7 +85,7 @@ impl AppState {
     /// Total rows of the active tab's open result, if any.
     fn active_result_total(&self) -> Option<usize> {
         match &self.phase {
-            Phase::Connected(active) => active.active().result.as_ref().map(|g| g.total_rows()),
+            Phase::Connected(active) => active.active_result().map(|g| g.total_rows()),
             _ => None,
         }
     }
@@ -176,7 +176,7 @@ impl AppState {
                     Cmd::NewTab,
                 ));
                 // Only meaningful with rows on screen to navigate.
-                if active.active().result.is_some() {
+                if active.active_result().is_some() {
                     out.push((
                         PaletteItem::new("cmd:goto-row", "go to row…").hint("⌃G"),
                         Cmd::GoToRow,

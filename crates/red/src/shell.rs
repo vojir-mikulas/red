@@ -53,7 +53,21 @@ impl AppState {
             .child("Disconnect")
             .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx)));
 
-        let topbar_right = div().flex().items_center().child(disconnect);
+        // Settings gear lives in the top bar (mirrors the welcome screen's
+        // top-right placement) rather than the status strip.
+        let settings_gear = IconButton::new(
+            "shell-settings",
+            crate::icons::icon("settings", px(16.), theme.text_muted),
+        )
+        .size(IconButtonSize::Sm)
+        .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
+
+        let topbar_right = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(disconnect)
+            .child(settings_gear);
 
         // The top bar doubles as the window drag region (seamless traffic lights
         // sit in the left inset); interactive children keep their own hitboxes.
@@ -171,12 +185,8 @@ impl AppState {
         let body = div().flex_1().min_h(px(0.)).child(outer);
 
         // --- status bar: endpoint · db · read-only | rows · cols · UTF-8 · SQL ·
-        // engine · theme — the design's information-dense bottom strip ---
-        let counts = active
-            .active()
-            .result
-            .as_ref()
-            .and_then(|g| g.status_counts());
+        // engine — the design's information-dense bottom strip ---
+        let counts = active.active_result().and_then(|g| g.status_counts());
 
         let status_left = div()
             .flex()
@@ -230,18 +240,6 @@ impl AppState {
                 div()
                     .px_2()
                     .child(format!("{} {}", config.kind, active.version)),
-            )
-            .child(
-                div()
-                    .id("status-settings")
-                    .flex()
-                    .items_center()
-                    .px_2()
-                    .cursor_pointer()
-                    .text_color(theme.text_muted)
-                    .hover(|s| s.text_color(theme.text))
-                    .child(crate::icons::icon("settings", px(13.), theme.text_muted))
-                    .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx))),
             );
 
         let statusbar = div()

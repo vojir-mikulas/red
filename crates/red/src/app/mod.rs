@@ -189,13 +189,24 @@ impl ActiveConn {
         }
     }
 
-    /// The focused tab. `active_tab` is kept in range, so these never panic.
-    pub(crate) fn active(&self) -> &QueryTab {
-        &self.tabs[self.active_tab]
+    /// The focused tab, or `None` when the strip is empty (the user closed the
+    /// last tab — the shell then shows an empty pane instead of a query editor).
+    pub(crate) fn active(&self) -> Option<&QueryTab> {
+        self.tabs.get(self.active_tab)
     }
 
-    pub(crate) fn active_mut(&mut self) -> &mut QueryTab {
-        &mut self.tabs[self.active_tab]
+    pub(crate) fn active_mut(&mut self) -> Option<&mut QueryTab> {
+        self.tabs.get_mut(self.active_tab)
+    }
+
+    /// The focused tab's open result, if any. Folds together "no tab" and "tab
+    /// with no result" — the common shape at most result call sites.
+    pub(crate) fn active_result(&self) -> Option<&ResultGrid> {
+        self.active().and_then(|t| t.result.as_ref())
+    }
+
+    pub(crate) fn active_result_mut(&mut self) -> Option<&mut ResultGrid> {
+        self.active_mut().and_then(|t| t.result.as_mut())
     }
 
     /// Find the open result whose grid carries `epoch`, across all tabs — result
@@ -699,6 +710,8 @@ impl AppState {
         if let Phase::Connected(active) = &mut self.phase {
             if index < active.tabs.len() {
                 active.active_tab = index;
+                // Selecting a partly off-screen tab scrolls it fully into view.
+                active.tab_scroll.scroll_to_item(index);
             }
         }
         cx.notify();
@@ -781,6 +794,9 @@ impl AppState {
             Phase::Connected(active) => {
                 active.tabs.push(tab);
                 active.active_tab = active.tabs.len() - 1;
+                // Scroll the freshly-focused tab into view on the next paint, in
+                // case the strip was already scrolled or crowded.
+                active.tab_scroll.scroll_to_item(active.active_tab);
                 active.active_tab
             }
             _ => return 0,
@@ -833,40 +849,27 @@ impl AppState {
         cx.notify();
     }
 
-    /// Drop tab `index`, freeing its backend result. Closing the *last* tab
-    /// disconnects — the shell has nothing left to show, so we drop back to the
-    /// connection list rather than conjuring a replacement tab.
+    /// Drop tab `index`, freeing its backend result. Closing the *last* tab is
+    /// allowed: the strip goes empty and the shell shows a placeholder pane (the
+    /// connection stays open — the strip's ＋ opens a fresh query).
     fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         self.confirm_close_tab = None;
-        let mut disconnect = false;
-        let mut free_epoch = None;
-        match &mut self.phase {
+        let free_epoch = match &mut self.phase {
             Phase::Connected(active) if index < active.tabs.len() => {
                 let removed = active.tabs.remove(index);
-                let closed_epoch = removed.result.map(|g| g.epoch);
-                if active.tabs.is_empty() {
-                    disconnect = true;
-                } else {
-                    // Keep the focus stable: clamp, and shift left if we removed a
-                    // tab at or before the focused one.
-                    if active.active_tab >= index && active.active_tab > 0 {
-                        active.active_tab -= 1;
-                    }
-                    active.active_tab = active.active_tab.min(active.tabs.len() - 1);
-                    free_epoch = closed_epoch;
+                // Keep the focus stable: clamp, and shift left if we removed a
+                // tab at or before the focused one. Harmless when the strip is
+                // now empty — `active()` just returns `None`.
+                if active.active_tab >= index && active.active_tab > 0 {
+                    active.active_tab -= 1;
                 }
+                active.active_tab = active.active_tab.min(active.tabs.len().saturating_sub(1));
+                removed.result.map(|g| g.epoch)
             }
             _ => return,
-        }
-        if disconnect {
-            // Mirror `cancel_connect`: flip the phase synchronously so the shell
-            // never renders an empty tab list (which `active()` would panic on)
-            // while the backend tears the session down. Disconnect frees every
-            // result, so the closed tab's epoch needs no separate cleanup.
-            self.service.send(Command::Disconnect);
-            self.phase = Phase::Disconnected;
-        } else if let Some(epoch) = free_epoch {
-            // Free the backend result that backed the closed tab's grid.
+        };
+        // Free the backend result that backed the closed tab's grid.
+        if let Some(epoch) = free_epoch {
             self.service.send(Command::CloseResult { epoch });
         }
         cx.notify();

@@ -104,7 +104,7 @@ impl AppState {
         };
         let container = div().size_full().flex().flex_col().bg(bg);
 
-        let grid = match &active.active().result {
+        let grid = match active.active_result() {
             Some(grid) => grid,
             None => {
                 return container.child(

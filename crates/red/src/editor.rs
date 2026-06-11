@@ -229,26 +229,36 @@ impl AppState {
         let dragging = cx.has_active_drag();
         let tabs = active.tabs.iter().enumerate().map(|(i, t)| {
             let is_active = i == active_idx;
-            let (tab_bg, tab_text, icon_color) = if is_active {
-                (bg_app, text, green)
+            let (tab_bg, tab_text) = if is_active {
+                (bg_app, text)
             } else {
-                (bg_panel, muted, dim)
+                (bg_panel, muted)
             };
             let drag_title: SharedString = t.title.clone().into();
             let drop_view = view.clone();
             let move_view = view.clone();
+            // Group so the close button reveals only on this tab's hover.
+            let group = SharedString::from(format!("sql-tab-{i}"));
             // The dragged tab lands before this tab (gap == i) or after it
             // (gap == i+1); the bar paints on whichever edge the gap names.
             let bar_before = dragging && drop_target == Some(i);
             let bar_after = dragging && i + 1 == tab_count && drop_target == Some(tab_count);
             div()
                 .id(("sql-tab", i))
+                .group(group.clone())
                 .relative()
                 .flex()
                 .flex_shrink_0()
                 .items_center()
-                .gap_1p5()
-                .px_2p5()
+                .justify_center()
+                // Stretch with the title between a comfortable min and a cap;
+                // past the cap the label ellipsizes (see the title's `truncate`).
+                .min_w(px(96.))
+                .max_w(px(200.))
+                // Symmetric horizontal room: the hover close button lives in the
+                // right inset (right: 4px + 15px wide); mirror it on the left so
+                // the centered title clears the button and stays balanced.
+                .px(px(23.))
                 .bg(tab_bg)
                 .border_r_1()
                 .border_color(border)
@@ -321,29 +331,44 @@ impl AppState {
                             .bg(green),
                     )
                 })
-                .child(crate::icons::icon("play", px(10.), icon_color))
                 .child(
                     div()
+                        .min_w_0()
+                        .truncate()
                         .font_family(FONT_MONO)
                         .text_size(px(12.))
                         .text_color(tab_text)
                         .child(t.title.clone()),
                 )
+                // Close button: pinned to the right, revealed only on tab hover
+                // so it never crowds the centered title at rest. The outer div
+                // positions + vertically centers; the inner one is the hitbox.
                 .child(
                     div()
-                        .id(("sql-tab-close", i))
+                        .absolute()
+                        .right(px(4.))
+                        .top_0()
+                        .bottom_0()
                         .flex()
                         .items_center()
-                        .justify_center()
-                        .size(px(15.))
-                        .rounded(px(3.))
-                        .text_color(faint)
-                        .hover(|s| s.bg(bg_hover).text_color(text))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.request_close_tab(i, cx);
-                        }))
-                        .child(crate::icons::icon("close", px(9.), faint)),
+                        .invisible()
+                        .group_hover(group, |s| s.visible())
+                        .child(
+                            div()
+                                .id(("sql-tab-close", i))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(15.))
+                                .rounded(px(3.))
+                                .text_color(faint)
+                                .hover(|s| s.bg(bg_hover).text_color(text))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.request_close_tab(i, cx);
+                                }))
+                                .child(crate::icons::icon("close", px(9.), faint)),
+                        ),
                 )
         });
         let strip_drop_view = view.clone();
@@ -414,6 +439,28 @@ impl AppState {
                     .child(crate::icons::icon("plus", px(13.), faint)),
             );
 
+        // No open tab (user closed the last one): keep the strip — its ＋ opens
+        // a new query — over an empty pane, and skip the editor/run/breadcrumb.
+        let Some(tab) = active.active() else {
+            let empty = div()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(12.))
+                .text_color(faint)
+                .child("No query tab open — press ＋ to start");
+            return div()
+                .relative()
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(bg_app)
+                .child(tabstrip)
+                .child(empty);
+        };
+
         // --- breadcrumb: connection › query ---
         let breadcrumb = div()
             .flex_shrink_0()
@@ -430,7 +477,7 @@ impl AppState {
             .text_color(muted)
             .child(active.config.name.clone())
             .child(div().text_color(dim).child("/"))
-            .child(div().text_color(text).child(active.active().title.clone()));
+            .child(div().text_color(text).child(tab.title.clone()));
 
         // The editor's own typography, applied here: the `CodeEditor` shapes its
         // text with `window.text_style()` / `window.line_height()`, both inherited
@@ -443,7 +490,7 @@ impl AppState {
             .font_family(ed.font_family.clone())
             .text_size(px(ed.font_size))
             .line_height(px(ed.font_size * ed.line_height))
-            .child(active.active().editor.clone());
+            .child(tab.editor.clone());
 
         // --- bottom run bar: Run · history · ……… · read-only ---
         let ro_chip = active.config.read_only.then(|| {
@@ -490,8 +537,8 @@ impl AppState {
             )
             .children(ro_chip);
 
-        let history = active.active().history_open.then(|| {
-            let list: Vec<_> = active.active().history.clone();
+        let history = tab.history_open.then(|| {
+            let list: Vec<_> = tab.history.clone();
             let inner = if list.is_empty() {
                 div()
                     .px_2()
@@ -556,10 +603,13 @@ impl AppState {
     /// streams the first window into the results pane.
     pub(crate) fn run_editor_query(&mut self, cx: &mut Context<Self>) {
         let sql = match &self.phase {
-            Phase::Connected(active) => {
-                let editor = active.active().editor.read(cx);
-                editor.selected_text().unwrap_or_else(|| editor.content())
-            }
+            Phase::Connected(active) => match active.active() {
+                Some(tab) => {
+                    let editor = tab.editor.read(cx);
+                    editor.selected_text().unwrap_or_else(|| editor.content())
+                }
+                None => return,
+            },
             _ => return,
         };
         let sql = sql.trim().to_string();
@@ -568,13 +618,14 @@ impl AppState {
         }
 
         if let Phase::Connected(active) = &mut self.phase {
-            let tab = active.active_mut();
-            // De-dupe consecutive identical runs at the head of the history.
-            if tab.history.first() != Some(&sql) {
-                tab.history.insert(0, sql.clone());
-                tab.history.truncate(50);
+            if let Some(tab) = active.active_mut() {
+                // De-dupe consecutive identical runs at the head of the history.
+                if tab.history.first() != Some(&sql) {
+                    tab.history.insert(0, sql.clone());
+                    tab.history.truncate(50);
+                }
+                tab.history_open = false;
             }
-            tab.history_open = false;
         }
 
         // Row-returning statements stream into the grid; writes execute in a
@@ -634,19 +685,22 @@ impl AppState {
 
     pub(crate) fn toggle_history(&mut self, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase {
-            let tab = active.active_mut();
-            tab.history_open = !tab.history_open;
+            if let Some(tab) = active.active_mut() {
+                tab.history_open = !tab.history_open;
+            }
         }
         cx.notify();
     }
 
     pub(crate) fn load_history(&mut self, sql: String, cx: &mut Context<Self>) {
         let editor = match &mut self.phase {
-            Phase::Connected(active) => {
-                let tab = active.active_mut();
-                tab.history_open = false;
-                tab.editor.clone()
-            }
+            Phase::Connected(active) => match active.active_mut() {
+                Some(tab) => {
+                    tab.history_open = false;
+                    tab.editor.clone()
+                }
+                None => return,
+            },
             _ => return,
         };
         editor.update(cx, |editor, cx| editor.set_content(sql, cx));

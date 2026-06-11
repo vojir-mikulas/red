@@ -297,7 +297,7 @@ impl AppState {
         );
 
         let grid = match &self.phase {
-            Phase::Connected(active) => active.active().result.as_ref().map(|g| g.dev_snapshot()),
+            Phase::Connected(active) => active.active_result().map(|g| g.dev_snapshot()),
             _ => None,
         };
         let line2 = match grid {

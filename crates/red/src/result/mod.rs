@@ -343,10 +343,11 @@ impl AppState {
     ) {
         let sender = self.service.command_sender();
         let opened = match &mut self.phase {
-            Phase::Connected(active) => {
+            Phase::Connected(active) if active.active().is_some() => {
                 let grid = ResultGrid::new(label.into(), base_sql, table, sender);
                 let opened = (grid.effective_sql(), grid.epoch, grid.table.clone());
-                active.active_mut().result = Some(grid);
+                // Safe: the guard above ensured a focused tab exists.
+                active.active_mut().unwrap().result = Some(grid);
                 opened
             }
             _ => return,
@@ -429,7 +430,7 @@ impl AppState {
     /// toast). Errors aren't epoch-tagged yet, so they attach to the focused tab.
     pub(crate) fn on_result_error(&mut self, message: &str) {
         if let Phase::Connected(active) = &mut self.phase {
-            if let Some(grid) = &mut active.active_mut().result {
+            if let Some(grid) = active.active_result_mut() {
                 grid.error = Some(message.to_string());
                 grid.ready = true;
                 grid.stop_timer();
@@ -444,7 +445,7 @@ impl AppState {
         }
         let dcol = table_col - 1;
         let reopen = match &mut self.phase {
-            Phase::Connected(active) => match &mut active.active_mut().result {
+            Phase::Connected(active) => match active.active_result_mut() {
                 Some(grid) => {
                     let old_epoch = grid.epoch;
                     grid.sort = match grid.sort {
@@ -491,7 +492,7 @@ impl AppState {
             return;
         }
         if let Phase::Connected(active) = &mut self.phase {
-            if let Some(grid) = &mut active.active_mut().result {
+            if let Some(grid) = active.active_result_mut() {
                 grid.selection = match (extend, grid.selection) {
                     (true, Some(mut range)) => {
                         range.focus = (row, table_col);
@@ -507,7 +508,7 @@ impl AppState {
     /// Prompt for a save path, then stream the active tab's result there in `format`.
     pub(crate) fn export_result(&mut self, format: ExportFormat, cx: &mut Context<Self>) {
         let epoch = match &self.phase {
-            Phase::Connected(a) => a.active().result.as_ref().map(|g| g.epoch),
+            Phase::Connected(a) => a.active_result().map(|g| g.epoch),
             _ => None,
         };
         let Some(epoch) = epoch else {
@@ -544,7 +545,7 @@ impl AppState {
     pub(crate) fn go_to_row(&mut self, one_based: usize, cx: &mut Context<Self>) {
         let row_height = f32::from(self.settings.grid.density.row_height());
         if let Phase::Connected(active) = &self.phase {
-            if let Some(grid) = active.active().result.as_ref() {
+            if let Some(grid) = active.active_result() {
                 grid.go_to_row(one_based.saturating_sub(1), row_height);
             }
         }
@@ -553,11 +554,7 @@ impl AppState {
 
     pub(crate) fn copy_result_selection(&mut self, cx: &mut Context<Self>) {
         let tsv = match &self.phase {
-            Phase::Connected(active) => active
-                .active()
-                .result
-                .as_ref()
-                .and_then(ResultGrid::selection_tsv),
+            Phase::Connected(active) => active.active_result().and_then(ResultGrid::selection_tsv),
             _ => None,
         };
         if let Some(tsv) = tsv {

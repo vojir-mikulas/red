@@ -481,17 +481,23 @@ impl AppState {
         };
         // Reuse the focused tab only if it's untouched; otherwise open a new one
         // so the user's current query and result are preserved.
-        let reuse = matches!(&self.phase, Phase::Connected(a) if a.active().is_pristine(cx));
+        let reuse = matches!(&self.phase, Phase::Connected(a) if a.active().is_some_and(|t| t.is_pristine(cx)));
         if reuse {
             if let Phase::Connected(active) = &mut self.phase {
-                active.active_mut().title = label.clone();
+                if let Some(tab) = active.active_mut() {
+                    tab.title = label.clone();
+                }
             }
         } else {
+            // No pristine tab to reuse (incl. the empty-strip case) — open one.
             let tab = crate::app::QueryTab::new(label.clone(), cx);
             self.push_tab(tab, cx);
         }
         let editor = match &self.phase {
-            Phase::Connected(active) => active.active().editor.clone(),
+            Phase::Connected(active) => match active.active() {
+                Some(tab) => tab.editor.clone(),
+                None => return,
+            },
             _ => return,
         };
         editor.update(cx, |editor, cx| editor.set_content(sql.clone(), cx));
