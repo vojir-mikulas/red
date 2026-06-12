@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use flint::prelude::*;
 use gpui::{point, px, ClipboardItem, Context, Pixels, ScrollHandle, UniformListScrollHandle};
 use red_core::{Column as ResultColumn, ExportFormat, KeySpec, Value};
-use red_service::{Command, CommandSender, RunFetch};
+use red_service::{Command, CommandSender, RunFetch, SortKey};
 
 use crate::app::{AppState, ExportProgress, Notification, Phase};
 
@@ -113,22 +113,6 @@ impl ResultGrid {
         }
     }
 
-    /// The SQL to open: the base query, wrapped with `ORDER BY <pos>` when sorted.
-    /// Ordering by output position is robust to column-name quoting/aliases.
-    fn effective_sql(&self) -> String {
-        match self.sort {
-            // The derived table needs an alias — MySQL and Postgres both reject an
-            // unaliased subquery in `FROM`.
-            Some((col, asc)) => format!(
-                "SELECT * FROM ({}) AS _red_sort ORDER BY {} {}",
-                strip_trailing(&self.base_sql),
-                col + 1,
-                if asc { "ASC" } else { "DESC" }
-            ),
-            None => self.base_sql.clone(),
-        }
-    }
-
     /// Whether the open query has landed (ready or errored) vs. still running —
     /// drives the shell's live query-timer ticker.
     pub(crate) fn is_ready(&self) -> bool {
@@ -152,7 +136,16 @@ impl ResultGrid {
     /// mode: keyed when the backend resolved a seek key that names a result
     /// column, offset otherwise.
     fn on_ready(&mut self, columns: Vec<ResultColumn>, total: usize, key: Option<KeySpec>) {
-        let key_col = key.and_then(|k| columns.iter().position(|c| c.name == k.column));
+        // Keyed only when every key column (lead, then tiebreaker) is present in
+        // the result — a `SELECT *` table browse always satisfies this.
+        let key_cols = key.as_ref().and_then(|k| {
+            let cols: Vec<usize> = k
+                .column_names()
+                .iter()
+                .filter_map(|name| columns.iter().position(|c| &c.name == name))
+                .collect();
+            (cols.len() == k.column_names().len()).then_some(cols)
+        });
         self.columns = columns;
         self.total = total;
         self.ready = true;
@@ -161,8 +154,8 @@ impl ResultGrid {
         self.window_base.set(0);
         let mut buffer = self.buffer.borrow_mut();
         *buffer = GridBuffer::default();
-        if let Some(key_col) = key_col {
-            buffer.mode = BufferMode::Keyed(KeyedRun::new(key_col));
+        if let Some(key_cols) = key_cols {
+            buffer.mode = BufferMode::Keyed(KeyedRun::new(key_cols));
         }
     }
 
@@ -438,11 +431,6 @@ pub(in crate::result) fn place_window(
         .set_offset(point(x, px(-(local as f32 * row_height))));
 }
 
-/// Trim trailing whitespace + a single terminator, so the SQL nests as a subquery.
-fn strip_trailing(sql: &str) -> &str {
-    sql.trim().strip_suffix(';').unwrap_or(sql.trim()).trim()
-}
-
 /// A value as a plain TSV/clipboard string (NULL → empty).
 fn cell_string(value: &Value) -> String {
     match value {
@@ -474,7 +462,7 @@ impl AppState {
         let opened = match &mut self.phase {
             Phase::Connected(active) if active.active().is_some() => {
                 let grid = ResultGrid::new(label.into(), base_sql, table, sender);
-                let opened = (grid.effective_sql(), grid.epoch, grid.table.clone());
+                let opened = (grid.base_sql.clone(), grid.epoch, grid.table.clone());
                 // Safe: the guard above ensured a focused tab exists.
                 active.active_mut().unwrap().result = Some(grid);
                 opened
@@ -482,7 +470,13 @@ impl AppState {
             _ => return,
         };
         let (sql, epoch, table) = opened;
-        self.service.send(Command::OpenResult { sql, epoch, table });
+        // A fresh open is never sorted — the backend keys it from `table`.
+        self.service.send(Command::OpenResult {
+            sql,
+            epoch,
+            table,
+            sort: None,
+        });
         self.start_query_ticker(cx);
         cx.notify();
     }
@@ -577,10 +571,11 @@ impl AppState {
             Phase::Connected(active) => match active.active_result_mut() {
                 Some(grid) => {
                     let old_epoch = grid.epoch;
-                    grid.sort = match grid.sort {
-                        Some((c, asc)) if c == dcol => Some((c, !asc)),
-                        _ => Some((dcol, true)),
+                    let asc = match grid.sort {
+                        Some((c, asc)) if c == dcol => !asc,
+                        _ => true,
                     };
+                    grid.sort = Some((dcol, asc));
                     grid.selection = None;
                     grid.ready = false;
                     grid.restart_timer();
@@ -588,21 +583,33 @@ impl AppState {
                     // New SQL → new epoch, so pages still in flight for the old
                     // ordering are dropped rather than landing in the wrong rows.
                     grid.epoch = next_epoch();
-                    Some((grid.effective_sql(), grid.epoch, old_epoch))
+                    // Carry the table ref + sort down so the backend resolves the
+                    // composite `(sort_col, pk)` keyset key (or wraps for OFFSET).
+                    let sort = SortKey {
+                        position: dcol + 1,
+                        column: grid.columns[dcol].name.clone(),
+                        descending: !asc,
+                    };
+                    Some((
+                        grid.base_sql.clone(),
+                        grid.table.clone(),
+                        sort,
+                        grid.epoch,
+                        old_epoch,
+                    ))
                 }
                 None => None,
             },
             _ => None,
         };
-        if let Some((sql, epoch, old_epoch)) = reopen {
+        if let Some((sql, table, sort, epoch, old_epoch)) = reopen {
             // Evict the superseded SQL so the backend's result map can't grow.
             self.service.send(Command::CloseResult { epoch: old_epoch });
-            // No `table`: sorted SQL isn't ordered by the PK, so it pages by
-            // `OFFSET` — composite `(sort_col, pk)` seek isn't implemented.
             self.service.send(Command::OpenResult {
                 sql,
                 epoch,
-                table: None,
+                table,
+                sort: Some(sort),
             });
             self.start_query_ticker(cx);
         }

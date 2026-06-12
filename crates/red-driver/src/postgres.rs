@@ -413,44 +413,34 @@ impl DatabaseDriver for PostgresDriver {
         &self,
         sql: &str,
         key: &KeySpec,
-        bound: Option<&Value>,
+        bound: Option<&[Value]>,
         descending: bool,
         limit: usize,
         abort: &AbortSignal,
     ) -> Result<ResultPage> {
-        let col = pg_quote(&key.column);
         let base = strip_trailing(sql);
-        let (cmp, ord) = if descending {
-            ("<", "DESC")
-        } else {
-            (">", "ASC")
-        };
-        // The placeholder carries an explicit cast: the parameter's wire type is
+        let bound_len = bound.map_or(0, <[Value]>::len);
+        // Each placeholder carries an explicit cast: the parameter's wire type is
         // fixed by the Rust value (i64 → int8), and without the cast Postgres
         // would infer the column's narrower type (int4) and reject the bind.
-        let sql = match bound {
-            Some(value) => format!(
-                "SELECT * FROM ({base}) AS _red WHERE {col} {cmp} $1{cast} \
-                 ORDER BY {col} {ord} LIMIT {limit}",
-                cast = pg_cast(value)
-            ),
-            None => format!("SELECT * FROM ({base}) AS _red ORDER BY {col} {ord} LIMIT {limit}"),
-        };
-        let bound = bound.cloned();
+        let (where_clause, order_by) = crate::seek_clauses(
+            key,
+            bound_len,
+            descending,
+            false,
+            pg_quote,
+            |i| format!("${}{}", i + 1, pg_cast(&bound.unwrap()[i])),
+        );
+        let sql = format!(
+            "SELECT * FROM ({base}) AS _red {where_clause}ORDER BY {order_by} LIMIT {limit}"
+        );
+        let boxed = pg_params(bound)?;
         self.with_fetch_conn(abort, |client| async move {
             let (stmt, columns) = prepare_columns(&client, &sql).await?;
-            let rows = match &bound {
-                Some(Value::Integer(n)) => client.query(&stmt, &[n]).await,
-                Some(Value::Real(x)) => client.query(&stmt, &[x]).await,
-                Some(Value::Text(s)) => client.query(&stmt, &[s]).await,
-                Some(Value::Blob(b)) => client.query(&stmt, &[b]).await,
-                Some(Value::Null) | Some(Value::Capped(_)) => {
-                    return Err(RedError::Query("null seek bound".into()))
-                }
-                None => client.query(&stmt, &[]).await,
-            }
-            .map_err(map_pg_err)?;
-            let cap = CellCap::display(key_col(&columns, key));
+            let params: Vec<&(dyn ToSql + Sync)> =
+                boxed.iter().map(|b| -> &(dyn ToSql + Sync) { b.as_ref() }).collect();
+            let rows = client.query(&stmt, &params).await.map_err(map_pg_err)?;
+            let cap = CellCap::display(crate::key_positions(key, &columns));
             Ok(ResultPage {
                 rows: rows.iter().map(|r| pg_row(r, cap)).collect(),
                 columns,
@@ -463,38 +453,32 @@ impl DatabaseDriver for PostgresDriver {
         &self,
         sql: &str,
         key: &KeySpec,
-        from: Option<&Value>,
+        from: Option<&[Value]>,
         skip: usize,
         limit: usize,
         abort: &AbortSignal,
     ) -> Result<ResultPage> {
-        let col = pg_quote(&key.column);
         let base = strip_trailing(sql);
-        let sql = match from {
-            Some(value) => format!(
-                "SELECT * FROM ({base}) AS _red WHERE {col} >= $1{cast} \
-                 ORDER BY {col} ASC LIMIT {limit} OFFSET {skip}",
-                cast = pg_cast(value)
-            ),
-            None => format!(
-                "SELECT * FROM ({base}) AS _red ORDER BY {col} ASC LIMIT {limit} OFFSET {skip}"
-            ),
-        };
-        let from = from.cloned();
+        let bound_len = from.map_or(0, <[Value]>::len);
+        let (where_clause, order_by) = crate::seek_clauses(
+            key,
+            bound_len,
+            false,
+            true,
+            pg_quote,
+            |i| format!("${}{}", i + 1, pg_cast(&from.unwrap()[i])),
+        );
+        let sql = format!(
+            "SELECT * FROM ({base}) AS _red {where_clause}\
+             ORDER BY {order_by} LIMIT {limit} OFFSET {skip}"
+        );
+        let boxed = pg_params(from)?;
         self.with_fetch_conn(abort, |client| async move {
             let (stmt, columns) = prepare_columns(&client, &sql).await?;
-            let rows = match &from {
-                Some(Value::Integer(n)) => client.query(&stmt, &[n]).await,
-                Some(Value::Real(x)) => client.query(&stmt, &[x]).await,
-                Some(Value::Text(s)) => client.query(&stmt, &[s]).await,
-                Some(Value::Blob(b)) => client.query(&stmt, &[b]).await,
-                Some(Value::Null) | Some(Value::Capped(_)) => {
-                    return Err(RedError::Query("null seek bound".into()))
-                }
-                None => client.query(&stmt, &[]).await,
-            }
-            .map_err(map_pg_err)?;
-            let cap = CellCap::display(key_col(&columns, key));
+            let params: Vec<&(dyn ToSql + Sync)> =
+                boxed.iter().map(|b| -> &(dyn ToSql + Sync) { b.as_ref() }).collect();
+            let rows = client.query(&stmt, &params).await.map_err(map_pg_err)?;
+            let cap = CellCap::display(crate::key_positions(key, &columns));
             Ok(ResultPage {
                 rows: rows.iter().map(|r| pg_row(r, cap)).collect(),
                 columns,
@@ -642,7 +626,7 @@ impl QueryCursor for PgCursor {
 
     async fn next_window(&self, max: usize) -> Result<RowWindow> {
         // Offset-mode display stream (editor run) — cap every cell, no key exempt.
-        let cap = CellCap::display(None);
+        let cap = CellCap::display([None, None]);
         let mut stream = self.stream.lock().await;
         let mut rows = Vec::with_capacity(max);
         for _ in 0..max {
@@ -685,9 +669,25 @@ fn pg_cast(value: &Value) -> &'static str {
     }
 }
 
-/// The result-column index of `key`, used to exempt it from the display cap.
-fn key_col(columns: &[Column], key: &KeySpec) -> Option<usize> {
-    columns.iter().position(|c| c.name == key.column)
+/// Box each seek-bound value as a typed `ToSql` parameter (one per leading key
+/// column), for positional binding into the row-value comparison. Key columns are
+/// never null/capped, so those variants are a query error rather than a `NULL`.
+fn pg_params(bound: Option<&[Value]>) -> Result<Vec<Box<dyn ToSql + Sync + Send>>> {
+    bound
+        .unwrap_or(&[])
+        .iter()
+        .map(|v| -> Result<Box<dyn ToSql + Sync + Send>> {
+            Ok(match v {
+                Value::Integer(n) => Box::new(*n),
+                Value::Real(x) => Box::new(*x),
+                Value::Text(s) => Box::new(s.clone()),
+                Value::Blob(b) => Box::new(b.clone()),
+                Value::Null | Value::Capped(_) => {
+                    return Err(RedError::Query("null seek bound".into()))
+                }
+            })
+        })
+        .collect()
 }
 
 /// Map one row's cells to [`Value`]s by column type (text fallback for the rest).
@@ -1021,16 +1021,41 @@ mod tests {
             .await
             .unwrap();
 
-        let key = KeySpec {
-            column: "id".into(),
-            kind: KeyKind::Int,
-        };
+        let key = KeySpec::single("id", KeyKind::Int);
         battery::seeks_forward_backward_and_reads_bounds(
             &driver,
             &format!("SELECT * FROM {t}"),
             &key,
         )
         .await;
+
+        // Composite `(grp, id)` seek over a non-unique sort column (Track A3).
+        let g = tag("seekcomposite");
+        driver
+            .execute(&format!(
+                "CREATE TABLE {g} (id INT PRIMARY KEY, grp INT NOT NULL)"
+            ))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!(
+                "INSERT INTO {g} SELECT s, s % 3 FROM generate_series(1, 30) s"
+            ))
+            .await
+            .unwrap();
+        let key_asc = KeySpec {
+            column: "grp".into(),
+            kind: KeyKind::Int,
+            tiebreak: Some("id".into()),
+            descending: false,
+        };
+        let key_desc = KeySpec {
+            descending: true,
+            ..key_asc.clone()
+        };
+        battery::seeks_composite_sorted(&driver, &format!("SELECT * FROM {g}"), &key_asc, &key_desc, 30)
+            .await;
+        driver.execute(&format!("DROP TABLE {g}")).await.unwrap();
 
         driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
     }
@@ -1060,10 +1085,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let key = KeySpec {
-            column: "id".into(),
-            kind: KeyKind::Int,
-        };
+        let key = KeySpec::single("id", KeyKind::Int);
         battery::caps_display_keeps_key_and_export(
             &driver,
             &format!("SELECT id, t, b FROM {t}"),

@@ -49,8 +49,9 @@ const BUILD_TRIGGER_DEPTH: usize = 100_000;
 /// it incrementally while fetches read it.
 #[derive(Debug, Default)]
 struct CheckpointIndex {
-    /// `(ordinal, key)` pairs, ascending by ordinal. `points[0]` is `(0, first_key)`.
-    points: Vec<(usize, Value)>,
+    /// `(ordinal, key tuple)` pairs, ascending by ordinal. `points[0]` is
+    /// `(0, first_key)`. The key is the full seek tuple (lead, then tiebreaker).
+    points: Vec<(usize, Vec<Value>)>,
     status: BuildStatus,
 }
 
@@ -73,9 +74,10 @@ enum BuildStatus {
 struct OpenSpec {
     sql: String,
     key: Option<KeySpec>,
-    /// Position of the key column within a result row — the checkpoint build
-    /// reads each checkpoint's key out of the row at that index.
-    key_col: Option<usize>,
+    /// Positions of the key columns within a result row (lead, then tiebreaker) —
+    /// the checkpoint build reads each checkpoint's key tuple out of the row at
+    /// these indices. Empty when the result isn't keyset-keyed.
+    key_cols: Vec<usize>,
     bounds: Option<(i64, i64)>,
     total: Option<usize>,
     checkpoints: Arc<Mutex<CheckpointIndex>>,
@@ -265,7 +267,12 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 }
             }
 
-            Command::OpenResult { sql, epoch, table } => {
+            Command::OpenResult {
+                sql,
+                epoch,
+                table,
+                sort,
+            } => {
                 let Some(driver) = session.clone() else {
                     emit(&events, Event::Error("not connected".into()));
                     continue;
@@ -281,7 +288,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                     OpenSpec {
                         sql: sql.clone(),
                         key: None,
-                        key_col: None,
+                        key_cols: Vec::new(),
                         bounds: None,
                         total: None,
                         checkpoints: Arc::new(Mutex::new(CheckpointIndex::default())),
@@ -298,15 +305,21 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 let results = results.clone();
                 tokio::spawn(async move {
                     // A table browse resolves its seek key from the table's
-                    // introspected detail; a resolution failure just means the
-                    // `OFFSET` fallback (never an error).
+                    // introspected detail: a sorted browse gets the composite
+                    // `(sort_col, pk)` key, an unsorted one the plain PK. A
+                    // resolution failure just means the `OFFSET` fallback (never
+                    // an error).
                     let key = match &table {
                         Some((schema, table)) => match driver.describe_table(schema, table).await {
                             Ok(detail) => {
-                                let key = KeySpec::from_detail(&detail);
+                                let key = match &sort {
+                                    Some(s) => KeySpec::sorted(&detail, &s.column, s.descending),
+                                    None => KeySpec::from_detail(&detail),
+                                };
                                 match &key {
                                     Some(k) => tracing::info!(
                                         %schema, %table, column = %k.column,
+                                        tiebreak = ?k.tiebreak, descending = k.descending,
                                         "keyset key resolved"
                                     ),
                                     None => tracing::info!(
@@ -323,8 +336,18 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                         },
                         None => None,
                     };
+                    // The SQL later page/run fetches re-run. Keyset orders itself
+                    // (driver adds `ORDER BY (sort_col, pk)`), so it pages the
+                    // *base* query; a sorted result that fell back to OFFSET must
+                    // still be ordered, so wrap it by output position.
+                    let effective_sql = match (&sort, &key) {
+                        (Some(s), None) => wrap_sorted(&sql, s.position, s.descending),
+                        _ => sql.clone(),
+                    };
                     // `LIMIT 0` reads column metadata without stepping rows;
                     // counting and the key-bounds probe run concurrently with it.
+                    // Probes run on the base `sql` — ordering doesn't change the
+                    // count, the column set, or the lead column's min/max.
                     let bounds = async {
                         match &key {
                             Some(k) if k.kind == KeyKind::Int => {
@@ -342,14 +365,23 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                         (Ok(total), Ok(page)) => {
                             let total = total.max(0) as usize;
                             // Fill the spec in only if the result is still open.
-                            // `key_col` locates the key within a row so the
-                            // checkpoint build can read each checkpoint's key.
-                            let key_col = key
+                            // `key_cols` locate the key columns within a row so the
+                            // checkpoint build can read each checkpoint's key tuple.
+                            let key_cols = key
                                 .as_ref()
-                                .and_then(|k| page.columns.iter().position(|c| c.name == k.column));
+                                .map(|k| {
+                                    k.column_names()
+                                        .iter()
+                                        .filter_map(|name| {
+                                            page.columns.iter().position(|c| &c.name == name)
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
                             if let Some(spec) = lock(&results).get_mut(&epoch) {
+                                spec.sql = effective_sql;
                                 spec.key = key.clone();
-                                spec.key_col = key_col;
+                                spec.key_cols = key_cols;
                                 spec.bounds = bounds;
                                 spec.total = Some(total);
                             }
@@ -741,13 +773,13 @@ async fn run_fetch(
     match fetch {
         RunFetch::Forward { after } => {
             let page = driver
-                .fetch_seek(&spec.sql, key, after.as_ref(), false, limit, abort)
+                .fetch_seek(&spec.sql, key, after.as_deref(), false, limit, abort)
                 .await?;
             Ok((page.rows, false))
         }
         RunFetch::Backward { before } => {
             let page = driver
-                .fetch_seek(&spec.sql, key, Some(before), true, limit, abort)
+                .fetch_seek(&spec.sql, key, Some(before.as_slice()), true, limit, abort)
                 .await?;
             Ok((page.rows, false))
         }
@@ -757,19 +789,31 @@ async fn run_fetch(
             // uniform keys) — the grid renders the run's ordinals with a `≈`.
             // Skipped for an exact "go to row N": that wants the precise row, so
             // it falls straight through to the exact `OFFSET` page below.
+            // Interpolates on the *lead* column only (a one-element prefix bound),
+            // so a composite sort key still gets fraction jumps when its lead is
+            // an integer.
             if !exact && key.kind == KeyKind::Int {
                 if let (Some((min, max)), Some(total)) = (spec.bounds, spec.total) {
                     if total > 1 && max > min {
                         let fraction = (*ordinal as f64 / (total - 1) as f64).clamp(0.0, 1.0);
-                        let target = (min as f64 + (max as f64 - min as f64) * fraction)
-                            .clamp(min as f64, max as f64)
-                            as i64;
+                        let span = max as f64 - min as f64;
+                        // Ordinal 0 is the result's first row in sort order: the
+                        // smallest lead value for an ascending sort, the largest
+                        // for a descending one. Seek forward (in sort order) from
+                        // just past the target's neighbour so the bound row is
+                        // included.
+                        let bound = if key.descending {
+                            let target = (max as f64 - span * fraction).clamp(min as f64, max as f64);
+                            (target as i64).saturating_add(1) // `< t+1` == `<= t`
+                        } else {
+                            let target = (min as f64 + span * fraction).clamp(min as f64, max as f64);
+                            (target as i64).saturating_sub(1) // `> t-1` == `>= t`
+                        };
                         let page = driver
                             .fetch_seek(
                                 &spec.sql,
                                 key,
-                                // `>=` via a strict `>` on the predecessor.
-                                Some(&Value::Integer(target.saturating_sub(1))),
+                                Some(&[Value::Integer(bound)]),
                                 false,
                                 limit,
                                 abort,
@@ -822,7 +866,7 @@ async fn run_fetch(
 /// building. Flips the status to `Building` under the lock so two concurrent deep
 /// jumps can't both spawn a build.
 fn claim_build(spec: &OpenSpec, ordinal: usize) -> bool {
-    if spec.key.is_none() || spec.key_col.is_none() || ordinal <= BUILD_TRIGGER_DEPTH {
+    if spec.key.is_none() || spec.key_cols.is_empty() || ordinal <= BUILD_TRIGGER_DEPTH {
         return false;
     }
     let mut idx = lock(&spec.checkpoints);
@@ -834,17 +878,18 @@ fn claim_build(spec: &OpenSpec, ordinal: usize) -> bool {
     }
 }
 
-/// The greatest checkpoint `(ordinal, key)` at or before `target`, if the index
-/// has reached that far. Points are ascending, so the last one `<= target` wins.
-fn nearest_checkpoint(spec: &OpenSpec, target: usize) -> Option<(usize, Value)> {
+/// The greatest checkpoint `(ordinal, key tuple)` at or before `target`, if the
+/// index has reached that far. Points are ascending, so the last one `<= target`
+/// wins.
+fn nearest_checkpoint(spec: &OpenSpec, target: usize) -> Option<(usize, Vec<Value>)> {
     let idx = lock(&spec.checkpoints);
     idx.points.iter().rev().find(|(o, _)| *o <= target).cloned()
 }
 
 /// Build `spec`'s checkpoint index: walk the result in `CHECKPOINT_STRIDE`-sized
-/// strides via an indexed seek + bounded skip, recording one `(ordinal, key)` per
-/// stride. One row transfers per checkpoint (just its key), so it's a background
-/// O(total)-server-work scan with flat memory. Bails if the result closes.
+/// strides via an indexed seek + bounded skip, recording one `(ordinal, key tuple)`
+/// per stride. One row transfers per checkpoint (just its key columns), so it's a
+/// background O(total)-server-work scan with flat memory. Bails if the result closes.
 async fn build_checkpoints(
     driver: Arc<dyn DatabaseDriver>,
     spec: OpenSpec,
@@ -852,16 +897,18 @@ async fn build_checkpoints(
     epoch: u64,
     abort: AbortSignal,
 ) {
-    let (Some(key), Some(key_col)) = (spec.key.clone(), spec.key_col) else {
+    let key = spec.key.clone();
+    let (Some(key), false) = (key, spec.key_cols.is_empty()) else {
         lock(&spec.checkpoints).status = BuildStatus::Idle;
         return;
     };
+    let key_cols = spec.key_cols.clone();
     let total = spec.total.unwrap_or(0);
 
     // First checkpoint: ordinal 0, seeking from the result's start. Each later
     // step seeks from the previous checkpoint key (inclusive) and skips a stride.
     let mut ordinal = 0usize;
-    let mut from: Option<Value> = None;
+    let mut from: Option<Vec<Value>> = None;
     let mut skip = 0usize;
 
     loop {
@@ -870,7 +917,7 @@ async fn build_checkpoints(
             return;
         }
         let page = match driver
-            .fetch_seek_skip(&spec.sql, &key, from.as_ref(), skip, 1, &abort)
+            .fetch_seek_skip(&spec.sql, &key, from.as_deref(), skip, 1, &abort)
             .await
         {
             Ok(page) => page,
@@ -886,9 +933,13 @@ async fn build_checkpoints(
                 return;
             }
         };
-        let Some(cp_key) = page.rows.first().and_then(|row| row.get(key_col).cloned()) else {
+        let Some(row) = page.rows.first() else {
             break; // walked past the last row
         };
+        let cp_key: Vec<Value> = key_cols
+            .iter()
+            .map(|&c| row.get(c).cloned().unwrap_or(Value::Null))
+            .collect();
         lock(&spec.checkpoints)
             .points
             .push((ordinal, cp_key.clone()));
@@ -903,6 +954,18 @@ async fn build_checkpoints(
         tokio::task::yield_now().await;
     }
     lock(&spec.checkpoints).status = BuildStatus::Done;
+}
+
+/// Wrap a base query in `ORDER BY <position>` for the `OFFSET`-fallback sorted
+/// path (a sorted browse with no resolvable PK). Ordering by output *position*
+/// is engine-agnostic — it needs no identifier quoting — and the derived table is
+/// aliased because MySQL and Postgres both reject an unaliased subquery in `FROM`.
+fn wrap_sorted(base: &str, position: usize, descending: bool) -> String {
+    let base = base.trim_end().trim_end_matches(';').trim_end();
+    format!(
+        "SELECT * FROM ({base}) AS _red_sort ORDER BY {position} {}",
+        if descending { "DESC" } else { "ASC" }
+    )
 }
 
 /// A timeout future that never fires when no timeout is set, so the `select!`
@@ -988,11 +1051,8 @@ mod checkpoint_tests {
     fn spec_for(checkpoints: &Arc<Mutex<CheckpointIndex>>, total: usize) -> OpenSpec {
         OpenSpec {
             sql: "SELECT * FROM t".into(),
-            key: Some(KeySpec {
-                column: "x".into(),
-                kind: KeyKind::Int,
-            }),
-            key_col: Some(0),
+            key: Some(KeySpec::single("x", KeyKind::Int)),
+            key_cols: vec![0],
             bounds: None,
             total: Some(total),
             checkpoints: checkpoints.clone(),
@@ -1021,9 +1081,9 @@ mod checkpoint_tests {
             assert_eq!(
                 idx.points,
                 vec![
-                    (0, Value::Integer(1)),
-                    (10_000, Value::Integer(10_001)),
-                    (20_000, Value::Integer(20_001)),
+                    (0, vec![Value::Integer(1)]),
+                    (10_000, vec![Value::Integer(10_001)]),
+                    (20_000, vec![Value::Integer(20_001)]),
                 ]
             );
         }
@@ -1031,7 +1091,7 @@ mod checkpoint_tests {
         // The nearest checkpoint at/under a target, and a bounded-skip serve.
         assert_eq!(
             nearest_checkpoint(&spec, 20_500),
-            Some((20_000, Value::Integer(20_001)))
+            Some((20_000, vec![Value::Integer(20_001)]))
         );
         let (rows, estimated) = run_fetch(
             &*driver,

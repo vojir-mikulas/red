@@ -103,6 +103,35 @@ impl MysqlDriver {
             });
         })
     }
+
+    /// Run a prepared display-capped seek query on a dedicated pooled connection,
+    /// armed for cancellation. Shared by `fetch_seek` / `fetch_seek_skip` (they
+    /// differ only in the SQL and its bound parameters).
+    async fn exec_seek(
+        &self,
+        sql: &str,
+        params: Vec<MyValue>,
+        key: &KeySpec,
+        abort: &AbortSignal,
+    ) -> Result<ResultPage> {
+        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let _guard = abort.arm(self.kill_token(conn.id()));
+        if abort.is_aborted() {
+            return Err(RedError::Interrupted);
+        }
+        let stmt = conn.prep(sql).await.map_err(map_my_err)?;
+        let columns: Vec<Column> = stmt.columns().iter().map(col_meta).collect();
+        let rows: Vec<Row> = if params.is_empty() {
+            conn.exec(&stmt, ()).await.map_err(map_my_err)?
+        } else {
+            conn.exec(&stmt, params).await.map_err(map_my_err)?
+        };
+        let cap = CellCap::display(crate::key_positions(key, &columns));
+        Ok(ResultPage {
+            rows: rows.iter().map(|r| my_row(r, cap)).collect(),
+            columns,
+        })
+    }
 }
 
 #[async_trait]
@@ -139,7 +168,7 @@ impl DatabaseDriver for MysqlDriver {
                 }
             };
             // Offset-mode display stream (editor run) — cap every cell, no exempt key.
-            let cap = CellCap::display(None);
+            let cap = CellCap::display([None, None]);
             loop {
                 match result.next().await {
                     Ok(Some(row)) => {
@@ -322,84 +351,53 @@ impl DatabaseDriver for MysqlDriver {
         &self,
         sql: &str,
         key: &KeySpec,
-        bound: Option<&Value>,
+        bound: Option<&[Value]>,
         descending: bool,
         limit: usize,
         abort: &AbortSignal,
     ) -> Result<ResultPage> {
-        let col = format!("`{}`", quote_ident(&key.column));
         let base = strip_trailing(sql);
-        let (cmp, ord) = if descending {
-            ("<", "DESC")
-        } else {
-            (">", "ASC")
-        };
-        let sql = match bound {
-            Some(_) => format!(
-                "SELECT * FROM ({base}) AS _red WHERE {col} {cmp} ? ORDER BY {col} {ord} LIMIT {limit}"
-            ),
-            None => format!("SELECT * FROM ({base}) AS _red ORDER BY {col} {ord} LIMIT {limit}"),
-        };
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
-        let _guard = abort.arm(self.kill_token(conn.id()));
-        if abort.is_aborted() {
-            return Err(RedError::Interrupted);
-        }
-        let stmt = conn.prep(&sql).await.map_err(map_my_err)?;
-        let columns: Vec<Column> = stmt.columns().iter().map(col_meta).collect();
-        let rows: Vec<Row> = match bound {
-            Some(value) => conn
-                .exec(&stmt, (to_my(value),))
-                .await
-                .map_err(map_my_err)?,
-            None => conn.exec(&stmt, ()).await.map_err(map_my_err)?,
-        };
-        let cap = CellCap::display(key_col(&columns, key));
-        Ok(ResultPage {
-            rows: rows.iter().map(|r| my_row(r, cap)).collect(),
-            columns,
-        })
+        let bound_len = bound.map_or(0, <[Value]>::len);
+        let (where_clause, order_by) = crate::seek_clauses(
+            key,
+            bound_len,
+            descending,
+            false,
+            |c| format!("`{}`", quote_ident(c)),
+            |_| "?".into(),
+        );
+        let sql = format!(
+            "SELECT * FROM ({base}) AS _red {where_clause}ORDER BY {order_by} LIMIT {limit}"
+        );
+        let params: Vec<MyValue> = bound.into_iter().flatten().map(to_my).collect();
+        self.exec_seek(&sql, params, key, abort).await
     }
 
     async fn fetch_seek_skip(
         &self,
         sql: &str,
         key: &KeySpec,
-        from: Option<&Value>,
+        from: Option<&[Value]>,
         skip: usize,
         limit: usize,
         abort: &AbortSignal,
     ) -> Result<ResultPage> {
-        let col = format!("`{}`", quote_ident(&key.column));
         let base = strip_trailing(sql);
-        let sql = match from {
-            Some(_) => format!(
-                "SELECT * FROM ({base}) AS _red WHERE {col} >= ? \
-                 ORDER BY {col} ASC LIMIT {limit} OFFSET {skip}"
-            ),
-            None => format!(
-                "SELECT * FROM ({base}) AS _red ORDER BY {col} ASC LIMIT {limit} OFFSET {skip}"
-            ),
-        };
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
-        let _guard = abort.arm(self.kill_token(conn.id()));
-        if abort.is_aborted() {
-            return Err(RedError::Interrupted);
-        }
-        let stmt = conn.prep(&sql).await.map_err(map_my_err)?;
-        let columns: Vec<Column> = stmt.columns().iter().map(col_meta).collect();
-        let rows: Vec<Row> = match from {
-            Some(value) => conn
-                .exec(&stmt, (to_my(value),))
-                .await
-                .map_err(map_my_err)?,
-            None => conn.exec(&stmt, ()).await.map_err(map_my_err)?,
-        };
-        let cap = CellCap::display(key_col(&columns, key));
-        Ok(ResultPage {
-            rows: rows.iter().map(|r| my_row(r, cap)).collect(),
-            columns,
-        })
+        let bound_len = from.map_or(0, <[Value]>::len);
+        let (where_clause, order_by) = crate::seek_clauses(
+            key,
+            bound_len,
+            false,
+            true,
+            |c| format!("`{}`", quote_ident(c)),
+            |_| "?".into(),
+        );
+        let sql = format!(
+            "SELECT * FROM ({base}) AS _red {where_clause}\
+             ORDER BY {order_by} LIMIT {limit} OFFSET {skip}"
+        );
+        let params: Vec<MyValue> = from.into_iter().flatten().map(to_my).collect();
+        self.exec_seek(&sql, params, key, abort).await
     }
 
     async fn key_bounds(
@@ -567,11 +565,6 @@ fn col_meta(col: &MyColumn) -> Column {
         name: col.name_str().into_owned(),
         decl_type: Some(col_type_name(col.column_type()).to_string()),
     }
-}
-
-/// The result-column index of `key`, used to exempt it from the display cap.
-fn key_col(columns: &[Column], key: &KeySpec) -> Option<usize> {
-    columns.iter().position(|c| c.name == key.column)
 }
 
 /// Map a row's cells to [`Value`]s, branching `Bytes` on the column charset. With a
@@ -894,6 +887,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seeks_composite_sorted_key() {
+        use red_core::KeyKind;
+        let url = url_or_skip!();
+        let driver = MysqlDriver::connect(&url, false).await.unwrap();
+        let g = tag("seekcomposite");
+        driver
+            .execute(&format!(
+                "CREATE TABLE `{g}` (id INT PRIMARY KEY, grp INT NOT NULL)"
+            ))
+            .await
+            .unwrap();
+        // `grp = id % 3` repeats heavily so equal-`grp` ties straddle page bounds.
+        driver
+            .execute(&format!(
+                "INSERT INTO `{g}` (id, grp) WITH RECURSIVE c(x) AS \
+                 (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 30) \
+                 SELECT x, x % 3 FROM c"
+            ))
+            .await
+            .unwrap();
+        let key_asc = KeySpec {
+            column: "grp".into(),
+            kind: KeyKind::Int,
+            tiebreak: Some("id".into()),
+            descending: false,
+        };
+        let key_desc = KeySpec {
+            descending: true,
+            ..key_asc.clone()
+        };
+        battery::seeks_composite_sorted(
+            &driver,
+            &format!("SELECT * FROM `{g}`"),
+            &key_asc,
+            &key_desc,
+            30,
+        )
+        .await;
+        driver.execute(&format!("DROP TABLE `{g}`")).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn caps_display_keeps_key_and_export() {
         use red_core::KeyKind;
         let url = url_or_skip!();
@@ -912,10 +947,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let key = KeySpec {
-            column: "id".into(),
-            kind: KeyKind::Int,
-        };
+        let key = KeySpec::single("id", KeyKind::Int);
         battery::caps_display_keeps_key_and_export(
             &driver,
             &format!("SELECT id, t, b FROM `{t}`"),

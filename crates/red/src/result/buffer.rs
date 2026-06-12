@@ -181,9 +181,12 @@ impl Row {
         }
     }
 
-    /// The value in column `col` (for reading a keyset boundary key).
-    fn key(&self, col: usize) -> Value {
-        self.values.get(col).cloned().unwrap_or(Value::Null)
+    /// The key tuple at `cols` (lead, then tiebreaker) — the keyset boundary of
+    /// this row, round-tripped to the backend as the next seek's bound.
+    fn key_tuple(&self, cols: &[usize]) -> Vec<Value> {
+        cols.iter()
+            .map(|&c| self.values.get(c).cloned().unwrap_or(Value::Null))
+            .collect()
     }
 
     /// Whether data column `col`'s stored value is a clipped display stand-in
@@ -237,8 +240,9 @@ pub(super) struct OffsetPages {
 /// strictly after the run's last key, a backward fetch prepends before its
 /// first — so ordinals are counted from the anchor, not refetched by offset.
 pub(super) struct KeyedRun {
-    /// Index of the key column within a row (for reading boundary keys).
-    key_col: usize,
+    /// Indices of the key columns within a row (lead, then tiebreaker) — for
+    /// reading a boundary's key tuple.
+    key_cols: Vec<usize>,
     /// Ordinal of the run's first row. Exact after contiguous scroll from a
     /// known end; an estimate (`estimated`) after an interpolated jump.
     anchor: usize,
@@ -262,9 +266,9 @@ pub(super) struct KeyedRun {
 }
 
 impl KeyedRun {
-    pub(super) fn new(key_col: usize) -> Self {
+    pub(super) fn new(key_cols: Vec<usize>) -> Self {
         Self {
-            key_col,
+            key_cols,
             anchor: 0,
             rows: VecDeque::new(),
             estimated: false,
@@ -276,12 +280,12 @@ impl KeyedRun {
         }
     }
 
-    fn first_key(&self) -> Option<Value> {
-        self.rows.front().map(|r| r.key(self.key_col))
+    fn first_key(&self) -> Option<Vec<Value>> {
+        self.rows.front().map(|r| r.key_tuple(&self.key_cols))
     }
 
-    fn last_key(&self) -> Option<Value> {
-        self.rows.back().map(|r| r.key(self.key_col))
+    fn last_key(&self) -> Option<Vec<Value>> {
+        self.rows.back().map(|r| r.key_tuple(&self.key_cols))
     }
 
     /// Trim the run to `lo..hi`. Popping an end forfeits its `at_*` flag — the
@@ -838,7 +842,7 @@ mod keyed_run_tests {
 
     #[test]
     fn forward_from_start_is_exact() {
-        let mut run = pending(KeyedRun::new(0), 1);
+        let mut run = pending(KeyedRun::new(vec![0]), 1);
         run.apply(
             RunFetch::Forward { after: None },
             rows(1..=PAGE as i64),
@@ -854,7 +858,7 @@ mod keyed_run_tests {
         run = pending(run, 2);
         run.apply(
             RunFetch::Forward {
-                after: Some(Value::Integer(PAGE as i64)),
+                after: Some(vec![Value::Integer(PAGE as i64)]),
             },
             rows(PAGE as i64 + 1..=2 * PAGE as i64),
             false,
@@ -867,7 +871,7 @@ mod keyed_run_tests {
 
     #[test]
     fn short_forward_pins_the_run_to_the_end() {
-        let mut run = pending(KeyedRun::new(0), 1);
+        let mut run = pending(KeyedRun::new(vec![0]), 1);
         // An estimated run near the bottom gets a short (final) page: the
         // anchor re-pins so the run ends exactly at `total`.
         run.anchor = 9_950;
@@ -875,7 +879,7 @@ mod keyed_run_tests {
         run.rows = run_rows(99_001..=99_010);
         run.apply(
             RunFetch::Forward {
-                after: Some(Value::Integer(99_010)),
+                after: Some(vec![Value::Integer(99_010)]),
             },
             rows(99_011..=99_015), // short: the result ends here
             false,
@@ -889,13 +893,13 @@ mod keyed_run_tests {
 
     #[test]
     fn backward_prepends_descending_rows_in_order() {
-        let mut run = pending(KeyedRun::new(0), 1);
+        let mut run = pending(KeyedRun::new(vec![0]), 1);
         run.anchor = 500;
         run.rows = run_rows(501..=700);
         let page = 501 - PAGE as i64..=500;
         run.apply(
             RunFetch::Backward {
-                before: Value::Integer(501),
+                before: vec![Value::Integer(501)],
             },
             rows(page.rev()), // a full page, arriving descending: 500, 499, …
             false,
@@ -924,13 +928,13 @@ mod keyed_run_tests {
 
     #[test]
     fn short_backward_pins_the_run_to_the_start() {
-        let mut run = pending(KeyedRun::new(0), 1);
+        let mut run = pending(KeyedRun::new(vec![0]), 1);
         run.anchor = 80; // estimate was high — only 3 rows actually precede
         run.estimated = true;
         run.rows = run_rows(4..=10);
         run.apply(
             RunFetch::Backward {
-                before: Value::Integer(4),
+                before: vec![Value::Integer(4)],
             },
             rows((1..=3).rev()),
             false,
@@ -943,7 +947,7 @@ mod keyed_run_tests {
 
     #[test]
     fn jump_replaces_the_run_with_estimated_ordinals() {
-        let mut run = pending(KeyedRun::new(0), 1);
+        let mut run = pending(KeyedRun::new(vec![0]), 1);
         run.anchor = 0;
         run.rows = run_rows(1..=200);
         run.apply(
@@ -963,7 +967,7 @@ mod keyed_run_tests {
 
     #[test]
     fn stale_replies_are_dropped() {
-        let mut run = pending(KeyedRun::new(0), 2);
+        let mut run = pending(KeyedRun::new(vec![0]), 2);
         run.rows = run_rows(1..=10);
 
         // Wrong seq: a reply for a superseded request.
@@ -984,7 +988,7 @@ mod keyed_run_tests {
         run = pending(run, 3);
         run.apply(
             RunFetch::Forward {
-                after: Some(Value::Integer(999)),
+                after: Some(vec![Value::Integer(999)]),
             },
             rows(1_000..=1_004),
             false,
@@ -997,7 +1001,7 @@ mod keyed_run_tests {
 
     #[test]
     fn eviction_trims_the_run_and_forfeits_end_flags() {
-        let mut run = KeyedRun::new(0);
+        let mut run = KeyedRun::new(vec![0]);
         run.anchor = 0;
         run.at_start = true;
         run.rows = run_rows(1..=1000);
@@ -1005,7 +1009,7 @@ mod keyed_run_tests {
         assert_eq!(run.anchor, 300);
         assert_eq!(run.rows.len(), 500);
         assert!(!run.at_start && !run.at_end);
-        assert_eq!(run.first_key(), Some(Value::Integer(301)));
-        assert_eq!(run.last_key(), Some(Value::Integer(800)));
+        assert_eq!(run.first_key(), Some(vec![Value::Integer(301)]));
+        assert_eq!(run.last_key(), Some(vec![Value::Integer(800)]));
     }
 }

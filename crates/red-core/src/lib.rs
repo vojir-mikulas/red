@@ -413,15 +413,32 @@ pub struct IndexMeta {
     pub columns: Vec<String>,
 }
 
-/// How a result's rows are keyed for seek (keyset) pagination: a stable,
-/// orderable, effectively-unique column. Present only for a plain table browse
-/// whose introspected detail yields a usable key (see [`KeySpec::from_detail`]);
-/// arbitrary editor SQL has no key and pages by `OFFSET`.
+/// How a result's rows are keyed for seek (keyset) pagination: an ordered,
+/// effectively-unique tuple of columns. A plain table browse is a single key
+/// column (the PK / unique index — see [`KeySpec::from_detail`]); a header-click
+/// sorted browse is `(sort_col, pk)` with the PK as tiebreaker (see
+/// [`KeySpec::sorted`]). Arbitrary editor SQL has no key and pages by `OFFSET`.
+///
+/// The seek is always a single row-value comparison `(c1, …) </> (…)`, so every
+/// column in the tuple shares one [`descending`](Self::descending) direction. RED
+/// only offers a single-column header sort, so the tiebreaker inherits the lead's
+/// direction and a mixed-direction tuple never arises.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeySpec {
-    /// The key column's name, as it appears in the result set.
+    /// The lead key column's name, as it appears in the result set — the sort
+    /// column for a sorted browse, or the PK for a plain browse.
     pub column: String,
+    /// The lead column's kind. Drives key-space interpolation (only the lead
+    /// matters): an `Int` lead supports fraction jumps, `Other` degrades to
+    /// `OFFSET` for far jumps.
     pub kind: KeyKind,
+    /// The PK tiebreaker, appended after [`column`](Self::column) when sorting by
+    /// a non-PK column so rows sharing a `column` value order deterministically.
+    /// `None` for a plain browse (the lead column is itself the unique key).
+    pub tiebreak: Option<String>,
+    /// The sort direction of the lead column (header click). `false` (ascending)
+    /// for a plain browse. The tiebreaker shares this direction.
+    pub descending: bool,
 }
 
 /// Whether the key is numerically interpolable. `Int` keys support key-space
@@ -434,39 +451,98 @@ pub enum KeyKind {
 }
 
 impl KeySpec {
+    /// A single-column, ascending key (a plain table browse — also the building
+    /// block the conformance battery seeds with).
+    pub fn single(column: impl Into<String>, kind: KeyKind) -> KeySpec {
+        KeySpec {
+            column: column.into(),
+            kind,
+            tiebreak: None,
+            descending: false,
+        }
+    }
+
+    /// The seek columns in order — the lead column then the tiebreaker, if any.
+    /// Drivers quote these for the `ORDER BY` and the row-value comparison.
+    pub fn column_names(&self) -> Vec<&str> {
+        let mut cols = vec![self.column.as_str()];
+        if let Some(t) = &self.tiebreak {
+            cols.push(t.as_str());
+        }
+        cols
+    }
+
     /// Resolve a table's seek key from its introspected detail: a single-column
     /// primary key, or failing that a single-column unique not-null index.
     /// `None` (composite or nullable key, or no key at all) means the result
     /// isn't keyset-eligible and pages by `OFFSET`.
     pub fn from_detail(detail: &TableDetail) -> Option<KeySpec> {
-        let pks: Vec<&ColumnMeta> = detail.columns.iter().filter(|c| c.primary_key).collect();
-        let candidate = match pks.as_slice() {
-            [single] => Some(*single),
-            [] => detail
-                .indexes
-                .iter()
-                .filter(|i| i.unique && i.columns.len() == 1)
-                .find_map(|i| {
-                    detail
-                        .columns
-                        .iter()
-                        .find(|c| c.name == i.columns[0] && c.not_null)
-                }),
-            _ => None,
-        };
-        let column = candidate?;
-        let kind = if column.type_name.as_deref().is_some_and(is_int_type) {
-            KeyKind::Int
-        } else {
-            KeyKind::Other
-        };
+        let column = resolve_key_column(detail)?;
         // SQLite reports `INTEGER PRIMARY KEY` (the rowid alias, never null) as
         // nullable, so an integer key passes without `not_null`; any other
         // nullable key disqualifies keyset (NULLs don't order reliably).
-        (column.not_null || kind == KeyKind::Int).then(|| KeySpec {
-            column: column.name.clone(),
+        let kind = key_kind(column);
+        (column.not_null || kind == KeyKind::Int)
+            .then(|| KeySpec::single(column.name.clone(), kind))
+    }
+
+    /// Resolve the composite seek key for a header-click sort by `sort_col`: the
+    /// sort column led, with the table's PK appended as a tiebreaker so equal
+    /// `sort_col` rows page deterministically. `None` (→ `OFFSET` fallback) when
+    /// the table has no usable PK, when `sort_col` isn't a real column of the
+    /// table (an expression/alias), or when it's nullable (NULLs don't order
+    /// reliably across engines). Sorting by the PK itself collapses to the plain
+    /// single-column key, just carrying the direction.
+    pub fn sorted(detail: &TableDetail, sort_col: &str, descending: bool) -> Option<KeySpec> {
+        let pk = resolve_key_column(detail)?;
+        let lead = detail.columns.iter().find(|c| c.name == sort_col)?;
+        if lead.name == pk.name {
+            return Some(KeySpec {
+                column: pk.name.clone(),
+                kind: key_kind(pk),
+                tiebreak: None,
+                descending,
+            });
+        }
+        // A nullable non-PK lead disqualifies keyset — same posture `from_detail`
+        // takes for nullable keys.
+        let kind = key_kind(lead);
+        (lead.not_null || kind == KeyKind::Int).then(|| KeySpec {
+            column: lead.name.clone(),
             kind,
+            tiebreak: Some(pk.name.clone()),
+            descending,
         })
+    }
+}
+
+/// The PK / unique-not-null-index column a table's keyset key is built from, if
+/// any. Shared by [`KeySpec::from_detail`] (the key itself) and
+/// [`KeySpec::sorted`] (the tiebreaker).
+fn resolve_key_column(detail: &TableDetail) -> Option<&ColumnMeta> {
+    let pks: Vec<&ColumnMeta> = detail.columns.iter().filter(|c| c.primary_key).collect();
+    match pks.as_slice() {
+        [single] => Some(*single),
+        [] => detail
+            .indexes
+            .iter()
+            .filter(|i| i.unique && i.columns.len() == 1)
+            .find_map(|i| {
+                detail
+                    .columns
+                    .iter()
+                    .find(|c| c.name == i.columns[0] && c.not_null)
+            }),
+        _ => None,
+    }
+}
+
+/// Whether a column is numerically interpolable (drives key-space fraction jumps).
+fn key_kind(column: &ColumnMeta) -> KeyKind {
+    if column.type_name.as_deref().is_some_and(is_int_type) {
+        KeyKind::Int
+    } else {
+        KeyKind::Other
     }
 }
 

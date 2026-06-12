@@ -45,11 +45,17 @@ pub enum Command {
     /// `table` names the `(schema, table)` when `sql` is a plain table browse:
     /// the backend introspects it for a keyset seek key (single-column PK or
     /// unique not-null index) and echoes the resolved [`KeySpec`] in
-    /// `ResultReady`. `None` (editor SQL, sorted re-opens) pages by `OFFSET`.
+    /// `ResultReady`. `None` (editor SQL) pages by `OFFSET`.
+    ///
+    /// `sort` describes a header-click sort over a table browse: `sql` is the
+    /// *unwrapped* base query and the backend either resolves a composite
+    /// `(sort_col, pk)` keyset key (fast seek) or, failing that, wraps the base in
+    /// `ORDER BY <position>` and pages by `OFFSET`. `None` is the unsorted open.
     OpenResult {
         sql: String,
         epoch: u64,
         table: Option<(String, String)>,
+        sort: Option<SortKey>,
     },
     /// Fetch one random-access page of an open result (grid load-on-scroll).
     /// `epoch` selects which open result; an unknown epoch is ignored (the tab
@@ -224,16 +230,30 @@ pub enum Event {
     Error(String),
 }
 
+/// A header-click sort on a table browse, carried with `OpenResult` so the
+/// backend can resolve a composite keyset key (or wrap for the `OFFSET` fallback).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortKey {
+    /// 1-based output position of the sort column — used for the `OFFSET`-fallback
+    /// `ORDER BY <position>` wrap, which orders by position to dodge identifier
+    /// quoting (engine-agnostic).
+    pub position: usize,
+    /// The sort column's name, for resolving the composite `(sort_col, pk)` key.
+    pub column: String,
+    pub descending: bool,
+}
+
 /// One `FetchRun` shape: how to extend or relocate the grid's resident run of
-/// a keyset-keyed result.
+/// a keyset-keyed result. A boundary is the key *tuple* of one row (lead column,
+/// then tiebreaker) — one element for a plain browse, two for a sorted browse.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunFetch {
-    /// Rows strictly after `after`, ascending. `None` starts from the result's
+    /// Rows strictly after `after`, in sort order. `None` starts from the result's
     /// first row.
-    Forward { after: Option<Value> },
-    /// Rows strictly before `before`, delivered descending (the grid prepends
-    /// them in arrival order, which restores ascending).
-    Backward { before: Value },
+    Forward { after: Option<Vec<Value>> },
+    /// Rows strictly before `before`, delivered reversed (the grid prepends them
+    /// in arrival order, which restores sort order).
+    Backward { before: Vec<Value> },
     /// Replace the run near row `ordinal`. When `exact` is `false` (scroll /
     /// scrollbar relocations), an integer key with known bounds is served by a
     /// key-space interpolated seek (`estimated` reply) — fast but approximate.

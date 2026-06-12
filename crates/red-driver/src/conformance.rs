@@ -250,7 +250,7 @@ pub(crate) async fn seeks_forward_backward_and_reads_bounds(
 
     // Forward: strictly after a bound.
     let fwd = driver
-        .fetch_seek(sql, key, Some(&Value::Integer(997)), false, 5, &abort)
+        .fetch_seek(sql, key, Some(&[Value::Integer(997)]), false, 5, &abort)
         .await
         .unwrap();
     assert_eq!(
@@ -264,7 +264,7 @@ pub(crate) async fn seeks_forward_backward_and_reads_bounds(
 
     // Backward: strictly before a bound, returned descending (the caller flips).
     let back = driver
-        .fetch_seek(sql, key, Some(&Value::Integer(4)), true, 5, &abort)
+        .fetch_seek(sql, key, Some(&[Value::Integer(4)]), true, 5, &abort)
         .await
         .unwrap();
     assert_eq!(
@@ -284,13 +284,13 @@ pub(crate) async fn seeks_forward_backward_and_reads_bounds(
     );
     // `>=` includes the bound itself (skip 0 lands on it).
     let inclusive = driver
-        .fetch_seek_skip(sql, key, Some(&Value::Integer(500)), 0, 1, &abort)
+        .fetch_seek_skip(sql, key, Some(&[Value::Integer(500)]), 0, 1, &abort)
         .await
         .unwrap();
     assert_eq!(ids(&inclusive, 0), vec![Value::Integer(500)]);
     // The bound is ordinal 0 of the window; skipping 10 lands on id 510.
     let skipped = driver
-        .fetch_seek_skip(sql, key, Some(&Value::Integer(500)), 10, 1, &abort)
+        .fetch_seek_skip(sql, key, Some(&[Value::Integer(500)]), 10, 1, &abort)
         .await
         .unwrap();
     assert_eq!(ids(&skipped, 0), vec![Value::Integer(510)]);
@@ -299,6 +299,79 @@ pub(crate) async fn seeks_forward_backward_and_reads_bounds(
         driver.key_bounds(sql, key, &abort).await.unwrap(),
         Some((1, 1000))
     );
+}
+
+/// Composite keyset seek for sorted results (Track A3): paging by a `(sort_col,
+/// pk)` tuple over a **non-unique** sort column covers every row exactly once, in
+/// `(sort_col, pk)` order, for both sort directions — the tiebreaker is what stops
+/// equal-`sort_col` rows from being skipped or duplicated across a page boundary.
+/// `sql` must select a table of `n` rows whose `pk` is the contiguous range
+/// `1..=n` and whose `sort_col` repeats (many rows share a value); `key_asc` and
+/// `key_desc` are the same composite key ascending/descending. `lead`/`tie` name
+/// the sort and pk columns; both must be integers for this check.
+pub(crate) async fn seeks_composite_sorted(
+    driver: &dyn DatabaseDriver,
+    sql: &str,
+    key_asc: &KeySpec,
+    key_desc: &KeySpec,
+    n: i64,
+) {
+    let abort = AbortSignal::new();
+    // A deliberately small page so equal-`sort_col` ties straddle boundaries —
+    // the exact case a scalar (sort_col-only) seek gets wrong.
+    let page_size = 4;
+    let int = |row: &[Value], col: usize| match row[col] {
+        Value::Integer(v) => v,
+        ref other => panic!("expected integer key, got {other:?}"),
+    };
+
+    for (key, descending) in [(key_asc, false), (key_desc, true)] {
+        // Walk the whole result forward (in sort order) one page at a time,
+        // re-seeking from each page's last key tuple.
+        let mut all: Vec<Vec<Value>> = Vec::new();
+        let mut bound: Option<Vec<Value>> = None;
+        let (mut lead, mut tie) = (0usize, 0usize);
+        loop {
+            let page = driver
+                .fetch_seek(sql, key, bound.as_deref(), false, page_size, &abort)
+                .await
+                .unwrap();
+            let Some(last) = page.rows.last() else { break };
+            lead = page.columns.iter().position(|c| c.name == key.column).unwrap();
+            tie = page
+                .columns
+                .iter()
+                .position(|c| Some(&c.name) == key.tiebreak.as_ref())
+                .unwrap();
+            bound = Some(vec![last[lead].clone(), last[tie].clone()]);
+            all.extend(page.rows);
+        }
+
+        // Every row exactly once: the pk set is precisely `1..=n`.
+        assert_eq!(
+            all.len(),
+            n as usize,
+            "composite seek covered every row (descending={descending})"
+        );
+        let mut ids: Vec<i64> = all.iter().map(|r| int(r, tie)).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            (1..=n).collect::<Vec<_>>(),
+            "no skipped or duplicated rows at tie boundaries (descending={descending})"
+        );
+
+        // Strictly monotonic in `(sort_col, pk)` — the tiebreaker orders rows that
+        // share a `sort_col` value deterministically.
+        let tuples: Vec<(i64, i64)> = all.iter().map(|r| (int(r, lead), int(r, tie))).collect();
+        for w in tuples.windows(2) {
+            if descending {
+                assert!(w[0] > w[1], "descending (sort_col, pk) strictly decreasing");
+            } else {
+                assert!(w[0] < w[1], "ascending (sort_col, pk) strictly increasing");
+            }
+        }
+    }
 }
 
 /// The driver-side display cap (Track A1): a display fetch caps fat non-key cells
