@@ -488,6 +488,10 @@ impl AppState {
         Modal::new("connection-form")
             .title(title)
             .width(px(520.))
+            // The shared modal focus handle is this form's ancestor, so the
+            // focus-trap listener keeps Tab inside the dialog. The name field is
+            // focused on open (see `focus_name_field`), not the handle itself.
+            .focus_handle(self.modal_focus.clone())
             .footer(footer)
             .on_close(move |_, cx| {
                 close_view.update(cx, |this, cx| this.close_form(cx)).ok();

@@ -19,7 +19,7 @@
 //! The bindings use `cmd-*` unconditionally, matching the rest of the app's
 //! macOS-first chrome; per-platform `ctrl-*` splitting is a follow-up.
 
-use flint::{CodeEditor, Palette, TextInput};
+use flint::{CodeEditor, Modal, Palette, TextInput};
 use gpui::{actions, App, KeyBinding};
 
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
@@ -47,13 +47,16 @@ actions!(
         FocusSchema,
         FocusEditor,
         FocusGrid,
+        /// Reveal the schema sidebar and focus its filter field (search schema).
+        SearchSchema,
         /// Cycle focus to the next / previous pane (schema → editor → grid).
         CycleFocusNext,
         CycleFocusPrev,
         /// Open the keyboard-shortcuts reference overlay.
         ShowShortcuts,
-        /// Test the connection form (⌘↵ while a form field is focused).
-        TestConnection,
+        /// ⌘↵ from anywhere: run the active tab's query — or, while the connection
+        /// form is open, test the connection.
+        RunQuery,
         /// Open a new-connection form (the disconnected screen's ⌘N).
         NewConnection,
     ]
@@ -77,7 +80,7 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
         (
             "Panes",
             vec![
-                ("⌘1 / ⌘2 / ⌘3", "Focus schema / editor / grid"),
+                ("⌥⌘1 / ⌥⌘2 / ⌥⌘3", "Focus schema / editor / grid"),
                 ("F6 / ⇧F6", "Cycle focus forward / back"),
                 ("⌘B", "Toggle schema sidebar"),
             ],
@@ -110,7 +113,24 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
                 ("↑ / ↓", "Move selection"),
                 ("← / →", "Collapse / expand"),
                 ("↵", "Open table preview"),
+                ("⌘F", "Search schema (focus filter)"),
                 ("⌘R", "Refresh schema"),
+            ],
+        ),
+        (
+            "Dialogs",
+            vec![
+                ("↵", "Confirm / connect"),
+                ("Esc", "Cancel / close"),
+                ("Tab / ⇧Tab", "Cycle controls (trapped)"),
+            ],
+        ),
+        (
+            "Welcome screen",
+            vec![
+                ("↑ / ↓", "Move between saved connections"),
+                ("↵", "Connect to the highlighted one"),
+                ("⌘N", "New connection"),
             ],
         ),
     ]
@@ -125,6 +145,7 @@ pub(crate) fn bind_all(cx: &mut App) {
     TextInput::bind_keys(cx);
     CodeEditor::bind_keys(cx);
     Palette::bind_keys(cx);
+    Modal::bind_keys(cx);
 
     cx.bind_keys([
         // --- true globals (work from any phase) ---
@@ -145,22 +166,27 @@ pub(crate) fn bind_all(cx: &mut App) {
         KeyBinding::new("cmd-w", CloseTab, Some("RedRoot")),
         KeyBinding::new("ctrl-tab", NextTab, Some("RedRoot")),
         KeyBinding::new("ctrl-shift-tab", PrevTab, Some("RedRoot")),
-        // Schema sidebar + reload.
+        // Schema sidebar + reload + filter. ⌘F reaches `RedRoot` from the editor
+        // (the `CodeEditor` context doesn't bind it), so it always opens search.
         KeyBinding::new("cmd-b", ToggleSidebar, Some("RedRoot")),
         KeyBinding::new("cmd-r", RefreshSchema, Some("RedRoot")),
-        // Pane focus: direct jumps (⌘1/2/3) and a cycle (F6 / ⇧F6).
-        KeyBinding::new("cmd-1", FocusSchema, Some("RedRoot")),
-        KeyBinding::new("cmd-2", FocusEditor, Some("RedRoot")),
-        KeyBinding::new("cmd-3", FocusGrid, Some("RedRoot")),
+        KeyBinding::new("cmd-f", SearchSchema, Some("RedRoot")),
+        // Pane focus: direct jumps (⌥⌘1/2/3) and a cycle (F6 / ⇧F6). ⌥⌘ avoids
+        // the bare ⌘+digit keys (macOS / screenshot tools bind several of those).
+        KeyBinding::new("cmd-alt-1", FocusSchema, Some("RedRoot")),
+        KeyBinding::new("cmd-alt-2", FocusEditor, Some("RedRoot")),
+        KeyBinding::new("cmd-alt-3", FocusGrid, Some("RedRoot")),
         KeyBinding::new("f6", CycleFocusNext, Some("RedRoot")),
         KeyBinding::new("shift-f6", CycleFocusPrev, Some("RedRoot")),
         // Discoverability. `⌘/` (not `?`) so typing `?` into the editor or a field
         // still inserts the character — a global `?` binding would swallow it.
         KeyBinding::new("cmd-/", ShowShortcuts, Some("RedRoot")),
-        // Connection form / welcome screen. `⌘↵` reaches `RedRoot` from a focused
-        // form field (the editor's deeper `CodeEditor` context keeps its own ⌘↵
-        // for Run); both handlers no-op outside their screen.
-        KeyBinding::new("cmd-enter", TestConnection, Some("RedRoot")),
+        // ⌘↵ runs the active tab's query from any pane. The editor's deeper
+        // `CodeEditor` context keeps its own ⌘↵ (so a focused editor runs through
+        // its Run event); this `RedRoot` binding covers every other focus — grid,
+        // schema, root — and tests the connection while the form is open.
+        KeyBinding::new("cmd-enter", RunQuery, Some("RedRoot")),
+        // ⌘N opens a new-connection form on the welcome screen (no-op elsewhere).
         KeyBinding::new("cmd-n", NewConnection, Some("RedRoot")),
     ]);
 }

@@ -28,10 +28,23 @@ pub(crate) enum Cmd {
     Connect(usize),
     RunQuery,
     NewTab,
+    CloseTab,
+    NextTab,
+    PrevTab,
     ToggleHistory,
     ToggleSidebar,
     RefreshSchema,
     Disconnect,
+    /// Move keyboard focus to the schema / editor / grid pane.
+    FocusSchema,
+    FocusEditor,
+    FocusGrid,
+    /// Reveal the sidebar and focus its filter field (search schema).
+    SearchSchema,
+    /// Copy the result grid's current selection (TSV).
+    CopySelection,
+    /// Open a new-connection form (disconnected phase).
+    NewConnection,
     /// Open the "go to row…" prompt (only when a result is open).
     GoToRow,
     /// Open the keyboard-shortcuts reference overlay.
@@ -154,10 +167,22 @@ impl AppState {
             Cmd::Connect(index) => self.connect(index, cx),
             Cmd::RunQuery => self.run_editor_query(cx),
             Cmd::NewTab => self.new_query(cx),
+            Cmd::CloseTab => self.close_active_tab(cx),
+            Cmd::NextTab => self.next_tab(cx),
+            Cmd::PrevTab => self.prev_tab(cx),
             Cmd::ToggleHistory => self.toggle_history(cx),
             Cmd::ToggleSidebar => self.toggle_sidebar(cx),
             Cmd::RefreshSchema => self.refresh_schema(),
             Cmd::Disconnect => self.disconnect(cx),
+            // Pane focus needs a `Window`; defer it to the next render (drained
+            // there) the same way the editor's Esc-to-grid does.
+            Cmd::FocusSchema => self.pending_focus = Some(crate::app::Pane::Schema),
+            Cmd::FocusEditor => self.pending_focus = Some(crate::app::Pane::Editor),
+            Cmd::FocusGrid => self.pending_focus = Some(crate::app::Pane::Grid),
+            // Deferred to the next render (needs a `Window`), like the focus jumps.
+            Cmd::SearchSchema => self.focus_search = true,
+            Cmd::CopySelection => self.copy_result_selection(cx),
+            Cmd::NewConnection => self.open_new_form(cx),
             Cmd::GoToRow => self.open_goto_prompt(cx),
             Cmd::ShowShortcuts => self.toggle_shortcuts(cx),
         }
@@ -179,16 +204,54 @@ impl AppState {
                     PaletteItem::new("cmd:new-tab", "query: new tab").hint("⌘T"),
                     Cmd::NewTab,
                 ));
-                // Only meaningful with rows on screen to navigate.
+                // Tab management — close needs an open tab; switching needs two.
+                if active.active().is_some() {
+                    out.push((
+                        PaletteItem::new("cmd:close-tab", "query: close tab").hint("⌘W"),
+                        Cmd::CloseTab,
+                    ));
+                }
+                if active.tabs.len() > 1 {
+                    out.push((
+                        PaletteItem::new("cmd:next-tab", "query: next tab").hint("⌃Tab"),
+                        Cmd::NextTab,
+                    ));
+                    out.push((
+                        PaletteItem::new("cmd:prev-tab", "query: previous tab").hint("⌃⇧Tab"),
+                        Cmd::PrevTab,
+                    ));
+                }
+                // Only meaningful with rows on screen to navigate / copy.
                 if active.active_result().is_some() {
                     out.push((
                         PaletteItem::new("cmd:goto-row", "go to row…").hint("⌃G"),
                         Cmd::GoToRow,
                     ));
+                    out.push((
+                        PaletteItem::new("cmd:copy", "result: copy selection").hint("⌘C"),
+                        Cmd::CopySelection,
+                    ));
                 }
                 out.push((
                     PaletteItem::new("cmd:history", "query: toggle history"),
                     Cmd::ToggleHistory,
+                ));
+                // Pane focus.
+                out.push((
+                    PaletteItem::new("cmd:focus-schema", "focus: schema sidebar").hint("⌥⌘1"),
+                    Cmd::FocusSchema,
+                ));
+                out.push((
+                    PaletteItem::new("cmd:focus-editor", "focus: editor").hint("⌥⌘2"),
+                    Cmd::FocusEditor,
+                ));
+                out.push((
+                    PaletteItem::new("cmd:focus-grid", "focus: result grid").hint("⌥⌘3"),
+                    Cmd::FocusGrid,
+                ));
+                out.push((
+                    PaletteItem::new("cmd:search-schema", "schema: search").hint("⌘F"),
+                    Cmd::SearchSchema,
                 ));
                 out.push((
                     PaletteItem::new("cmd:sidebar", "view: toggle sidebar").hint("⌘B"),
@@ -211,6 +274,10 @@ impl AppState {
                         Cmd::Connect(index),
                     ));
                 }
+                out.push((
+                    PaletteItem::new("cmd:new-conn", "connection: new").hint("⌘N"),
+                    Cmd::NewConnection,
+                ));
             }
             // Mid-connect there's nothing query-shaped to do; only globals show.
             Phase::Connecting(_) => {}

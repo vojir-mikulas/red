@@ -368,6 +368,10 @@ pub struct AppState {
     pub(crate) modal_focus: FocusHandle,
     /// Set when such a modal just opened: the next render focuses `modal_focus`.
     pub(crate) focus_modal: bool,
+    /// Active while a modal is open: a focus-out listener on `modal_focus` that
+    /// pulls focus back inside if Tab would carry it to the backdrop (the focus
+    /// trap). Dropped — unsubscribing — when the modal closes.
+    pub(crate) modal_focus_trap: Option<gpui::Subscription>,
     /// The command palette overlay, when open, plus the `id → Cmd` map for the
     /// commands it's currently showing (so an activation routes to the right one).
     pub(crate) palette: Option<Entity<Palette>>,
@@ -390,6 +394,9 @@ pub struct AppState {
     /// Set when the history popover just opened: the next render focuses it so its
     /// arrow-key navigation works.
     pub(crate) focus_history: bool,
+    /// Set by ⌘F / the search command: the next render reveals the sidebar and
+    /// focuses the schema filter field.
+    pub(crate) focus_search: bool,
     /// Dev-only perf HUD collector — brackets `render` to read build time and
     /// allocation churn. Compiled only under the `dev-stats` feature.
     #[cfg(feature = "dev-stats")]
@@ -564,6 +571,7 @@ impl AppState {
             root_focus: cx.focus_handle(),
             modal_focus: cx.focus_handle(),
             focus_modal: false,
+            modal_focus_trap: None,
             palette: None,
             palette_cmds: Vec::new(),
             // Focus the root on first paint so the very first ⌘K dispatches.
@@ -573,6 +581,7 @@ impl AppState {
             pending_focus: None,
             focus_name_field: false,
             focus_history: false,
+            focus_search: false,
             #[cfg(feature = "dev-stats")]
             dev_stats: crate::dev_stats::DevStats::default(),
         }
@@ -1110,6 +1119,15 @@ impl AppState {
         self.service.send(Command::LoadObjects);
     }
 
+    /// Whether any modal that should trap focus is currently open. Drives the
+    /// focus-trap subscription in `render`.
+    pub(crate) fn any_modal_open(&self) -> bool {
+        self.confirm_exec.is_some()
+            || self.confirm_close_tab.is_some()
+            || self.shortcuts_open
+            || self.form.is_some()
+    }
+
     /// Open or close the keyboard-shortcuts overlay (`⌘/` / palette command).
     /// Opening focuses the modal so its Esc-to-close is heard; closing returns
     /// focus to the root.
@@ -1148,6 +1166,22 @@ impl AppState {
         if let Phase::Connected(active) = &mut self.phase {
             active.active_pane = pane;
         }
+        cx.notify();
+    }
+
+    /// Reveal the schema sidebar and focus its filter field, so the user can type
+    /// to search the schema (the ⌘F / "search schema" command). No-op outside the
+    /// connected shell.
+    pub(crate) fn open_schema_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let filter = match &mut self.phase {
+            Phase::Connected(active) => {
+                active.sidebar_collapsed = false;
+                active.active_pane = Pane::Schema;
+                active.schema.filter.clone()
+            }
+            _ => return,
+        };
+        window.focus(&filter.focus_handle(cx), cx);
         cx.notify();
     }
 

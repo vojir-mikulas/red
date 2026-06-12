@@ -8,7 +8,7 @@ use gpui::{div, prelude::*, px, Focusable, KeyDownEvent, Render, Window};
 use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::keymap::{
     CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusSchema, NewConnection,
-    NewTab, NextTab, PrevTab, RefreshSchema, ShowShortcuts, TestConnection, ToggleSidebar,
+    NewTab, NextTab, PrevTab, RefreshSchema, RunQuery, SearchSchema, ShowShortcuts, ToggleSidebar,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
@@ -116,11 +116,40 @@ impl Render for AppState {
             }
         }
 
+        // ⌘F / search command — reveal the sidebar and focus the schema filter.
+        if self.focus_search {
+            self.focus_search = false;
+            self.open_schema_search(window, cx);
+        }
+
         // A keyboard-driven modal (a confirmation or the shortcuts overlay) just
         // opened — focus it so Flint's `Modal` hears its Esc/Enter.
         if self.focus_modal {
             self.focus_modal = false;
             window.focus(&self.modal_focus.clone(), cx);
+        }
+
+        // Focus trap: while a modal is open, a focus-out listener on `modal_focus`
+        // pulls focus back inside if Tab would carry it to the backdrop. Registered
+        // once when a modal opens (the modal's panel is a descendant of
+        // `modal_focus`), and dropped — unsubscribing — when it closes.
+        if self.any_modal_open() {
+            if self.modal_focus_trap.is_none() {
+                let handle = self.modal_focus.clone();
+                let weak = cx.entity().downgrade();
+                let sub = window.on_focus_out(&handle.clone(), cx, move |_event, window, cx| {
+                    // Re-enter only while a modal is genuinely still open (not mid-
+                    // close) and focus actually left the modal subtree.
+                    let open = weak.upgrade().is_some_and(|e| e.read(cx).any_modal_open());
+                    if open && !handle.contains_focused(window, cx) {
+                        window.focus(&handle, cx);
+                        window.focus_next(cx);
+                    }
+                });
+                self.modal_focus_trap = Some(sub);
+            }
+        } else {
+            self.modal_focus_trap = None;
         }
 
         // First paint: install the OS-appearance observer and the settings
@@ -173,6 +202,10 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &PrevTab, _, cx| this.prev_tab(cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &RefreshSchema, _, _| this.refresh_schema()))
+            .on_action(cx.listener(|this, _: &SearchSchema, _, cx| {
+                this.focus_search = true;
+                cx.notify();
+            }))
             // Pane focus jumps + cycle.
             .on_action(cx.listener(|this, _: &FocusSchema, window, cx| {
                 this.focus_pane(Pane::Schema, window, cx)
@@ -190,11 +223,13 @@ impl Render for AppState {
                 this.cycle_focus(false, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| this.toggle_shortcuts(cx)))
-            // ⌘↵ in the connection form tests; ⌘N on the welcome screen adds one.
-            // Both no-op outside their screen.
-            .on_action(cx.listener(|this, _: &TestConnection, _, cx| {
+            // ⌘↵ runs the active tab's query from any pane — or tests the connection
+            // while the form is open. ⌘N on the welcome screen adds a connection.
+            .on_action(cx.listener(|this, _: &RunQuery, _, cx| {
                 if this.form.is_some() {
                     this.test_connection(cx);
+                } else {
+                    this.run_editor_query(cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &NewConnection, _, cx| {

@@ -217,7 +217,8 @@ impl AppState {
             theme.text_faint,
             theme.text_dim,
         );
-        let (yellow, green, on_accent) = (theme.yellow, theme.green, theme.on_accent);
+        let (yellow, on_accent) = (theme.yellow, theme.on_accent);
+        let accent = theme.accent;
         // UI-chrome icon size scaled with the general UI font (not the editor
         // mono font). Snapshotted here (Pixels is Copy) so it survives into the
         // lazy per-tab `.map` closure without re-borrowing `theme`.
@@ -327,7 +328,7 @@ impl AppState {
                             .top_0()
                             .bottom_0()
                             .w(px(2.))
-                            .bg(green),
+                            .bg(accent),
                     )
                 })
                 .when(bar_after, |d| {
@@ -338,7 +339,7 @@ impl AppState {
                             .top_0()
                             .bottom_0()
                             .w(px(2.))
-                            .bg(green),
+                            .bg(accent),
                     )
                 })
                 .child(
