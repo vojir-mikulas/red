@@ -26,9 +26,10 @@ use crate::app::{AppState, ExportProgress, Notification, Phase};
 use buffer::{next_epoch, window_decision, BufferMode, GridBuffer, KeyedRun, WindowView, WINDOW};
 pub(crate) use render::group_digits;
 
-/// All the state for one open result. The grid columns include a leading row-
-/// number gutter, so table-column index `0` is the gutter and data column `n` is
-/// table column `n + 1`.
+/// All the state for one open result. When the row-number gutter is shown
+/// (`grid.row_numbers`) it occupies table column `0`, so data column `n` sits at
+/// table column `n + 1`; with the gutter hidden the data columns start at `0`. The
+/// offset is [`AppState::gutter`] and selection/copy/sort map through it.
 pub(crate) struct ResultGrid {
     pub label: String,
     base_sql: String,
@@ -54,6 +55,10 @@ pub(crate) struct ResultGrid {
     /// `Table`/`uniform_list` are stateless across frames, so the base lives
     /// here. See `WINDOW` and `prepare_window`.
     pub(in crate::result) window_base: Rc<Cell<usize>>,
+    /// Rows per fetched page (the `grid.page_size` in effect when this result was
+    /// opened) — used to (re)build the buffer in either paging mode. A live result
+    /// keeps the page it was opened with; a settings change applies to the next open.
+    page_size: usize,
     /// Identifies the current open SQL; bumped on every (re)open so stale page
     /// fetches and late `ResultReady`/`ResultPageLoaded` replies are ignored.
     pub(crate) epoch: u64,
@@ -70,6 +75,7 @@ impl ResultGrid {
         base_sql: String,
         table: Option<(String, String)>,
         sender: CommandSender,
+        page_size: usize,
     ) -> Self {
         Self {
             label,
@@ -81,8 +87,9 @@ impl ResultGrid {
             sort: None,
             selection: None,
             table,
-            buffer: Rc::new(RefCell::new(GridBuffer::default())),
+            buffer: Rc::new(RefCell::new(GridBuffer::new(page_size))),
             sender,
+            page_size,
             scroll: UniformListScrollHandle::new(),
             h_scroll: ScrollHandle::new(),
             scrollbar: ScrollbarState::new(),
@@ -119,6 +126,12 @@ impl ResultGrid {
         self.ready
     }
 
+    /// Drop any cell selection — used when the gutter offset changes under it (the
+    /// selection is stored in table-column coordinates, see `AppState::set_row_numbers`).
+    pub(crate) fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
     /// Total rows in the open result (0 until `ResultReady`) — for the
     /// go-to-row prompt's range hint and bound.
     pub(crate) fn total_rows(&self) -> usize {
@@ -152,10 +165,11 @@ impl ResultGrid {
         self.error = None;
         self.stop_timer();
         self.window_base.set(0);
+        let page = self.page_size;
         let mut buffer = self.buffer.borrow_mut();
-        *buffer = GridBuffer::default();
+        *buffer = GridBuffer::new(page);
         if let Some(key_cols) = key_cols {
-            buffer.mode = BufferMode::Keyed(KeyedRun::new(key_cols));
+            buffer.mode = BufferMode::Keyed(KeyedRun::new(key_cols, page));
         }
     }
 
@@ -216,7 +230,7 @@ impl ResultGrid {
     }
 
     fn reset_buffer(&mut self) {
-        *self.buffer.borrow_mut() = GridBuffer::default();
+        *self.buffer.borrow_mut() = GridBuffer::new(self.page_size);
         self.window_base.set(0);
     }
 
@@ -318,16 +332,17 @@ impl ResultGrid {
     /// when the selection touches a cell the grid clipped for display, or reaches
     /// rows scrolled out of the window (a whole-column select), those rows must be
     /// re-fetched in full first ([`CopyPlan::Refetch`]). `None` when the selection
-    /// is empty or covers only the gutter.
-    fn copy_plan(&self) -> Option<CopyPlan> {
+    /// is empty or covers only the gutter. `gutter` is the data-column table offset
+    /// (`1` with the row-number gutter shown, else `0`).
+    fn copy_plan(&self, gutter: usize) -> Option<CopyPlan> {
         let (r0, c0, r1, c1) = self.selection?.bounds();
         let ncol = self.columns.len();
-        let dc0 = c0.max(1);
+        let dc0 = c0.max(gutter);
         if dc0 > c1 {
             return None;
         }
-        let dcol_lo = dc0 - 1;
-        let dcol_hi = (c1 - 1).min(ncol.saturating_sub(1));
+        let dcol_lo = dc0 - gutter;
+        let dcol_hi = (c1 - gutter).min(ncol.saturating_sub(1));
         let buffer = self.buffer.borrow();
         // Any selected row that's off-window (not resident) or holds a clipped
         // display stand-in forces a full re-fetch; otherwise the buffer already
@@ -462,7 +477,13 @@ impl AppState {
             Phase::Connected(active) if active.active().is_some() => {
                 // Bind the grid's load-on-scroll sender to this workspace's session.
                 let sender = self.service.command_sender(active.session);
-                let grid = ResultGrid::new(label.into(), base_sql, table, sender);
+                let grid = ResultGrid::new(
+                    label.into(),
+                    base_sql,
+                    table,
+                    sender,
+                    self.settings.grid.page_size,
+                );
                 let opened = (grid.base_sql.clone(), grid.epoch, grid.table.clone());
                 // Safe: the guard above ensured a focused tab exists.
                 active.active_mut().unwrap().result = Some(grid);
@@ -504,7 +525,12 @@ impl AppState {
 
     /// A keyset run fetch failed — free the grid's in-flight slot so scrolling
     /// can fetch again (the error itself arrives separately as a toast).
-    pub(crate) fn on_result_run_failed(&mut self, session: Option<SessionId>, epoch: u64, seq: u64) {
+    pub(crate) fn on_result_run_failed(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: u64,
+        seq: u64,
+    ) {
         if let Some(active) = self.conn_mut(session) {
             if let Some(grid) = active.result_by_epoch(epoch) {
                 grid.buffer.borrow_mut().run_failed(seq);
@@ -566,12 +592,20 @@ impl AppState {
         }
     }
 
+    /// Table-column index of the first *data* column: `1` when the row-number
+    /// gutter occupies column 0, else `0`. A data column `d` sits at table column
+    /// `d + gutter`; selection/copy/sort all map through this offset.
+    pub(in crate::result) fn gutter(&self) -> usize {
+        self.settings.grid.row_numbers as usize
+    }
+
     /// Header click on a data column: toggle / set sort and re-open the result.
     pub(crate) fn result_sort(&mut self, table_col: usize, cx: &mut Context<Self>) {
-        if table_col == 0 {
+        let gutter = self.gutter();
+        if table_col < gutter {
             return; // the row-number gutter isn't sortable
         }
-        let dcol = table_col - 1;
+        let dcol = table_col - gutter;
         let reopen = match &mut self.phase {
             Phase::Connected(active) => match active.active_result_mut() {
                 Some(grid) => {
@@ -631,12 +665,13 @@ impl AppState {
         extend: bool,
         cx: &mut Context<Self>,
     ) {
+        let gutter = self.gutter();
         if let Phase::Connected(active) = &mut self.phase {
             if let Some(grid) = active.active_result_mut() {
                 let ncols = grid.columns.len();
-                grid.selection = if table_col == 0 {
-                    // Gutter: span all data columns (table cols `1..=ncols`); an
-                    // empty result has no columns to select.
+                grid.selection = if gutter == 1 && table_col == 0 {
+                    // Gutter click: span every data column (table cols
+                    // `gutter..=ncols`); an empty result has no columns to select.
                     (ncols > 0).then(|| match (extend, grid.selection) {
                         (true, Some(mut range)) => {
                             range.focus = (row, ncols);
@@ -674,6 +709,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let row_height = f32::from(self.settings.grid.density.row_height());
+        let gutter = self.gutter();
         if let Phase::Connected(active) = &mut self.phase {
             if let Some(grid) = active.active_result_mut() {
                 if !grid.ready || grid.error.is_some() || grid.columns.is_empty() {
@@ -682,20 +718,22 @@ impl AppState {
                 let ncols = grid.columns.len();
                 let last_row = grid.total.saturating_sub(1);
                 let page = grid.viewport_rows(row_height).max(1);
+                // Data columns occupy table indices `gutter..=ncols-1+gutter`.
+                let (first_col, last_col) = (gutter, ncols + gutter - 1);
                 // The cursor is the selection's focus; with nothing selected yet
                 // it starts at the first visible row's first data column.
                 let (row, col) = match grid.selection {
                     Some(r) => r.focus,
-                    None => (grid.first_visible_row(row_height), 1),
+                    None => (grid.first_visible_row(row_height), first_col),
                 };
-                let col = col.clamp(1, ncols);
+                let col = col.clamp(first_col, last_col);
                 let (new_row, new_col) = match mv {
                     TableNav::Up => (row.saturating_sub(1), col),
                     TableNav::Down => ((row + 1).min(last_row), col),
-                    TableNav::Left => (row, (col - 1).max(1)),
-                    TableNav::Right => (row, (col + 1).min(ncols)),
-                    TableNav::RowStart => (row, 1),
-                    TableNav::RowEnd => (row, ncols),
+                    TableNav::Left => (row, (col - 1).max(first_col)),
+                    TableNav::Right => (row, (col + 1).min(last_col)),
+                    TableNav::RowStart => (row, first_col),
+                    TableNav::RowEnd => (row, last_col),
                     TableNav::PageUp => (row.saturating_sub(page), col),
                     TableNav::PageDown => ((row + page).min(last_row), col),
                     TableNav::First => (0, col),
@@ -726,7 +764,8 @@ impl AppState {
         extend: bool,
         cx: &mut Context<Self>,
     ) {
-        if table_col == 0 {
+        let gutter = self.gutter();
+        if table_col < gutter {
             return;
         }
         if let Phase::Connected(active) = &mut self.phase {
@@ -736,7 +775,7 @@ impl AppState {
                     // Keep the anchor column, pull the focus to this one, and force
                     // full height so the block stays a clean column span.
                     (true, Some(mut range)) => {
-                        range.anchor = (0, range.anchor.1.max(1));
+                        range.anchor = (0, range.anchor.1.max(gutter));
                         range.focus = (last, table_col);
                         Some(range)
                     }
@@ -882,8 +921,9 @@ impl AppState {
     }
 
     pub(crate) fn copy_result_selection(&mut self, cx: &mut Context<Self>) {
+        let gutter = self.gutter();
         let plan = match &self.phase {
-            Phase::Connected(active) => active.active_result().and_then(ResultGrid::copy_plan),
+            Phase::Connected(active) => active.active_result().and_then(|g| g.copy_plan(gutter)),
             _ => None,
         };
         match plan {

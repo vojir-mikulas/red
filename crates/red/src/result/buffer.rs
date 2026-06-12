@@ -1,6 +1,7 @@
 //! The windowed row buffer behind the grid: the two paging modes (offset and
 //! keyset-run), eviction around the viewport, and the virtual-scroll window
-//! arithmetic. Holds at most ~`2*MARGIN` rows regardless of result size.
+//! arithmetic. Holds at most ~`2*margin` rows regardless of result size, where the
+//! margin scales with the page (`grid.page_size`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
@@ -12,22 +13,29 @@ use red_core::CappedCell;
 use red_core::Value;
 use red_service::{Command, CommandSender, RunFetch};
 
-/// Rows per fetched page, and how far beyond the viewport to keep resident before
-/// evicting. The buffer holds at most ~`2*MARGIN` rows regardless of total.
-const PAGE: usize = 200;
-const MARGIN: usize = 400;
+/// Default rows per fetched page when `grid.page_size` doesn't override it (and the
+/// value the buffer tests run with). The live page is per-buffer ([`GridBuffer::page`]);
+/// every derived span below scales from it, so a larger page keeps the same shape:
+/// a margin of `2*page` rows beyond the viewport, a fling threshold of `3*page`, and
+/// a keyed jump gap of `2*page`. The buffer holds at most ~`2*margin` rows regardless
+/// of total.
+pub(crate) const DEFAULT_PAGE: usize = 200;
 
-/// Skip fetching while the viewport is moving faster than this many rows per
-/// paint — a flung scrollbar across a multi-million-row result would otherwise
-/// spawn a deep-`OFFSET` page query every frame at a different offset, none of
-/// which the user ever dwells on. Fetching resumes once the scroll slows to near
-/// its resting position. A deliberate drag moves far fewer rows/frame than this.
-const FLING_ROWS: usize = 3 * PAGE;
+/// Rows beyond the viewport to keep resident before evicting, as a multiple of the
+/// page. `margin = MARGIN_PAGES * page`.
+const MARGIN_PAGES: usize = 2;
 
-/// In keyed mode: a viewport landing this far beyond the resident run abandons
-/// run-extension (which would chain seeks across the gap) and jumps — one
+/// Fling threshold (skip fetching while moving faster than this), as a multiple of
+/// the page — a flung scrollbar across a multi-million-row result would otherwise
+/// spawn a deep-`OFFSET` page query every frame at a different offset, none of which
+/// the user ever dwells on. Fetching resumes once the scroll slows to near its
+/// resting position. A deliberate drag moves far fewer rows/frame than this.
+const FLING_PAGES: usize = 3;
+
+/// In keyed mode: a viewport landing this many pages beyond the resident run
+/// abandons run-extension (which would chain seeks across the gap) and jumps — one
 /// key-space interpolated seek that replaces the run.
-const JUMP_GAP: usize = 2 * PAGE;
+const JUMP_PAGES: usize = 2;
 
 /// Physical rows the list (`uniform_list`) is laid out over at once. GPUI places
 /// each row at `index * row_height` in `f32`, which is only exact up to 2^24
@@ -208,12 +216,33 @@ impl Row {
 /// viewport margin is evicted each paint.
 ///
 /// [`KeySpec`]: red_core::KeySpec
-#[derive(Default)]
 pub(super) struct GridBuffer {
     pub(super) mode: BufferMode,
+    /// Rows per fetched page (the live `grid.page_size`). Threaded into the keyed
+    /// run / offset pages and the margin/fling spans derived from it.
+    page: usize,
     /// The previous paint's first visible row, to gauge scroll velocity (see
-    /// `FLING_ROWS`). `None` until the first paint.
+    /// `FLING_PAGES`). `None` until the first paint.
     last_start: Option<usize>,
+}
+
+impl Default for GridBuffer {
+    fn default() -> Self {
+        Self::new(DEFAULT_PAGE)
+    }
+}
+
+impl GridBuffer {
+    /// A fresh offset-mode buffer with `page` rows per fetch. The grid switches it
+    /// into keyed mode on `ResultReady` when the backend resolves a seek key.
+    pub(super) fn new(page: usize) -> Self {
+        let page = page.max(1);
+        Self {
+            mode: BufferMode::Offset(OffsetPages::new(page)),
+            page,
+            last_start: None,
+        }
+    }
 }
 
 pub(super) enum BufferMode {
@@ -229,10 +258,28 @@ impl Default for BufferMode {
 
 /// Offset mode: absolute row index → cells, plus the set of in-flight page
 /// requests (so the same page isn't fetched twice).
-#[derive(Default)]
 pub(super) struct OffsetPages {
     rows: HashMap<usize, Row>,
     requested: HashSet<usize>,
+    /// Rows per page (the live `grid.page_size`) — the unit page boundaries and the
+    /// `FetchPage` limit are computed in.
+    page: usize,
+}
+
+impl Default for OffsetPages {
+    fn default() -> Self {
+        Self::new(DEFAULT_PAGE)
+    }
+}
+
+impl OffsetPages {
+    fn new(page: usize) -> Self {
+        Self {
+            rows: HashMap::new(),
+            requested: HashSet::new(),
+            page: page.max(1),
+        }
+    }
 }
 
 /// Keyed mode: one contiguous run of rows, `anchor..anchor + rows.len()` in
@@ -243,6 +290,9 @@ pub(super) struct KeyedRun {
     /// Indices of the key columns within a row (lead, then tiebreaker) — for
     /// reading a boundary's key tuple.
     key_cols: Vec<usize>,
+    /// Rows per fetched run window (the live `grid.page_size`). The `short` end
+    /// detection (`n < page`) and the jump-gap/margin spans all key off this.
+    page: usize,
     /// Ordinal of the run's first row. Exact after contiguous scroll from a
     /// known end; an estimate (`estimated`) after an interpolated jump.
     anchor: usize,
@@ -266,9 +316,10 @@ pub(super) struct KeyedRun {
 }
 
 impl KeyedRun {
-    pub(super) fn new(key_cols: Vec<usize>) -> Self {
+    pub(super) fn new(key_cols: Vec<usize>, page: usize) -> Self {
         Self {
             key_cols,
+            page,
             anchor: 0,
             rows: VecDeque::new(),
             estimated: false,
@@ -308,7 +359,7 @@ impl KeyedRun {
         sender.send(Command::FetchRun {
             epoch,
             fetch,
-            limit: PAGE,
+            limit: self.page,
             seq: self.seq,
         });
     }
@@ -341,8 +392,9 @@ impl KeyedRun {
         if self.pending.is_some() || self.halted {
             return;
         }
-        let lo = range.start.saturating_sub(MARGIN);
-        let hi = (range.end + MARGIN).min(total);
+        let margin = MARGIN_PAGES * self.page;
+        let lo = range.start.saturating_sub(margin);
+        let hi = (range.end + margin).min(total);
 
         if self.rows.is_empty() {
             if range.start == 0 {
@@ -366,7 +418,8 @@ impl KeyedRun {
         let run_end = self.anchor + self.rows.len();
 
         // Far from the run → relocate it rather than chain seeks across the gap.
-        if range.start >= run_end + JUMP_GAP || range.end + JUMP_GAP <= run_start {
+        let jump_gap = JUMP_PAGES * self.page;
+        if range.start >= run_end + jump_gap || range.end + jump_gap <= run_start {
             self.issue(
                 RunFetch::Jump {
                     ordinal: range.start,
@@ -414,7 +467,7 @@ impl KeyedRun {
         }
         self.pending = None;
         let n = rows.len();
-        let short = n < PAGE;
+        let short = n < self.page;
         match fetch {
             RunFetch::Forward { after } => {
                 if after != self.last_key() {
@@ -535,7 +588,7 @@ impl GridBuffer {
     /// A no-op in keyed mode (keyed grids never request pages).
     pub(super) fn insert_page(&mut self, offset: usize, rows: Vec<Vec<Value>>) {
         if let BufferMode::Offset(pages) = &mut self.mode {
-            pages.requested.remove(&(offset / PAGE));
+            pages.requested.remove(&(offset / pages.page));
             for (i, row) in rows.into_iter().enumerate() {
                 pages.rows.insert(offset + i, Row::new(row));
             }
@@ -570,14 +623,16 @@ impl GridBuffer {
         epoch: u64,
         sender: &CommandSender,
     ) -> bool {
-        let lo = range.start.saturating_sub(MARGIN);
-        let hi = (range.end + MARGIN).min(total);
+        let margin = MARGIN_PAGES * self.page;
+        let lo = range.start.saturating_sub(margin);
+        let hi = (range.end + margin).min(total);
         match &mut self.mode {
             BufferMode::Offset(pages) => {
+                let page = pages.page;
                 pages.rows.retain(|k, _| *k >= lo && *k < hi);
                 pages
                     .requested
-                    .retain(|p| p * PAGE + PAGE > lo && p * PAGE < hi);
+                    .retain(|p| p * page + page > lo && p * page < hi);
             }
             BufferMode::Keyed(run) => run.evict(lo, hi),
         }
@@ -598,7 +653,7 @@ impl GridBuffer {
         // destination.
         let settled = self
             .last_start
-            .is_none_or(|prev| range.start.abs_diff(prev) <= FLING_ROWS);
+            .is_none_or(|prev| range.start.abs_diff(prev) <= FLING_PAGES * self.page);
         self.last_start = Some(range.start);
         if !settled {
             return false;
@@ -615,21 +670,22 @@ impl GridBuffer {
 impl OffsetPages {
     /// Request any missing pages covering `range` (the offset path).
     fn request(&mut self, range: Range<usize>, total: usize, epoch: u64, sender: &CommandSender) {
-        let first = range.start / PAGE;
-        let last = (range.end - 1) / PAGE;
+        let size = self.page;
+        let first = range.start / size;
+        let last = (range.end - 1) / size;
         for page in first..=last {
-            let offset = page * PAGE;
+            let offset = page * size;
             if offset >= total || self.requested.contains(&page) {
                 continue;
             }
-            let end = (offset + PAGE).min(total);
+            let end = (offset + size).min(total);
             if (offset..end).all(|i| self.rows.contains_key(&i)) {
                 continue;
             }
             self.requested.insert(page);
             sender.send(Command::FetchPage {
                 offset,
-                limit: PAGE,
+                limit: size,
                 epoch,
             });
         }
@@ -840,38 +896,68 @@ mod keyed_run_tests {
 
     const TOTAL: usize = 10_000;
 
+    /// The `short = n < page` end detection keys off the run's *runtime* page, not
+    /// the default — so a custom `grid.page_size` pages correctly.
     #[test]
-    fn forward_from_start_is_exact() {
-        let mut run = pending(KeyedRun::new(vec![0]), 1);
+    fn short_detection_uses_the_run_page() {
+        let mut run = pending(KeyedRun::new(vec![0], 5), 1);
         run.apply(
             RunFetch::Forward { after: None },
-            rows(1..=PAGE as i64),
+            rows(1..=5),
+            false,
+            1,
+            TOTAL,
+        );
+        assert!(!run.at_end, "a full 5-row page (page=5) isn't the end");
+
+        run = pending(run, 2);
+        run.apply(
+            RunFetch::Forward {
+                after: Some(vec![Value::Integer(5)]),
+            },
+            rows(6..=8), // a 3-row page, short of page=5 → the result ends here
+            false,
+            2,
+            TOTAL,
+        );
+        assert!(
+            run.at_end,
+            "a page shorter than the run's page pins the end"
+        );
+    }
+
+    #[test]
+    fn forward_from_start_is_exact() {
+        let mut run = pending(KeyedRun::new(vec![0], DEFAULT_PAGE), 1);
+        run.apply(
+            RunFetch::Forward { after: None },
+            rows(1..=DEFAULT_PAGE as i64),
             false,
             1,
             TOTAL,
         );
         assert_eq!(run.anchor, 0);
         assert!(run.at_start && !run.at_end && !run.estimated);
-        assert_eq!(run.rows.len(), PAGE);
+        assert_eq!(run.rows.len(), DEFAULT_PAGE);
 
         // Extend forward from the boundary key.
         run = pending(run, 2);
         run.apply(
             RunFetch::Forward {
-                after: Some(vec![Value::Integer(PAGE as i64)]),
+                after: Some(vec![Value::Integer(DEFAULT_PAGE as i64)]),
             },
-            rows(PAGE as i64 + 1..=2 * PAGE as i64),
+            rows(DEFAULT_PAGE as i64 + 1..=2 * DEFAULT_PAGE as i64),
             false,
             2,
             TOTAL,
         );
-        assert_eq!(run.rows.len(), 2 * PAGE);
+        assert_eq!(run.rows.len(), 2 * DEFAULT_PAGE);
         assert_eq!(run.anchor, 0);
     }
 
     #[test]
     fn short_forward_pins_the_run_to_the_end() {
-        let mut run = pending(KeyedRun::new(vec![0]), 1);
+        let mut run = pending(KeyedRun::new(vec![0], DEFAULT_PAGE), 1);
         // An estimated run near the bottom gets a short (final) page: the
         // anchor re-pins so the run ends exactly at `total`.
         run.anchor = 9_950;
@@ -893,10 +979,10 @@ mod keyed_run_tests {
 
     #[test]
     fn backward_prepends_descending_rows_in_order() {
-        let mut run = pending(KeyedRun::new(vec![0]), 1);
+        let mut run = pending(KeyedRun::new(vec![0], DEFAULT_PAGE), 1);
         run.anchor = 500;
         run.rows = run_rows(501..=700);
-        let page = 501 - PAGE as i64..=500;
+        let page = 501 - DEFAULT_PAGE as i64..=500;
         run.apply(
             RunFetch::Backward {
                 before: vec![Value::Integer(501)],
@@ -906,7 +992,7 @@ mod keyed_run_tests {
             1,
             TOTAL,
         );
-        assert_eq!(run.anchor, 500 - PAGE);
+        assert_eq!(run.anchor, 500 - DEFAULT_PAGE);
         assert!(!run.at_start, "a full page doesn't touch the start");
         let head: Vec<_> = run
             .rows
@@ -917,18 +1003,18 @@ mod keyed_run_tests {
         assert_eq!(
             head,
             vec![
-                Value::Integer(501 - PAGE as i64),
-                Value::Integer(502 - PAGE as i64)
+                Value::Integer(501 - DEFAULT_PAGE as i64),
+                Value::Integer(502 - DEFAULT_PAGE as i64)
             ]
         );
         // The run stays contiguous across the seam.
-        assert_eq!(run.rows[PAGE - 1].values[0], Value::Integer(500));
-        assert_eq!(run.rows[PAGE].values[0], Value::Integer(501));
+        assert_eq!(run.rows[DEFAULT_PAGE - 1].values[0], Value::Integer(500));
+        assert_eq!(run.rows[DEFAULT_PAGE].values[0], Value::Integer(501));
     }
 
     #[test]
     fn short_backward_pins_the_run_to_the_start() {
-        let mut run = pending(KeyedRun::new(vec![0]), 1);
+        let mut run = pending(KeyedRun::new(vec![0], DEFAULT_PAGE), 1);
         run.anchor = 80; // estimate was high — only 3 rows actually precede
         run.estimated = true;
         run.rows = run_rows(4..=10);
@@ -947,7 +1033,7 @@ mod keyed_run_tests {
 
     #[test]
     fn jump_replaces_the_run_with_estimated_ordinals() {
-        let mut run = pending(KeyedRun::new(vec![0]), 1);
+        let mut run = pending(KeyedRun::new(vec![0], DEFAULT_PAGE), 1);
         run.anchor = 0;
         run.rows = run_rows(1..=200);
         run.apply(
@@ -955,19 +1041,19 @@ mod keyed_run_tests {
                 ordinal: 6_700,
                 exact: false,
             },
-            rows(66_000..66_000 + PAGE as i64),
+            rows(66_000..66_000 + DEFAULT_PAGE as i64),
             true,
             1,
             TOTAL,
         );
         assert_eq!(run.anchor, 6_700);
         assert!(run.estimated && !run.at_start && !run.at_end);
-        assert_eq!(run.rows.len(), PAGE);
+        assert_eq!(run.rows.len(), DEFAULT_PAGE);
     }
 
     #[test]
     fn stale_replies_are_dropped() {
-        let mut run = pending(KeyedRun::new(vec![0]), 2);
+        let mut run = pending(KeyedRun::new(vec![0], DEFAULT_PAGE), 2);
         run.rows = run_rows(1..=10);
 
         // Wrong seq: a reply for a superseded request.
@@ -1001,7 +1087,7 @@ mod keyed_run_tests {
 
     #[test]
     fn eviction_trims_the_run_and_forfeits_end_flags() {
-        let mut run = KeyedRun::new(vec![0]);
+        let mut run = KeyedRun::new(vec![0], DEFAULT_PAGE);
         run.anchor = 0;
         run.at_start = true;
         run.rows = run_rows(1..=1000);

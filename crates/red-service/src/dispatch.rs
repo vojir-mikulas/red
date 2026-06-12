@@ -200,6 +200,10 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
     // Which session the UI currently shows (`SetActiveSession`). Exempt from idle
     // eviction so an on-screen-but-unscrolled result stays warm.
     let mut foreground: Option<SessionId> = None;
+    // The statement timeout (`query.statement_timeout`) applied to every open
+    // probe and page/run fetch. `None` = no cap. Global, set by the UI at launch
+    // and on each settings reload, captured into each spawned fetch task.
+    let mut statement_timeout: Option<Duration> = None;
     // Bounds how many page fetches hit servers concurrently across *all* sessions
     // (see the const) — a shared backstop, so a flung scrollbar on one connection
     // can't fan out dozens of deep scans. A busy session can briefly delay
@@ -244,6 +248,10 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::SetActiveSession(id) => foreground = id,
+
+            Command::SetStatementTimeout(timeout) => statement_timeout = timeout,
+
+            Command::SetDisplayCellCap(bytes) => red_driver::set_display_cell_cap(bytes),
 
             Command::TestConnection(config) => {
                 // A throwaway probe: connect, report, and let the driver drop. No
@@ -298,7 +306,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         // Re-borrow the session's cursor slot (it can't vanish
                         // mid-await on this single-threaded loop).
                         if let Some(active) = sessions.get_mut(&id).map(|s| &mut s.active) {
-                            if drive_fetch(aq, opts.window, id, &mut commands, &events, active).await
+                            if drive_fetch(aq, opts.window, id, &mut commands, &events, active)
+                                .await
                             {
                                 break; // shutdown requested mid-fetch
                             }
@@ -395,6 +404,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // another table stays instant.
                 let events = events.clone();
                 let results = state.results.clone();
+                let timeout = statement_timeout;
                 tokio::spawn(async move {
                     // A table browse resolves its seek key from the table's
                     // introspected detail: a sorted browse gets the composite
@@ -448,11 +458,24 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             _ => None,
                         }
                     };
-                    let (total, columns, bounds) = tokio::join!(
-                        driver.count(&sql, &abort),
-                        driver.fetch_page(&sql, 0, 0, PageCap::Full, &abort),
-                        bounds
-                    );
+                    // Race the (potentially full-table `COUNT(*)`) probe against the
+                    // statement timeout: on expiry, abort the bundle at the engine
+                    // and report a timeout instead of leaving the result "running".
+                    let probe = async {
+                        tokio::join!(
+                            driver.count(&sql, &abort),
+                            driver.fetch_page(&sql, 0, 0, PageCap::Full, &abort),
+                            bounds
+                        )
+                    };
+                    let (total, columns, bounds) = tokio::select! {
+                        out = probe => out,
+                        _ = sleep_for(timeout), if timeout.is_some() => {
+                            abort.abort();
+                            emit(&events, session_id, Event::Error(RedError::Timeout.to_string()));
+                            return;
+                        }
+                    };
                     match (total, columns) {
                         (Ok(total), Ok(page)) => {
                             let total = total.max(0) as usize;
@@ -527,13 +550,18 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // once, so a burst can't saturate the server.
                 let events = events.clone();
                 let limit_src = page_fetch_limit.clone();
+                let timeout = statement_timeout;
                 tokio::spawn(async move {
                     let _permit = limit_src.acquire_owned().await;
                     // Offset-mode display page — cap fat cells; no seek key to exempt.
-                    match driver
-                        .fetch_page(&sql, offset, limit, PageCap::Display { key: None }, &abort)
-                        .await
-                    {
+                    let fetch = driver.fetch_page(
+                        &sql,
+                        offset,
+                        limit,
+                        PageCap::Display { key: None },
+                        &abort,
+                    );
+                    match with_timeout(timeout, &abort, fetch).await {
                         Ok(page) => emit(
                             &events,
                             session_id,
@@ -604,9 +632,11 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 }
                 let events = events.clone();
                 let limit_src = page_fetch_limit.clone();
+                let timeout = statement_timeout;
                 tokio::spawn(async move {
                     let _permit = limit_src.acquire_owned().await;
-                    match run_fetch(&*driver, &spec, &key, &fetch, limit, &abort).await {
+                    let run = run_fetch(&*driver, &spec, &key, &fetch, limit, &abort);
+                    match with_timeout(timeout, &abort, run).await {
                         Ok((rows, estimated)) => emit(
                             &events,
                             session_id,
@@ -671,7 +701,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
 
             Command::CloseResult { epoch } => {
                 let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    continue;
+                };
                 // Stop every in-flight fetch for the tab at the engine, then forget it.
                 if let Some(f) = state.inflight.remove(&epoch) {
                     f.abort_all();
@@ -820,9 +852,7 @@ fn evict_idle(
     let now = Instant::now();
     let stale: Vec<SessionId> = sessions
         .iter()
-        .filter(|(id, s)| {
-            Some(**id) != foreground && now.duration_since(s.last_used) >= IDLE_EVICT
-        })
+        .filter(|(id, s)| Some(**id) != foreground && now.duration_since(s.last_used) >= IDLE_EVICT)
         .map(|(id, _)| *id)
         .collect();
     for id in stale {
@@ -957,10 +987,12 @@ async fn run_fetch(
                         // just past the target's neighbour so the bound row is
                         // included.
                         let bound = if key.descending {
-                            let target = (max as f64 - span * fraction).clamp(min as f64, max as f64);
+                            let target =
+                                (max as f64 - span * fraction).clamp(min as f64, max as f64);
                             (target as i64).saturating_add(1) // `< t+1` == `<= t`
                         } else {
-                            let target = (min as f64 + span * fraction).clamp(min as f64, max as f64);
+                            let target =
+                                (min as f64 + span * fraction).clamp(min as f64, max as f64);
                             (target as i64).saturating_sub(1) // `> t-1` == `>= t`
                         };
                         let page = driver
@@ -1128,6 +1160,32 @@ async fn sleep_for(timeout: Option<Duration>) {
     match timeout {
         Some(d) => tokio::time::sleep(d).await,
         None => std::future::pending().await,
+    }
+}
+
+/// Race a one-shot fetch against the statement timeout. On expiry, fire the
+/// fetch's [`AbortSignal`] so the engine stops, then surface [`RedError::Timeout`].
+/// A `None` timeout never fires; an *externally* aborted fetch (a superseded
+/// page/run) keeps its [`RedError::Interrupted`], so the caller stays silent.
+async fn with_timeout<T>(
+    timeout: Option<Duration>,
+    abort: &AbortSignal,
+    fut: impl std::future::Future<Output = red_core::Result<T>>,
+) -> red_core::Result<T> {
+    tokio::pin!(fut);
+    let mut timed_out = false;
+    let out = loop {
+        tokio::select! {
+            res = &mut fut => break res,
+            _ = sleep_for(timeout), if !timed_out && timeout.is_some() => {
+                timed_out = true;
+                abort.abort();
+            }
+        }
+    };
+    match out {
+        Err(RedError::Interrupted) if timed_out => Err(RedError::Timeout),
+        other => other,
     }
 }
 

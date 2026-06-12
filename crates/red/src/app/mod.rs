@@ -475,6 +475,12 @@ impl AppState {
                 }
             }
         }
+        // Push the backend-side tuning knobs (statement timeout + the driver's
+        // fat-cell display cap) so they're in effect before the first connect; the
+        // setters and `reload_settings` re-push them when they change.
+        service.send_global(Command::SetStatementTimeout(settings.query.timeout()));
+        service.send_global(Command::SetDisplayCellCap(settings.grid.max_cell_chars));
+
         let os_dark = matches!(
             cx.window_appearance(),
             gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
@@ -576,8 +582,12 @@ impl AppState {
         let switcher = cx.new(|cx| {
             let mut s = Switcher::new("connection-switcher", cx);
             s.set_placeholder("Search connections…", cx);
-            let (label, dot, sections) =
-                switcher_sections(&connections, &Phase::Disconnected, &HashMap::new(), cx.theme());
+            let (label, dot, sections) = switcher_sections(
+                &connections,
+                &Phase::Disconnected,
+                &HashMap::new(),
+                cx.theme(),
+            );
             s.set_trigger(label, dot, cx);
             s.set_sections(sections, cx);
             s.set_footer(switcher_footer(), cx);
@@ -926,7 +936,8 @@ impl AppState {
             return false;
         };
         self.foreground_session = Some(id);
-        self.service.send_global(Command::SetActiveSession(Some(id)));
+        self.service
+            .send_global(Command::SetActiveSession(Some(id)));
         self.phase = Phase::Connected(active);
         cx.notify();
         true
@@ -935,7 +946,12 @@ impl AppState {
     /// A `Connected` event: promote the connecting splash to a live workspace, if
     /// it's still the one the user wants. An orphan (they switched away mid-dial)
     /// is closed.
-    fn on_connected(&mut self, session: Option<SessionId>, version: String, cx: &mut Context<Self>) {
+    fn on_connected(
+        &mut self,
+        session: Option<SessionId>,
+        version: String,
+        cx: &mut Context<Self>,
+    ) {
         let Some(id) = session else { return };
         let promote = matches!(&self.phase, Phase::Connecting(c) if c.session == id);
         if !promote {
@@ -1048,7 +1064,8 @@ impl AppState {
         let session = self.mint_session();
         self.foreground_session = Some(session);
         self.connect_gen += 1;
-        self.service.send_to(session, Command::Connect(config.clone()));
+        self.service
+            .send_to(session, Command::Connect(config.clone()));
         self.service
             .send_global(Command::SetActiveSession(Some(session)));
         self.phase = Phase::Connecting(Connecting {
@@ -1637,6 +1654,21 @@ impl AppState {
                 .detach();
             }
         }
+
+        // Reconnect to the most recently used connection on launch, when the user
+        // opted in. The list arrives recency-sorted (newest first), so the first
+        // entry that's actually been opened is the one to restore; credentials come
+        // from the keychain inside `connect`.
+        if self.settings.behavior.restore_last_session && matches!(self.phase, Phase::Disconnected)
+        {
+            if let Some(index) = self
+                .connections
+                .iter()
+                .position(|c| c.last_accessed.is_some())
+            {
+                self.connect(index, cx);
+            }
+        }
     }
 
     /// Re-read `settings.toml` after an external edit and re-apply. Theme is
@@ -1657,6 +1689,12 @@ impl AppState {
             .update(cx, |n, cx| n.set_value(ui_size, cx));
         self.editor_font_size_input
             .update(cx, |n, cx| n.set_value(editor_size, cx));
+        // A hand-edit of the file changes these too — re-push to the backend.
+        self.service
+            .send_global(Command::SetStatementTimeout(self.settings.query.timeout()));
+        self.service.send_global(Command::SetDisplayCellCap(
+            self.settings.grid.max_cell_chars,
+        ));
         self.apply_theme(cx);
         cx.notify();
     }
@@ -1925,6 +1963,62 @@ impl AppState {
 
     pub(crate) fn set_confirm_destructive(&mut self, on: bool, cx: &mut Context<Self>) {
         self.settings.query.confirm_destructive = on;
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Set the statement timeout (seconds; `0` disables) and push it to the backend
+    /// so it applies to the next query and its page/run fetches.
+    pub(crate) fn set_statement_timeout(&mut self, secs: u32, cx: &mut Context<Self>) {
+        self.settings.query.statement_timeout = secs;
+        self.save_settings();
+        self.service
+            .send_global(Command::SetStatementTimeout(self.settings.query.timeout()));
+        cx.notify();
+    }
+
+    /// Set the fat-cell display cap (bytes) and push it to the driver; it applies to
+    /// every subsequent display fetch. Clamped to a sane range.
+    pub(crate) fn set_max_cell_chars(&mut self, bytes: usize, cx: &mut Context<Self>) {
+        self.settings.grid.max_cell_chars = bytes.clamp(
+            crate::settings::MIN_CELL_CHARS,
+            crate::settings::MAX_CELL_CHARS,
+        );
+        self.save_settings();
+        self.service.send_global(Command::SetDisplayCellCap(
+            self.settings.grid.max_cell_chars,
+        ));
+        cx.notify();
+    }
+
+    /// Set the keyset/offset fetch window. Clamped; applies to results opened after
+    /// the change (a live result keeps the page its buffer was built with).
+    pub(crate) fn set_page_size(&mut self, rows: usize, cx: &mut Context<Self>) {
+        self.settings.grid.page_size = rows.clamp(
+            crate::settings::MIN_PAGE_SIZE,
+            crate::settings::MAX_PAGE_SIZE,
+        );
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Toggle the leading row-number gutter. The gutter is column `0` in the grid's
+    /// coordinate system, so flipping it shifts the data-column offset — clear the
+    /// active selection (stored in table-column coords) so it can't point off by one.
+    pub(crate) fn set_row_numbers(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.grid.row_numbers = on;
+        if let Phase::Connected(active) = &mut self.phase {
+            if let Some(grid) = active.active_result_mut() {
+                grid.clear_selection();
+            }
+        }
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Toggle reconnect-on-launch. Takes effect next launch (see `ensure_observers`).
+    pub(crate) fn set_restore_last_session(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.behavior.restore_last_session = on;
         self.save_settings();
         cx.notify();
     }

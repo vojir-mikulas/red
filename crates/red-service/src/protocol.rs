@@ -142,6 +142,13 @@ pub enum Command {
     /// stare at a result without scrolling and it must stay warm. Global (the
     /// payload, not the envelope, carries the id).
     SetActiveSession(Option<SessionId>),
+    /// Set the statement timeout applied to every query and its page/run fetches
+    /// (`query.statement_timeout`). `None` disables it. Global — sent at launch and
+    /// on each settings reload — so it isn't threaded through every fetch command.
+    SetStatementTimeout(Option<Duration>),
+    /// Set the driver's display fat-cell cap (`grid.max_cell_chars`), in bytes.
+    /// Global; applies to every subsequent display fetch. Export stays full-fidelity.
+    SetDisplayCellCap(usize),
     Shutdown,
 }
 

@@ -54,16 +54,18 @@ density = "comfortable"
 # What a SQL NULL renders as in a cell (e.g. "∅", "NULL", or "" for blank).
 null_display = "NULL"
 
-# Show the leading row-number gutter (not yet applied).
-# row_numbers = true
+# Show the leading row-number gutter.
+row_numbers = true
 
 # Hard cap on the characters of any one cell kept resident — the fat-cell memory
-# rail (not yet applied; the built-in 4096 cap is in effect).
-# max_cell_chars = 4096
+# rail. The driver reads over-cap blobs by length only and clips long text to a
+# prefix, so a page of huge cells can't spike RAM. Export stays full-fidelity.
+# Clamped to 256–1048576.
+max_cell_chars = 4096
 
-# Rows pulled per page as you scroll — the keyset fetch window (not yet applied;
-# the built-in 200-row window is in effect).
-# page_size = 200
+# Rows pulled per page as you scroll — the keyset/offset fetch window. Larger
+# pages mean fewer round-trips but more resident rows. Clamped to 20–5000.
+page_size = 200
 
 [query]
 # Append LIMIT n to a bare `SELECT *` so a fat table can't flood the grid.
@@ -73,6 +75,11 @@ auto_limit = 1000
 # Ask before running DROP / TRUNCATE / DELETE-without-WHERE and similar.
 confirm_destructive = true
 
+# Abort a query — and each of its page/run fetches — that runs longer than this
+# many seconds, at the engine. 0 disables the cap.
+statement_timeout = 0
+
 [behavior]
-# Reconnect to the last session on launch (not yet applied — needs the keychain).
-# restore_last_session = false
+# Reconnect to the most recently used connection on launch (credentials come from
+# the OS keychain). Off shows the connection picker.
+restore_last_session = false

@@ -232,10 +232,17 @@ impl AppState {
             return container.child(toolbar);
         }
 
-        // Row-number gutter + one fixed-width, sortable column per result column.
-        // Each header carries the engine's declared type as a dim subtitle, like
-        // the design's typed headers (`email` + `text`).
-        let mut columns = vec![Column::new("#").width(px(56.)).align_end()];
+        // An optional leading row-number gutter, then one fixed-width, sortable
+        // column per result column. Each header carries the engine's declared type
+        // as a dim subtitle, like the design's typed headers (`email` + `text`).
+        // The gutter occupies table column 0 when shown, so a data column's table
+        // index is `data + gutter` (see the handlers in `mod.rs`).
+        let show_gutter = self.settings.grid.row_numbers;
+        let gutter = show_gutter as usize;
+        let mut columns: Vec<Column> = Vec::with_capacity(grid.columns.len() + gutter);
+        if show_gutter {
+            columns.push(Column::new("#").width(px(56.)).align_end());
+        }
         for c in &grid.columns {
             let mut col = Column::new(c.name.clone()).width(px(180.)).sortable();
             if let Some(t) = &c.decl_type {
@@ -245,7 +252,7 @@ impl AppState {
             }
             columns.push(col);
         }
-        let sort = grid.sort.map(|(c, asc)| (c + 1, asc));
+        let sort = grid.sort.map(|(c, asc)| (c + gutter, asc));
         let total = grid.total;
         let ncols = grid.columns.len();
         let buffer_range = grid.buffer.clone();
@@ -339,16 +346,18 @@ impl AppState {
             .render_row(move |ix, _, _| {
                 // `ix` is list-local; the gutter and buffer are absolute.
                 let abs = base + ix;
-                let mut out = Vec::with_capacity(ncols + 1);
+                let mut out = Vec::with_capacity(ncols + gutter);
                 let buffer = buffer_row.borrow();
-                // After an interpolated jump the run's ordinals are estimates;
-                // the gutter marks them `≈` until a true end pins them exact.
-                let gutter = if buffer.is_estimated() {
-                    format!("≈{}", group_digits(abs + 1))
-                } else {
-                    group_digits(abs + 1)
-                };
-                out.push(div().text_color(faint).child(gutter).into_any_element());
+                if show_gutter {
+                    // After an interpolated jump the run's ordinals are estimates;
+                    // the gutter marks them `≈` until a true end pins them exact.
+                    let label = if buffer.is_estimated() {
+                        format!("≈{}", group_digits(abs + 1))
+                    } else {
+                        group_digits(abs + 1)
+                    };
+                    out.push(div().text_color(faint).child(label).into_any_element());
+                }
                 match buffer.row(abs) {
                     Some(row) => {
                         for c in 0..ncols {

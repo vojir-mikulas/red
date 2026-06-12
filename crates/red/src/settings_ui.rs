@@ -14,21 +14,22 @@ use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, MouseButton, Sh
 use crate::app::{AppState, FontSelect};
 use crate::settings::{Density, ThemeMode};
 
-/// The settings categories, in nav order. Behavior knobs live in the file (see
-/// the footer's "Open settings file"), so they get no panel tab.
+/// The settings categories, in nav order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingsTab {
     Appearance,
     Grid,
     Query,
+    Behavior,
     About,
 }
 
 impl SettingsTab {
-    pub(crate) const ALL: [SettingsTab; 4] = [
+    pub(crate) const ALL: [SettingsTab; 5] = [
         SettingsTab::Appearance,
         SettingsTab::Grid,
         SettingsTab::Query,
+        SettingsTab::Behavior,
         SettingsTab::About,
     ];
 
@@ -37,6 +38,7 @@ impl SettingsTab {
             SettingsTab::Appearance => "Appearance",
             SettingsTab::Grid => "Result grid",
             SettingsTab::Query => "Query",
+            SettingsTab::Behavior => "Behavior",
             SettingsTab::About => "About",
         }
     }
@@ -199,6 +201,7 @@ fn settings_page(tab: SettingsTab, state: &AppState, cx: &mut Context<AppState>)
         SettingsTab::Appearance => appearance_page(state, cx),
         SettingsTab::Grid => grid_page(state, cx),
         SettingsTab::Query => query_page(state, cx),
+        SettingsTab::Behavior => behavior_page(state, cx),
         SettingsTab::About => about_page(cx),
     }
 }
@@ -523,6 +526,45 @@ fn grid_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             null_view.update(cx, |this, cx| this.set_null_display(value, cx));
         });
 
+    let row_numbers = Toggle::new("set-row-numbers", state.settings.grid.row_numbers)
+        .on_change(cx.listener(|this, on: &bool, _, cx| this.set_row_numbers(*on, cx)));
+
+    // Page-size presets; a custom value (set in the file) shows none selected.
+    const PAGE_PRESETS: [usize; 4] = [100, 200, 500, 1000];
+    let page_sel = PAGE_PRESETS
+        .iter()
+        .position(|&n| n == state.settings.grid.page_size)
+        .unwrap_or(usize::MAX);
+    let page_view = view.clone();
+    let page_size = Segmented::new("set-page-size")
+        .segment("100")
+        .segment("200")
+        .segment("500")
+        .segment("1000")
+        .selected(page_sel)
+        .on_select(move |ix, _, cx| {
+            let n = PAGE_PRESETS[ix.min(PAGE_PRESETS.len() - 1)];
+            page_view.update(cx, |this, cx| this.set_page_size(n, cx));
+        });
+
+    // Fat-cell cap presets, in bytes; a custom value shows none selected.
+    const CELL_PRESETS: [usize; 4] = [1024, 4096, 16384, 65536];
+    let cell_sel = CELL_PRESETS
+        .iter()
+        .position(|&n| n == state.settings.grid.max_cell_chars)
+        .unwrap_or(usize::MAX);
+    let cell_view = view.clone();
+    let max_cell = Segmented::new("set-max-cell")
+        .segment("1K")
+        .segment("4K")
+        .segment("16K")
+        .segment("64K")
+        .selected(cell_sel)
+        .on_select(move |ix, _, cx| {
+            let n = CELL_PRESETS[ix.min(CELL_PRESETS.len() - 1)];
+            cell_view.update(cx, |this, cx| this.set_max_cell_chars(n, cx));
+        });
+
     settings_page_scaffold(
         "Result grid",
         div()
@@ -540,8 +582,25 @@ fn grid_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 null_display,
                 &theme,
             ))
-            .child(file_hint(
-                "Row numbers, page size, and the fat-cell cap",
+            .child(setting_row(
+                "Row numbers",
+                "Show the leading row-number gutter.",
+                row_numbers,
+                &theme,
+            ))
+            .child(settings_header("Performance", &theme))
+            .child(setting_row(
+                "Page size",
+                "Rows fetched per page as you scroll. Larger means fewer round-trips, \
+                 more resident rows.",
+                page_size,
+                &theme,
+            ))
+            .child(setting_row(
+                "Max cell size",
+                "Bytes of a single cell kept resident — the fat-cell memory rail. \
+                 Over-cap cells are clipped for display only; export stays full.",
+                max_cell,
                 &theme,
             )),
         &theme,
@@ -574,6 +633,24 @@ fn query_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     let confirm = Toggle::new("set-confirm", state.settings.query.confirm_destructive)
         .on_change(cx.listener(|this, on: &bool, _, cx| this.set_confirm_destructive(*on, cx)));
 
+    // Statement-timeout presets, in seconds (0 = off); a custom value shows none.
+    const TIMEOUT_PRESETS: [u32; 4] = [0, 10, 30, 60];
+    let timeout_sel = TIMEOUT_PRESETS
+        .iter()
+        .position(|&n| n == state.settings.query.statement_timeout)
+        .unwrap_or(usize::MAX);
+    let timeout_view = view.clone();
+    let statement_timeout = Segmented::new("set-statement-timeout")
+        .segment("Off")
+        .segment("10s")
+        .segment("30s")
+        .segment("60s")
+        .selected(timeout_sel)
+        .on_select(move |ix, _, cx| {
+            let n = TIMEOUT_PRESETS[ix.min(TIMEOUT_PRESETS.len() - 1)];
+            timeout_view.update(cx, |this, cx| this.set_statement_timeout(n, cx));
+        });
+
     settings_page_scaffold(
         "Query",
         div()
@@ -586,6 +663,12 @@ fn query_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 auto_limit,
                 &theme,
             ))
+            .child(setting_row(
+                "Statement timeout",
+                "Abort a query — and its page/run fetches — that runs longer than this.",
+                statement_timeout,
+                &theme,
+            ))
             .child(settings_header("Safety", &theme))
             .child(setting_row(
                 "Confirm destructive statements",
@@ -593,6 +676,29 @@ fn query_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 confirm,
                 &theme,
             )),
+        &theme,
+    )
+    .into_any_element()
+}
+
+fn behavior_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
+    let theme = cx.theme().clone();
+
+    let restore = Toggle::new(
+        "set-restore-last-session",
+        state.settings.behavior.restore_last_session,
+    )
+    .on_change(cx.listener(|this, on: &bool, _, cx| this.set_restore_last_session(*on, cx)));
+
+    settings_page_scaffold(
+        "Behavior",
+        div().flex().flex_col().child(setting_row(
+            "Restore last session",
+            "Reconnect to the most recently used connection on launch (credentials \
+             come from the keychain). Takes effect next launch.",
+            restore,
+            &theme,
+        )),
         &theme,
     )
     .into_any_element()
@@ -625,18 +731,6 @@ fn about_page(cx: &mut Context<AppState>) -> AnyElement {
         &theme,
     )
     .into_any_element()
-}
-
-/// A muted note that a knob lives in the settings file (the documented surface),
-/// keeping the panel honest about what it doesn't expose.
-fn file_hint(what: &str, theme: &Theme) -> impl IntoElement {
-    div()
-        .py_3()
-        .text_size(theme.scale(12.))
-        .text_color(theme.text_faint)
-        .child(SharedString::from(format!(
-            "{what} are configurable in settings.toml (Open settings file)."
-        )))
 }
 
 /// A page heading above its sections.

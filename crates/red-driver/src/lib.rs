@@ -8,7 +8,7 @@
 //! results of any size, the layer's central performance contract.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -28,16 +28,33 @@ pub use mysql::MysqlDriver;
 pub use postgres::PostgresDriver;
 pub use sqlite::SqliteDriver;
 
-/// Bytes of a non-key cell's content a *display* fetch keeps; past it, text is
-/// truncated to a [`Value::Capped`] prefix and a blob to its length only. The
-/// resident-cell budget that keeps the grid's RAM flat over fat `TEXT`/`BLOB`
+/// Default bytes of a non-key cell's content a *display* fetch keeps; past it,
+/// text is truncated to a [`Value::Capped`] prefix and a blob to its length only.
+/// The resident-cell budget that keeps the grid's RAM flat over fat `TEXT`/`BLOB`
 /// columns — the driver never materializes the over-cap bytes, so a page of huge
-/// cells can't spike the channel. (A built-in for now; `grid.max_cell_chars`
-/// makes it configurable later.)
-pub(crate) const DISPLAY_CELL_CAP: usize = 4096;
+/// cells can't spike the channel. The live value is [`display_cell_cap`], driven
+/// by `grid.max_cell_chars` via [`set_display_cell_cap`].
+pub const DEFAULT_DISPLAY_CELL_CAP: usize = 4096;
+
+/// The live display cap (see [`DEFAULT_DISPLAY_CELL_CAP`]). A process-global so a
+/// settings change applies to every subsequent display fetch across all sessions
+/// without threading the value through each `fetch_page`/`fetch_seek` call; the
+/// service sets it from `grid.max_cell_chars` on launch and on every reload.
+static DISPLAY_CELL_CAP: AtomicUsize = AtomicUsize::new(DEFAULT_DISPLAY_CELL_CAP);
+
+/// Set the live display cap (bytes of a non-key cell a display fetch keeps). The
+/// caller clamps to a sane range; export fetches ([`PageCap::Full`]) ignore it.
+pub fn set_display_cell_cap(bytes: usize) {
+    DISPLAY_CELL_CAP.store(bytes.max(1), Ordering::Relaxed);
+}
+
+/// The live display cap currently in effect.
+pub(crate) fn display_cell_cap() -> usize {
+    DISPLAY_CELL_CAP.load(Ordering::Relaxed)
+}
 
 /// Whether [`DatabaseDriver::fetch_page`] caps oversized cells. The display path
-/// caps non-key cells to [`DISPLAY_CELL_CAP`]; the clipboard re-fetch wants the
+/// caps non-key cells to [`display_cell_cap`]; the clipboard re-fetch wants the
 /// real values, so it asks for `Full`. (The seek paths are always display-capped
 /// and learn their exempt key from their own `KeySpec` argument.)
 #[derive(Clone)]
@@ -68,7 +85,7 @@ impl CellCap {
         match cap {
             PageCap::Full => None,
             PageCap::Display { key } => Some(CellCap {
-                max_bytes: DISPLAY_CELL_CAP,
+                max_bytes: display_cell_cap(),
                 key_cols: key
                     .as_ref()
                     .map(|k| key_positions(k, columns))
@@ -81,7 +98,7 @@ impl CellCap {
     /// columns (see [`key_positions`]).
     pub(crate) fn display(key_cols: [Option<usize>; 2]) -> Option<CellCap> {
         Some(CellCap {
-            max_bytes: DISPLAY_CELL_CAP,
+            max_bytes: display_cell_cap(),
             key_cols,
         })
     }
@@ -124,7 +141,11 @@ pub(crate) fn seek_clauses(
 ) -> (String, String) {
     let cols: Vec<String> = key.column_names().iter().map(|c| quote(c)).collect();
     let descending = key.descending ^ scroll_descending;
-    let (strict, dir) = if descending { ("<", "DESC") } else { (">", "ASC") };
+    let (strict, dir) = if descending {
+        ("<", "DESC")
+    } else {
+        (">", "ASC")
+    };
     let cmp = if inclusive {
         format!("{strict}=")
     } else {

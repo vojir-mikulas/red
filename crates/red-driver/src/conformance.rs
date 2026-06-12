@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use red_core::{ExportFormat, KeySpec, ObjectKind, QueryOptions, RedError, Value};
 
-use crate::{AbortSignal, DatabaseDriver, PageCap, DISPLAY_CELL_CAP};
+use crate::{AbortSignal, DatabaseDriver, PageCap, DEFAULT_DISPLAY_CELL_CAP};
 
 /// `open_cursor` streams the result in windows that never exceed the requested
 /// size, and the total is exact — memory stays flat regardless of result size.
@@ -337,7 +337,11 @@ pub(crate) async fn seeks_composite_sorted(
                 .await
                 .unwrap();
             let Some(last) = page.rows.last() else { break };
-            lead = page.columns.iter().position(|c| c.name == key.column).unwrap();
+            lead = page
+                .columns
+                .iter()
+                .position(|c| c.name == key.column)
+                .unwrap();
             tie = page
                 .columns
                 .iter()
@@ -377,7 +381,7 @@ pub(crate) async fn seeks_composite_sorted(
 /// The driver-side display cap (Track A1): a display fetch caps fat non-key cells
 /// while the keyset key rides through verbatim and `export`/`Full` stay byte-exact.
 /// `sql` must select exactly one row with columns `(key, big_text, big_blob)` where
-/// `big_text` and `big_blob` each exceed [`DISPLAY_CELL_CAP`] bytes and `big_text`
+/// `big_text` and `big_blob` each exceed [`DEFAULT_DISPLAY_CELL_CAP`] bytes and `big_text`
 /// is `text_len` repeats of the ASCII byte `fill`; `key` names the integer key
 /// column; `text_len`/`blob_len` are the full source byte lengths; `tag` keeps the
 /// export temp file unique.
@@ -413,8 +417,8 @@ pub(crate) async fn caps_display_keeps_key_and_export(
             assert!(!c.blob, "text capped as text");
             assert_eq!(c.len, text_len, "the true text length is preserved");
             assert!(
-                c.head.len() <= DISPLAY_CELL_CAP,
-                "head ({}) within the cap ({DISPLAY_CELL_CAP})",
+                c.head.len() <= DEFAULT_DISPLAY_CELL_CAP,
+                "head ({}) within the cap ({DEFAULT_DISPLAY_CELL_CAP})",
                 c.head.len()
             );
         }

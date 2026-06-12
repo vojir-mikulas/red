@@ -227,6 +227,9 @@ pub struct QuerySettings {
     pub auto_limit: u32,
     /// Confirm destructive statements (DROP/TRUNCATE/…) before they run.
     pub confirm_destructive: bool,
+    /// Abort a query (and each of its page/run fetches) that runs longer than this
+    /// many seconds, so a runaway can't wedge the grid. `0` disables the cap.
+    pub statement_timeout: u32,
 }
 
 impl Default for QuerySettings {
@@ -234,7 +237,16 @@ impl Default for QuerySettings {
         Self {
             auto_limit: 1000,
             confirm_destructive: true,
+            statement_timeout: 0,
         }
+    }
+}
+
+impl QuerySettings {
+    /// The statement timeout as a duration, or `None` when disabled (`0`).
+    pub fn timeout(&self) -> Option<std::time::Duration> {
+        (self.statement_timeout > 0)
+            .then(|| std::time::Duration::from_secs(self.statement_timeout as u64))
     }
 }
 
@@ -327,6 +339,14 @@ impl FileSettingsStore {
         } else {
             1.5
         };
+        // Grid fetch knobs feed the keyset window and the fat-cell rail directly,
+        // so a stray value (0, absurdly large) must clamp to a sane range rather
+        // than thrash memory or stall paging. Silent, like the typography clamp.
+        settings.grid.page_size = settings.grid.page_size.clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE);
+        settings.grid.max_cell_chars = settings
+            .grid
+            .max_cell_chars
+            .clamp(MIN_CELL_CHARS, MAX_CELL_CHARS);
 
         LoadReport {
             settings,
@@ -361,6 +381,18 @@ impl FileSettingsStore {
 /// / infinity — falls back to the safe floor rather than breaking layout.
 pub const MIN_FONT_SIZE: f32 = 8.0;
 pub const MAX_FONT_SIZE: f32 = 32.0;
+
+/// The keyset/offset fetch window (`grid.page_size`) the grid will accept. Below
+/// the floor paging stalls; above the ceiling a single page can spike RAM (the
+/// resident buffer is bounded by a multiple of the page).
+pub const MIN_PAGE_SIZE: usize = 20;
+pub const MAX_PAGE_SIZE: usize = 5_000;
+
+/// The fat-cell display rail (`grid.max_cell_chars`). The floor keeps a cell
+/// readable; the ceiling bounds the per-cell bytes the driver materializes for a
+/// display page (export stays full-fidelity regardless).
+pub const MIN_CELL_CHARS: usize = 256;
+pub const MAX_CELL_CHARS: usize = 1_048_576;
 
 fn clamp_font_size(size: f32) -> f32 {
     if size.is_finite() {
@@ -484,6 +516,33 @@ mod tests {
         assert_eq!(loaded.grid.page_size, GridSettings::default().page_size);
         assert_eq!(loaded.query, QuerySettings::default());
         assert_eq!(loaded.appearance, AppearanceSettings::default());
+    }
+
+    #[test]
+    fn clamps_grid_fetch_knobs() {
+        // Out-of-range fetch knobs clamp to the floor / ceiling rather than thrash.
+        let t = temp_store();
+        write(&t.store, "[grid]\npage_size = 0\nmax_cell_chars = 1\n");
+        let g = t.store.load_report().settings.grid;
+        assert_eq!(g.page_size, MIN_PAGE_SIZE);
+        assert_eq!(g.max_cell_chars, MIN_CELL_CHARS);
+
+        write(
+            &t.store,
+            "[grid]\npage_size = 99999999\nmax_cell_chars = 999999999\n",
+        );
+        let g = t.store.load_report().settings.grid;
+        assert_eq!(g.page_size, MAX_PAGE_SIZE);
+        assert_eq!(g.max_cell_chars, MAX_CELL_CHARS);
+    }
+
+    #[test]
+    fn statement_timeout_parses_and_maps_to_duration() {
+        let q: QuerySettings = toml::from_str("statement_timeout = 30").expect("timeout");
+        assert_eq!(q.statement_timeout, 30);
+        assert_eq!(q.timeout(), Some(std::time::Duration::from_secs(30)));
+        // The default (and an explicit 0) disables the cap.
+        assert_eq!(QuerySettings::default().timeout(), None);
     }
 
     #[test]
