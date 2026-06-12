@@ -70,6 +70,7 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
                 ("⌘K", "Command palette"),
                 ("⌘/", "Keyboard shortcuts"),
                 ("⌘,", "Settings"),
+                ("⌘N", "New connection (welcome screen)"),
                 ("⌘Q", "Quit"),
             ],
         ),
@@ -88,6 +89,7 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
                 ("⌘W", "Close tab"),
                 ("⌃Tab / ⌃⇧Tab", "Next / previous tab"),
                 ("⌘↵", "Run query"),
+                ("Esc", "Leave the editor for the result grid"),
             ],
         ),
         (

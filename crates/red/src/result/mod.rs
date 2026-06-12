@@ -380,26 +380,6 @@ pub(crate) struct PendingCopy {
     pub(crate) dcol_hi: usize,
 }
 
-/// A keyboard cursor move over the result grid — the move-selection *intent* the
-/// key handler translates into a new cursor cell (see [`AppState::result_cursor_move`]).
-#[derive(Clone, Copy)]
-pub(crate) enum GridMove {
-    Up,
-    Down,
-    Left,
-    Right,
-    /// Home / ⌘← — first data column of the row.
-    RowStart,
-    /// End / ⌘→ — last data column of the row.
-    RowEnd,
-    PageUp,
-    PageDown,
-    /// ⌘↑ — first row.
-    First,
-    /// ⌘↓ — last row.
-    Last,
-}
-
 /// How [`ResultGrid::copy_plan`] resolves a selection copy.
 pub(crate) enum CopyPlan {
     /// Ready to copy now — the assembled TSV.
@@ -673,7 +653,7 @@ impl AppState {
     /// No-op until the result is ready and has columns.
     pub(crate) fn result_cursor_move(
         &mut self,
-        mv: GridMove,
+        mv: TableNav,
         extend: bool,
         cx: &mut Context<Self>,
     ) {
@@ -694,16 +674,16 @@ impl AppState {
                 };
                 let col = col.clamp(1, ncols);
                 let (new_row, new_col) = match mv {
-                    GridMove::Up => (row.saturating_sub(1), col),
-                    GridMove::Down => ((row + 1).min(last_row), col),
-                    GridMove::Left => (row, (col - 1).max(1)),
-                    GridMove::Right => (row, (col + 1).min(ncols)),
-                    GridMove::RowStart => (row, 1),
-                    GridMove::RowEnd => (row, ncols),
-                    GridMove::PageUp => (row.saturating_sub(page), col),
-                    GridMove::PageDown => ((row + page).min(last_row), col),
-                    GridMove::First => (0, col),
-                    GridMove::Last => (last_row, col),
+                    TableNav::Up => (row.saturating_sub(1), col),
+                    TableNav::Down => ((row + 1).min(last_row), col),
+                    TableNav::Left => (row, (col - 1).max(1)),
+                    TableNav::Right => (row, (col + 1).min(ncols)),
+                    TableNav::RowStart => (row, 1),
+                    TableNav::RowEnd => (row, ncols),
+                    TableNav::PageUp => (row.saturating_sub(page), col),
+                    TableNav::PageDown => ((row + page).min(last_row), col),
+                    TableNav::First => (0, col),
+                    TableNav::Last => (last_row, col),
                 };
                 grid.selection = Some(match (extend, grid.selection) {
                     (true, Some(mut range)) => {

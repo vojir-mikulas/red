@@ -443,6 +443,7 @@ impl AppState {
                     .border_l_1()
                     .border_color(border)
                     .cursor_pointer()
+                    .tooltip(Tooltip::text("New tab  ⌘T"))
                     .text_color(faint)
                     .hover(|s| s.bg(bg_elevated).text_color(text))
                     .on_click(cx.listener(|this, _, _, cx| this.new_query(cx)))
@@ -685,8 +686,8 @@ impl AppState {
                 // The safety rail is opt-out in settings; when off, run immediately.
                 if self.settings.query.confirm_destructive {
                     self.confirm_exec = Some(sql);
-                    // Pull focus to the root so the modal's Enter/Esc are heard.
-                    self.refocus_root = true;
+                    // Focus the modal so its own Enter/Esc handling is heard.
+                    self.focus_modal = true;
                     cx.notify();
                 } else {
                     self.execute_sql(sql, cx);

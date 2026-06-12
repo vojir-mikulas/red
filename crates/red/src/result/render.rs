@@ -3,11 +3,10 @@
 //! toolbar · grid · footer · scrollbar that make up the pane.
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Hsla, KeyDownEvent, SharedString, Window};
+use gpui::{div, prelude::*, px, Hsla, SharedString, Window};
 use red_core::ExportFormat;
 
 use super::buffer::{CellKind, DisplayCell};
-use super::GridMove;
 use crate::app::{ActiveConn, AppState, Pane};
 
 /// Group a number's digits in threes (`1234567` → `1,234,567`) so large row
@@ -114,45 +113,17 @@ impl AppState {
             cyan,
             faint,
         };
-        // Focusable so ⌘3 / focus-cycle can land here and the grid can take its
-        // cell-cursor keys; `Grid` scopes those keys to this pane. Every early
-        // return below builds on `container`, so all grid states stay focusable.
+        // The focus + cell-cursor keys live on the `Table` itself (see its
+        // `.focus_handle`/`.on_nav` below); this pane just draws the focus ring
+        // when the grid holds focus. The 1px transparent border reserves the
+        // ring's space so focus never shifts the layout.
         let container = div()
             .size_full()
             .flex()
             .flex_col()
-            .key_context("Grid")
-            .track_focus(&active.grid_focus)
-            // 1px transparent border reserves the focus ring's space (no layout
-            // shift); the accent ring marks the grid as the active pane.
             .border_1()
             .border_color(gpui::transparent_black())
             .when(grid_focused, |d| d.focus_ring(cx))
-            // Cell-cursor navigation while the grid is focused. Handled here (not
-            // via the global keymap) so arrows/Home/End mean "move the cursor"
-            // only in this pane; Shift extends, ⌘ jumps to edges. Unrecognized
-            // keys fall through (so ⌘C still bubbles to RedRoot's copy binding).
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                let ks = &event.keystroke;
-                let cmd = ks.modifiers.secondary();
-                let mv = match ks.key.as_str() {
-                    "up" if cmd => GridMove::First,
-                    "down" if cmd => GridMove::Last,
-                    "left" if cmd => GridMove::RowStart,
-                    "right" if cmd => GridMove::RowEnd,
-                    "up" => GridMove::Up,
-                    "down" => GridMove::Down,
-                    "left" => GridMove::Left,
-                    "right" => GridMove::Right,
-                    "home" => GridMove::RowStart,
-                    "end" => GridMove::RowEnd,
-                    "pageup" => GridMove::PageUp,
-                    "pagedown" => GridMove::PageDown,
-                    _ => return,
-                };
-                cx.stop_propagation();
-                this.result_cursor_move(mv, ks.modifiers.shift, cx);
-            }))
             .bg(bg);
 
         let grid = match active.active_result() {
@@ -281,7 +252,7 @@ impl AppState {
         let buffer_row = grid.buffer.clone();
         let sender = grid.sender.clone();
         let epoch = grid.epoch;
-        let (sort_view, cell_view) = (view.clone(), view.clone());
+        let (sort_view, cell_view, nav_view) = (view.clone(), view.clone(), view.clone());
 
         // Resolve (and possibly re-center) the virtual-scroll window for this
         // frame; everything below works in list-local coordinates offset by
@@ -309,6 +280,14 @@ impl AppState {
             .track_scroll(&grid.scroll)
             .track_horizontal_scroll(&grid.h_scroll)
             .horizontal(true)
+            // Keyboard cell cursor: the grid pane's focus handle lives on the
+            // table, and arrow/Home/End/Page/⌘-arrow intents drive the selection.
+            .focus_handle(active.grid_focus.clone())
+            .on_nav(move |nav, extend, _window, cx| {
+                nav_view
+                    .update(cx, |this, cx| this.result_cursor_move(nav, extend, cx))
+                    .ok();
+            })
             .selected_cells(local_selection)
             .sort(sort)
             .sort_carets(

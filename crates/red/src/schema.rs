@@ -11,26 +11,11 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use flint::prelude::*;
-use gpui::{
-    div, prelude::*, px, App, Context, Entity, KeyDownEvent, UniformListScrollHandle, Window,
-};
+use gpui::{div, prelude::*, px, App, Context, Entity, UniformListScrollHandle, Window};
 use red_core::{ColumnMeta, DbKind, ObjectKind, SchemaMeta, TableDetail};
 use red_service::Command;
 
 use crate::app::{ActiveConn, AppState, Phase};
-
-/// A keyboard navigation step over the schema tree while the sidebar is focused.
-#[derive(Clone, Copy)]
-enum TreeNav {
-    Up,
-    Down,
-    /// Left — collapse an expanded node, else move to its parent.
-    Collapse,
-    /// Right — expand a collapsed node, else descend to its first child.
-    Expand,
-    /// Enter — preview a table/view, or toggle a namespace.
-    Activate,
-}
 
 /// A stable identity for a tree node, surviving re-render and filtering so
 /// expansion + selection track the right node regardless of row position.
@@ -380,13 +365,19 @@ impl AppState {
         let rows_toggle = rows.clone();
         let rows_select = rows.clone();
         let rows_activate = rows.clone();
-        let (tv, sv, av) = (view.clone(), view.clone(), view.clone());
+        let (tv, sv, av, nv) = (view.clone(), view.clone(), view.clone(), view.clone());
 
         let tree = Tree::new("schema-tree")
             .rows(items)
             .row_height(px(24.))
             .indent(px(14.))
             .track_scroll(&s.tree_scroll)
+            // Keyboard navigation: the sidebar's focus handle lives on the tree,
+            // and ↑/↓ / ←/→ / Enter intents drive selection, expansion, and preview.
+            .focus_handle(active.schema_focus.clone())
+            .on_nav(move |nav, _window, cx| {
+                nv.update(cx, |this, cx| this.schema_nav(nav, cx)).ok();
+            })
             .selected(selected_ix)
             .disclosure(|expanded, _window, cx| {
                 let name = if expanded { "chevron-down" } else { "chevron" };
@@ -431,29 +422,12 @@ impl AppState {
             .size_full()
             .flex()
             .flex_col()
-            // Focusable so ⌘1 / focus-cycle can land here and the tree can take
-            // its navigation keys; `Schema` scopes those keys to this pane.
-            .key_context("Schema")
-            .track_focus(&active.schema_focus)
-            // A 1px border (transparent until focused) reserves the ring's space so
-            // focus never nudges the layout; the accent ring shows the active pane.
+            // The tree itself owns the focus handle + navigation keys (see its
+            // `.focus_handle`/`.on_nav` above); this pane just draws the focus ring.
+            // The 1px transparent border reserves the ring's space (no layout shift).
             .border_1()
             .border_color(gpui::transparent_black())
             .when(focused, |d| d.focus_ring(cx))
-            // Tree navigation while the sidebar is focused: arrows move/expand,
-            // Enter previews. Unrecognized keys fall through to ancestors.
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                let nav = match event.keystroke.key.as_str() {
-                    "up" => TreeNav::Up,
-                    "down" => TreeNav::Down,
-                    "left" => TreeNav::Collapse,
-                    "right" => TreeNav::Expand,
-                    "enter" => TreeNav::Activate,
-                    _ => return,
-                };
-                cx.stop_propagation();
-                this.schema_nav(nav, cx);
-            }))
             .bg(bg_panel)
             .child(filter_row)
             .child(div().flex_1().min_h(px(0.)).child(tree))

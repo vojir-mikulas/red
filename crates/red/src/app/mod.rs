@@ -162,13 +162,16 @@ impl QueryTab {
         });
         // ⌘↵ runs the active tab's statement / selection; Esc (with no completion
         // open) jumps focus to the result grid, so run → inspect is a keyboard loop.
-        cx.subscribe(&editor, |this, _editor, event: &CodeEditorEvent, cx| match event {
-            CodeEditorEvent::Run => this.run_editor_query(cx),
-            CodeEditorEvent::Escape => {
-                this.pending_focus = Some(Pane::Grid);
-                cx.notify();
-            }
-        })
+        cx.subscribe(
+            &editor,
+            |this, _editor, event: &CodeEditorEvent, cx| match event {
+                CodeEditorEvent::Run => this.run_editor_query(cx),
+                CodeEditorEvent::Escape => {
+                    this.pending_focus = Some(Pane::Grid);
+                    cx.notify();
+                }
+            },
+        )
         .detach();
 
         Self {
@@ -360,6 +363,11 @@ pub struct AppState {
     /// Focus anchor for the root view, so the global ⌘K binding dispatches even
     /// when nothing else is focused.
     pub(crate) root_focus: FocusHandle,
+    /// Focus anchor handed to the keyboard-driven modals (the confirmations and
+    /// the shortcuts overlay) so Flint's `Modal` hears their `Esc`/`Enter`.
+    pub(crate) modal_focus: FocusHandle,
+    /// Set when such a modal just opened: the next render focuses `modal_focus`.
+    pub(crate) focus_modal: bool,
     /// The command palette overlay, when open, plus the `id → Cmd` map for the
     /// commands it's currently showing (so an activation routes to the right one).
     pub(crate) palette: Option<Entity<Palette>>,
@@ -554,6 +562,8 @@ impl AppState {
             query_ticking: false,
             connect_gen: 0,
             root_focus: cx.focus_handle(),
+            modal_focus: cx.focus_handle(),
+            focus_modal: false,
             palette: None,
             palette_cmds: Vec::new(),
             // Focus the root on first paint so the very first ⌘K dispatches.
@@ -708,7 +718,12 @@ impl AppState {
                     self.service.send(Command::LoadObjects);
                 }
             }
-            Event::Disconnected => self.phase = Phase::Disconnected,
+            Event::Disconnected => {
+                self.phase = Phase::Disconnected;
+                self.connect_sel = 0;
+                // Reclaim root focus so the welcome screen's card navigation works.
+                self.refocus_root = true;
+            }
             Event::TestSucceeded { version } => {
                 if let Some(form) = &mut self.form {
                     form.test = TestState::Ok(format!("Connection successful · {version}").into());
@@ -942,11 +957,14 @@ impl AppState {
         if let Some(sql) = self.confirm_exec.take() {
             self.execute_sql(sql, cx);
         }
+        // The modal is closing — return focus to the root for the next ⌘K etc.
+        self.refocus_root = true;
         cx.notify();
     }
 
     pub(crate) fn cancel_destructive(&mut self, cx: &mut Context<Self>) {
         self.confirm_exec = None;
+        self.refocus_root = true;
         cx.notify();
     }
 
@@ -1093,10 +1111,15 @@ impl AppState {
     }
 
     /// Open or close the keyboard-shortcuts overlay (`⌘/` / palette command).
-    /// Reclaims root focus so the overlay's Esc-to-close is heard.
+    /// Opening focuses the modal so its Esc-to-close is heard; closing returns
+    /// focus to the root.
     pub(crate) fn toggle_shortcuts(&mut self, cx: &mut Context<Self>) {
         self.shortcuts_open = !self.shortcuts_open;
-        self.refocus_root = true;
+        if self.shortcuts_open {
+            self.focus_modal = true;
+        } else {
+            self.refocus_root = true;
+        }
         cx.notify();
     }
 
@@ -1187,8 +1210,8 @@ impl AppState {
             self.close_tab(index, cx);
         } else {
             self.confirm_close_tab = Some(index);
-            // Pull focus to the root so the modal's Enter/Esc are heard.
-            self.refocus_root = true;
+            // Focus the modal so its own Enter/Esc handling is heard.
+            self.focus_modal = true;
             cx.notify();
         }
     }
@@ -1198,10 +1221,13 @@ impl AppState {
         if let Some(index) = self.confirm_close_tab.take() {
             self.close_tab(index, cx);
         }
+        self.refocus_root = true;
+        cx.notify();
     }
 
     pub(crate) fn cancel_close(&mut self, cx: &mut Context<Self>) {
         self.confirm_close_tab = None;
+        self.refocus_root = true;
         cx.notify();
     }
 

@@ -64,6 +64,7 @@ impl AppState {
             crate::icons::icon("settings", theme.scale(16.), theme.text_muted),
         )
         .size(IconButtonSize::Sm)
+        .tooltip("Settings  ⌘,")
         .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
 
         let topbar_right = div()
@@ -262,6 +263,7 @@ impl AppState {
             .size(px(20.))
             .rounded(px(4.))
             .cursor_pointer()
+            .tooltip(Tooltip::text("Toggle sidebar  ⌘B"))
             .hover(|s| s.bg(theme.bg_elevated))
             .child(crate::icons::icon(
                 if active.sidebar_collapsed {

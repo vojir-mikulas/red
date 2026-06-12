@@ -116,6 +116,13 @@ impl Render for AppState {
             }
         }
 
+        // A keyboard-driven modal (a confirmation or the shortcuts overlay) just
+        // opened — focus it so Flint's `Modal` hears its Esc/Enter.
+        if self.focus_modal {
+            self.focus_modal = false;
+            window.focus(&self.modal_focus.clone(), cx);
+        }
+
         // First paint: install the OS-appearance observer and the settings
         // file-watcher (both need a live `Window`).
         self.ensure_observers(window, cx);
@@ -195,38 +202,32 @@ impl Render for AppState {
                     this.open_new_form(cx);
                 }
             }))
-            // Keyboard close/confirm for the overlays that have no focus of their
-            // own (the shortcuts reference and the two confirmation modals). They
-            // open with focus reclaimed to the root, so these keys land here.
+            // Welcome-screen card navigation (the modals own their own Esc/Enter
+            // via Flint's `Modal` focus handling). ↑/↓ move the highlight, Enter
+            // connects. Only acts on the disconnected screen with no form open.
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                let key = event.keystroke.key.as_str();
-                if this.shortcuts_open {
-                    if key == "escape" {
-                        this.shortcuts_open = false;
+                if !matches!(this.phase, Phase::Disconnected) || this.form.is_some() {
+                    return;
+                }
+                let n = this.connections.len();
+                if n == 0 {
+                    return;
+                }
+                match event.keystroke.key.as_str() {
+                    "up" => {
+                        this.connect_sel = this.connect_sel.saturating_sub(1);
                         cx.stop_propagation();
                         cx.notify();
                     }
-                    return;
-                }
-                if this.confirm_exec.is_none() && this.confirm_close_tab.is_none() {
-                    return;
-                }
-                match key {
-                    "escape" => {
-                        if this.confirm_exec.is_some() {
-                            this.cancel_destructive(cx);
-                        } else {
-                            this.cancel_close(cx);
-                        }
+                    "down" => {
+                        this.connect_sel = (this.connect_sel + 1).min(n - 1);
                         cx.stop_propagation();
+                        cx.notify();
                     }
                     "enter" => {
-                        if this.confirm_exec.is_some() {
-                            this.confirm_destructive(cx);
-                        } else {
-                            this.confirm_close(cx);
-                        }
+                        let ix = this.connect_sel.min(n - 1);
                         cx.stop_propagation();
+                        this.connect(ix, cx);
                     }
                     _ => {}
                 }
@@ -327,6 +328,7 @@ impl AppState {
     fn render_confirm_close(&self, title: String, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let close_view = cx.entity().downgrade();
+        let confirm_view = cx.entity().downgrade();
         let body = div().text_color(theme.text_muted).child(format!(
             "“{title}” has a query or result that will be lost. Close it?"
         ));
@@ -347,9 +349,15 @@ impl AppState {
         Modal::new("confirm-close-tab")
             .title("Close tab")
             .width(px(420.))
+            .focus_handle(self.modal_focus.clone())
             .footer(footer)
             .on_close(move |_, cx| {
                 close_view.update(cx, |this, cx| this.cancel_close(cx)).ok();
+            })
+            .on_confirm(move |_, cx| {
+                confirm_view
+                    .update(cx, |this, cx| this.confirm_close(cx))
+                    .ok();
             })
             .child(body)
     }
@@ -392,12 +400,10 @@ impl AppState {
         Modal::new("keyboard-shortcuts")
             .title("Keyboard shortcuts")
             .width(px(460.))
+            .focus_handle(self.modal_focus.clone())
             .on_close(move |_, cx| {
                 close_view
-                    .update(cx, |this, cx| {
-                        this.shortcuts_open = false;
-                        cx.notify();
-                    })
+                    .update(cx, |this, cx| this.toggle_shortcuts(cx))
                     .ok();
             })
             .child(body)
@@ -407,6 +413,7 @@ impl AppState {
     fn render_confirm(&self, sql: String, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let close_view = cx.entity().downgrade();
+        let confirm_view = cx.entity().downgrade();
         let preview: String = sql.chars().take(200).collect();
         let body = div()
             .flex()
@@ -444,10 +451,16 @@ impl AppState {
         Modal::new("confirm-destructive")
             .title("Confirm destructive statement")
             .width(px(440.))
+            .focus_handle(self.modal_focus.clone())
             .footer(footer)
             .on_close(move |_, cx| {
                 close_view
                     .update(cx, |this, cx| this.cancel_destructive(cx))
+                    .ok();
+            })
+            .on_confirm(move |_, cx| {
+                confirm_view
+                    .update(cx, |this, cx| this.confirm_destructive(cx))
                     .ok();
             })
             .child(body)

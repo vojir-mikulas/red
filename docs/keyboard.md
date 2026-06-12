@@ -35,6 +35,10 @@ overlay and this doc are both built from `keymap::shortcuts()` so they don't dri
 | `⌘W` | Close tab (confirms if it holds unsaved work) |
 | `⌃Tab` / `⌃⇧Tab` | Next / previous tab |
 | `⌘↵` | Run the query (or the selection) |
+| `Esc` | Leave the editor for the result grid (when no completion is open) |
+
+The history popover (toggle from the palette or the History button) is keyboard
+driven once open: `↑`/`↓` move, `↵` loads the entry, `Esc` closes.
 
 ## Result grid
 
@@ -72,17 +76,28 @@ Focus the sidebar (`⌘1`), then:
 | `↵` | Confirm (run the destructive statement, close the tab, or connect) |
 | `Esc` | Cancel / close the dialog or overlay |
 
-In the connection form, `↵` in any field connects and `Esc` closes the form.
+Confirmation dialogs and the shortcuts overlay handle these keys through Flint's
+`Modal`. In the connection form, `↵` in any field connects, `⌘↵` runs **Test
+connection**, and `Esc` closes the form (which auto-focuses the name field on
+open).
 
-## Deferred
+## Welcome screen
 
-These are noted in `docs/plans/keyboard-operability.md` and not yet wired:
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Move between saved-connection cards |
+| `↵` | Connect to the highlighted card |
+| `⌘N` | New connection |
 
-- Editor `Esc` → jump to the grid (needs Flint `CodeEditor` to surface a
-  no-completion escape).
-- `⌘↵` = Test in the connection form (needs Flint `TextInput` to report the
-  modifier on submit, or a Flint `Modal` `on_confirm`).
-- Disconnected-screen card navigation (`↑/↓`, `↵`, `⌘N`).
-- History-popover arrow navigation; the `ToggleHistory` direct binding.
-- Pane focus rings, chrome tooltips, and pushing the generic grid/tree/modal
-  keyboard nav down into Flint (it's spiked in RED today).
+## Implementation notes
+
+The generic, domain-free keyboard navigation now lives in Flint, per the
+gallery-first rule: `Table` and `Tree` own a `FocusHandle` and emit
+`TableNav`/`TreeNav` move-selection intents (RED keeps the selection state and
+windowing); `Modal` owns `Esc`/`on_confirm` with a caller-supplied focus handle;
+`CodeEditor` emits an `Escape` event; `Button`/`IconButton` take a `tooltip`.
+
+One small piece remains genuinely partial: the modal **focus trap** (Tab cycling
+strictly within the dialog) — `Esc`/`Enter`/scrim-dismiss all work, but Tab can
+still reach background controls. Tracked in
+`docs/plans/keyboard-operability.md`.

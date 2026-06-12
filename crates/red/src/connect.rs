@@ -102,6 +102,7 @@ impl AppState {
             crate::icons::icon("settings", cx.theme().scale(16.), cx.theme().text_muted),
         )
         .size(IconButtonSize::Sm)
+        .tooltip("Settings  ⌘,")
         .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
 
         let theme = cx.theme();
@@ -271,7 +272,13 @@ impl AppState {
             .rounded(theme.radius)
             .bg(theme.bg_elevated)
             .border_1()
-            .border_color(theme.border)
+            // The keyboard-highlighted card (↑/↓ on the welcome screen) gets the
+            // accent border; the rest sit on the neutral border until hovered.
+            .border_color(if index == self.connect_sel {
+                theme.accent
+            } else {
+                theme.border
+            })
             .cursor_pointer()
             .hover(|s| s.border_color(theme.border_strong).bg(theme.bg_active))
             .child(
