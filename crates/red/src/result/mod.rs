@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use flint::prelude::*;
 use gpui::{point, px, ClipboardItem, Context, Pixels, ScrollHandle, UniformListScrollHandle};
 use red_core::{Column as ResultColumn, ExportFormat, KeySpec, Value};
-use red_service::{Command, CommandSender, RunFetch, SortKey};
+use red_service::{Command, CommandSender, RunFetch, SessionId, SortKey};
 
 use crate::app::{AppState, ExportProgress, Notification, Phase};
 
@@ -458,9 +458,10 @@ impl AppState {
         table: Option<(String, String)>,
         cx: &mut Context<Self>,
     ) {
-        let sender = self.service.command_sender();
         let opened = match &mut self.phase {
             Phase::Connected(active) if active.active().is_some() => {
+                // Bind the grid's load-on-scroll sender to this workspace's session.
+                let sender = self.service.command_sender(active.session);
                 let grid = ResultGrid::new(label.into(), base_sql, table, sender);
                 let opened = (grid.base_sql.clone(), grid.epoch, grid.table.clone());
                 // Safe: the guard above ensured a focused tab exists.
@@ -471,7 +472,7 @@ impl AppState {
         };
         let (sql, epoch, table) = opened;
         // A fresh open is never sorted — the backend keys it from `table`.
-        self.service.send(Command::OpenResult {
+        self.send_active(Command::OpenResult {
             sql,
             epoch,
             table,
@@ -484,15 +485,16 @@ impl AppState {
     /// Backend reported the open result's columns + total (+ resolved seek key).
     pub(crate) fn on_result_ready(
         &mut self,
+        session: Option<SessionId>,
         columns: Vec<ResultColumn>,
         total: usize,
         epoch: u64,
         key: Option<KeySpec>,
         cx: &mut Context<Self>,
     ) {
-        if let Phase::Connected(active) = &mut self.phase {
-            // Route by epoch: the result may belong to a background tab. A late
-            // reply for a replaced/closed result finds no match and is dropped.
+        // Route to the event's session (it may be a backgrounded workspace), then
+        // by epoch within it. A late reply for a closed result finds no match.
+        if let Some(active) = self.conn_mut(session) {
             if let Some(grid) = active.result_by_epoch(epoch) {
                 grid.on_ready(columns, total, key);
             }
@@ -502,8 +504,8 @@ impl AppState {
 
     /// A keyset run fetch failed — free the grid's in-flight slot so scrolling
     /// can fetch again (the error itself arrives separately as a toast).
-    pub(crate) fn on_result_run_failed(&mut self, epoch: u64, seq: u64) {
-        if let Phase::Connected(active) = &mut self.phase {
+    pub(crate) fn on_result_run_failed(&mut self, session: Option<SessionId>, epoch: u64, seq: u64) {
+        if let Some(active) = self.conn_mut(session) {
             if let Some(grid) = active.result_by_epoch(epoch) {
                 grid.buffer.borrow_mut().run_failed(seq);
             }
@@ -511,8 +513,10 @@ impl AppState {
     }
 
     /// A keyset run window arrived — extend/relocate the grid's run and repaint.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_result_run(
         &mut self,
+        session: Option<SessionId>,
         epoch: u64,
         fetch: RunFetch,
         rows: Vec<Vec<Value>>,
@@ -520,7 +524,7 @@ impl AppState {
         seq: u64,
         cx: &mut Context<Self>,
     ) {
-        if let Phase::Connected(active) = &mut self.phase {
+        if let Some(active) = self.conn_mut(session) {
             if let Some(grid) = active.result_by_epoch(epoch) {
                 let total = grid.total;
                 grid.buffer
@@ -534,14 +538,15 @@ impl AppState {
     /// A page arrived — drop it into the buffer and repaint.
     pub(crate) fn on_result_page(
         &mut self,
+        session: Option<SessionId>,
         offset: usize,
         rows: Vec<Vec<Value>>,
         epoch: u64,
         cx: &mut Context<Self>,
     ) {
-        if let Phase::Connected(active) = &mut self.phase {
-            // Route by epoch so a background tab's page lands in its own grid; a
-            // page for a superseded result finds no match and is dropped.
+        // Route by session then epoch so a background tab's page lands in its own
+        // grid; a page for a superseded result finds no match and is dropped.
+        if let Some(active) = self.conn_mut(session) {
             if let Some(grid) = active.result_by_epoch(epoch) {
                 grid.buffer.borrow_mut().insert_page(offset, rows);
             }
@@ -549,10 +554,10 @@ impl AppState {
         cx.notify();
     }
 
-    /// Record a result error against the active tab's grid (also surfaced as a
-    /// toast). Errors aren't epoch-tagged yet, so they attach to the focused tab.
-    pub(crate) fn on_result_error(&mut self, message: &str) {
-        if let Phase::Connected(active) = &mut self.phase {
+    /// Record a result error against the session's focused tab grid (also surfaced
+    /// as a toast). Errors aren't epoch-tagged, so they attach to the focused tab.
+    pub(crate) fn on_result_error(&mut self, session: Option<SessionId>, message: &str) {
+        if let Some(active) = self.conn_mut(session) {
             if let Some(grid) = active.active_result_mut() {
                 grid.error = Some(message.to_string());
                 grid.ready = true;
@@ -604,8 +609,8 @@ impl AppState {
         };
         if let Some((sql, table, sort, epoch, old_epoch)) = reopen {
             // Evict the superseded SQL so the backend's result map can't grow.
-            self.service.send(Command::CloseResult { epoch: old_epoch });
-            self.service.send(Command::OpenResult {
+            self.send_active(Command::CloseResult { epoch: old_epoch });
+            self.send_active(Command::OpenResult {
                 sql,
                 epoch,
                 table,
@@ -788,7 +793,7 @@ impl AppState {
         };
         let id = self.next_export_id;
         self.next_export_id += 1;
-        self.service.send(Command::Export {
+        self.send_active(Command::Export {
             format,
             path,
             epoch,
@@ -902,7 +907,7 @@ impl AppState {
                     dcol_lo,
                     dcol_hi,
                 });
-                self.service.send(Command::CopyRows {
+                self.send_active(Command::CopyRows {
                     offset,
                     limit,
                     epoch,

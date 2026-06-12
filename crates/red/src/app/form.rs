@@ -318,7 +318,7 @@ impl AppState {
         if let Some(form) = &mut self.form {
             form.test = TestState::Testing;
         }
-        self.service.send(Command::TestConnection(config));
+        self.service.send_global(Command::TestConnection(config));
         cx.notify();
     }
 }

@@ -17,7 +17,11 @@ use red_driver::{
 use tokio::sync::mpsc::UnboundedReceiver as CmdReceiver;
 use tokio::sync::Semaphore;
 
-use crate::{Command, Event, RunFetch};
+use crate::{Command, Envelope, Event, RunFetch, SessionId};
+
+/// The event sender carries each event tagged with the session it belongs to
+/// (`None` for the session-less probe replies).
+type Events = UnboundedSender<(Option<SessionId>, Event)>;
 
 /// Cap on page fetches running at once. The grid can request a burst of pages
 /// (several tabs, or a viewport spanning page boundaries); without a cap a flung
@@ -41,6 +45,15 @@ const CHECKPOINT_STRIDE: usize = 10_000;
 /// Shallower jumps are served by a plain `OFFSET` (already fast), so tables
 /// nobody jumps deep into are never scanned.
 const BUILD_TRIGGER_DEPTH: usize = 100_000;
+
+/// How long a non-foreground session may sit untouched before it's evicted: its
+/// driver is dropped (connection released) and any in-flight work aborted. The
+/// foreground session (per `SetActiveSession`) is exempt — it must stay warm
+/// however long the user studies a result without scrolling.
+const IDLE_EVICT: Duration = Duration::from_secs(600);
+
+/// How often the dispatch loop wakes (absent any command) to sweep idle sessions.
+const EVICT_SWEEP: Duration = Duration::from_secs(30);
 
 /// A sparse `ordinal → key` index over an open keyset result: one entry every
 /// [`CHECKPOINT_STRIDE`] rows, built by a single background ordered traversal.
@@ -139,73 +152,133 @@ struct ActiveQuery {
     started: Instant,
 }
 
-pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: UnboundedSender<Event>) {
-    let mut session: Option<Arc<dyn DatabaseDriver>> = None;
-    let mut active: Option<ActiveQuery> = None;
-    // The spec backing each open result, keyed by epoch and re-fetched per
-    // `FetchPage`/`FetchRun`. One entry per live query tab (plus a transient
-    // extra while a re-sort swaps a tab to a new epoch). Fetches run as detached
-    // tasks (so a slow `count`/deep page never stalls the dispatch loop); a
-    // fetch for an epoch absent from the map is stale — the tab closed or moved
-    // on — and is dropped. UI epochs start at 1, so an empty map means "no live
-    // result".
-    let results: ResultMap = Arc::new(Mutex::new(HashMap::new()));
-    // The abort handles for in-flight fetches, keyed by epoch. Lives only on the
-    // dispatch loop: superseding (abort the old) and registering (store the new)
-    // both happen here, so it needs no lock. See [`InFlight`].
-    let mut inflight: HashMap<u64, InFlight> = HashMap::new();
-    // Bounds how many page fetches hit the server concurrently (see the const).
-    let page_fetch_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_PAGE_FETCHES));
-    // In-flight exports: `id → cancel flag`. An export runs as a detached task
-    // (so the loop stays responsive while it streams); `CancelExport` flips its
-    // flag and the task removes its own entry on completion. Shared so the task
-    // can self-clean without round-tripping a command.
-    let exports: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>> = Arc::new(Mutex::new(HashMap::new()));
+/// Everything the backend owns for one keep-alive session: its driver, the
+/// streaming cursor (the legacy `Query` path), the open-result map, the per-epoch
+/// abort handles, the in-flight export flags, and when it was last touched (for
+/// idle eviction). Several of these stay warm at once, keyed by [`SessionId`], so
+/// switching between connections is instant — no reconnect, no schema reload.
+struct SessionState {
+    driver: Arc<dyn DatabaseDriver>,
+    /// The streaming `Query`/`FetchMore` cursor. Single-active per session; this
+    /// path is legacy/test-only (the UI drives results via `OpenResult`).
+    active: Option<ActiveQuery>,
+    results: ResultMap,
+    inflight: HashMap<u64, InFlight>,
+    exports: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
+    /// Bumped on every command routed here; idle eviction reads it.
+    last_used: Instant,
+}
 
-    while let Some(command) = commands.recv().await {
+impl SessionState {
+    fn new(driver: Arc<dyn DatabaseDriver>) -> Self {
+        Self {
+            driver,
+            active: None,
+            results: Arc::new(Mutex::new(HashMap::new())),
+            inflight: HashMap::new(),
+            exports: Arc::new(Mutex::new(HashMap::new())),
+            last_used: Instant::now(),
+        }
+    }
+
+    /// Stop everything in flight at the engine and forget every open result —
+    /// the session is being dropped (disconnect / close / eviction).
+    fn teardown(&mut self) {
+        abort_all_inflight(&mut self.inflight);
+        lock(&self.results).clear();
+    }
+}
+
+pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events) {
+    // The warm sessions, keyed by `SessionId`. Several stay live at once so the UI
+    // can switch between connections instantly (no reconnect); each owns its
+    // driver, cursor, open-result map, in-flight handles, and exports. `Connect`
+    // inserts, `Disconnect`/`CloseSession`/eviction remove. Per-epoch fetch state
+    // lives inside each session — UI epochs start at 1, so an empty result map
+    // means "no live result" for that session.
+    let mut sessions: HashMap<SessionId, SessionState> = HashMap::new();
+    // Which session the UI currently shows (`SetActiveSession`). Exempt from idle
+    // eviction so an on-screen-but-unscrolled result stays warm.
+    let mut foreground: Option<SessionId> = None;
+    // Bounds how many page fetches hit servers concurrently across *all* sessions
+    // (see the const) — a shared backstop, so a flung scrollbar on one connection
+    // can't fan out dozens of deep scans. A busy session can briefly delay
+    // another's page fetches; acceptable for a backstop.
+    let page_fetch_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_PAGE_FETCHES));
+    // Wakes the loop even when no command arrives, so idle sessions get swept.
+    let mut sweep = tokio::time::interval(EVICT_SWEEP);
+
+    loop {
+        let (session_id, command) = tokio::select! {
+            maybe = commands.recv() => match maybe {
+                Some(envelope) => envelope,
+                None => break, // UI dropped the sender — window closed
+            },
+            _ = sweep.tick() => {
+                evict_idle(&mut sessions, foreground, &events);
+                continue;
+            }
+        };
+        // Any command routed to a session counts as activity, deferring eviction.
+        if let Some(id) = session_id {
+            if let Some(s) = sessions.get_mut(&id) {
+                s.last_used = Instant::now();
+            }
+        }
         match command {
             Command::Connect(config) => {
-                active = None; // a new connection abandons any in-flight cursor
-                abort_all_inflight(&mut inflight); // and any superseded fetch work
-                lock(&results).clear();
+                let Some(id) = session_id else { continue };
+                // A re-connect on the same id (a retry, or replacing a dropped
+                // session) tears down whatever was there first.
+                if let Some(mut old) = sessions.remove(&id) {
+                    old.teardown();
+                }
                 match attempt_connect(&config).await {
                     Ok(driver) => {
                         let version = driver.server_version();
-                        session = Some(driver);
-                        emit(&events, Event::Connected { version });
+                        sessions.insert(id, SessionState::new(driver));
+                        emit(&events, Some(id), Event::Connected { version });
                     }
-                    Err(message) => emit(&events, Event::Error(message)),
+                    Err(message) => emit(&events, Some(id), Event::Error(message)),
                 }
             }
 
+            Command::SetActiveSession(id) => foreground = id,
+
             Command::TestConnection(config) => {
-                // A throwaway probe: connect, report, and let the driver drop. The
-                // active session is untouched.
+                // A throwaway probe: connect, report, and let the driver drop. No
+                // session is created or disturbed — it's session-less (`None`).
                 match attempt_connect(&config).await {
                     Ok(driver) => emit(
                         &events,
+                        None,
                         Event::TestSucceeded {
                             version: driver.server_version(),
                         },
                     ),
-                    Err(message) => emit(&events, Event::TestFailed { message }),
+                    Err(message) => emit(&events, None, Event::TestFailed { message }),
                 }
             }
 
-            Command::Disconnect => {
-                active = None;
-                abort_all_inflight(&mut inflight);
-                lock(&results).clear();
-                session = None;
-                emit(&events, Event::Disconnected);
+            Command::Disconnect | Command::CloseSession => {
+                let Some(id) = session_id else { continue };
+                if let Some(mut state) = sessions.remove(&id) {
+                    state.teardown();
+                }
+                if foreground == session_id {
+                    foreground = None;
+                }
+                emit(&events, session_id, Event::Disconnected);
             }
 
             Command::Query { sql, opts } => {
-                active = None; // a new query supersedes the previous cursor
-                let Some(driver) = session.clone() else {
-                    emit(&events, Event::Error("not connected".into()));
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
+                state.active = None; // a new query supersedes the previous cursor
+                let driver = state.driver.clone();
                 match driver.open_cursor(&sql, opts.clone()).await {
                     Ok(cursor) => {
                         let aq = ActiveQuery {
@@ -217,53 +290,70 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                         };
                         emit(
                             &events,
+                            session_id,
                             Event::QueryStarted {
                                 columns: aq.cursor.columns().to_vec(),
                             },
                         );
-                        if drive_fetch(aq, opts.window, &mut commands, &events, &mut active).await {
-                            break; // shutdown requested mid-fetch
+                        // Re-borrow the session's cursor slot (it can't vanish
+                        // mid-await on this single-threaded loop).
+                        if let Some(active) = sessions.get_mut(&id).map(|s| &mut s.active) {
+                            if drive_fetch(aq, opts.window, id, &mut commands, &events, active).await
+                            {
+                                break; // shutdown requested mid-fetch
+                            }
                         }
                     }
-                    Err(err) => emit(&events, Event::Error(err.to_string())),
+                    Err(err) => emit(&events, session_id, Event::Error(err.to_string())),
                 }
             }
 
-            Command::FetchMore { max } => match active.take() {
-                Some(aq) => {
-                    if drive_fetch(aq, max, &mut commands, &events, &mut active).await {
-                        break;
+            Command::FetchMore { max } => {
+                let Some(id) = session_id else { continue };
+                let aq = sessions.get_mut(&id).and_then(|s| s.active.take());
+                match aq {
+                    Some(aq) => {
+                        if let Some(active) = sessions.get_mut(&id).map(|s| &mut s.active) {
+                            if drive_fetch(aq, max, id, &mut commands, &events, active).await {
+                                break;
+                            }
+                        }
                     }
+                    None => emit(&events, session_id, Event::Error("no active query".into())),
                 }
-                None => emit(&events, Event::Error("no active query".into())),
-            },
+            }
 
             Command::LoadObjects => {
-                let Some(driver) = session.clone() else {
-                    emit(&events, Event::Error("not connected".into()));
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
+                let driver = state.driver.clone();
                 match driver.list_objects().await {
-                    Ok(schemas) => emit(&events, Event::ObjectsLoaded { schemas }),
-                    Err(e) => emit(&events, Event::Error(e.to_string())),
+                    Ok(schemas) => emit(&events, session_id, Event::ObjectsLoaded { schemas }),
+                    Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
                 }
             }
 
             Command::DescribeTable { schema, table } => {
-                let Some(driver) = session.clone() else {
-                    emit(&events, Event::Error("not connected".into()));
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
+                let driver = state.driver.clone();
                 match driver.describe_table(&schema, &table).await {
                     Ok(detail) => emit(
                         &events,
+                        session_id,
                         Event::TableDescribed {
                             schema,
                             table,
                             detail,
                         },
                     ),
-                    Err(e) => emit(&events, Event::Error(e.to_string())),
+                    Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
                 }
             }
 
@@ -273,17 +363,19 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 table,
                 sort,
             } => {
-                let Some(driver) = session.clone() else {
-                    emit(&events, Event::Error("not connected".into()));
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
+                let driver = state.driver.clone();
                 // A re-open on the same epoch supersedes any prior probe.
-                if let Some(f) = inflight.remove(&epoch) {
+                if let Some(f) = state.inflight.remove(&epoch) {
                     f.abort_all();
                 }
                 // Registered before the (slow) open task so an early fetch for
                 // this epoch isn't mistaken for a stale one.
-                lock(&results).insert(
+                lock(&state.results).insert(
                     epoch,
                     OpenSpec {
                         sql: sql.clone(),
@@ -297,12 +389,12 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 // One abort handle for the whole probe bundle: re-sort / close
                 // cancels the (potentially full-table) `count` and column probe.
                 let abort = AbortSignal::new();
-                inflight.entry(epoch).or_default().open = Some(abort.clone());
+                state.inflight.entry(epoch).or_default().open = Some(abort.clone());
                 // Count + column metadata can be slow (a full `COUNT(*)` over a
                 // large table); run them off the dispatch loop so switching to
                 // another table stays instant.
                 let events = events.clone();
-                let results = results.clone();
+                let results = state.results.clone();
                 tokio::spawn(async move {
                     // A table browse resolves its seek key from the table's
                     // introspected detail: a sorted browse gets the composite
@@ -387,6 +479,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                             }
                             emit(
                                 &events,
+                                session_id,
                                 Event::ResultReady {
                                     columns: page.columns,
                                     total,
@@ -395,7 +488,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                                 },
                             );
                         }
-                        (Err(e), _) | (_, Err(e)) => emit(&events, Event::Error(e.to_string())),
+                        (Err(e), _) | (_, Err(e)) => {
+                            emit(&events, session_id, Event::Error(e.to_string()))
+                        }
                     }
                 });
             }
@@ -405,20 +500,22 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 limit,
                 epoch,
             } => {
-                let Some(driver) = session.clone() else {
-                    emit(&events, Event::Error("not connected".into()));
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
+                let driver = state.driver.clone();
                 // The tab closed or re-sorted (its epoch is gone); skip the stale
                 // request rather than running an expensive query whose result
                 // would be discarded.
-                let Some(sql) = lock(&results).get(&epoch).map(|s| s.sql.clone()) else {
+                let Some(sql) = lock(&state.results).get(&epoch).map(|s| s.sql.clone()) else {
                     continue;
                 };
                 // A newer page for this epoch supersedes the last one (the viewport
                 // moved); cancel its in-flight fetch so a flung scrollbar doesn't
                 // back a pile of doomed deep-`OFFSET` scans up behind the semaphore.
-                let entry = inflight.entry(epoch).or_default();
+                let entry = state.inflight.entry(epoch).or_default();
                 if let Some(prev) = entry.page.take() {
                     prev.abort();
                 }
@@ -439,13 +536,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                     {
                         Ok(page) => emit(
                             &events,
+                            session_id,
                             Event::ResultPageLoaded {
                                 offset,
                                 rows: page.rows,
                                 epoch,
                             },
                         ),
-                        Err(e) => emit(&events, Event::Error(e.to_string())),
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
                     }
                 });
             }
@@ -456,12 +554,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 limit,
                 seq,
             } => {
-                let Some(driver) = session.clone() else {
-                    emit(&events, Event::Error("not connected".into()));
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
+                let driver = state.driver.clone();
                 // Stale epoch (tab closed / re-sorted) — drop, like `FetchPage`.
-                let Some(spec) = lock(&results).get(&epoch).cloned() else {
+                let Some(spec) = lock(&state.results).get(&epoch).cloned() else {
                     continue;
                 };
                 let Some(key) = spec.key.clone() else {
@@ -472,7 +572,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 // the previous in-flight run so its seek stops at the engine. `seq`
                 // is monotonic over the ordered command stream, so the guard against
                 // a lower-seq arrival is belt-and-suspenders.
-                let entry = inflight.entry(epoch).or_default();
+                let entry = state.inflight.entry(epoch).or_default();
                 match entry.run.take() {
                     Some((prev_seq, prev)) if prev_seq >= seq => {
                         entry.run = Some((prev_seq, prev));
@@ -492,11 +592,11 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 {
                     if claim_build(&spec, *ordinal) {
                         let build_abort = AbortSignal::new();
-                        inflight.entry(epoch).or_default().build = Some(build_abort.clone());
+                        state.inflight.entry(epoch).or_default().build = Some(build_abort.clone());
                         tokio::spawn(build_checkpoints(
                             driver.clone(),
                             spec.clone(),
-                            results.clone(),
+                            state.results.clone(),
                             epoch,
                             build_abort,
                         ));
@@ -509,6 +609,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                     match run_fetch(&*driver, &spec, &key, &fetch, limit, &abort).await {
                         Ok((rows, estimated)) => emit(
                             &events,
+                            session_id,
                             Event::ResultRunLoaded {
                                 epoch,
                                 fetch,
@@ -519,8 +620,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                         ),
                         Err(e) => {
                             tracing::warn!(%epoch, ?fetch, "run fetch failed: {e}");
-                            emit(&events, Event::ResultRunFailed { epoch, seq });
-                            emit(&events, Event::Error(e.to_string()));
+                            emit(&events, session_id, Event::ResultRunFailed { epoch, seq });
+                            emit(&events, session_id, Event::Error(e.to_string()));
                         }
                     }
                 });
@@ -532,12 +633,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 epoch,
                 id,
             } => {
-                let Some(driver) = session.clone() else {
-                    emit(&events, Event::Error("not connected".into()));
+                let Some(sid) = session_id else { continue };
+                let Some(state) = sessions.get(&sid) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
+                let driver = state.driver.clone();
                 // Stale epoch (tab closed / re-sorted) — drop, like `FetchPage`.
-                let Some(sql) = lock(&results).get(&epoch).map(|s| s.sql.clone()) else {
+                let Some(sql) = lock(&state.results).get(&epoch).map(|s| s.sql.clone()) else {
                     continue;
                 };
                 // Same windowed read as a page fetch, but `Full` so the rows carry the
@@ -555,29 +658,35 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                     {
                         Ok(page) => emit(
                             &events,
+                            session_id,
                             Event::CopyRowsLoaded {
                                 id,
                                 rows: page.rows,
                             },
                         ),
-                        Err(e) => emit(&events, Event::Error(e.to_string())),
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
                     }
                 });
             }
 
             Command::CloseResult { epoch } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else { continue };
                 // Stop every in-flight fetch for the tab at the engine, then forget it.
-                if let Some(f) = inflight.remove(&epoch) {
+                if let Some(f) = state.inflight.remove(&epoch) {
                     f.abort_all();
                 }
-                lock(&results).remove(&epoch);
+                lock(&state.results).remove(&epoch);
             }
 
             Command::Execute { sql } => {
-                let Some(driver) = session.clone() else {
-                    emit(&events, Event::Error("not connected".into()));
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
+                let driver = state.driver.clone();
+                let results = state.results.clone();
                 match driver.execute(&sql).await {
                     Ok(affected) => {
                         // A write may have shifted rows under any open result, so
@@ -590,12 +699,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                         }
                         emit(
                             &events,
+                            session_id,
                             Event::Executed {
                                 affected: affected as usize,
                             },
                         );
                     }
-                    Err(e) => emit(&events, Event::Error(e.to_string())),
+                    Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
                 }
             }
 
@@ -605,18 +715,24 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 epoch,
                 id,
             } => {
-                let Some(driver) = session.clone() else {
-                    emit(&events, Event::Error("not connected".into()));
+                let Some(sid) = session_id else { continue };
+                let Some(state) = sessions.get(&sid) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                let Some(sql) = lock(&results).get(&epoch).map(|s| s.sql.clone()) else {
-                    emit(&events, Event::Error("no open result to export".into()));
+                let driver = state.driver.clone();
+                let Some(sql) = lock(&state.results).get(&epoch).map(|s| s.sql.clone()) else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("no open result to export".into()),
+                    );
                     continue;
                 };
                 // Register the cancel flag before the task starts, so a fast
                 // `CancelExport` can't race ahead of it.
                 let cancel = Arc::new(AtomicBool::new(false));
-                lock(&exports).insert(id, cancel.clone());
+                lock(&state.exports).insert(id, cancel.clone());
 
                 // Forward the driver's throttled row counts to the UI as progress
                 // events; the channel closes (loop ends) when the export drops its
@@ -628,6 +744,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                         while let Some(rows) = progress_rx.recv().await {
                             emit(
                                 &events,
+                                session_id,
                                 Event::ExportProgress {
                                     id,
                                     rows: rows as usize,
@@ -640,7 +757,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 // Run the export off the dispatch loop so the loop keeps pumping
                 // (a `CancelExport` or any other command lands while it streams).
                 let events = events.clone();
-                let exports = exports.clone();
+                let exports = state.exports.clone();
                 tokio::spawn(async move {
                     let path_str = path.to_string_lossy().into_owned();
                     let result = driver
@@ -650,37 +767,69 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                     match result {
                         Ok(rows) => emit(
                             &events,
+                            session_id,
                             Event::ExportFinished {
                                 id,
                                 path: path_str,
                                 rows: rows as usize,
                             },
                         ),
-                        Err(RedError::Interrupted) => emit(&events, Event::ExportCancelled { id }),
-                        Err(e) => emit(&events, Event::Error(e.to_string())),
+                        Err(RedError::Interrupted) => {
+                            emit(&events, session_id, Event::ExportCancelled { id })
+                        }
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
                     }
                 });
             }
 
             Command::CancelExport { id } => {
+                let Some(sid) = session_id else { continue };
                 // Flip the flag; the export's per-row check picks it up, removes
                 // the partial file, and replies `ExportCancelled`.
-                if let Some(cancel) = lock(&exports).get(&id) {
-                    cancel.store(true, Ordering::Relaxed);
+                if let Some(state) = sessions.get(&sid) {
+                    if let Some(cancel) = lock(&state.exports).get(&id) {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
                 }
             }
 
             Command::Cancel => {
+                let Some(id) = session_id else { continue };
                 // No fetch is in flight here (pull protocol), so cancelling just
                 // drops the cursor; the in-flight case is handled inside
                 // `drive_fetch`.
-                if let Some(aq) = active.take() {
+                if let Some(aq) = sessions.get_mut(&id).and_then(|s| s.active.take()) {
                     aq.cancel.cancel();
-                    emit(&events, Event::QueryCancelled);
+                    emit(&events, session_id, Event::QueryCancelled);
                 }
             }
 
             Command::Shutdown => break,
+        }
+    }
+}
+
+/// Drop every session that's been idle past [`IDLE_EVICT`] and isn't the
+/// foreground one: abort its in-flight work, release its driver, and tell the UI
+/// (`Disconnected`) so it demotes that workspace to a plain recent.
+fn evict_idle(
+    sessions: &mut HashMap<SessionId, SessionState>,
+    foreground: Option<SessionId>,
+    events: &Events,
+) {
+    let now = Instant::now();
+    let stale: Vec<SessionId> = sessions
+        .iter()
+        .filter(|(id, s)| {
+            Some(**id) != foreground && now.duration_since(s.last_used) >= IDLE_EVICT
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    for id in stale {
+        if let Some(mut state) = sessions.remove(&id) {
+            state.teardown();
+            tracing::info!(id = id.0, "evicted idle session");
+            emit(events, Some(id), Event::Disconnected);
         }
     }
 }
@@ -692,10 +841,12 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
 async fn drive_fetch(
     aq: ActiveQuery,
     max: usize,
-    commands: &mut CmdReceiver<Command>,
-    events: &UnboundedSender<Event>,
+    session: SessionId,
+    commands: &mut CmdReceiver<Envelope>,
+    events: &Events,
     active: &mut Option<ActiveQuery>,
 ) -> bool {
+    let session = Some(session);
     let mut aq = aq;
     let mut cancelled = false;
     let mut timed_out = false;
@@ -708,8 +859,10 @@ async fn drive_fetch(
             tokio::select! {
                 res = &mut fetch => break res,
                 cmd = commands.recv(), if !shutdown => match cmd {
-                    Some(Command::Cancel) => { cancelled = true; aq.cancel.cancel(); }
-                    Some(Command::Shutdown) | None => { shutdown = true; aq.cancel.cancel(); }
+                    // Legacy single-active streaming path: a `Cancel` (from any
+                    // session) drops this cursor; `Shutdown` always stops the loop.
+                    Some((_, Command::Cancel)) => { cancelled = true; aq.cancel.cancel(); }
+                    Some((_, Command::Shutdown)) | None => { shutdown = true; aq.cancel.cancel(); }
                     // Pull protocol: the consumer awaits each window before
                     // sending the next command, so nothing else lands mid-fetch.
                     _ => {}
@@ -727,16 +880,17 @@ async fn drive_fetch(
             // An interrupt can land between the last row and the channel reply,
             // so honor a pending cancel/timeout even on an Ok window.
             if shutdown || cancelled {
-                emit(events, Event::QueryCancelled);
+                emit(events, session, Event::QueryCancelled);
             } else if timed_out {
-                emit(events, Event::Error(RedError::Timeout.to_string()));
+                emit(events, session, Event::Error(RedError::Timeout.to_string()));
             } else {
                 aq.streamed += window.rows.len();
                 let done = window.exhausted;
-                emit(events, Event::QueryRows(window));
+                emit(events, session, Event::QueryRows(window));
                 if done {
                     emit(
                         events,
+                        session,
                         Event::QueryFinished {
                             rows_streamed: aq.streamed,
                             elapsed: aq.started.elapsed(),
@@ -749,12 +903,12 @@ async fn drive_fetch(
         }
         Err(RedError::Interrupted) => {
             if timed_out {
-                emit(events, Event::Error(RedError::Timeout.to_string()));
+                emit(events, session, Event::Error(RedError::Timeout.to_string()));
             } else {
-                emit(events, Event::QueryCancelled);
+                emit(events, session, Event::QueryCancelled);
             }
         }
-        Err(e) => emit(events, Event::Error(e.to_string())),
+        Err(e) => emit(events, session, Event::Error(e.to_string())),
     }
 
     shutdown
@@ -1015,9 +1169,10 @@ async fn connect(config: &ConnectionConfig) -> Result<Arc<dyn DatabaseDriver>, S
 }
 
 /// The UI may have dropped its receiver (window closed) — a failed send is the
-/// expected shutdown path, not an error.
-fn emit(events: &UnboundedSender<Event>, event: Event) {
-    let _ = events.unbounded_send(event);
+/// expected shutdown path, not an error. `session` tags the event so the UI
+/// routes it to the right workspace (`None` for the session-less probe replies).
+fn emit(events: &Events, session: Option<SessionId>, event: Event) {
+    let _ = events.unbounded_send((session, event));
 }
 
 /// Abort every in-flight fetch across all open results and clear the registry —

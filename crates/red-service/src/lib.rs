@@ -20,43 +20,62 @@ mod protocol;
 #[cfg(test)]
 mod tests;
 
-pub use protocol::{Command, Event, RunFetch, SortKey};
+pub use protocol::{Command, Event, RunFetch, SessionId, SortKey};
 
 use futures::channel::mpsc::{unbounded, UnboundedReceiver};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender as CmdSender};
 
-/// A cloneable handle that can only *send* commands. Handed to the result grid so
-/// its load-on-scroll callback can request pages mid-render without touching the
-/// (non-cloneable) `ServiceHandle` or the UI entity.
+/// One command on its way to the backend, tagged with the session it routes to
+/// (`None` for the session-less `TestConnection`/`Shutdown`). See `protocol`.
+pub type Envelope = (Option<SessionId>, Command);
+
+/// A cloneable handle that can only *send* commands, **bound to one session** so
+/// its sends are stamped automatically. Handed to the result grid so its
+/// load-on-scroll callback can request pages mid-render without touching the
+/// (non-cloneable) `ServiceHandle`, the UI entity, or the session id.
 #[derive(Clone)]
-pub struct CommandSender(CmdSender<Command>);
+pub struct CommandSender {
+    tx: CmdSender<Envelope>,
+    session: SessionId,
+}
 
 impl CommandSender {
     pub fn send(&self, command: Command) {
-        let _ = self.0.send(command);
+        let _ = self.tx.send((Some(self.session), command));
     }
 }
 
 /// The UI's handle on the backend: send commands, take the event stream once.
 pub struct ServiceHandle {
-    commands: CmdSender<Command>,
-    events: Option<UnboundedReceiver<Event>>,
+    commands: CmdSender<Envelope>,
+    events: Option<UnboundedReceiver<(Option<SessionId>, Event)>>,
 }
 
 impl ServiceHandle {
-    /// Fire a command at the backend. Infallible from the caller's view — if the
-    /// backend is gone the command is dropped.
-    pub fn send(&self, command: Command) {
-        let _ = self.commands.send(command);
+    /// Fire a command at a specific session. Infallible from the caller's view —
+    /// if the backend is gone the command is dropped.
+    pub fn send_to(&self, session: SessionId, command: Command) {
+        let _ = self.commands.send((Some(session), command));
     }
 
-    /// A cloneable send-only handle (for the result grid's page requests).
-    pub fn command_sender(&self) -> CommandSender {
-        CommandSender(self.commands.clone())
+    /// Fire a session-less command (`TestConnection`, `Shutdown`,
+    /// `SetActiveSession`).
+    pub fn send_global(&self, command: Command) {
+        let _ = self.commands.send((None, command));
     }
 
-    /// Take the event stream. Call once; it moves into the UI's async loop.
-    pub fn take_events(&mut self) -> Option<UnboundedReceiver<Event>> {
+    /// A cloneable send-only handle bound to `session` (for the result grid's
+    /// page requests).
+    pub fn command_sender(&self, session: SessionId) -> CommandSender {
+        CommandSender {
+            tx: self.commands.clone(),
+            session,
+        }
+    }
+
+    /// Take the event stream. Call once; it moves into the UI's async loop. Each
+    /// item is `(session, event)` — the session the event belongs to.
+    pub fn take_events(&mut self) -> Option<UnboundedReceiver<(Option<SessionId>, Event)>> {
         self.events.take()
     }
 }
@@ -65,8 +84,8 @@ impl ServiceHandle {
 /// current-thread Tokio runtime; the blocking SQLite work runs on its blocking
 /// pool, so the dispatch loop never stalls.
 pub fn spawn() -> ServiceHandle {
-    let (cmd_tx, cmd_rx) = unbounded_channel::<Command>();
-    let (evt_tx, evt_rx) = unbounded::<Event>();
+    let (cmd_tx, cmd_rx) = unbounded_channel::<Envelope>();
+    let (evt_tx, evt_rx) = unbounded::<(Option<SessionId>, Event)>();
 
     std::thread::Builder::new()
         .name("red-service".into())
@@ -87,7 +106,8 @@ pub fn spawn() -> ServiceHandle {
             if let Err(panic) = std::panic::catch_unwind(run) {
                 let detail = panic_message(panic.as_ref());
                 tracing::error!(detail, "red-service dispatch loop panicked");
-                let _ = report.unbounded_send(Event::Error(format!("backend crashed: {detail}")));
+                let _ = report
+                    .unbounded_send((None, Event::Error(format!("backend crashed: {detail}"))));
             }
         })
         .expect("spawn red-service thread");

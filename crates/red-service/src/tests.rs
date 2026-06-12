@@ -1,8 +1,23 @@
 use super::*;
+use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use std::time::{Duration, Instant};
 
 use red_core::{ConnectionConfig, DbKind, QueryOptions, Value};
+
+/// The session every single-session test drives. Real multi-session routing is
+/// exercised by [`keeps_two_sessions_warm`].
+const S: SessionId = SessionId(1);
+
+/// Fire a command at the default test session (the channel now routes by id).
+fn send(handle: &ServiceHandle, command: Command) {
+    handle.send_to(S, command);
+}
+
+/// Pull the next event, dropping the session tag the single-session tests ignore.
+async fn next(events: &mut UnboundedReceiver<(Option<SessionId>, Event)>) -> Option<Event> {
+    events.next().await.map(|(_, e)| e)
+}
 
 fn sqlite(dsn: &str, read_only: bool) -> ConnectionConfig {
     ConnectionConfig {
@@ -27,10 +42,10 @@ fn counting_sql(n: i64) -> String {
 async fn streams_query_in_bounded_windows() {
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
-    handle.send(Command::Connect(sqlite(":memory:", true)));
-    assert!(matches!(events.next().await, Some(Event::Connected { .. })));
+    send(&handle, Command::Connect(sqlite(":memory:", true)));
+    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
 
-    handle.send(Command::Query {
+    send(&handle, Command::Query {
         sql: counting_sql(25_000),
         opts: QueryOptions {
             window: 1000,
@@ -38,19 +53,19 @@ async fn streams_query_in_bounded_windows() {
         },
     });
 
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::QueryStarted { columns }) => assert_eq!(columns[0].name, "x"),
         other => panic!("expected QueryStarted, got {other:?}"),
     }
 
     let mut total = 0usize;
     loop {
-        match events.next().await {
+        match next(&mut events).await {
             Some(Event::QueryRows(window)) => {
                 assert!(window.rows.len() <= 1000);
                 total += window.rows.len();
                 if !window.exhausted {
-                    handle.send(Command::FetchMore { max: 1000 });
+                    send(&handle, Command::FetchMore { max: 1000 });
                 }
             }
             Some(Event::QueryFinished { rows_streamed, .. }) => {
@@ -61,7 +76,7 @@ async fn streams_query_in_bounded_windows() {
         }
     }
     assert_eq!(total, 25_000);
-    handle.send(Command::Shutdown);
+    send(&handle, Command::Shutdown);
 }
 
 /// Cancel a long-running query mid-flight and get a prompt `QueryCancelled`.
@@ -69,10 +84,10 @@ async fn streams_query_in_bounded_windows() {
 async fn cancels_query_mid_flight() {
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
-    handle.send(Command::Connect(sqlite(":memory:", true)));
-    assert!(matches!(events.next().await, Some(Event::Connected { .. })));
+    send(&handle, Command::Connect(sqlite(":memory:", true)));
+    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
 
-    handle.send(Command::Query {
+    send(&handle, Command::Query {
         sql: counting_sql(1_000_000_000),
         opts: QueryOptions {
             window: 1_000_000_000,
@@ -80,16 +95,16 @@ async fn cancels_query_mid_flight() {
         },
     });
     assert!(matches!(
-        events.next().await,
+        next(&mut events).await,
         Some(Event::QueryStarted { .. })
     ));
 
     // Let the first step get underway, then cancel out-of-band.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    handle.send(Command::Cancel);
+    send(&handle, Command::Cancel);
 
-    assert!(matches!(events.next().await, Some(Event::QueryCancelled)));
-    handle.send(Command::Shutdown);
+    assert!(matches!(next(&mut events).await, Some(Event::QueryCancelled)));
+    send(&handle, Command::Shutdown);
 }
 
 /// A tiny timeout aborts a runaway first step and surfaces an error.
@@ -97,10 +112,10 @@ async fn cancels_query_mid_flight() {
 async fn query_times_out() {
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
-    handle.send(Command::Connect(sqlite(":memory:", true)));
-    assert!(matches!(events.next().await, Some(Event::Connected { .. })));
+    send(&handle, Command::Connect(sqlite(":memory:", true)));
+    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
 
-    handle.send(Command::Query {
+    send(&handle, Command::Query {
         sql: counting_sql(1_000_000_000),
         opts: QueryOptions {
             window: 1_000_000_000,
@@ -108,37 +123,37 @@ async fn query_times_out() {
         },
     });
     assert!(matches!(
-        events.next().await,
+        next(&mut events).await,
         Some(Event::QueryStarted { .. })
     ));
 
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::Error(msg)) => assert!(msg.contains("timed out"), "got: {msg}"),
         other => panic!("expected timeout error, got {other:?}"),
     }
-    handle.send(Command::Shutdown);
+    send(&handle, Command::Shutdown);
 }
 
 #[tokio::test]
 async fn disconnect_drops_session() {
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
-    handle.send(Command::Connect(sqlite(":memory:", true)));
-    assert!(matches!(events.next().await, Some(Event::Connected { .. })));
+    send(&handle, Command::Connect(sqlite(":memory:", true)));
+    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
 
-    handle.send(Command::Disconnect);
-    assert!(matches!(events.next().await, Some(Event::Disconnected)));
+    send(&handle, Command::Disconnect);
+    assert!(matches!(next(&mut events).await, Some(Event::Disconnected)));
 
     // A query after disconnect must report "not connected", not crash.
-    handle.send(Command::Query {
+    send(&handle, Command::Query {
         sql: "SELECT 1".into(),
         opts: QueryOptions::default(),
     });
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::Error(msg)) => assert!(msg.contains("not connected")),
         other => panic!("expected not-connected error, got {other:?}"),
     }
-    handle.send(Command::Shutdown);
+    send(&handle, Command::Shutdown);
 }
 
 /// Connect, load the skeleton, then describe a table — the schema-explorer
@@ -158,11 +173,11 @@ async fn loads_and_describes_schema() {
 
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
-    handle.send(Command::Connect(sqlite(path.to_str().unwrap(), true)));
-    assert!(matches!(events.next().await, Some(Event::Connected { .. })));
+    send(&handle, Command::Connect(sqlite(path.to_str().unwrap(), true)));
+    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
 
-    handle.send(Command::LoadObjects);
-    match events.next().await {
+    send(&handle, Command::LoadObjects);
+    match next(&mut events).await {
         Some(Event::ObjectsLoaded { schemas }) => {
             let main = schemas.iter().find(|s| s.name == "main").unwrap();
             assert!(main.objects.iter().any(|o| o.name == "t"));
@@ -171,11 +186,11 @@ async fn loads_and_describes_schema() {
         other => panic!("expected ObjectsLoaded, got {other:?}"),
     }
 
-    handle.send(Command::DescribeTable {
+    send(&handle, Command::DescribeTable {
         schema: "main".into(),
         table: "t".into(),
     });
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::TableDescribed { table, detail, .. }) => {
             assert_eq!(table, "t");
             assert!(detail
@@ -190,7 +205,7 @@ async fn loads_and_describes_schema() {
         other => panic!("expected TableDescribed, got {other:?}"),
     }
 
-    handle.send(Command::Shutdown);
+    send(&handle, Command::Shutdown);
     std::fs::remove_file(&path).ok();
 }
 
@@ -199,16 +214,16 @@ async fn loads_and_describes_schema() {
 async fn opens_and_pages_result() {
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
-    handle.send(Command::Connect(sqlite(":memory:", true)));
-    assert!(matches!(events.next().await, Some(Event::Connected { .. })));
+    send(&handle, Command::Connect(sqlite(":memory:", true)));
+    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
 
-    handle.send(Command::OpenResult {
+    send(&handle, Command::OpenResult {
         sql: counting_sql(1000),
         epoch: 1,
         table: None,
         sort: None,
     });
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::ResultReady {
             columns,
             total,
@@ -223,12 +238,12 @@ async fn opens_and_pages_result() {
         other => panic!("expected ResultReady, got {other:?}"),
     }
 
-    handle.send(Command::FetchPage {
+    send(&handle, Command::FetchPage {
         offset: 998,
         limit: 100,
         epoch: 1,
     });
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::ResultPageLoaded {
             offset,
             rows,
@@ -241,7 +256,7 @@ async fn opens_and_pages_result() {
         }
         other => panic!("expected ResultPageLoaded, got {other:?}"),
     }
-    handle.send(Command::Shutdown);
+    send(&handle, Command::Shutdown);
 }
 
 /// The keyset path end-to-end: a table browse resolves its PK as the seek
@@ -263,16 +278,16 @@ async fn resolves_key_and_serves_runs() {
 
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
-    handle.send(Command::Connect(sqlite(path.to_str().unwrap(), true)));
-    assert!(matches!(events.next().await, Some(Event::Connected { .. })));
+    send(&handle, Command::Connect(sqlite(path.to_str().unwrap(), true)));
+    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
 
-    handle.send(Command::OpenResult {
+    send(&handle, Command::OpenResult {
         sql: "SELECT * FROM t".into(),
         epoch: 7,
         table: Some(("main".into(), "t".into())),
         sort: None,
     });
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::ResultReady { total, key, .. }) => {
             assert_eq!(total, 1000);
             let key = key.expect("table browse resolves its PK");
@@ -283,13 +298,13 @@ async fn resolves_key_and_serves_runs() {
     }
 
     // Forward from the start, then forward from a boundary key.
-    handle.send(Command::FetchRun {
+    send(&handle, Command::FetchRun {
         epoch: 7,
         fetch: RunFetch::Forward { after: None },
         limit: 3,
         seq: 1,
     });
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::ResultRunLoaded {
             rows,
             estimated,
@@ -303,7 +318,7 @@ async fn resolves_key_and_serves_runs() {
         }
         other => panic!("expected ResultRunLoaded, got {other:?}"),
     }
-    handle.send(Command::FetchRun {
+    send(&handle, Command::FetchRun {
         epoch: 7,
         fetch: RunFetch::Forward {
             after: Some(vec![Value::Integer(3)]),
@@ -311,7 +326,7 @@ async fn resolves_key_and_serves_runs() {
         limit: 3,
         seq: 2,
     });
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::ResultRunLoaded { rows, .. }) => {
             assert_eq!(rows[0][0], Value::Integer(4));
         }
@@ -319,7 +334,7 @@ async fn resolves_key_and_serves_runs() {
     }
 
     // Backward: rows strictly before the bound, delivered descending.
-    handle.send(Command::FetchRun {
+    send(&handle, Command::FetchRun {
         epoch: 7,
         fetch: RunFetch::Backward {
             before: vec![Value::Integer(4)],
@@ -327,7 +342,7 @@ async fn resolves_key_and_serves_runs() {
         limit: 5,
         seq: 3,
     });
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::ResultRunLoaded { rows, .. }) => {
             assert_eq!(
                 rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
@@ -339,7 +354,7 @@ async fn resolves_key_and_serves_runs() {
 
     // A far jump interpolates the key space: ~halfway lands near id 500,
     // flagged estimated.
-    handle.send(Command::FetchRun {
+    send(&handle, Command::FetchRun {
         epoch: 7,
         fetch: RunFetch::Jump {
             ordinal: 499,
@@ -348,7 +363,7 @@ async fn resolves_key_and_serves_runs() {
         limit: 3,
         seq: 4,
     });
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::ResultRunLoaded {
             rows, estimated, ..
         }) => {
@@ -364,7 +379,7 @@ async fn resolves_key_and_serves_runs() {
     }
 
     // A jump to ordinal 0 seeks from the true start — exact, not estimated.
-    handle.send(Command::FetchRun {
+    send(&handle, Command::FetchRun {
         epoch: 7,
         fetch: RunFetch::Jump {
             ordinal: 0,
@@ -373,7 +388,7 @@ async fn resolves_key_and_serves_runs() {
         limit: 3,
         seq: 5,
     });
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::ResultRunLoaded {
             rows, estimated, ..
         }) => {
@@ -383,7 +398,7 @@ async fn resolves_key_and_serves_runs() {
         other => panic!("expected ResultRunLoaded, got {other:?}"),
     }
 
-    handle.send(Command::Shutdown);
+    send(&handle, Command::Shutdown);
     std::fs::remove_file(&path).ok();
 }
 
@@ -412,29 +427,29 @@ async fn mariadb_keyset_end_to_end() {
 
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
-    handle.send(Command::Connect(config));
-    assert!(matches!(events.next().await, Some(Event::Connected { .. })));
+    send(&handle, Command::Connect(config));
+    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
 
     // Seed 1M rows (MariaDB's sequence engine; the test targets MariaDB).
-    handle.send(Command::Execute {
+    send(&handle, Command::Execute {
         sql: format!("CREATE TABLE `{table}`(id BIGINT PRIMARY KEY, name VARCHAR(64))"),
     });
-    assert!(matches!(events.next().await, Some(Event::Executed { .. })));
-    handle.send(Command::Execute {
+    assert!(matches!(next(&mut events).await, Some(Event::Executed { .. })));
+    send(&handle, Command::Execute {
         sql: format!("INSERT INTO `{table}` SELECT seq, CONCAT('row ', seq) FROM seq_1_to_1000000"),
     });
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::Executed { affected }) => assert_eq!(affected, 1_000_000),
         other => panic!("seeding failed: {other:?}"),
     }
 
-    handle.send(Command::OpenResult {
+    send(&handle, Command::OpenResult {
         sql: format!("SELECT * FROM `{}`.`{table}`", p.database),
         epoch: 1,
         table: Some((p.database.clone(), table.clone())),
         sort: None,
     });
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::ResultReady { total, key, .. }) => {
             assert_eq!(total, 1_000_000);
             let key = key.expect("PK resolves as the seek key");
@@ -446,7 +461,7 @@ async fn mariadb_keyset_end_to_end() {
 
     // Deep forward seek near the bottom — must be indexed-fast.
     let started = Instant::now();
-    handle.send(Command::FetchRun {
+    send(&handle, Command::FetchRun {
         epoch: 1,
         fetch: RunFetch::Forward {
             after: Some(vec![Value::Integer(999_000)]),
@@ -454,7 +469,7 @@ async fn mariadb_keyset_end_to_end() {
         limit: 200,
         seq: 1,
     });
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::ResultRunLoaded { rows, .. }) => {
             assert_eq!(rows.len(), 200);
             assert_eq!(rows[0][0], Value::Integer(999_001));
@@ -468,7 +483,7 @@ async fn mariadb_keyset_end_to_end() {
     );
 
     // Interpolated jump to ~50% — fast but approximate, flagged estimated.
-    handle.send(Command::FetchRun {
+    send(&handle, Command::FetchRun {
         epoch: 1,
         fetch: RunFetch::Jump {
             ordinal: 500_000,
@@ -477,7 +492,7 @@ async fn mariadb_keyset_end_to_end() {
         limit: 200,
         seq: 2,
     });
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::ResultRunLoaded {
             rows, estimated, ..
         }) => {
@@ -495,7 +510,7 @@ async fn mariadb_keyset_end_to_end() {
     // Exact jump to row 500_000 ("go to row N"): interpolation is skipped, so
     // ordinals are exact (not estimated) and the row is precisely id 500_001
     // (ids are 1-based; ordinal 500_000 is the 500_001st row).
-    handle.send(Command::FetchRun {
+    send(&handle, Command::FetchRun {
         epoch: 1,
         fetch: RunFetch::Jump {
             ordinal: 500_000,
@@ -504,7 +519,7 @@ async fn mariadb_keyset_end_to_end() {
         limit: 200,
         seq: 3,
     });
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::ResultRunLoaded {
             rows, estimated, ..
         }) => {
@@ -515,7 +530,7 @@ async fn mariadb_keyset_end_to_end() {
     }
 
     // Backward from the middle (scrolling up).
-    handle.send(Command::FetchRun {
+    send(&handle, Command::FetchRun {
         epoch: 1,
         fetch: RunFetch::Backward {
             before: vec![Value::Integer(500_000)],
@@ -523,7 +538,7 @@ async fn mariadb_keyset_end_to_end() {
         limit: 200,
         seq: 4,
     });
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::ResultRunLoaded { rows, .. }) => {
             assert_eq!(rows[0][0], Value::Integer(499_999));
             assert_eq!(rows.len(), 200);
@@ -531,11 +546,11 @@ async fn mariadb_keyset_end_to_end() {
         other => panic!("expected ResultRunLoaded, got {other:?}"),
     }
 
-    handle.send(Command::Execute {
+    send(&handle, Command::Execute {
         sql: format!("DROP TABLE `{table}`"),
     });
-    assert!(matches!(events.next().await, Some(Event::Executed { .. })));
-    handle.send(Command::Shutdown);
+    assert!(matches!(next(&mut events).await, Some(Event::Executed { .. })));
+    send(&handle, Command::Shutdown);
 }
 
 /// A non-interpolable (text) key still gets keyset scroll, and its jumps
@@ -556,23 +571,23 @@ async fn text_key_jump_falls_back_to_offset() {
 
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
-    handle.send(Command::Connect(sqlite(path.to_str().unwrap(), true)));
-    assert!(matches!(events.next().await, Some(Event::Connected { .. })));
+    send(&handle, Command::Connect(sqlite(path.to_str().unwrap(), true)));
+    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
 
-    handle.send(Command::OpenResult {
+    send(&handle, Command::OpenResult {
         sql: "SELECT * FROM t".into(),
         epoch: 9,
         table: Some(("main".into(), "t".into())),
         sort: None,
     });
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::ResultReady { key, .. }) => {
             assert_eq!(key.map(|k| k.kind), Some(KeyKind::Other));
         }
         other => panic!("expected ResultReady, got {other:?}"),
     }
 
-    handle.send(Command::FetchRun {
+    send(&handle, Command::FetchRun {
         epoch: 9,
         fetch: RunFetch::Jump {
             ordinal: 50,
@@ -581,7 +596,7 @@ async fn text_key_jump_falls_back_to_offset() {
         limit: 5,
         seq: 1,
     });
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::ResultRunLoaded {
             rows, estimated, ..
         }) => {
@@ -591,7 +606,7 @@ async fn text_key_jump_falls_back_to_offset() {
         other => panic!("expected ResultRunLoaded, got {other:?}"),
     }
 
-    handle.send(Command::Shutdown);
+    send(&handle, Command::Shutdown);
     std::fs::remove_file(&path).ok();
 }
 
@@ -599,18 +614,18 @@ async fn text_key_jump_falls_back_to_offset() {
 async fn connect_and_query_roundtrip() {
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
-    handle.send(Command::Connect(sqlite(":memory:", false)));
-    handle.send(Command::Query {
+    send(&handle, Command::Connect(sqlite(":memory:", false)));
+    send(&handle, Command::Query {
         sql: "SELECT 42 AS answer".into(),
         opts: QueryOptions::default(),
     });
 
-    assert!(matches!(events.next().await, Some(Event::Connected { .. })));
+    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
     assert!(matches!(
-        events.next().await,
+        next(&mut events).await,
         Some(Event::QueryStarted { .. })
     ));
-    match events.next().await {
+    match next(&mut events).await {
         Some(Event::QueryRows(window)) => {
             assert_eq!(window.rows[0][0], Value::Integer(42));
             assert!(window.exhausted);
@@ -618,10 +633,101 @@ async fn connect_and_query_roundtrip() {
         other => panic!("expected QueryRows, got {other:?}"),
     }
     assert!(matches!(
-        events.next().await,
+        next(&mut events).await,
         Some(Event::QueryFinished { .. })
     ));
-    handle.send(Command::Shutdown);
+    send(&handle, Command::Shutdown);
+}
+
+/// Two connections stay warm at once, each owning its own driver and per-session
+/// epoch space; dropping one leaves the other serving (no reconnect), and a
+/// command to the dropped session reports "not connected" rather than crashing.
+#[tokio::test]
+async fn keeps_two_sessions_warm() {
+    let a = SessionId(1);
+    let b = SessionId(2);
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+
+    handle.send_to(a, Command::Connect(sqlite(":memory:", true)));
+    assert!(matches!(
+        events.next().await,
+        Some((Some(s), Event::Connected { .. })) if s == a
+    ));
+    handle.send_to(b, Command::Connect(sqlite(":memory:", true)));
+    assert!(matches!(
+        events.next().await,
+        Some((Some(s), Event::Connected { .. })) if s == b
+    ));
+
+    // Same epoch in each session — epochs are per-session, not global.
+    handle.send_to(
+        a,
+        Command::OpenResult {
+            sql: counting_sql(100),
+            epoch: 1,
+            table: None,
+            sort: None,
+        },
+    );
+    handle.send_to(
+        b,
+        Command::OpenResult {
+            sql: counting_sql(200),
+            epoch: 1,
+            table: None,
+            sort: None,
+        },
+    );
+
+    // The two opens probe off the loop, so their replies can interleave — route
+    // each by its session tag and assert it landed on the right one.
+    let mut totals = std::collections::HashMap::new();
+    while totals.len() < 2 {
+        match events.next().await {
+            Some((Some(s), Event::ResultReady { total, epoch, .. })) => {
+                assert_eq!(epoch, 1);
+                totals.insert(s, total);
+            }
+            other => panic!("expected ResultReady, got {other:?}"),
+        }
+    }
+    assert_eq!(totals[&a], 100);
+    assert_eq!(totals[&b], 200);
+
+    // Dropping session A leaves B warm and serving — no reconnect.
+    handle.send_to(a, Command::Disconnect);
+    assert!(matches!(
+        events.next().await,
+        Some((Some(s), Event::Disconnected)) if s == a
+    ));
+    handle.send_to(
+        b,
+        Command::FetchPage {
+            offset: 0,
+            limit: 5,
+            epoch: 1,
+        },
+    );
+    match events.next().await {
+        Some((Some(s), Event::ResultPageLoaded { rows, .. })) => {
+            assert_eq!(s, b);
+            assert_eq!(rows[0][0], Value::Integer(1));
+        }
+        other => panic!("expected ResultPageLoaded from B, got {other:?}"),
+    }
+
+    // A command to the dropped session A reports not-connected, not a crash.
+    handle.send_to(a, Command::LoadObjects);
+    match events.next().await {
+        Some((Some(s), Event::Error(msg))) => {
+            assert_eq!(s, a);
+            assert!(msg.contains("not connected"), "got: {msg}");
+        }
+        other => panic!("expected not-connected error from A, got {other:?}"),
+    }
+
+    handle.send_to(b, Command::Shutdown);
 }
 
 #[test]

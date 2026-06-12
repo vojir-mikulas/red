@@ -2,6 +2,12 @@
 //! (UI → service), `Event` (service → UI), and the `RunFetch` shape describing
 //! one keyset run-window request. These are the only types that cross the
 //! channel; the dispatch loop and handle types live in their own modules.
+//!
+//! Both channels carry their payload in an **envelope** `(Option<SessionId>, _)`
+//! so a message routes to one of several keep-alive sessions without threading a
+//! `session` field through every variant (see [`SessionId`]). `None` is for the
+//! genuinely session-less messages — a `TestConnection` probe, `Shutdown`, and
+//! the `TestSucceeded`/`TestFailed` replies.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -11,7 +17,17 @@ use red_core::{
     TableDetail, Value,
 };
 
-/// UI → service. One active session at a time, driven across many commands.
+/// Identifies one keep-alive backend session. Minted UI-side at connect start so
+/// the UI can address a session before it's live (the connecting splash, a
+/// cancel, a retry), and stable across an errored session's retries so the
+/// workspace identity doesn't churn. The service keys its `HashMap<SessionId,
+/// SessionState>` by this; the UI keys its parked-workspace map by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionId(pub u64);
+
+/// UI → service. Routed to a session by the channel envelope's [`SessionId`]
+/// (see the module docs). `Connect` *creates* the session its envelope names;
+/// `Disconnect`/`CloseSession` drop it; the rest address an existing one.
 #[derive(Debug)]
 pub enum Command {
     Connect(ConnectionConfig),
@@ -114,12 +130,25 @@ pub enum Command {
     },
     /// Abort the active query / drop its cursor.
     Cancel,
-    /// Drop the active session and any cursor; return to a disconnected state.
+    /// Drop the envelope's session and any cursor; the window returns to a
+    /// disconnected state. Other warm sessions are untouched.
     Disconnect,
+    /// Drop the envelope's session — the user removed/closed a *background*
+    /// connection (vs `Disconnect`, the window's active one going away). Same
+    /// effect on the backend; kept distinct so the UI's intent stays legible.
+    CloseSession,
+    /// Tell the backend which session is foregrounded (`None` = the welcome
+    /// screen). The foreground session is exempt from idle eviction — a user can
+    /// stare at a result without scrolling and it must stay warm. Global (the
+    /// payload, not the envelope, carries the id).
+    SetActiveSession(Option<SessionId>),
     Shutdown,
 }
 
-/// service → UI. Streamed into the UI's async loop.
+/// service → UI. Streamed into the UI's async loop, tagged by the channel
+/// envelope with the [`SessionId`] it belongs to (`None` for the session-less
+/// `TestSucceeded`/`TestFailed` probe replies) so the UI routes it to the right
+/// workspace — including a backgrounded one whose query is still populating.
 #[derive(Debug)]
 pub enum Event {
     /// A session opened. `version` is the engine version for the status bar.

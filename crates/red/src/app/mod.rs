@@ -9,6 +9,7 @@
 mod form;
 mod render;
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use flint::prelude::*;
@@ -20,7 +21,7 @@ use gpui::{
     PathPromptOptions, Pixels, ScrollHandle, SharedString, WeakEntity, Window, WindowAppearance,
 };
 use red_core::{ConnectionConfig, DbKind};
-use red_service::{Command, Event, ServiceHandle};
+use red_service::{Command, Event, ServiceHandle, SessionId};
 
 use crate::config::{self, StoredConnection};
 use crate::palette::Cmd;
@@ -70,6 +71,11 @@ pub(crate) enum Phase {
 /// out a backoff before the next retry. Drives the connecting splash (progress
 /// bar / error / retry / cancel). See [`AppState::start_connect`].
 pub(crate) struct Connecting {
+    /// The session this connect is opening — minted UI-side so retries reuse it.
+    pub session: SessionId,
+    /// The session that was foreground when this connect began (parked, kept
+    /// warm). Restored on cancel; left parked on success (so both stay warm).
+    pub previous: Option<SessionId>,
     pub config: ConnectionConfig,
     /// 1-based number of the attempt currently in flight or just failed.
     pub attempt: u32,
@@ -194,6 +200,9 @@ impl QueryTab {
 /// resizable split sizes (caller-owned, per `SplitPane`'s stateless contract),
 /// the schema explorer, and the open query tabs.
 pub(crate) struct ActiveConn {
+    /// The backend session backing this workspace. Stays warm while parked, so a
+    /// switch back is instant; binds this conn's `CommandSender`.
+    pub session: SessionId,
     pub config: ConnectionConfig,
     pub version: String,
     pub sidebar_w: Pixels,
@@ -230,9 +239,15 @@ pub(crate) struct ActiveConn {
 }
 
 impl ActiveConn {
-    fn new(config: ConnectionConfig, version: String, cx: &mut Context<AppState>) -> Self {
+    fn new(
+        session: SessionId,
+        config: ConnectionConfig,
+        version: String,
+        cx: &mut Context<AppState>,
+    ) -> Self {
         let tab = QueryTab::new("query 1".to_string(), cx);
         Self {
+            session,
             config,
             version,
             sidebar_w: px(240.),
@@ -382,6 +397,19 @@ pub struct AppState {
     /// searchable, sectioned popover of the active + recent connections. Its
     /// sections are rebuilt from `connections` + `phase` via [`Self::rebuild_switcher`].
     pub(crate) switcher: Entity<Switcher>,
+    /// Warm background connections, kept live so switching back is instant (no
+    /// reconnect). The foreground connection lives in `phase` (`Phase::Connected`);
+    /// these are the ones the user switched away from. Keyed by their backend
+    /// session. An idle one is evicted backend-side after 10 min — its
+    /// `Disconnected` event drops it here and demotes it to a plain recent.
+    pub(crate) parked: HashMap<SessionId, Box<ActiveConn>>,
+    /// The session the window currently shows — the `phase`'s session (connecting
+    /// or connected), or `None` on the welcome screen. Mirrored to the backend via
+    /// `SetActiveSession` so it's exempt from idle eviction.
+    pub(crate) foreground_session: Option<SessionId>,
+    /// Monotonic source of `SessionId`s. The UI mints them so it can address a
+    /// connection (splash, cancel, retry) before the backend confirms it.
+    pub(crate) next_session_id: u64,
     /// Set when an overlay closed: the next render pulls focus back to the root
     /// so the global ⌘K keeps dispatching (see `close_palette`).
     pub(crate) refocus_root: bool,
@@ -415,14 +443,14 @@ impl AppState {
     pub fn new(
         cx: &mut Context<Self>,
         service: ServiceHandle,
-        events: UnboundedReceiver<Event>,
+        events: UnboundedReceiver<(Option<SessionId>, Event)>,
     ) -> Self {
         // Drain backend events on the foreground executor into `on_event`.
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let mut events = events;
-            while let Some(event) = events.next().await {
+            while let Some((session, event)) = events.next().await {
                 if this
-                    .update(cx, |state, cx| state.on_event(event, cx))
+                    .update(cx, |state, cx| state.on_event(session, event, cx))
                     .is_err()
                 {
                     break; // view dropped — window closed
@@ -549,7 +577,7 @@ impl AppState {
             let mut s = Switcher::new("connection-switcher", cx);
             s.set_placeholder("Search connections…", cx);
             let (label, dot, sections) =
-                switcher_sections(&connections, &Phase::Disconnected, cx.theme());
+                switcher_sections(&connections, &Phase::Disconnected, &HashMap::new(), cx.theme());
             s.set_trigger(label, dot, cx);
             s.set_sections(sections, cx);
             s.set_footer(switcher_footer(), cx);
@@ -601,6 +629,9 @@ impl AppState {
             palette: None,
             palette_cmds: Vec::new(),
             switcher,
+            parked: HashMap::new(),
+            foreground_session: None,
+            next_session_id: 0,
             // Focus the root on first paint so the very first ⌘K dispatches.
             refocus_root: true,
             shortcuts_open: false,
@@ -730,7 +761,7 @@ impl AppState {
             .map(|e| e.id);
         match export_id {
             Some(export_id) => {
-                self.service.send(Command::CancelExport { id: export_id });
+                self.send_active(Command::CancelExport { id: export_id });
                 if let Some(n) = self.notifications.iter_mut().find(|n| n.id == id) {
                     n.message = "Cancelling export…".into();
                 }
@@ -740,29 +771,12 @@ impl AppState {
         }
     }
 
-    /// The single point where backend events drive UI state.
-    fn on_event(&mut self, event: Event, cx: &mut Context<Self>) {
+    /// The single point where backend events drive UI state. `session` is the
+    /// workspace the event belongs to (`None` for the session-less probe replies).
+    fn on_event(&mut self, session: Option<SessionId>, event: Event, cx: &mut Context<Self>) {
         match event {
-            Event::Connected { version } => {
-                if let Phase::Connecting(conn) =
-                    std::mem::replace(&mut self.phase, Phase::Disconnected)
-                {
-                    // Invalidate any pending backoff timer from a prior attempt.
-                    self.connect_gen += 1;
-                    self.phase =
-                        Phase::Connected(Box::new(ActiveConn::new(conn.config, version, cx)));
-                    // Kick off the schema-tree skeleton load for the sidebar.
-                    self.service.send(Command::LoadObjects);
-                    self.rebuild_switcher(cx);
-                }
-            }
-            Event::Disconnected => {
-                self.phase = Phase::Disconnected;
-                self.connect_sel = 0;
-                // Reclaim root focus so the welcome screen's card navigation works.
-                self.refocus_root = true;
-                self.rebuild_switcher(cx);
-            }
+            Event::Connected { version } => self.on_connected(session, version, cx),
+            Event::Disconnected => self.on_disconnected(session, cx),
             Event::TestSucceeded { version } => {
                 if let Some(form) = &mut self.form {
                     form.test = TestState::Ok(format!("Connection successful · {version}").into());
@@ -774,34 +788,39 @@ impl AppState {
                 }
             }
             Event::Error(message) => {
-                // While connecting, the only thing in flight is the connect — so
-                // an error is a failed attempt: keep the splash and schedule a
-                // backoff retry instead of dropping to the connect screen.
-                if matches!(self.phase, Phase::Connecting(_)) {
+                // While the foreground is connecting, the only thing in flight is
+                // that connect — so an error is a failed attempt: keep the splash
+                // and schedule a backoff retry instead of dropping to the screen.
+                if matches!(&self.phase, Phase::Connecting(c) if Some(c.session) == session) {
                     self.on_connect_failed(message, cx);
                 } else {
-                    self.on_result_error(&message);
+                    self.on_result_error(session, &message);
                     self.notify(ToastVariant::Error, message, cx);
                 }
             }
 
             // --- schema explorer ---
             Event::ObjectsLoaded { schemas } => {
-                if let Phase::Connected(active) = &mut self.phase {
+                if let Some(active) = self.conn_mut(session) {
                     active.schema.apply_objects(schemas);
                 }
-                self.prefetch_table_details();
-                self.refresh_completions(cx);
+                // Completions / prefetch only matter for the on-screen connection.
+                if session == self.foreground_session {
+                    self.prefetch_table_details();
+                    self.refresh_completions(cx);
+                }
             }
             Event::TableDescribed {
                 schema,
                 table,
                 detail,
             } => {
-                if let Phase::Connected(active) = &mut self.phase {
+                if let Some(active) = self.conn_mut(session) {
                     active.schema.details.insert((schema, table), detail);
                 }
-                self.refresh_completions(cx);
+                if session == self.foreground_session {
+                    self.refresh_completions(cx);
+                }
             }
 
             // --- result grid ---
@@ -810,12 +829,12 @@ impl AppState {
                 total,
                 epoch,
                 key,
-            } => self.on_result_ready(columns, total, epoch, key, cx),
+            } => self.on_result_ready(session, columns, total, epoch, key, cx),
             Event::ResultPageLoaded {
                 offset,
                 rows,
                 epoch,
-            } => self.on_result_page(offset, rows, epoch, cx),
+            } => self.on_result_page(session, offset, rows, epoch, cx),
             // Keyset runs: extend/relocate a grid's resident row run.
             Event::ResultRunLoaded {
                 epoch,
@@ -823,8 +842,8 @@ impl AppState {
                 rows,
                 estimated,
                 seq,
-            } => self.on_result_run(epoch, fetch, rows, estimated, seq, cx),
-            Event::ResultRunFailed { epoch, seq } => self.on_result_run_failed(epoch, seq),
+            } => self.on_result_run(session, epoch, fetch, rows, estimated, seq, cx),
+            Event::ResultRunFailed { epoch, seq } => self.on_result_run_failed(session, epoch, seq),
             Event::CopyRowsLoaded { id, rows } => self.on_copy_rows(id, rows, cx),
 
             // --- export & writes ---
@@ -834,8 +853,11 @@ impl AppState {
                     format!("{affected} row(s) affected"),
                     cx,
                 );
-                // A write may have changed the schema (CREATE/DROP) — refresh the tree.
-                self.service.send(Command::LoadObjects);
+                // A write may have changed the schema (CREATE/DROP) — refresh the
+                // tree of the session that ran it.
+                if let Some(id) = session {
+                    self.service.send_to(id, Command::LoadObjects);
+                }
             }
             Event::ExportProgress { id, rows } => self.on_export_progress(id, rows, cx),
             Event::ExportFinished { id, path, rows } => self.on_export_finished(id, path, rows, cx),
@@ -849,6 +871,109 @@ impl AppState {
             | Event::QueryCancelled => {}
         }
         cx.notify();
+    }
+
+    // --- sessions (keep-alive workspaces) ---
+
+    /// Mint a fresh `SessionId` for a new connect.
+    fn mint_session(&mut self) -> SessionId {
+        self.next_session_id += 1;
+        SessionId(self.next_session_id)
+    }
+
+    /// The live `ActiveConn` for `session` — the foreground one (in `phase`) or a
+    /// parked warm one. Used to route a backend event to its workspace even when
+    /// that workspace is backgrounded (its query is still populating).
+    pub(crate) fn conn_mut(&mut self, session: Option<SessionId>) -> Option<&mut ActiveConn> {
+        let id = session?;
+        if self.foreground_session == Some(id) {
+            if let Phase::Connected(active) = &mut self.phase {
+                return Some(active);
+            }
+        }
+        self.parked.get_mut(&id).map(|b| b.as_mut())
+    }
+
+    /// Fire a command at the foreground session (the on-screen connection). A
+    /// no-op when nothing is foregrounded.
+    pub(crate) fn send_active(&self, command: Command) {
+        if let Some(id) = self.foreground_session {
+            self.service.send_to(id, command);
+        }
+    }
+
+    /// Move the foreground live connection (if any) into the warm-session map so
+    /// switching back to it is instant. Leaves `phase` `Disconnected` — the caller
+    /// installs the next phase. A connecting/disconnected foreground parks nothing.
+    fn park_foreground(&mut self) -> Option<SessionId> {
+        if matches!(self.phase, Phase::Connected(_)) {
+            if let Phase::Connected(active) =
+                std::mem::replace(&mut self.phase, Phase::Disconnected)
+            {
+                let id = active.session;
+                self.parked.insert(id, active);
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Bring a parked warm session to the foreground — the instant-switch payoff:
+    /// no reconnect, the grid/tabs/scroll exactly as left. Tells the backend it's
+    /// now active (eviction-exempt).
+    fn foreground_parked(&mut self, id: SessionId, cx: &mut Context<Self>) -> bool {
+        let Some(active) = self.parked.remove(&id) else {
+            return false;
+        };
+        self.foreground_session = Some(id);
+        self.service.send_global(Command::SetActiveSession(Some(id)));
+        self.phase = Phase::Connected(active);
+        cx.notify();
+        true
+    }
+
+    /// A `Connected` event: promote the connecting splash to a live workspace, if
+    /// it's still the one the user wants. An orphan (they switched away mid-dial)
+    /// is closed.
+    fn on_connected(&mut self, session: Option<SessionId>, version: String, cx: &mut Context<Self>) {
+        let Some(id) = session else { return };
+        let promote = matches!(&self.phase, Phase::Connecting(c) if c.session == id);
+        if !promote {
+            // We've moved on (switched away / cancelled) — drop the stray session.
+            self.service.send_to(id, Command::CloseSession);
+            return;
+        }
+        if let Phase::Connecting(conn) = std::mem::replace(&mut self.phase, Phase::Disconnected) {
+            // Invalidate any pending backoff timer from a prior attempt.
+            self.connect_gen += 1;
+            self.phase = Phase::Connected(Box::new(ActiveConn::new(id, conn.config, version, cx)));
+            self.foreground_session = Some(id);
+            // Kick off the schema-tree skeleton load for the sidebar.
+            self.service.send_to(id, Command::LoadObjects);
+            self.rebuild_switcher(cx);
+        }
+    }
+
+    /// A `Disconnected` event: the session went away (manual disconnect, or
+    /// backend idle eviction of a parked one). Drop it from wherever it lives; if
+    /// it was foreground, fall back to a warm session or the welcome screen.
+    fn on_disconnected(&mut self, session: Option<SessionId>, cx: &mut Context<Self>) {
+        let Some(id) = session else { return };
+        self.parked.remove(&id);
+        if self.foreground_session == Some(id) {
+            self.foreground_session = None;
+            // Prefer an already-warm connection over the welcome screen.
+            if let Some(&other) = self.parked.keys().next() {
+                self.foreground_parked(other, cx);
+            } else {
+                self.service.send_global(Command::SetActiveSession(None));
+                self.phase = Phase::Disconnected;
+                self.connect_sel = 0;
+                // Reclaim root focus so the welcome screen's cards navigate.
+                self.refocus_root = true;
+            }
+        }
+        self.rebuild_switcher(cx);
     }
 
     // --- connection-manager actions ---
@@ -915,13 +1040,20 @@ impl AppState {
         self.start_connect(config, cx);
     }
 
-    /// Open a fresh connect session: bump the generation (abandoning any pending
-    /// retry from a previous session), show the splash, and fire the first
-    /// attempt.
+    /// Open a fresh connect session: park whatever was foreground (kept warm),
+    /// mint a session id, bump the generation (abandoning any pending retry), show
+    /// the splash, and fire the first attempt.
     fn start_connect(&mut self, config: ConnectionConfig, cx: &mut Context<Self>) {
+        let previous = self.park_foreground();
+        let session = self.mint_session();
+        self.foreground_session = Some(session);
         self.connect_gen += 1;
-        self.service.send(Command::Connect(config.clone()));
+        self.service.send_to(session, Command::Connect(config.clone()));
+        self.service
+            .send_global(Command::SetActiveSession(Some(session)));
         self.phase = Phase::Connecting(Connecting {
+            session,
+            previous,
             config,
             attempt: 1,
             status: ConnectStatus::InProgress,
@@ -984,38 +1116,70 @@ impl AppState {
     /// (abandoning any pending backoff timer), advance the counter, and re-send
     /// the Connect command.
     fn begin_attempt(&mut self, cx: &mut Context<Self>) {
-        let config = match &mut self.phase {
+        let (config, session) = match &mut self.phase {
             Phase::Connecting(conn) => {
                 conn.attempt += 1;
                 conn.status = ConnectStatus::InProgress;
-                conn.config.clone()
+                (conn.config.clone(), conn.session)
             }
             _ => return,
         };
         self.connect_gen += 1;
-        self.service.send(Command::Connect(config));
+        self.service.send_to(session, Command::Connect(config));
         cx.notify();
     }
 
     /// Abandon an in-progress connection (the splash "Cancel" button): bump the
-    /// generation so any pending retry is dropped, tell the backend to discard
-    /// the session it may still be opening, and return to the connect screen.
+    /// generation so any pending retry is dropped, tell the backend to discard the
+    /// session it may still be opening, and restore the connection that was
+    /// foreground before this connect (or the welcome screen if there was none).
     pub(crate) fn cancel_connect(&mut self, cx: &mut Context<Self>) {
         self.connect_gen += 1;
-        self.service.send(Command::Disconnect);
-        self.phase = Phase::Disconnected;
+        let previous = match &self.phase {
+            Phase::Connecting(conn) => {
+                self.service.send_to(conn.session, Command::CloseSession);
+                conn.previous
+            }
+            _ => None,
+        };
+        self.foreground_session = None;
+        match previous {
+            Some(id) if self.foreground_parked(id, cx) => {}
+            _ => {
+                self.service.send_global(Command::SetActiveSession(None));
+                self.phase = Phase::Disconnected;
+            }
+        }
+        self.rebuild_switcher(cx);
         cx.notify();
     }
 
+    /// Leave the connected view for the manager (welcome) screen: drop the
+    /// foreground connection *and* every warm parked one — "Manage connections…"
+    /// means a clean slate, not a pile of orphaned warm sessions the welcome
+    /// screen can't reach.
     pub(crate) fn disconnect(&mut self, cx: &mut Context<Self>) {
-        self.service.send(Command::Disconnect);
+        for id in self.parked.keys().copied().collect::<Vec<_>>() {
+            self.service.send_to(id, Command::CloseSession);
+        }
+        self.parked.clear();
+        if let Some(id) = self.foreground_session {
+            self.service.send_to(id, Command::Disconnect);
+        }
+        self.foreground_session = None;
+        self.service.send_global(Command::SetActiveSession(None));
+        self.phase = Phase::Disconnected;
+        self.connect_sel = 0;
+        self.refocus_root = true;
+        self.rebuild_switcher(cx);
         cx.notify();
     }
 
     /// Rebuild the switcher's trigger + sections from the current connections and
     /// phase. Called after every connect/disconnect and before the popover opens.
     pub(crate) fn rebuild_switcher(&mut self, cx: &mut Context<Self>) {
-        let (label, dot, sections) = switcher_sections(&self.connections, &self.phase, cx.theme());
+        let (label, dot, sections) =
+            switcher_sections(&self.connections, &self.phase, &self.parked, cx.theme());
         self.switcher.update(cx, |s, cx| {
             s.set_trigger(label, dot, cx);
             s.set_sections(sections, cx);
@@ -1030,7 +1194,8 @@ impl AppState {
     }
 
     /// Handle a row chosen in the switcher popover. Row ids are `conn:<index>` (a
-    /// saved connection) or the two action rows. Phase 1 reconnects on switch.
+    /// saved connection) or the two action rows. Switching to a warm connection is
+    /// instant (foreground its parked workspace); a cold one connects.
     fn on_switcher_event(
         &mut self,
         _switcher: Entity<Switcher>,
@@ -1051,13 +1216,40 @@ impl AppState {
             .strip_prefix("conn:")
             .and_then(|n| n.parse::<usize>().ok())
         {
-            // Switching to the already-active connection is a no-op.
-            let already_active = matches!(&self.phase, Phase::Connected(a)
-                if self.connections.get(index).is_some_and(|c| c.config.name == a.config.name));
-            if !already_active {
-                self.connect(index, cx);
-            }
+            self.switch_to_connection(index, cx);
         }
+    }
+
+    /// Switch the window to saved connection `index`. Already foreground → no-op;
+    /// already warm (parked) → foreground it instantly (no reconnect); otherwise
+    /// connect cold.
+    fn switch_to_connection(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(target) = self.connections.get(index).map(|c| c.config.name.clone()) else {
+            return;
+        };
+        // Already the on-screen connection — nothing to do.
+        if matches!(&self.phase, Phase::Connected(a) if a.config.name == target) {
+            return;
+        }
+        // A warm parked session for this connection — the instant-switch path.
+        if let Some(&warm) = self
+            .parked
+            .iter()
+            .find(|(_, a)| a.config.name == target)
+            .map(|(id, _)| id)
+        {
+            // Refresh recency for the switched-to connection.
+            if let Some(stored) = self.connections.get_mut(index) {
+                stored.last_accessed = Some(config::now());
+            }
+            self.persist(cx);
+            self.park_foreground();
+            self.foreground_parked(warm, cx);
+            self.rebuild_switcher(cx);
+            return;
+        }
+        // Cold — open a new session (parking the current one warm).
+        self.connect(index, cx);
     }
 
     /// Show or hide the schema sidebar (toggled from the status-bar control).
@@ -1166,7 +1358,7 @@ impl AppState {
             _ => return,
         };
         for (schema, table) in pending {
-            self.service.send(Command::DescribeTable { schema, table });
+            self.send_active(Command::DescribeTable { schema, table });
         }
     }
 
@@ -1223,7 +1415,7 @@ impl AppState {
 
     /// Reload the schema tree from the backend (the ⌘R binding / palette command).
     pub(crate) fn refresh_schema(&mut self) {
-        self.service.send(Command::LoadObjects);
+        self.send_active(Command::LoadObjects);
     }
 
     /// Whether any modal that should trap focus is currently open. Drives the
@@ -1394,7 +1586,7 @@ impl AppState {
         };
         // Free the backend result that backed the closed tab's grid.
         if let Some(epoch) = free_epoch {
-            self.service.send(Command::CloseResult { epoch });
+            self.send_active(Command::CloseResult { epoch });
         }
         cx.notify();
     }
@@ -1831,27 +2023,34 @@ impl AppState {
 const SWITCHER_RECENT_CAP: usize = 8;
 
 /// Build the connection switcher's trigger (label + leading dot) and its
-/// sections from the saved connections and the current phase. The active
-/// connection (matched by name) heads a "This window" section with a checkmark
-/// and drives the trigger; recently-opened connections fill a capped "Recent"
-/// section. The "New…" / "Manage…" actions live in the always-visible footer
-/// (see [`switcher_footer`]). Phase 1 reconnects on switch, so every connection
-/// row is just a saved connection.
+/// sections from the saved connections, the current phase, and the warm parked
+/// sessions. The foreground connection heads a "This window" section (checkmark +
+/// warm/connecting badge) and drives the trigger; other warm sessions fill an
+/// "Open" section (instant switch); the rest are capped "Recent" recents. The
+/// "New…" / "Manage…" actions live in the always-visible footer.
 fn switcher_sections(
     connections: &[StoredConnection],
     phase: &Phase,
+    parked: &HashMap<SessionId, Box<ActiveConn>>,
     theme: &Theme,
 ) -> (SharedString, Option<Hsla>, Vec<SwitcherSection>) {
     use crate::connect::{fmt_ago, label_color};
 
-    let active_name = match phase {
-        Phase::Connected(active) => Some(active.config.name.clone()),
-        _ => None,
+    // The on-screen connection's name (live or mid-connect), and whether it's
+    // still dialing — drives the "This window" badge and the trigger.
+    let (active_name, connecting) = match phase {
+        Phase::Connected(active) => (Some(active.config.name.clone()), false),
+        Phase::Connecting(conn) => (Some(conn.config.name.clone()), true),
+        Phase::Disconnected => (None, false),
     };
     let active_index = active_name
         .as_ref()
         .and_then(|name| connections.iter().position(|c| c.config.name == *name));
+    // Names of connections backed by a warm parked session (instant to switch to).
+    let warm_names: std::collections::HashSet<&str> =
+        parked.values().map(|a| a.config.name.as_str()).collect();
 
+    let warm_badge = SwitcherBadge::new("warm", theme.green);
     let row = |index: usize| -> SwitcherItem {
         let c = &connections[index];
         SwitcherItem::new(
@@ -1863,22 +2062,51 @@ fn switcher_sections(
 
     let mut sections = Vec::new();
 
-    // "This window" — the active connection, checkmarked.
+    // "This window" — the foreground connection, checkmarked, warm or connecting.
     if let Some(ai) = active_index {
+        let badge = if connecting {
+            SwitcherBadge::new("connecting", theme.yellow)
+        } else {
+            warm_badge.clone()
+        };
         sections.push(SwitcherSection::new(
             "This window",
             vec![row(ai)
                 .detail(connections[ai].config.display_target())
+                .badge(badge)
                 .checked(true)],
         ));
     }
 
-    // "Recent" — recently-opened connections (excluding the active one), newest
-    // first, capped.
+    // "Open" — other warm connections, instant to switch to.
+    let mut open: Vec<usize> = connections
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| Some(*i) != active_index && warm_names.contains(c.config.name.as_str()))
+        .map(|(i, _)| i)
+        .collect();
+    open.sort_by_key(|&i| std::cmp::Reverse(connections[i].last_accessed));
+    if !open.is_empty() {
+        let items = open
+            .iter()
+            .map(|&i| {
+                row(i)
+                    .detail(connections[i].config.display_target())
+                    .badge(warm_badge.clone())
+            })
+            .collect();
+        sections.push(SwitcherSection::new("Open", items));
+    }
+
+    // "Recent" — cold recents (no live session), newest first, capped.
     let mut recent: Vec<usize> = connections
         .iter()
         .enumerate()
-        .filter(|(i, c)| Some(*i) != active_index && c.last_accessed.is_some())
+        .filter(|(i, c)| {
+            Some(*i) != active_index
+                && !warm_names.contains(c.config.name.as_str())
+                && c.last_accessed.is_some()
+        })
         .map(|(i, _)| i)
         .collect();
     recent.sort_by_key(|&i| std::cmp::Reverse(connections[i].last_accessed));

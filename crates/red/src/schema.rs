@@ -452,7 +452,7 @@ impl AppState {
             }
         }
         if let Some((schema, table)) = describe {
-            self.service.send(Command::DescribeTable { schema, table });
+            self.send_active(Command::DescribeTable { schema, table });
         }
         cx.notify();
     }

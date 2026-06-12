@@ -710,7 +710,7 @@ impl AppState {
             );
             return;
         }
-        self.service.send(Command::Execute { sql });
+        self.send_active(Command::Execute { sql });
         cx.notify();
     }
 
