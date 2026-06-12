@@ -16,7 +16,7 @@ use flint::{CodeEditor, CodeEditorEvent};
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use gpui::{
-    prelude::*, px, AsyncApp, Context, ElementId, Entity, FocusHandle, Focusable,
+    prelude::*, px, AsyncApp, Context, ElementId, Entity, FocusHandle, Focusable, Hsla,
     PathPromptOptions, Pixels, ScrollHandle, SharedString, WeakEntity, Window, WindowAppearance,
 };
 use red_core::{ConnectionConfig, DbKind};
@@ -364,6 +364,10 @@ pub struct AppState {
     /// commands it's currently showing (so an activation routes to the right one).
     pub(crate) palette: Option<Entity<Palette>>,
     pub(crate) palette_cmds: Vec<(ElementId, Cmd)>,
+    /// The connection switcher (⌘P): an always-mounted topbar trigger that opens a
+    /// searchable, sectioned popover of the active + recent connections. Its
+    /// sections are rebuilt from `connections` + `phase` via [`Self::rebuild_switcher`].
+    pub(crate) switcher: Entity<Switcher>,
     /// Set when an overlay closed: the next render pulls focus back to the root
     /// so the global ⌘K keeps dispatching (see `close_palette`).
     pub(crate) refocus_root: bool,
@@ -517,9 +521,24 @@ impl AppState {
         )
         .detach();
 
+        let connections = config::load();
+
+        // The connection switcher (⌘P). Seed its sections off the just-loaded
+        // connections; `rebuild_switcher` refreshes them on every connect/disconnect.
+        let switcher = cx.new(|cx| {
+            let mut s = Switcher::new("connection-switcher", cx);
+            s.set_placeholder("Search connections…", cx);
+            let (label, dot, sections) =
+                switcher_sections(&connections, &Phase::Disconnected, cx.theme());
+            s.set_trigger(label, dot, cx);
+            s.set_sections(sections, cx);
+            s
+        });
+        cx.subscribe(&switcher, Self::on_switcher_event).detach();
+
         Self {
             service,
-            connections: config::load(),
+            connections,
             phase: Phase::Disconnected,
             name_input,
             host_input,
@@ -556,6 +575,7 @@ impl AppState {
             root_focus: cx.focus_handle(),
             palette: None,
             palette_cmds: Vec::new(),
+            switcher,
             // Focus the root on first paint so the very first ⌘K dispatches.
             refocus_root: true,
             shortcuts_open: false,
@@ -706,9 +726,13 @@ impl AppState {
                         Phase::Connected(Box::new(ActiveConn::new(conn.config, version, cx)));
                     // Kick off the schema-tree skeleton load for the sidebar.
                     self.service.send(Command::LoadObjects);
+                    self.rebuild_switcher(cx);
                 }
             }
-            Event::Disconnected => self.phase = Phase::Disconnected,
+            Event::Disconnected => {
+                self.phase = Phase::Disconnected;
+                self.rebuild_switcher(cx);
+            }
             Event::TestSucceeded { version } => {
                 if let Some(form) = &mut self.form {
                     form.test = TestState::Ok(format!("Connection successful · {version}").into());
@@ -927,6 +951,55 @@ impl AppState {
     pub(crate) fn disconnect(&mut self, cx: &mut Context<Self>) {
         self.service.send(Command::Disconnect);
         cx.notify();
+    }
+
+    /// Rebuild the switcher's trigger + sections from the current connections and
+    /// phase. Called after every connect/disconnect and before the popover opens.
+    pub(crate) fn rebuild_switcher(&mut self, cx: &mut Context<Self>) {
+        let (label, dot, sections) = switcher_sections(&self.connections, &self.phase, cx.theme());
+        self.switcher.update(cx, |s, cx| {
+            s.set_trigger(label, dot, cx);
+            s.set_sections(sections, cx);
+        });
+    }
+
+    /// Toggle the connection switcher popover (⌘P, or a click on its topbar
+    /// trigger). Refresh its contents first so recents/active are current.
+    pub(crate) fn toggle_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.rebuild_switcher(cx);
+        self.switcher
+            .update(cx, |s, cx| s.toggle(window, cx));
+    }
+
+    /// Handle a row chosen in the switcher popover. Row ids are `conn:<index>` (a
+    /// saved connection) or the two action rows. Phase 1 reconnects on switch.
+    fn on_switcher_event(
+        &mut self,
+        _switcher: Entity<Switcher>,
+        event: &SwitcherEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let SwitcherEvent::Activate(ElementId::Name(name)) = event else {
+            return;
+        };
+        if name.as_ref() == "action:new" {
+            self.open_new_form(cx);
+        } else if name.as_ref() == "action:manage" {
+            // The full manager *is* the disconnected landing screen.
+            if !matches!(self.phase, Phase::Disconnected) {
+                self.disconnect(cx);
+            }
+        } else if let Some(index) = name
+            .strip_prefix("conn:")
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            // Switching to the already-active connection is a no-op.
+            let already_active = matches!(&self.phase, Phase::Connected(a)
+                if self.connections.get(index).is_some_and(|c| c.config.name == a.config.name));
+            if !already_active {
+                self.connect(index, cx);
+            }
+        }
     }
 
     /// Show or hide the schema sidebar (toggled from the status-bar control).
@@ -1650,6 +1723,88 @@ impl AppState {
             );
         }
     }
+}
+
+/// How many recent connections to surface in the switcher popover.
+const SWITCHER_RECENT_CAP: usize = 8;
+
+/// Build the connection switcher's trigger (label + leading dot) and its
+/// sections from the saved connections and the current phase. The active
+/// connection (matched by name) heads a "This window" section with a checkmark
+/// and drives the trigger; recently-opened connections fill a capped "Recent"
+/// section; two action rows close it out. Phase 1 reconnects on switch, so every
+/// connection row is just a saved connection.
+fn switcher_sections(
+    connections: &[StoredConnection],
+    phase: &Phase,
+    theme: &Theme,
+) -> (SharedString, Option<Hsla>, Vec<SwitcherSection>) {
+    use crate::connect::{fmt_ago, label_color};
+
+    let active_name = match phase {
+        Phase::Connected(active) => Some(active.config.name.clone()),
+        _ => None,
+    };
+    let active_index = active_name
+        .as_ref()
+        .and_then(|name| connections.iter().position(|c| c.config.name == *name));
+
+    let row = |index: usize| -> SwitcherItem {
+        let c = &connections[index];
+        SwitcherItem::new(
+            SharedString::from(format!("conn:{index}")),
+            c.config.name.clone(),
+        )
+        .dot(label_color(c.config.color, theme))
+    };
+
+    let mut sections = Vec::new();
+
+    // "This window" — the active connection, checkmarked.
+    if let Some(ai) = active_index {
+        sections.push(SwitcherSection::new(
+            "This window",
+            vec![row(ai)
+                .detail(connections[ai].config.display_target())
+                .checked(true)],
+        ));
+    }
+
+    // "Recent" — recently-opened connections (excluding the active one), newest
+    // first, capped.
+    let mut recent: Vec<usize> = connections
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| Some(*i) != active_index && c.last_accessed.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    recent.sort_by_key(|&i| std::cmp::Reverse(connections[i].last_accessed));
+    recent.truncate(SWITCHER_RECENT_CAP);
+    if !recent.is_empty() {
+        let items = recent
+            .into_iter()
+            .map(|i| row(i).detail(fmt_ago(connections[i].last_accessed)))
+            .collect();
+        sections.push(SwitcherSection::new("Recent", items));
+    }
+
+    // Actions.
+    sections.push(SwitcherSection::untitled(vec![
+        SwitcherItem::new("action:new", "New connection…"),
+        SwitcherItem::new("action:manage", "Manage connections…"),
+    ]));
+
+    let (label, dot) = match active_index {
+        Some(ai) => (
+            connections[ai].config.name.clone(),
+            Some(label_color(connections[ai].config.color, theme)),
+        ),
+        None => match active_name {
+            Some(name) => (name, None),
+            None => ("Connect…".into(), None),
+        },
+    };
+    (label.into(), dot, sections)
 }
 
 /// Open `path` with the OS's default handler — the file-first "open in editor"

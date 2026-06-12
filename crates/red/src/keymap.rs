@@ -19,7 +19,7 @@
 //! The bindings use `cmd-*` unconditionally, matching the rest of the app's
 //! macOS-first chrome; per-platform `ctrl-*` splitting is a follow-up.
 
-use flint::{CodeEditor, Palette, TextInput};
+use flint::{CodeEditor, Palette, Switcher, TextInput};
 use gpui::{actions, App, KeyBinding};
 
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
@@ -56,6 +56,8 @@ actions!(
         TestConnection,
         /// Open a new-connection form (the disconnected screen's ⌘N).
         NewConnection,
+        /// Open the connection switcher popover (⌘P).
+        SwitchConnection,
     ]
 );
 
@@ -68,6 +70,7 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
             "Global",
             vec![
                 ("⌘K", "Command palette"),
+                ("⌘P", "Switch connection"),
                 ("⌘/", "Keyboard shortcuts"),
                 ("⌘,", "Settings"),
                 ("⌘Q", "Quit"),
@@ -123,12 +126,15 @@ pub(crate) fn bind_all(cx: &mut App) {
     TextInput::bind_keys(cx);
     CodeEditor::bind_keys(cx);
     Palette::bind_keys(cx);
+    Switcher::bind_keys(cx);
 
     cx.bind_keys([
         // --- true globals (work from any phase) ---
-        // ⌘K toggles the command palette; ⌃G opens "go to row"; ⌘Q quits (we
-        // render a seamless titlebar with no native app menu, so quit is ours).
+        // ⌘K toggles the command palette; ⌘P the connection switcher; ⌃G opens
+        // "go to row"; ⌘Q quits (we render a seamless titlebar with no native app
+        // menu, so quit is ours).
         KeyBinding::new("cmd-k", ToggleCommandPalette, None),
+        KeyBinding::new("cmd-p", SwitchConnection, None),
         KeyBinding::new("ctrl-g", GoToRow, None),
         KeyBinding::new("cmd-q", Quit, None),
         // --- RedRoot: app chrome, fires from any focus within the app ---

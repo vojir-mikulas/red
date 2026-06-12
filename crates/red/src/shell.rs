@@ -98,6 +98,9 @@ impl AppState {
             .bg(theme.bg_panel)
             .border_b_1()
             .border_color(theme.border)
+            // The connection switcher sits on the left, right of the traffic
+            // lights (Zed's project-switcher slot).
+            .child(self.switcher.clone())
             // Spacer keeps the disconnect control flush right.
             .child(div().flex_1())
             .child(topbar_right);

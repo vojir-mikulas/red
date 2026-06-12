@@ -37,7 +37,7 @@ fn engine_tint(kind: DbKind, theme: &Theme) -> Hsla {
 
 /// A connection's last-used time as a coarse relative label ("just now", "5m
 /// ago", "never") — the per-card recency the design shows on the right.
-fn fmt_ago(secs: Option<u64>) -> String {
+pub(crate) fn fmt_ago(secs: Option<u64>) -> String {
     let Some(secs) = secs else {
         return "never".into();
     };
@@ -95,7 +95,6 @@ impl AppState {
                     .into_any_element()
             })
             .collect();
-        let modal = self.form.as_ref().map(|form| self.render_form(form, cx));
         let new_button = self.new_button(cx);
         let settings_gear = IconButton::new(
             "connect-settings",
@@ -195,7 +194,6 @@ impl AppState {
             .relative()
             .child(screen)
             .child(gear)
-            .children(modal)
     }
 
     fn new_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -454,7 +452,7 @@ impl AppState {
             .on_click(cx.listener(move |this, _, _, cx| this.connect(index, cx)))
     }
 
-    fn render_form(&self, form: &FormState, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_form(&self, form: &FormState, cx: &mut Context<Self>) -> impl IntoElement {
         // Owned clone so the theme doesn't hold an immutable borrow of `cx` across
         // the `&mut cx` helper calls below.
         let theme = cx.theme().clone();
