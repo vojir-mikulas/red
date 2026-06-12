@@ -9,7 +9,7 @@ use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::keymap::{
     About, CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusSchema,
     NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, RunQuery, SearchSchema, Settings,
-    ShowShortcuts, ToggleSidebar,
+    ShowShortcuts, SwitchConnection, ToggleSidebar,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
@@ -193,6 +193,9 @@ impl Render for AppState {
             .key_context("RedRoot")
             .track_focus(&self.root_focus)
             .on_action(cx.listener(|this, _: &ToggleCommandPalette, _, cx| this.toggle_palette(cx)))
+            .on_action(cx.listener(|this, _: &SwitchConnection, window, cx| {
+                this.toggle_switcher(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &GoToRow, _, cx| this.open_goto_prompt(cx)))
             .on_action(cx.listener(|this, _: &CopyResult, _, cx| this.copy_result_selection(cx)))
             // App-chrome actions (tabs · sidebar · schema reload), bound in the
@@ -284,6 +287,10 @@ impl Render for AppState {
             .children(confirm_close)
             .children(settings)
             .children(shortcuts)
+            // The connection form modal is rendered at the root so it works in any
+            // phase (the welcome screen *and* the connected shell, e.g. opened from
+            // the switcher's "New connection…").
+            .children(self.form.as_ref().map(|f| self.render_form(f, cx)))
             // The palette renders its own full-screen overlay; last = on top.
             .children(self.palette.clone());
 
