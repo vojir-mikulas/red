@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ExportFormat, KeySpec, QueryOptions, RedError, Result, ResultPage, RowWindow,
-    SchemaMeta, TableDetail, Value,
+    Column, ColumnMeta, ExportFormat, KeySpec, QueryOptions, RedError, Result, ResultPage,
+    RowWindow, SchemaMeta, TableDetail, Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -170,6 +170,71 @@ pub(crate) fn seek_clauses(
     (where_clause, order_by)
 }
 
+/// Build a portable "any text-representable column contains `term`" predicate for
+/// the result-search filter ([`red_core::ResultFilter::Contains`]): an OR-chain of
+/// `<col-as-text> <like> '<escaped %term%>' ESCAPE '\'` over every non-blob column.
+/// Shared across the three drivers — only the identifier quoting, the text cast,
+/// and the match keyword differ. Returns `None` when nothing is searchable (all
+/// columns blob, or an empty column set); the service then applies no filter.
+///
+/// Blob columns are skipped: casting binary to text is engine-specific noise
+/// (Postgres hex, etc.) and never what a text search means. The `term` is escaped
+/// to match **literally** — the `LIKE` metacharacters `\` `%` `_` are backslash-
+/// escaped and embedded quotes doubled — so it can never inject SQL or leak a
+/// wildcard.
+///
+/// `quote` quotes one identifier; `as_text(quoted)` wraps a quoted column in the
+/// engine's text cast (`(c)::text`, `CAST(c AS TEXT)`, `CAST(c AS CHAR)`); `like_op`
+/// is the case-insensitive match keyword (`ILIKE` on Postgres, `LIKE` elsewhere —
+/// SQLite/MySQL `LIKE` is ASCII-case-insensitive by default).
+pub(crate) fn contains_clause(
+    columns: &[ColumnMeta],
+    term: &str,
+    quote: impl Fn(&str) -> String,
+    as_text: impl Fn(&str) -> String,
+    like_op: &str,
+) -> Option<String> {
+    let pattern = like_pattern(term);
+    let preds: Vec<String> = columns
+        .iter()
+        .filter(|c| !c.type_name.as_deref().is_some_and(is_blob_type))
+        .map(|c| format!("{} {like_op} {pattern} ESCAPE '\\'", as_text(&quote(&c.name))))
+        .collect();
+    (!preds.is_empty()).then(|| format!("({})", preds.join(" OR ")))
+}
+
+/// The SQL string literal `'%term%'` for a `LIKE` contains-match: backslash-escape
+/// the `LIKE` metacharacters (`\` `%` `_`) so the term matches literally, then wrap
+/// in `%…%`, then single-quote with embedded quotes doubled. Pair with `ESCAPE '\'`.
+fn like_pattern(term: &str) -> String {
+    let mut esc = String::with_capacity(term.len() + 2);
+    for ch in term.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            esc.push('\\');
+        }
+        esc.push(ch);
+    }
+    format!("'%{}%'", esc.replace('\'', "''"))
+}
+
+/// Whether a declared type names a binary/blob column across the three engines —
+/// skipped by the contains-search cast (binary-to-text is engine-specific noise).
+fn is_blob_type(type_name: &str) -> bool {
+    let t = type_name.to_ascii_lowercase();
+    let base = t.split(['(', ' ']).next().unwrap_or("");
+    matches!(
+        base,
+        "blob"
+            | "bytea"
+            | "binary"
+            | "varbinary"
+            | "tinyblob"
+            | "mediumblob"
+            | "longblob"
+            | "bit"
+    )
+}
+
 /// One open database session. Object-safe so the service can hold
 /// `Arc<dyn DatabaseDriver>` and swap engines behind it.
 #[async_trait]
@@ -194,6 +259,16 @@ pub trait DatabaseDriver: Send + Sync {
     /// One object's columns, foreign keys, and indexes. Loaded on demand when the
     /// user expands a table, so the initial tree load stays light.
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableDetail>;
+
+    /// Render a portable, case-insensitive "contains `term`" predicate over the
+    /// searchable columns of a result, for [`red_core::ResultFilter::Contains`].
+    /// The service wraps `SELECT * FROM (base) WHERE <predicate>`; `columns` are the
+    /// result's own (a browse passes the table's columns, an editor result its
+    /// probed columns). `None` when nothing is searchable (all-blob / empty) — the
+    /// service then applies no filter. `term` is escaped to match literally, never
+    /// interpolated raw. Synchronous: pure string building, no engine round-trip.
+    /// Each impl delegates to [`contains_clause`] with its own quoting/cast/keyword.
+    fn contains_predicate(&self, columns: &[ColumnMeta], term: &str) -> Option<String>;
 
     /// Total row count of `sql`'s result — one pass, no row materialization. Lets
     /// the grid show a real scrollbar without holding every row. `abort` cancels
@@ -412,4 +487,78 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// stay terse.
 pub(crate) fn driver_err(e: impl std::fmt::Display) -> RedError {
     RedError::Driver(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn col(name: &str, type_name: Option<&str>) -> ColumnMeta {
+        ColumnMeta {
+            name: name.into(),
+            type_name: type_name.map(Into::into),
+            not_null: false,
+            primary_key: false,
+            default: None,
+        }
+    }
+
+    #[test]
+    fn like_pattern_escapes_metacharacters_and_quotes() {
+        // Plain term: wrapped in `%…%`, nothing escaped.
+        assert_eq!(like_pattern("foo"), "'%foo%'");
+        // LIKE metacharacters are backslash-escaped so they match literally.
+        assert_eq!(like_pattern("50%_x"), "'%50\\%\\_x%'");
+        assert_eq!(like_pattern("a\\b"), "'%a\\\\b%'");
+        // Single quotes are doubled (can't break out of the literal).
+        assert_eq!(like_pattern("O'Brien"), "'%O''Brien%'");
+    }
+
+    #[test]
+    fn is_blob_type_matches_binary_families() {
+        for t in ["BLOB", "bytea", "VARBINARY(16)", "longblob", "bit"] {
+            assert!(is_blob_type(t), "{t} is a blob type");
+        }
+        for t in ["text", "varchar(20)", "integer", "json"] {
+            assert!(!is_blob_type(t), "{t} is not a blob type");
+        }
+    }
+
+    #[test]
+    fn contains_clause_skips_blobs_and_ors_text_columns() {
+        let columns = [
+            col("id", Some("integer")),
+            col("name", Some("text")),
+            col("data", Some("blob")),
+        ];
+        let pred = contains_clause(
+            &columns,
+            "x",
+            |c| format!("\"{c}\""),
+            |c| format!("CAST({c} AS TEXT)"),
+            "LIKE",
+        )
+        .expect("text/int columns are searchable");
+        assert_eq!(
+            pred,
+            "(CAST(\"id\" AS TEXT) LIKE '%x%' ESCAPE '\\' OR \
+             CAST(\"name\" AS TEXT) LIKE '%x%' ESCAPE '\\')"
+        );
+        assert!(!pred.contains("data"), "the blob column is excluded");
+    }
+
+    #[test]
+    fn contains_clause_is_none_when_nothing_searchable() {
+        // All-blob and empty column sets yield no predicate (→ no filter applied).
+        let blobs = [col("a", Some("blob")), col("b", Some("bytea"))];
+        assert!(contains_clause(&blobs, "x", |c| c.into(), |c| c.into(), "LIKE").is_none());
+        assert!(contains_clause(&[], "x", |c| c.into(), |c| c.into(), "LIKE").is_none());
+    }
+
+    #[test]
+    fn contains_clause_searches_untyped_columns() {
+        // A computed/untyped column (`type_name: None`) is searched, not skipped.
+        let columns = [col("expr", None)];
+        assert!(contains_clause(&columns, "x", |c| c.into(), |c| c.into(), "LIKE").is_some());
+    }
 }

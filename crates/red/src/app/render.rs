@@ -9,7 +9,7 @@ use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::keymap::{
     About, CloseInspector, CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid,
     FocusSchema, NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, RunQuery, SearchSchema,
-    Settings, ShowShortcuts, SwitchConnection, ToggleInspector, ToggleSidebar,
+    Settings, ShowShortcuts, SwitchConnection, ToggleFilter, ToggleInspector, ToggleSidebar,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
@@ -123,6 +123,14 @@ impl Render for AppState {
             self.open_schema_search(window, cx);
         }
 
+        // ⌘⇧F — the result filter bar just opened; focus its input to type at once.
+        if self.focus_filter {
+            self.focus_filter = false;
+            if let Some(bar) = &self.filter_bar {
+                window.focus(&bar.input.focus_handle(cx), cx);
+            }
+        }
+
         // The palette's "switch connection" command — open the switcher popover
         // now that the `Window` its field-focus needs is in hand.
         if self.open_switcher {
@@ -219,6 +227,7 @@ impl Render for AppState {
             // ⌘I toggles the cell detail inspector; Esc closes it (no-op when shut).
             .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| this.toggle_inspector(cx)))
             .on_action(cx.listener(|this, _: &CloseInspector, _, cx| this.close_inspector(cx)))
+            .on_action(cx.listener(|this, _: &ToggleFilter, _, cx| this.toggle_filter_bar(cx)))
             // App-chrome actions (tabs · sidebar · schema reload), bound in the
             // central keymap to `RedRoot` so they fire from any pane's focus.
             .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_query(cx)))

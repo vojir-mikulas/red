@@ -208,6 +208,18 @@ impl AppState {
                     .items_center()
                     .gap_1()
                     .child(
+                        // ⌘⇧F — toggle the filter bar. Reads as "filled" while a
+                        // filter is applied (Track B2).
+                        Button::new("result-filter", "Filter")
+                            .variant(if grid.filter.is_some() {
+                                ButtonVariant::Secondary
+                            } else {
+                                ButtonVariant::Ghost
+                            })
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_filter_bar(cx))),
+                    )
+                    .child(
                         Button::new("result-csv", "CSV")
                             .variant(ButtonVariant::Ghost)
                             .size(ButtonSize::Sm)
@@ -450,6 +462,9 @@ impl AppState {
 
         let grid_pane = container
             .child(toolbar)
+            // The filter bar (Track B2) sits between the toolbar and the grid when
+            // open; narrowing re-opens the result so the grid below just repaints.
+            .when_some(self.render_filter_bar(cx), |c, bar| c.child(bar))
             .child(
                 div()
                     .flex_1()

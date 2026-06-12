@@ -69,6 +69,8 @@ actions!(
         ToggleInspector,
         /// Close the cell detail inspector (Esc) — a no-op when it's shut.
         CloseInspector,
+        /// Open or close the result filter bar (⌘⇧F) — Track B2.
+        ToggleFilter,
     ]
 );
 
@@ -117,6 +119,7 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
                 ("⌃G", "Go to row…"),
                 ("⌘C", "Copy selection"),
                 ("⌘I", "Inspect cell"),
+                ("⌘⇧F", "Filter rows…"),
             ],
         ),
         (
@@ -183,6 +186,8 @@ pub(crate) fn bind_all(cx: &mut App) {
         // was otherwise unbound.
         KeyBinding::new("cmd-i", ToggleInspector, Some("RedRoot")),
         KeyBinding::new("escape", CloseInspector, Some("RedRoot")),
+        // Result filter bar (Track B2). ⌘⇧F to keep plain ⌘F as schema search.
+        KeyBinding::new("cmd-shift-f", ToggleFilter, Some("RedRoot")),
         // Tab management. `RedRoot` is an ancestor of the editor, so these still
         // fire while the editor is focused — none collide with the editor's keys
         // (it binds plain `tab`, not `ctrl-tab`).

@@ -309,6 +309,16 @@ impl DatabaseDriver for MysqlDriver {
         })
     }
 
+    fn contains_predicate(&self, columns: &[ColumnMeta], term: &str) -> Option<String> {
+        crate::contains_clause(
+            columns,
+            term,
+            |s| format!("`{}`", escape_ident(s)),
+            |c| format!("CAST({c} AS CHAR)"),
+            "LIKE",
+        )
+    }
+
     async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64> {
         let sql = format!("SELECT count(*) FROM ({}) AS _red", strip_trailing(sql));
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
@@ -857,6 +867,36 @@ mod tests {
         ] {
             driver.execute(&format!("DROP {obj}")).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn filters_contains() {
+        let url = url_or_skip!();
+        let driver = MysqlDriver::connect(&url, false).await.unwrap();
+        let f = tag("f");
+        let schema = current_schema(&driver).await;
+        driver
+            .execute(&format!(
+                "CREATE TABLE `{f}` \
+                 (id INT PRIMARY KEY, name VARCHAR(50), note VARCHAR(50), data BLOB)"
+            ))
+            .await
+            .unwrap();
+        // Rows 1–2 carry a blob whose bytes spell "apple" (`CAST(blob AS CHAR)` on
+        // MySQL yields the text) so a leaked blob cast would lift the 'apple' count.
+        driver
+            .execute(&format!(
+                "INSERT INTO `{f}` VALUES \
+                 (1,'apple','red fruit',0x6170706c65), \
+                 (2,'banana','yellow',0x6170706c65), \
+                 (3,'apple pie','dessert',0x00), \
+                 (4,'100% juice','on sale',0x00), \
+                 (5,'O''Brien','name',0x00)"
+            ))
+            .await
+            .unwrap();
+        battery::filters_contains(&driver, &schema, &f, &format!("SELECT * FROM `{f}`")).await;
+        driver.execute(&format!("DROP TABLE `{f}`")).await.unwrap();
     }
 
     #[tokio::test]

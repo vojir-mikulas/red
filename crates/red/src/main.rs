@@ -11,6 +11,7 @@ mod connect;
 #[cfg(feature = "dev-stats")]
 mod dev_stats;
 mod editor;
+mod filter;
 mod icons;
 mod inspector;
 mod keymap;

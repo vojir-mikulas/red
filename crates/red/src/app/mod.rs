@@ -334,6 +334,9 @@ pub struct AppState {
     /// The cell detail inspector, when open (Track B1). Owns its scroll position
     /// and any on-demand full value fetched for a capped/evicted cell.
     pub(crate) inspector: Option<crate::inspector::InspectorState>,
+    /// The result filter bar, when open (Track B2). The transient editing UI; the
+    /// *applied* filter lives on the grid (`ResultGrid::filter`).
+    pub(crate) filter_bar: Option<crate::filter::FilterBarState>,
     /// Window-coordinate anchor for the result cell's right-click context menu,
     /// when open. The right-click selects the cell first, so the menu's Inspect/
     /// Copy act on it; `None` keeps the menu closed.
@@ -443,6 +446,9 @@ pub struct AppState {
     /// Set by ⌘F / the search command: the next render reveals the sidebar and
     /// focuses the schema filter field.
     pub(crate) focus_search: bool,
+    /// Set when the result filter bar just opened: the next render focuses its
+    /// input so the user can type immediately.
+    pub(crate) focus_filter: bool,
     /// Set by the palette's "switch connection" command: the next render opens
     /// the switcher popover (its `toggle` needs a `Window` the palette lacks).
     pub(crate) open_switcher: bool,
@@ -708,6 +714,7 @@ impl AppState {
             next_copy_id: 0,
             pending_copy: None,
             inspector: None,
+            filter_bar: None,
             cell_menu: None,
             confirm_exec: None,
             confirm_close_tab: None,
@@ -748,6 +755,7 @@ impl AppState {
             focus_name_field: false,
             focus_history: false,
             focus_search: false,
+            focus_filter: false,
             open_switcher: false,
             #[cfg(feature = "dev-stats")]
             dev_stats: crate::dev_stats::DevStats::default(),

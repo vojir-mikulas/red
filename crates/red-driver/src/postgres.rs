@@ -380,6 +380,10 @@ impl DatabaseDriver for PostgresDriver {
         })
     }
 
+    fn contains_predicate(&self, columns: &[ColumnMeta], term: &str) -> Option<String> {
+        crate::contains_clause(columns, term, pg_quote, |c| format!("({c})::text"), "ILIKE")
+    }
+
     async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64> {
         let sql = format!("SELECT count(*) FROM ({}) AS _red", strip_trailing(sql));
         self.with_fetch_conn(abort, |client| async move {
@@ -1126,6 +1130,35 @@ mod tests {
         ] {
             driver.execute(&format!("DROP {obj}")).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn filters_contains() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, false).await.unwrap();
+        let f = tag("f");
+        let schema = current_schema(&driver).await;
+        driver
+            .execute(&format!(
+                "CREATE TABLE {f} (id INT PRIMARY KEY, name TEXT, note TEXT, data BYTEA)"
+            ))
+            .await
+            .unwrap();
+        // Rows 1–2 carry a blob whose bytes spell "apple"; on Postgres `bytea::text`
+        // is a hex string anyway, but the predicate must still skip the column.
+        driver
+            .execute(&format!(
+                "INSERT INTO {f} VALUES \
+                 (1,'apple','red fruit','\\x6170706c65'::bytea), \
+                 (2,'banana','yellow','\\x6170706c65'::bytea), \
+                 (3,'apple pie','dessert','\\x00'::bytea), \
+                 (4,'100% juice','on sale','\\x00'::bytea), \
+                 (5,'O''Brien','name','\\x00'::bytea)"
+            ))
+            .await
+            .unwrap();
+        battery::filters_contains(&driver, &schema, &f, &format!("SELECT * FROM {f}")).await;
+        driver.execute(&format!("DROP TABLE {f}")).await.unwrap();
     }
 
     #[tokio::test]

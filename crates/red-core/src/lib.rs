@@ -349,6 +349,29 @@ pub struct Column {
     pub decl_type: Option<String>,
 }
 
+/// A result-narrowing filter pushed into the query (Track B2). The service wraps
+/// the open's base SQL in `SELECT * FROM (base) WHERE <predicate>` *before* the
+/// count / key-bounds probe, so the whole result — count, keyset seek, sort,
+/// export — operates on the filtered set without ever materializing it. Because
+/// the wrap preserves `SELECT *`, the key column survives and keyset paging is
+/// unaffected.
+///
+/// The UI stays driver-independent by sending this *semantic* filter, not SQL: the
+/// backend renders [`Contains`](Self::Contains) to a portable, escaped predicate
+/// per engine (see `DatabaseDriver::contains_predicate`) and wraps
+/// [`Where`](Self::Where) — power-user SQL, same trust level as the editor —
+/// verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResultFilter {
+    /// "Any text-representable column contains this term" — the portable quick
+    /// filter. Rendered per engine to a case-insensitive `LIKE`/`ILIKE` OR-chain
+    /// over the non-blob columns, with the term escaped to match literally.
+    Contains(String),
+    /// A raw boolean SQL expression, wrapped verbatim into the `WHERE`. For users
+    /// who want a precise predicate; trusted like editor SQL.
+    Where(String),
+}
+
 /// What a schema object is. SQLite has tables and views; Postgres maps onto
 /// the same two for the explorer's purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use flint::prelude::*;
 use gpui::{point, px, ClipboardItem, Context, Pixels, ScrollHandle, UniformListScrollHandle};
-use red_core::{Column as ResultColumn, ExportFormat, KeySpec, Value};
+use red_core::{Column as ResultColumn, ExportFormat, KeySpec, ResultFilter, Value};
 use red_service::{Command, CommandSender, RunFetch, SessionId, SortKey};
 
 use crate::app::{AppState, ExportProgress, Notification, Phase};
@@ -39,6 +39,9 @@ pub(crate) struct ResultGrid {
     pub(in crate::result) error: Option<String>,
     /// `(data column, ascending)` — `None` is unsorted.
     pub(in crate::result) sort: Option<(usize, bool)>,
+    /// The active result filter (Track B2), pushed into the query on (re)open.
+    /// `None` is unfiltered. Survives a re-sort (both ride the same `OpenResult`).
+    pub(in crate::result) filter: Option<ResultFilter>,
     pub(in crate::result) selection: Option<CellRange>,
     /// The `(schema, table)` this result browses, when it's a plain table
     /// preview — sent with `OpenResult` so the backend can resolve a seek key.
@@ -85,6 +88,7 @@ impl ResultGrid {
             ready: false,
             error: None,
             sort: None,
+            filter: None,
             selection: None,
             table,
             buffer: Rc::new(RefCell::new(GridBuffer::new(page_size))),
@@ -520,12 +524,13 @@ impl AppState {
             _ => return,
         };
         let (sql, epoch, table) = opened;
-        // A fresh open is never sorted — the backend keys it from `table`.
+        // A fresh open is never sorted or filtered — the backend keys it from `table`.
         self.send_active(Command::OpenResult {
             sql,
             epoch,
             table,
             sort: None,
+            filter: None,
         });
         self.start_query_ticker(cx);
         cx.notify();
@@ -661,6 +666,7 @@ impl AppState {
                         grid.base_sql.clone(),
                         grid.table.clone(),
                         sort,
+                        grid.filter.clone(),
                         grid.epoch,
                         old_epoch,
                     ))
@@ -669,7 +675,7 @@ impl AppState {
             },
             _ => None,
         };
-        if let Some((sql, table, sort, epoch, old_epoch)) = reopen {
+        if let Some((sql, table, sort, filter, epoch, old_epoch)) = reopen {
             // Evict the superseded SQL so the backend's result map can't grow.
             self.send_active(Command::CloseResult { epoch: old_epoch });
             self.send_active(Command::OpenResult {
@@ -677,10 +683,71 @@ impl AppState {
                 epoch,
                 table,
                 sort: Some(sort),
+                filter,
             });
             self.start_query_ticker(cx);
         }
         cx.notify();
+    }
+
+    /// Apply (or clear) the result filter (Track B2): re-open the active grid with
+    /// `filter` pushed into the query, preserving the current header-click sort. A
+    /// new epoch drops pages still in flight for the prior (un)filtered ordering.
+    /// `None` clears the filter. A no-op when the filter is unchanged.
+    pub(crate) fn apply_result_filter(
+        &mut self,
+        filter: Option<ResultFilter>,
+        cx: &mut Context<Self>,
+    ) {
+        let reopen = match &mut self.phase {
+            Phase::Connected(active) => match active.active_result_mut() {
+                Some(grid) if grid.filter != filter => {
+                    let old_epoch = grid.epoch;
+                    grid.filter = filter;
+                    grid.selection = None;
+                    grid.ready = false;
+                    grid.restart_timer();
+                    grid.reset_buffer();
+                    grid.epoch = next_epoch();
+                    // Preserve the header-click sort across the re-open.
+                    let sort = grid.sort.map(|(dcol, asc)| SortKey {
+                        position: dcol + 1,
+                        column: grid.columns[dcol].name.clone(),
+                        descending: !asc,
+                    });
+                    Some((
+                        grid.base_sql.clone(),
+                        grid.table.clone(),
+                        sort,
+                        grid.filter.clone(),
+                        grid.epoch,
+                        old_epoch,
+                    ))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((sql, table, sort, filter, epoch, old_epoch)) = reopen {
+            self.send_active(Command::CloseResult { epoch: old_epoch });
+            self.send_active(Command::OpenResult {
+                sql,
+                epoch,
+                table,
+                sort,
+                filter,
+            });
+            self.start_query_ticker(cx);
+        }
+        cx.notify();
+    }
+
+    /// The active result's current filter, for the toolbar chip / filter-bar seed.
+    pub(crate) fn active_result_filter(&self) -> Option<ResultFilter> {
+        match &self.phase {
+            Phase::Connected(active) => active.active_result().and_then(|g| g.filter.clone()),
+            _ => None,
+        }
     }
 
     /// Cell click: set the selection anchor, or extend it on shift-click. A click

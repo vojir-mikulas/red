@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::UnboundedSender;
-use red_core::{ConnectionConfig, DbKind, KeyKind, KeySpec, RedError, Value};
+use red_core::{ConnectionConfig, DbKind, KeyKind, KeySpec, RedError, ResultFilter, Value};
 use red_driver::{
     AbortSignal, CancelToken, DatabaseDriver, MysqlDriver, PageCap, PostgresDriver, QueryCursor,
     SqliteDriver,
@@ -371,6 +371,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 epoch,
                 table,
                 sort,
+                filter,
             } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get_mut(&id) else {
@@ -410,27 +411,11 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     // introspected detail: a sorted browse gets the composite
                     // `(sort_col, pk)` key, an unsorted one the plain PK. A
                     // resolution failure just means the `OFFSET` fallback (never
-                    // an error).
-                    let key = match &table {
+                    // an error). The detail is kept around — a `Contains` filter
+                    // searches the table's columns.
+                    let detail = match &table {
                         Some((schema, table)) => match driver.describe_table(schema, table).await {
-                            Ok(detail) => {
-                                let key = match &sort {
-                                    Some(s) => KeySpec::sorted(&detail, &s.column, s.descending),
-                                    None => KeySpec::from_detail(&detail),
-                                };
-                                match &key {
-                                    Some(k) => tracing::info!(
-                                        %schema, %table, column = %k.column,
-                                        tiebreak = ?k.tiebreak, descending = k.descending,
-                                        "keyset key resolved"
-                                    ),
-                                    None => tracing::info!(
-                                        %schema, %table,
-                                        "no usable key (composite/nullable/no PK) — OFFSET paging"
-                                    ),
-                                }
-                                key
-                            }
+                            Ok(detail) => Some(detail),
                             Err(e) => {
                                 tracing::warn!(%schema, %table, "keyset describe failed: {e}");
                                 None
@@ -438,22 +423,73 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         },
                         None => None,
                     };
+                    let key = match &detail {
+                        Some(detail) => {
+                            let key = match &sort {
+                                Some(s) => KeySpec::sorted(detail, &s.column, s.descending),
+                                None => KeySpec::from_detail(detail),
+                            };
+                            match &key {
+                                Some(k) => tracing::info!(
+                                    column = %k.column, tiebreak = ?k.tiebreak,
+                                    descending = k.descending, "keyset key resolved"
+                                ),
+                                None => tracing::info!(
+                                    "no usable key (composite/nullable/no PK) — OFFSET paging"
+                                ),
+                            }
+                            key
+                        }
+                        None => None,
+                    };
+                    // Narrow the result *before* any probe: the filter wraps the
+                    // base in `SELECT * FROM (base) WHERE <pred>` so count, bounds,
+                    // and paging all see the filtered set. The wrap keeps `SELECT *`,
+                    // so the key column survives and keyset is unaffected. A
+                    // `Contains` needs the result's columns — the table's (a browse)
+                    // or, for editor SQL, a cheap `LIMIT 0` probe.
+                    let filtered_sql = match &filter {
+                        None => sql.clone(),
+                        Some(ResultFilter::Where(expr)) => wrap_where(&sql, expr),
+                        Some(ResultFilter::Contains(term)) => {
+                            let cols = match &detail {
+                                Some(d) => d.columns.clone(),
+                                None => match driver
+                                    .fetch_page(&sql, 0, 0, PageCap::Full, &abort)
+                                    .await
+                                {
+                                    Ok(p) => p.columns.iter().map(col_meta_from_result).collect(),
+                                    Err(_) => Vec::new(),
+                                },
+                            };
+                            match driver.contains_predicate(&cols, term) {
+                                Some(pred) => wrap_where(&sql, &pred),
+                                // Nothing searchable (all-blob / empty) — no filter.
+                                None => sql.clone(),
+                            }
+                        }
+                    };
                     // The SQL later page/run fetches re-run. Keyset orders itself
                     // (driver adds `ORDER BY (sort_col, pk)`), so it pages the
-                    // *base* query; a sorted result that fell back to OFFSET must
+                    // *filtered* query; a sorted result that fell back to OFFSET must
                     // still be ordered, so wrap it by output position.
                     let effective_sql = match (&sort, &key) {
-                        (Some(s), None) => wrap_sorted(&sql, s.position, s.descending),
-                        _ => sql.clone(),
+                        (Some(s), None) => wrap_sorted(&filtered_sql, s.position, s.descending),
+                        _ => filtered_sql.clone(),
                     };
                     // `LIMIT 0` reads column metadata without stepping rows;
                     // counting and the key-bounds probe run concurrently with it.
-                    // Probes run on the base `sql` — ordering doesn't change the
-                    // count, the column set, or the lead column's min/max.
+                    // Probes run on `filtered_sql` — ordering doesn't change the
+                    // count, the column set, or the lead column's min/max, but the
+                    // filter narrows all three, so the total and bounds reflect it.
                     let bounds = async {
                         match &key {
                             Some(k) if k.kind == KeyKind::Int => {
-                                driver.key_bounds(&sql, k, &abort).await.ok().flatten()
+                                driver
+                                    .key_bounds(&filtered_sql, k, &abort)
+                                    .await
+                                    .ok()
+                                    .flatten()
                             }
                             _ => None,
                         }
@@ -463,8 +499,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     // and report a timeout instead of leaving the result "running".
                     let probe = async {
                         tokio::join!(
-                            driver.count(&sql, &abort),
-                            driver.fetch_page(&sql, 0, 0, PageCap::Full, &abort),
+                            driver.count(&filtered_sql, &abort),
+                            driver.fetch_page(&filtered_sql, 0, 0, PageCap::Full, &abort),
                             bounds
                         )
                     };
@@ -1161,6 +1197,30 @@ fn wrap_sorted(base: &str, position: usize, descending: bool) -> String {
         "SELECT * FROM ({base}) AS _red_sort ORDER BY {position} {}",
         if descending { "DESC" } else { "ASC" }
     )
+}
+
+/// Wrap a base query in a filter `WHERE` (Track B2): `SELECT * FROM (base) WHERE
+/// (pred)`. `pred` is either a driver-rendered `Contains` predicate (already an
+/// OR-chain in parens) or a raw `Where` expression; the wrapping parens contain
+/// its precedence. `SELECT *` is preserved, so the keyset key column survives the
+/// wrap and paging is unaffected. Trailing `;` is stripped like [`wrap_sorted`].
+fn wrap_where(base: &str, pred: &str) -> String {
+    let base = base.trim_end().trim_end_matches(';').trim_end();
+    format!("SELECT * FROM ({base}) AS _red_filter WHERE ({pred})")
+}
+
+/// Lift a result-set [`red_core::Column`] to a [`red_core::ColumnMeta`] for the
+/// contains-filter column list, used when filtering editor SQL (no table to
+/// introspect). Only the name and declared type matter — `decl_type` lets the
+/// predicate skip blob columns; nullability / PK are irrelevant to a text search.
+fn col_meta_from_result(c: &red_core::Column) -> red_core::ColumnMeta {
+    red_core::ColumnMeta {
+        name: c.name.clone(),
+        type_name: c.decl_type.clone(),
+        not_null: false,
+        primary_key: false,
+        default: None,
+    }
 }
 
 /// A timeout future that never fires when no timeout is set, so the `select!`

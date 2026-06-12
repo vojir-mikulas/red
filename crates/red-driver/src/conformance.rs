@@ -226,6 +226,59 @@ pub(crate) async fn exports_csv_and_json(driver: &dyn DatabaseDriver, select_sql
     std::fs::remove_file(&json_path).ok();
 }
 
+/// The contains-filter ([`red_core::ResultFilter::Contains`]) narrows a result to
+/// rows whose text matches case-insensitively and **literally** (no `LIKE`
+/// wildcard or quote can leak), and excludes blob columns. The caller seeds a
+/// table `(id PK, name TEXT, note TEXT, data BLOB)` with these five rows and passes
+/// its `(schema, table)` plus a `SELECT *` base over it:
+/// ```text
+///   1 'apple'      'red fruit'   data = bytes "apple"
+///   2 'banana'     'yellow'      data = bytes "apple"
+///   3 'apple pie'  'dessert'     data = 0x00
+///   4 '100% juice' 'on sale'     data = 0x00
+///   5 "O'Brien"    'name'        data = 0x00
+/// ```
+/// Rows 1–2 carry a `data` blob whose bytes spell `apple` so that *including* the
+/// blob in the cast would inflate the `apple` count — proving it's excluded.
+pub(crate) async fn filters_contains(
+    driver: &dyn DatabaseDriver,
+    schema: &str,
+    table: &str,
+    base_sql: &str,
+) {
+    let abort = AbortSignal::new();
+    let detail = driver.describe_table(schema, table).await.unwrap();
+    // The base narrowed by the contains predicate for `term` (panics if nothing is
+    // searchable — these fixtures always have text columns).
+    let filtered = |term: &str| {
+        let pred = driver
+            .contains_predicate(&detail.columns, term)
+            .expect("a text column is searchable");
+        format!("SELECT * FROM ({base_sql}) AS _red_f WHERE ({pred})")
+    };
+    let count = |sql: String| {
+        let abort = &abort;
+        async move { driver.count(&sql, abort).await.unwrap() }
+    };
+
+    // Plain substring across the text columns, case-insensitive: 'apple' + 'apple pie'.
+    assert_eq!(count(filtered("apple")).await, 2, "matches across text columns");
+    assert_eq!(count(filtered("APPLE")).await, 2, "case-insensitive");
+    // `%` is a LIKE wildcard; escaped, it matches only the literal-percent row.
+    // Unescaped the pattern would be `%%%` and match every row — the regression
+    // this guards against.
+    assert_eq!(count(filtered("%")).await, 1, "LIKE metacharacters match literally");
+    // A single quote can't break out of the string literal (no injection / no error).
+    assert_eq!(count(filtered("O'Brien")).await, 1, "embedded quote is escaped");
+    // A non-match is empty, never an error.
+    assert_eq!(count(filtered("zzznope")).await, 0, "no match → empty result");
+
+    // The blob column is excluded from the cast (binary-to-text is engine-specific
+    // noise) — its bytes spell `apple` but don't lift the count above.
+    let pred = driver.contains_predicate(&detail.columns, "apple").unwrap();
+    assert!(!pred.contains("data"), "blob column is not searched: {pred}");
+}
+
 /// Keyset (seek) paging is exact in both directions and reads key bounds. `sql`
 /// must select a table with an integer key column whose values are the
 /// contiguous range `1..=1000`; `key` names that column.

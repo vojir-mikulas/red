@@ -131,6 +131,16 @@ impl DatabaseDriver for SqliteDriver {
         .map_err(driver_err)?
     }
 
+    fn contains_predicate(&self, columns: &[ColumnMeta], term: &str) -> Option<String> {
+        crate::contains_clause(
+            columns,
+            term,
+            quote_ident,
+            |c| format!("CAST({c} AS TEXT)"),
+            "LIKE",
+        )
+    }
+
     async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64> {
         let path = self.path.clone();
         let read_only = self.read_only;
@@ -928,6 +938,29 @@ mod tests {
             None
         );
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn filters_contains() {
+        let path = temp_db_path("contains");
+        {
+            let conn = Connection::open(&path).unwrap();
+            // Rows 1–2 carry a blob whose bytes spell "apple" (`x'6170706c65'`) so
+            // a blob that leaked into the cast would lift the 'apple' count to 3.
+            conn.execute_batch(
+                "CREATE TABLE f(id INTEGER PRIMARY KEY, name TEXT, note TEXT, data BLOB);
+                 INSERT INTO f VALUES
+                   (1,'apple','red fruit',x'6170706c65'),
+                   (2,'banana','yellow',x'6170706c65'),
+                   (3,'apple pie','dessert',x'00'),
+                   (4,'100% juice','on sale',x'00'),
+                   (5,'O''Brien','name',x'00');",
+            )
+            .unwrap();
+        }
+        let driver = SqliteDriver::new(&path, true);
+        battery::filters_contains(&driver, "main", "f", "SELECT * FROM f").await;
         std::fs::remove_file(&path).ok();
     }
 

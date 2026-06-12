@@ -263,6 +263,7 @@ async fn opens_and_pages_result() {
             epoch: 1,
             table: None,
             sort: None,
+            filter: None,
         },
     );
     match next(&mut events).await {
@@ -339,6 +340,7 @@ async fn resolves_key_and_serves_runs() {
             epoch: 7,
             table: Some(("main".into(), "t".into())),
             sort: None,
+            filter: None,
         },
     );
     match next(&mut events).await {
@@ -533,6 +535,7 @@ async fn mariadb_keyset_end_to_end() {
             epoch: 1,
             table: Some((p.database.clone(), table.clone())),
             sort: None,
+            filter: None,
         },
     );
     match next(&mut events).await {
@@ -691,6 +694,7 @@ async fn text_key_jump_falls_back_to_offset() {
             epoch: 9,
             table: Some(("main".into(), "t".into())),
             sort: None,
+            filter: None,
         },
     );
     match next(&mut events).await {
@@ -790,6 +794,7 @@ async fn keeps_two_sessions_warm() {
             epoch: 1,
             table: None,
             sort: None,
+            filter: None,
         },
     );
     handle.send_to(
@@ -799,6 +804,7 @@ async fn keeps_two_sessions_warm() {
             epoch: 1,
             table: None,
             sort: None,
+            filter: None,
         },
     );
 

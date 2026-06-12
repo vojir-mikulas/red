@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use red_core::{
-    Column, ConnectionConfig, ExportFormat, KeySpec, QueryOptions, RowWindow, SchemaMeta,
-    TableDetail, Value,
+    Column, ConnectionConfig, ExportFormat, KeySpec, QueryOptions, ResultFilter, RowWindow,
+    SchemaMeta, TableDetail, Value,
 };
 
 /// Identifies one keep-alive backend session. Minted UI-side at connect start so
@@ -67,11 +67,18 @@ pub enum Command {
     /// *unwrapped* base query and the backend either resolves a composite
     /// `(sort_col, pk)` keyset key (fast seek) or, failing that, wraps the base in
     /// `ORDER BY <position>` and pages by `OFFSET`. `None` is the unsorted open.
+    ///
+    /// `filter` narrows the result (Track B2): the backend wraps `sql` in
+    /// `SELECT * FROM (sql) WHERE <predicate>` *before* the count / key-bounds
+    /// probe, so the total, the seek key, sort, and export all operate on the
+    /// filtered set. The wrap preserves `SELECT *`, so the key column survives and
+    /// keyset paging is unaffected. `None` is the unfiltered open.
     OpenResult {
         sql: String,
         epoch: u64,
         table: Option<(String, String)>,
         sort: Option<SortKey>,
+        filter: Option<ResultFilter>,
     },
     /// Fetch one random-access page of an open result (grid load-on-scroll).
     /// `epoch` selects which open result; an unknown epoch is ignored (the tab

@@ -40,6 +40,7 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           brew install librsvg
+          mkdir -p build
           rsvg-convert -w 1024 -h 1024 assets/red.svg -o build/icon-1024.png
           ./scripts/make-icns.sh build/icon-1024.png build/Red.icns
           ARCH=universal ./scripts/bundle-mac.sh "$VERSION"
