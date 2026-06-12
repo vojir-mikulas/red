@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # create the GitHub Release + upload assets
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Import signing certificate
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN=$RUNNER_TEMP/build.keychain
+          echo "$CERT_P12" | base64 --decode > $RUNNER_TEMP/cert.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import $RUNNER_TEMP/cert.p12 -k "$KEYCHAIN" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain
+
+      - name: Build universal .app
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          brew install librsvg
+          rsvg-convert -w 1024 -h 1024 assets/red.svg -o build/icon-1024.png
+          ./scripts/make-icns.sh build/icon-1024.png build/Red.icns
+          ARCH=universal ./scripts/bundle-mac.sh "$VERSION"
+
+      - name: Sign
+        env:
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          SKIP_NOTARIZE=1 ./scripts/sign-mac.sh
+
+      - name: Notarize & staple
+        env:
+          KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+        run: |
+          echo "$KEY" | base64 --decode > $RUNNER_TEMP/key.p8
+          ditto -c -k --keepParent build/Red.app build/Red.zip
+          xcrun notarytool submit build/Red.zip \
+            --key $RUNNER_TEMP/key.p8 --key-id "$KEY_ID" --issuer "$ISSUER" --wait
+          xcrun stapler staple build/Red.app
+
+      - name: Package .dmg
+        env:
+          IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          brew install create-dmg
+          create-dmg --volname "Red $VERSION" --app-drop-link 480 200 \
+            --icon "Red.app" 160 200 --window-size 640 400 \
+            "build/Red-$VERSION.dmg" "build/Red.app"
+          codesign --force --timestamp --sign "$IDENTITY" "build/Red-$VERSION.dmg"
+          xcrun notarytool submit "build/Red-$VERSION.dmg" \
+            --key $RUNNER_TEMP/key.p8 --key-id "$KEY_ID" --issuer "$ISSUER" --wait
+          xcrun stapler staple "build/Red-$VERSION.dmg"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/Red-*.dmg
+          generate_release_notes: true
+          fail_on_unmatched_files: true

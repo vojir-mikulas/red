@@ -42,3 +42,23 @@ fmt-check:
 
 # The pre-push gate: format, lint, test.
 check: fmt lint test
+
+# --- macOS release (see docs/release-macos.md) ---
+
+# Generate the app icon (needs librsvg: `brew install librsvg`).
+icon:
+    mkdir -p build
+    rsvg-convert -w 1024 -h 1024 assets/red.svg -o build/icon-1024.png
+    ./scripts/make-icns.sh build/icon-1024.png build/Red.icns
+
+# Assemble build/Red.app. Native arch (fast); use `bundle-universal` to ship.
+bundle:
+    ARCH=native ./scripts/bundle-mac.sh
+
+# Assemble a universal (arm64+x86_64) build/Red.app for distribution.
+bundle-universal:
+    ARCH=universal ./scripts/bundle-mac.sh
+
+# Sign the bundle with the Developer ID identity (no notarization).
+sign identity="Developer ID Application: Mikulas Vojir (ZGT84Z73N9)":
+    SIGN_IDENTITY="{{identity}}" SKIP_NOTARIZE=1 ./scripts/sign-mac.sh

@@ -1,8 +1,15 @@
 /target
+/build/
 **/*.rs.bk
 *.db
 *.sqlite
 *.sqlite3
+
+# Signing material — never commit. Lives only in your keychain / GitHub Secrets.
+*.p12
+*.p8
+*.cer
+*.certSigningRequest
 
 # Editor / OS noise
 .DS_Store

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Intentionally minimal. Developer ID + hardened runtime, no App Sandbox.
+       DB network access and Keychain reads need no entitlement outside the
+       sandbox. Add com.apple.security.cs.* only if a hardened-runtime crash
+       proves it necessary. -->
+</dict>
+</plist>
