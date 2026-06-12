@@ -175,7 +175,7 @@ fn slug(name: &str) -> String {
     }
 }
 
-const BUILTINS: &[&str] = &["One Dark", "GitHub Dark", "Ayu Light"];
+const BUILTINS: &[&str] = &["One Dark", "GitHub Dark", "Ayu Dark", "Ayu Light"];
 
 fn is_builtin(name: &str) -> bool {
     BUILTINS.contains(&name)
@@ -196,6 +196,13 @@ fn builtin_entries() -> Vec<ThemeEntry> {
             user: false,
             path: None,
             theme: github_dark(),
+        },
+        ThemeEntry {
+            name: "Ayu Dark".into(),
+            is_light: false,
+            user: false,
+            path: None,
+            theme: ayu_dark(),
         },
         ThemeEntry {
             name: "Ayu Light".into(),
@@ -333,6 +340,7 @@ fn h(hex: u32) -> Hsla {
 fn builtin_by_name(name: &str) -> Theme {
     match name {
         "GitHub Dark" => github_dark(),
+        "Ayu Dark" => ayu_dark(),
         "Ayu Light" => ayu_light(),
         _ => one_dark(),
     }
@@ -361,13 +369,25 @@ pub fn github_dark() -> Theme {
     }
 }
 
-/// Ayu Light with RED's blue accent — the light counterpart for `mode = light`
-/// (or `mode = system` on a light OS). White text sits atop the blue.
+/// Ayu Dark carrying Red's brand accent (`#dc2626`) — the dark face of the app.
+/// `accent_hover` is the lighter red-500, white text sits atop the red.
+pub fn ayu_dark() -> Theme {
+    Theme {
+        accent: h(0xdc2626),
+        accent_hover: h(0xef4444),
+        accent_ghost: h(0xdc2626).opacity(0.18),
+        on_accent: h(0xffffff),
+        ..Theme::ayu_dark()
+    }
+}
+
+/// Ayu Light carrying Red's brand accent (`#dc2626`) — the light counterpart for
+/// `mode = light` (or `mode = system` on a light OS). White text sits atop the red.
 pub fn ayu_light() -> Theme {
     Theme {
-        accent: h(0x399ee6),
-        accent_hover: h(0x55b4f0),
-        accent_ghost: h(0x399ee6).opacity(0.14),
+        accent: h(0xdc2626),
+        accent_hover: h(0xef4444),
+        accent_ghost: h(0xdc2626).opacity(0.12),
         on_accent: h(0xffffff),
         ..Theme::ayu_light()
     }

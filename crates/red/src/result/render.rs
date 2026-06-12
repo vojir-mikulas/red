@@ -205,6 +205,16 @@ impl AppState {
                     .items_center()
                     .gap_1()
                     .child(
+                        Button::new("result-inspect", "Inspect")
+                            .variant(if self.inspector.is_some() {
+                                ButtonVariant::Secondary
+                            } else {
+                                ButtonVariant::Ghost
+                            })
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector(cx))),
+                    )
+                    .child(
                         Button::new("result-copy", "Copy")
                             .variant(ButtonVariant::Ghost)
                             .size(ButtonSize::Sm)
@@ -333,13 +343,18 @@ impl AppState {
             })
             .on_cell_click(move |row, table_col, event, window, cx| {
                 let extend = event.modifiers().shift;
+                let inspect = event.click_count() >= 2;
                 let abs_row = base + row;
                 cell_view
                     .update(cx, |this, cx| {
                         // Focus the grid so the cell cursor + ⌘C land on this
                         // selection, not a still-focused editor/field.
                         this.focus_pane(Pane::Grid, window, cx);
-                        this.result_select(abs_row, table_col, extend, cx)
+                        this.result_select(abs_row, table_col, extend, cx);
+                        // Double-click reveals the detail inspector for the cell.
+                        if inspect {
+                            this.open_inspector(cx);
+                        }
                     })
                     .ok();
             })
@@ -431,7 +446,7 @@ impl AppState {
                 scrub_view.update(cx, |_, cx| cx.notify()).ok();
             });
 
-        container
+        let grid_pane = container
             .child(toolbar)
             .child(
                 div()
@@ -442,6 +457,20 @@ impl AppState {
                     .child(table)
                     .child(scrollbar),
             )
-            .child(footer)
+            .child(footer);
+
+        // With the detail inspector open, dock it to the right of the grid (the
+        // grid narrows; the inspector never occludes it, so the cursor and its live
+        // updates stay visible). Closed, the grid keeps the full pane.
+        if self.inspector.is_some() {
+            div()
+                .size_full()
+                .flex()
+                .flex_row()
+                .child(div().flex_1().min_w(px(0.)).h_full().child(grid_pane))
+                .child(self.render_inspector(active, cx))
+        } else {
+            grid_pane
+        }
     }
 }

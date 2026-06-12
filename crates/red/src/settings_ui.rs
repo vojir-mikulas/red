@@ -716,7 +716,7 @@ fn about_page(cx: &mut Context<AppState>) -> AnyElement {
                     .pb_2()
                     .text_size(theme.scale(14.))
                     .text_color(theme.text_muted)
-                    .child("RED — Roughly Enough Data, a fast, native database explorer."),
+                    .child("Red — Roughly Enough Data, a fast, native database explorer."),
             )
             .child(settings_header("Build", &theme))
             .child(setting_row(

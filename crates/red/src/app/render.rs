@@ -7,9 +7,9 @@ use gpui::{div, prelude::*, px, Focusable, KeyDownEvent, Render, Window};
 
 use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::keymap::{
-    About, CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusSchema,
-    NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, RunQuery, SearchSchema, Settings,
-    ShowShortcuts, SwitchConnection, ToggleSidebar,
+    About, CloseInspector, CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid,
+    FocusSchema, NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, RunQuery, SearchSchema,
+    Settings, ShowShortcuts, SwitchConnection, ToggleInspector, ToggleSidebar,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
@@ -160,6 +160,11 @@ impl Render for AppState {
             self.modal_focus_trap = None;
         }
 
+        // Detail inspector: drop a loaded/in-flight full value once the cursor has
+        // moved off the cell it belonged to, so a big inspected value never outlives
+        // the cursor sitting on it (the "bytes dropped when focus moves" promise).
+        self.reconcile_inspector();
+
         // First paint: install the OS-appearance observer and the settings
         // file-watcher (both need a live `Window`).
         self.ensure_observers(window, cx);
@@ -211,6 +216,9 @@ impl Render for AppState {
             }))
             .on_action(cx.listener(|this, _: &GoToRow, _, cx| this.open_goto_prompt(cx)))
             .on_action(cx.listener(|this, _: &CopyResult, _, cx| this.copy_result_selection(cx)))
+            // ⌘I toggles the cell detail inspector; Esc closes it (no-op when shut).
+            .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| this.toggle_inspector(cx)))
+            .on_action(cx.listener(|this, _: &CloseInspector, _, cx| this.close_inspector(cx)))
             // App-chrome actions (tabs · sidebar · schema reload), bound in the
             // central keymap to `RedRoot` so they fire from any pane's focus.
             .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_query(cx)))
@@ -286,6 +294,18 @@ impl Render for AppState {
                         let ix = this.connect_sel.min(n - 1);
                         cx.stop_propagation();
                         this.connect(ix, cx);
+                    }
+                    // E edits the highlighted connection, ⌫/⌦ asks to remove it —
+                    // the keyboard mirrors the hover edit/trash buttons on each card.
+                    "e" => {
+                        let ix = this.connect_sel.min(n - 1);
+                        cx.stop_propagation();
+                        this.open_edit_form(ix, cx);
+                    }
+                    "backspace" | "delete" => {
+                        let ix = this.connect_sel.min(n - 1);
+                        cx.stop_propagation();
+                        this.request_delete_connection(ix, cx);
                     }
                     _ => {}
                 }

@@ -132,6 +132,34 @@ impl ResultGrid {
         self.selection = None;
     }
 
+    /// The `(absolute row, data column)` of the cell under the keyboard cursor —
+    /// the selection's focus, mapped through the gutter and clamped to the data
+    /// columns. `None` when nothing is selected or the result has no columns. The
+    /// detail inspector resolves the focused cell through this.
+    pub(crate) fn cursor_cell(&self, gutter: usize) -> Option<(usize, usize)> {
+        let focus = self.selection?.focus;
+        let ncols = self.columns.len();
+        (ncols > 0).then(|| (focus.0, focus.1.saturating_sub(gutter).min(ncols - 1)))
+    }
+
+    /// A data column's `(name, declared type)` — for the inspector header.
+    pub(crate) fn column_meta(&self, col: usize) -> Option<(String, Option<String>)> {
+        self.columns
+            .get(col)
+            .map(|c| (c.name.clone(), c.decl_type.clone()))
+    }
+
+    /// The resident value at `(row, col)`, cloned. `None` when the row is off the
+    /// resident window (evicted) or the column is out of range. A whole resident
+    /// cell is bounded by the driver's display cap, so this clone is cheap; a
+    /// `Value::Capped` comes back as itself so the caller can tell it's partial.
+    pub(crate) fn cell_value(&self, row: usize, col: usize) -> Option<Value> {
+        self.buffer
+            .borrow()
+            .row(row)
+            .and_then(|r| r.values.get(col).cloned())
+    }
+
     /// Total rows in the open result (0 until `ResultReady`) — for the
     /// go-to-row prompt's range hint and bound.
     pub(crate) fn total_rows(&self) -> usize {
@@ -595,7 +623,7 @@ impl AppState {
     /// Table-column index of the first *data* column: `1` when the row-number
     /// gutter occupies column 0, else `0`. A data column `d` sits at table column
     /// `d + gutter`; selection/copy/sort all map through this offset.
-    pub(in crate::result) fn gutter(&self) -> usize {
+    pub(crate) fn gutter(&self) -> usize {
         self.settings.grid.row_numbers as usize
     }
 
@@ -962,6 +990,13 @@ impl AppState {
     /// untruncated selection and put it on the clipboard. A superseded reply (the
     /// user copied again before this returned) finds a stale id and is dropped.
     pub(crate) fn on_copy_rows(&mut self, id: u64, rows: Vec<Vec<Value>>, cx: &mut Context<Self>) {
+        // The detail inspector draws full values from the same `CopyRows` path; if
+        // this reply is its in-flight fetch, it claims it (and never reaches the
+        // clipboard). Ids come from one counter, so the two never collide.
+        if self.on_inspect_rows(id, &rows) {
+            cx.notify();
+            return;
+        }
         let Some(pending) = self.pending_copy.take_if(|p| p.id == id) else {
             return;
         };

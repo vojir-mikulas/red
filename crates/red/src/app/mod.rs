@@ -332,6 +332,9 @@ pub struct AppState {
     /// full-row re-fetch (`CopyRows`). The latest copy wins; an earlier reply is
     /// then stale and dropped.
     pub(crate) pending_copy: Option<crate::result::PendingCopy>,
+    /// The cell detail inspector, when open (Track B1). Owns its scroll position
+    /// and any on-demand full value fetched for a capped/evicted cell.
+    pub(crate) inspector: Option<crate::inspector::InspectorState>,
     /// A destructive statement awaiting the user's confirmation before it runs.
     pub(crate) confirm_exec: Option<String>,
     /// A non-pristine query tab the user asked to close, awaiting confirmation.
@@ -614,6 +617,7 @@ impl AppState {
             next_export_id: 0,
             next_copy_id: 0,
             pending_copy: None,
+            inspector: None,
             confirm_exec: None,
             confirm_close_tab: None,
             confirm_delete_conn: None,

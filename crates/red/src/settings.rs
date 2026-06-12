@@ -83,7 +83,12 @@ pub enum ThemeSetting {
 
 impl Default for ThemeSetting {
     fn default() -> Self {
-        ThemeSetting::Named(default_dark())
+        // Follow the OS appearance out of the box, on Red's brand-red Ayu pair.
+        ThemeSetting::Modal {
+            mode: ThemeMode::System,
+            light: default_light(),
+            dark: default_dark(),
+        }
     }
 }
 
@@ -91,7 +96,7 @@ fn default_light() -> String {
     "Ayu Light".to_string()
 }
 fn default_dark() -> String {
-    "One Dark".to_string()
+    "Ayu Dark".to_string()
 }
 
 impl ThemeSetting {

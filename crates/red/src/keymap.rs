@@ -65,6 +65,10 @@ actions!(
         About,
         /// Open the connection switcher popover (⌘P).
         SwitchConnection,
+        /// Open or close the cell detail inspector (⌘I).
+        ToggleInspector,
+        /// Close the cell detail inspector (Esc) — a no-op when it's shut.
+        CloseInspector,
     ]
 );
 
@@ -112,6 +116,7 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
                 ("PgUp / PgDn", "Page up / down"),
                 ("⌃G", "Go to row…"),
                 ("⌘C", "Copy selection"),
+                ("⌘I", "Inspect cell"),
             ],
         ),
         (
@@ -137,6 +142,8 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
             vec![
                 ("↑ / ↓", "Move between saved connections"),
                 ("↵", "Connect to the highlighted one"),
+                ("E", "Edit the highlighted connection"),
+                ("⌫", "Remove the highlighted connection"),
                 ("⌘N", "New connection"),
             ],
         ),
@@ -169,6 +176,12 @@ pub(crate) fn bind_all(cx: &mut App) {
         // text field or the SQL editor keeps its own ⌘C (their context sits deeper
         // in the focus path and wins); it only reaches here when neither is focused.
         KeyBinding::new("cmd-c", CopyResult, Some("RedRoot")),
+        // ⌘I toggles the cell detail inspector; Esc closes it. Both scoped to
+        // `RedRoot` so the editor / a field / a modal (deeper contexts) keep their
+        // own ⌘I / Esc — this fires only from the grid, schema, or root, where Esc
+        // was otherwise unbound.
+        KeyBinding::new("cmd-i", ToggleInspector, Some("RedRoot")),
+        KeyBinding::new("escape", CloseInspector, Some("RedRoot")),
         // Tab management. `RedRoot` is an ancestor of the editor, so these still
         // fire while the editor is focused — none collide with the editor's keys
         // (it binds plain `tab`, not `ctrl-tab`).

@@ -107,21 +107,35 @@ impl AppState {
 
         let theme = cx.theme();
 
-        // RED's wordmark sits in Nyx's logo slot — the red mark, the tagline as the
-        // title tier, then a one-line descriptor, matching the welcome rhythm.
+        // Red's wordmark sits in Nyx's logo slot — the square brand mark above the
+        // word, the tagline as the title tier, then a one-line descriptor, all
+        // centered. The mark and wordmark take the accent so they re-tint with the
+        // active theme (`red.svg` renders as an accent-masked square).
         let header = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .text_center()
+            .child(
+                gpui::svg()
+                    .path("red.svg")
+                    .size(theme.scale(64.))
+                    .flex_none()
+                    .text_color(theme.accent),
+            )
             .child(
                 div()
-                    .text_color(theme.red)
+                    .mt_3()
+                    .text_color(theme.accent)
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_size(theme.scale(34.))
-                    .child("RED"),
+                    .child("Red"),
             )
             .child(
                 div()
                     .text_size(theme.scale(20.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .mt_3()
+                    .mt_1()
                     .child("Roughly Enough Data"),
             )
             .child(div().text_size(theme.scale(14.)).text_color(theme.text_faint).mt_1().child(

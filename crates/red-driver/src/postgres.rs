@@ -8,9 +8,10 @@
 //! Value mapping covers the common scalar types — bool/int/float/text/bytea —
 //! plus the richer ones a first-time visitor expects to *see* rather than as empty
 //! NULLs: numeric, timestamp(tz), date, time(tz), uuid, and json(b) are rendered
-//! from their binary wire form by [`crate::pg_text`] (dependency-free); anything
-//! else falls back to Postgres's own text decode. Read-only sets
-//! `default_transaction_read_only`.
+//! from their binary wire form by [`crate::pg_text`] (dependency-free). Anything
+//! else decodes through Postgres's string path, and a type that path rejects
+//! (enum, inet, interval, array, …) falls back to its raw wire bytes as lossy UTF-8
+//! rather than a silent NULL. Read-only sets `default_transaction_read_only`.
 
 use std::path::Path;
 use std::pin::Pin;
@@ -770,19 +771,20 @@ fn pg_value(row: &Row, i: usize, max: Option<usize>) -> Value {
         // text / varchar / name / bpchar / unknown — and a best-effort for the rest.
         // `&str` and `String` accept the same types, so capping doesn't change which
         // columns decode (only how much of an over-cap one is kept).
-        _ => match max {
-            Some(max) => row
-                .try_get::<_, Option<&str>>(i)
-                .ok()
-                .flatten()
-                .map(|s| Value::capped_text(s, max))
-                .unwrap_or(Value::Null),
-            None => row
-                .try_get::<_, Option<String>>(i)
-                .ok()
-                .flatten()
-                .map(Value::Text)
-                .unwrap_or(Value::Null),
+        //
+        // `try_get` returns `Ok(None)` for a SQL NULL and `Err` when the target type
+        // *rejects* the column type (its `accepts` said no). The former is a genuine
+        // `Null`; the latter is an unmapped type the string decode declined (enum,
+        // inet, interval, array, …), and rather than collapse it to a silent NULL we
+        // fall back to its raw wire bytes as lossy UTF-8 — correct for the text-shaped
+        // wire forms (enum labels, citext-likes) and a visible cell for the rest.
+        _ => match row.try_get::<_, Option<&str>>(i) {
+            Ok(None) => Value::Null,
+            Ok(Some(s)) => match max {
+                Some(max) => Value::capped_text(s, max),
+                None => Value::Text(s.to_string()),
+            },
+            Err(_) => raw_text_fallback(row, i, max),
         },
     }
 }
@@ -828,6 +830,18 @@ fn decode_raw(
             None => Value::Text(s),
         })
         .unwrap_or(Value::Null)
+}
+
+/// Last-resort render for a column type the scalar/`pg_text` arms don't name and
+/// that the string decode rejected (its `accepts` said no): take the raw wire bytes
+/// and render them as lossy UTF-8. Correct for the text-shaped binary forms (enum
+/// labels, `citext`-likes, domains over text) and at worst a visible cell for the
+/// others — anything but the silent NULL the bare string decode would have produced.
+/// A fetch error or genuine SQL NULL still collapses to [`Value::Null`].
+fn raw_text_fallback(row: &Row, i: usize, max: Option<usize>) -> Value {
+    decode_raw(row, i, max, |b| {
+        Some(String::from_utf8_lossy(b).into_owned())
+    })
 }
 
 fn be_i64(b: &[u8]) -> Option<i64> {
@@ -964,6 +978,32 @@ mod tests {
         assert_eq!(text(&row[6]), "{\"a\":1}");
         // jsonb normalizes spacing/key order on the server.
         assert_eq!(text(&row[7]), "{\"b\": 2}");
+    }
+
+    /// Types neither the scalar arms nor `pg_text` name, and that the string decode
+    /// *rejects* (its `accepts` says no): inet, interval, and an array all flow
+    /// through the raw-bytes fallback. The contract under test is "visible text, not
+    /// a silent NULL" — the exact bytes are server-version dependent, so assert only
+    /// that each cell is non-empty text.
+    #[tokio::test]
+    async fn unmapped_types_fall_back_to_text_not_null() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, true).await.unwrap();
+        let sql = "SELECT \
+            '192.168.0.1'::inet, \
+            '1 day 02:03:04'::interval, \
+            ARRAY[1, 2, 3]";
+        let page = driver
+            .fetch_page(sql, 0, 1, PageCap::Full, &AbortSignal::new())
+            .await
+            .unwrap();
+        let row = &page.rows[0];
+        for (i, cell) in row.iter().enumerate() {
+            match cell {
+                Value::Text(s) if !s.is_empty() => {}
+                other => panic!("col {i} fell back to {other:?}, expected non-empty text"),
+            }
+        }
     }
 
     #[tokio::test]
