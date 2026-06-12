@@ -1433,6 +1433,13 @@ impl AppState {
         cx.notify();
     }
 
+    /// Open the settings panel on its About tab — the RED → About RED menu item.
+    /// There's no standalone About modal yet; the panel's About tab is it.
+    pub(crate) fn open_about(&mut self, cx: &mut Context<Self>) {
+        self.open_settings(cx);
+        self.set_settings_tab(SettingsTab::About, cx);
+    }
+
     /// The cached sorted/deduped installed font families (see [`Self::open_settings`]).
     pub(crate) fn font_names(&self) -> &[String] {
         self.font_names_cache.as_deref().unwrap_or(&[])

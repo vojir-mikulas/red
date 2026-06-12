@@ -7,8 +7,9 @@ use gpui::{div, prelude::*, px, Focusable, KeyDownEvent, Render, Window};
 
 use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::keymap::{
-    CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusSchema, NewConnection,
-    NewTab, NextTab, PrevTab, RefreshSchema, RunQuery, SearchSchema, ShowShortcuts, ToggleSidebar,
+    About, CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusSchema,
+    NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, RunQuery, SearchSchema, Settings,
+    ShowShortcuts, ToggleSidebar,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
@@ -223,6 +224,9 @@ impl Render for AppState {
                 this.cycle_focus(false, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| this.toggle_shortcuts(cx)))
+            // Settings panel: ⌘, and the RED → Settings… / About RED menu items.
+            .on_action(cx.listener(|this, _: &Settings, _, cx| this.open_settings(cx)))
+            .on_action(cx.listener(|this, _: &About, _, cx| this.open_about(cx)))
             // ⌘↵ runs the active tab's query from any pane — or tests the connection
             // while the form is open. ⌘N on the welcome screen adds a connection.
             .on_action(cx.listener(|this, _: &RunQuery, _, cx| {

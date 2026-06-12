@@ -59,6 +59,10 @@ actions!(
         RunQuery,
         /// Open a new-connection form (the disconnected screen's ⌘N).
         NewConnection,
+        /// Open the settings panel (⌘,). Also reachable from the gear and palette.
+        Settings,
+        /// Open the settings panel on its About tab (RED → About RED in the menu).
+        About,
     ]
 );
 
@@ -188,5 +192,9 @@ pub(crate) fn bind_all(cx: &mut App) {
         KeyBinding::new("cmd-enter", RunQuery, Some("RedRoot")),
         // ⌘N opens a new-connection form on the welcome screen (no-op elsewhere).
         KeyBinding::new("cmd-n", NewConnection, Some("RedRoot")),
+        // Settings. `⌘,` is the macOS-standard binding; the menu's RED → Settings…
+        // item displays this accelerator by looking the action up here. About has
+        // no shortcut — it's reachable only from the menu.
+        KeyBinding::new("cmd-,", Settings, Some("RedRoot")),
     ]);
 }
