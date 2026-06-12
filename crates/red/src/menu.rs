@@ -40,8 +40,7 @@ use crate::Quit;
 /// re-handed to `cx.set_menus` whenever the menu needs to reflect new state.
 ///
 /// macOS forces the bold app-menu title to the process/bundle name, so without a
-/// `.app` bundle it reads as the lowercase binary name rather than "RED" — see
-/// `docs/deferred.md` (Phase 4).
+/// `.app` bundle it reads as the lowercase binary name rather than "RED".
 pub(crate) fn build_menus() -> Vec<Menu> {
     vec![
         // The app menu. macOS overrides the visible name with the bundle name.

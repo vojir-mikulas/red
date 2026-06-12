@@ -71,8 +71,9 @@ red-service = { path = "crates/red-service" }
 [profile.dev.package."*"]
 opt-level = 2
 
-# Local Flint+RED development: build against the sibling checkout so changes in
-# both repos compile together (the `Palette` component lands here first). Bump the
-# pinned `flint` rev above and drop this patch once the Flint changes are pushed.
-[patch."https://github.com/vojir-mikulas/flint"]
-flint = { path = "../flint" }
+# Local Flint+RED development: to build against a sibling `../flint` checkout so
+# changes in both repos compile together, add (do NOT commit) a patch to your
+# local Cargo.toml — a fresh clone must build from the pinned git rev above:
+#
+#   [patch."https://github.com/vojir-mikulas/flint"]
+#   flint = { path = "../flint" }

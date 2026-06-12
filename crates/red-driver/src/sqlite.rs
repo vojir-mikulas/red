@@ -20,7 +20,9 @@ use rusqlite::{Connection, ErrorCode, OpenFlags};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::format::ProgressThrottle;
+use crate::format::{
+    csv_cell, csv_record, json_string, json_value, strip_trailing, ProgressThrottle,
+};
 use crate::{driver_err, AbortSignal, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor};
 
 /// A SQLite connection target: a file path (or `:memory:`) plus the read-only
@@ -184,9 +186,10 @@ impl DatabaseDriver for SqliteDriver {
         let base = strip_trailing(sql);
         let bound_len = bound.map_or(0, <[Value]>::len);
         let (where_clause, order_by) =
-            crate::seek_clauses(key, bound_len, descending, false, quote_ident, |_| "?".into());
-        let sql =
-            format!("SELECT * FROM ({base}) {where_clause}ORDER BY {order_by} LIMIT {limit}");
+            crate::seek_clauses(key, bound_len, descending, false, quote_ident, |_| {
+                "?".into()
+            });
+        let sql = format!("SELECT * FROM ({base}) {where_clause}ORDER BY {order_by} LIMIT {limit}");
         let params: Vec<rusqlite::types::Value> =
             bound.into_iter().flatten().map(to_sqlite).collect();
         let cap = PageCap::Display {
@@ -397,69 +400,6 @@ fn export_blocking(
     }
     out.flush().map_err(driver_err)?;
     Ok(written)
-}
-
-/// Join fields into one RFC-4180 CSV record (no trailing newline).
-fn csv_record<'a>(fields: impl Iterator<Item = &'a str>) -> String {
-    fields.map(csv_escape).collect::<Vec<_>>().join(",")
-}
-
-/// Quote a CSV field only when it contains a delimiter, quote, or newline.
-fn csv_escape(field: &str) -> String {
-    if field.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", field.replace('"', "\"\""))
-    } else {
-        field.to_string()
-    }
-}
-
-/// A cell as a CSV field value (NULL → empty; blob → byte-length marker). Export
-/// never caps, so `Capped` can't appear here; it's rendered defensively for totality.
-fn csv_cell(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::Integer(n) => n.to_string(),
-        Value::Real(x) => x.to_string(),
-        Value::Text(s) => s.clone(),
-        Value::Blob(b) => format!("<{} bytes>", b.len()),
-        Value::Capped(_) => value.to_string(),
-    }
-}
-
-fn json_value(value: &Value) -> String {
-    match value {
-        Value::Null => "null".to_string(),
-        Value::Integer(n) => n.to_string(),
-        Value::Real(x) => x.to_string(),
-        Value::Text(s) => json_string(s),
-        Value::Blob(b) => json_string(&format!("<{} bytes>", b.len())),
-        Value::Capped(_) => json_string(&value.to_string()),
-    }
-}
-
-/// A JSON string literal with the mandatory escapes.
-fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// Trim trailing whitespace and a single statement terminator so the SQL can be
-/// wrapped as a subquery (`SELECT * FROM (<sql>) …`).
-fn strip_trailing(sql: &str) -> &str {
-    sql.trim().strip_suffix(';').unwrap_or(sql.trim()).trim()
 }
 
 /// A cell value as a bindable SQLite parameter (for seek bounds). A seek bound is

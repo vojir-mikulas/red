@@ -3,8 +3,8 @@
 //! system allocator with nothing in the hot path.
 //!
 //! The core is a *counting global allocator*: every allocation and free bumps
-//! process-wide atomics, so a caller (the perf HUD — see
-//! `docs/plans/dev-perf-hud.md`) can read allocations-per-frame and live bytes —
+//! process-wide atomics, so a caller (the perf HUD, toggled with ⌥⌘P) can read
+//! allocations-per-frame and live bytes —
 //! the direct measure of the per-frame heap churn RED's render path is tuned to
 //! avoid. The only overhead is a couple of relaxed atomic adds per call, paid
 //! solely in `dev-stats` builds.

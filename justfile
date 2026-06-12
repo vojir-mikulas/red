@@ -10,9 +10,9 @@ run:
     cargo run -p red
 
 # Release build only — debug timings are several× slower and lie, so only
-# optimized numbers are honest. The on-screen HUD lands in Tier 2
-# (docs/plans/dev-perf-hud.md); for now this installs the counting allocator.
-# Run with dev perf instrumentation (optimized + counting allocator).
+# optimized numbers are honest. Installs the counting allocator and enables the
+# on-screen perf HUD (toggle with ⌥⌘P).
+# Run with dev perf instrumentation (optimized + counting allocator + HUD).
 run-stats:
     cargo run -p red --release --features dev-stats
 

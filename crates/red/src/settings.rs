@@ -57,7 +57,7 @@ impl Default for AppearanceSettings {
             theme: ThemeSetting::default(),
             ui_font_family: FONT_UI.to_string(),
             ui_mono_family: FONT_MONO.to_string(),
-            // The design's base UI size (the root previously hard-coded this).
+            // The design's base UI size.
             ui_font_size: 13.0,
         }
     }

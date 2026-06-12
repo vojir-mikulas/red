@@ -22,6 +22,7 @@ use tokio::sync::mpsc::UnboundedSender;
 mod conformance;
 mod format;
 mod mysql;
+mod pg_text;
 mod postgres;
 mod sqlite;
 pub use mysql::MysqlDriver;

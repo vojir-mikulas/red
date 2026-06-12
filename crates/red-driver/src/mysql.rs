@@ -296,8 +296,8 @@ impl DatabaseDriver for MysqlDriver {
         // bind parameters for `SHOW INDEX`).
         let idx_sql = format!(
             "SHOW INDEX FROM `{}`.`{}`",
-            quote_ident(schema),
-            quote_ident(table)
+            escape_ident(schema),
+            escape_ident(table)
         );
         let idx_rows: Vec<Row> = conn.query(idx_sql).await.map_err(driver_err)?;
         let indexes = group_indexes(&idx_rows);
@@ -363,7 +363,7 @@ impl DatabaseDriver for MysqlDriver {
             bound_len,
             descending,
             false,
-            |c| format!("`{}`", quote_ident(c)),
+            |c| format!("`{}`", escape_ident(c)),
             |_| "?".into(),
         );
         let sql = format!(
@@ -389,7 +389,7 @@ impl DatabaseDriver for MysqlDriver {
             bound_len,
             false,
             true,
-            |c| format!("`{}`", quote_ident(c)),
+            |c| format!("`{}`", escape_ident(c)),
             |_| "?".into(),
         );
         let sql = format!(
@@ -406,7 +406,7 @@ impl DatabaseDriver for MysqlDriver {
         key: &KeySpec,
         abort: &AbortSignal,
     ) -> Result<Option<(i64, i64)>> {
-        let col = format!("`{}`", quote_ident(&key.column));
+        let col = format!("`{}`", escape_ident(&key.column));
         let sql = format!(
             "SELECT min({col}), max({col}) FROM ({}) AS _red",
             strip_trailing(sql)
@@ -711,8 +711,10 @@ fn group_indexes(rows: &[Row]) -> Vec<IndexMeta> {
         .collect()
 }
 
-/// Backtick-quote an identifier for interpolation (doubling embedded backticks).
-fn quote_ident(s: &str) -> String {
+/// Escape an identifier's embedded backticks (doubling them); callers add the
+/// surrounding backticks. Named to contrast with the other drivers' `quote_ident`/
+/// `pg_quote`, which both wrap *and* escape.
+fn escape_ident(s: &str) -> String {
     s.replace('`', "``")
 }
 

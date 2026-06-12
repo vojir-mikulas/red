@@ -51,7 +51,7 @@ fn main() {
     application().with_assets(Assets).run(|cx: &mut App| {
         cx.set_global(crate::theme::one_dark());
         if let Err(err) = Assets::load_fonts(cx) {
-            eprintln!("warning: failed to load vendored fonts: {err}");
+            tracing::warn!("failed to load vendored fonts: {err}");
         }
         // Install every key binding (Flint component keymaps + RED's globals and
         // app-chrome bindings) from the central keymap.

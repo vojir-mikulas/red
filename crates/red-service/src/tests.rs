@@ -43,15 +43,21 @@ async fn streams_query_in_bounded_windows() {
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
     send(&handle, Command::Connect(sqlite(":memory:", true)));
-    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
 
-    send(&handle, Command::Query {
-        sql: counting_sql(25_000),
-        opts: QueryOptions {
-            window: 1000,
-            timeout: None,
+    send(
+        &handle,
+        Command::Query {
+            sql: counting_sql(25_000),
+            opts: QueryOptions {
+                window: 1000,
+                timeout: None,
+            },
         },
-    });
+    );
 
     match next(&mut events).await {
         Some(Event::QueryStarted { columns }) => assert_eq!(columns[0].name, "x"),
@@ -85,15 +91,21 @@ async fn cancels_query_mid_flight() {
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
     send(&handle, Command::Connect(sqlite(":memory:", true)));
-    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
 
-    send(&handle, Command::Query {
-        sql: counting_sql(1_000_000_000),
-        opts: QueryOptions {
-            window: 1_000_000_000,
-            timeout: None,
+    send(
+        &handle,
+        Command::Query {
+            sql: counting_sql(1_000_000_000),
+            opts: QueryOptions {
+                window: 1_000_000_000,
+                timeout: None,
+            },
         },
-    });
+    );
     assert!(matches!(
         next(&mut events).await,
         Some(Event::QueryStarted { .. })
@@ -103,7 +115,10 @@ async fn cancels_query_mid_flight() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     send(&handle, Command::Cancel);
 
-    assert!(matches!(next(&mut events).await, Some(Event::QueryCancelled)));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::QueryCancelled)
+    ));
     send(&handle, Command::Shutdown);
 }
 
@@ -113,15 +128,21 @@ async fn query_times_out() {
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
     send(&handle, Command::Connect(sqlite(":memory:", true)));
-    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
 
-    send(&handle, Command::Query {
-        sql: counting_sql(1_000_000_000),
-        opts: QueryOptions {
-            window: 1_000_000_000,
-            timeout: Some(Duration::from_millis(50)),
+    send(
+        &handle,
+        Command::Query {
+            sql: counting_sql(1_000_000_000),
+            opts: QueryOptions {
+                window: 1_000_000_000,
+                timeout: Some(Duration::from_millis(50)),
+            },
         },
-    });
+    );
     assert!(matches!(
         next(&mut events).await,
         Some(Event::QueryStarted { .. })
@@ -139,16 +160,22 @@ async fn disconnect_drops_session() {
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
     send(&handle, Command::Connect(sqlite(":memory:", true)));
-    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
 
     send(&handle, Command::Disconnect);
     assert!(matches!(next(&mut events).await, Some(Event::Disconnected)));
 
     // A query after disconnect must report "not connected", not crash.
-    send(&handle, Command::Query {
-        sql: "SELECT 1".into(),
-        opts: QueryOptions::default(),
-    });
+    send(
+        &handle,
+        Command::Query {
+            sql: "SELECT 1".into(),
+            opts: QueryOptions::default(),
+        },
+    );
     match next(&mut events).await {
         Some(Event::Error(msg)) => assert!(msg.contains("not connected")),
         other => panic!("expected not-connected error, got {other:?}"),
@@ -173,8 +200,14 @@ async fn loads_and_describes_schema() {
 
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
-    send(&handle, Command::Connect(sqlite(path.to_str().unwrap(), true)));
-    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), true)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
 
     send(&handle, Command::LoadObjects);
     match next(&mut events).await {
@@ -186,10 +219,13 @@ async fn loads_and_describes_schema() {
         other => panic!("expected ObjectsLoaded, got {other:?}"),
     }
 
-    send(&handle, Command::DescribeTable {
-        schema: "main".into(),
-        table: "t".into(),
-    });
+    send(
+        &handle,
+        Command::DescribeTable {
+            schema: "main".into(),
+            table: "t".into(),
+        },
+    );
     match next(&mut events).await {
         Some(Event::TableDescribed { table, detail, .. }) => {
             assert_eq!(table, "t");
@@ -215,14 +251,20 @@ async fn opens_and_pages_result() {
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
     send(&handle, Command::Connect(sqlite(":memory:", true)));
-    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
 
-    send(&handle, Command::OpenResult {
-        sql: counting_sql(1000),
-        epoch: 1,
-        table: None,
-        sort: None,
-    });
+    send(
+        &handle,
+        Command::OpenResult {
+            sql: counting_sql(1000),
+            epoch: 1,
+            table: None,
+            sort: None,
+        },
+    );
     match next(&mut events).await {
         Some(Event::ResultReady {
             columns,
@@ -238,11 +280,14 @@ async fn opens_and_pages_result() {
         other => panic!("expected ResultReady, got {other:?}"),
     }
 
-    send(&handle, Command::FetchPage {
-        offset: 998,
-        limit: 100,
-        epoch: 1,
-    });
+    send(
+        &handle,
+        Command::FetchPage {
+            offset: 998,
+            limit: 100,
+            epoch: 1,
+        },
+    );
     match next(&mut events).await {
         Some(Event::ResultPageLoaded {
             offset,
@@ -278,15 +323,24 @@ async fn resolves_key_and_serves_runs() {
 
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
-    send(&handle, Command::Connect(sqlite(path.to_str().unwrap(), true)));
-    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), true)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
 
-    send(&handle, Command::OpenResult {
-        sql: "SELECT * FROM t".into(),
-        epoch: 7,
-        table: Some(("main".into(), "t".into())),
-        sort: None,
-    });
+    send(
+        &handle,
+        Command::OpenResult {
+            sql: "SELECT * FROM t".into(),
+            epoch: 7,
+            table: Some(("main".into(), "t".into())),
+            sort: None,
+        },
+    );
     match next(&mut events).await {
         Some(Event::ResultReady { total, key, .. }) => {
             assert_eq!(total, 1000);
@@ -298,12 +352,15 @@ async fn resolves_key_and_serves_runs() {
     }
 
     // Forward from the start, then forward from a boundary key.
-    send(&handle, Command::FetchRun {
-        epoch: 7,
-        fetch: RunFetch::Forward { after: None },
-        limit: 3,
-        seq: 1,
-    });
+    send(
+        &handle,
+        Command::FetchRun {
+            epoch: 7,
+            fetch: RunFetch::Forward { after: None },
+            limit: 3,
+            seq: 1,
+        },
+    );
     match next(&mut events).await {
         Some(Event::ResultRunLoaded {
             rows,
@@ -318,14 +375,17 @@ async fn resolves_key_and_serves_runs() {
         }
         other => panic!("expected ResultRunLoaded, got {other:?}"),
     }
-    send(&handle, Command::FetchRun {
-        epoch: 7,
-        fetch: RunFetch::Forward {
-            after: Some(vec![Value::Integer(3)]),
+    send(
+        &handle,
+        Command::FetchRun {
+            epoch: 7,
+            fetch: RunFetch::Forward {
+                after: Some(vec![Value::Integer(3)]),
+            },
+            limit: 3,
+            seq: 2,
         },
-        limit: 3,
-        seq: 2,
-    });
+    );
     match next(&mut events).await {
         Some(Event::ResultRunLoaded { rows, .. }) => {
             assert_eq!(rows[0][0], Value::Integer(4));
@@ -334,14 +394,17 @@ async fn resolves_key_and_serves_runs() {
     }
 
     // Backward: rows strictly before the bound, delivered descending.
-    send(&handle, Command::FetchRun {
-        epoch: 7,
-        fetch: RunFetch::Backward {
-            before: vec![Value::Integer(4)],
+    send(
+        &handle,
+        Command::FetchRun {
+            epoch: 7,
+            fetch: RunFetch::Backward {
+                before: vec![Value::Integer(4)],
+            },
+            limit: 5,
+            seq: 3,
         },
-        limit: 5,
-        seq: 3,
-    });
+    );
     match next(&mut events).await {
         Some(Event::ResultRunLoaded { rows, .. }) => {
             assert_eq!(
@@ -354,15 +417,18 @@ async fn resolves_key_and_serves_runs() {
 
     // A far jump interpolates the key space: ~halfway lands near id 500,
     // flagged estimated.
-    send(&handle, Command::FetchRun {
-        epoch: 7,
-        fetch: RunFetch::Jump {
-            ordinal: 499,
-            exact: false,
+    send(
+        &handle,
+        Command::FetchRun {
+            epoch: 7,
+            fetch: RunFetch::Jump {
+                ordinal: 499,
+                exact: false,
+            },
+            limit: 3,
+            seq: 4,
         },
-        limit: 3,
-        seq: 4,
-    });
+    );
     match next(&mut events).await {
         Some(Event::ResultRunLoaded {
             rows, estimated, ..
@@ -379,15 +445,18 @@ async fn resolves_key_and_serves_runs() {
     }
 
     // A jump to ordinal 0 seeks from the true start — exact, not estimated.
-    send(&handle, Command::FetchRun {
-        epoch: 7,
-        fetch: RunFetch::Jump {
-            ordinal: 0,
-            exact: false,
+    send(
+        &handle,
+        Command::FetchRun {
+            epoch: 7,
+            fetch: RunFetch::Jump {
+                ordinal: 0,
+                exact: false,
+            },
+            limit: 3,
+            seq: 5,
         },
-        limit: 3,
-        seq: 5,
-    });
+    );
     match next(&mut events).await {
         Some(Event::ResultRunLoaded {
             rows, estimated, ..
@@ -428,27 +497,44 @@ async fn mariadb_keyset_end_to_end() {
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
     send(&handle, Command::Connect(config));
-    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
 
     // Seed 1M rows (MariaDB's sequence engine; the test targets MariaDB).
-    send(&handle, Command::Execute {
-        sql: format!("CREATE TABLE `{table}`(id BIGINT PRIMARY KEY, name VARCHAR(64))"),
-    });
-    assert!(matches!(next(&mut events).await, Some(Event::Executed { .. })));
-    send(&handle, Command::Execute {
-        sql: format!("INSERT INTO `{table}` SELECT seq, CONCAT('row ', seq) FROM seq_1_to_1000000"),
-    });
+    send(
+        &handle,
+        Command::Execute {
+            sql: format!("CREATE TABLE `{table}`(id BIGINT PRIMARY KEY, name VARCHAR(64))"),
+        },
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Executed { .. })
+    ));
+    send(
+        &handle,
+        Command::Execute {
+            sql: format!(
+                "INSERT INTO `{table}` SELECT seq, CONCAT('row ', seq) FROM seq_1_to_1000000"
+            ),
+        },
+    );
     match next(&mut events).await {
         Some(Event::Executed { affected }) => assert_eq!(affected, 1_000_000),
         other => panic!("seeding failed: {other:?}"),
     }
 
-    send(&handle, Command::OpenResult {
-        sql: format!("SELECT * FROM `{}`.`{table}`", p.database),
-        epoch: 1,
-        table: Some((p.database.clone(), table.clone())),
-        sort: None,
-    });
+    send(
+        &handle,
+        Command::OpenResult {
+            sql: format!("SELECT * FROM `{}`.`{table}`", p.database),
+            epoch: 1,
+            table: Some((p.database.clone(), table.clone())),
+            sort: None,
+        },
+    );
     match next(&mut events).await {
         Some(Event::ResultReady { total, key, .. }) => {
             assert_eq!(total, 1_000_000);
@@ -461,14 +547,17 @@ async fn mariadb_keyset_end_to_end() {
 
     // Deep forward seek near the bottom — must be indexed-fast.
     let started = Instant::now();
-    send(&handle, Command::FetchRun {
-        epoch: 1,
-        fetch: RunFetch::Forward {
-            after: Some(vec![Value::Integer(999_000)]),
+    send(
+        &handle,
+        Command::FetchRun {
+            epoch: 1,
+            fetch: RunFetch::Forward {
+                after: Some(vec![Value::Integer(999_000)]),
+            },
+            limit: 200,
+            seq: 1,
         },
-        limit: 200,
-        seq: 1,
-    });
+    );
     match next(&mut events).await {
         Some(Event::ResultRunLoaded { rows, .. }) => {
             assert_eq!(rows.len(), 200);
@@ -483,15 +572,18 @@ async fn mariadb_keyset_end_to_end() {
     );
 
     // Interpolated jump to ~50% — fast but approximate, flagged estimated.
-    send(&handle, Command::FetchRun {
-        epoch: 1,
-        fetch: RunFetch::Jump {
-            ordinal: 500_000,
-            exact: false,
+    send(
+        &handle,
+        Command::FetchRun {
+            epoch: 1,
+            fetch: RunFetch::Jump {
+                ordinal: 500_000,
+                exact: false,
+            },
+            limit: 200,
+            seq: 2,
         },
-        limit: 200,
-        seq: 2,
-    });
+    );
     match next(&mut events).await {
         Some(Event::ResultRunLoaded {
             rows, estimated, ..
@@ -510,15 +602,18 @@ async fn mariadb_keyset_end_to_end() {
     // Exact jump to row 500_000 ("go to row N"): interpolation is skipped, so
     // ordinals are exact (not estimated) and the row is precisely id 500_001
     // (ids are 1-based; ordinal 500_000 is the 500_001st row).
-    send(&handle, Command::FetchRun {
-        epoch: 1,
-        fetch: RunFetch::Jump {
-            ordinal: 500_000,
-            exact: true,
+    send(
+        &handle,
+        Command::FetchRun {
+            epoch: 1,
+            fetch: RunFetch::Jump {
+                ordinal: 500_000,
+                exact: true,
+            },
+            limit: 200,
+            seq: 3,
         },
-        limit: 200,
-        seq: 3,
-    });
+    );
     match next(&mut events).await {
         Some(Event::ResultRunLoaded {
             rows, estimated, ..
@@ -530,14 +625,17 @@ async fn mariadb_keyset_end_to_end() {
     }
 
     // Backward from the middle (scrolling up).
-    send(&handle, Command::FetchRun {
-        epoch: 1,
-        fetch: RunFetch::Backward {
-            before: vec![Value::Integer(500_000)],
+    send(
+        &handle,
+        Command::FetchRun {
+            epoch: 1,
+            fetch: RunFetch::Backward {
+                before: vec![Value::Integer(500_000)],
+            },
+            limit: 200,
+            seq: 4,
         },
-        limit: 200,
-        seq: 4,
-    });
+    );
     match next(&mut events).await {
         Some(Event::ResultRunLoaded { rows, .. }) => {
             assert_eq!(rows[0][0], Value::Integer(499_999));
@@ -546,10 +644,16 @@ async fn mariadb_keyset_end_to_end() {
         other => panic!("expected ResultRunLoaded, got {other:?}"),
     }
 
-    send(&handle, Command::Execute {
-        sql: format!("DROP TABLE `{table}`"),
-    });
-    assert!(matches!(next(&mut events).await, Some(Event::Executed { .. })));
+    send(
+        &handle,
+        Command::Execute {
+            sql: format!("DROP TABLE `{table}`"),
+        },
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Executed { .. })
+    ));
     send(&handle, Command::Shutdown);
 }
 
@@ -571,15 +675,24 @@ async fn text_key_jump_falls_back_to_offset() {
 
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
-    send(&handle, Command::Connect(sqlite(path.to_str().unwrap(), true)));
-    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), true)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
 
-    send(&handle, Command::OpenResult {
-        sql: "SELECT * FROM t".into(),
-        epoch: 9,
-        table: Some(("main".into(), "t".into())),
-        sort: None,
-    });
+    send(
+        &handle,
+        Command::OpenResult {
+            sql: "SELECT * FROM t".into(),
+            epoch: 9,
+            table: Some(("main".into(), "t".into())),
+            sort: None,
+        },
+    );
     match next(&mut events).await {
         Some(Event::ResultReady { key, .. }) => {
             assert_eq!(key.map(|k| k.kind), Some(KeyKind::Other));
@@ -587,15 +700,18 @@ async fn text_key_jump_falls_back_to_offset() {
         other => panic!("expected ResultReady, got {other:?}"),
     }
 
-    send(&handle, Command::FetchRun {
-        epoch: 9,
-        fetch: RunFetch::Jump {
-            ordinal: 50,
-            exact: false,
+    send(
+        &handle,
+        Command::FetchRun {
+            epoch: 9,
+            fetch: RunFetch::Jump {
+                ordinal: 50,
+                exact: false,
+            },
+            limit: 5,
+            seq: 1,
         },
-        limit: 5,
-        seq: 1,
-    });
+    );
     match next(&mut events).await {
         Some(Event::ResultRunLoaded {
             rows, estimated, ..
@@ -615,12 +731,18 @@ async fn connect_and_query_roundtrip() {
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
     send(&handle, Command::Connect(sqlite(":memory:", false)));
-    send(&handle, Command::Query {
-        sql: "SELECT 42 AS answer".into(),
-        opts: QueryOptions::default(),
-    });
+    send(
+        &handle,
+        Command::Query {
+            sql: "SELECT 42 AS answer".into(),
+            opts: QueryOptions::default(),
+        },
+    );
 
-    assert!(matches!(next(&mut events).await, Some(Event::Connected { .. })));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
     assert!(matches!(
         next(&mut events).await,
         Some(Event::QueryStarted { .. })

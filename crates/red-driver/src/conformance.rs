@@ -301,7 +301,7 @@ pub(crate) async fn seeks_forward_backward_and_reads_bounds(
     );
 }
 
-/// Composite keyset seek for sorted results (Track A3): paging by a `(sort_col,
+/// Composite keyset seek for sorted results: paging by a `(sort_col,
 /// pk)` tuple over a **non-unique** sort column covers every row exactly once, in
 /// `(sort_col, pk)` order, for both sort directions — the tiebreaker is what stops
 /// equal-`sort_col` rows from being skipped or duplicated across a page boundary.
@@ -378,7 +378,7 @@ pub(crate) async fn seeks_composite_sorted(
     }
 }
 
-/// The driver-side display cap (Track A1): a display fetch caps fat non-key cells
+/// The driver-side display cap: a display fetch caps fat non-key cells
 /// while the keyset key rides through verbatim and `export`/`Full` stay byte-exact.
 /// `sql` must select exactly one row with columns `(key, big_text, big_blob)` where
 /// `big_text` and `big_blob` each exceed [`DEFAULT_DISPLAY_CELL_CAP`] bytes and `big_text`

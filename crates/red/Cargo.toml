@@ -17,7 +17,7 @@ path = "src/main.rs"
 [features]
 # Dev-only performance instrumentation. Off by default, so a normal `cargo run`
 # / release build carries zero overhead. Enable to install the counting global
-# allocator (and, later, the on-screen perf HUD — see docs/plans/dev-perf-hud.md):
+# allocator and the on-screen perf HUD (toggle with ⌥⌘P):
 #   cargo run --release --features dev-stats
 # Measure on an *optimized* build; debug timings are several× slower and lie.
 dev-stats = []

@@ -95,7 +95,7 @@ driver internals.
 These come up most in review (full list in [`docs/conventions.md`](docs/conventions.md)):
 
 - **Comments explain *why*, not *what*** — and stay free of milestone/ticket
-  references. Planning context lives in `docs/plans/`.
+  references. Keep planning context out of the code.
 - **`thiserror` in libraries, `anyhow` at the app edge.** Use `tracing` for
   diagnostics — no `println!`/`eprintln!` in shipped paths.
 - **Build the UI with Flint** and semantic theme tokens (`cx.theme().bg_app`),

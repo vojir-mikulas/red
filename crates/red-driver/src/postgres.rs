@@ -4,10 +4,12 @@
 //! `query_raw`, and **out-of-band cancel** via `tokio-postgres`'s `CancelToken`
 //! (a separate cancel-request connection, not a dropped future).
 //!
-//! Caveats for v0.1: connections are `NoTls` (TLS is the next hardening step),
-//! and value mapping covers the common scalar types — bool/int/float/text/bytea —
-//! with a text fallback; richer types (numeric, timestamp, json, uuid) surface as
-//! NULL until typed rendering lands. Read-only sets
+//! Caveats for v0.1: connections are `NoTls` (TLS is the next hardening step).
+//! Value mapping covers the common scalar types — bool/int/float/text/bytea —
+//! plus the richer ones a first-time visitor expects to *see* rather than as empty
+//! NULLs: numeric, timestamp(tz), date, time(tz), uuid, and json(b) are rendered
+//! from their binary wire form by [`crate::pg_text`] (dependency-free); anything
+//! else falls back to Postgres's own text decode. Read-only sets
 //! `default_transaction_read_only`.
 
 use std::path::Path;
@@ -32,6 +34,7 @@ use tokio_postgres::{Client, NoTls, Row, RowStream, Statement};
 use crate::format::{
     csv_cell, csv_record, json_string, json_value, strip_trailing, ProgressThrottle,
 };
+use crate::pg_text;
 use crate::{
     driver_err, AbortSignal, ArmGuard, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor,
 };
@@ -423,22 +426,20 @@ impl DatabaseDriver for PostgresDriver {
         // Each placeholder carries an explicit cast: the parameter's wire type is
         // fixed by the Rust value (i64 → int8), and without the cast Postgres
         // would infer the column's narrower type (int4) and reject the bind.
-        let (where_clause, order_by) = crate::seek_clauses(
-            key,
-            bound_len,
-            descending,
-            false,
-            pg_quote,
-            |i| format!("${}{}", i + 1, pg_cast(&bound.unwrap()[i])),
-        );
+        let (where_clause, order_by) =
+            crate::seek_clauses(key, bound_len, descending, false, pg_quote, |i| {
+                format!("${}{}", i + 1, pg_cast(&bound.unwrap()[i]))
+            });
         let sql = format!(
             "SELECT * FROM ({base}) AS _red {where_clause}ORDER BY {order_by} LIMIT {limit}"
         );
         let boxed = pg_params(bound)?;
         self.with_fetch_conn(abort, |client| async move {
             let (stmt, columns) = prepare_columns(&client, &sql).await?;
-            let params: Vec<&(dyn ToSql + Sync)> =
-                boxed.iter().map(|b| -> &(dyn ToSql + Sync) { b.as_ref() }).collect();
+            let params: Vec<&(dyn ToSql + Sync)> = boxed
+                .iter()
+                .map(|b| -> &(dyn ToSql + Sync) { b.as_ref() })
+                .collect();
             let rows = client.query(&stmt, &params).await.map_err(map_pg_err)?;
             let cap = CellCap::display(crate::key_positions(key, &columns));
             Ok(ResultPage {
@@ -460,14 +461,10 @@ impl DatabaseDriver for PostgresDriver {
     ) -> Result<ResultPage> {
         let base = strip_trailing(sql);
         let bound_len = from.map_or(0, <[Value]>::len);
-        let (where_clause, order_by) = crate::seek_clauses(
-            key,
-            bound_len,
-            false,
-            true,
-            pg_quote,
-            |i| format!("${}{}", i + 1, pg_cast(&from.unwrap()[i])),
-        );
+        let (where_clause, order_by) =
+            crate::seek_clauses(key, bound_len, false, true, pg_quote, |i| {
+                format!("${}{}", i + 1, pg_cast(&from.unwrap()[i]))
+            });
         let sql = format!(
             "SELECT * FROM ({base}) AS _red {where_clause}\
              ORDER BY {order_by} LIMIT {limit} OFFSET {skip}"
@@ -475,8 +472,10 @@ impl DatabaseDriver for PostgresDriver {
         let boxed = pg_params(from)?;
         self.with_fetch_conn(abort, |client| async move {
             let (stmt, columns) = prepare_columns(&client, &sql).await?;
-            let params: Vec<&(dyn ToSql + Sync)> =
-                boxed.iter().map(|b| -> &(dyn ToSql + Sync) { b.as_ref() }).collect();
+            let params: Vec<&(dyn ToSql + Sync)> = boxed
+                .iter()
+                .map(|b| -> &(dyn ToSql + Sync) { b.as_ref() })
+                .collect();
             let rows = client.query(&stmt, &params).await.map_err(map_pg_err)?;
             let cap = CellCap::display(crate::key_positions(key, &columns));
             Ok(ResultPage {
@@ -732,6 +731,26 @@ fn pg_value(row: &Row, i: usize, max: Option<usize>) -> Value {
             .flatten()
             .map(Value::Real)
             .unwrap_or(Value::Null),
+        // Types `tokio-postgres` won't decode without an optional crate: render the
+        // raw wire bytes to text ourselves (see `pg_text`) so they don't decode-fail
+        // into a silent NULL. Each result is short except JSON, which honours `max`.
+        Type::NUMERIC => decode_raw(row, i, max, pg_text::numeric_to_string),
+        Type::TIMESTAMP => decode_raw(row, i, max, |b| be_i64(b).map(pg_text::timestamp_to_string)),
+        Type::TIMESTAMPTZ => decode_raw(row, i, max, |b| {
+            be_i64(b).map(pg_text::timestamptz_to_string)
+        }),
+        Type::DATE => decode_raw(row, i, max, |b| be_i32(b).map(pg_text::date_to_string)),
+        Type::TIME => decode_raw(row, i, max, |b| be_i64(b).map(pg_text::time_to_string)),
+        Type::TIMETZ => decode_raw(row, i, max, pg_text::timetz_to_string),
+        Type::UUID => decode_raw(row, i, max, pg_text::uuid_to_string),
+        // JSON is UTF-8 text on the wire; JSONB prefixes a 1-byte version header.
+        Type::JSON => decode_raw(row, i, max, |b| {
+            Some(String::from_utf8_lossy(b).into_owned())
+        }),
+        Type::JSONB => decode_raw(row, i, max, |b| {
+            let text = b.split_first().map(|(_, rest)| rest).unwrap_or(b);
+            Some(String::from_utf8_lossy(text).into_owned())
+        }),
         // Capped: read the bytes as a borrowed slice for their length, never owning
         // them. Full fidelity: own the bytes (export / clipboard / key column).
         Type::BYTEA => match max {
@@ -770,6 +789,53 @@ fn pg_value(row: &Row, i: usize, max: Option<usize>) -> Value {
 
 fn int_value(v: Option<i64>) -> Value {
     v.map(Value::Integer).unwrap_or(Value::Null)
+}
+
+/// Captures a column's raw binary wire bytes verbatim, so the driver can render the
+/// types `tokio-postgres` declines to decode itself (see [`crate::pg_text`]).
+/// `accepts` is unconditional — it's only ever asked for via the explicit type
+/// arms in [`pg_value`].
+struct RawBytes(Vec<u8>);
+
+impl<'a> tokio_postgres::types::FromSql<'a> for RawBytes {
+    fn from_sql(
+        _ty: &Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(RawBytes(raw.to_vec()))
+    }
+
+    fn accepts(_ty: &Type) -> bool {
+        true
+    }
+}
+
+/// Decode cell `i`'s raw wire bytes with `f`, wrapping the result as a display
+/// [`Value`] (honouring `max`). A SQL NULL, a fetch error, or an `f` that can't
+/// parse the buffer all collapse to [`Value::Null`].
+fn decode_raw(
+    row: &Row,
+    i: usize,
+    max: Option<usize>,
+    f: impl FnOnce(&[u8]) -> Option<String>,
+) -> Value {
+    row.try_get::<_, Option<RawBytes>>(i)
+        .ok()
+        .flatten()
+        .and_then(|b| f(&b.0))
+        .map(|s| match max {
+            Some(m) => Value::capped_text(&s, m),
+            None => Value::Text(s),
+        })
+        .unwrap_or(Value::Null)
+}
+
+fn be_i64(b: &[u8]) -> Option<i64> {
+    b.try_into().ok().map(i64::from_be_bytes)
+}
+
+fn be_i32(b: &[u8]) -> Option<i32> {
+    b.try_into().ok().map(i32::from_be_bytes)
 }
 
 /// Map a cancel (SQLSTATE 57014) to the distinct `Interrupted`, else a driver error.
@@ -860,6 +926,44 @@ mod tests {
         let driver = PostgresDriver::connect(&url, true).await.unwrap();
         assert!(!driver.server_version().is_empty());
         driver.ping().await.unwrap();
+    }
+
+    /// The non-scalar types `pg_value` renders from their binary wire form must
+    /// come back as their text, never as a silent NULL (the regression `pg_text`
+    /// fixes). Complements the wire-format unit tests in [`crate::pg_text`] with a
+    /// live round-trip through the real `tokio-postgres` decode path.
+    #[tokio::test]
+    async fn rich_types_render_as_text_not_null() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, true).await.unwrap();
+        let sql = "SELECT \
+            1234.567::numeric, \
+            '2021-03-15 12:30:45'::timestamp, \
+            '2021-03-15 12:30:45+00'::timestamptz, \
+            '2021-03-15'::date, \
+            '12:30:45'::time, \
+            '12345678-1234-5678-1234-567812345678'::uuid, \
+            '{\"a\":1}'::json, \
+            '{\"b\": 2}'::jsonb";
+        let page = driver
+            .fetch_page(sql, 0, 1, PageCap::Full, &AbortSignal::new())
+            .await
+            .unwrap();
+        let row = &page.rows[0];
+        let text = |v: &Value| match v {
+            Value::Text(s) => s.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert_eq!(text(&row[0]), "1234.567");
+        assert_eq!(text(&row[1]), "2021-03-15 12:30:45");
+        // timestamptz is UTC on the wire regardless of session zone.
+        assert_eq!(text(&row[2]), "2021-03-15 12:30:45+00");
+        assert_eq!(text(&row[3]), "2021-03-15");
+        assert_eq!(text(&row[4]), "12:30:45");
+        assert_eq!(text(&row[5]), "12345678-1234-5678-1234-567812345678");
+        assert_eq!(text(&row[6]), "{\"a\":1}");
+        // jsonb normalizes spacing/key order on the server.
+        assert_eq!(text(&row[7]), "{\"b\": 2}");
     }
 
     #[tokio::test]
@@ -1029,7 +1133,7 @@ mod tests {
         )
         .await;
 
-        // Composite `(grp, id)` seek over a non-unique sort column (Track A3).
+        // Composite `(grp, id)` seek over a non-unique sort column.
         let g = tag("seekcomposite");
         driver
             .execute(&format!(
@@ -1053,8 +1157,14 @@ mod tests {
             descending: true,
             ..key_asc.clone()
         };
-        battery::seeks_composite_sorted(&driver, &format!("SELECT * FROM {g}"), &key_asc, &key_desc, 30)
-            .await;
+        battery::seeks_composite_sorted(
+            &driver,
+            &format!("SELECT * FROM {g}"),
+            &key_asc,
+            &key_desc,
+            30,
+        )
+        .await;
         driver.execute(&format!("DROP TABLE {g}")).await.unwrap();
 
         driver.execute(&format!("DROP TABLE {t}")).await.unwrap();

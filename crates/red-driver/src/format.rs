@@ -2,6 +2,11 @@
 //! `export` path. These are pure [`Value`] → text functions with zero engine
 //! knowledge, lifted here so every driver writes byte-identical CSV/JSON and a
 //! new driver doesn't fork yet another copy.
+//!
+//! Blobs export as a `<N bytes>` length marker, not their bytes (hex/base64) — a
+//! deliberate v0.1 choice: the streaming export path never materializes cell bytes,
+//! and a text CSV/JSON of raw binary is rarely what a user wants. Binary-faithful
+//! export is a later format option.
 
 use std::time::{Duration, Instant};
 
