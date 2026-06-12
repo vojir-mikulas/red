@@ -83,7 +83,11 @@ impl DatabaseDriver for SqliteDriver {
         let read_only = self.read_only;
         let sql = sql.to_string();
 
-        let (req_tx, req_rx) = mpsc::unbounded_channel::<FetchReq>();
+        // Capacity 1: the handle sends one `FetchReq` then awaits its reply
+        // before sending the next, so a single slot is all that's ever in flight —
+        // a bound, not a buffer. Keeps the channel honest about the "one window at
+        // a time" contract rather than letting requests pile up unboundedly.
+        let (req_tx, req_rx) = mpsc::channel::<FetchReq>(1);
         let (meta_tx, meta_rx) = oneshot::channel::<Result<CursorMeta>>();
 
         // One blocking-pool thread owns the connection + statement + rows for the
@@ -683,7 +687,7 @@ fn cursor_thread(
     sql: &str,
     read_only: bool,
     meta_tx: oneshot::Sender<Result<CursorMeta>>,
-    mut req_rx: mpsc::UnboundedReceiver<FetchReq>,
+    mut req_rx: mpsc::Receiver<FetchReq>,
 ) {
     let conn = match SqliteDriver::open(path, read_only) {
         Ok(conn) => conn,
@@ -812,7 +816,7 @@ fn map_step_err(e: rusqlite::Error) -> RedError {
 /// channel and tears down the blocking cursor.
 struct SqliteCursor {
     columns: Vec<Column>,
-    req_tx: mpsc::UnboundedSender<FetchReq>,
+    req_tx: mpsc::Sender<FetchReq>,
     cancel: CancelToken,
 }
 
@@ -829,6 +833,7 @@ impl QueryCursor for SqliteCursor {
                 max,
                 reply: reply_tx,
             })
+            .await
             .map_err(|_| RedError::Driver("cursor closed".into()))?;
         reply_rx
             .await

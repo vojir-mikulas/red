@@ -1091,6 +1091,15 @@ async fn build_checkpoints(
     let key_cols = spec.key_cols.clone();
     let total = spec.total.unwrap_or(0);
 
+    // One checkpoint per stride: reserve the whole index up front when the total
+    // is known, so a deep walk doesn't repeatedly grow + copy the points Vec under
+    // the lock as it fills (a 100M-row result is ~10k pushes otherwise).
+    if total > 0 {
+        lock(&spec.checkpoints)
+            .points
+            .reserve(total / CHECKPOINT_STRIDE + 1);
+    }
+
     // First checkpoint: ordinal 0, seeking from the result's start. Each later
     // step seeks from the previous checkpoint key (inclusive) and skips a stride.
     let mut ordinal = 0usize;
