@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use futures::channel::mpsc::UnboundedSender;
 use red_core::{ConnectionConfig, DbKind, KeyKind, KeySpec, RedError, Value};
 use red_driver::{
-    CancelToken, DatabaseDriver, MysqlDriver, PageCap, PostgresDriver, QueryCursor, SqliteDriver,
+    AbortSignal, CancelToken, DatabaseDriver, MysqlDriver, PageCap, PostgresDriver, QueryCursor,
+    SqliteDriver,
 };
 use tokio::sync::mpsc::UnboundedReceiver as CmdReceiver;
 use tokio::sync::Semaphore;
@@ -84,6 +85,41 @@ struct OpenSpec {
 /// bounds/total after the fact and read specs without round-tripping commands).
 type ResultMap = Arc<Mutex<HashMap<u64, OpenSpec>>>;
 
+/// The cancellable work in flight for one open result. Each detached fetch carries
+/// an [`AbortSignal`]; when a newer one supersedes it (a flung scrollbar, a new
+/// page, a closed tab) the old signal is [`abort`](AbortSignal::abort)ed so the
+/// engine stops the doomed query instead of running it to completion. Held only on
+/// the dispatch loop (single-threaded), so no extra lock — the spawned task keeps
+/// its own clone and the driver disarms it on completion, making a late abort a
+/// no-op.
+#[derive(Default)]
+struct InFlight {
+    /// The `OpenResult` probe bundle (`count` + `fetch_page` + `key_bounds`).
+    open: Option<AbortSignal>,
+    /// The latest offset `FetchPage` for this epoch.
+    page: Option<AbortSignal>,
+    /// The latest `FetchRun`, tagged with its `seq` so a stale (lower-seq) run
+    /// arriving late doesn't cancel a newer one.
+    run: Option<(u64, AbortSignal)>,
+    /// The background checkpoint-index build, if one is running.
+    build: Option<AbortSignal>,
+}
+
+impl InFlight {
+    /// Supersede every in-flight fetch for this result (tab closed / reconnected).
+    fn abort_all(&self) {
+        for sig in [self.open.as_ref(), self.page.as_ref(), self.build.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            sig.abort();
+        }
+        if let Some((_, sig)) = &self.run {
+            sig.abort();
+        }
+    }
+}
+
 /// Lock a mutex, tolerating poison. A detached page-fetch task can panic while
 /// holding `results`; recovering the guard keeps one bad task from bricking the
 /// whole backend. The worst case is a half-written entry, which dispatch already
@@ -112,6 +148,10 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
     // on — and is dropped. UI epochs start at 1, so an empty map means "no live
     // result".
     let results: ResultMap = Arc::new(Mutex::new(HashMap::new()));
+    // The abort handles for in-flight fetches, keyed by epoch. Lives only on the
+    // dispatch loop: superseding (abort the old) and registering (store the new)
+    // both happen here, so it needs no lock. See [`InFlight`].
+    let mut inflight: HashMap<u64, InFlight> = HashMap::new();
     // Bounds how many page fetches hit the server concurrently (see the const).
     let page_fetch_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_PAGE_FETCHES));
     // In-flight exports: `id → cancel flag`. An export runs as a detached task
@@ -124,6 +164,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
         match command {
             Command::Connect(config) => {
                 active = None; // a new connection abandons any in-flight cursor
+                abort_all_inflight(&mut inflight); // and any superseded fetch work
                 lock(&results).clear();
                 match attempt_connect(&config).await {
                     Ok(driver) => {
@@ -151,6 +192,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
 
             Command::Disconnect => {
                 active = None;
+                abort_all_inflight(&mut inflight);
                 lock(&results).clear();
                 session = None;
                 emit(&events, Event::Disconnected);
@@ -228,6 +270,10 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                     emit(&events, Event::Error("not connected".into()));
                     continue;
                 };
+                // A re-open on the same epoch supersedes any prior probe.
+                if let Some(f) = inflight.remove(&epoch) {
+                    f.abort_all();
+                }
                 // Registered before the (slow) open task so an early fetch for
                 // this epoch isn't mistaken for a stale one.
                 lock(&results).insert(
@@ -241,6 +287,10 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                         checkpoints: Arc::new(Mutex::new(CheckpointIndex::default())),
                     },
                 );
+                // One abort handle for the whole probe bundle: re-sort / close
+                // cancels the (potentially full-table) `count` and column probe.
+                let abort = AbortSignal::new();
+                inflight.entry(epoch).or_default().open = Some(abort.clone());
                 // Count + column metadata can be slow (a full `COUNT(*)` over a
                 // large table); run them off the dispatch loop so switching to
                 // another table stays instant.
@@ -278,14 +328,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                     let bounds = async {
                         match &key {
                             Some(k) if k.kind == KeyKind::Int => {
-                                driver.key_bounds(&sql, k).await.ok().flatten()
+                                driver.key_bounds(&sql, k, &abort).await.ok().flatten()
                             }
                             _ => None,
                         }
                     };
                     let (total, columns, bounds) = tokio::join!(
-                        driver.count(&sql),
-                        driver.fetch_page(&sql, 0, 0, PageCap::Full),
+                        driver.count(&sql, &abort),
+                        driver.fetch_page(&sql, 0, 0, PageCap::Full, &abort),
                         bounds
                     );
                     match (total, columns) {
@@ -333,6 +383,15 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 let Some(sql) = lock(&results).get(&epoch).map(|s| s.sql.clone()) else {
                     continue;
                 };
+                // A newer page for this epoch supersedes the last one (the viewport
+                // moved); cancel its in-flight fetch so a flung scrollbar doesn't
+                // back a pile of doomed deep-`OFFSET` scans up behind the semaphore.
+                let entry = inflight.entry(epoch).or_default();
+                if let Some(prev) = entry.page.take() {
+                    prev.abort();
+                }
+                let abort = AbortSignal::new();
+                entry.page = Some(abort.clone());
                 // Pages fetch concurrently (the driver pools connections) and off
                 // the dispatch loop, so a deep-`OFFSET` page never blocks the next
                 // command or another page — but no more than `page_fetch_limit` at
@@ -343,7 +402,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                     let _permit = limit_src.acquire_owned().await;
                     // Offset-mode display page — cap fat cells; no seek key to exempt.
                     match driver
-                        .fetch_page(&sql, offset, limit, PageCap::Display { key: None })
+                        .fetch_page(&sql, offset, limit, PageCap::Display { key: None }, &abort)
                         .await
                     {
                         Ok(page) => emit(
@@ -376,6 +435,22 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 let Some(key) = spec.key.clone() else {
                     continue; // a keyless result never gets `FetchRun`s
                 };
+                // A newer run (higher `seq`) supersedes the last one — a scrollbar
+                // fling emits a stream of runs and only the latest matters. Cancel
+                // the previous in-flight run so its seek stops at the engine. `seq`
+                // is monotonic over the ordered command stream, so the guard against
+                // a lower-seq arrival is belt-and-suspenders.
+                let entry = inflight.entry(epoch).or_default();
+                match entry.run.take() {
+                    Some((prev_seq, prev)) if prev_seq >= seq => {
+                        entry.run = Some((prev_seq, prev));
+                        continue;
+                    }
+                    Some((_, prev)) => prev.abort(),
+                    None => {}
+                }
+                let abort = AbortSignal::new();
+                entry.run = Some((seq, abort.clone()));
                 // A deep exact jump kicks off the checkpoint index (once) so the
                 // *next* deep jump is O(stride). This one still serves via OFFSET.
                 if let RunFetch::Jump {
@@ -384,11 +459,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 } = &fetch
                 {
                     if claim_build(&spec, *ordinal) {
+                        let build_abort = AbortSignal::new();
+                        inflight.entry(epoch).or_default().build = Some(build_abort.clone());
                         tokio::spawn(build_checkpoints(
                             driver.clone(),
                             spec.clone(),
                             results.clone(),
                             epoch,
+                            build_abort,
                         ));
                     }
                 }
@@ -396,7 +474,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 let limit_src = page_fetch_limit.clone();
                 tokio::spawn(async move {
                     let _permit = limit_src.acquire_owned().await;
-                    match run_fetch(&*driver, &spec, &key, &fetch, limit).await {
+                    match run_fetch(&*driver, &spec, &key, &fetch, limit, &abort).await {
                         Ok((rows, estimated)) => emit(
                             &events,
                             Event::ResultRunLoaded {
@@ -436,7 +514,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 let limit_src = page_fetch_limit.clone();
                 tokio::spawn(async move {
                     let _permit = limit_src.acquire_owned().await;
-                    match driver.fetch_page(&sql, offset, limit, PageCap::Full).await {
+                    // A deliberate clipboard re-fetch isn't superseded by scrolling,
+                    // so it carries a throwaway signal that never aborts.
+                    let abort = AbortSignal::new();
+                    match driver
+                        .fetch_page(&sql, offset, limit, PageCap::Full, &abort)
+                        .await
+                    {
                         Ok(page) => emit(
                             &events,
                             Event::CopyRowsLoaded {
@@ -450,6 +534,10 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
             }
 
             Command::CloseResult { epoch } => {
+                // Stop every in-flight fetch for the tab at the engine, then forget it.
+                if let Some(f) = inflight.remove(&epoch) {
+                    f.abort_all();
+                }
                 lock(&results).remove(&epoch);
             }
 
@@ -648,17 +736,18 @@ async fn run_fetch(
     key: &KeySpec,
     fetch: &RunFetch,
     limit: usize,
+    abort: &AbortSignal,
 ) -> red_core::Result<(Vec<Vec<Value>>, bool)> {
     match fetch {
         RunFetch::Forward { after } => {
             let page = driver
-                .fetch_seek(&spec.sql, key, after.as_ref(), false, limit)
+                .fetch_seek(&spec.sql, key, after.as_ref(), false, limit, abort)
                 .await?;
             Ok((page.rows, false))
         }
         RunFetch::Backward { before } => {
             let page = driver
-                .fetch_seek(&spec.sql, key, Some(before), true, limit)
+                .fetch_seek(&spec.sql, key, Some(before), true, limit, abort)
                 .await?;
             Ok((page.rows, false))
         }
@@ -683,6 +772,7 @@ async fn run_fetch(
                                 Some(&Value::Integer(target.saturating_sub(1))),
                                 false,
                                 limit,
+                                abort,
                             )
                             .await?;
                         // Jumping to ordinal 0 seeks from the true start — exact.
@@ -702,7 +792,7 @@ async fn run_fetch(
                     let skip = *ordinal - cp_ordinal;
                     if skip <= CHECKPOINT_STRIDE {
                         let page = driver
-                            .fetch_seek_skip(&spec.sql, key, Some(&cp_key), skip, limit)
+                            .fetch_seek_skip(&spec.sql, key, Some(&cp_key), skip, limit, abort)
                             .await?;
                         return Ok((page.rows, false));
                     }
@@ -719,6 +809,7 @@ async fn run_fetch(
                     PageCap::Display {
                         key: Some(key.clone()),
                     },
+                    abort,
                 )
                 .await?;
             Ok((page.rows, false))
@@ -759,6 +850,7 @@ async fn build_checkpoints(
     spec: OpenSpec,
     results: ResultMap,
     epoch: u64,
+    abort: AbortSignal,
 ) {
     let (Some(key), Some(key_col)) = (spec.key.clone(), spec.key_col) else {
         lock(&spec.checkpoints).status = BuildStatus::Idle;
@@ -778,10 +870,16 @@ async fn build_checkpoints(
             return;
         }
         let page = match driver
-            .fetch_seek_skip(&spec.sql, &key, from.as_ref(), skip, 1)
+            .fetch_seek_skip(&spec.sql, &key, from.as_ref(), skip, 1, &abort)
             .await
         {
             Ok(page) => page,
+            // A superseded build's in-flight stride comes back interrupted — a
+            // clean stop, not a failure; leave the status so a later jump retries.
+            Err(RedError::Interrupted) => {
+                lock(&spec.checkpoints).status = BuildStatus::Idle;
+                return;
+            }
             Err(e) => {
                 tracing::warn!(%epoch, "checkpoint build failed: {e}");
                 lock(&spec.checkpoints).status = BuildStatus::Idle; // allow a later retry
@@ -859,6 +957,14 @@ fn emit(events: &UnboundedSender<Event>, event: Event) {
     let _ = events.unbounded_send(event);
 }
 
+/// Abort every in-flight fetch across all open results and clear the registry —
+/// the connection is being dropped or replaced, so all of it is doomed work.
+fn abort_all_inflight(inflight: &mut HashMap<u64, InFlight>) {
+    for (_, f) in inflight.drain() {
+        f.abort_all();
+    }
+}
+
 #[cfg(test)]
 mod checkpoint_tests {
     use super::*;
@@ -905,7 +1011,7 @@ mod checkpoint_tests {
         let results: ResultMap = Arc::new(Mutex::new(HashMap::new()));
         lock(&results).insert(1, spec.clone());
 
-        build_checkpoints(driver.clone(), spec.clone(), results, 1).await;
+        build_checkpoints(driver.clone(), spec.clone(), results, 1, AbortSignal::new()).await;
 
         // Checkpoints every 10k rows: ids are 1-based, so ordinal N → id N+1.
         // Scoped so the guard is dropped before the `await` below.
@@ -936,6 +1042,7 @@ mod checkpoint_tests {
                 exact: true,
             },
             5,
+            &AbortSignal::new(),
         )
         .await
         .unwrap();

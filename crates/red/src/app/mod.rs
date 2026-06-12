@@ -882,7 +882,9 @@ impl AppState {
         if index < self.connections.len() {
             let removed = self.connections.remove(index);
             // Keep the selection highlight in range after the row vanishes.
-            self.connect_sel = self.connect_sel.min(self.connections.len().saturating_sub(1));
+            self.connect_sel = self
+                .connect_sel
+                .min(self.connections.len().saturating_sub(1));
             // Drop the connection's keychain credential too, so deleting a
             // connection doesn't orphan its password.
             if let Err(e) = crate::secrets::delete_password(&removed.id) {
@@ -1024,8 +1026,7 @@ impl AppState {
     /// trigger). Refresh its contents first so recents/active are current.
     pub(crate) fn toggle_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.rebuild_switcher(cx);
-        self.switcher
-            .update(cx, |s, cx| s.toggle(window, cx));
+        self.switcher.update(cx, |s, cx| s.toggle(window, cx));
     }
 
     /// Handle a row chosen in the switcher popover. Row ids are `conn:<index>` (a

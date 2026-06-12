@@ -21,7 +21,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::format::ProgressThrottle;
-use crate::{driver_err, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor};
+use crate::{driver_err, AbortSignal, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor};
 
 /// A SQLite connection target: a file path (or `:memory:`) plus the read-only
 /// posture. Cheap to clone — it holds no live handle.
@@ -125,14 +125,19 @@ impl DatabaseDriver for SqliteDriver {
         .map_err(driver_err)?
     }
 
-    async fn count(&self, sql: &str) -> Result<i64> {
+    async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64> {
         let path = self.path.clone();
         let read_only = self.read_only;
+        let abort = abort.clone();
         let sql = format!("SELECT count(*) FROM ({})", strip_trailing(sql));
         tokio::task::spawn_blocking(move || {
             let conn = SqliteDriver::open(&path, read_only)?;
+            let _guard = arm_interrupt(&conn, &abort);
+            if abort.is_aborted() {
+                return Err(RedError::Interrupted);
+            }
             conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
-                .map_err(driver_err)
+                .map_err(map_step_err)
         })
         .await
         .map_err(driver_err)?
@@ -144,16 +149,18 @@ impl DatabaseDriver for SqliteDriver {
         offset: usize,
         limit: usize,
         cap: PageCap,
+        abort: &AbortSignal,
     ) -> Result<ResultPage> {
         let path = self.path.clone();
         let read_only = self.read_only;
+        let abort = abort.clone();
         // `limit`/`offset` are `usize`, so inlining them can't inject.
         let sql = format!(
             "SELECT * FROM ({}) LIMIT {limit} OFFSET {offset}",
             strip_trailing(sql)
         );
         tokio::task::spawn_blocking(move || {
-            fetch_page_blocking(&path, read_only, &sql, Vec::new(), cap)
+            fetch_page_blocking(&path, read_only, &sql, Vec::new(), cap, &abort)
         })
         .await
         .map_err(driver_err)?
@@ -166,6 +173,7 @@ impl DatabaseDriver for SqliteDriver {
         bound: Option<&Value>,
         descending: bool,
         limit: usize,
+        abort: &AbortSignal,
     ) -> Result<ResultPage> {
         let path = self.path.clone();
         let read_only = self.read_only;
@@ -186,8 +194,9 @@ impl DatabaseDriver for SqliteDriver {
         let cap = PageCap::Display {
             key: Some(key.clone()),
         };
+        let abort = abort.clone();
         tokio::task::spawn_blocking(move || {
-            fetch_page_blocking(&path, read_only, &sql, params, cap)
+            fetch_page_blocking(&path, read_only, &sql, params, cap, &abort)
         })
         .await
         .map_err(driver_err)?
@@ -200,6 +209,7 @@ impl DatabaseDriver for SqliteDriver {
         from: Option<&Value>,
         skip: usize,
         limit: usize,
+        abort: &AbortSignal,
     ) -> Result<ResultPage> {
         let path = self.path.clone();
         let read_only = self.read_only;
@@ -218,16 +228,23 @@ impl DatabaseDriver for SqliteDriver {
         let cap = PageCap::Display {
             key: Some(key.clone()),
         };
+        let abort = abort.clone();
         tokio::task::spawn_blocking(move || {
-            fetch_page_blocking(&path, read_only, &sql, params, cap)
+            fetch_page_blocking(&path, read_only, &sql, params, cap, &abort)
         })
         .await
         .map_err(driver_err)?
     }
 
-    async fn key_bounds(&self, sql: &str, key: &KeySpec) -> Result<Option<(i64, i64)>> {
+    async fn key_bounds(
+        &self,
+        sql: &str,
+        key: &KeySpec,
+        abort: &AbortSignal,
+    ) -> Result<Option<(i64, i64)>> {
         let path = self.path.clone();
         let read_only = self.read_only;
+        let abort = abort.clone();
         let col = quote_ident(&key.column);
         let sql = format!(
             "SELECT min({col}), max({col}) FROM ({})",
@@ -235,13 +252,17 @@ impl DatabaseDriver for SqliteDriver {
         );
         tokio::task::spawn_blocking(move || {
             let conn = SqliteDriver::open(&path, read_only)?;
+            let _guard = arm_interrupt(&conn, &abort);
+            if abort.is_aborted() {
+                return Err(RedError::Interrupted);
+            }
             conn.query_row(&sql, [], |row| {
                 Ok(match (row.get_ref(0)?, row.get_ref(1)?) {
                     (ValueRef::Integer(min), ValueRef::Integer(max)) => Some((min, max)),
                     _ => None,
                 })
             })
-            .map_err(driver_err)
+            .map_err(map_step_err)
         })
         .await
         .map_err(driver_err)?
@@ -458,14 +479,28 @@ fn to_sqlite(value: &Value) -> rusqlite::types::Value {
     }
 }
 
+/// Arm `abort` with this connection's interrupt handle for the duration of the
+/// returned guard. The handle is taken before any step so a cancel can abort even
+/// the first one, and `sqlite3_interrupt` is safe to call from the dispatch thread
+/// while the step runs on this blocking thread.
+fn arm_interrupt(conn: &Connection, abort: &AbortSignal) -> crate::ArmGuard {
+    let interrupt = conn.get_interrupt_handle();
+    abort.arm(CancelToken::new(move || interrupt.interrupt()))
+}
+
 fn fetch_page_blocking(
     path: &Path,
     read_only: bool,
     sql: &str,
     params: Vec<rusqlite::types::Value>,
     cap: PageCap,
+    abort: &AbortSignal,
 ) -> Result<ResultPage> {
     let conn = SqliteDriver::open(path, read_only)?;
+    let _guard = arm_interrupt(&conn, abort);
+    if abort.is_aborted() {
+        return Err(RedError::Interrupted);
+    }
     let mut stmt = conn.prepare(sql).map_err(driver_err)?;
     let column_count = stmt.column_count();
     let columns: Vec<Column> = stmt
@@ -856,6 +891,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn superseded_one_shot_fetch_is_cancelled() {
+        let driver = SqliteDriver::new(":memory:", true);
+        battery::superseded_fetch_is_cancelled(
+            &driver,
+            &counting_sql(1_000_000_000),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        battery::pre_aborted_fetch_returns_immediately(&driver, &counting_sql(1_000_000_000)).await;
+        battery::abort_after_completion_is_noop(&driver, &counting_sql(10)).await;
+    }
+
+    #[tokio::test]
     async fn introspects_tables_columns_fks_and_indexes() {
         let path = temp_db_path("introspect");
         {
@@ -940,7 +988,13 @@ mod tests {
             column: "name".into(),
             kind: KeyKind::Other,
         };
-        assert_eq!(driver.key_bounds(sql, &text_key).await.unwrap(), None);
+        assert_eq!(
+            driver
+                .key_bounds(sql, &text_key, &AbortSignal::new())
+                .await
+                .unwrap(),
+            None
+        );
 
         std::fs::remove_file(&path).ok();
     }

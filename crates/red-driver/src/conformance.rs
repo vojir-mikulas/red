@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use red_core::{ExportFormat, KeySpec, ObjectKind, QueryOptions, RedError, Value};
 
-use crate::{DatabaseDriver, PageCap, DISPLAY_CELL_CAP};
+use crate::{AbortSignal, DatabaseDriver, PageCap, DISPLAY_CELL_CAP};
 
 /// `open_cursor` streams the result in windows that never exceed the requested
 /// size, and the total is exact — memory stays flat regardless of result size.
@@ -67,6 +67,59 @@ pub(crate) async fn cancel_aborts_in_flight_fetch(
         Err(RedError::Interrupted) => {}
         other => panic!("expected Interrupted, got {other:?}"),
     }
+}
+
+/// A superseded one-shot fetch (`count` over `heavy_sql`) is aborted *at the
+/// engine*, not just abandoned: after `settle` the [`AbortSignal`] fires and the
+/// fetch returns `Interrupted` promptly — proving the engine stopped rather than
+/// the future being dropped while the server kept scanning. `heavy_sql` must keep a
+/// `count(*)` busy long enough to interrupt.
+pub(crate) async fn superseded_fetch_is_cancelled(
+    driver: &dyn DatabaseDriver,
+    heavy_sql: &str,
+    settle: Duration,
+) {
+    let abort = AbortSignal::new();
+    let trigger = abort.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(settle).await;
+        trigger.abort();
+    });
+    match driver.count(heavy_sql, &abort).await {
+        Err(RedError::Interrupted) => {}
+        other => panic!("expected Interrupted, got {other:?}"),
+    }
+}
+
+/// A fetch on an *already*-aborted signal bails immediately with `Interrupted` —
+/// the arm-after-abort path, so a fetch superseded while still queued behind the
+/// concurrency limit never reaches the engine. `heavy_sql` would run a long time
+/// if it *weren't* short-circuited, so a prompt return is the proof.
+pub(crate) async fn pre_aborted_fetch_returns_immediately(
+    driver: &dyn DatabaseDriver,
+    heavy_sql: &str,
+) {
+    let abort = AbortSignal::new();
+    abort.abort();
+    match driver.count(heavy_sql, &abort).await {
+        Err(RedError::Interrupted) => {}
+        other => panic!("expected immediate Interrupted, got {other:?}"),
+    }
+}
+
+/// A late abort, fired *after* its fetch completed, is a no-op — the driver
+/// disarmed on completion, so it can't cancel a connection that's since returned to
+/// a pool and serves the next fetch. `fast_sql` must be a cheap `count` source.
+pub(crate) async fn abort_after_completion_is_noop(driver: &dyn DatabaseDriver, fast_sql: &str) {
+    let abort = AbortSignal::new();
+    let first = driver.count(fast_sql, &abort).await.unwrap();
+    abort.abort(); // late — the fetch already disarmed it
+                   // A follow-up fetch on the (possibly reused) connection still succeeds.
+    let again = driver.count(fast_sql, &AbortSignal::new()).await.unwrap();
+    assert_eq!(
+        first, again,
+        "the reused connection is healthy after a late abort"
+    );
 }
 
 /// The introspection shape: `list_objects` surfaces the fixture tables and view
@@ -185,14 +238,19 @@ pub(crate) async fn seeks_forward_backward_and_reads_bounds(
         page.rows.iter().map(|r| r[col].clone()).collect::<Vec<_>>()
     };
 
+    let abort = AbortSignal::new();
+
     // First page: no bound, ascending from the start.
-    let first = driver.fetch_seek(sql, key, None, false, 5).await.unwrap();
+    let first = driver
+        .fetch_seek(sql, key, None, false, 5, &abort)
+        .await
+        .unwrap();
     assert_eq!(first.rows.len(), 5);
     assert_eq!(first.rows[0][0], Value::Integer(1));
 
     // Forward: strictly after a bound.
     let fwd = driver
-        .fetch_seek(sql, key, Some(&Value::Integer(997)), false, 5)
+        .fetch_seek(sql, key, Some(&Value::Integer(997)), false, 5, &abort)
         .await
         .unwrap();
     assert_eq!(
@@ -206,7 +264,7 @@ pub(crate) async fn seeks_forward_backward_and_reads_bounds(
 
     // Backward: strictly before a bound, returned descending (the caller flips).
     let back = driver
-        .fetch_seek(sql, key, Some(&Value::Integer(4)), true, 5)
+        .fetch_seek(sql, key, Some(&Value::Integer(4)), true, 5, &abort)
         .await
         .unwrap();
     assert_eq!(
@@ -216,25 +274,31 @@ pub(crate) async fn seeks_forward_backward_and_reads_bounds(
 
     // Seek + bounded skip (the exact-jump / checkpoint primitive): an inclusive
     // `>=` lower bound, then OFFSET within the post-seek window.
-    let from_start = driver.fetch_seek_skip(sql, key, None, 10, 3).await.unwrap();
+    let from_start = driver
+        .fetch_seek_skip(sql, key, None, 10, 3, &abort)
+        .await
+        .unwrap();
     assert_eq!(
         ids(&from_start, 0),
         vec![Value::Integer(11), Value::Integer(12), Value::Integer(13)]
     );
     // `>=` includes the bound itself (skip 0 lands on it).
     let inclusive = driver
-        .fetch_seek_skip(sql, key, Some(&Value::Integer(500)), 0, 1)
+        .fetch_seek_skip(sql, key, Some(&Value::Integer(500)), 0, 1, &abort)
         .await
         .unwrap();
     assert_eq!(ids(&inclusive, 0), vec![Value::Integer(500)]);
     // The bound is ordinal 0 of the window; skipping 10 lands on id 510.
     let skipped = driver
-        .fetch_seek_skip(sql, key, Some(&Value::Integer(500)), 10, 1)
+        .fetch_seek_skip(sql, key, Some(&Value::Integer(500)), 10, 1, &abort)
         .await
         .unwrap();
     assert_eq!(ids(&skipped, 0), vec![Value::Integer(510)]);
 
-    assert_eq!(driver.key_bounds(sql, key).await.unwrap(), Some((1, 1000)));
+    assert_eq!(
+        driver.key_bounds(sql, key, &abort).await.unwrap(),
+        Some((1, 1000))
+    );
 }
 
 /// The driver-side display cap (Track A1): a display fetch caps fat non-key cells
@@ -255,7 +319,11 @@ pub(crate) async fn caps_display_keeps_key_and_export(
     tag: &str,
 ) {
     // --- Display seek caps the fat non-key cells, key column verbatim. ---
-    let page = driver.fetch_seek(sql, key, None, false, 5).await.unwrap();
+    let abort = AbortSignal::new();
+    let page = driver
+        .fetch_seek(sql, key, None, false, 5, &abort)
+        .await
+        .unwrap();
     assert_eq!(page.rows.len(), 1, "fixture has exactly one row");
     let row = &page.rows[0];
 
@@ -290,7 +358,10 @@ pub(crate) async fn caps_display_keeps_key_and_export(
     }
 
     // --- A Full page fetch keeps the same cells whole (the clipboard re-fetch). ---
-    let full = driver.fetch_page(sql, 0, 5, PageCap::Full).await.unwrap();
+    let full = driver
+        .fetch_page(sql, 0, 5, PageCap::Full, &abort)
+        .await
+        .unwrap();
     match &full.rows[0][1] {
         Value::Text(s) => assert_eq!(s.len(), text_len, "Full keeps the whole text"),
         other => panic!("expected whole text under Full, got {other:?}"),

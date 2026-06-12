@@ -191,11 +191,7 @@ impl AppState {
             .right(px(16.))
             .child(settings_gear);
 
-        div()
-            .size_full()
-            .relative()
-            .child(screen)
-            .child(gear)
+        div().size_full().relative().child(screen).child(gear)
     }
 
     fn new_button(&self, cx: &mut Context<Self>) -> impl IntoElement {

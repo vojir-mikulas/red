@@ -37,7 +37,7 @@ use tokio::sync::{mpsc, Mutex};
 use crate::format::{
     csv_cell, csv_record, json_string, json_value, strip_trailing, ProgressThrottle,
 };
-use crate::{driver_err, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor};
+use crate::{driver_err, AbortSignal, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor};
 
 /// A live MySQL/MariaDB session. Holds a connection `Pool`: cursors take a
 /// dedicated connection for the duration of their stream, and the out-of-band
@@ -87,6 +87,22 @@ impl MysqlDriver {
         self.scope = database.filter(|d| !d.is_empty());
         self
     }
+
+    /// An out-of-band cancel that `KILL QUERY <conn_id>`s on a *separate* pooled
+    /// connection — MySQL has no in-band cancel-request protocol. Idempotent: a
+    /// `KILL` that lands after the query finished (or the connection went idle) is
+    /// a harmless no-op. Shared by the streaming cursor and the one-shot fetches.
+    fn kill_token(&self, conn_id: u32) -> CancelToken {
+        let pool = self.pool.clone();
+        CancelToken::new(move || {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                if let Ok(mut c) = pool.get_conn().await {
+                    let _ = c.query_drop(format!("KILL QUERY {conn_id}")).await;
+                }
+            });
+        })
+    }
 }
 
 #[async_trait]
@@ -109,17 +125,8 @@ impl DatabaseDriver for MysqlDriver {
         let columns: Vec<Column> = stmt.columns().iter().map(col_meta).collect();
 
         // Out-of-band cancel: `KILL QUERY` on a *separate* pooled connection aborts
-        // the thread running this cursor's query. Idempotent — a harmless no-op if
-        // the query already finished by the time the kill lands.
-        let pool = self.pool.clone();
-        let cancel = CancelToken::new(move || {
-            let pool = pool.clone();
-            tokio::spawn(async move {
-                if let Ok(mut c) = pool.get_conn().await {
-                    let _ = c.query_drop(format!("KILL QUERY {conn_id}")).await;
-                }
-            });
-        });
+        // the thread running this cursor's query.
+        let cancel = self.kill_token(conn_id);
 
         let (tx, rx) = mpsc::channel::<Result<Vec<Value>>>(opts.window.max(1));
         tokio::spawn(async move {
@@ -273,9 +280,13 @@ impl DatabaseDriver for MysqlDriver {
         })
     }
 
-    async fn count(&self, sql: &str) -> Result<i64> {
+    async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64> {
         let sql = format!("SELECT count(*) FROM ({}) AS _red", strip_trailing(sql));
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let _guard = abort.arm(self.kill_token(conn.id()));
+        if abort.is_aborted() {
+            return Err(RedError::Interrupted);
+        }
         let n: Option<i64> = conn.query_first(&sql).await.map_err(map_my_err)?;
         Ok(n.unwrap_or(0))
     }
@@ -286,12 +297,17 @@ impl DatabaseDriver for MysqlDriver {
         offset: usize,
         limit: usize,
         cap: PageCap,
+        abort: &AbortSignal,
     ) -> Result<ResultPage> {
         let sql = format!(
             "SELECT * FROM ({}) AS _red LIMIT {limit} OFFSET {offset}",
             strip_trailing(sql)
         );
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let _guard = abort.arm(self.kill_token(conn.id()));
+        if abort.is_aborted() {
+            return Err(RedError::Interrupted);
+        }
         let stmt = conn.prep(&sql).await.map_err(map_my_err)?;
         let columns: Vec<Column> = stmt.columns().iter().map(col_meta).collect();
         let rows: Vec<Row> = conn.exec(&stmt, ()).await.map_err(map_my_err)?;
@@ -309,6 +325,7 @@ impl DatabaseDriver for MysqlDriver {
         bound: Option<&Value>,
         descending: bool,
         limit: usize,
+        abort: &AbortSignal,
     ) -> Result<ResultPage> {
         let col = format!("`{}`", quote_ident(&key.column));
         let base = strip_trailing(sql);
@@ -324,6 +341,10 @@ impl DatabaseDriver for MysqlDriver {
             None => format!("SELECT * FROM ({base}) AS _red ORDER BY {col} {ord} LIMIT {limit}"),
         };
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let _guard = abort.arm(self.kill_token(conn.id()));
+        if abort.is_aborted() {
+            return Err(RedError::Interrupted);
+        }
         let stmt = conn.prep(&sql).await.map_err(map_my_err)?;
         let columns: Vec<Column> = stmt.columns().iter().map(col_meta).collect();
         let rows: Vec<Row> = match bound {
@@ -347,6 +368,7 @@ impl DatabaseDriver for MysqlDriver {
         from: Option<&Value>,
         skip: usize,
         limit: usize,
+        abort: &AbortSignal,
     ) -> Result<ResultPage> {
         let col = format!("`{}`", quote_ident(&key.column));
         let base = strip_trailing(sql);
@@ -360,6 +382,10 @@ impl DatabaseDriver for MysqlDriver {
             ),
         };
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let _guard = abort.arm(self.kill_token(conn.id()));
+        if abort.is_aborted() {
+            return Err(RedError::Interrupted);
+        }
         let stmt = conn.prep(&sql).await.map_err(map_my_err)?;
         let columns: Vec<Column> = stmt.columns().iter().map(col_meta).collect();
         let rows: Vec<Row> = match from {
@@ -376,13 +402,22 @@ impl DatabaseDriver for MysqlDriver {
         })
     }
 
-    async fn key_bounds(&self, sql: &str, key: &KeySpec) -> Result<Option<(i64, i64)>> {
+    async fn key_bounds(
+        &self,
+        sql: &str,
+        key: &KeySpec,
+        abort: &AbortSignal,
+    ) -> Result<Option<(i64, i64)>> {
         let col = format!("`{}`", quote_ident(&key.column));
         let sql = format!(
             "SELECT min({col}), max({col}) FROM ({}) AS _red",
             strip_trailing(sql)
         );
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let _guard = abort.arm(self.kill_token(conn.id()));
+        if abort.is_aborted() {
+            return Err(RedError::Interrupted);
+        }
         let stmt = conn.prep(&sql).await.map_err(map_my_err)?;
         let rows: Vec<Row> = conn.exec(&stmt, ()).await.map_err(map_my_err)?;
         Ok(rows.first().map(|r| my_row(r, None)).and_then(|cells| {
@@ -762,6 +797,24 @@ mod tests {
                    CROSS JOIN information_schema.columns c";
         battery::cancel_aborts_in_flight_fetch(&driver, sql, std::time::Duration::from_millis(200))
             .await;
+    }
+
+    #[tokio::test]
+    async fn superseded_one_shot_fetch_is_cancelled() {
+        let url = url_or_skip!();
+        let driver = MysqlDriver::connect(&url, true).await.unwrap();
+        // count(*) over a heavy triple cross join keeps the engine busy to KILL.
+        let heavy = "SELECT a.ORDINAL_POSITION FROM information_schema.columns a \
+                     CROSS JOIN information_schema.columns b \
+                     CROSS JOIN information_schema.columns c";
+        battery::superseded_fetch_is_cancelled(
+            &driver,
+            heavy,
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        battery::pre_aborted_fetch_returns_immediately(&driver, heavy).await;
+        battery::abort_after_completion_is_noop(&driver, "SELECT 1").await;
     }
 
     #[tokio::test]

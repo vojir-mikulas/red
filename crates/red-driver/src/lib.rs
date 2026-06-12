@@ -8,8 +8,8 @@
 //! results of any size, the layer's central performance contract.
 
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use red_core::{
@@ -117,19 +117,22 @@ pub trait DatabaseDriver: Send + Sync {
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableDetail>;
 
     /// Total row count of `sql`'s result — one pass, no row materialization. Lets
-    /// the grid show a real scrollbar without holding every row.
-    async fn count(&self, sql: &str) -> Result<i64>;
+    /// the grid show a real scrollbar without holding every row. `abort` cancels
+    /// the (potentially full-table) scan out-of-band when the result is superseded.
+    async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64>;
 
     /// A random-access `(offset, limit)` page of `sql`'s result. Backs the grid's
     /// load-on-scroll so memory stays flat: only the pages around the viewport are
     /// ever resident. `cap` chooses display capping (the common scroll path) or
-    /// full fidelity (the clipboard re-fetch) — see [`PageCap`].
+    /// full fidelity (the clipboard re-fetch) — see [`PageCap`]. `abort` cancels a
+    /// superseded fetch (a flung scrollbar, a closed tab) at the engine.
     async fn fetch_page(
         &self,
         sql: &str,
         offset: usize,
         limit: usize,
         cap: PageCap,
+        abort: &AbortSignal,
     ) -> Result<ResultPage>;
 
     /// One keyset (seek) page of `sql`'s result, ordered by `key`: the rows
@@ -145,6 +148,7 @@ pub trait DatabaseDriver: Send + Sync {
         bound: Option<&Value>,
         descending: bool,
         limit: usize,
+        abort: &AbortSignal,
     ) -> Result<ResultPage>;
 
     /// One keyset page from an inclusive lower bound with a bounded `skip`:
@@ -162,12 +166,19 @@ pub trait DatabaseDriver: Send + Sync {
         from: Option<&Value>,
         skip: usize,
         limit: usize,
+        abort: &AbortSignal,
     ) -> Result<ResultPage>;
 
     /// `MIN`/`MAX` of `key` over `sql`'s result — one indexed probe, backing
     /// key-space interpolation for fraction jumps. `None` when the result is
-    /// empty or the key isn't an integer (not interpolable).
-    async fn key_bounds(&self, sql: &str, key: &KeySpec) -> Result<Option<(i64, i64)>>;
+    /// empty or the key isn't an integer (not interpolable). `abort` cancels the
+    /// probe out-of-band when the open it belongs to is superseded.
+    async fn key_bounds(
+        &self,
+        sql: &str,
+        key: &KeySpec,
+        abort: &AbortSignal,
+    ) -> Result<Option<(i64, i64)>>;
 
     /// Run a non-row-returning statement wrapped in a transaction, returning the
     /// number of rows affected. A read-only driver rejects the write at the engine.
@@ -223,6 +234,93 @@ impl CancelToken {
     pub fn cancel(&self) {
         (self.0)()
     }
+}
+
+/// A caller-created abort handle for one in-flight one-shot fetch (`count`,
+/// `fetch_page`, `fetch_seek`, `fetch_seek_skip`, `key_bounds`). The service makes
+/// one per cancellable fetch, keeps a clone, and calls [`abort`](Self::abort) when
+/// that fetch is superseded — a flung scrollbar, a re-sort, a closed tab.
+///
+/// Where [`CancelToken`] is produced *by* the driver (the streaming cursor hands
+/// one back), a one-shot `async fn` can't return a handle before it's awaited — so
+/// this inverts it: the caller owns the handle and the driver [`arm`](Self::arm)s
+/// it with an engine [`CancelToken`] for the fetch's lifetime. The arm is dropped
+/// when the fetch returns ([`ArmGuard`]), so a late `abort` after completion — the
+/// connection already back in a pool and reused — is a harmless no-op.
+///
+/// A single signal can be armed by several concurrent fetches (the open probe runs
+/// `count` + `fetch_page` + `key_bounds` together under one signal); `abort` fires
+/// every armed token.
+#[derive(Clone, Default)]
+pub struct AbortSignal(Arc<AbortState>);
+
+#[derive(Default)]
+struct AbortState {
+    aborted: AtomicBool,
+    next_id: AtomicU64,
+    /// The engine cancels currently armed (one per in-flight fetch sharing this
+    /// signal), each tagged with a unique id so its [`ArmGuard`] removes only its own.
+    armed: Mutex<Vec<(u64, CancelToken)>>,
+}
+
+impl AbortSignal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Supersede every fetch armed on this signal: fire each armed engine cancel
+    /// and latch the aborted state so a fetch that arms *after* this dies at once.
+    /// Idempotent and non-blocking.
+    pub fn abort(&self) {
+        let armed = lock(&self.0.armed);
+        self.0.aborted.store(true, Ordering::SeqCst);
+        for (_, token) in armed.iter() {
+            token.cancel();
+        }
+    }
+
+    /// Whether [`abort`](Self::abort) has fired. Drivers check this right before the
+    /// engine call so a fetch superseded *before* it starts bails immediately —
+    /// some engines no-op an out-of-band cancel with nothing yet running.
+    pub fn is_aborted(&self) -> bool {
+        self.0.aborted.load(Ordering::SeqCst)
+    }
+
+    /// Driver side: install `token` as this fetch's engine cancel for the duration
+    /// of the returned guard. If the signal already aborted, fire `token` now (the
+    /// arm-after-abort race). Cancel/arm are serialized on the same lock so a
+    /// concurrent `abort` can't slip between the check and the install.
+    pub(crate) fn arm(&self, token: CancelToken) -> ArmGuard {
+        let id = self.0.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut armed = lock(&self.0.armed);
+        if self.0.aborted.load(Ordering::SeqCst) {
+            token.cancel();
+        }
+        armed.push((id, token));
+        ArmGuard {
+            state: self.0.clone(),
+            id,
+        }
+    }
+}
+
+/// Disarms its fetch's engine cancel on drop (fetch completion), so a later
+/// `abort` can't reach a connection that's since been returned to a pool/reused.
+pub(crate) struct ArmGuard {
+    state: Arc<AbortState>,
+    id: u64,
+}
+
+impl Drop for ArmGuard {
+    fn drop(&mut self) {
+        lock(&self.state.armed).retain(|(id, _)| *id != self.id);
+    }
+}
+
+/// Lock a mutex, tolerating poison — the armed-list critical sections can't panic,
+/// but recovering the guard keeps a stray panic elsewhere from wedging cancels.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 /// Map any error carrying a message into a driver error. Small helper so impls

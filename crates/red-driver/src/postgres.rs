@@ -23,26 +23,75 @@ use red_core::{
 };
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::sync::Mutex as StdMutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
 use tokio_postgres::types::{ToSql, Type};
-use tokio_postgres::{Client, NoTls, Row, RowStream};
+use tokio_postgres::{Client, NoTls, Row, RowStream, Statement};
 
 use crate::format::{
     csv_cell, csv_record, json_string, json_value, strip_trailing, ProgressThrottle,
 };
-use crate::{driver_err, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor};
+use crate::{
+    driver_err, AbortSignal, ArmGuard, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor,
+};
 
-/// A live PostgreSQL session. Holds the shared `Client`; the connection future
-/// runs on a background task spawned at connect.
+/// Warm fetch connections kept ready for the one-shot read paths. `tokio-postgres`
+/// cancellation is *connection-scoped*, so running every page/seek/count on the one
+/// shared `Client` would mean a superseded fetch's cancel could land on a sibling
+/// fetch pipelined on the same connection. A small pool gives each cancellable
+/// fetch its own connection, so its cancel hits exactly its own query. Grows
+/// lazily (nothing opened until the first fetch) to respect the cold-start budget.
+const FETCH_POOL_CAP: usize = 4;
+
+/// A live PostgreSQL session. Holds the shared `Client` (cursor, introspection,
+/// `execute`) plus a small lazily-grown pool of warm connections the cancellable
+/// one-shot fetches borrow — see [`FETCH_POOL_CAP`].
 pub struct PostgresDriver {
     client: Arc<Client>,
     version: String,
+    dsn: String,
+    read_only: bool,
+    /// Idle fetch connections, returned after each one-shot fetch. A free list, not
+    /// a semaphore — `acquire` opens a fresh connection when it's empty.
+    pool: StdMutex<Vec<Arc<Client>>>,
 }
 
 /// No bind parameters — `query_raw` needs a typed iterator, so spell out the kind.
 fn no_params() -> Vec<&'static (dyn ToSql + Sync)> {
     Vec::new()
+}
+
+/// Lock a mutex, tolerating poison (the free-list critical sections can't panic).
+fn lock<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// An out-of-band cancel for `client`: a separate cancel request over a fresh
+/// connection (not a dropped future). `client` is one connection, so this cancels
+/// exactly that connection's in-flight query.
+fn pg_cancel_token(client: &Client) -> CancelToken {
+    let token = client.cancel_token();
+    CancelToken::new(move || {
+        let token = token.clone();
+        tokio::spawn(async move {
+            let _ = token.cancel_query(NoTls).await;
+        });
+    })
+}
+
+/// Prepare `sql` on `client` and read its column metadata (works for an empty result).
+async fn prepare_columns(client: &Client, sql: &str) -> Result<(Statement, Vec<Column>)> {
+    let stmt = client.prepare(sql).await.map_err(driver_err)?;
+    let columns = stmt
+        .columns()
+        .iter()
+        .map(|c| Column {
+            name: c.name().to_string(),
+            decl_type: Some(c.type_().name().to_string()),
+        })
+        .collect();
+    Ok((stmt, columns))
 }
 
 impl PostgresDriver {
@@ -73,21 +122,76 @@ impl PostgresDriver {
         Ok(Self {
             client: Arc::new(client),
             version,
+            dsn: dsn.to_string(),
+            read_only,
+            pool: StdMutex::new(Vec::new()),
         })
     }
 
-    /// Prepare `sql` and read its column metadata (works even for an empty result).
-    async fn prepare_columns(&self, sql: &str) -> Result<(tokio_postgres::Statement, Vec<Column>)> {
-        let stmt = self.client.prepare(sql).await.map_err(driver_err)?;
-        let columns = stmt
-            .columns()
-            .iter()
-            .map(|c| Column {
-                name: c.name().to_string(),
-                decl_type: Some(c.type_().name().to_string()),
-            })
-            .collect();
-        Ok((stmt, columns))
+    /// Borrow a warm fetch connection: pop a live one off the free list, or open a
+    /// fresh one. Dead connections (a dropped backend) are discarded, not reused.
+    async fn acquire(&self) -> Result<Arc<Client>> {
+        loop {
+            let pooled = lock(&self.pool).pop();
+            match pooled {
+                Some(c) if !c.is_closed() => return Ok(c),
+                Some(_) => continue, // closed — drop it and try the next
+                None => break,
+            }
+        }
+        self.open_fetch_conn().await
+    }
+
+    /// Return a fetch connection to the free list (dropping it if dead or the pool
+    /// is at cap). Call only *after* disarming the fetch's cancel, so a late abort
+    /// can't fire against a connection that's about to serve someone else.
+    fn release(&self, client: Arc<Client>) {
+        if client.is_closed() {
+            return;
+        }
+        let mut pool = lock(&self.pool);
+        if pool.len() < FETCH_POOL_CAP {
+            pool.push(client);
+        }
+    }
+
+    /// Open one fetch connection with the same read-only posture as the main client.
+    async fn open_fetch_conn(&self) -> Result<Arc<Client>> {
+        let (client, connection) = tokio_postgres::connect(&self.dsn, NoTls)
+            .await
+            .map_err(|e| RedError::Connect(e.to_string()))?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        if self.read_only {
+            client
+                .batch_execute("SET default_transaction_read_only = on")
+                .await
+                .map_err(|e| RedError::Connect(e.to_string()))?;
+        }
+        Ok(Arc::new(client))
+    }
+
+    /// Run `f` on a borrowed fetch connection with `abort` armed to its cancel for
+    /// the duration. Disarms *before* the connection returns to the pool, so a late
+    /// `abort` never reaches a reused connection. A fetch superseded before it
+    /// starts bails with `Interrupted` (a connection-scoped cancel is a no-op with
+    /// nothing yet running).
+    async fn with_fetch_conn<T, F, Fut>(&self, abort: &AbortSignal, f: F) -> Result<T>
+    where
+        F: FnOnce(Arc<Client>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let client = self.acquire().await?;
+        let guard = abort.arm(pg_cancel_token(&client));
+        let result = if abort.is_aborted() {
+            Err(RedError::Interrupted)
+        } else {
+            f(client.clone()).await
+        };
+        drop::<ArmGuard>(guard); // disarm before the connection is reusable
+        self.release(client);
+        result
     }
 }
 
@@ -105,7 +209,7 @@ impl DatabaseDriver for PostgresDriver {
     }
 
     async fn open_cursor(&self, sql: &str, _opts: QueryOptions) -> Result<Box<dyn QueryCursor>> {
-        let (stmt, columns) = self.prepare_columns(sql).await?;
+        let (stmt, columns) = prepare_columns(&self.client, sql).await?;
         let stream = self
             .client
             .query_raw(&stmt, no_params())
@@ -113,13 +217,7 @@ impl DatabaseDriver for PostgresDriver {
             .map_err(driver_err)?;
 
         // Out-of-band cancel: a separate cancel request over a fresh connection.
-        let cancel_token = self.client.cancel_token();
-        let cancel = CancelToken::new(move || {
-            let token = cancel_token.clone();
-            tokio::spawn(async move {
-                let _ = token.cancel_query(NoTls).await;
-            });
-        });
+        let cancel = pg_cancel_token(&self.client);
 
         Ok(Box::new(PgCursor {
             columns,
@@ -278,10 +376,13 @@ impl DatabaseDriver for PostgresDriver {
         })
     }
 
-    async fn count(&self, sql: &str) -> Result<i64> {
+    async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64> {
         let sql = format!("SELECT count(*) FROM ({}) AS _red", strip_trailing(sql));
-        let row = self.client.query_one(&sql, &[]).await.map_err(driver_err)?;
-        Ok(row.get(0))
+        self.with_fetch_conn(abort, |client| async move {
+            let row = client.query_one(&sql, &[]).await.map_err(map_pg_err)?;
+            Ok(row.get(0))
+        })
+        .await
     }
 
     async fn fetch_page(
@@ -290,18 +391,22 @@ impl DatabaseDriver for PostgresDriver {
         offset: usize,
         limit: usize,
         cap: PageCap,
+        abort: &AbortSignal,
     ) -> Result<ResultPage> {
         let sql = format!(
             "SELECT * FROM ({}) AS _red LIMIT {limit} OFFSET {offset}",
             strip_trailing(sql)
         );
-        let (stmt, columns) = self.prepare_columns(&sql).await?;
-        let rows = self.client.query(&stmt, &[]).await.map_err(driver_err)?;
-        let cap = CellCap::resolve(&cap, &columns);
-        Ok(ResultPage {
-            rows: rows.iter().map(|r| pg_row(r, cap)).collect(),
-            columns,
+        self.with_fetch_conn(abort, |client| async move {
+            let (stmt, columns) = prepare_columns(&client, &sql).await?;
+            let rows = client.query(&stmt, &[]).await.map_err(map_pg_err)?;
+            let cap = CellCap::resolve(&cap, &columns);
+            Ok(ResultPage {
+                rows: rows.iter().map(|r| pg_row(r, cap)).collect(),
+                columns,
+            })
         })
+        .await
     }
 
     async fn fetch_seek(
@@ -311,6 +416,7 @@ impl DatabaseDriver for PostgresDriver {
         bound: Option<&Value>,
         descending: bool,
         limit: usize,
+        abort: &AbortSignal,
     ) -> Result<ResultPage> {
         let col = pg_quote(&key.column);
         let base = strip_trailing(sql);
@@ -330,23 +436,27 @@ impl DatabaseDriver for PostgresDriver {
             ),
             None => format!("SELECT * FROM ({base}) AS _red ORDER BY {col} {ord} LIMIT {limit}"),
         };
-        let (stmt, columns) = self.prepare_columns(&sql).await?;
-        let rows = match bound {
-            Some(Value::Integer(n)) => self.client.query(&stmt, &[n]).await,
-            Some(Value::Real(x)) => self.client.query(&stmt, &[x]).await,
-            Some(Value::Text(s)) => self.client.query(&stmt, &[s]).await,
-            Some(Value::Blob(b)) => self.client.query(&stmt, &[b]).await,
-            Some(Value::Null) | Some(Value::Capped(_)) => {
-                return Err(RedError::Query("null seek bound".into()))
+        let bound = bound.cloned();
+        self.with_fetch_conn(abort, |client| async move {
+            let (stmt, columns) = prepare_columns(&client, &sql).await?;
+            let rows = match &bound {
+                Some(Value::Integer(n)) => client.query(&stmt, &[n]).await,
+                Some(Value::Real(x)) => client.query(&stmt, &[x]).await,
+                Some(Value::Text(s)) => client.query(&stmt, &[s]).await,
+                Some(Value::Blob(b)) => client.query(&stmt, &[b]).await,
+                Some(Value::Null) | Some(Value::Capped(_)) => {
+                    return Err(RedError::Query("null seek bound".into()))
+                }
+                None => client.query(&stmt, &[]).await,
             }
-            None => self.client.query(&stmt, &[]).await,
-        }
-        .map_err(map_pg_err)?;
-        let cap = CellCap::display(key_col(&columns, key));
-        Ok(ResultPage {
-            rows: rows.iter().map(|r| pg_row(r, cap)).collect(),
-            columns,
+            .map_err(map_pg_err)?;
+            let cap = CellCap::display(key_col(&columns, key));
+            Ok(ResultPage {
+                rows: rows.iter().map(|r| pg_row(r, cap)).collect(),
+                columns,
+            })
         })
+        .await
     }
 
     async fn fetch_seek_skip(
@@ -356,6 +466,7 @@ impl DatabaseDriver for PostgresDriver {
         from: Option<&Value>,
         skip: usize,
         limit: usize,
+        abort: &AbortSignal,
     ) -> Result<ResultPage> {
         let col = pg_quote(&key.column);
         let base = strip_trailing(sql);
@@ -369,38 +480,50 @@ impl DatabaseDriver for PostgresDriver {
                 "SELECT * FROM ({base}) AS _red ORDER BY {col} ASC LIMIT {limit} OFFSET {skip}"
             ),
         };
-        let (stmt, columns) = self.prepare_columns(&sql).await?;
-        let rows = match from {
-            Some(Value::Integer(n)) => self.client.query(&stmt, &[n]).await,
-            Some(Value::Real(x)) => self.client.query(&stmt, &[x]).await,
-            Some(Value::Text(s)) => self.client.query(&stmt, &[s]).await,
-            Some(Value::Blob(b)) => self.client.query(&stmt, &[b]).await,
-            Some(Value::Null) | Some(Value::Capped(_)) => {
-                return Err(RedError::Query("null seek bound".into()))
+        let from = from.cloned();
+        self.with_fetch_conn(abort, |client| async move {
+            let (stmt, columns) = prepare_columns(&client, &sql).await?;
+            let rows = match &from {
+                Some(Value::Integer(n)) => client.query(&stmt, &[n]).await,
+                Some(Value::Real(x)) => client.query(&stmt, &[x]).await,
+                Some(Value::Text(s)) => client.query(&stmt, &[s]).await,
+                Some(Value::Blob(b)) => client.query(&stmt, &[b]).await,
+                Some(Value::Null) | Some(Value::Capped(_)) => {
+                    return Err(RedError::Query("null seek bound".into()))
+                }
+                None => client.query(&stmt, &[]).await,
             }
-            None => self.client.query(&stmt, &[]).await,
-        }
-        .map_err(map_pg_err)?;
-        let cap = CellCap::display(key_col(&columns, key));
-        Ok(ResultPage {
-            rows: rows.iter().map(|r| pg_row(r, cap)).collect(),
-            columns,
+            .map_err(map_pg_err)?;
+            let cap = CellCap::display(key_col(&columns, key));
+            Ok(ResultPage {
+                rows: rows.iter().map(|r| pg_row(r, cap)).collect(),
+                columns,
+            })
         })
+        .await
     }
 
-    async fn key_bounds(&self, sql: &str, key: &KeySpec) -> Result<Option<(i64, i64)>> {
+    async fn key_bounds(
+        &self,
+        sql: &str,
+        key: &KeySpec,
+        abort: &AbortSignal,
+    ) -> Result<Option<(i64, i64)>> {
         let col = pg_quote(&key.column);
         let sql = format!(
             "SELECT min({col}), max({col}) FROM ({}) AS _red",
             strip_trailing(sql)
         );
-        let rows = self.client.query(&sql, &[]).await.map_err(driver_err)?;
-        Ok(rows.first().map(|r| pg_row(r, None)).and_then(|cells| {
-            match (cells.first(), cells.get(1)) {
-                (Some(Value::Integer(min)), Some(Value::Integer(max))) => Some((*min, *max)),
-                _ => None,
-            }
-        }))
+        self.with_fetch_conn(abort, |client| async move {
+            let rows = client.query(&sql, &[]).await.map_err(map_pg_err)?;
+            Ok(rows.first().map(|r| pg_row(r, None)).and_then(|cells| {
+                match (cells.first(), cells.get(1)) {
+                    (Some(Value::Integer(min)), Some(Value::Integer(max))) => Some((*min, *max)),
+                    _ => None,
+                }
+            }))
+        })
+        .await
     }
 
     async fn execute(&self, sql: &str) -> Result<u64> {
@@ -432,7 +555,7 @@ impl DatabaseDriver for PostgresDriver {
         progress: UnboundedSender<u64>,
     ) -> Result<u64> {
         let sql = format!("SELECT * FROM ({}) AS _red", strip_trailing(sql));
-        let (stmt, columns) = self.prepare_columns(&sql).await?;
+        let (stmt, columns) = prepare_columns(&self.client, &sql).await?;
         let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
 
         let stream = self
@@ -716,7 +839,13 @@ mod tests {
     /// private client.
     async fn current_schema(driver: &PostgresDriver) -> String {
         let page = driver
-            .fetch_page("SELECT current_schema()", 0, 1, PageCap::Full)
+            .fetch_page(
+                "SELECT current_schema()",
+                0,
+                1,
+                PageCap::Full,
+                &AbortSignal::new(),
+            )
             .await
             .unwrap();
         match &page.rows[0][0] {
@@ -753,6 +882,57 @@ mod tests {
                    CROSS JOIN generate_series(1, 100000) b";
         battery::cancel_aborts_in_flight_fetch(&driver, sql, std::time::Duration::from_millis(200))
             .await;
+    }
+
+    #[tokio::test]
+    async fn superseded_one_shot_fetch_is_cancelled() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, true).await.unwrap();
+        // count(*) over a 10^10-row cross join keeps the backend busy to interrupt.
+        let heavy = "SELECT a FROM generate_series(1, 100000) a \
+                     CROSS JOIN generate_series(1, 100000) b";
+        battery::superseded_fetch_is_cancelled(
+            &driver,
+            heavy,
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        battery::pre_aborted_fetch_returns_immediately(&driver, heavy).await;
+        battery::abort_after_completion_is_noop(&driver, "SELECT 1").await;
+    }
+
+    /// The reason Postgres fetches use a pool: cancelling one fetch's abort signal
+    /// must not disturb another fetch in flight on a *different* pooled connection.
+    #[tokio::test]
+    async fn superseding_one_fetch_spares_a_concurrent_one() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, true).await.unwrap();
+        let heavy = "SELECT a FROM generate_series(1, 100000) a \
+                     CROSS JOIN generate_series(1, 100000) b";
+
+        let doomed = AbortSignal::new();
+        let kept = AbortSignal::new();
+        // Abort only `doomed` once both are in flight on their own pooled conns.
+        let trigger = doomed.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            trigger.abort();
+        });
+
+        let (a, b) = tokio::join!(
+            driver.count(heavy, &doomed),
+            // A finite-but-still-running count that must complete untouched.
+            driver.count("SELECT generate_series(1, 5000000)", &kept),
+        );
+        assert!(
+            matches!(a, Err(RedError::Interrupted)),
+            "doomed fetch cancelled: {a:?}"
+        );
+        assert_eq!(
+            b.unwrap(),
+            5_000_000,
+            "the concurrent fetch finished unharmed"
+        );
     }
 
     #[tokio::test]
