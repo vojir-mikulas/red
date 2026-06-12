@@ -451,6 +451,10 @@ fn cell_string(value: &Value) -> String {
         Value::Real(x) => x.to_string(),
         Value::Text(s) => s.clone(),
         Value::Blob(b) => format!("<{} bytes>", b.len()),
+        // A capped blob copies as its summary; a capped text would re-fetch full
+        // before reaching here (`copy_plan`), so its head is only a defensive form.
+        Value::Capped(c) if c.blob => format!("<{} bytes>", c.len),
+        Value::Capped(c) => format!("{}…", c.head),
     }
 }
 
