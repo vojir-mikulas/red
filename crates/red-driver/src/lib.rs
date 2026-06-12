@@ -50,45 +50,102 @@ pub enum PageCap {
 }
 
 /// The positional, per-extraction form of a display cap: the byte budget plus the
-/// result-column index of the key (exempt — its value must round-trip exactly).
+/// result-column indices of the key columns (exempt — each rides back verbatim as
+/// a seek bound, so its value must round-trip exactly). A composite sort key has
+/// two exempt columns (lead + tiebreaker); a plain browse has one.
 /// `None` everywhere a fetch is full-fidelity (export / clipboard re-fetch).
 #[derive(Clone, Copy)]
 pub(crate) struct CellCap {
     pub(crate) max_bytes: usize,
-    pub(crate) key_col: Option<usize>,
+    pub(crate) key_cols: [Option<usize>; 2],
 }
 
 impl CellCap {
     /// Resolve a [`PageCap`] against a result's columns into a positional cap.
-    /// `Full` → `None` (nothing capped); `Display` → the key's column index (if the
-    /// named key is present) is the lone exempt column.
+    /// `Full` → `None` (nothing capped); `Display` → the key's column indices (the
+    /// present ones) are the exempt columns.
     pub(crate) fn resolve(cap: &PageCap, columns: &[Column]) -> Option<CellCap> {
         match cap {
             PageCap::Full => None,
             PageCap::Display { key } => Some(CellCap {
                 max_bytes: DISPLAY_CELL_CAP,
-                key_col: key
+                key_cols: key
                     .as_ref()
-                    .and_then(|k| columns.iter().position(|c| c.name == k.column)),
+                    .map(|k| key_positions(k, columns))
+                    .unwrap_or([None, None]),
             }),
         }
     }
 
-    /// The display cap a seek/cursor fetch applies: always on, exempting `key_col`.
-    pub(crate) fn display(key_col: Option<usize>) -> Option<CellCap> {
+    /// The display cap a seek/cursor fetch applies: always on, exempting the key
+    /// columns (see [`key_positions`]).
+    pub(crate) fn display(key_cols: [Option<usize>; 2]) -> Option<CellCap> {
         Some(CellCap {
             max_bytes: DISPLAY_CELL_CAP,
-            key_col,
+            key_cols,
         })
     }
 
-    /// Whether column `i` is capped under `cap` (`None` cap → nothing capped).
+    /// Whether column `i` is capped under `cap` (`None` cap → nothing capped; a key
+    /// column → never capped).
     pub(crate) fn caps(cap: Option<CellCap>, i: usize) -> Option<usize> {
         match cap {
-            Some(c) if c.key_col != Some(i) => Some(c.max_bytes),
+            Some(c) if !c.key_cols.contains(&Some(i)) => Some(c.max_bytes),
             _ => None,
         }
     }
+}
+
+/// The result-column indices of `key`'s columns (lead, then tiebreaker), used to
+/// exempt them from the display cap. A missing column resolves to `None`.
+pub(crate) fn key_positions(key: &KeySpec, columns: &[Column]) -> [Option<usize>; 2] {
+    let find = |name: &str| columns.iter().position(|c| c.name == name);
+    [find(&key.column), key.tiebreak.as_deref().and_then(find)]
+}
+
+/// Build a seek's `WHERE (cols) cmp (ph…)` and `ORDER BY cols dir` clauses, shared
+/// across the three drivers (only quoting and placeholder syntax differ). The seek
+/// is a single row-value comparison over the leading `bound_len` key columns, so
+/// every column shares one direction: the key's [`descending`](KeySpec::descending)
+/// sort, XOR'd with `scroll_descending` (the up/down scroll direction).
+/// `inclusive` picks `>=`/`<=` (the `fetch_seek_skip` lower bound) over `>`/`<`.
+///
+/// `quote` quotes one identifier; `placeholder(i)` renders the `i`-th (0-based)
+/// bind slot (e.g. `?` or `$1::int8`). `bound_len == 0` yields an empty `WHERE`
+/// (a first/last page). The returned `WHERE` clause carries a trailing space so it
+/// drops cleanly before `ORDER BY` when present.
+pub(crate) fn seek_clauses(
+    key: &KeySpec,
+    bound_len: usize,
+    scroll_descending: bool,
+    inclusive: bool,
+    quote: impl Fn(&str) -> String,
+    placeholder: impl Fn(usize) -> String,
+) -> (String, String) {
+    let cols: Vec<String> = key.column_names().iter().map(|c| quote(c)).collect();
+    let descending = key.descending ^ scroll_descending;
+    let (strict, dir) = if descending { ("<", "DESC") } else { (">", "ASC") };
+    let cmp = if inclusive {
+        format!("{strict}=")
+    } else {
+        strict.to_string()
+    };
+    let order_by = cols
+        .iter()
+        .map(|c| format!("{c} {dir}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let where_clause = if bound_len == 0 {
+        String::new()
+    } else {
+        let lhs = cols[..bound_len].join(", ");
+        let rhs = (0..bound_len)
+            .map(&placeholder)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("WHERE ({lhs}) {cmp} ({rhs}) ")
+    };
+    (where_clause, order_by)
 }
 
 /// One open database session. Object-safe so the service can hold
@@ -135,35 +192,41 @@ pub trait DatabaseDriver: Send + Sync {
         abort: &AbortSignal,
     ) -> Result<ResultPage>;
 
-    /// One keyset (seek) page of `sql`'s result, ordered by `key`: the rows
-    /// strictly after (`descending = false`) or strictly before (`descending =
-    /// true`, returned in reverse order — the caller flips) `bound`; `None`
-    /// starts from the result's first/last row. An indexed seek, so it costs the
-    /// same at row 200 or 46,000,000 — unlike `fetch_page`'s O(offset). `bound`
-    /// is bound as a real parameter, never string-interpolated.
+    /// One keyset (seek) page of `sql`'s result, ordered by `key`'s column tuple:
+    /// the rows strictly after (`descending = false`) or strictly before
+    /// (`descending = true`, returned in reverse order — the caller flips)
+    /// `bound`; `None` starts from the result's first/last row. An indexed seek,
+    /// so it costs the same at row 200 or 46,000,000 — unlike `fetch_page`'s
+    /// O(offset).
+    ///
+    /// `descending` is the *scroll* direction; it composes (XOR) with the key's
+    /// own [`descending`](KeySpec::descending) sort direction. `bound` carries one
+    /// value per leading key column — the full tuple for a contiguous seek, or
+    /// just the lead value for a key-space interpolation jump (a prefix
+    /// comparison). Each value is bound as a real parameter, never interpolated.
     async fn fetch_seek(
         &self,
         sql: &str,
         key: &KeySpec,
-        bound: Option<&Value>,
+        bound: Option<&[Value]>,
         descending: bool,
         limit: usize,
         abort: &AbortSignal,
     ) -> Result<ResultPage>;
 
     /// One keyset page from an inclusive lower bound with a bounded `skip`:
-    /// rows with `key >= from`, ordered by `key`, skipping `skip` then taking
-    /// `limit`. `from = None` starts at the result's first row. The lower bound
-    /// is an *indexed* seek, so the `OFFSET skip` only walks within the
+    /// rows at or after `from` in the key's sort order, skipping `skip` then
+    /// taking `limit`. `from = None` starts at the result's first row. The lower
+    /// bound is an *indexed* seek, so the `OFFSET skip` only walks within the
     /// post-seek window — O(skip), not O(offset-from-row-0). Backs exact "go to
     /// row N" jumps and the checkpoint-index build, which both seek to a known
-    /// key and then step a bounded number of rows. `from` is bound as a real
-    /// parameter, never string-interpolated.
+    /// key and then step a bounded number of rows. `from` carries one value per
+    /// leading key column, each bound as a real parameter.
     async fn fetch_seek_skip(
         &self,
         sql: &str,
         key: &KeySpec,
-        from: Option<&Value>,
+        from: Option<&[Value]>,
         skip: usize,
         limit: usize,
         abort: &AbortSignal,

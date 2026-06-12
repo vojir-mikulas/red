@@ -206,6 +206,7 @@ async fn opens_and_pages_result() {
         sql: counting_sql(1000),
         epoch: 1,
         table: None,
+        sort: None,
     });
     match events.next().await {
         Some(Event::ResultReady {
@@ -269,6 +270,7 @@ async fn resolves_key_and_serves_runs() {
         sql: "SELECT * FROM t".into(),
         epoch: 7,
         table: Some(("main".into(), "t".into())),
+        sort: None,
     });
     match events.next().await {
         Some(Event::ResultReady { total, key, .. }) => {
@@ -304,7 +306,7 @@ async fn resolves_key_and_serves_runs() {
     handle.send(Command::FetchRun {
         epoch: 7,
         fetch: RunFetch::Forward {
-            after: Some(Value::Integer(3)),
+            after: Some(vec![Value::Integer(3)]),
         },
         limit: 3,
         seq: 2,
@@ -320,7 +322,7 @@ async fn resolves_key_and_serves_runs() {
     handle.send(Command::FetchRun {
         epoch: 7,
         fetch: RunFetch::Backward {
-            before: Value::Integer(4),
+            before: vec![Value::Integer(4)],
         },
         limit: 5,
         seq: 3,
@@ -430,6 +432,7 @@ async fn mariadb_keyset_end_to_end() {
         sql: format!("SELECT * FROM `{}`.`{table}`", p.database),
         epoch: 1,
         table: Some((p.database.clone(), table.clone())),
+        sort: None,
     });
     match events.next().await {
         Some(Event::ResultReady { total, key, .. }) => {
@@ -446,7 +449,7 @@ async fn mariadb_keyset_end_to_end() {
     handle.send(Command::FetchRun {
         epoch: 1,
         fetch: RunFetch::Forward {
-            after: Some(Value::Integer(999_000)),
+            after: Some(vec![Value::Integer(999_000)]),
         },
         limit: 200,
         seq: 1,
@@ -515,7 +518,7 @@ async fn mariadb_keyset_end_to_end() {
     handle.send(Command::FetchRun {
         epoch: 1,
         fetch: RunFetch::Backward {
-            before: Value::Integer(500_000),
+            before: vec![Value::Integer(500_000)],
         },
         limit: 200,
         seq: 4,
@@ -560,6 +563,7 @@ async fn text_key_jump_falls_back_to_offset() {
         sql: "SELECT * FROM t".into(),
         epoch: 9,
         table: Some(("main".into(), "t".into())),
+        sort: None,
     });
     match events.next().await {
         Some(Event::ResultReady { key, .. }) => {

@@ -170,27 +170,21 @@ impl DatabaseDriver for SqliteDriver {
         &self,
         sql: &str,
         key: &KeySpec,
-        bound: Option<&Value>,
+        bound: Option<&[Value]>,
         descending: bool,
         limit: usize,
         abort: &AbortSignal,
     ) -> Result<ResultPage> {
         let path = self.path.clone();
         let read_only = self.read_only;
-        let col = quote_ident(&key.column);
         let base = strip_trailing(sql);
-        let (cmp, ord) = if descending {
-            ("<", "DESC")
-        } else {
-            (">", "ASC")
-        };
-        let sql = match bound {
-            Some(_) => format!(
-                "SELECT * FROM ({base}) WHERE {col} {cmp} ? ORDER BY {col} {ord} LIMIT {limit}"
-            ),
-            None => format!("SELECT * FROM ({base}) ORDER BY {col} {ord} LIMIT {limit}"),
-        };
-        let params: Vec<rusqlite::types::Value> = bound.into_iter().map(to_sqlite).collect();
+        let bound_len = bound.map_or(0, <[Value]>::len);
+        let (where_clause, order_by) =
+            crate::seek_clauses(key, bound_len, descending, false, quote_ident, |_| "?".into());
+        let sql =
+            format!("SELECT * FROM ({base}) {where_clause}ORDER BY {order_by} LIMIT {limit}");
+        let params: Vec<rusqlite::types::Value> =
+            bound.into_iter().flatten().map(to_sqlite).collect();
         let cap = PageCap::Display {
             key: Some(key.clone()),
         };
@@ -206,25 +200,24 @@ impl DatabaseDriver for SqliteDriver {
         &self,
         sql: &str,
         key: &KeySpec,
-        from: Option<&Value>,
+        from: Option<&[Value]>,
         skip: usize,
         limit: usize,
         abort: &AbortSignal,
     ) -> Result<ResultPage> {
         let path = self.path.clone();
         let read_only = self.read_only;
-        let col = quote_ident(&key.column);
         let base = strip_trailing(sql);
-        // `skip`/`limit` are `usize`, so inlining them can't inject.
-        let sql = match from {
-            Some(_) => format!(
-                "SELECT * FROM ({base}) WHERE {col} >= ? ORDER BY {col} ASC LIMIT {limit} OFFSET {skip}"
-            ),
-            None => {
-                format!("SELECT * FROM ({base}) ORDER BY {col} ASC LIMIT {limit} OFFSET {skip}")
-            }
-        };
-        let params: Vec<rusqlite::types::Value> = from.into_iter().map(to_sqlite).collect();
+        let bound_len = from.map_or(0, <[Value]>::len);
+        // The lower bound walks forward in sort order (inclusive); `skip`/`limit`
+        // are `usize`, so inlining them can't inject.
+        let (where_clause, order_by) =
+            crate::seek_clauses(key, bound_len, false, true, quote_ident, |_| "?".into());
+        let sql = format!(
+            "SELECT * FROM ({base}) {where_clause}ORDER BY {order_by} LIMIT {limit} OFFSET {skip}"
+        );
+        let params: Vec<rusqlite::types::Value> =
+            from.into_iter().flatten().map(to_sqlite).collect();
         let cap = PageCap::Display {
             key: Some(key.clone()),
         };
@@ -751,7 +744,7 @@ fn fetch_window(
 ) -> Result<RowWindow> {
     // The cursor backs the editor-run / initial-window stream — offset-mode
     // display, so cap every cell (no seek key resolved here to exempt).
-    let cap = CellCap::display(None);
+    let cap = CellCap::display([None, None]);
     let mut out = Vec::with_capacity(max);
     for _ in 0..max {
         match rows.next() {
@@ -975,19 +968,13 @@ mod tests {
             .unwrap();
         }
         let driver = SqliteDriver::new(&path, true);
-        let key = KeySpec {
-            column: "id".into(),
-            kind: KeyKind::Int,
-        };
+        let key = KeySpec::single("id", KeyKind::Int);
         let sql = "SELECT * FROM t";
 
         battery::seeks_forward_backward_and_reads_bounds(&driver, sql, &key).await;
 
         // SQLite-specific extra: a non-integer key has no interpolable bounds.
-        let text_key = KeySpec {
-            column: "name".into(),
-            kind: KeyKind::Other,
-        };
+        let text_key = KeySpec::single("name", KeyKind::Other);
         assert_eq!(
             driver
                 .key_bounds(sql, &text_key, &AbortSignal::new())
@@ -996,6 +983,35 @@ mod tests {
             None
         );
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn seeks_composite_sorted_key() {
+        let path = temp_db_path("seek_composite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            // `grp = id % 3` repeats heavily (each value ~10 rows), so equal-`grp`
+            // ties straddle the battery's small page boundary.
+            conn.execute_batch(
+                "CREATE TABLE g(id INTEGER PRIMARY KEY NOT NULL, grp INTEGER NOT NULL);
+                 WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 30)
+                 INSERT INTO g SELECT x, x % 3 FROM c;",
+            )
+            .unwrap();
+        }
+        let driver = SqliteDriver::new(&path, true);
+        let key_asc = KeySpec {
+            column: "grp".into(),
+            kind: KeyKind::Int,
+            tiebreak: Some("id".into()),
+            descending: false,
+        };
+        let key_desc = KeySpec {
+            descending: true,
+            ..key_asc.clone()
+        };
+        battery::seeks_composite_sorted(&driver, "SELECT * FROM g", &key_asc, &key_desc, 30).await;
         std::fs::remove_file(&path).ok();
     }
 
@@ -1013,10 +1029,7 @@ mod tests {
             .unwrap();
         }
         let driver = SqliteDriver::new(&path, true);
-        let key = KeySpec {
-            column: "id".into(),
-            kind: KeyKind::Int,
-        };
+        let key = KeySpec::single("id", KeyKind::Int);
         battery::caps_display_keeps_key_and_export(
             &driver,
             "SELECT id, t, b FROM big",
