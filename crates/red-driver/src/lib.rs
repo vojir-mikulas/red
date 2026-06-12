@@ -28,6 +28,69 @@ pub use mysql::MysqlDriver;
 pub use postgres::PostgresDriver;
 pub use sqlite::SqliteDriver;
 
+/// Bytes of a non-key cell's content a *display* fetch keeps; past it, text is
+/// truncated to a [`Value::Capped`] prefix and a blob to its length only. The
+/// resident-cell budget that keeps the grid's RAM flat over fat `TEXT`/`BLOB`
+/// columns — the driver never materializes the over-cap bytes, so a page of huge
+/// cells can't spike the channel. (A built-in for now; `grid.max_cell_chars`
+/// makes it configurable later.)
+pub(crate) const DISPLAY_CELL_CAP: usize = 4096;
+
+/// Whether [`DatabaseDriver::fetch_page`] caps oversized cells. The display path
+/// caps non-key cells to [`DISPLAY_CELL_CAP`]; the clipboard re-fetch wants the
+/// real values, so it asks for `Full`. (The seek paths are always display-capped
+/// and learn their exempt key from their own `KeySpec` argument.)
+#[derive(Clone)]
+pub enum PageCap {
+    /// Cap non-key cells; `key` (when the result is keyed) rides through verbatim
+    /// so its bytes round-trip as a seek bound.
+    Display { key: Option<KeySpec> },
+    /// No cap — full-fidelity rows, for the clipboard re-fetch.
+    Full,
+}
+
+/// The positional, per-extraction form of a display cap: the byte budget plus the
+/// result-column index of the key (exempt — its value must round-trip exactly).
+/// `None` everywhere a fetch is full-fidelity (export / clipboard re-fetch).
+#[derive(Clone, Copy)]
+pub(crate) struct CellCap {
+    pub(crate) max_bytes: usize,
+    pub(crate) key_col: Option<usize>,
+}
+
+impl CellCap {
+    /// Resolve a [`PageCap`] against a result's columns into a positional cap.
+    /// `Full` → `None` (nothing capped); `Display` → the key's column index (if the
+    /// named key is present) is the lone exempt column.
+    pub(crate) fn resolve(cap: &PageCap, columns: &[Column]) -> Option<CellCap> {
+        match cap {
+            PageCap::Full => None,
+            PageCap::Display { key } => Some(CellCap {
+                max_bytes: DISPLAY_CELL_CAP,
+                key_col: key
+                    .as_ref()
+                    .and_then(|k| columns.iter().position(|c| c.name == k.column)),
+            }),
+        }
+    }
+
+    /// The display cap a seek/cursor fetch applies: always on, exempting `key_col`.
+    pub(crate) fn display(key_col: Option<usize>) -> Option<CellCap> {
+        Some(CellCap {
+            max_bytes: DISPLAY_CELL_CAP,
+            key_col,
+        })
+    }
+
+    /// Whether column `i` is capped under `cap` (`None` cap → nothing capped).
+    pub(crate) fn caps(cap: Option<CellCap>, i: usize) -> Option<usize> {
+        match cap {
+            Some(c) if c.key_col != Some(i) => Some(c.max_bytes),
+            _ => None,
+        }
+    }
+}
+
 /// One open database session. Object-safe so the service can hold
 /// `Arc<dyn DatabaseDriver>` and swap engines behind it.
 #[async_trait]
@@ -59,8 +122,15 @@ pub trait DatabaseDriver: Send + Sync {
 
     /// A random-access `(offset, limit)` page of `sql`'s result. Backs the grid's
     /// load-on-scroll so memory stays flat: only the pages around the viewport are
-    /// ever resident.
-    async fn fetch_page(&self, sql: &str, offset: usize, limit: usize) -> Result<ResultPage>;
+    /// ever resident. `cap` chooses display capping (the common scroll path) or
+    /// full fidelity (the clipboard re-fetch) — see [`PageCap`].
+    async fn fetch_page(
+        &self,
+        sql: &str,
+        offset: usize,
+        limit: usize,
+        cap: PageCap,
+    ) -> Result<ResultPage>;
 
     /// One keyset (seek) page of `sql`'s result, ordered by `key`: the rows
     /// strictly after (`descending = false`) or strictly before (`descending =

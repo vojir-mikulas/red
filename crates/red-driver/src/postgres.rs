@@ -31,7 +31,7 @@ use tokio_postgres::{Client, NoTls, Row, RowStream};
 use crate::format::{
     csv_cell, csv_record, json_string, json_value, strip_trailing, ProgressThrottle,
 };
-use crate::{driver_err, CancelToken, DatabaseDriver, QueryCursor};
+use crate::{driver_err, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor};
 
 /// A live PostgreSQL session. Holds the shared `Client`; the connection future
 /// runs on a background task spawned at connect.
@@ -284,16 +284,23 @@ impl DatabaseDriver for PostgresDriver {
         Ok(row.get(0))
     }
 
-    async fn fetch_page(&self, sql: &str, offset: usize, limit: usize) -> Result<ResultPage> {
+    async fn fetch_page(
+        &self,
+        sql: &str,
+        offset: usize,
+        limit: usize,
+        cap: PageCap,
+    ) -> Result<ResultPage> {
         let sql = format!(
             "SELECT * FROM ({}) AS _red LIMIT {limit} OFFSET {offset}",
             strip_trailing(sql)
         );
         let (stmt, columns) = self.prepare_columns(&sql).await?;
         let rows = self.client.query(&stmt, &[]).await.map_err(driver_err)?;
+        let cap = CellCap::resolve(&cap, &columns);
         Ok(ResultPage {
+            rows: rows.iter().map(|r| pg_row(r, cap)).collect(),
             columns,
-            rows: rows.iter().map(pg_row).collect(),
         })
     }
 
@@ -329,13 +336,16 @@ impl DatabaseDriver for PostgresDriver {
             Some(Value::Real(x)) => self.client.query(&stmt, &[x]).await,
             Some(Value::Text(s)) => self.client.query(&stmt, &[s]).await,
             Some(Value::Blob(b)) => self.client.query(&stmt, &[b]).await,
-            Some(Value::Null) => return Err(RedError::Query("null seek bound".into())),
+            Some(Value::Null) | Some(Value::Capped(_)) => {
+                return Err(RedError::Query("null seek bound".into()))
+            }
             None => self.client.query(&stmt, &[]).await,
         }
         .map_err(map_pg_err)?;
+        let cap = CellCap::display(key_col(&columns, key));
         Ok(ResultPage {
+            rows: rows.iter().map(|r| pg_row(r, cap)).collect(),
             columns,
-            rows: rows.iter().map(pg_row).collect(),
         })
     }
 
@@ -365,13 +375,16 @@ impl DatabaseDriver for PostgresDriver {
             Some(Value::Real(x)) => self.client.query(&stmt, &[x]).await,
             Some(Value::Text(s)) => self.client.query(&stmt, &[s]).await,
             Some(Value::Blob(b)) => self.client.query(&stmt, &[b]).await,
-            Some(Value::Null) => return Err(RedError::Query("null seek bound".into())),
+            Some(Value::Null) | Some(Value::Capped(_)) => {
+                return Err(RedError::Query("null seek bound".into()))
+            }
             None => self.client.query(&stmt, &[]).await,
         }
         .map_err(map_pg_err)?;
+        let cap = CellCap::display(key_col(&columns, key));
         Ok(ResultPage {
+            rows: rows.iter().map(|r| pg_row(r, cap)).collect(),
             columns,
-            rows: rows.iter().map(pg_row).collect(),
         })
     }
 
@@ -382,13 +395,12 @@ impl DatabaseDriver for PostgresDriver {
             strip_trailing(sql)
         );
         let rows = self.client.query(&sql, &[]).await.map_err(driver_err)?;
-        Ok(rows
-            .first()
-            .map(pg_row)
-            .and_then(|cells| match (cells.first(), cells.get(1)) {
+        Ok(rows.first().map(|r| pg_row(r, None)).and_then(|cells| {
+            match (cells.first(), cells.get(1)) {
                 (Some(Value::Integer(min)), Some(Value::Integer(max))) => Some((*min, *max)),
                 _ => None,
-            }))
+            }
+        }))
     }
 
     async fn execute(&self, sql: &str) -> Result<u64> {
@@ -454,7 +466,7 @@ impl DatabaseDriver for PostgresDriver {
                 while let Some(row) = stream.next().await {
                     bail_if_cancelled!();
                     let row = row.map_err(map_pg_err)?;
-                    let cells = pg_row(&row);
+                    let cells = pg_row(&row, None);
                     let fields: Vec<String> = cells.iter().map(csv_cell).collect();
                     writeln!(out, "{}", csv_record(fields.iter().map(String::as_str)))
                         .map_err(driver_err)?;
@@ -467,7 +479,7 @@ impl DatabaseDriver for PostgresDriver {
                 while let Some(row) = stream.next().await {
                     bail_if_cancelled!();
                     let row = row.map_err(map_pg_err)?;
-                    let cells = pg_row(&row);
+                    let cells = pg_row(&row, None);
                     if written > 0 {
                         write!(out, ",").map_err(driver_err)?;
                     }
@@ -506,11 +518,13 @@ impl QueryCursor for PgCursor {
     }
 
     async fn next_window(&self, max: usize) -> Result<RowWindow> {
+        // Offset-mode display stream (editor run) — cap every cell, no key exempt.
+        let cap = CellCap::display(None);
         let mut stream = self.stream.lock().await;
         let mut rows = Vec::with_capacity(max);
         for _ in 0..max {
             match stream.next().await {
-                Some(Ok(row)) => rows.push(pg_row(&row)),
+                Some(Ok(row)) => rows.push(pg_row(&row, cap)),
                 Some(Err(e)) => return Err(map_pg_err(e)),
                 None => {
                     return Ok(RowWindow {
@@ -537,23 +551,32 @@ fn pg_quote(ident: &str) -> String {
 }
 
 /// The explicit cast for a seek-bound placeholder, from the bound value's wire
-/// type (see `fetch_seek`).
+/// type (see `fetch_seek`). A bound comes from the key column, never capped.
 fn pg_cast(value: &Value) -> &'static str {
     match value {
         Value::Integer(_) => "::int8",
         Value::Real(_) => "::float8",
         Value::Text(_) => "::text",
         Value::Blob(_) => "::bytea",
-        Value::Null => "",
+        Value::Null | Value::Capped(_) => "",
     }
 }
 
-/// Map one row's cells to [`Value`]s by column type (text fallback for the rest).
-fn pg_row(row: &Row) -> Vec<Value> {
-    (0..row.len()).map(|i| pg_value(row, i)).collect()
+/// The result-column index of `key`, used to exempt it from the display cap.
+fn key_col(columns: &[Column], key: &KeySpec) -> Option<usize> {
+    columns.iter().position(|c| c.name == key.column)
 }
 
-fn pg_value(row: &Row, i: usize) -> Value {
+/// Map one row's cells to [`Value`]s by column type (text fallback for the rest).
+/// With a display `cap`, over-cap non-key text/blob cells come back [`Value::Capped`]
+/// (blob bytes are read as a borrowed slice for their length only, never owned).
+fn pg_row(row: &Row, cap: Option<CellCap>) -> Vec<Value> {
+    (0..row.len())
+        .map(|i| pg_value(row, i, CellCap::caps(cap, i)))
+        .collect()
+}
+
+fn pg_value(row: &Row, i: usize, max: Option<usize>) -> Value {
     match *row.columns()[i].type_() {
         Type::BOOL => row
             .try_get::<_, Option<bool>>(i)
@@ -586,19 +609,39 @@ fn pg_value(row: &Row, i: usize) -> Value {
             .flatten()
             .map(Value::Real)
             .unwrap_or(Value::Null),
-        Type::BYTEA => row
-            .try_get::<_, Option<Vec<u8>>>(i)
-            .ok()
-            .flatten()
-            .map(Value::Blob)
-            .unwrap_or(Value::Null),
+        // Capped: read the bytes as a borrowed slice for their length, never owning
+        // them. Full fidelity: own the bytes (export / clipboard / key column).
+        Type::BYTEA => match max {
+            Some(_) => row
+                .try_get::<_, Option<&[u8]>>(i)
+                .ok()
+                .flatten()
+                .map(|b| Value::capped_blob(b.len()))
+                .unwrap_or(Value::Null),
+            None => row
+                .try_get::<_, Option<Vec<u8>>>(i)
+                .ok()
+                .flatten()
+                .map(Value::Blob)
+                .unwrap_or(Value::Null),
+        },
         // text / varchar / name / bpchar / unknown — and a best-effort for the rest.
-        _ => row
-            .try_get::<_, Option<String>>(i)
-            .ok()
-            .flatten()
-            .map(Value::Text)
-            .unwrap_or(Value::Null),
+        // `&str` and `String` accept the same types, so capping doesn't change which
+        // columns decode (only how much of an over-cap one is kept).
+        _ => match max {
+            Some(max) => row
+                .try_get::<_, Option<&str>>(i)
+                .ok()
+                .flatten()
+                .map(|s| Value::capped_text(s, max))
+                .unwrap_or(Value::Null),
+            None => row
+                .try_get::<_, Option<String>>(i)
+                .ok()
+                .flatten()
+                .map(Value::Text)
+                .unwrap_or(Value::Null),
+        },
     }
 }
 
@@ -673,7 +716,7 @@ mod tests {
     /// private client.
     async fn current_schema(driver: &PostgresDriver) -> String {
         let page = driver
-            .fetch_page("SELECT current_schema()", 0, 1)
+            .fetch_page("SELECT current_schema()", 0, 1, PageCap::Full)
             .await
             .unwrap();
         match &page.rows[0][0] {
@@ -817,5 +860,40 @@ mod tests {
         let url = url_or_skip!();
         let driver = PostgresDriver::connect(&url, true).await.unwrap();
         battery::read_only_rejects_write(&driver, "CREATE TABLE red_ro_should_fail (x INT)").await;
+    }
+
+    #[tokio::test]
+    async fn caps_display_keeps_key_and_export() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, false).await.unwrap();
+        let t = tag("cap");
+        driver
+            .execute(&format!(
+                "CREATE TABLE {t} (id INT PRIMARY KEY, t TEXT, b BYTEA)"
+            ))
+            .await
+            .unwrap();
+        // One row whose text and blob both far exceed the display cap.
+        driver
+            .execute(&format!(
+                "INSERT INTO {t} VALUES (1, repeat('a', 5000), decode(repeat('61', 5000), 'hex'))"
+            ))
+            .await
+            .unwrap();
+        let key = KeySpec {
+            column: "id".into(),
+            kind: KeyKind::Int,
+        };
+        battery::caps_display_keeps_key_and_export(
+            &driver,
+            &format!("SELECT id, t, b FROM {t}"),
+            &key,
+            b'a',
+            5000,
+            5000,
+            &t,
+        )
+        .await;
+        driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
     }
 }

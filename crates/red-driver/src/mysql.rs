@@ -37,7 +37,7 @@ use tokio::sync::{mpsc, Mutex};
 use crate::format::{
     csv_cell, csv_record, json_string, json_value, strip_trailing, ProgressThrottle,
 };
-use crate::{driver_err, CancelToken, DatabaseDriver, QueryCursor};
+use crate::{driver_err, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor};
 
 /// A live MySQL/MariaDB session. Holds a connection `Pool`: cursors take a
 /// dedicated connection for the duration of their stream, and the out-of-band
@@ -131,10 +131,12 @@ impl DatabaseDriver for MysqlDriver {
                     return;
                 }
             };
+            // Offset-mode display stream (editor run) — cap every cell, no exempt key.
+            let cap = CellCap::display(None);
             loop {
                 match result.next().await {
                     Ok(Some(row)) => {
-                        if tx.send(Ok(my_row(&row))).await.is_err() {
+                        if tx.send(Ok(my_row(&row, cap))).await.is_err() {
                             break; // cursor dropped — stop pumping.
                         }
                     }
@@ -278,7 +280,13 @@ impl DatabaseDriver for MysqlDriver {
         Ok(n.unwrap_or(0))
     }
 
-    async fn fetch_page(&self, sql: &str, offset: usize, limit: usize) -> Result<ResultPage> {
+    async fn fetch_page(
+        &self,
+        sql: &str,
+        offset: usize,
+        limit: usize,
+        cap: PageCap,
+    ) -> Result<ResultPage> {
         let sql = format!(
             "SELECT * FROM ({}) AS _red LIMIT {limit} OFFSET {offset}",
             strip_trailing(sql)
@@ -287,9 +295,10 @@ impl DatabaseDriver for MysqlDriver {
         let stmt = conn.prep(&sql).await.map_err(map_my_err)?;
         let columns: Vec<Column> = stmt.columns().iter().map(col_meta).collect();
         let rows: Vec<Row> = conn.exec(&stmt, ()).await.map_err(map_my_err)?;
+        let cap = CellCap::resolve(&cap, &columns);
         Ok(ResultPage {
+            rows: rows.iter().map(|r| my_row(r, cap)).collect(),
             columns,
-            rows: rows.iter().map(my_row).collect(),
         })
     }
 
@@ -324,9 +333,10 @@ impl DatabaseDriver for MysqlDriver {
                 .map_err(map_my_err)?,
             None => conn.exec(&stmt, ()).await.map_err(map_my_err)?,
         };
+        let cap = CellCap::display(key_col(&columns, key));
         Ok(ResultPage {
+            rows: rows.iter().map(|r| my_row(r, cap)).collect(),
             columns,
-            rows: rows.iter().map(my_row).collect(),
         })
     }
 
@@ -359,9 +369,10 @@ impl DatabaseDriver for MysqlDriver {
                 .map_err(map_my_err)?,
             None => conn.exec(&stmt, ()).await.map_err(map_my_err)?,
         };
+        let cap = CellCap::display(key_col(&columns, key));
         Ok(ResultPage {
+            rows: rows.iter().map(|r| my_row(r, cap)).collect(),
             columns,
-            rows: rows.iter().map(my_row).collect(),
         })
     }
 
@@ -374,13 +385,12 @@ impl DatabaseDriver for MysqlDriver {
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
         let stmt = conn.prep(&sql).await.map_err(map_my_err)?;
         let rows: Vec<Row> = conn.exec(&stmt, ()).await.map_err(map_my_err)?;
-        Ok(rows
-            .first()
-            .map(my_row)
-            .and_then(|cells| match (cells.first(), cells.get(1)) {
+        Ok(rows.first().map(|r| my_row(r, None)).and_then(|cells| {
+            match (cells.first(), cells.get(1)) {
                 (Some(Value::Integer(min)), Some(Value::Integer(max))) => Some((*min, *max)),
                 _ => None,
-            }))
+            }
+        }))
     }
 
     async fn execute(&self, sql: &str) -> Result<u64> {
@@ -440,7 +450,7 @@ impl DatabaseDriver for MysqlDriver {
                     .map_err(driver_err)?;
                 while let Some(row) = result.next().await.map_err(map_my_err)? {
                     bail_if_cancelled!();
-                    let cells = my_row(&row);
+                    let cells = my_row(&row, None);
                     let fields: Vec<String> = cells.iter().map(csv_cell).collect();
                     writeln!(out, "{}", csv_record(fields.iter().map(String::as_str)))
                         .map_err(driver_err)?;
@@ -452,7 +462,7 @@ impl DatabaseDriver for MysqlDriver {
                 write!(out, "[").map_err(driver_err)?;
                 while let Some(row) = result.next().await.map_err(map_my_err)? {
                     bail_if_cancelled!();
-                    let cells = my_row(&row);
+                    let cells = my_row(&row, None);
                     if written > 0 {
                         write!(out, ",").map_err(driver_err)?;
                     }
@@ -524,18 +534,26 @@ fn col_meta(col: &MyColumn) -> Column {
     }
 }
 
-/// Map a row's cells to [`Value`]s, branching `Bytes` on the column charset.
-fn my_row(row: &Row) -> Vec<Value> {
+/// The result-column index of `key`, used to exempt it from the display cap.
+fn key_col(columns: &[Column], key: &KeySpec) -> Option<usize> {
+    columns.iter().position(|c| c.name == key.column)
+}
+
+/// Map a row's cells to [`Value`]s, branching `Bytes` on the column charset. With a
+/// display `cap`, over-cap non-key text/blob cells come back [`Value::Capped`] —
+/// the bytes past the cap (and a blob's whole payload) never reach a `Value`.
+fn my_row(row: &Row, cap: Option<CellCap>) -> Vec<Value> {
     let cols = row.columns_ref();
     (0..row.len())
-        .map(|i| my_value(row.as_ref(i), &cols[i]))
+        .map(|i| my_value(row.as_ref(i), &cols[i], CellCap::caps(cap, i)))
         .collect()
 }
 
-/// A cell value as a bindable MySQL parameter (for seek bounds).
+/// A cell value as a bindable MySQL parameter (for seek bounds). A bound comes from
+/// the key column, never capped, so `Capped` is unreachable here.
 fn to_my(value: &Value) -> MyValue {
     match value {
-        Value::Null => MyValue::NULL,
+        Value::Null | Value::Capped(_) => MyValue::NULL,
         Value::Integer(n) => MyValue::Int(*n),
         Value::Real(x) => MyValue::Double(*x),
         Value::Text(s) => MyValue::Bytes(s.clone().into_bytes()),
@@ -543,14 +561,14 @@ fn to_my(value: &Value) -> MyValue {
     }
 }
 
-fn my_value(value: Option<&MyValue>, col: &MyColumn) -> Value {
+fn my_value(value: Option<&MyValue>, col: &MyColumn, max: Option<usize>) -> Value {
     match value {
         None | Some(MyValue::NULL) => Value::Null,
         Some(MyValue::Int(n)) => Value::Integer(*n),
         Some(MyValue::UInt(n)) => Value::Integer(*n as i64),
         Some(MyValue::Float(f)) => Value::Real(*f as f64),
         Some(MyValue::Double(f)) => Value::Real(*f),
-        Some(MyValue::Bytes(bytes)) => bytes_value(bytes, col),
+        Some(MyValue::Bytes(bytes)) => bytes_value(bytes, col, max),
         Some(MyValue::Date(y, mo, d, h, mi, s, us)) => {
             Value::Text(fmt_datetime(*y, *mo, *d, *h, *mi, *s, *us))
         }
@@ -562,13 +580,22 @@ fn my_value(value: Option<&MyValue>, col: &MyColumn) -> Value {
 
 /// `TEXT` and `BLOB` share type codes and differ only by charset: the binary
 /// charset (`63`) marks genuine binary. `JSON` reports the binary charset but is
-/// UTF-8 text, so it's the one exception that stays `Text`.
-fn bytes_value(bytes: &[u8], col: &MyColumn) -> Value {
+/// UTF-8 text, so it's the one exception that stays `Text`. With a display cap
+/// (`max`), a non-key blob keeps only its length and over-cap text its prefix —
+/// `mysql_async` already owns the row's bytes, but capping keeps a *page* of fat
+/// cells from accumulating (and skips the second copy into the `Value`).
+fn bytes_value(bytes: &[u8], col: &MyColumn, max: Option<usize>) -> Value {
     let is_binary = col.character_set() == 63 && col.column_type() != ColumnType::MYSQL_TYPE_JSON;
     if is_binary {
-        Value::Blob(bytes.to_vec())
+        match max {
+            Some(_) => Value::capped_blob(bytes.len()),
+            None => Value::Blob(bytes.to_vec()),
+        }
     } else {
-        Value::Text(String::from_utf8_lossy(bytes).into_owned())
+        match max {
+            Some(max) => Value::capped_text(&String::from_utf8_lossy(bytes), max),
+            None => Value::Text(String::from_utf8_lossy(bytes).into_owned()),
+        }
     }
 }
 
@@ -811,6 +838,42 @@ mod tests {
         let url = url_or_skip!();
         let driver = MysqlDriver::connect(&url, true).await.unwrap();
         battery::read_only_rejects_write(&driver, "CREATE TABLE red_ro_should_fail (x INT)").await;
+    }
+
+    #[tokio::test]
+    async fn caps_display_keeps_key_and_export() {
+        use red_core::KeyKind;
+        let url = url_or_skip!();
+        let driver = MysqlDriver::connect(&url, false).await.unwrap();
+        let t = tag("cap");
+        driver
+            .execute(&format!(
+                "CREATE TABLE `{t}` (id INT PRIMARY KEY, t TEXT, b BLOB)"
+            ))
+            .await
+            .unwrap();
+        // One row whose text and blob both far exceed the display cap.
+        driver
+            .execute(&format!(
+                "INSERT INTO `{t}` VALUES (1, REPEAT('a', 5000), REPEAT('a', 5000))"
+            ))
+            .await
+            .unwrap();
+        let key = KeySpec {
+            column: "id".into(),
+            kind: KeyKind::Int,
+        };
+        battery::caps_display_keeps_key_and_export(
+            &driver,
+            &format!("SELECT id, t, b FROM `{t}`"),
+            &key,
+            b'a',
+            5000,
+            5000,
+            &t,
+        )
+        .await;
+        driver.execute(&format!("DROP TABLE `{t}`")).await.unwrap();
     }
 
     /// The connection's current database — fixtures live here, so introspection

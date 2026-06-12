@@ -273,6 +273,57 @@ pub enum Value {
     Real(f64),
     Text(String),
     Blob(Vec<u8>),
+    /// A cell the *display* fetch path capped: only a bounded prefix was read
+    /// (over-cap text) or only the length (blob), so the full value was never
+    /// materialized. Produced solely by capped fetch paths — never by `export` or
+    /// a write path, where every cell is whole.
+    Capped(CappedCell),
+}
+
+/// The payload of a [`Value::Capped`] cell: what the grid shows plus the true byte
+/// length of the source value, so a detail view can re-fetch the whole thing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CappedCell {
+    /// The shown text: a char-boundary-safe prefix of over-cap text, or empty for
+    /// a blob (rendered as its `<len bytes>` summary). No ellipsis — that's added
+    /// at render time, so a copy path can tell the real head from the marker.
+    pub head: String,
+    /// True byte length of the source value (full text length, or blob size).
+    pub len: usize,
+    /// Blob vs text — drives the `<N bytes>` summary and the grid's faint styling.
+    pub blob: bool,
+}
+
+impl Value {
+    /// Build a display value from full text `s`, capping to `max_bytes`. Under the
+    /// cap it's a whole [`Value::Text`]; over it, a [`Value::Capped`] holding only a
+    /// char-boundary-safe prefix plus the true length — the bytes past the cap are
+    /// never copied into the value, which is the point on the display fetch path.
+    pub fn capped_text(s: &str, max_bytes: usize) -> Value {
+        if s.len() <= max_bytes {
+            return Value::Text(s.to_owned());
+        }
+        let mut end = max_bytes;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        Value::Capped(CappedCell {
+            head: s[..end].to_owned(),
+            len: s.len(),
+            blob: false,
+        })
+    }
+
+    /// A blob reduced to its length for display — the bytes are never read. The
+    /// grid only ever paints a blob as its `<N bytes>` summary; a copy/inspector
+    /// re-fetches the real bytes on demand.
+    pub fn capped_blob(len: usize) -> Value {
+        Value::Capped(CappedCell {
+            head: String::new(),
+            len,
+            blob: true,
+        })
+    }
 }
 
 impl fmt::Display for Value {
@@ -283,6 +334,8 @@ impl fmt::Display for Value {
             Value::Real(x) => write!(f, "{x}"),
             Value::Text(s) => write!(f, "{s}"),
             Value::Blob(b) => write!(f, "<{} bytes>", b.len()),
+            Value::Capped(c) if c.blob => write!(f, "<{} bytes>", c.len),
+            Value::Capped(c) => write!(f, "{}…", c.head),
         }
     }
 }

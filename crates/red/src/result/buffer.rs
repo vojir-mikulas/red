@@ -7,6 +7,8 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::SharedString;
+#[cfg(test)]
+use red_core::CappedCell;
 use red_core::Value;
 use red_service::{Command, CommandSender, RunFetch};
 
@@ -26,30 +28,6 @@ const FLING_ROWS: usize = 3 * PAGE;
 /// run-extension (which would chain seeks across the gap) and jumps — one
 /// key-space interpolated seek that replaces the run.
 const JUMP_GAP: usize = 2 * PAGE;
-
-/// Cap, in bytes, on a non-key cell's display text held resident in the buffer. A
-/// one-line grid cell only ever shows a few dozen characters, so a multi-megabyte
-/// `TEXT`/`JSON` column would otherwise pin hundreds of MB across the ~`2*MARGIN`
-/// resident rows for content no one can see. Over-cap text is truncated (with an
-/// ellipsis) and blobs are reduced to their `<N bytes>` summary the moment a row
-/// lands. The keyset key column is never capped — its value must round-trip
-/// exactly to seek the next page — and export streams from the driver untouched,
-/// so this bounds only what the grid keeps in RAM. Copying an over-cap cell yields
-/// the truncated text; for the full value, export.
-const CELL_DISPLAY_CAP: usize = 4096;
-
-/// Truncate `s` to at most [`CELL_DISPLAY_CAP`] bytes on a char boundary, marking
-/// the cut with an ellipsis.
-fn truncate_display(s: &str) -> String {
-    let mut end = CELL_DISPLAY_CAP.min(s.len());
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut out = String::with_capacity(end + '…'.len_utf8());
-    out.push_str(&s[..end]);
-    out.push('…');
-    out
-}
 
 /// Physical rows the list (`uniform_list`) is laid out over at once. GPUI places
 /// each row at `index * row_height` in `f32`, which is only exact up to 2^24
@@ -136,6 +114,25 @@ impl DisplayCell {
                 text: format!("<{} bytes>", b.len()).into(),
                 kind: CellKind::Blob,
             },
+            // A driver-capped cell: a blob renders as its `<N bytes>` summary; an
+            // over-cap text shows its prefix plus an ellipsis, classified on the
+            // visible head (never a UUID — those are short and arrive whole).
+            Value::Capped(c) if c.blob => DisplayCell {
+                text: format!("<{} bytes>", c.len).into(),
+                kind: CellKind::Blob,
+            },
+            Value::Capped(c) => {
+                let trimmed = c.head.trim_start();
+                let kind = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                    CellKind::Json
+                } else {
+                    CellKind::Text
+                };
+                DisplayCell {
+                    text: format!("{}…", c.head).into(),
+                    kind,
+                }
+            }
         }
     }
 }
@@ -156,56 +153,29 @@ pub(super) struct Row {
     pub(super) values: Vec<Value>,
     pub(super) display: Vec<DisplayCell>,
     /// Data-column indices whose stored value is a display stand-in, not the real
-    /// cell: text clipped to [`CELL_DISPLAY_CAP`]. Empty for the common row (no
-    /// allocation). A copy that touches one of these re-fetches the row in full
-    /// rather than handing over the clipped text (see `ResultGrid::copy_plan`).
+    /// cell: an over-cap text the driver clipped to a [`Value::Capped`] prefix.
+    /// Empty for the common row (no allocation). A copy that touches one of these
+    /// re-fetches the row in full rather than handing over the clipped text (see
+    /// `ResultGrid::copy_plan`). A capped *blob* is not listed — its `<N bytes>`
+    /// summary is the intended clipboard form, so no re-fetch is needed.
     pub(super) truncated: Vec<usize>,
 }
 
 impl Row {
-    /// Build a resident row, classifying each cell's display once and bounding
-    /// the RAM a fat non-key cell can pin (see [`CELL_DISPLAY_CAP`]). `key_col`
-    /// names the keyset key column, whose value is kept verbatim so it can seek
-    /// the next page; in offset mode it is `None` and nothing is exempt.
-    fn new(values: Vec<Value>, key_col: Option<usize>) -> Row {
-        let mut stored = Vec::with_capacity(values.len());
-        let mut display = Vec::with_capacity(values.len());
-        let mut truncated = Vec::new();
-        for (i, value) in values.into_iter().enumerate() {
-            // The key column rides through untouched — its bytes round-trip as a
-            // seek bound, and it's never the megabyte payload we're guarding against.
-            if key_col == Some(i) {
-                display.push(DisplayCell::from_value(&value));
-                stored.push(value);
-                continue;
-            }
-            match value {
-                // A blob only ever renders as its byte count; drop the payload and
-                // keep just the summary (which is also what a copy yields).
-                Value::Blob(b) => {
-                    let summary = format!("<{} bytes>", b.len());
-                    display.push(DisplayCell {
-                        text: summary.clone().into(),
-                        kind: CellKind::Blob,
-                    });
-                    stored.push(Value::Text(summary));
-                }
-                // Oversized text: keep only the visible head, marked truncated so
-                // a copy of this cell re-fetches the full value instead of the head.
-                Value::Text(s) if s.len() > CELL_DISPLAY_CAP => {
-                    let capped = Value::Text(truncate_display(&s));
-                    display.push(DisplayCell::from_value(&capped));
-                    stored.push(capped);
-                    truncated.push(i);
-                }
-                other => {
-                    display.push(DisplayCell::from_value(&other));
-                    stored.push(other);
-                }
-            }
-        }
+    /// Build a resident row from the driver's cells, classifying each display once.
+    /// The driver has already applied the display cap — fat non-key cells arrive as
+    /// [`Value::Capped`] (the key column verbatim) — so this only records which
+    /// cells are clipped text, for the copy re-fetch path.
+    fn new(values: Vec<Value>) -> Row {
+        let display = values.iter().map(DisplayCell::from_value).collect();
+        let truncated = values
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| matches!(v, Value::Capped(c) if !c.blob))
+            .map(|(i, _)| i)
+            .collect();
         Row {
-            values: stored,
+            values,
             display,
             truncated,
         }
@@ -452,9 +422,7 @@ impl KeyedRun {
                     self.at_start = true;
                     self.estimated = false;
                 }
-                let key_col = self.key_col;
-                self.rows
-                    .extend(rows.into_iter().map(|r| Row::new(r, Some(key_col))));
+                self.rows.extend(rows.into_iter().map(Row::new));
                 self.at_end = short;
                 if short {
                     // The run now touches the true last row, so its ordinals
@@ -470,7 +438,7 @@ impl KeyedRun {
                 // Rows arrive descending; pushing each to the front restores
                 // ascending order.
                 for row in rows {
-                    self.rows.push_front(Row::new(row, Some(self.key_col)));
+                    self.rows.push_front(Row::new(row));
                 }
                 self.anchor = self.anchor.saturating_sub(n);
                 if short || self.anchor == 0 {
@@ -481,11 +449,7 @@ impl KeyedRun {
                 }
             }
             RunFetch::Jump { ordinal, .. } => {
-                let key_col = self.key_col;
-                self.rows = rows
-                    .into_iter()
-                    .map(|r| Row::new(r, Some(key_col)))
-                    .collect();
+                self.rows = rows.into_iter().map(Row::new).collect();
                 self.at_end = short;
                 self.estimated = estimated;
                 self.anchor = if short {
@@ -569,7 +533,7 @@ impl GridBuffer {
         if let BufferMode::Offset(pages) = &mut self.mode {
             pages.requested.remove(&(offset / PAGE));
             for (i, row) in rows.into_iter().enumerate() {
-                pages.rows.insert(offset + i, Row::new(row, None));
+                pages.rows.insert(offset + i, Row::new(row));
             }
         }
     }
@@ -793,73 +757,54 @@ mod window_tests {
 mod row_tests {
     use super::*;
 
-    /// A fat non-key cell is truncated in the resident buffer, but the keyset key
-    /// column rides through verbatim so it can still seek the next page.
+    // The display cap now lives in the driver (it hands the buffer already-capped
+    // `Value::Capped` cells, the key column verbatim — see the driver conformance
+    // battery). These tests cover what the buffer derives from those cells: the
+    // `truncated` flag that drives the copy re-fetch, and the rendered display.
+
+    /// A capped text cell is flagged truncated — that flag is what sends a copy of
+    /// it back to the driver for the full value (see `copy_plan`) — and renders as
+    /// its head plus an ellipsis.
     #[test]
-    fn caps_non_key_cells_but_keeps_the_key_exact() {
-        let big = "x".repeat(CELL_DISPLAY_CAP * 4);
-        let key = "k".repeat(CELL_DISPLAY_CAP * 4);
-        let row = Row::new(
-            vec![Value::Text(key.clone()), Value::Text(big.clone())],
-            Some(0),
-        );
-        // Key column (0): untouched — exact round-trip for seeks.
-        assert_eq!(row.key(0), Value::Text(key));
-        // Non-key column (1): truncated to the cap (+ ellipsis), under the original.
-        match &row.values[1] {
-            Value::Text(s) => {
-                assert!(s.len() <= CELL_DISPLAY_CAP + '…'.len_utf8());
-                assert!(s.ends_with('…'));
-            }
-            other => panic!("expected truncated text, got {other:?}"),
-        }
+    fn capped_text_is_flagged_and_renders_with_ellipsis() {
+        let row = Row::new(vec![
+            Value::Integer(1),
+            Value::Capped(CappedCell {
+                head: "hello".into(),
+                len: 9000,
+                blob: false,
+            }),
+            Value::Text("small".into()),
+        ]);
+        assert!(row.is_truncated(1), "the capped text cell is flagged");
+        assert!(!row.is_truncated(0), "an integer is untouched");
+        assert!(!row.is_truncated(2), "a small text cell is untouched");
+        assert_eq!(row.display[1].text.as_ref(), "hello…");
+        assert_eq!(row.display[1].kind, CellKind::Text);
     }
 
-    /// Only the clipped text cell is flagged truncated — that flag is what sends a
-    /// copy of it back to the driver for the full value (see `copy_plan`). The key
-    /// column rides through verbatim, so it is never flagged.
+    /// A capped blob renders as its `<N bytes>` summary and is *not* flagged: that
+    /// summary is the intended clipboard form, so it never triggers a re-fetch.
     #[test]
-    fn only_clipped_text_is_flagged_truncated() {
-        let big = "x".repeat(CELL_DISPLAY_CAP * 4);
-        let row = Row::new(
-            vec![
-                Value::Text(big.clone()), // col 0: key — kept verbatim
-                Value::Text(big),         // col 1: clipped
-                Value::Text("small".into()),
-            ],
-            Some(0),
-        );
-        assert!(!row.is_truncated(0), "the key column is never clipped");
-        assert!(row.is_truncated(1), "the fat non-key cell is clipped");
-        assert!(!row.is_truncated(2), "a small cell is untouched");
-    }
-
-    /// A blob is reduced to its byte-count summary the moment it lands — the bytes
-    /// never sit resident in the grid buffer. The summary is the intended clipboard
-    /// form, so a blob is not flagged for a full re-fetch.
-    #[test]
-    fn blobs_drop_to_their_byte_summary() {
-        let row = Row::new(vec![Value::Integer(1), Value::Blob(vec![0u8; 1_000])], None);
+    fn capped_blob_renders_summary_and_is_not_flagged() {
+        let row = Row::new(vec![Value::Integer(1), Value::capped_blob(1_000)]);
         assert_eq!(row.display[1].kind, CellKind::Blob);
         assert_eq!(row.display[1].text.as_ref(), "<1000 bytes>");
-        // The resident value carries only the summary string, not the payload.
-        assert_eq!(row.values[1], Value::Text("<1000 bytes>".into()));
         assert!(
             !row.is_truncated(1),
             "a blob copies as its summary, not re-fetched"
         );
     }
 
-    /// Small cells pass through unchanged.
+    /// Whole cells (the key column and any under-cap value) pass through unchanged
+    /// and are never flagged.
     #[test]
-    fn small_cells_are_untouched() {
-        let row = Row::new(
-            vec![Value::Integer(7), Value::Text("hello".into())],
-            Some(0),
-        );
+    fn whole_cells_pass_through() {
+        let row = Row::new(vec![Value::Integer(7), Value::Text("hello".into())]);
         assert_eq!(row.values[1], Value::Text("hello".into()));
         assert_eq!(row.display[1].text.as_ref(), "hello");
         assert_eq!(row.display[1].kind, CellKind::Text);
+        assert!(!row.is_truncated(1));
     }
 }
 
@@ -879,9 +824,7 @@ mod keyed_run_tests {
     /// The same rows as resident [`Row`]s — for seeding a run's buffer directly,
     /// as an arrived page would after `Row::new`.
     fn run_rows(ids: impl IntoIterator<Item = i64>) -> VecDeque<Row> {
-        ids.into_iter()
-            .map(|id| Row::new(row(id), Some(0)))
-            .collect()
+        ids.into_iter().map(|id| Row::new(row(id))).collect()
     }
 
     /// A run pretending its in-flight request is `seq` (as `issue` would set).

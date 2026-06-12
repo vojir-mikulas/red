@@ -21,7 +21,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::format::ProgressThrottle;
-use crate::{driver_err, CancelToken, DatabaseDriver, QueryCursor};
+use crate::{driver_err, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor};
 
 /// A SQLite connection target: a file path (or `:memory:`) plus the read-only
 /// posture. Cheap to clone — it holds no live handle.
@@ -138,7 +138,13 @@ impl DatabaseDriver for SqliteDriver {
         .map_err(driver_err)?
     }
 
-    async fn fetch_page(&self, sql: &str, offset: usize, limit: usize) -> Result<ResultPage> {
+    async fn fetch_page(
+        &self,
+        sql: &str,
+        offset: usize,
+        limit: usize,
+        cap: PageCap,
+    ) -> Result<ResultPage> {
         let path = self.path.clone();
         let read_only = self.read_only;
         // `limit`/`offset` are `usize`, so inlining them can't inject.
@@ -146,9 +152,11 @@ impl DatabaseDriver for SqliteDriver {
             "SELECT * FROM ({}) LIMIT {limit} OFFSET {offset}",
             strip_trailing(sql)
         );
-        tokio::task::spawn_blocking(move || fetch_page_blocking(&path, read_only, &sql, Vec::new()))
-            .await
-            .map_err(driver_err)?
+        tokio::task::spawn_blocking(move || {
+            fetch_page_blocking(&path, read_only, &sql, Vec::new(), cap)
+        })
+        .await
+        .map_err(driver_err)?
     }
 
     async fn fetch_seek(
@@ -175,9 +183,14 @@ impl DatabaseDriver for SqliteDriver {
             None => format!("SELECT * FROM ({base}) ORDER BY {col} {ord} LIMIT {limit}"),
         };
         let params: Vec<rusqlite::types::Value> = bound.into_iter().map(to_sqlite).collect();
-        tokio::task::spawn_blocking(move || fetch_page_blocking(&path, read_only, &sql, params))
-            .await
-            .map_err(driver_err)?
+        let cap = PageCap::Display {
+            key: Some(key.clone()),
+        };
+        tokio::task::spawn_blocking(move || {
+            fetch_page_blocking(&path, read_only, &sql, params, cap)
+        })
+        .await
+        .map_err(driver_err)?
     }
 
     async fn fetch_seek_skip(
@@ -202,9 +215,14 @@ impl DatabaseDriver for SqliteDriver {
             }
         };
         let params: Vec<rusqlite::types::Value> = from.into_iter().map(to_sqlite).collect();
-        tokio::task::spawn_blocking(move || fetch_page_blocking(&path, read_only, &sql, params))
-            .await
-            .map_err(driver_err)?
+        let cap = PageCap::Display {
+            key: Some(key.clone()),
+        };
+        tokio::task::spawn_blocking(move || {
+            fetch_page_blocking(&path, read_only, &sql, params, cap)
+        })
+        .await
+        .map_err(driver_err)?
     }
 
     async fn key_bounds(&self, sql: &str, key: &KeySpec) -> Result<Option<(i64, i64)>> {
@@ -322,7 +340,7 @@ fn export_blocking(
                 .map_err(driver_err)?;
             while let Some(row) = rows_iter.next().map_err(map_step_err)? {
                 bail_if_cancelled!();
-                let cells = extract_row(row, column_count)?;
+                let cells = extract_row(row, column_count, None)?;
                 let line = csv_record(
                     cells
                         .iter()
@@ -340,7 +358,7 @@ fn export_blocking(
             write!(out, "[").map_err(driver_err)?;
             while let Some(row) = rows_iter.next().map_err(map_step_err)? {
                 bail_if_cancelled!();
-                let cells = extract_row(row, column_count)?;
+                let cells = extract_row(row, column_count, None)?;
                 if written > 0 {
                     write!(out, ",").map_err(driver_err)?;
                 }
@@ -377,7 +395,8 @@ fn csv_escape(field: &str) -> String {
     }
 }
 
-/// A cell as a CSV field value (NULL → empty; blob → byte-length marker).
+/// A cell as a CSV field value (NULL → empty; blob → byte-length marker). Export
+/// never caps, so `Capped` can't appear here; it's rendered defensively for totality.
 fn csv_cell(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
@@ -385,6 +404,7 @@ fn csv_cell(value: &Value) -> String {
         Value::Real(x) => x.to_string(),
         Value::Text(s) => s.clone(),
         Value::Blob(b) => format!("<{} bytes>", b.len()),
+        Value::Capped(_) => value.to_string(),
     }
 }
 
@@ -395,6 +415,7 @@ fn json_value(value: &Value) -> String {
         Value::Real(x) => x.to_string(),
         Value::Text(s) => json_string(s),
         Value::Blob(b) => json_string(&format!("<{} bytes>", b.len())),
+        Value::Capped(_) => json_string(&value.to_string()),
     }
 }
 
@@ -423,7 +444,8 @@ fn strip_trailing(sql: &str) -> &str {
     sql.trim().strip_suffix(';').unwrap_or(sql.trim()).trim()
 }
 
-/// A cell value as a bindable SQLite parameter (for seek bounds).
+/// A cell value as a bindable SQLite parameter (for seek bounds). A seek bound is
+/// read from the key column, which is never capped, so `Capped` is unreachable here.
 fn to_sqlite(value: &Value) -> rusqlite::types::Value {
     use rusqlite::types::Value as Sq;
     match value {
@@ -432,6 +454,7 @@ fn to_sqlite(value: &Value) -> rusqlite::types::Value {
         Value::Real(x) => Sq::Real(*x),
         Value::Text(s) => Sq::Text(s.clone()),
         Value::Blob(b) => Sq::Blob(b.clone()),
+        Value::Capped(_) => Sq::Null,
     }
 }
 
@@ -440,6 +463,7 @@ fn fetch_page_blocking(
     read_only: bool,
     sql: &str,
     params: Vec<rusqlite::types::Value>,
+    cap: PageCap,
 ) -> Result<ResultPage> {
     let conn = SqliteDriver::open(path, read_only)?;
     let mut stmt = conn.prepare(sql).map_err(driver_err)?;
@@ -452,12 +476,13 @@ fn fetch_page_blocking(
             decl_type: c.decl_type().map(|t| t.to_string()),
         })
         .collect();
+    let cap = CellCap::resolve(&cap, &columns);
     let mut rows_iter = stmt
         .query(rusqlite::params_from_iter(params))
         .map_err(driver_err)?;
     let mut rows = Vec::new();
     while let Some(row) = rows_iter.next().map_err(map_step_err)? {
-        rows.push(extract_row(row, column_count)?);
+        rows.push(extract_row(row, column_count, cap)?);
     }
     Ok(ResultPage { columns, rows })
 }
@@ -689,10 +714,13 @@ fn fetch_window(
     column_count: usize,
     max: usize,
 ) -> Result<RowWindow> {
+    // The cursor backs the editor-run / initial-window stream — offset-mode
+    // display, so cap every cell (no seek key resolved here to exempt).
+    let cap = CellCap::display(None);
     let mut out = Vec::with_capacity(max);
     for _ in 0..max {
         match rows.next() {
-            Ok(Some(row)) => out.push(extract_row(row, column_count)?),
+            Ok(Some(row)) => out.push(extract_row(row, column_count, cap)?),
             Ok(None) => {
                 return Ok(RowWindow {
                     rows: out,
@@ -708,15 +736,31 @@ fn fetch_window(
     })
 }
 
-fn extract_row(row: &rusqlite::Row<'_>, column_count: usize) -> Result<Vec<Value>> {
+/// Map one row's cells to [`Value`]s. With a display `cap`, a non-key over-cap
+/// text cell keeps only its prefix and a non-key blob only its length — the bytes
+/// past the cap are never copied (`ValueRef` borrows the step buffer, so the cap
+/// is read off the slice). `cap = None` (export / clipboard re-fetch) is full
+/// fidelity, and the exempt key column rides through whole either way.
+fn extract_row(
+    row: &rusqlite::Row<'_>,
+    column_count: usize,
+    cap: Option<CellCap>,
+) -> Result<Vec<Value>> {
     let mut cells = Vec::with_capacity(column_count);
     for i in 0..column_count {
+        let max = CellCap::caps(cap, i);
         let value = match row.get_ref(i).map_err(driver_err)? {
             ValueRef::Null => Value::Null,
             ValueRef::Integer(n) => Value::Integer(n),
             ValueRef::Real(x) => Value::Real(x),
-            ValueRef::Text(s) => Value::Text(String::from_utf8_lossy(s).into_owned()),
-            ValueRef::Blob(b) => Value::Blob(b.to_vec()),
+            ValueRef::Text(s) => match max {
+                Some(max) => Value::capped_text(&String::from_utf8_lossy(s), max),
+                None => Value::Text(String::from_utf8_lossy(s).into_owned()),
+            },
+            ValueRef::Blob(b) => match max {
+                Some(_) => Value::capped_blob(b.len()),
+                None => Value::Blob(b.to_vec()),
+            },
         };
         cells.push(value);
     }
@@ -898,6 +942,37 @@ mod tests {
         };
         assert_eq!(driver.key_bounds(sql, &text_key).await.unwrap(), None);
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn caps_display_keeps_key_and_export() {
+        let path = temp_db_path("cap");
+        {
+            let conn = Connection::open(&path).unwrap();
+            // `hex(zeroblob(2500))` is 5000 ASCII '0' chars; `zeroblob(5000)` is a
+            // 5000-byte blob — both far over the display cap.
+            conn.execute_batch(
+                "CREATE TABLE big(id INTEGER PRIMARY KEY, t TEXT, b BLOB);
+                 INSERT INTO big VALUES (1, hex(zeroblob(2500)), zeroblob(5000));",
+            )
+            .unwrap();
+        }
+        let driver = SqliteDriver::new(&path, true);
+        let key = KeySpec {
+            column: "id".into(),
+            kind: KeyKind::Int,
+        };
+        battery::caps_display_keeps_key_and_export(
+            &driver,
+            "SELECT id, t, b FROM big",
+            &key,
+            b'0',
+            5000,
+            5000,
+            "sqlite_cap",
+        )
+        .await;
         std::fs::remove_file(&path).ok();
     }
 

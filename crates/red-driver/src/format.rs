@@ -69,6 +69,8 @@ pub(crate) fn csv_cell(value: &Value) -> String {
         Value::Real(x) => x.to_string(),
         Value::Text(s) => s.clone(),
         Value::Blob(b) => format!("<{} bytes>", b.len()),
+        // Export never caps, so a `Capped` can't reach here — rendered for totality.
+        Value::Capped(_) => value.to_string(),
     }
 }
 
@@ -79,6 +81,7 @@ pub(crate) fn json_value(value: &Value) -> String {
         Value::Real(x) => x.to_string(),
         Value::Text(s) => json_string(s),
         Value::Blob(b) => json_string(&format!("<{} bytes>", b.len())),
+        Value::Capped(_) => json_string(&value.to_string()),
     }
 }
 

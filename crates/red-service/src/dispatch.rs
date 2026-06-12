@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use futures::channel::mpsc::UnboundedSender;
 use red_core::{ConnectionConfig, DbKind, KeyKind, KeySpec, RedError, Value};
 use red_driver::{
-    CancelToken, DatabaseDriver, MysqlDriver, PostgresDriver, QueryCursor, SqliteDriver,
+    CancelToken, DatabaseDriver, MysqlDriver, PageCap, PostgresDriver, QueryCursor, SqliteDriver,
 };
 use tokio::sync::mpsc::UnboundedReceiver as CmdReceiver;
 use tokio::sync::Semaphore;
@@ -283,8 +283,11 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                             _ => None,
                         }
                     };
-                    let (total, columns, bounds) =
-                        tokio::join!(driver.count(&sql), driver.fetch_page(&sql, 0, 0), bounds);
+                    let (total, columns, bounds) = tokio::join!(
+                        driver.count(&sql),
+                        driver.fetch_page(&sql, 0, 0, PageCap::Full),
+                        bounds
+                    );
                     match (total, columns) {
                         (Ok(total), Ok(page)) => {
                             let total = total.max(0) as usize;
@@ -338,7 +341,11 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 let limit_src = page_fetch_limit.clone();
                 tokio::spawn(async move {
                     let _permit = limit_src.acquire_owned().await;
-                    match driver.fetch_page(&sql, offset, limit).await {
+                    // Offset-mode display page — cap fat cells; no seek key to exempt.
+                    match driver
+                        .fetch_page(&sql, offset, limit, PageCap::Display { key: None })
+                        .await
+                    {
                         Ok(page) => emit(
                             &events,
                             Event::ResultPageLoaded {
@@ -423,13 +430,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Command>, events: Unbound
                 let Some(sql) = lock(&results).get(&epoch).map(|s| s.sql.clone()) else {
                     continue;
                 };
-                // Same windowed read as a page fetch, but the rows are full (the
-                // grid's display cap never reaches here) and routed to the clipboard.
+                // Same windowed read as a page fetch, but `Full` so the rows carry the
+                // real values (the grid's display cap is bypassed) for the clipboard.
                 let events = events.clone();
                 let limit_src = page_fetch_limit.clone();
                 tokio::spawn(async move {
                     let _permit = limit_src.acquire_owned().await;
-                    match driver.fetch_page(&sql, offset, limit).await {
+                    match driver.fetch_page(&sql, offset, limit, PageCap::Full).await {
                         Ok(page) => emit(
                             &events,
                             Event::CopyRowsLoaded {
@@ -702,8 +709,18 @@ async fn run_fetch(
                 }
             }
             // No usable key/bounds/index: one `OFFSET` page — O(ordinal), but a
-            // one-off; ordinals stay exact.
-            let page = driver.fetch_page(&spec.sql, *ordinal, limit).await?;
+            // one-off; ordinals stay exact. Keyed mode, so the key column rides
+            // through verbatim — these rows' keys seed the run's seek bounds.
+            let page = driver
+                .fetch_page(
+                    &spec.sql,
+                    *ordinal,
+                    limit,
+                    PageCap::Display {
+                        key: Some(key.clone()),
+                    },
+                )
+                .await?;
             Ok((page.rows, false))
         }
     }

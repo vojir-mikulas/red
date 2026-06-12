@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use red_core::{ExportFormat, KeySpec, ObjectKind, QueryOptions, RedError, Value};
 
-use crate::DatabaseDriver;
+use crate::{DatabaseDriver, PageCap, DISPLAY_CELL_CAP};
 
 /// `open_cursor` streams the result in windows that never exceed the requested
 /// size, and the total is exact — memory stays flat regardless of result size.
@@ -235,6 +235,83 @@ pub(crate) async fn seeks_forward_backward_and_reads_bounds(
     assert_eq!(ids(&skipped, 0), vec![Value::Integer(510)]);
 
     assert_eq!(driver.key_bounds(sql, key).await.unwrap(), Some((1, 1000)));
+}
+
+/// The driver-side display cap (Track A1): a display fetch caps fat non-key cells
+/// while the keyset key rides through verbatim and `export`/`Full` stay byte-exact.
+/// `sql` must select exactly one row with columns `(key, big_text, big_blob)` where
+/// `big_text` and `big_blob` each exceed [`DISPLAY_CELL_CAP`] bytes and `big_text`
+/// is `text_len` repeats of the ASCII byte `fill`; `key` names the integer key
+/// column; `text_len`/`blob_len` are the full source byte lengths; `tag` keeps the
+/// export temp file unique.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn caps_display_keeps_key_and_export(
+    driver: &dyn DatabaseDriver,
+    sql: &str,
+    key: &KeySpec,
+    fill: u8,
+    text_len: usize,
+    blob_len: usize,
+    tag: &str,
+) {
+    // --- Display seek caps the fat non-key cells, key column verbatim. ---
+    let page = driver.fetch_seek(sql, key, None, false, 5).await.unwrap();
+    assert_eq!(page.rows.len(), 1, "fixture has exactly one row");
+    let row = &page.rows[0];
+
+    // Key column (0): NOT capped — its bytes must round-trip as a seek bound.
+    assert!(
+        matches!(row[0], Value::Integer(_)),
+        "the key rides through whole, got {:?}",
+        row[0]
+    );
+
+    // Text column (1): a Capped prefix carrying the true length, head within the cap.
+    match &row[1] {
+        Value::Capped(c) => {
+            assert!(!c.blob, "text capped as text");
+            assert_eq!(c.len, text_len, "the true text length is preserved");
+            assert!(
+                c.head.len() <= DISPLAY_CELL_CAP,
+                "head ({}) within the cap ({DISPLAY_CELL_CAP})",
+                c.head.len()
+            );
+        }
+        other => panic!("expected capped text, got {other:?}"),
+    }
+
+    // Blob column (2): length only — the bytes were never materialized.
+    match &row[2] {
+        Value::Capped(c) => {
+            assert!(c.blob, "blob capped as blob");
+            assert_eq!(c.len, blob_len, "the true blob length is preserved");
+        }
+        other => panic!("expected capped blob, got {other:?}"),
+    }
+
+    // --- A Full page fetch keeps the same cells whole (the clipboard re-fetch). ---
+    let full = driver.fetch_page(sql, 0, 5, PageCap::Full).await.unwrap();
+    match &full.rows[0][1] {
+        Value::Text(s) => assert_eq!(s.len(), text_len, "Full keeps the whole text"),
+        other => panic!("expected whole text under Full, got {other:?}"),
+    }
+
+    // --- Export stays byte-exact: the full text reaches the file uncapped. ---
+    let dir = std::env::temp_dir();
+    let csv_path = dir.join(format!("red_conf_cap_{tag}.csv"));
+    let no_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drain = tokio::sync::mpsc::unbounded_channel().0;
+    driver
+        .export(sql, &csv_path, ExportFormat::Csv, no_cancel, drain)
+        .await
+        .unwrap();
+    let csv = std::fs::read_to_string(&csv_path).unwrap();
+    let needle = String::from_utf8(vec![fill; text_len]).unwrap();
+    assert!(
+        csv.contains(&needle),
+        "export carries the full {text_len}-byte text uncapped"
+    );
+    std::fs::remove_file(&csv_path).ok();
 }
 
 /// A read-only connection rejects a write at the engine. `write_sql` is any
