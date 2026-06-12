@@ -321,6 +321,8 @@ pub struct AppState {
     pub(crate) confirm_exec: Option<String>,
     /// A non-pristine query tab the user asked to close, awaiting confirmation.
     pub(crate) confirm_close_tab: Option<usize>,
+    /// A saved connection the user asked to delete, awaiting confirmation.
+    pub(crate) confirm_delete_conn: Option<usize>,
     /// Persisted UI preferences (theme, grid, query, the safety rail) + their store.
     pub(crate) settings: Settings,
     pub(crate) settings_store: Option<FileSettingsStore>,
@@ -401,6 +403,9 @@ pub struct AppState {
     /// Set by ⌘F / the search command: the next render reveals the sidebar and
     /// focuses the schema filter field.
     pub(crate) focus_search: bool,
+    /// Set by the palette's "switch connection" command: the next render opens
+    /// the switcher popover (its `toggle` needs a `Window` the palette lacks).
+    pub(crate) open_switcher: bool,
     /// Dev-only perf HUD collector — brackets `render` to read build time and
     /// allocation churn. Compiled only under the `dev-stats` feature.
     #[cfg(feature = "dev-stats")]
@@ -547,6 +552,7 @@ impl AppState {
                 switcher_sections(&connections, &Phase::Disconnected, cx.theme());
             s.set_trigger(label, dot, cx);
             s.set_sections(sections, cx);
+            s.set_footer(switcher_footer(), cx);
             s
         });
         cx.subscribe(&switcher, Self::on_switcher_event).detach();
@@ -572,6 +578,7 @@ impl AppState {
             pending_copy: None,
             confirm_exec: None,
             confirm_close_tab: None,
+            confirm_delete_conn: None,
             settings,
             settings_store,
             settings_open: false,
@@ -602,6 +609,7 @@ impl AppState {
             focus_name_field: false,
             focus_history: false,
             focus_search: false,
+            open_switcher: false,
             #[cfg(feature = "dev-stats")]
             dev_stats: crate::dev_stats::DevStats::default(),
         }
@@ -845,9 +853,36 @@ impl AppState {
 
     // --- connection-manager actions ---
 
-    pub(crate) fn delete_connection(&mut self, index: usize, cx: &mut Context<Self>) {
+    /// Arm the delete-confirmation modal for connection `index`. Deletion is
+    /// destructive (drops the keychain credential too), so we never remove a
+    /// connection on a single click — the modal's `confirm_delete` does the work.
+    pub(crate) fn request_delete_connection(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.connections.len() {
+            self.confirm_delete_conn = Some(index);
+            cx.notify();
+        }
+    }
+
+    /// Confirmation accepted — remove the connection that was awaiting it.
+    pub(crate) fn confirm_delete_connection(&mut self, cx: &mut Context<Self>) {
+        if let Some(index) = self.confirm_delete_conn.take() {
+            self.delete_connection(index, cx);
+        }
+        self.refocus_root = true;
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_delete_connection(&mut self, cx: &mut Context<Self>) {
+        self.confirm_delete_conn = None;
+        self.refocus_root = true;
+        cx.notify();
+    }
+
+    fn delete_connection(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.connections.len() {
             let removed = self.connections.remove(index);
+            // Keep the selection highlight in range after the row vanishes.
+            self.connect_sel = self.connect_sel.min(self.connections.len().saturating_sub(1));
             // Drop the connection's keychain credential too, so deleting a
             // connection doesn't orphan its password.
             if let Err(e) = crate::secrets::delete_password(&removed.id) {
@@ -1195,6 +1230,7 @@ impl AppState {
     pub(crate) fn any_modal_open(&self) -> bool {
         self.confirm_exec.is_some()
             || self.confirm_close_tab.is_some()
+            || self.confirm_delete_conn.is_some()
             || self.shortcuts_open
             || self.form.is_some()
     }
@@ -1797,8 +1833,9 @@ const SWITCHER_RECENT_CAP: usize = 8;
 /// sections from the saved connections and the current phase. The active
 /// connection (matched by name) heads a "This window" section with a checkmark
 /// and drives the trigger; recently-opened connections fill a capped "Recent"
-/// section; two action rows close it out. Phase 1 reconnects on switch, so every
-/// connection row is just a saved connection.
+/// section. The "New…" / "Manage…" actions live in the always-visible footer
+/// (see [`switcher_footer`]). Phase 1 reconnects on switch, so every connection
+/// row is just a saved connection.
 fn switcher_sections(
     connections: &[StoredConnection],
     phase: &Phase,
@@ -1853,12 +1890,6 @@ fn switcher_sections(
         sections.push(SwitcherSection::new("Recent", items));
     }
 
-    // Actions.
-    sections.push(SwitcherSection::untitled(vec![
-        SwitcherItem::new("action:new", "New connection…"),
-        SwitcherItem::new("action:manage", "Manage connections…"),
-    ]));
-
     let (label, dot) = match active_index {
         Some(ai) => (
             connections[ai].config.name.clone(),
@@ -1870,6 +1901,15 @@ fn switcher_sections(
         },
     };
     (label.into(), dot, sections)
+}
+
+/// The switcher's pinned footer actions — always visible beneath the
+/// scrollable connection list.
+fn switcher_footer() -> Vec<SwitcherItem> {
+    vec![
+        SwitcherItem::new("action:new", "New connection…"),
+        SwitcherItem::new("action:manage", "Manage connections…"),
+    ]
 }
 
 /// Open `path` with the OS's default handler — the file-first "open in editor"

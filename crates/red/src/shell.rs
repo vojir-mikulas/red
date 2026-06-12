@@ -6,10 +6,11 @@ use flint::prelude::*;
 use gpui::{div, prelude::*, px, Axis, Context, Window, WindowControlArea};
 
 /// Left inset of the top bar. On macOS it clears the seamless traffic lights
-/// overlapping this strip; elsewhere the native caption bar is separate, so only
-/// normal padding is needed. Mirrors Nyx.
+/// overlapping this strip and leaves a little breathing room between them and
+/// the connection switcher; elsewhere the native caption bar is separate, so
+/// only normal padding is needed. Mirrors Nyx.
 #[cfg(target_os = "macos")]
-const TITLEBAR_LEFT_INSET: f32 = 72.;
+const TITLEBAR_LEFT_INSET: f32 = 88.;
 #[cfg(not(target_os = "macos"))]
 const TITLEBAR_LEFT_INSET: f32 = 12.;
 

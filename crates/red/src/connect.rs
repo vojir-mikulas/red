@@ -389,7 +389,7 @@ impl AppState {
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         cx.stop_propagation();
-                                        this.delete_connection(index, cx);
+                                        this.request_delete_connection(index, cx);
                                     },
                                 )),
                             ),

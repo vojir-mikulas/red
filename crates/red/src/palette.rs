@@ -26,6 +26,8 @@ pub(crate) enum Cmd {
     OpenDefaultSettings,
     /// Connect to the saved connection at this index (disconnected phase).
     Connect(usize),
+    /// Open the connection switcher popover (the ⌘P switcher).
+    SwitchConnection,
     RunQuery,
     NewTab,
     CloseTab,
@@ -165,6 +167,9 @@ impl AppState {
             Cmd::OpenSettingsFile => self.open_settings_file(cx),
             Cmd::OpenDefaultSettings => self.open_default_settings(cx),
             Cmd::Connect(index) => self.connect(index, cx),
+            // The switcher's `toggle` needs a `Window` to focus its field; defer
+            // to the next render (drained there), like the pane-focus jumps.
+            Cmd::SwitchConnection => self.open_switcher = true,
             Cmd::RunQuery => self.run_editor_query(cx),
             Cmd::NewTab => self.new_query(cx),
             Cmd::CloseTab => self.close_active_tab(cx),
@@ -283,6 +288,10 @@ impl AppState {
             Phase::Connecting(_) => {}
         }
 
+        out.push((
+            PaletteItem::new("cmd:switch-conn", "connection: switch…").hint("⌘P"),
+            Cmd::SwitchConnection,
+        ));
         out.push((
             PaletteItem::new("cmd:shortcuts", "view: keyboard shortcuts").hint("⌘/"),
             Cmd::ShowShortcuts,

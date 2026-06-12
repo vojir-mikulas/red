@@ -29,9 +29,9 @@ use flint::components::text_input::{
 };
 
 use crate::keymap::{
-    About, CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusSchema, NewTab,
-    NextTab, PrevTab, RefreshSchema, RunQuery, SearchSchema, Settings, ShowShortcuts,
-    ToggleSidebar,
+    About, CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusSchema,
+    NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, RunQuery, SearchSchema, Settings,
+    ShowShortcuts, SwitchConnection, ToggleSidebar,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 use crate::Quit;
@@ -53,6 +53,13 @@ pub(crate) fn build_menus() -> Vec<Menu> {
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
             MenuItem::action("Quit RED", Quit),
+        ]),
+        Menu::new("Connection").items([
+            // Open the ⌘P switcher (active + recent connections), or start a new
+            // connection (⌘N on the welcome screen). Both display their
+            // accelerators via the keybinding registry.
+            MenuItem::action("Switch Connection…", SwitchConnection),
+            MenuItem::action("New Connection…", NewConnection),
         ]),
         Menu::new("Edit").items([
             // Clipboard for text fields. Undo/Redo are intentionally omitted —

@@ -123,6 +123,13 @@ impl Render for AppState {
             self.open_schema_search(window, cx);
         }
 
+        // The palette's "switch connection" command — open the switcher popover
+        // now that the `Window` its field-focus needs is in hand.
+        if self.open_switcher {
+            self.open_switcher = false;
+            self.toggle_switcher(window, cx);
+        }
+
         // A keyboard-driven modal (a confirmation or the shortcuts overlay) just
         // opened — focus it so Flint's `Modal` hears its Esc/Enter.
         if self.focus_modal {
@@ -177,6 +184,12 @@ impl Render for AppState {
             .confirm_close_tab
             .and_then(|i| self.tab_title(i))
             .map(|title| self.render_confirm_close(title, cx));
+
+        let confirm_delete = self
+            .confirm_delete_conn
+            .and_then(|i| self.connections.get(i))
+            .map(|c| c.config.name.clone())
+            .map(|name| self.render_confirm_delete(name, cx));
 
         let settings = self
             .settings_open
@@ -248,7 +261,10 @@ impl Render for AppState {
             // via Flint's `Modal` focus handling). ↑/↓ move the highlight, Enter
             // connects. Only acts on the disconnected screen with no form open.
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if !matches!(this.phase, Phase::Disconnected) || this.form.is_some() {
+                if !matches!(this.phase, Phase::Disconnected)
+                    || this.form.is_some()
+                    || this.any_modal_open()
+                {
                     return;
                 }
                 let n = this.connections.len();
@@ -285,6 +301,7 @@ impl Render for AppState {
             .children(toast)
             .children(confirm)
             .children(confirm_close)
+            .children(confirm_delete)
             .children(settings)
             .children(shortcuts)
             // The connection form modal is rendered at the root so it works in any
@@ -403,6 +420,47 @@ impl AppState {
             .on_confirm(move |_, cx| {
                 confirm_view
                     .update(cx, |this, cx| this.confirm_close(cx))
+                    .ok();
+            })
+            .child(body)
+    }
+
+    /// Confirmation before deleting a saved connection. Deletion also drops the
+    /// keychain credential, so this is the safety rail against accidental removal.
+    fn render_confirm_delete(&self, name: String, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let close_view = cx.entity().downgrade();
+        let confirm_view = cx.entity().downgrade();
+        let body = div().text_color(theme.text_muted).child(format!(
+            "“{name}” and its saved password will be removed. This can't be undone."
+        ));
+        let footer = div()
+            .flex()
+            .justify_end()
+            .gap_2()
+            .child(
+                Button::new("delete-cancel", "Cancel")
+                    .variant(ButtonVariant::Secondary)
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel_delete_connection(cx))),
+            )
+            .child(
+                Button::new("delete-confirm", "Delete connection")
+                    .variant(ButtonVariant::Danger)
+                    .on_click(cx.listener(|this, _, _, cx| this.confirm_delete_connection(cx))),
+            );
+        Modal::new("confirm-delete-conn")
+            .title("Delete connection")
+            .width(px(420.))
+            .focus_handle(self.modal_focus.clone())
+            .footer(footer)
+            .on_close(move |_, cx| {
+                close_view
+                    .update(cx, |this, cx| this.cancel_delete_connection(cx))
+                    .ok();
+            })
+            .on_confirm(move |_, cx| {
+                confirm_view
+                    .update(cx, |this, cx| this.confirm_delete_connection(cx))
                     .ok();
             })
             .child(body)
