@@ -13,6 +13,7 @@ mod dev_stats;
 mod editor;
 mod icons;
 mod keymap;
+mod menu;
 mod palette;
 mod result;
 mod schema;
@@ -56,6 +57,10 @@ fn main() {
         // app-chrome bindings) from the central keymap.
         keymap::bind_all(cx);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+        // Populate the global menu bar (the macOS bar at the top of the screen).
+        // Items reference the same action structs `keymap` binds, so their
+        // shortcuts render and stay in sync automatically.
+        cx.set_menus(menu::build_menus());
         // Dev-only: ⌥⌘P toggles the perf HUD overlay.
         #[cfg(feature = "dev-stats")]
         cx.bind_keys([gpui::KeyBinding::new("cmd-alt-p", ToggleDevStats, None)]);

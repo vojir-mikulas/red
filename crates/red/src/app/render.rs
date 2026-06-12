@@ -7,8 +7,9 @@ use gpui::{div, prelude::*, px, Focusable, KeyDownEvent, Render, Window};
 
 use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::keymap::{
-    CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusSchema, NewConnection,
-    NewTab, NextTab, PrevTab, RefreshSchema, ShowShortcuts, TestConnection, ToggleSidebar,
+    About, CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusSchema,
+    NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, Settings, ShowShortcuts,
+    TestConnection, ToggleSidebar,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
@@ -183,6 +184,9 @@ impl Render for AppState {
                 this.cycle_focus(false, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| this.toggle_shortcuts(cx)))
+            // Settings panel: ⌘, and the RED → Settings… / About RED menu items.
+            .on_action(cx.listener(|this, _: &Settings, _, cx| this.open_settings(cx)))
+            .on_action(cx.listener(|this, _: &About, _, cx| this.open_about(cx)))
             // ⌘↵ in the connection form tests; ⌘N on the welcome screen adds one.
             // Both no-op outside their screen.
             .on_action(cx.listener(|this, _: &TestConnection, _, cx| {
