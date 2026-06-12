@@ -31,15 +31,8 @@ use crate::settings::{Density, FileSettingsStore, Settings, ThemeMode, ThemeSett
 use crate::settings_ui::SettingsTab;
 use crate::theme::ThemeRegistry;
 
-/// Which theme picker (light / dark) is open in the settings panel, if any.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ThemeSelect {
-    Light,
-    Dark,
-}
-
-/// Which font-family picker (UI sans / UI mono / editor) is open in the settings
-/// panel, if any.
+/// Which font-family picker (UI sans / UI mono / editor) a settings action refers
+/// to — routes a choice to the matching setter and the matching combo box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FontSelect {
     Ui,
@@ -212,6 +205,10 @@ pub(crate) struct ActiveConn {
     pub sidebar_collapsed: bool,
     pub editor_h: Pixels,
     pub editor_drag: Option<DragAnchor>,
+    /// Width of the cell/row detail inspector when docked to the right of the
+    /// grid; retained while the inspector is closed so reopening restores it.
+    pub inspector_w: Pixels,
+    pub inspector_drag: Option<DragAnchor>,
     pub schema: SchemaState,
     /// Open query tabs (never empty), and the index of the focused one.
     pub tabs: Vec<QueryTab>,
@@ -255,6 +252,8 @@ impl ActiveConn {
             sidebar_collapsed: false,
             editor_h: px(300.),
             editor_drag: None,
+            inspector_w: px(360.),
+            inspector_drag: None,
             schema: SchemaState::new(cx),
             tabs: vec![tab],
             active_tab: 0,
@@ -335,6 +334,10 @@ pub struct AppState {
     /// The cell detail inspector, when open (Track B1). Owns its scroll position
     /// and any on-demand full value fetched for a capped/evicted cell.
     pub(crate) inspector: Option<crate::inspector::InspectorState>,
+    /// Window-coordinate anchor for the result cell's right-click context menu,
+    /// when open. The right-click selects the cell first, so the menu's Inspect/
+    /// Copy act on it; `None` keeps the menu closed.
+    pub(crate) cell_menu: Option<gpui::Point<gpui::Pixels>>,
     /// A destructive statement awaiting the user's confirmation before it runs.
     pub(crate) confirm_exec: Option<String>,
     /// A non-pristine query tab the user asked to close, awaiting confirmation.
@@ -364,10 +367,16 @@ pub struct AppState {
     /// Built-in + imported themes, resolved for the light/dark pickers and the
     /// theme manager. Rebuilt on import / remove.
     pub(crate) themes: ThemeRegistry,
-    /// Which theme picker dropdown is open in the panel, if any.
-    pub(crate) theme_select_open: Option<ThemeSelect>,
-    /// Which font-family picker dropdown is open in the panel, if any.
-    pub(crate) font_select_open: Option<FontSelect>,
+    /// The five Appearance-panel dropdowns: searchable single-select combo boxes
+    /// for the light/dark theme and the three font families. Their options are
+    /// (re)filled from the theme registry + warmed font cache by
+    /// [`Self::rebuild_settings_pickers`] when the panel opens; each routes its
+    /// chosen label straight to the matching setter.
+    pub(crate) theme_combo_light: Entity<ComboBox>,
+    pub(crate) theme_combo_dark: Entity<ComboBox>,
+    pub(crate) font_combo_ui: Entity<ComboBox>,
+    pub(crate) font_combo_ui_mono: Entity<ComboBox>,
+    pub(crate) font_combo_editor: Entity<ComboBox>,
     /// Installed font families, sorted + deduped. Enumerating these hits the OS
     /// text system (a CoreText scan of hundreds of faces) — far too slow to do
     /// per render, so the Appearance panel reads this cache. Filled lazily when
@@ -585,6 +594,15 @@ impl AppState {
         let switcher = cx.new(|cx| {
             let mut s = Switcher::new("connection-switcher", cx);
             s.set_placeholder("Search connections…", cx);
+            // Lucide disclosure glyph, re-themed each render; muted to match the
+            // topbar trigger's subtle look.
+            s.set_chevron(
+                |app| {
+                    crate::icons::icon("chevron-down", app.theme().scale(14.), app.theme().text_dim)
+                        .into_any_element()
+                },
+                cx,
+            );
             let (label, dot, sections) = switcher_sections(
                 &connections,
                 &Phase::Disconnected,
@@ -597,6 +615,78 @@ impl AppState {
             s
         });
         cx.subscribe(&switcher, Self::on_switcher_event).detach();
+
+        // The five Appearance-panel dropdowns (searchable combo boxes). They start
+        // empty: their options are filled lazily by `rebuild_settings_pickers` when
+        // the panel first opens — the installed-font list is a slow OS scan we keep
+        // off the startup path. Each routes its chosen label to its setter.
+        let new_combo = |cx: &mut Context<Self>, id: &'static str, search: &'static str| {
+            cx.new(|cx| {
+                let mut c = ComboBox::new(id, cx);
+                c.set_search_placeholder(search, cx);
+                // Lucide disclosure + check glyphs, re-themed each render from the
+                // current app theme (accent colour, size scaled to the font ramp).
+                c.set_chevron(
+                    |app| {
+                        crate::icons::icon(
+                            "chevron-down",
+                            app.theme().scale(14.),
+                            app.theme().text_dim,
+                        )
+                        .into_any_element()
+                    },
+                    cx,
+                );
+                c.set_check(
+                    |app| {
+                        crate::icons::icon("check", app.theme().scale(13.), app.theme().accent)
+                            .into_any_element()
+                    },
+                    cx,
+                );
+                c
+            })
+        };
+        let theme_combo_light = new_combo(cx, "pick-light-theme", "Search themes…");
+        let theme_combo_dark = new_combo(cx, "pick-dark-theme", "Search themes…");
+        let font_combo_ui = new_combo(cx, "pick-ui-font", "Search fonts…");
+        let font_combo_ui_mono = new_combo(cx, "pick-ui-mono-font", "Search fonts…");
+        let font_combo_editor = new_combo(cx, "pick-editor-font", "Search fonts…");
+        theme_combo_light.update(cx, |c, cx| c.set_placeholder("Select a theme…", cx));
+        theme_combo_dark.update(cx, |c, cx| c.set_placeholder("Select a theme…", cx));
+        for combo in [&font_combo_ui, &font_combo_ui_mono, &font_combo_editor] {
+            combo.update(cx, |c, cx| c.set_placeholder("Select a font…", cx));
+        }
+        cx.subscribe(&theme_combo_light, |this, _, e: &ComboBoxEvent, cx| {
+            if let ComboBoxEvent::Select(name) = e {
+                this.set_light_theme(name.as_ref(), cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&theme_combo_dark, |this, _, e: &ComboBoxEvent, cx| {
+            if let ComboBoxEvent::Select(name) = e {
+                this.set_dark_theme(name.as_ref(), cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&font_combo_ui, |this, _, e: &ComboBoxEvent, cx| {
+            if let ComboBoxEvent::Select(name) = e {
+                this.set_ui_font_family(name.as_ref(), cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&font_combo_ui_mono, |this, _, e: &ComboBoxEvent, cx| {
+            if let ComboBoxEvent::Select(name) = e {
+                this.set_ui_mono_family(name.as_ref(), cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&font_combo_editor, |this, _, e: &ComboBoxEvent, cx| {
+            if let ComboBoxEvent::Select(name) = e {
+                this.set_editor_font_family(name.as_ref(), cx);
+            }
+        })
+        .detach();
 
         Self {
             service,
@@ -618,6 +708,7 @@ impl AppState {
             next_copy_id: 0,
             pending_copy: None,
             inspector: None,
+            cell_menu: None,
             confirm_exec: None,
             confirm_close_tab: None,
             confirm_delete_conn: None,
@@ -631,8 +722,11 @@ impl AppState {
             settings_watcher: None,
             observers_installed: false,
             themes,
-            theme_select_open: None,
-            font_select_open: None,
+            theme_combo_light,
+            theme_combo_dark,
+            font_combo_ui,
+            font_combo_ui_mono,
+            font_combo_editor,
             font_names_cache: None,
             query_ticking: false,
             connect_gen: 0,
@@ -1004,6 +1098,9 @@ impl AppState {
     pub(crate) fn request_delete_connection(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.connections.len() {
             self.confirm_delete_conn = Some(index);
+            // Focus the modal so its Enter/Esc handling is heard — and so focus
+            // doesn't fall to the close ✕ — matching the other confirmations.
+            self.focus_modal = true;
             cx.notify();
         }
     }
@@ -1210,8 +1307,23 @@ impl AppState {
     /// Toggle the connection switcher popover (⌘P, or a click on its topbar
     /// trigger). Refresh its contents first so recents/active are current.
     pub(crate) fn toggle_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.switcher.read(cx).is_open() {
+            // Closing: the popover's search field held focus, so dropping it leaves
+            // `window.focused()` dangling — reclaim the root (like `close_palette`)
+            // or the *next* ⌘P finds no dispatch target and won't reopen.
+            self.switcher.update(cx, |s, cx| s.close(cx));
+            self.refocus_root = true;
+            cx.notify();
+            return;
+        }
+        // Opening only makes sense where the trigger is mounted (the connected
+        // topbar anchors the popover). On the welcome screen there's no anchor, so
+        // opening would just steal focus into an unrendered field — no-op instead.
+        if !matches!(self.phase, Phase::Connected(_)) {
+            return;
+        }
         self.rebuild_switcher(cx);
-        self.switcher.update(cx, |s, cx| s.toggle(window, cx));
+        self.switcher.update(cx, |s, cx| s.open(window, cx));
     }
 
     /// Handle a row chosen in the switcher popover. Row ids are `conn:<index>` (a
@@ -1223,6 +1335,11 @@ impl AppState {
         event: &SwitcherEvent,
         cx: &mut Context<Self>,
     ) {
+        // Both Activate and Dismiss close the popover, dropping its focused search
+        // field. Reclaim the root so the next ⌘P dispatches; any follow-on focus
+        // (a modal, a switched-in pane) overrides this within the same render.
+        self.refocus_root = true;
+        cx.notify();
         let SwitcherEvent::Activate(ElementId::Name(name)) = event else {
             return;
         };
@@ -1772,7 +1889,48 @@ impl AppState {
             names.dedup();
             self.font_names_cache = Some(names);
         }
+        // Now that the font cache is warm, fill the Appearance dropdowns.
+        self.rebuild_settings_pickers(cx);
         cx.notify();
+    }
+
+    /// Fill the five Appearance dropdowns with the current themes + installed fonts
+    /// and mark the active option. Called when the settings panel opens and after
+    /// the theme registry changes (import/remove). The font list is read from the
+    /// warmed cache (see [`Self::open_settings`]) — never re-enumerated here.
+    fn rebuild_settings_pickers(&mut self, cx: &mut Context<Self>) {
+        for (light, combo) in [
+            (true, self.theme_combo_light.clone()),
+            (false, self.theme_combo_dark.clone()),
+        ] {
+            let names = self.themes.names(light);
+            let current = self.selected_theme(light);
+            let selected = names.iter().position(|n| *n == current);
+            let options = names.into_iter().map(Into::into).collect();
+            combo.update(cx, |c, cx| c.set_options(options, selected, cx));
+        }
+
+        for which in [FontSelect::Ui, FontSelect::UiMono, FontSelect::Editor] {
+            let current = match which {
+                FontSelect::Ui => self.settings.appearance.ui_font_family.clone(),
+                FontSelect::UiMono => self.settings.appearance.ui_mono_family.clone(),
+                FontSelect::Editor => self.settings.editor.font_family.clone(),
+            };
+            // Keep the configured family selectable even if it isn't installed (a
+            // settings file referencing a font from another machine).
+            let mut names = self.font_names().to_vec();
+            if !names.contains(&current) {
+                names.insert(0, current.clone());
+            }
+            let selected = names.iter().position(|n| *n == current);
+            let options = names.into_iter().map(Into::into).collect();
+            let combo = match which {
+                FontSelect::Ui => self.font_combo_ui.clone(),
+                FontSelect::UiMono => self.font_combo_ui_mono.clone(),
+                FontSelect::Editor => self.font_combo_editor.clone(),
+            };
+            combo.update(cx, |c, cx| c.set_options(options, selected, cx));
+        }
     }
 
     /// Open the settings panel on its About tab — the RED → About RED menu item.
@@ -1865,31 +2023,18 @@ impl AppState {
     /// Choose the light-appearance theme (used in Light and System-on-light modes).
     pub(crate) fn set_light_theme(&mut self, name: &str, cx: &mut Context<Self>) {
         let (mode, _, dark) = self.theme_decompose();
-        self.theme_select_open = None;
         self.set_theme_pair(mode, name.to_string(), dark, cx);
     }
 
     /// Choose the dark-appearance theme (used in Dark and System-on-dark modes).
     pub(crate) fn set_dark_theme(&mut self, name: &str, cx: &mut Context<Self>) {
         let (mode, light, _) = self.theme_decompose();
-        self.theme_select_open = None;
         self.set_theme_pair(mode, light, name.to_string(), cx);
-    }
-
-    /// Open/close a theme picker dropdown (the panel owns the open flag).
-    pub(crate) fn toggle_theme_select(&mut self, which: ThemeSelect, cx: &mut Context<Self>) {
-        self.theme_select_open = if self.theme_select_open == Some(which) {
-            None
-        } else {
-            Some(which)
-        };
-        cx.notify();
     }
 
     /// Pick a theme file from disk, validate + copy it into the user themes dir,
     /// then reload the registry. Async (the native file dialog runs off-thread).
     pub(crate) fn import_theme(&mut self, cx: &mut Context<Self>) {
-        self.theme_select_open = None;
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -1914,6 +2059,7 @@ impl AppState {
             Ok(name) => {
                 self.themes = ThemeRegistry::load();
                 self.apply_theme(cx);
+                self.rebuild_settings_pickers(cx);
                 self.notify(
                     ToastVariant::Success,
                     format!("Imported theme “{name}”"),
@@ -1944,6 +2090,7 @@ impl AppState {
         }
         self.themes = ThemeRegistry::load();
         self.apply_theme(cx);
+        self.rebuild_settings_pickers(cx);
         self.notify(ToastVariant::Success, format!("Removed theme “{name}”"), cx);
     }
 
@@ -2029,7 +2176,6 @@ impl AppState {
 
     pub(crate) fn set_ui_font_family(&mut self, family: &str, cx: &mut Context<Self>) {
         self.settings.appearance.ui_font_family = family.to_string();
-        self.font_select_open = None;
         self.save_settings();
         self.apply_theme(cx);
         cx.notify();
@@ -2047,7 +2193,6 @@ impl AppState {
 
     pub(crate) fn set_ui_mono_family(&mut self, family: &str, cx: &mut Context<Self>) {
         self.settings.appearance.ui_mono_family = family.to_string();
-        self.font_select_open = None;
         self.save_settings();
         // The UI mono family is a theme token (result grid, schema identifiers).
         self.apply_theme(cx);
@@ -2056,7 +2201,6 @@ impl AppState {
 
     pub(crate) fn set_editor_font_family(&mut self, family: &str, cx: &mut Context<Self>) {
         self.settings.editor.font_family = family.to_string();
-        self.font_select_open = None;
         self.save_settings();
         cx.notify();
     }
@@ -2067,16 +2211,6 @@ impl AppState {
             crate::settings::MAX_FONT_SIZE,
         );
         self.save_settings();
-        cx.notify();
-    }
-
-    /// Open/close a font-family picker dropdown (the panel owns the open flag).
-    pub(crate) fn toggle_font_select(&mut self, which: FontSelect, cx: &mut Context<Self>) {
-        self.font_select_open = if self.font_select_open == Some(which) {
-            None
-        } else {
-            Some(which)
-        };
         cx.notify();
     }
 
@@ -2122,8 +2256,8 @@ const SWITCHER_RECENT_CAP: usize = 8;
 
 /// Build the connection switcher's trigger (label + leading dot) and its
 /// sections from the saved connections, the current phase, and the warm parked
-/// sessions. The foreground connection heads a "This window" section (checkmark +
-/// warm/connecting badge) and drives the trigger; other warm sessions fill an
+/// sessions. The foreground connection heads a "This window" section (warm/
+/// connecting badge) and drives the trigger; other warm sessions fill an
 /// "Open" section (instant switch); the rest are capped "Recent" recents. The
 /// "New…" / "Manage…" actions live in the always-visible footer.
 fn switcher_sections(
@@ -2171,8 +2305,7 @@ fn switcher_sections(
             "This window",
             vec![row(ai)
                 .detail(connections[ai].config.display_target())
-                .badge(badge)
-                .checked(true)],
+                .badge(badge)],
         ));
     }
 

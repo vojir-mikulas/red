@@ -19,7 +19,7 @@
 //! The bindings use `cmd-*` unconditionally, matching the rest of the app's
 //! macOS-first chrome; per-platform `ctrl-*` splitting is a follow-up.
 
-use flint::{CodeEditor, Modal, Palette, Switcher, TextInput};
+use flint::{CodeEditor, ComboBox, Modal, Palette, Switcher, TextInput};
 use gpui::{actions, App, KeyBinding};
 
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
@@ -161,6 +161,7 @@ pub(crate) fn bind_all(cx: &mut App) {
     Palette::bind_keys(cx);
     Modal::bind_keys(cx);
     Switcher::bind_keys(cx);
+    ComboBox::bind_keys(cx);
 
     cx.bind_keys([
         // --- true globals (work from any phase) ---

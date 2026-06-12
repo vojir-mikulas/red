@@ -433,15 +433,14 @@ impl AppState {
                 .child(a)
         });
 
+        // Fills the trailing pane of the result split; the split's divider is the
+        // left separator and the user-draggable resize handle, so no border/width
+        // here.
         div()
             .id("inspector")
-            .flex_shrink_0()
-            .w(px(440.))
-            .h_full()
+            .size_full()
             .flex()
             .flex_col()
-            .border_l_1()
-            .border_color(border)
             .bg(bg)
             .text_color(muted)
             .child(header)

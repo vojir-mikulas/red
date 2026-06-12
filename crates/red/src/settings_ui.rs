@@ -245,20 +245,20 @@ fn appearance_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             .child(setting_row(
                 "Light theme",
                 "Used in Light mode, and in System mode on a light OS.",
-                theme_picker(state, true, cx),
+                theme_picker(state, true),
                 &theme,
             ))
             .child(setting_row(
                 "Dark theme",
                 "Used in Dark mode, and in System mode on a dark OS.",
-                theme_picker(state, false, cx),
+                theme_picker(state, false),
                 &theme,
             ))
             .child(settings_header("Typography", &theme))
             .child(setting_row(
                 "Interface font",
                 "The sans font for chrome — toolbars, tabs, sidebars, status bar, menus.",
-                font_picker(state, FontSelect::Ui, cx),
+                font_picker(state, FontSelect::Ui),
                 &theme,
             ))
             .child(setting_row(
@@ -266,7 +266,7 @@ fn appearance_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 "The font for in-UI data — result grid cells and schema identifiers. \
                  Shares the interface font size; match it to the interface font for a \
                  uniform look.",
-                font_picker(state, FontSelect::UiMono, cx),
+                font_picker(state, FontSelect::UiMono),
                 &theme,
             ))
             .child(setting_row(
@@ -279,7 +279,7 @@ fn appearance_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 "Editor font",
                 "The SQL editor font — independent of the interface. A monospace face is \
                  recommended.",
-                font_picker(state, FontSelect::Editor, cx),
+                font_picker(state, FontSelect::Editor),
                 &theme,
             ))
             .child(setting_row(
@@ -299,117 +299,26 @@ fn appearance_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     .into_any_element()
 }
 
-/// A dropdown of the themes of one family (light or dark), selecting the active
-/// one for that slot. The panel owns the open flag on [`AppState`].
-fn theme_picker(state: &AppState, light: bool, cx: &mut Context<AppState>) -> impl IntoElement {
-    let which = if light {
-        crate::app::ThemeSelect::Light
+/// The searchable dropdown for one theme family (light or dark). The combo box is
+/// a long-lived entity on [`AppState`]; its options + selection are filled by
+/// `AppState::rebuild_settings_pickers` when the panel opens, and it routes the
+/// chosen theme name to `set_light_theme` / `set_dark_theme`.
+fn theme_picker(state: &AppState, light: bool) -> impl IntoElement {
+    if light {
+        state.theme_combo_light.clone()
     } else {
-        crate::app::ThemeSelect::Dark
-    };
-    let names = state.themes.names(light);
-    let current = state.selected_theme(light);
-    let selected = names
-        .iter()
-        .position(|n| *n == current)
-        .unwrap_or(usize::MAX);
-
-    let theme = cx.theme().clone();
-    let accent = theme.accent;
-    let chevron_sz = theme.scale(14.);
-    let check_sz = theme.scale(13.);
-    let mut select = Select::new(if light { "pick-light" } else { "pick-dark" })
-        .placeholder("Select a theme…")
-        .selected(selected)
-        .open(state.theme_select_open == Some(which))
-        .chevron(crate::icons::icon("chevron-down", chevron_sz, accent))
-        .check(crate::icons::icon("check", check_sz, accent));
-    for name in &names {
-        select = select.option(name.clone());
+        state.theme_combo_dark.clone()
     }
-
-    let toggle_view = cx.entity();
-    let pick_view = cx.entity();
-    let pick_names = names.clone();
-    select
-        .on_toggle(move |_, cx| {
-            toggle_view.update(cx, |this, cx| this.toggle_theme_select(which, cx));
-        })
-        .on_select(move |ix, _, cx| {
-            if let Some(name) = pick_names.get(ix).cloned() {
-                pick_view.update(cx, |this, cx| {
-                    if light {
-                        this.set_light_theme(&name, cx)
-                    } else {
-                        this.set_dark_theme(&name, cx)
-                    }
-                });
-            }
-        })
 }
 
-/// A dropdown of the installed font families, selecting the one for either the
-/// UI or the editor. Mirrors [`theme_picker`]: the panel owns the open flag.
-fn font_picker(
-    state: &AppState,
-    which: FontSelect,
-    cx: &mut Context<AppState>,
-) -> impl IntoElement {
-    let current = match which {
-        FontSelect::Ui => state.settings.appearance.ui_font_family.clone(),
-        FontSelect::UiMono => state.settings.appearance.ui_mono_family.clone(),
-        FontSelect::Editor => state.settings.editor.font_family.clone(),
-    };
-
-    // Read the warmed cache (see `AppState::open_settings`) — never re-enumerate
-    // the OS font list on the render path; it's a slow CoreText scan and the
-    // Appearance tab would pay it twice per frame while scrolling.
-    let mut names = state.font_names().to_vec();
-    // The configured family may not be installed (a file edit referencing a font
-    // from another machine) — keep it selectable so it isn't silently dropped.
-    if !names.contains(&current) {
-        names.insert(0, current.clone());
+/// The searchable dropdown for one font slot (UI sans / UI mono / editor). Mirrors
+/// [`theme_picker`]: a long-lived combo box on [`AppState`], filled on panel open.
+fn font_picker(state: &AppState, which: FontSelect) -> impl IntoElement {
+    match which {
+        FontSelect::Ui => state.font_combo_ui.clone(),
+        FontSelect::UiMono => state.font_combo_ui_mono.clone(),
+        FontSelect::Editor => state.font_combo_editor.clone(),
     }
-    let selected = names
-        .iter()
-        .position(|n| *n == current)
-        .unwrap_or(usize::MAX);
-
-    let id = match which {
-        FontSelect::Ui => "pick-ui-font",
-        FontSelect::UiMono => "pick-ui-mono-font",
-        FontSelect::Editor => "pick-editor-font",
-    };
-    let theme = cx.theme().clone();
-    let accent = theme.accent;
-    let chevron_sz = theme.scale(14.);
-    let check_sz = theme.scale(13.);
-    let mut select = Select::new(id)
-        .placeholder("Select a font…")
-        .selected(selected)
-        .open(state.font_select_open == Some(which))
-        .chevron(crate::icons::icon("chevron-down", chevron_sz, accent))
-        .check(crate::icons::icon("check", check_sz, accent));
-    for name in &names {
-        select = select.option(name.clone());
-    }
-
-    let toggle_view = cx.entity();
-    let pick_view = cx.entity();
-    let pick_names = names;
-    select
-        .on_toggle(move |_, cx| {
-            toggle_view.update(cx, |this, cx| this.toggle_font_select(which, cx));
-        })
-        .on_select(move |ix, _, cx| {
-            if let Some(name) = pick_names.get(ix).cloned() {
-                pick_view.update(cx, |this, cx| match which {
-                    FontSelect::Ui => this.set_ui_font_family(&name, cx),
-                    FontSelect::UiMono => this.set_ui_mono_family(&name, cx),
-                    FontSelect::Editor => this.set_editor_font_family(&name, cx),
-                });
-            }
-        })
 }
 
 /// The theme manager: an Import button, then every theme as a row — built-ins

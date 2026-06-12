@@ -3,11 +3,11 @@
 //! toolbar · grid · footer · scrollbar that make up the pane.
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Hsla, SharedString, Window};
+use gpui::{div, prelude::*, px, Axis, Hsla, MouseButton, Pixels, Point, SharedString, Window};
 use red_core::ExportFormat;
 
 use super::buffer::{CellKind, DisplayCell};
-use crate::app::{ActiveConn, AppState, Pane};
+use crate::app::{ActiveConn, AppState, Pane, Phase};
 
 /// Group a number's digits in threes (`1234567` → `1,234,567`) so large row
 /// numbers and totals read at a glance.
@@ -119,6 +119,7 @@ impl AppState {
         // ring's space so focus never shifts the layout.
         let container = div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .border_1()
@@ -199,27 +200,13 @@ impl AppState {
             .child(div().text_color(muted).child(grid.label.clone()))
             .child(status)
             .child(
+                // Per-cell actions (Inspect · Copy) moved to the cell's right-click
+                // context menu; the toolbar keeps the result-wide CSV/JSON exports.
                 div()
                     .ml_auto()
                     .flex()
                     .items_center()
                     .gap_1()
-                    .child(
-                        Button::new("result-inspect", "Inspect")
-                            .variant(if self.inspector.is_some() {
-                                ButtonVariant::Secondary
-                            } else {
-                                ButtonVariant::Ghost
-                            })
-                            .size(ButtonSize::Sm)
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector(cx))),
-                    )
-                    .child(
-                        Button::new("result-copy", "Copy")
-                            .variant(ButtonVariant::Ghost)
-                            .size(ButtonSize::Sm)
-                            .on_click(cx.listener(|this, _, _, cx| this.copy_result_selection(cx))),
-                    )
                     .child(
                         Button::new("result-csv", "CSV")
                             .variant(ButtonVariant::Ghost)
@@ -270,6 +257,7 @@ impl AppState {
         let sender = grid.sender.clone();
         let epoch = grid.epoch;
         let (sort_view, cell_view, nav_view) = (view.clone(), view.clone(), view.clone());
+        let sec_view = view.clone();
 
         // Resolve (and possibly re-center) the virtual-scroll window for this
         // frame; everything below works in list-local coordinates offset by
@@ -355,6 +343,20 @@ impl AppState {
                         if inspect {
                             this.open_inspector(cx);
                         }
+                    })
+                    .ok();
+            })
+            // Right-click selects the cell and opens its context menu (Inspect ·
+            // Copy) anchored at the cursor — the per-cell actions that used to live
+            // in the toolbar.
+            .on_cell_secondary(move |row, table_col, pos, window, cx| {
+                let abs_row = base + row;
+                sec_view
+                    .update(cx, |this, cx| {
+                        this.focus_pane(Pane::Grid, window, cx);
+                        this.result_select(abs_row, table_col, false, cx);
+                        this.cell_menu = Some(pos);
+                        cx.notify();
                     })
                     .ok();
             })
@@ -457,20 +459,100 @@ impl AppState {
                     .child(table)
                     .child(scrollbar),
             )
-            .child(footer);
+            .child(footer)
+            // The cell right-click menu floats above the pane, anchored at the
+            // cursor; a full-cover backdrop dismisses it on an outside click.
+            .when_some(self.cell_menu, |c, pos| {
+                c.child(self.render_cell_menu(pos, cx))
+            });
 
-        // With the detail inspector open, dock it to the right of the grid (the
-        // grid narrows; the inspector never occludes it, so the cursor and its live
-        // updates stay visible). Closed, the grid keeps the full pane.
+        // With the detail inspector open, dock it to the right of the grid via a
+        // resizable split: the grid flexes, the inspector carries the user-set
+        // width (caller-owned, like the sidebar/editor splits). The inspector never
+        // occludes the grid, so the cursor and its live updates stay visible.
+        // Closed, the grid keeps the full pane.
         if self.inspector.is_some() {
-            div()
-                .size_full()
-                .flex()
-                .flex_row()
-                .child(div().flex_1().min_w(px(0.)).h_full().child(grid_pane))
-                .child(self.render_inspector(active, cx))
+            let start = view.clone();
+            let resize = view.clone();
+            let end = view.clone();
+            div().size_full().child(
+                SplitPane::new("result-split-inspector", Axis::Horizontal)
+                    .sized(SplitSide::Trailing)
+                    .size(active.inspector_w)
+                    .drag(active.inspector_drag)
+                    .min_first(px(260.))
+                    .max_first(px(720.))
+                    .on_drag_start(move |anchor, _, cx| {
+                        start
+                            .update(cx, |this, cx| {
+                                if let Phase::Connected(a) = &mut this.phase {
+                                    a.inspector_drag = Some(anchor);
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+                    .on_resize(move |size, _, cx| {
+                        resize
+                            .update(cx, |this, cx| {
+                                if let Phase::Connected(a) = &mut this.phase {
+                                    a.inspector_w = size;
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+                    .on_drag_end(move |_, cx| {
+                        end.update(cx, |this, cx| {
+                            if let Phase::Connected(a) = &mut this.phase {
+                                a.inspector_drag = None;
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .first(div().size_full().child(grid_pane))
+                    .second(self.render_inspector(active, cx)),
+            )
         } else {
-            grid_pane
+            div().size_full().child(grid_pane)
         }
+    }
+
+    /// The result cell's right-click context menu — the per-cell actions (Inspect
+    /// · Copy) that used to sit in the toolbar, anchored at `pos` (the cursor).
+    /// Both act on the cell the right-click just selected. A full-cover backdrop
+    /// closes the menu on an outside click.
+    fn render_cell_menu(&self, pos: Point<Pixels>, cx: &mut Context<Self>) -> impl IntoElement {
+        let menu = ContextMenu::new("result-cell-menu")
+            .item(
+                ContextMenuItem::new("cell-inspect", "Inspect")
+                    .shortcut("⌘I")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.cell_menu = None;
+                        this.open_inspector(cx);
+                        cx.notify();
+                    })),
+            )
+            .item(
+                ContextMenuItem::new("cell-copy", "Copy")
+                    .shortcut("⌘C")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.cell_menu = None;
+                        this.copy_result_selection(cx);
+                        cx.notify();
+                    })),
+            );
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.cell_menu = None;
+                    cx.notify();
+                }),
+            )
+            .child(floating(div().occlude().child(menu)).at(pos))
     }
 }
