@@ -2067,7 +2067,7 @@ dependencies = [
 [[package]]
 name = "flint"
 version = "0.1.0"
-source = "git+https://github.com/vojir-mikulas/flint?rev=7c913d8b4df351620d82e7750e52949d74a09d50#7c913d8b4df351620d82e7750e52949d74a09d50"
+source = "git+https://github.com/vojir-mikulas/flint?rev=35aa00b34115397be595284eec3d6f0ba2508fcb#35aa00b34115397be595284eec3d6f0ba2508fcb"
 dependencies = [
  "gpui",
  "unicode-segmentation",
@@ -5316,7 +5316,7 @@ dependencies = [
 
 [[package]]
 name = "red"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -5337,7 +5337,7 @@ dependencies = [
 
 [[package]]
 name = "red-core"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -5345,7 +5345,7 @@ dependencies = [
 
 [[package]]
 name = "red-driver"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -5358,7 +5358,7 @@ dependencies = [
 
 [[package]]
 name = "red-service"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "futures",
  "red-core",
