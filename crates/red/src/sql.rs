@@ -232,6 +232,49 @@ pub fn classify(sql: &str) -> StatementKind {
         .unwrap_or(StatementKind::Query)
 }
 
+/// The single `;`-delimited statement to run for a caret at `cursor`: the
+/// statement the caret sits in, or — when it sits in a blank/comment-only region
+/// (commonly just past the final `;`) — the nearest non-empty statement before it.
+/// The editor's "run" uses this so a buffer holding several statements runs just
+/// the one under the caret, not the whole buffer: the `SELECT * FROM (<sql>)`
+/// paging wrap can't accept a `;`-separated batch and would bounce back a bare
+/// syntax error. Returns the trimmed slice; empty only when there's no statement.
+pub fn statement_at(content: &str, cursor: usize) -> &str {
+    let bounds = statement_bounds(content, cursor);
+    let stmt = content[bounds.clone()].trim();
+    if !first_keyword(stmt).is_empty() {
+        return stmt;
+    }
+    // Caret in a blank region — fall back to the last non-empty statement before
+    // it rather than running nothing.
+    split_statements(&content[..bounds.start])
+        .into_iter()
+        .map(str::trim)
+        .rfind(|s| !first_keyword(s).is_empty())
+        .unwrap_or(stmt)
+}
+
+/// True when `sql` holds nothing runnable — only whitespace, comments, and bare
+/// `;` terminators. The editor's run skips these so an empty/comment-only buffer
+/// never reaches the engine, where the `SELECT * FROM (<sql>)` paging wrap would
+/// collapse to a bare `db error`. Reuses [`tokenize`]: every such input yields
+/// only comment tokens (or none), while any real content produces a non-comment.
+pub fn is_blank(sql: &str) -> bool {
+    tokenize(sql)
+        .iter()
+        .all(|(_, style)| *style == TokenStyle::Comment)
+}
+
+/// How many non-empty `;`-delimited statements `sql` holds. Lets the run path tell
+/// a single statement (opens as a result) from a batch (which the paging wrap
+/// can't run) so the latter gets a clear message, not a cryptic engine error.
+pub fn statement_count(sql: &str) -> usize {
+    split_statements(sql)
+        .into_iter()
+        .filter(|s| !first_keyword(s).is_empty())
+        .count()
+}
+
 /// Classify a single statement by its leading keyword (comments + whitespace
 /// skipped). See [`classify`] for the batch entry point.
 fn classify_one(sql: &str) -> StatementKind {
@@ -687,6 +730,47 @@ mod tests {
         );
         // Trailing terminator / empty statements are ignored.
         assert_eq!(classify("DELETE FROM t;"), StatementKind::Destructive);
+    }
+
+    #[test]
+    fn statement_at_picks_the_caret_statement() {
+        // Single statement: the whole buffer, wherever the caret sits.
+        let (c, cur) = at("SELECT * FROM |users");
+        assert_eq!(statement_at(&c, cur), "SELECT * FROM users");
+        // Multi-statement: only the one under the caret, trimmed.
+        let (c, cur) = at("SELECT 1;\nSELECT |2;\nSELECT 3");
+        assert_eq!(statement_at(&c, cur), "SELECT 2");
+        // Caret just past the final `;` (blank tail) falls back to the last real one.
+        let (c, cur) = at("SELECT 1;\nSELECT 2;\n|");
+        assert_eq!(statement_at(&c, cur), "SELECT 2");
+        // A `;` inside a string isn't a boundary — the whole statement comes back.
+        let (c, cur) = at("SELECT 'a; b' AS |x");
+        assert_eq!(statement_at(&c, cur), "SELECT 'a; b' AS x");
+    }
+
+    #[test]
+    fn is_blank_detects_nothing_runnable() {
+        // Empty, whitespace, comments, and bare terminators have nothing to run.
+        assert!(is_blank(""));
+        assert!(is_blank("   \n\t"));
+        assert!(is_blank(";"));
+        assert!(is_blank("-- just a note"));
+        assert!(is_blank("/* block */  ;\n"));
+        // Any real statement (even paren-led, which has no leading keyword) is not.
+        assert!(!is_blank("SELECT 1"));
+        assert!(!is_blank("-- note\nSELECT 1"));
+        assert!(!is_blank("(SELECT 1)"));
+    }
+
+    #[test]
+    fn statement_count_ignores_empty_statements() {
+        assert_eq!(statement_count("SELECT 1"), 1);
+        assert_eq!(statement_count("SELECT 1; SELECT 2"), 2);
+        // Trailing terminator / whitespace-only statements don't count.
+        assert_eq!(statement_count("SELECT 1;"), 1);
+        assert_eq!(statement_count("SELECT 1;  ;\n"), 1);
+        // A `;` inside a literal stays within one statement.
+        assert_eq!(statement_count("SELECT 'a; b'"), 1);
     }
 
     #[test]

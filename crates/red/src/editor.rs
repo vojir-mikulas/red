@@ -641,21 +641,34 @@ impl AppState {
             .children(history)
     }
 
-    /// Run the selection if any, else the whole buffer. Pushes to history and
-    /// streams the first window into the results pane.
+    /// Run the selection if any, else the statement under the caret. Pushes to
+    /// history and streams the first window into the results pane.
     pub(crate) fn run_editor_query(&mut self, cx: &mut Context<Self>) {
         let sql = match &self.phase {
             Phase::Connected(active) => match active.active() {
                 Some(tab) => {
                     let editor = tab.editor.read(cx);
-                    editor.selected_text().unwrap_or_else(|| editor.content())
+                    // An explicit selection runs verbatim; otherwise run just the
+                    // statement under the caret, not the whole buffer — a buffer of
+                    // several statements can't open as one result (the paging wrap
+                    // is a single subquery), so running the caret's statement is what
+                    // the user means and avoids a cryptic engine error.
+                    match editor.selected_text() {
+                        Some(sel) => sel,
+                        None => {
+                            let content = editor.content();
+                            crate::sql::statement_at(&content, editor.cursor_offset()).to_string()
+                        }
+                    }
                 }
                 None => return,
             },
             _ => return,
         };
         let sql = sql.trim().to_string();
-        if sql.is_empty() {
+        // Nothing runnable (empty, or only comments/`;`) — skip it rather than let
+        // the empty `SELECT * FROM (<sql>)` paging wrap bounce back a bare "db error".
+        if crate::sql::is_blank(&sql) {
             return;
         }
 
@@ -687,6 +700,19 @@ impl AppState {
 
         match kind {
             crate::sql::StatementKind::Query => {
+                // A row-returning batch can't open as one result — the paging path
+                // wraps the SQL in a single `SELECT * FROM (<sql>) AS _red`, which a
+                // `;`-separated batch makes a syntax error. Only an explicit
+                // multi-statement selection reaches here (a no-selection run already
+                // narrowed to the caret's statement); say so plainly.
+                if crate::sql::statement_count(&sql) > 1 {
+                    self.notify(
+                        ToastVariant::Error,
+                        "Select a single statement to run — a multi-statement query can't open as a result.",
+                        cx,
+                    );
+                    return;
+                }
                 // Guard a bare `SELECT *` against flooding the grid: append the
                 // configured `LIMIT` unless the user wrote their own.
                 let sql =

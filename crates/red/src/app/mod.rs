@@ -1185,6 +1185,9 @@ impl AppState {
                 }
             }
             Event::Error(message) => {
+                // Log the full text to stderr (RUST_LOG) — a toast is ephemeral and
+                // can truncate, so the console keeps the complete error to inspect.
+                tracing::error!(?session, "{message}");
                 // While the foreground is connecting, the only thing in flight is
                 // that connect — so an error is a failed attempt: keep the splash
                 // and schedule a backoff retry instead of dropping to the screen.
