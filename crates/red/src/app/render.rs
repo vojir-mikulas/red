@@ -460,7 +460,11 @@ impl AppState {
 
         for n in self.notifications.iter().skip(hidden) {
             let id = n.id;
-            let mut toast = Toast::new(n.message.clone()).variant(n.variant);
+            // The notification id doubles as the toast's a11y id, so each toast
+            // becomes a (polite/assertive) live region screen readers announce.
+            let mut toast = Toast::new(n.message.clone())
+                .id(("toast", id))
+                .variant(n.variant);
             if let Some(export) = &n.export {
                 let fraction = if export.total > 0 {
                     export.rows as f32 / export.total as f32

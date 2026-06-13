@@ -6,7 +6,8 @@
 use flint::prelude::*;
 use flint::Theme;
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, SharedString, WindowControlArea,
+    div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, Role, SharedString,
+    WindowControlArea,
 };
 use red_core::DbKind;
 
@@ -103,6 +104,7 @@ impl AppState {
         )
         .size(IconButtonSize::Sm)
         .tooltip("Settings  ⌘,")
+        .a11y_label("Settings")
         .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
 
         let theme = cx.theme();
@@ -269,9 +271,18 @@ impl AppState {
             DbKind::Mysql => (BadgeVariant::Warning, "MySQL"),
         };
         let group = SharedString::from(format!("connect-card-{index}"));
+        // Accessible name: the connection's name, engine, and read-only state —
+        // the card is the welcome screen's primary action, announced as a button.
+        let a11y_name = if config.read_only {
+            format!("{}, {}, read-only", config.name, badge_label)
+        } else {
+            format!("{}, {}", config.name, badge_label)
+        };
 
         div()
             .id(SharedString::from(format!("connect-{index}")))
+            .role(Role::Button)
+            .aria_label(a11y_name)
             .group(group.clone())
             .flex()
             .items_center()
@@ -383,6 +394,7 @@ impl AppState {
                                     crate::icons::icon("edit", theme.scale(14.), theme.text_muted),
                                 )
                                 .size(IconButtonSize::Sm)
+                                .tooltip("Edit connection")
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         cx.stop_propagation();
@@ -396,6 +408,7 @@ impl AppState {
                                     crate::icons::icon("trash", theme.scale(14.), theme.red),
                                 )
                                 .size(IconButtonSize::Sm)
+                                .tooltip("Delete connection")
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         cx.stop_propagation();

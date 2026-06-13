@@ -175,7 +175,13 @@ fn slug(name: &str) -> String {
     }
 }
 
-const BUILTINS: &[&str] = &["One Dark", "GitHub Dark", "Ayu Dark", "Ayu Light"];
+const BUILTINS: &[&str] = &[
+    "One Dark",
+    "GitHub Dark",
+    "Ayu Dark",
+    "Ayu Light",
+    "High Contrast",
+];
 
 fn is_builtin(name: &str) -> bool {
     BUILTINS.contains(&name)
@@ -210,6 +216,13 @@ fn builtin_entries() -> Vec<ThemeEntry> {
             user: false,
             path: None,
             theme: ayu_light(),
+        },
+        ThemeEntry {
+            name: "High Contrast".into(),
+            is_light: false,
+            user: false,
+            path: None,
+            theme: high_contrast(),
         },
     ]
 }
@@ -279,6 +292,10 @@ fn entry_from_file(file: ThemeFile, path: PathBuf) -> ThemeEntry {
             apply_token(&mut theme, key, color);
         }
     }
+    // A user theme can override tokens to arbitrary colors; flag (don't block)
+    // any that land below the WCAG AA text threshold so an unreadable import is
+    // diagnosable rather than silent.
+    warn_low_contrast(&theme, &file.name);
     ThemeEntry {
         name: file.name,
         is_light,
@@ -323,6 +340,54 @@ fn apply_token(theme: &mut Theme, key: &str, color: Hsla) {
     }
 }
 
+/// Relative luminance of a color per WCAG 2.1 (sRGB → linear → weighted sum).
+/// Alpha is ignored — these are opaque token colors.
+fn relative_luminance(color: Hsla) -> f32 {
+    let rgb = color.to_rgb();
+    let lin = |c: f32| {
+        if c <= 0.039_28 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(rgb.r) + 0.7152 * lin(rgb.g) + 0.0722 * lin(rgb.b)
+}
+
+/// WCAG contrast ratio between two colors, `1.0..=21.0`. AA body text wants ≥ 4.5.
+fn contrast_ratio(a: Hsla, b: Hsla) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = (la.max(lb), la.min(lb));
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// WCAG AA contrast threshold for normal-size body text.
+const AA_CONTRAST: f32 = 4.5;
+
+/// Warn (non-blocking) about token pairs in an imported theme that fall below the
+/// WCAG AA body-text threshold — a foreground that's hard to read on its surface.
+/// The theme still loads; this only flags it in the log so an author can tell why
+/// their colors look washed out. The pairs checked are the load-bearing ones: the
+/// text tones over the app/panel backgrounds, and the accent fill's own text.
+fn warn_low_contrast(theme: &Theme, name: &str) {
+    let pairs: &[(&str, Hsla, Hsla)] = &[
+        ("text on bg_app", theme.text, theme.bg_app),
+        ("text on bg_panel", theme.text, theme.bg_panel),
+        ("text_muted on bg_panel", theme.text_muted, theme.bg_panel),
+        ("text_faint on bg_app", theme.text_faint, theme.bg_app),
+        ("text_dim on bg_bar", theme.text_dim, theme.bg_bar),
+        ("on_accent on accent", theme.on_accent, theme.accent),
+    ];
+    for (label, fg, bg) in pairs {
+        let ratio = contrast_ratio(*fg, *bg);
+        if ratio < AA_CONTRAST {
+            tracing::warn!(
+                "theme {name:?}: low contrast for {label} ({ratio:.2}:1, want ≥ {AA_CONTRAST:.1}:1)"
+            );
+        }
+    }
+}
+
 /// Parse `#RRGGBB` (or `RRGGBB`) into an opaque [`Hsla`]; `None` if malformed.
 fn parse_hex(s: &str) -> Option<Hsla> {
     let hex = s.trim().trim_start_matches('#');
@@ -342,6 +407,7 @@ fn builtin_by_name(name: &str) -> Theme {
         "GitHub Dark" => github_dark(),
         "Ayu Dark" => ayu_dark(),
         "Ayu Light" => ayu_light(),
+        "High Contrast" => high_contrast(),
         _ => one_dark(),
     }
 }
@@ -408,5 +474,44 @@ pub fn ayu_light() -> Theme {
         on_accent: h(0xffffff),
         bg_selected: h(0xfbdcdc),
         ..Theme::ayu_light()
+    }
+}
+
+/// A shipped high-contrast dark theme for low-vision users: pure-black canvas,
+/// pure-white body text (21:1), and bright, AA-clearing chrome, accent, and
+/// syntax colors. Every text/surface pair here exceeds the WCAG AA 4.5:1
+/// body-text threshold; the borders are deliberately loud so structure reads
+/// without relying on subtle fills. (RED ships no OS "increase contrast" bridge
+/// yet — this is the manual opt-in until that lands.)
+pub fn high_contrast() -> Theme {
+    Theme {
+        bg_app: h(0x000000),      // editor / results canvas
+        bg_panel: h(0x0a0a0a),    // side panels
+        bg_panel_2: h(0x000000),  // deep wells
+        bg_elevated: h(0x161616), // popovers / modals
+        bg_bar: h(0x161616),      // toolbars / tab strip
+        bg_hover: h(0x2a2a2a),
+        bg_active: h(0x3a3a3a),
+        bg_selected: h(0x5c2b2b),
+        bg_input: h(0x0a0a0a),
+        border: h(0x9a9a9a),
+        border_soft: h(0x767676),
+        border_strong: h(0xcfcfcf),
+        text: h(0xffffff),
+        text_muted: h(0xeaeaea),
+        text_faint: h(0xcccccc),
+        text_dim: h(0xdcdcdc),
+        accent: h(0xff5b5b),
+        accent_hover: h(0xff8080),
+        accent_ghost: h(0xff5b5b).opacity(0.30),
+        on_accent: h(0x000000),
+        green: h(0x5be08a),
+        red: h(0xff6b6b),
+        blue: h(0x66c8ff),
+        purple: h(0xd79bff),
+        yellow: h(0xffe066),
+        orange: h(0xffb74d),
+        cyan: h(0x5bd6e6),
+        ..Theme::one_dark()
     }
 }

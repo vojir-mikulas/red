@@ -72,6 +72,7 @@ impl AppState {
         )
         .size(IconButtonSize::Sm)
         .tooltip("Settings  ⌘,")
+        .a11y_label("Settings")
         .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
 
         let topbar_right = div()

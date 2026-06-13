@@ -50,6 +50,11 @@ pub struct AppearanceSettings {
     /// family; the editor keeps its own family/size under `[editor]`.
     pub ui_mono_family: String,
     pub ui_font_size: f32,
+    /// Suppress non-essential animation (currently the indeterminate progress
+    /// sweep), for users who find motion distracting or vestibular-triggering.
+    /// Off by default; RED has no OS "reduce motion" bridge yet, so this is the
+    /// manual opt-in. Honored by Flint via its `ReduceMotion` global.
+    pub reduce_motion: bool,
 }
 
 impl Default for AppearanceSettings {
@@ -60,6 +65,7 @@ impl Default for AppearanceSettings {
             ui_mono_family: FONT_MONO.to_string(),
             // The design's base UI size.
             ui_font_size: 13.0,
+            reduce_motion: false,
         }
     }
 }

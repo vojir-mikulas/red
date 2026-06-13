@@ -222,6 +222,7 @@ impl QueryTab {
             CodeEditor::new(cx)
                 .highlighter(crate::sql::tokenize)
                 .corner_radius(px(0.))
+                .a11y_label("Query editor")
                 .with_content(EMPTY_QUERY)
         });
         // ⌘↵ runs the active tab's statement / selection; Esc (with no completion
@@ -638,6 +639,7 @@ impl AppState {
             themes.resolve(&settings.appearance.theme, os_dark),
             &settings.appearance,
         ));
+        cx.set_global(flint::ReduceMotion(settings.appearance.reduce_motion));
 
         let name_input = cx.new(|cx| TextInput::new(cx).with_placeholder("my database"));
         let host_input = cx.new(|cx| TextInput::new(cx).with_placeholder("localhost"));
@@ -730,6 +732,9 @@ impl AppState {
         let switcher = cx.new(|cx| {
             let mut s = Switcher::new("connection-switcher", cx);
             s.set_placeholder("Search connections…", cx);
+            // Match the topbar's other bordered controls (e.g. Disconnect), which
+            // use `theme.border` rather than the switcher's default soft hairline.
+            s.set_trigger_border(TriggerBorder::Normal, cx);
             // Lucide disclosure glyph, re-themed each render; muted to match the
             // topbar trigger's subtle look.
             s.set_chevron(

@@ -290,6 +290,7 @@ impl AppState {
                 .resolve(&self.settings.appearance.theme, self.os_dark),
             &self.settings.appearance,
         ));
+        cx.set_global(flint::ReduceMotion(self.settings.appearance.reduce_motion));
     }
 
     /// The `(mode, light, dark)` the current setting implies. The panel always

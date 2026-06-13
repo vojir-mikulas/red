@@ -66,9 +66,16 @@ fn render_cell(cell: &DisplayCell, c: CellColors, null_display: &SharedString) -
     } else {
         cell.text.clone()
     };
+    // Color independence (WCAG 1.4.1): NULL and binary blobs carry a *style* cue
+    // (italic), not just a faint color, so they're still distinguishable in
+    // grayscale or to a color-blind user. The other kinds (numbers, UUIDs, JSON)
+    // are disambiguated without color by their text shape and the declared type
+    // shown in each column header's subtitle, and are spoken with their value by
+    // the grid's accessible-name announcement.
+    let italic = matches!(cell.kind, CellKind::Null | CellKind::Blob);
     div()
         .text_color(color)
-        .when(cell.kind == CellKind::Null, |d| d.italic())
+        .when(italic, |d| d.italic())
         .child(text)
         .into_any_element()
 }
@@ -277,6 +284,38 @@ impl AppState {
             r
         });
 
+        // The focused cell, spoken aloud: the grid reports this as its accessible
+        // name (a `Grid` landmark), so a screen reader announces "<column>:
+        // <value>, row N of M" each time the cell cursor moves — the one piece of
+        // state a blind user needs to read the data. `focus` is in absolute,
+        // table-column coordinates (gutter included); a data column's index is
+        // `table_col - gutter`. Falls back to the grid's name when there's no cursor.
+        let a11y_label: SharedString = grid
+            .selection
+            .map(|sel| {
+                let (row, table_col) = sel.focus;
+                let pos = format!("row {} of {}", group_digits(row + 1), group_digits(total));
+                if show_gutter && table_col == 0 {
+                    return SharedString::from(format!("Row number, {pos}"));
+                }
+                let data_col = table_col - gutter;
+                let col_name = grid
+                    .columns
+                    .get(data_col)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_default();
+                let value = match grid.buffer.borrow().row(row) {
+                    Some(r) => match r.display.get(data_col) {
+                        Some(cell) if cell.kind == CellKind::Null => "null".to_string(),
+                        Some(cell) => cell.text.to_string(),
+                        None => "empty".to_string(),
+                    },
+                    None => "loading".to_string(),
+                };
+                SharedString::from(format!("{col_name}: {value}, {pos}"))
+            })
+            .unwrap_or_else(|| SharedString::from("Results grid"));
+
         let table = Table::<()>::new("result-grid", columns)
             .row_count(win.len)
             .row_height(row_height)
@@ -295,6 +334,7 @@ impl AppState {
                     .ok();
             })
             .selected_cells(local_selection)
+            .a11y_label(a11y_label)
             .sort(sort)
             .sort_carets(
                 move || crate::icons::icon("sort-asc", caret_icon, accent).into_any_element(),
