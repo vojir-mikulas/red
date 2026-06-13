@@ -15,11 +15,14 @@
 //! the generic scrollable viewer is a candidate to push down into Flint later.
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, AnyElement, ClipboardItem, Context, ScrollHandle, SharedString};
+use gpui::{
+    div, prelude::*, px, AnyElement, ClipboardItem, Context, Entity, FocusHandle, Focusable,
+    ScrollHandle, SharedString,
+};
 use red_core::{CappedCell, Value};
 use red_service::Command;
 
-use crate::app::{ActiveConn, AppState, Phase};
+use crate::app::{ActiveConn, AppState, EditContext, Phase};
 use crate::result::group_digits;
 
 /// Bytes of a blob rendered as hex before the dump is cut with a "more bytes"
@@ -42,6 +45,16 @@ pub(crate) struct InspectorState {
     full: Option<InspectedFull>,
     /// The in-flight full-fetch, if any — its reply is matched by `id`.
     pending: Option<PendingInspect>,
+    /// An open inline edit (Track B5): the value field + the cell it targets. The
+    /// inspector becomes the editor — type a new value and Save. Cleared when the
+    /// cursor moves off the cell, on Save (the confirm takes over), or on Cancel.
+    editing: Option<InspectorEdit>,
+}
+
+/// An in-progress inline cell edit hosted in the inspector (Track B5).
+struct InspectorEdit {
+    input: Entity<TextInput>,
+    ctx: EditContext,
 }
 
 impl InspectorState {
@@ -50,6 +63,7 @@ impl InspectorState {
             scroll: ScrollHandle::new(),
             full: None,
             pending: None,
+            editing: None,
         }
     }
 }
@@ -160,6 +174,13 @@ impl AppState {
                 insp.pending = None;
             }
         }
+        // An inline edit belongs to one cell; abandon it if the cursor moved off
+        // (or the result was replaced) so a stray edit can't apply to a new cell.
+        if let Some(edit) = &insp.editing {
+            if !matches(edit.ctx.epoch, edit.ctx.row, edit.ctx.data_col) {
+                insp.editing = None;
+            }
+        }
     }
 
     /// "Load full value": re-fetch the focused cell's row in full (reusing the
@@ -213,6 +234,80 @@ impl AppState {
             });
         }
         true
+    }
+
+    /// Begin an inline edit of the focused cell in the inspector (Track B5). No-op
+    /// when the cell isn't editable (read-only / not edit-enabled connection, not a
+    /// single-table keyed browse, the PK column, or a blob/clipped cell — see
+    /// [`AppState::active_edit_target`]). Prefills the field with the current value
+    /// so a small tweak is one keystroke; Enter saves, Esc cancels.
+    pub(crate) fn begin_inspector_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(ctx) = self.active_edit_target() else {
+            return;
+        };
+        if self.inspector.is_none() {
+            return;
+        }
+        let prefill = match &ctx.original {
+            Value::Null => String::new(),
+            other => other.to_string(),
+        };
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new(cx);
+            input.set_content(prefill, cx);
+            input
+        });
+        // Enter in the field saves; Esc cancels — the same submit/cancel idiom the
+        // form fields use.
+        cx.subscribe(&input, |this, _, event: &TextInputEvent, cx| match event {
+            TextInputEvent::Submit => this.save_inspector_edit(cx),
+            TextInputEvent::Cancel => this.cancel_inspector_edit(cx),
+            TextInputEvent::Change => {}
+        })
+        .detach();
+        if let Some(insp) = &mut self.inspector {
+            insp.editing = Some(InspectorEdit { input, ctx });
+        }
+        self.focus_inspector_edit = true;
+        cx.notify();
+    }
+
+    /// Abandon an open inline edit without writing.
+    pub(crate) fn cancel_inspector_edit(&mut self, cx: &mut Context<Self>) {
+        if let Some(insp) = &mut self.inspector {
+            insp.editing = None;
+        }
+        cx.notify();
+    }
+
+    /// Save the inline edit: coerce the typed value to the column's type and open
+    /// the guarded confirm preview (shared with the palette path via
+    /// [`AppState::stage_cell_edit`]). A coercion failure toasts the reason and
+    /// keeps the field open to fix.
+    pub(crate) fn save_inspector_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(insp) = &self.inspector else { return };
+        let Some(edit) = &insp.editing else { return };
+        let text = edit.input.read(cx).content().to_string();
+        let ctx = edit.ctx.clone();
+        let value = match red_core::coerce_edit_value(&text, ctx.decl_type.as_deref()) {
+            Ok(v) => v,
+            Err(reason) => {
+                self.notify(ToastVariant::Error, reason, cx);
+                return;
+            }
+        };
+        // Close the inline editor; the confirm preview takes over from here.
+        if let Some(insp) = &mut self.inspector {
+            insp.editing = None;
+        }
+        self.stage_cell_edit(ctx, value, cx);
+    }
+
+    /// The focus handle of the open inline-edit field, for the render-time focus
+    /// drain (see `focus_inspector_edit`).
+    pub(crate) fn inspector_edit_focus(&self, cx: &Context<Self>) -> Option<FocusHandle> {
+        let edit = self.inspector.as_ref()?.editing.as_ref()?;
+        Some(edit.input.focus_handle(cx))
     }
 
     /// Resolve the cell under the cursor into something renderable: a loaded full
@@ -327,6 +422,64 @@ impl AppState {
                     .on_click(cx.listener(|this, _, _, cx| this.close_inspector(cx))),
             );
 
+        // While an inline edit is open (Track B5) the body *is* the value field and
+        // the footer offers Save / Cancel — the inspector becomes the editor.
+        if let Some(edit) = self.inspector.as_ref().and_then(|i| i.editing.as_ref()) {
+            let field = div()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_3()
+                .font_family(ui_family.clone())
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(s11)
+                        .text_color(faint)
+                        .child("Editing — Enter to save, Esc to cancel. An empty value sets NULL."),
+                )
+                .child(edit.input.clone())
+                .into_any_element();
+            let footer = div()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap_1()
+                .px_3()
+                .py(px(6.))
+                .border_t_1()
+                .border_color(border)
+                .child(
+                    Button::new("inspector-edit-cancel", "Cancel")
+                        .variant(ButtonVariant::Ghost)
+                        .size(ButtonSize::Sm)
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_inspector_edit(cx))),
+                )
+                .child(
+                    Button::new("inspector-edit-save", "Save")
+                        .variant(ButtonVariant::Primary)
+                        .size(ButtonSize::Sm)
+                        .on_click(cx.listener(|this, _, _, cx| this.save_inspector_edit(cx))),
+                );
+            return div()
+                .id("inspector")
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(bg)
+                .text_color(muted)
+                .child(header)
+                .child(field)
+                .child(footer)
+                .into_any_element();
+        }
+
+        // Whether the focused cell is editable — drives the footer "Edit" button.
+        let editable = self.active_edit_target().is_some();
+
         // Body + actions vary by state.
         let (body, action): (AnyElement, Option<AnyElement>) = match resolved.map(|v| v.state) {
             Some(CellState::Ready(view)) => {
@@ -419,7 +572,20 @@ impl AppState {
             ),
         };
 
-        let footer = action.map(|a| {
+        // Footer actions: an "Edit" affordance when the cell is editable (B5), then
+        // the state's own action (Copy / Load full value).
+        let mut actions: Vec<AnyElement> = Vec::new();
+        if editable {
+            actions.push(
+                Button::new("inspector-edit", "Edit")
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Sm)
+                    .on_click(cx.listener(|this, _, _, cx| this.begin_inspector_edit(cx)))
+                    .into_any_element(),
+            );
+        }
+        actions.extend(action);
+        let footer = (!actions.is_empty()).then(|| {
             div()
                 .flex_shrink_0()
                 .flex()
@@ -430,7 +596,7 @@ impl AppState {
                 .py(px(6.))
                 .border_t_1()
                 .border_color(border)
-                .child(a)
+                .children(actions)
         });
 
         // Fills the trailing pane of the result split; the split's divider is the

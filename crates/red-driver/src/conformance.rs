@@ -631,7 +631,11 @@ pub(crate) async fn applies_edits(driver: &dyn DatabaseDriver, schema: &str, tab
         })
         .await
         .unwrap();
-    assert_eq!(read(one_name.clone()).await.rows[0][1], Value::Null, "NULL set");
+    assert_eq!(
+        read(one_name.clone()).await.rows[0][1],
+        Value::Null,
+        "NULL set"
+    );
 
     // A non-matching key affects 0 rows → error, rolled back, table unchanged.
     assert!(

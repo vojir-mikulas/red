@@ -336,7 +336,13 @@ async fn applies_a_data_edit() {
         }],
     };
 
-    send(&handle, Command::ApplyEdit { epoch: 4, op: edit(1) });
+    send(
+        &handle,
+        Command::ApplyEdit {
+            epoch: 4,
+            op: edit(1),
+        },
+    );
     match next(&mut events).await {
         Some(Event::EditApplied { epoch, affected }) => {
             assert_eq!(epoch, 4, "the result epoch is echoed");
@@ -346,7 +352,13 @@ async fn applies_a_data_edit() {
     }
 
     // An edit whose key matches no row fails *in the pane*, rolled back.
-    send(&handle, Command::ApplyEdit { epoch: 5, op: edit(9999) });
+    send(
+        &handle,
+        Command::ApplyEdit {
+            epoch: 5,
+            op: edit(9999),
+        },
+    );
     match next(&mut events).await {
         Some(Event::EditFailed { epoch, message }) => {
             assert_eq!(epoch, 5);

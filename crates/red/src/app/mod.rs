@@ -20,8 +20,8 @@ use gpui::{
     prelude::*, px, AsyncApp, Context, ElementId, Entity, FocusHandle, Focusable, Hsla,
     PathPromptOptions, Pixels, ScrollHandle, SharedString, WeakEntity, Window, WindowAppearance,
 };
-use red_core::{ConnectionConfig, DbKind, EditOp};
-use red_service::{Command, Event, ServiceHandle, SessionId};
+use red_core::{ConnectionConfig, DbKind, EditOp, UpdateState};
+use red_service::{Command, Event, ServiceHandle, SessionId, UpdateConfig};
 
 use crate::config::{self, StoredConnection};
 use crate::palette::{Cmd, PromptKind};
@@ -514,14 +514,36 @@ pub struct AppState {
     /// Set when the result filter bar just opened: the next render focuses its
     /// input so the user can type immediately.
     pub(crate) focus_filter: bool,
+    /// Set when an inline cell edit just opened in the inspector (Track B5): the
+    /// next render focuses its field so the user types into it at once.
+    pub(crate) focus_inspector_edit: bool,
     /// Set by the palette's "switch connection" command: the next render opens
     /// the switcher popover (its `toggle` needs a `Window` the palette lacks).
     pub(crate) open_switcher: bool,
+    /// The self-updater's latest state, driving the titlebar pill + About-tab
+    /// status line (Phases 3–4 of docs/plans/self-update.md). Updated only by
+    /// `Event::UpdateState`; `Unknown` until the first check completes.
+    pub(crate) update: UpdateState,
     /// Dev-only perf HUD collector — brackets `render` to read build time and
     /// allocation churn. Compiled only under the `dev-stats` feature.
     #[cfg(feature = "dev-stats")]
     pub(crate) dev_stats: crate::dev_stats::DevStats,
 }
+
+/// The GitHub `owner/repo` the self-updater polls (see docs/plans/self-update.md).
+pub(crate) const UPDATE_REPO: &str = "vojir-mikulas/red";
+
+/// Build the backend's updater config from the persisted settings + this build's
+/// version. Used at launch and on each settings reload.
+fn update_config(settings: &Settings) -> UpdateConfig {
+    UpdateConfig {
+        enabled: settings.update.auto_update,
+        repo: UPDATE_REPO.to_string(),
+        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        interval: settings.update.interval(),
+    }
+}
+
 impl AppState {
     pub fn new(
         cx: &mut Context<Self>,
@@ -563,6 +585,10 @@ impl AppState {
         // setters and `reload_settings` re-push them when they change.
         service.send_global(Command::SetStatementTimeout(settings.query.timeout()));
         service.send_global(Command::SetDisplayCellCap(settings.grid.max_cell_chars));
+        // Arm the self-updater (Phase 3): an initial check at launch, then on the
+        // configured cadence — unless `auto_update = false`, which sends a disabled
+        // config so the backend keeps the timer (and network) parked.
+        service.send_global(Command::ConfigureUpdates(update_config(&settings)));
 
         let os_dark = matches!(
             cx.window_appearance(),
@@ -824,7 +850,9 @@ impl AppState {
             focus_history: false,
             focus_search: false,
             focus_filter: false,
+            focus_inspector_edit: false,
             open_switcher: false,
+            update: UpdateState::Unknown,
             #[cfg(feature = "dev-stats")]
             dev_stats: crate::dev_stats::DevStats::default(),
         }
@@ -1054,6 +1082,9 @@ impl AppState {
             // --- guarded grid edits (Track B5) ---
             Event::EditApplied { epoch, affected } => self.on_edit_applied(epoch, affected, cx),
             Event::EditFailed { epoch, message } => self.on_edit_failed(epoch, message, cx),
+
+            // --- self-update (Phases 3–4) ---
+            Event::UpdateState(state) => self.on_update_state(state, cx),
 
             // The streaming `Query`/`FetchMore` path stays in the protocol for
             // headless use + tests; the UI now drives results via `OpenResult`.
@@ -1933,8 +1964,59 @@ impl AppState {
         self.service.send_global(Command::SetDisplayCellCap(
             self.settings.grid.max_cell_chars,
         ));
+        // Re-arm the updater in case `[update]` changed (toggle / interval). The
+        // backend only re-polls if the cadence actually moved.
+        self.service
+            .send_global(Command::ConfigureUpdates(update_config(&self.settings)));
         self.apply_theme(cx);
         cx.notify();
+    }
+
+    /// Force an update check now ("Check for updates" in the About tab). A no-op
+    /// in effect when `auto_update = false` — the backend ignores `CheckNow`
+    /// while disabled — so the button is only offered when updates are on.
+    pub(crate) fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        self.service.send_global(Command::CheckForUpdate);
+        cx.notify();
+    }
+
+    /// Relaunch into the freshly-staged build (Phase 4). The new bundle is already
+    /// swapped over `/Applications/Red.app`, so this just spawns it and exits —
+    /// macOS replaces the running process with the new version.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn restart_for_update(&mut self, _cx: &mut Context<Self>) {
+        let app = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.ancestors().nth(3).map(std::path::Path::to_path_buf));
+        if let Some(app) = app {
+            // `open -n` launches a fresh instance of the swapped bundle; we then
+            // exit so only the new version remains.
+            let _ = std::process::Command::new("/usr/bin/open")
+                .arg("-n")
+                .arg(&app)
+                .spawn();
+        }
+        std::process::exit(0);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn restart_for_update(&mut self, _cx: &mut Context<Self>) {}
+
+    /// Store the updater's latest state and, when a build has finished staging,
+    /// surface a one-off toast so the user notices the pill. Other transitions
+    /// (checking, up-to-date, background failures) stay quiet — they're visible
+    /// in the About tab without nagging.
+    fn on_update_state(&mut self, state: UpdateState, cx: &mut Context<Self>) {
+        let became_ready = matches!(state, UpdateState::ReadyToRestart { .. })
+            && !matches!(self.update, UpdateState::ReadyToRestart { .. });
+        self.update = state;
+        if became_ready {
+            self.notify(
+                ToastVariant::Success,
+                "An update is ready — restart to apply it.",
+                cx,
+            );
+        }
     }
 
     // --- settings: file-first workflow ---
@@ -2289,6 +2371,24 @@ impl AppState {
         self.settings.behavior.restore_last_session = on;
         self.save_settings();
         cx.notify();
+    }
+
+    /// Toggle background self-updates. Re-arms the backend updater immediately —
+    /// turning it on kicks off a check; turning it off parks the timer + network.
+    pub(crate) fn set_auto_update(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.update.auto_update = on;
+        self.save_settings();
+        self.service
+            .send_global(Command::ConfigureUpdates(update_config(&self.settings)));
+        cx.notify();
+    }
+
+    /// Open a URL (the update release page) with the OS default handler. Reuses
+    /// the same shell-out seam as the settings-file workflow.
+    pub(crate) fn open_external(&mut self, url: &str, cx: &mut Context<Self>) {
+        if let Err(e) = open_in_os(std::path::Path::new(url)) {
+            self.notify(ToastVariant::Error, format!("Couldn't open {url}: {e}"), cx);
+        }
     }
 
     pub(crate) fn set_ui_font_family(&mut self, family: &str, cx: &mut Context<Self>) {

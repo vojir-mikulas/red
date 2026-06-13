@@ -212,6 +212,16 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
     // Wakes the loop even when no command arrives, so idle sessions get swept.
     let mut sweep = tokio::time::interval(EVICT_SWEEP);
 
+    // The self-updater runs as its own task on this runtime (off this loop, so a
+    // download never stalls query dispatch). We forward its two global commands
+    // over a control channel; it emits `UpdateState` straight through the cloned
+    // event sink.
+    let updater = {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(crate::update::run(events.clone(), rx));
+        tx
+    };
+
     loop {
         let (session_id, command) = tokio::select! {
             maybe = commands.recv() => match maybe {
@@ -252,6 +262,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             Command::SetStatementTimeout(timeout) => statement_timeout = timeout,
 
             Command::SetDisplayCellCap(bytes) => red_driver::set_display_cell_cap(bytes),
+
+            Command::ConfigureUpdates(config) => {
+                let _ = updater.send(crate::update::UpdateControl::Configure(config));
+            }
+
+            Command::CheckForUpdate => {
+                let _ = updater.send(crate::update::UpdateControl::CheckNow);
+            }
 
             Command::TestConnection(config) => {
                 // A throwaway probe: connect, report, and let the driver drop. No
@@ -794,11 +812,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             idx.points.clear();
                             idx.status = BuildStatus::Idle;
                         }
-                        emit(
-                            &events,
-                            session_id,
-                            Event::EditApplied { epoch, affected },
-                        );
+                        emit(&events, session_id, Event::EditApplied { epoch, affected });
                     }
                     Err(e) => emit(
                         &events,

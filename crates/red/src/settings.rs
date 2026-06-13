@@ -32,6 +32,7 @@ pub struct Settings {
     pub grid: GridSettings,
     pub query: QuerySettings,
     pub behavior: BehaviorSettings,
+    pub update: UpdateSettings,
 }
 
 // --- appearance --------------------------------------------------------------
@@ -266,6 +267,37 @@ pub struct BehaviorSettings {
     pub restore_last_session: bool,
 }
 
+// --- update ------------------------------------------------------------------
+
+/// macOS self-update behaviour (see docs/plans/self-update.md). `auto_update =
+/// false` is the off-switch the plan promises: no poll timer, no network. The
+/// interval is clamped to a sane floor so a stray `0` can't hammer GitHub.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateSettings {
+    /// Poll GitHub Releases and stage newer notarized builds in the background.
+    pub auto_update: bool,
+    /// Hours between background checks (the first runs at launch).
+    pub check_interval_hours: u32,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            auto_update: true,
+            check_interval_hours: 6,
+        }
+    }
+}
+
+impl UpdateSettings {
+    /// The poll cadence as a `Duration`, with a 1-hour floor so a hand-edited `0`
+    /// (or a tiny value) can't turn the updater into a tight network loop.
+    pub fn interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.check_interval_hours.max(1)) * 3600)
+    }
+}
+
 // --- store -------------------------------------------------------------------
 
 /// The outcome of a load: the resolved settings, plus any non-fatal warnings to
@@ -332,6 +364,7 @@ impl FileSettingsStore {
             grid: section(&value, "grid", &mut warnings),
             query: section(&value, "query", &mut warnings),
             behavior: section(&value, "behavior", &mut warnings),
+            update: section(&value, "update", &mut warnings),
         };
         let migrated = apply_legacy(&mut settings, &value);
 

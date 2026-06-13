@@ -19,8 +19,9 @@ mod dispatch;
 mod protocol;
 #[cfg(test)]
 mod tests;
+mod update;
 
-pub use protocol::{Command, Event, RunFetch, SessionId, SortKey};
+pub use protocol::{Command, Event, RunFetch, SessionId, SortKey, UpdateConfig};
 
 use futures::channel::mpsc::{unbounded, UnboundedReceiver};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender as CmdSender};

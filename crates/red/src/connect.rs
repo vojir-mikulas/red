@@ -703,7 +703,9 @@ impl AppState {
                         // writable connection, so it's disabled while read-only is on.
                         .child(
                             Toggle::new("allow-edit", form.allow_edit).on_change(cx.listener(
-                                |this, checked: &bool, _, cx| this.set_form_allow_edit(*checked, cx),
+                                |this, checked: &bool, _, cx| {
+                                    this.set_form_allow_edit(*checked, cx)
+                                },
                             )),
                         )
                         .child(

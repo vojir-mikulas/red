@@ -204,7 +204,7 @@ fn settings_page(tab: SettingsTab, state: &AppState, cx: &mut Context<AppState>)
         SettingsTab::Grid => grid_page(state, cx),
         SettingsTab::Query => query_page(state, cx),
         SettingsTab::Behavior => behavior_page(state, cx),
-        SettingsTab::About => about_page(cx),
+        SettingsTab::About => about_page(state, cx),
     }
 }
 
@@ -615,8 +615,16 @@ fn behavior_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     .into_any_element()
 }
 
-fn about_page(cx: &mut Context<AppState>) -> AnyElement {
+fn about_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     let theme = cx.theme().clone();
+
+    // Build provenance: version, plus the git SHA + UTC build date embedded by
+    // build.rs (Phase 2) so a build is unambiguous in a bug report.
+    let build = format!("{} · {}", env!("RED_GIT_SHA"), env!("RED_BUILD_DATE"));
+
+    let auto_update = Toggle::new("set-auto-update", state.settings.update.auto_update)
+        .on_change(cx.listener(|this, on: &bool, _, cx| this.set_auto_update(*on, cx)));
+
     settings_page_scaffold(
         "About",
         div()
@@ -633,15 +641,87 @@ fn about_page(cx: &mut Context<AppState>) -> AnyElement {
             .child(setting_row(
                 "Version",
                 "The installed application version.",
-                div()
-                    .text_size(theme.scale(14.))
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(env!("CARGO_PKG_VERSION"))),
+                muted_value(env!("CARGO_PKG_VERSION"), &theme),
                 &theme,
-            )),
+            ))
+            .child(setting_row(
+                "Build",
+                "The commit and date this build was produced from.",
+                muted_value(build, &theme),
+                &theme,
+            ))
+            .child(settings_header("Updates", &theme))
+            .child(setting_row(
+                "Automatic updates",
+                "Check GitHub for newer signed builds in the background and stage \
+                 them for a one-click restart. macOS only.",
+                auto_update,
+                &theme,
+            ))
+            .child(update_status_row(state, &theme, cx)),
         &theme,
     )
     .into_any_element()
+}
+
+/// The update-status row: a live status line from the updater state, plus the
+/// "Check for updates" action (when enabled) or a "Download" link (when a build
+/// is available but can't be self-applied).
+fn update_status_row(
+    state: &AppState,
+    theme: &Theme,
+    cx: &mut Context<AppState>,
+) -> impl IntoElement {
+    use red_core::UpdateState;
+
+    let enabled = state.settings.update.auto_update;
+    let status = match &state.update {
+        _ if !enabled => "Automatic updates are off.".to_string(),
+        UpdateState::Unknown => "Not checked yet this session.".to_string(),
+        UpdateState::Checking => "Checking for updates…".to_string(),
+        UpdateState::UpToDate { .. } => "You're on the latest version.".to_string(),
+        UpdateState::Downloading { version, .. } => format!("Downloading {version}…"),
+        UpdateState::ReadyToRestart { version } => {
+            format!("{version} is staged — restart to apply.")
+        }
+        UpdateState::Failed { reason } => format!("Last check failed: {reason}"),
+        UpdateState::Unsupported { version, .. } => {
+            format!("{version} is available, but this install can't self-update.")
+        }
+    };
+
+    // A manual check only makes sense when updates are on (the backend ignores
+    // `CheckNow` while disabled). A non-self-updatable build offers a download
+    // link to the GitHub release instead.
+    let action = match &state.update {
+        UpdateState::Unsupported { url, .. } => {
+            let url = url.clone();
+            Some(
+                Button::new("update-download", "Download…")
+                    .variant(ButtonVariant::Secondary)
+                    .size(ButtonSize::Sm)
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_external(&url, cx))),
+            )
+        }
+        _ if enabled => Some(
+            Button::new("update-check", "Check for updates")
+                .variant(ButtonVariant::Secondary)
+                .size(ButtonSize::Sm)
+                .on_click(cx.listener(|this, _, _, cx| this.check_for_updates(cx))),
+        ),
+        _ => None,
+    };
+
+    setting_row("Status", status, div().children(action), theme)
+}
+
+/// A right-aligned muted value, the common read-only control shape on the About
+/// page.
+fn muted_value(text: impl Into<SharedString>, theme: &Theme) -> impl IntoElement {
+    div()
+        .text_size(theme.scale(14.))
+        .text_color(theme.text_muted)
+        .child(text.into())
 }
 
 /// A page heading above its sections.

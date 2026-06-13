@@ -15,6 +15,7 @@ red-driver.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
 futures.workspace = true
 tracing.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }

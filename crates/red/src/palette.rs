@@ -11,7 +11,7 @@
 
 use flint::{Palette, PaletteEvent, PaletteItem, ToastVariant};
 use gpui::{actions, prelude::*, Context, ElementId, Entity, SharedString};
-use red_core::EditOp;
+use red_core::{ColumnValue, EditOp, TableRef, Value};
 
 use crate::app::{AppState, Phase};
 
@@ -282,41 +282,52 @@ impl AppState {
         cx.notify();
     }
 
-    /// Coerce the typed value, build the `UPDATE` [`EditOp`], and open the confirm
-    /// preview (Track B5). A value equal to the original is a no-op (toast, no
-    /// write); a coercion failure (e.g. text in an integer column) toasts the reason.
+    /// Coerce the value typed into the edit prompt and stage it for confirmation
+    /// (Track B5). A coercion failure (e.g. text in an integer column) toasts the
+    /// reason instead of opening the preview.
     fn submit_edit(&mut self, text: &str, cx: &mut Context<Self>) {
-        let Some(mut ctx) = self.pending_edit.take() else {
+        let Some(ctx) = self.pending_edit.take() else {
             return;
         };
-        let value = match red_core::coerce_edit_value(text, ctx.decl_type.as_deref()) {
-            Ok(v) => v,
+        match red_core::coerce_edit_value(text, ctx.decl_type.as_deref()) {
+            Ok(value) => self.stage_cell_edit(ctx, value, cx),
             Err(reason) => {
                 self.notify(ToastVariant::Error, reason, cx);
-                return;
             }
-        };
+        }
+    }
+
+    /// Build the `UPDATE` [`EditOp`] for `ctx`'s cell with `value` and open the
+    /// guarded confirm preview (Track B5) — the single staging point both the
+    /// inspector's inline editor and the palette prompt funnel through. A value
+    /// equal to the original is a no-op (toast, no write). The cell context (now
+    /// carrying `value`) rides `pending_edit` through the confirm so a committed
+    /// edit can patch the resident cell in place.
+    pub(crate) fn stage_cell_edit(
+        &mut self,
+        mut ctx: crate::app::EditContext,
+        value: Value,
+        cx: &mut Context<Self>,
+    ) {
         if value == ctx.original {
             self.notify(ToastVariant::Info, "No change — value is the same.", cx);
             return;
         }
         let op = EditOp::Update {
-            table: red_core::TableRef {
+            table: TableRef {
                 schema: Some(ctx.table.0.clone()),
                 name: ctx.table.1.clone(),
             },
-            key: red_core::ColumnValue {
+            key: ColumnValue {
                 column: ctx.pk_column.clone(),
                 value: ctx.pk_value.clone(),
             },
-            set: vec![red_core::ColumnValue {
+            set: vec![ColumnValue {
                 column: ctx.column.clone(),
                 value: value.clone(),
             }],
         };
         let epoch = ctx.epoch;
-        // Hold the cell context (now carrying the new value) through the confirm so
-        // a committed edit can patch the resident cell in place.
         ctx.new_value = Some(value);
         self.pending_edit = Some(ctx);
         self.confirm_exec = Some(crate::app::PendingWrite::Edit { op, epoch });

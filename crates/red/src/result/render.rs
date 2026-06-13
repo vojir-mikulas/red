@@ -114,12 +114,7 @@ impl AppState {
         };
         // The focus + cell-cursor keys live on the `Table` itself (see its
         // `.focus_handle`/`.on_nav` below); the pane draws no focus ring.
-        let container = div()
-            .size_full()
-            .relative()
-            .flex()
-            .flex_col()
-            .bg(bg);
+        let container = div().size_full().relative().flex().flex_col().bg(bg);
 
         let grid = match active.active_result() {
             Some(grid) => grid,

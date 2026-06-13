@@ -538,7 +538,8 @@ impl DatabaseDriver for PostgresDriver {
     async fn apply_edit(&self, op: &EditOp) -> Result<u64> {
         // Typed placeholders (`$n::int8`, …) like the seek path: the value's wire
         // type is fixed by the Rust value, the cast keeps Postgres from re-inferring.
-        let (sql, params) = crate::edit_sql(op, pg_quote, |i, v| format!("${}{}", i + 1, pg_cast(v)));
+        let (sql, params) =
+            crate::edit_sql(op, pg_quote, |i, v| format!("${}{}", i + 1, pg_cast(v)));
         let owned: Vec<Value> = params.iter().map(|v| (*v).clone()).collect();
         let boxed = pg_params(Some(&owned))?;
         let refs: Vec<&(dyn ToSql + Sync)> = boxed
@@ -573,7 +574,11 @@ impl DatabaseDriver for PostgresDriver {
         // JSON dependency. Plain `EXPLAIN` never executes the statement;
         // `EXPLAIN ANALYZE` does (the caller gates it to read queries, and a
         // read-only connection rejects an underlying write at the engine anyway).
-        let verb = if analyze { "EXPLAIN ANALYZE " } else { "EXPLAIN " };
+        let verb = if analyze {
+            "EXPLAIN ANALYZE "
+        } else {
+            "EXPLAIN "
+        };
         let sql = format!("{verb}{}", strip_trailing(sql));
         let rows = self.client.query(&sql, &[]).await.map_err(map_pg_err)?;
         let text = rows
@@ -1346,9 +1351,8 @@ mod tests {
             .await
             .unwrap();
         assert!(plan.analyzed, "analyze flag set");
-        let has_actual = |n: &red_core::PlanNode| {
-            n.metrics.iter().any(|(k, _)| k.starts_with("actual"))
-        };
+        let has_actual =
+            |n: &red_core::PlanNode| n.metrics.iter().any(|(k, _)| k.starts_with("actual"));
         assert!(
             plan.nodes.iter().any(has_actual)
                 || plan.nodes.iter().flat_map(|n| &n.children).any(has_actual),

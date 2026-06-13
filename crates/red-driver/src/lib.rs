@@ -204,9 +204,14 @@ pub(crate) fn edit_sql<'a>(
         EditOp::Update { table, key, set } => {
             let mut assigns = Vec::with_capacity(set.len());
             for cv in set {
-                assigns.push(format!("{} = {}", quote(&cv.column), slot(&cv.value, &mut params)));
+                assigns.push(format!(
+                    "{} = {}",
+                    quote(&cv.column),
+                    slot(&cv.value, &mut params)
+                ));
             }
-            let where_clause = format!("{} = {}", quote(&key.column), slot(&key.value, &mut params));
+            let where_clause =
+                format!("{} = {}", quote(&key.column), slot(&key.value, &mut params));
             format!(
                 "UPDATE {} SET {} WHERE {}",
                 qualify(table),
@@ -215,7 +220,8 @@ pub(crate) fn edit_sql<'a>(
             )
         }
         EditOp::Delete { table, key } => {
-            let where_clause = format!("{} = {}", quote(&key.column), slot(&key.value, &mut params));
+            let where_clause =
+                format!("{} = {}", quote(&key.column), slot(&key.value, &mut params));
             format!("DELETE FROM {} WHERE {}", qualify(table), where_clause)
         }
         EditOp::Insert { table, values } => {

@@ -505,7 +505,9 @@ impl DatabaseDriver for MysqlDriver {
         let tree: std::result::Result<Vec<String>, MyError> =
             conn.query(format!("EXPLAIN FORMAT=TREE {base}")).await;
         match tree {
-            Ok(rows) if !rows.is_empty() => Ok(crate::plan::from_text_tree(&rows.join("\n"), false)),
+            Ok(rows) if !rows.is_empty() => {
+                Ok(crate::plan::from_text_tree(&rows.join("\n"), false))
+            }
             _ => {
                 let rows: Vec<Row> = conn
                     .query(format!("EXPLAIN {base}"))

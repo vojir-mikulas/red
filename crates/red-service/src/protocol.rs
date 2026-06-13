@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use red_core::{
     Column, ConnectionConfig, EditOp, ExportFormat, KeySpec, QueryOptions, QueryPlan, ResultFilter,
-    RowWindow, SchemaMeta, TableDetail, Value,
+    RowWindow, SchemaMeta, TableDetail, UpdateState, Value,
 };
 
 /// Identifies one keep-alive backend session. Minted UI-side at connect start so
@@ -175,6 +175,13 @@ pub enum Command {
     /// Set the driver's display fat-cell cap (`grid.max_cell_chars`), in bytes.
     /// Global; applies to every subsequent display fetch. Export stays full-fidelity.
     SetDisplayCellCap(usize),
+    /// (Re)configure the macOS self-updater (poll cadence, enable flag, running
+    /// version, repo). Global; sent at launch and on each settings reload, like
+    /// the tuning knobs above. Disabling stops all polling and network access.
+    ConfigureUpdates(UpdateConfig),
+    /// Force an immediate update check ("Check for updates" in the About tab).
+    /// Global.
+    CheckForUpdate,
     Shutdown,
 }
 
@@ -315,7 +322,26 @@ pub enum Event {
     ExportCancelled {
         id: u64,
     },
+    /// The self-updater's state changed (Phases 3–4). Global (`None` session) —
+    /// the UI stores it and renders the titlebar pill + About-tab status from it.
+    UpdateState(UpdateState),
     Error(String),
+}
+
+/// How the self-updater should behave, carried by `ConfigureUpdates`. Built
+/// UI-side from `settings.toml` + the running build's `CARGO_PKG_VERSION` (the
+/// app knows its own version; the service doesn't).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateConfig {
+    /// `false` (`auto_update = false`) short-circuits the updater entirely — no
+    /// timer, no network.
+    pub enabled: bool,
+    /// The GitHub `owner/repo` to poll, e.g. `vojir-mikulas/red`.
+    pub repo: String,
+    /// The running build's version, for the semver "am I behind?" compare.
+    pub current_version: String,
+    /// Poll cadence (startup, then every interval).
+    pub interval: Duration,
 }
 
 /// A header-click sort on a table browse, carried with `OpenResult` so the

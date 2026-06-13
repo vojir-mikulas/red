@@ -536,9 +536,7 @@ impl GridBuffer {
     pub(super) fn patch_cell(&mut self, ix: usize, col: usize, value: Value) {
         let row = match &mut self.mode {
             BufferMode::Offset(pages) => pages.rows.get_mut(&ix),
-            BufferMode::Keyed(run) => ix
-                .checked_sub(run.anchor)
-                .and_then(|i| run.rows.get_mut(i)),
+            BufferMode::Keyed(run) => ix.checked_sub(run.anchor).and_then(|i| run.rows.get_mut(i)),
         };
         let Some(row) = row else { return };
         if col >= row.values.len() {

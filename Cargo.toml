@@ -42,6 +42,9 @@ futures-util = { version = "0.3", default-features = false }
 
 # --- Config persistence (connection list at the app edge) ---
 serde = { version = "1", features = ["derive"] }
+# Reads one GitHub Releases API response in the self-updater (red-service); kept
+# minimal so the updater takes no heavyweight HTTP dependency (it shells curl).
+serde_json = "1"
 toml = "0.8"
 dirs = "5"
 # OS keychain for connection credentials — passwords never hit connections.toml.

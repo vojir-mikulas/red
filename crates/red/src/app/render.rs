@@ -132,6 +132,15 @@ impl Render for AppState {
             }
         }
 
+        // An inline cell edit just opened in the inspector (Track B5) — focus its
+        // field so the user types the new value immediately.
+        if self.focus_inspector_edit {
+            self.focus_inspector_edit = false;
+            if let Some(handle) = self.inspector_edit_focus(cx) {
+                window.focus(&handle, cx);
+            }
+        }
+
         // The palette's "switch connection" command — open the switcher popover
         // now that the `Window` its field-focus needs is in hand.
         if self.open_switcher {
@@ -210,6 +219,8 @@ impl Render for AppState {
             .then(|| self.render_settings(cx).into_any_element());
 
         let shortcuts = self.shortcuts_open.then(|| self.render_shortcuts(cx));
+
+        let update_pill = self.render_update_pill(cx);
 
         let theme = cx.theme();
         let root = div()
@@ -339,6 +350,9 @@ impl Render for AppState {
             .children(confirm_delete)
             .children(settings)
             .children(shortcuts)
+            // The "Restart to update" pill, top-right in the seamless titlebar
+            // (traffic lights are top-left, so no collision).
+            .children(update_pill)
             // The connection form modal is rendered at the root so it works in any
             // phase (the welcome screen *and* the connected shell, e.g. opened from
             // the switcher's "New connection…").
@@ -359,6 +373,58 @@ impl Render for AppState {
         };
 
         root
+    }
+}
+
+impl AppState {
+    /// The titlebar self-update pill. Shown only mid-flight (`Downloading`) and
+    /// when a build is staged (`ReadyToRestart`); the latter is clickable and
+    /// relaunches into the new version. All other states are surfaced in the
+    /// About tab, not here.
+    fn render_update_pill(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        use red_core::UpdateState;
+        let theme = cx.theme();
+
+        // Anchored top-right; the inset clears the window-edge radius and sits in
+        // the empty titlebar band opposite the traffic lights.
+        let base = || {
+            div()
+                .absolute()
+                .top(px(7.))
+                .right(px(12.))
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .px_2p5()
+                .py_1()
+                .rounded_full()
+                .text_size(theme.scale(12.))
+                .font_weight(gpui::FontWeight::MEDIUM)
+        };
+
+        match &self.update {
+            UpdateState::Downloading { .. } => Some(
+                base()
+                    .bg(theme.bg_elevated)
+                    .border_1()
+                    .border_color(theme.border_soft)
+                    .text_color(theme.text_muted)
+                    .child("Downloading update…")
+                    .into_any_element(),
+            ),
+            UpdateState::ReadyToRestart { version } => Some(
+                base()
+                    .id("update-pill")
+                    .bg(theme.accent)
+                    .text_color(theme.on_accent)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.accent_hover))
+                    .child(format!("Restart to update · {version}"))
+                    .on_click(cx.listener(|this, _, _, cx| this.restart_for_update(cx)))
+                    .into_any_element(),
+            ),
+            _ => None,
+        }
     }
 }
 

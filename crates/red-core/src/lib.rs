@@ -472,7 +472,12 @@ impl EditOp {
                     .map(|cv| literal(&cv.value))
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("INSERT INTO {} ({}) VALUES ({})", qualify(table), cols, vals)
+                format!(
+                    "INSERT INTO {} ({}) VALUES ({})",
+                    qualify(table),
+                    cols,
+                    vals
+                )
             }
         }
     }
@@ -498,7 +503,10 @@ fn literal(v: &Value) -> String {
 /// columns parse to [`Value::Integer`]/[`Value::Real`]; a parse failure is an
 /// `Err(reason)` the editor shows inline, so the preview never opens with an
 /// un-bindable value. Everything else is [`Value::Text`].
-pub fn coerce_edit_value(text: &str, decl_type: Option<&str>) -> std::result::Result<Value, String> {
+pub fn coerce_edit_value(
+    text: &str,
+    decl_type: Option<&str>,
+) -> std::result::Result<Value, String> {
     if text.is_empty() {
         return Ok(Value::Null);
     }
@@ -797,14 +805,7 @@ fn is_real_type(type_name: &str) -> bool {
     let base = t.split(['(', ' ']).next().unwrap_or("");
     matches!(
         base,
-        "real"
-            | "double"
-            | "float"
-            | "float4"
-            | "float8"
-            | "numeric"
-            | "decimal"
-            | "dec"
+        "real" | "double" | "float" | "float4" | "float8" | "numeric" | "decimal" | "dec"
     )
 }
 
@@ -874,6 +875,34 @@ pub enum RedError {
 }
 
 pub type Result<T> = std::result::Result<T, RedError>;
+
+/// The self-updater's lifecycle, surfaced from the backend to the UI titlebar
+/// pill + About tab (Phases 3–4 of docs/plans/self-update.md). macOS-only today;
+/// on other platforms the updater never advances past `Unknown`. A run is
+/// "stage on disk, apply on restart": the new bundle is fully swapped over the
+/// installed app *before* `ReadyToRestart`, so a restart is just a relaunch.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum UpdateState {
+    /// No check has completed this session (the initial state, and while updates
+    /// are disabled).
+    #[default]
+    Unknown,
+    /// A check is in flight.
+    Checking,
+    /// The running build is the latest published release.
+    UpToDate { current: String },
+    /// A newer release is downloading/staging over the installed app. `pct` is a
+    /// coarse 0–100 progress hint.
+    Downloading { version: String, pct: u8 },
+    /// A newer build is fully staged — clicking the pill relaunches into it.
+    ReadyToRestart { version: String },
+    /// The check or staging failed; `reason` is user-facing.
+    Failed { reason: String },
+    /// A newer release exists but RED can't self-swap (not running from a
+    /// writable `/Applications/Red.app` — a dev build, Homebrew, a read-only
+    /// volume). `url` links the GitHub release for a manual download.
+    Unsupported { version: String, url: String },
+}
 
 #[cfg(test)]
 mod key_tests {
@@ -1108,8 +1137,14 @@ mod edit_tests {
         // Empty input clears the cell regardless of type.
         assert_eq!(coerce_edit_value("", Some("text")), Ok(Value::Null));
         // Integer / real columns parse; everything else is text.
-        assert_eq!(coerce_edit_value("42", Some("integer")), Ok(Value::Integer(42)));
-        assert_eq!(coerce_edit_value("3.5", Some("numeric")), Ok(Value::Real(3.5)));
+        assert_eq!(
+            coerce_edit_value("42", Some("integer")),
+            Ok(Value::Integer(42))
+        );
+        assert_eq!(
+            coerce_edit_value("3.5", Some("numeric")),
+            Ok(Value::Real(3.5))
+        );
         assert_eq!(
             coerce_edit_value("hi", Some("varchar(20)")),
             Ok(Value::Text("hi".into()))
