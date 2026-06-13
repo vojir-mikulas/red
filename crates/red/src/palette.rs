@@ -205,8 +205,12 @@ impl AppState {
             Cmd::RunQuery => self.run_editor_query(cx),
             Cmd::NewTab => self.new_query(cx),
             Cmd::CloseTab => self.close_active_tab(cx),
-            Cmd::NextTab => self.next_tab(cx),
-            Cmd::PrevTab => self.prev_tab(cx),
+            Cmd::NextTab => {
+                self.step_active_tab(true, cx);
+            }
+            Cmd::PrevTab => {
+                self.step_active_tab(false, cx);
+            }
             Cmd::ToggleHistory => self.toggle_history(cx),
             Cmd::ToggleSidebar => self.toggle_sidebar(cx),
             Cmd::RefreshSchema => self.refresh_schema(),

@@ -51,7 +51,7 @@ impl AppState {
             .px_2p5()
             .rounded(px(6.))
             .border_1()
-            .border_color(theme.border_soft)
+            .border_color(theme.border)
             .text_size(theme.scale(11.5))
             .text_color(theme.text_muted)
             .cursor_pointer()

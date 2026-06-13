@@ -249,8 +249,8 @@ impl Render for AppState {
             // central keymap to `RedRoot` so they fire from any pane's focus.
             .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_query(cx)))
             .on_action(cx.listener(|this, _: &CloseTab, _, cx| this.close_active_tab(cx)))
-            .on_action(cx.listener(|this, _: &NextTab, _, cx| this.next_tab(cx)))
-            .on_action(cx.listener(|this, _: &PrevTab, _, cx| this.prev_tab(cx)))
+            .on_action(cx.listener(|this, _: &NextTab, window, cx| this.next_tab(window, cx)))
+            .on_action(cx.listener(|this, _: &PrevTab, window, cx| this.prev_tab(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &RefreshSchema, _, _| this.refresh_schema()))
             .on_action(cx.listener(|this, _: &SearchSchema, _, cx| {

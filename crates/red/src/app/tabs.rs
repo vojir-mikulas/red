@@ -109,27 +109,57 @@ impl AppState {
     }
 
     /// Focus the next query tab, wrapping past the end. No-op with one tab.
-    pub(crate) fn next_tab(&mut self, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase {
-            let n = active.tabs.len();
-            if n > 1 {
-                active.active_tab = (active.active_tab + 1) % n;
-                active.tab_scroll.scroll_to_item(active.active_tab);
-                cx.notify();
+    pub(crate) fn next_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_tab(true, window, cx);
+    }
+
+    /// Focus the previous query tab, wrapping past the start. No-op with one tab.
+    pub(crate) fn prev_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_tab(false, window, cx);
+    }
+
+    /// Step the active tab one slot forward (`forward`) or back, wrapping at the
+    /// ends. No-op with one tab. Each tab owns its own editor entity, so keyboard
+    /// focus must follow the switch: when the outgoing tab's editor held focus we
+    /// hand it to the incoming one, otherwise cycling from a focused editor would
+    /// strand focus on the now-hidden editor and the next keystroke would go
+    /// nowhere. The palette path has no `Window` to move focus, but it cycles
+    /// from the palette (not the editor), so there's nothing to follow.
+    fn cycle_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let editor_focused = matches!(
+            &self.phase,
+            Phase::Connected(active)
+                if active.active().is_some_and(|t| t.editor.focus_handle(cx).contains_focused(window, cx))
+        );
+        if !self.step_active_tab(forward, cx) || !editor_focused {
+            return;
+        }
+        if let Phase::Connected(active) = &self.phase {
+            if let Some(handle) = active.active().map(|t| t.editor.focus_handle(cx)) {
+                window.focus(&handle, cx);
             }
         }
     }
 
-    /// Focus the previous query tab, wrapping past the start. No-op with one tab.
-    pub(crate) fn prev_tab(&mut self, cx: &mut Context<Self>) {
+    /// Advance the active tab one slot (`forward` else back, wrapping); the pure
+    /// selection move shared by the keyboard and palette paths. Returns whether a
+    /// switch happened (false with ≤1 tab or outside the connected shell), so the
+    /// keyboard path knows when to chase focus.
+    pub(crate) fn step_active_tab(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
         if let Phase::Connected(active) = &mut self.phase {
             let n = active.tabs.len();
             if n > 1 {
-                active.active_tab = (active.active_tab + n - 1) % n;
+                active.active_tab = if forward {
+                    (active.active_tab + 1) % n
+                } else {
+                    (active.active_tab + n - 1) % n
+                };
                 active.tab_scroll.scroll_to_item(active.active_tab);
                 cx.notify();
+                return true;
             }
         }
+        false
     }
 
     /// Close the focused tab (the ⌘W binding) — routes through the same
