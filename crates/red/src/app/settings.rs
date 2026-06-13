@@ -219,6 +219,9 @@ impl AppState {
         }
         // Now that the font cache is warm, fill the Appearance dropdowns.
         self.rebuild_settings_pickers(cx);
+        // Focus the panel so its Esc-to-close is heard and Tab walks its controls
+        // (the next render focuses `modal_focus`, the panel's scrim ancestor).
+        self.focus_modal = true;
         cx.notify();
     }
 
@@ -275,6 +278,8 @@ impl AppState {
 
     pub(crate) fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = false;
+        // Return focus to the root so the app stays keyboard-driven after closing.
+        self.refocus_root = true;
         cx.notify();
     }
 

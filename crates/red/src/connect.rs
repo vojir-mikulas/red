@@ -11,7 +11,7 @@ use gpui::{
 };
 use red_core::DbKind;
 
-use crate::app::{AppState, ConnectSortField, FormState, TestState};
+use crate::app::{AppState, ConnectSortField, FormField, FormState, TestState};
 
 /// The six label colors a connection can be tagged with, mapped onto semantic
 /// theme tokens so they track the active theme. A connection stores the index.
@@ -585,9 +585,15 @@ impl AppState {
         let theme = &theme;
         let view = cx.entity().downgrade();
         let is_file = form.kind.is_file();
-        let valid = self
-            .form_config(cx)
-            .is_some_and(|c| AppState::form_valid(&c));
+        // Per-field validation messages, shown only once the user has tried to
+        // submit (or test) — so a fresh form isn't pre-littered with red text.
+        let errors = if form.submitted {
+            self.form_config(cx)
+                .map(|c| AppState::form_errors(&c))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let title = if form.editing.is_some() {
             "Edit connection"
         } else {
@@ -599,7 +605,7 @@ impl AppState {
         let conn_str_field = (!is_file)
             .then(|| labeled_field("Connection string", theme).child(self.conn_str_input.clone()));
 
-        let footer = self.render_form_footer(form, valid, cx);
+        let footer = self.render_form_footer(form, cx);
 
         let close_view = view.clone();
         Modal::new("connection-form")
@@ -618,14 +624,19 @@ impl AppState {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .child(labeled_field("Name", theme).child(self.name_input.clone()))
+                    .child(
+                        labeled_field("Name", theme)
+                            .child(self.name_input.clone())
+                            .children(field_error_line(theme, field_err(&errors, FormField::Name))),
+                    )
                     .child(
                         labeled_field("Engine", theme)
                             .child(self.render_engine_picker(form.kind, theme, cx)),
                     )
                     .children(conn_str_field)
-                    .child(self.render_connection_fields(form, is_file, theme))
-                    .child(self.render_label_access_row(form, theme, cx)),
+                    .child(self.render_connection_fields(form, is_file, &errors, theme))
+                    .child(self.render_label_access_row(form, theme, cx))
+                    .children(self.render_form_status(form, cx)),
             )
     }
 
@@ -635,11 +646,13 @@ impl AppState {
         &self,
         form: &FormState,
         is_file: bool,
+        errors: &[(FormField, &'static str)],
         theme: &Theme,
     ) -> AnyElement {
         if is_file {
             return labeled_field("Database file", theme)
                 .child(self.database_input.clone())
+                .children(field_error_line(theme, field_err(errors, FormField::Database)))
                 .into_any_element();
         }
         div()
@@ -648,12 +661,19 @@ impl AppState {
             .gap_3()
             .child(
                 div()
+                    // Top-align so a validation line under Host doesn't stretch the
+                    // Port input next to it.
                     .flex()
+                    .items_start()
                     .gap_3()
                     .child(
                         labeled_field("Host", theme)
                             .flex_1()
-                            .child(self.host_input.clone()),
+                            .child(self.host_input.clone())
+                            .children(field_error_line(
+                                theme,
+                                field_err(errors, FormField::Host),
+                            )),
                     )
                     .child(
                         labeled_field("Port", theme)
@@ -673,7 +693,8 @@ impl AppState {
                     },
                     theme,
                 )
-                .child(self.database_input.clone()),
+                .child(self.database_input.clone())
+                .children(field_error_line(theme, field_err(errors, FormField::Database))),
             )
             .child(
                 div()
@@ -815,100 +836,43 @@ impl AppState {
                                     },
                                 ))
                                 .child("Read-only"),
-                        )
-                        // Guarded in-grid editing (Track B5) — opt-in, and only on a
-                        // writable connection, so it's disabled while read-only is on.
-                        .child(
-                            Toggle::new("allow-edit", form.allow_edit)
-                                .label("Allow editing")
-                                .on_change(cx.listener(|this, checked: &bool, _, cx| {
-                                    this.set_form_allow_edit(*checked, cx)
-                                })),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .text_size(theme.scale(12.5))
-                                .text_color(if form.allow_edit {
-                                    theme.accent
-                                } else {
-                                    theme.text_muted
-                                })
-                                .child(crate::icons::icon(
-                                    "edit",
-                                    theme.scale(12.),
-                                    if form.allow_edit {
-                                        theme.accent
-                                    } else {
-                                        theme.text_muted
-                                    },
-                                ))
-                                .child("Allow editing"),
                         ),
                 ),
             )
     }
 
-    /// The modal footer: a Test-connection action with its result on the left, and
-    /// Cancel / Save / Connect on the right.
-    fn render_form_footer(
-        &self,
-        form: &FormState,
-        valid: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    /// The modal footer: the Test-connection action on the left, Cancel / Save /
+    /// Connect on the right. The test *result* renders in the full-width status row
+    /// above (see [`Self::render_form_status`]) so it has room to read.
+    fn render_form_footer(&self, form: &FormState, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let testing = matches!(form.test, TestState::Testing);
-        let result = match &form.test {
-            TestState::Idle | TestState::Testing => None,
-            TestState::Ok(msg) => Some((msg.clone(), theme.green)),
-            TestState::Fail(msg) => Some((msg.clone(), theme.red)),
-        };
-
-        let test_side = div()
-            .flex()
-            .items_center()
-            .gap_2p5()
-            .flex_1()
-            .min_w_0()
-            .child(
-                Button::new(
-                    "test-conn",
-                    if testing {
-                        "Testing…"
-                    } else {
-                        "Test connection"
-                    },
-                )
-                .variant(ButtonVariant::Ghost)
-                .icon(crate::icons::icon(
-                    "play",
-                    theme.scale(13.),
-                    theme.text_muted,
-                ))
-                .disabled(testing)
-                .on_click(cx.listener(|this, _, _, cx| this.test_connection(cx))),
-            )
-            .when_some(result, |row, (msg, color)| {
-                row.child(
-                    div()
-                        .min_w_0()
-                        .text_size(theme.scale(11.5))
-                        .text_color(color)
-                        .font_family(theme.mono_family.clone())
-                        .truncate()
-                        .child(msg),
-                )
-            });
 
         div()
             .flex()
             .items_center()
             .gap_2()
             .w_full()
-            .child(test_side)
+            .child(
+                div().flex_1().min_w_0().child(
+                    Button::new(
+                        "test-conn",
+                        if testing {
+                            "Testing…"
+                        } else {
+                            "Test connection"
+                        },
+                    )
+                    .variant(ButtonVariant::Ghost)
+                    .icon(crate::icons::icon(
+                        "play",
+                        theme.scale(13.),
+                        theme.text_muted,
+                    ))
+                    .disabled(testing)
+                    .on_click(cx.listener(|this, _, _, cx| this.test_connection(cx))),
+                ),
+            )
             .child(
                 Button::new("form-cancel", "Cancel")
                     .variant(ButtonVariant::Ghost)
@@ -917,7 +881,6 @@ impl AppState {
             .child(
                 Button::new("form-save", "Save")
                     .variant(ButtonVariant::Secondary)
-                    .disabled(!valid)
                     .on_click(cx.listener(|this, _, _, cx| this.save_form(false, cx))),
             )
             .child(
@@ -928,10 +891,65 @@ impl AppState {
                         theme.scale(14.),
                         theme.on_accent,
                     ))
-                    .disabled(!valid)
                     .on_click(cx.listener(|this, _, _, cx| this.save_form(true, cx))),
             )
     }
+
+    /// The full-width status row beneath the form fields: the test-connection
+    /// result, in a tinted, wrapping panel so a long engine error stays readable
+    /// instead of being truncated next to the buttons. `None` while idle/testing.
+    fn render_form_status(&self, form: &FormState, cx: &Context<Self>) -> Option<gpui::Div> {
+        let theme = cx.theme();
+        let (msg, color, icon_name) = match &form.test {
+            TestState::Ok(msg) => (msg.clone(), theme.green, "check"),
+            TestState::Fail(msg) => (msg.clone(), theme.red, "close"),
+            TestState::Idle | TestState::Testing => return None,
+        };
+        Some(
+            div()
+                .flex()
+                .items_start()
+                .gap_2()
+                .w_full()
+                .p(px(9.))
+                .rounded(theme.radius)
+                .bg(color.opacity(0.10))
+                .child(
+                    div()
+                        .flex_none()
+                        .mt(px(1.))
+                        .child(crate::icons::icon(icon_name, theme.scale(13.), color)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(theme.scale(12.))
+                        .text_color(theme.text)
+                        .child(msg),
+                ),
+        )
+    }
+}
+
+/// The first validation message tagged for `field`, if any — the per-input lookup
+/// over the form's collected [`AppState::form_errors`].
+fn field_err(errors: &[(FormField, &'static str)], field: FormField) -> Option<&'static str> {
+    errors
+        .iter()
+        .find(|(f, _)| *f == field)
+        .map(|(_, msg)| *msg)
+}
+
+/// A small red validation line, rendered beneath the input it belongs to. `None`
+/// when the field is valid, so it slots straight into `.children(...)`.
+fn field_error_line(theme: &Theme, message: Option<&str>) -> Option<gpui::Div> {
+    message.map(|msg| {
+        div()
+            .text_size(theme.scale(11.))
+            .text_color(theme.red)
+            .child(msg.to_string())
+    })
 }
 
 /// A small uppercase field caption, matching the design's form labels.

@@ -100,7 +100,15 @@ impl AppState {
         // app beneath, and the card stops its own clicks from reaching the scrim.
         // `on_scrim_dismiss` ignores the click that ends a window drag, so moving
         // the window from behind the panel doesn't close it.
+        //
+        // Keyboard handling rides on the scrim (the ancestor of every control), so
+        // it fires whether the panel root or a focused child holds focus — Esc
+        // closes, and Tab/Shift-Tab cycle the panel's controls (the `Modal` context
+        // is shared with Flint's `Modal`; its bindings are registered once at
+        // startup). The focus trap on `modal_focus` keeps Tab from escaping to the
+        // chrome behind the scrim (see `app::render`).
         let view = cx.entity().downgrade();
+        let modal_focus = self.modal_focus.clone();
         div()
             .id("settings")
             .absolute()
@@ -110,6 +118,26 @@ impl AppState {
             .justify_center()
             .bg(gpui::black().opacity(0.55))
             .occlude()
+            .track_focus(&modal_focus)
+            .key_context("Modal")
+            .on_action(|_: &flint::components::modal::FocusNext, window, cx| window.focus_next(cx))
+            .on_action(|_: &flint::components::modal::FocusPrev, window, cx| window.focus_prev(cx))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                match event.keystroke.key.as_str() {
+                    // Esc is one of the two ways out (the other is the Done button).
+                    "escape" => {
+                        this.close_settings(cx);
+                        cx.stop_propagation();
+                    }
+                    // Swallow a bare Enter so it can't fall through to a background
+                    // action (e.g. the welcome screen's Enter-to-connect) or read as
+                    // a "confirm" that dismisses the panel — closing stays explicit.
+                    // A focused control still activates on Enter (it handles the key
+                    // first, before it bubbles here).
+                    "enter" => cx.stop_propagation(),
+                    _ => {}
+                }
+            }))
             .on_scrim_dismiss(move |_, cx| {
                 view.update(cx, |this, cx| this.close_settings(cx)).ok();
             })
@@ -140,6 +168,7 @@ fn settings_banner(
     cx: &mut Context<AppState>,
 ) -> impl IntoElement {
     let message = state.settings_warnings.join("  •  ");
+    let focus_ring = theme.accent;
     div()
         .flex()
         .items_start()
@@ -162,10 +191,17 @@ fn settings_banner(
             div()
                 .id("settings-warn-dismiss")
                 .flex_shrink_0()
+                .px_1()
+                .rounded(theme.radius_sm)
                 .cursor_pointer()
                 .text_size(theme.scale(12.))
                 .text_color(theme.text_faint)
                 .hover(|s| s.text_color(theme.text))
+                // Focusable so Tab reaches it; Enter/Space fires the dismiss click.
+                .border_1()
+                .border_color(gpui::transparent_black())
+                .tab_index(0)
+                .focus(move |s| s.border_color(focus_ring))
                 .on_click(cx.listener(|this, _, _, cx| this.dismiss_settings_warnings(cx)))
                 .child("Dismiss"),
         )
@@ -179,6 +215,7 @@ fn settings_nav_item(
     cx: &mut Context<AppState>,
 ) -> impl IntoElement {
     let is_active = tab == active;
+    let focus_ring = theme.accent;
     div()
         .id(SharedString::from(format!("settings-nav-{}", tab.label())))
         .flex()
@@ -188,11 +225,19 @@ fn settings_nav_item(
         .rounded(theme.radius_sm)
         .text_size(theme.scale(14.))
         .cursor_pointer()
+        // A transparent border reserved in every state, so the focus ring colours
+        // it in without nudging the row's size.
+        .border_1()
+        .border_color(gpui::transparent_black())
         .when(is_active, |d| d.bg(theme.bg_active).text_color(theme.text))
         .when(!is_active, |d| {
             d.text_color(theme.text_muted)
                 .hover(|s| s.bg(theme.bg_hover).text_color(theme.text))
         })
+        // Focusable so Tab reaches each category; GPUI fires the click on
+        // Enter/Space, so the focused row becomes the selected tab.
+        .tab_index(0)
+        .focus(move |s| s.border_color(focus_ring))
         .on_click(cx.listener(move |this, _, _, cx| this.set_settings_tab(tab, cx)))
         .child(tab.label())
 }
@@ -379,6 +424,7 @@ fn theme_manage_row(
                 .child(if is_light { "light" } else { "dark" }),
         )
         .child(if user {
+            let focus_ring = theme.accent;
             div()
                 .id(SharedString::from(format!("theme-rm-{name}")))
                 .flex()
@@ -389,6 +435,11 @@ fn theme_manage_row(
                 .cursor_pointer()
                 .text_color(theme.text_faint)
                 .hover(|s| s.bg(theme.bg_hover).text_color(theme.red))
+                // Focusable so Tab reaches it; Enter/Space fires the remove click.
+                .border_1()
+                .border_color(gpui::transparent_black())
+                .tab_index(0)
+                .focus(move |s| s.border_color(focus_ring))
                 .on_click(cx.listener(move |this, _, _, cx| this.remove_theme(&name_owned, cx)))
                 .child(crate::icons::icon(
                     "trash",

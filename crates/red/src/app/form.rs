@@ -9,7 +9,7 @@ use red_service::Command;
 
 use crate::config::StoredConnection;
 
-use super::{AppState, FormState, TestState};
+use super::{AppState, FormField, FormState, TestState};
 
 impl AppState {
     /// Set every form text input in one go.
@@ -52,8 +52,8 @@ impl AppState {
             color: 3,
             // Read-only by default — RED's safe-by-default posture.
             read_only: true,
-            allow_edit: false,
             editing: None,
+            submitted: false,
             test: TestState::Idle,
         });
         self.focus_name_field = true;
@@ -81,8 +81,8 @@ impl AppState {
             kind: config.kind,
             color: config.color,
             read_only: config.read_only,
-            allow_edit: config.allow_edit,
             editing: Some(index),
+            submitted: false,
             test: TestState::Idle,
         });
         self.focus_name_field = true;
@@ -111,36 +111,32 @@ impl AppState {
             database: read(&self.database_input),
             color: form.color,
             read_only: form.read_only,
-            // Editing only makes sense on a writable connection; a read-only one
-            // can't write regardless, so clear the opt-in to keep the config honest.
-            allow_edit: form.allow_edit && !form.read_only,
         })
     }
 
-    /// Whether `config` has the minimum to attempt a connection — `None` when ok,
-    /// else the reason to surface. A file needs a path; a server needs a host; a
-    /// Postgres connection also needs a database (it connects to one), while MySQL
-    /// can browse the whole server so its database is optional.
-    pub(crate) fn form_invalid_reason(config: &ConnectionConfig) -> Option<&'static str> {
+    /// Every unmet requirement for `config`, each tagged with the field it belongs
+    /// to so the form can render the message beneath that input. Empty when the
+    /// form is ready to save. A file engine needs only a path; a server needs a
+    /// host (and Postgres a database, since it connects to one — MySQL can browse
+    /// the whole server, so its database is optional).
+    pub(crate) fn form_errors(config: &ConnectionConfig) -> Vec<(FormField, &'static str)> {
+        let mut errors = Vec::new();
+        if config.name.is_empty() {
+            errors.push((FormField::Name, "A name is required"));
+        }
         if config.kind.is_file() {
-            return config
-                .database
-                .is_empty()
-                .then_some("A database file path is required");
+            if config.database.is_empty() {
+                errors.push((FormField::Database, "A database file path is required"));
+            }
+        } else {
+            if config.host.is_empty() {
+                errors.push((FormField::Host, "Host is required"));
+            }
+            if config.kind == DbKind::Postgres && config.database.is_empty() {
+                errors.push((FormField::Database, "Database is required"));
+            }
         }
-        if config.host.is_empty() {
-            return Some("Host is required");
-        }
-        if config.kind == DbKind::Postgres && config.database.is_empty() {
-            return Some("Database is required");
-        }
-        None
-    }
-
-    /// Convenience predicate over [`Self::form_invalid_reason`] for Save/Connect
-    /// button enablement.
-    pub(crate) fn form_valid(config: &ConnectionConfig) -> bool {
-        Self::form_invalid_reason(config).is_none()
+        errors
     }
 
     /// Enter pressed in a form field — submit the connection form via its primary
@@ -158,12 +154,13 @@ impl AppState {
         let Some(mut config) = self.form_config(cx) else {
             return;
         };
-        if config.name.is_empty() {
-            self.form_error("A name is required", cx);
-            return;
-        }
-        if let Some(reason) = Self::form_invalid_reason(&config) {
-            self.form_error(reason, cx);
+        // Missing fields keep the modal open and surface inline beneath each input
+        // (gated by `submitted`) rather than as a transient toast.
+        if !Self::form_errors(&config).is_empty() {
+            if let Some(form) = &mut self.form {
+                form.submitted = true;
+            }
+            cx.notify();
             return;
         }
 
@@ -225,11 +222,6 @@ impl AppState {
         } else if let Err(e) = crate::secrets::delete_password(&id) {
             tracing::warn!("failed to clear keychain credential: {e}");
         }
-    }
-
-    /// Surface a form validation error without closing the modal.
-    fn form_error(&mut self, message: &str, cx: &mut Context<Self>) {
-        self.notify(ToastVariant::Error, message.to_string(), cx);
     }
 
     pub(crate) fn set_form_kind(&mut self, kind: DbKind, cx: &mut Context<Self>) {
@@ -304,22 +296,6 @@ impl AppState {
     pub(crate) fn set_form_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
         if let Some(form) = &mut self.form {
             form.read_only = read_only;
-            // Read-only and editing are mutually exclusive — turning on read-only
-            // clears the edit opt-in so the form can't show an impossible state.
-            if read_only {
-                form.allow_edit = false;
-            }
-        }
-        cx.notify();
-    }
-
-    pub(crate) fn set_form_allow_edit(&mut self, allow_edit: bool, cx: &mut Context<Self>) {
-        if let Some(form) = &mut self.form {
-            form.allow_edit = allow_edit;
-            // Enabling editing implies a writable connection.
-            if allow_edit {
-                form.read_only = false;
-            }
         }
         cx.notify();
     }
@@ -329,9 +305,15 @@ impl AppState {
         let Some(config) = self.form_config(cx) else {
             return;
         };
-        if let Some(reason) = Self::form_invalid_reason(&config) {
+        // A probe needs the connection coordinates but not a name — reveal any
+        // missing-field messages inline, yet still allow testing a yet-unnamed
+        // connection once host/database are filled.
+        if Self::form_errors(&config)
+            .iter()
+            .any(|(field, _)| *field != FormField::Name)
+        {
             if let Some(form) = &mut self.form {
-                form.test = TestState::Fail(reason.into());
+                form.submitted = true;
             }
             cx.notify();
             return;

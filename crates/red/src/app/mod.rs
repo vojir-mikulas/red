@@ -153,12 +153,22 @@ pub(crate) struct FormState {
     /// Label-palette index (see `connect::label_color`).
     pub color: u8,
     pub read_only: bool,
-    /// Opt-in to guarded in-grid editing (Track B5). Off by default; meaningful
-    /// only on a writable connection — gated again on use, see `editing_enabled`.
-    pub allow_edit: bool,
     /// `Some(index)` when editing an existing connection, `None` when adding.
     pub editing: Option<usize>,
+    /// Set once the user tries to Save/Connect (or Test) with missing fields —
+    /// the gate for showing the inline per-field validation messages, so a fresh
+    /// empty form isn't pre-littered with errors.
+    pub submitted: bool,
     pub test: TestState,
+}
+
+/// Which connection-form field a validation message belongs to, so it can render
+/// directly beneath that input instead of as a detached toast.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FormField {
+    Name,
+    Host,
+    Database,
 }
 
 /// A write awaiting the confirm modal (Track B5 generalized the destructive-confirm
@@ -1305,6 +1315,7 @@ impl AppState {
             || self.confirm_close_tab.is_some()
             || self.confirm_delete_conn.is_some()
             || self.shortcuts_open
+            || self.settings_open
             || self.form.is_some()
     }
 

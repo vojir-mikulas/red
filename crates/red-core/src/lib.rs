@@ -91,15 +91,12 @@ pub struct ConnectionConfig {
     pub database: String,
     #[cfg_attr(feature = "serde", serde(default))]
     pub color: u8,
+    /// When unset (read/write), the connection allows writes: deliberate `UPDATE`s
+    /// from the SQL editor and guarded, PK-keyed, previewed in-grid cell edits
+    /// (Track B5). Read-only is the safe default — the driver opens read-only and
+    /// every write path is refused up front.
     #[cfg_attr(feature = "serde", serde(default))]
     pub read_only: bool,
-    /// Opt-in to in-grid data editing (Track B5). Off by default and meaningful
-    /// only on a writable connection (`!read_only`): click-to-edit is a sharper
-    /// foot-gun than a deliberately typed `UPDATE`, so it gets its own switch on
-    /// top of writability. With both set, the grid offers guarded, PK-keyed,
-    /// previewed edits; otherwise the grid is read-only exactly as before.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub allow_edit: bool,
 }
 
 impl ConnectionConfig {

@@ -236,11 +236,11 @@ impl AppState {
     }
 
     /// Whether guarded in-grid editing is enabled for the active connection (Track
-    /// B5): writable *and* the per-connection editing opt-in. Both default safe.
+    /// B5): any writable (non-read-only) connection. Read-only is the safe default.
     pub(crate) fn editing_enabled(&self) -> bool {
         matches!(
             &self.phase,
-            Phase::Connected(active) if !active.config.read_only && active.config.allow_edit
+            Phase::Connected(active) if !active.config.read_only
         )
     }
 
