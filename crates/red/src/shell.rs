@@ -75,10 +75,13 @@ impl AppState {
         .a11y_label("Settings")
         .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
 
+        // The self-update pill ("Downloading…" / "Restart to update") sits to the
+        // left of the disconnect + settings controls so it never covers them.
         let topbar_right = div()
             .flex()
             .items_center()
             .gap_2()
+            .children(self.render_update_pill(cx))
             .child(disconnect)
             .child(settings_gear);
 

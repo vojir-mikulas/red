@@ -201,10 +201,15 @@ impl AppState {
             });
 
         // Settings gear floats top-right (the disconnected screen has no top bar).
+        // The self-update pill sits to its left so it never covers the gear.
         let gear = div()
             .absolute()
             .top(px(14.))
             .right(px(16.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .children(self.render_update_pill(cx))
             .child(settings_gear);
 
         div()

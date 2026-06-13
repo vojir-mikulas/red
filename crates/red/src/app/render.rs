@@ -234,8 +234,6 @@ impl Render for AppState {
 
         let shortcuts = self.shortcuts_open.then(|| self.render_shortcuts(cx));
 
-        let update_pill = self.render_update_pill(cx);
-
         let theme = cx.theme();
         let root = div()
             .size_full()
@@ -373,9 +371,6 @@ impl Render for AppState {
             .children(confirm_delete)
             .children(settings)
             .children(shortcuts)
-            // The "Restart to update" pill, top-right in the seamless titlebar
-            // (traffic lights are top-left, so no collision).
-            .children(update_pill)
             // The connection form modal is rendered at the root so it works in any
             // phase (the welcome screen *and* the connected shell, e.g. opened from
             // the switcher's "New connection…").
@@ -400,21 +395,17 @@ impl Render for AppState {
 }
 
 impl AppState {
-    /// The titlebar self-update pill. Shown only mid-flight (`Downloading`) and
-    /// when a build is staged (`ReadyToRestart`); the latter is clickable and
-    /// relaunches into the new version. All other states are surfaced in the
-    /// About tab, not here.
-    fn render_update_pill(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    /// The self-update pill. Shown only mid-flight (`Downloading`) and when a
+    /// build is staged (`ReadyToRestart`); the latter is clickable and relaunches
+    /// into the new version. All other states are surfaced in the About tab, not
+    /// here. Rendered inline by the callers (top bar / welcome screen), placed to
+    /// the *left* of the settings + disconnect controls so it never covers them.
+    pub(crate) fn render_update_pill(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         use red_core::UpdateState;
         let theme = cx.theme();
 
-        // Anchored top-right; the inset clears the window-edge radius and sits in
-        // the empty titlebar band opposite the traffic lights.
         let base = || {
             div()
-                .absolute()
-                .top(px(7.))
-                .right(px(12.))
                 .flex()
                 .items_center()
                 .gap_1p5()
