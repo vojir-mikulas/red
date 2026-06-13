@@ -77,7 +77,3 @@ opt-level = 2
 #
 #   [patch."https://github.com/vojir-mikulas/flint"]
 #   flint = { path = "../flint" }
-
-# Local Flint+RED development patch (uncommitted — see note above).
-[patch."https://github.com/vojir-mikulas/flint"]
-flint = { path = "../flint" }
