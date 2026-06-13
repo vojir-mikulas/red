@@ -698,6 +698,35 @@ impl AppState {
                                     },
                                 ))
                                 .child("Read-only"),
+                        )
+                        // Guarded in-grid editing (Track B5) — opt-in, and only on a
+                        // writable connection, so it's disabled while read-only is on.
+                        .child(
+                            Toggle::new("allow-edit", form.allow_edit).on_change(cx.listener(
+                                |this, checked: &bool, _, cx| this.set_form_allow_edit(*checked, cx),
+                            )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .text_size(theme.scale(12.5))
+                                .text_color(if form.allow_edit {
+                                    theme.accent
+                                } else {
+                                    theme.text_muted
+                                })
+                                .child(crate::icons::icon(
+                                    "edit",
+                                    theme.scale(12.),
+                                    if form.allow_edit {
+                                        theme.accent
+                                    } else {
+                                        theme.text_muted
+                                    },
+                                ))
+                                .child("Allow editing"),
                         ),
                 ),
             )

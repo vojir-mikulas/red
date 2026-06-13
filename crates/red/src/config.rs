@@ -65,6 +65,8 @@ struct RawConnection {
     #[serde(default)]
     read_only: bool,
     #[serde(default)]
+    allow_edit: bool,
+    #[serde(default)]
     last_accessed: Option<u64>,
 }
 
@@ -80,6 +82,7 @@ impl RawConnection {
             database: self.database,
             color: self.color,
             read_only: self.read_only,
+            allow_edit: self.allow_edit,
         };
         // Legacy migration: an old `dsn` with no structured fields populated. For a
         // file engine the DSN *is* the path; otherwise parse it back into fields.
@@ -127,6 +130,7 @@ struct WriteConnection {
     database: String,
     color: u8,
     read_only: bool,
+    allow_edit: bool,
     last_accessed: Option<u64>,
 }
 
@@ -143,6 +147,7 @@ impl From<&StoredConnection> for WriteConnection {
             database: c.database.clone(),
             color: c.color,
             read_only: c.read_only,
+            allow_edit: c.allow_edit,
             last_accessed: s.last_accessed,
         }
     }
@@ -305,6 +310,7 @@ mod tests {
                     database: "analytics".into(),
                     color: 3,
                     read_only: false,
+                    allow_edit: false,
                 },
                 last_accessed: None,
             },

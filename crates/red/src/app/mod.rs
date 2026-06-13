@@ -20,7 +20,7 @@ use gpui::{
     prelude::*, px, AsyncApp, Context, ElementId, Entity, FocusHandle, Focusable, Hsla,
     PathPromptOptions, Pixels, ScrollHandle, SharedString, WeakEntity, Window, WindowAppearance,
 };
-use red_core::{ConnectionConfig, DbKind};
+use red_core::{ConnectionConfig, DbKind, EditOp};
 use red_service::{Command, Event, ServiceHandle, SessionId};
 
 use crate::config::{self, StoredConnection};
@@ -104,9 +104,45 @@ pub(crate) struct FormState {
     /// Label-palette index (see `connect::label_color`).
     pub color: u8,
     pub read_only: bool,
+    /// Opt-in to guarded in-grid editing (Track B5). Off by default; meaningful
+    /// only on a writable connection — gated again on use, see `editing_enabled`.
+    pub allow_edit: bool,
     /// `Some(index)` when editing an existing connection, `None` when adding.
     pub editing: Option<usize>,
     pub test: TestState,
+}
+
+/// A write awaiting the confirm modal (Track B5 generalized the destructive-confirm
+/// path to carry either). Confirming runs it; cancelling drops it.
+#[derive(Clone)]
+pub(crate) enum PendingWrite {
+    /// A destructive editor statement (`UPDATE`/`DELETE`/… typed in the SQL editor),
+    /// run verbatim via `execute_sql` on confirm.
+    EditorSql(String),
+    /// A guarded grid edit: the previewed, parameterized [`EditOp`] sent as
+    /// `Command::ApplyEdit` on confirm. `epoch` scopes the reply to its result.
+    Edit { op: EditOp, epoch: u64 },
+}
+
+/// The grid cell a Track-B5 edit targets. Captured when the value prompt opens so
+/// the submit can assemble the [`EditOp`] from the typed value, and held through the
+/// confirm so a committed edit can patch the resident cell in place (no refetch).
+/// The `original` value lets the submit short-circuit a no-op edit; `new_value` is
+/// filled at submit and is what the success handler writes into the buffer.
+#[derive(Clone)]
+pub(crate) struct EditContext {
+    pub epoch: u64,
+    /// Absolute row ordinal and data-column index of the edited cell.
+    pub row: usize,
+    pub data_col: usize,
+    pub table: (String, String),
+    pub pk_column: String,
+    pub pk_value: red_core::Value,
+    pub column: String,
+    pub decl_type: Option<String>,
+    pub original: red_core::Value,
+    /// The coerced new value, set at submit; the success handler patches the cell.
+    pub new_value: Option<red_core::Value>,
 }
 
 /// How long a transient (info / success) toast stays up before it auto-dismisses.
@@ -359,8 +395,13 @@ pub struct AppState {
     /// when open. The right-click selects the cell first, so the menu's Inspect/
     /// Copy act on it; `None` keeps the menu closed.
     pub(crate) cell_menu: Option<gpui::Point<gpui::Pixels>>,
-    /// A destructive statement awaiting the user's confirmation before it runs.
-    pub(crate) confirm_exec: Option<String>,
+    /// A pending write awaiting the user's confirmation before it runs: an editor
+    /// destructive statement, or a guarded grid edit (Track B5). See [`PendingWrite`].
+    pub(crate) confirm_exec: Option<PendingWrite>,
+    /// The grid cell an in-flight edit prompt targets (Track B5), stashed between
+    /// opening the value prompt and its submit so the [`EditOp`] can be assembled
+    /// with the typed value. `None` when no edit prompt is open.
+    pub(crate) pending_edit: Option<EditContext>,
     /// A non-pristine query tab the user asked to close, awaiting confirmation.
     pub(crate) confirm_close_tab: Option<usize>,
     /// A saved connection the user asked to delete, awaiting confirmation.
@@ -741,6 +782,7 @@ impl AppState {
             filter_bar: None,
             cell_menu: None,
             confirm_exec: None,
+            pending_edit: None,
             confirm_close_tab: None,
             confirm_delete_conn: None,
             settings,
@@ -1008,6 +1050,10 @@ impl AppState {
             // --- query plan (Track B4) ---
             Event::PlanReady { epoch, plan } => self.on_plan_ready(session, epoch, plan),
             Event::PlanFailed { epoch, message } => self.on_plan_failed(session, epoch, message),
+
+            // --- guarded grid edits (Track B5) ---
+            Event::EditApplied { epoch, affected } => self.on_edit_applied(epoch, affected, cx),
+            Event::EditFailed { epoch, message } => self.on_edit_failed(epoch, message, cx),
 
             // The streaming `Query`/`FetchMore` path stays in the protocol for
             // headless use + tests; the UI now drives results via `OpenResult`.
@@ -1436,10 +1482,15 @@ impl AppState {
         }
     }
 
-    /// Run the destructive statement the user confirmed.
+    /// Run the pending write the user confirmed — a destructive editor statement
+    /// or a guarded grid edit (Track B5).
     pub(crate) fn confirm_destructive(&mut self, cx: &mut Context<Self>) {
-        if let Some(sql) = self.confirm_exec.take() {
-            self.execute_sql(sql, cx);
+        match self.confirm_exec.take() {
+            Some(PendingWrite::EditorSql(sql)) => self.execute_sql(sql, cx),
+            Some(PendingWrite::Edit { op, epoch }) => {
+                self.send_active(Command::ApplyEdit { epoch, op });
+            }
+            None => {}
         }
         // The modal is closing — return focus to the root for the next ⌘K etc.
         self.refocus_root = true;
@@ -1448,7 +1499,35 @@ impl AppState {
 
     pub(crate) fn cancel_destructive(&mut self, cx: &mut Context<Self>) {
         self.confirm_exec = None;
+        // Drop any pending grid edit the cancelled confirm was guarding (Track B5).
+        self.pending_edit = None;
         self.refocus_root = true;
+        cx.notify();
+    }
+
+    /// A guarded edit committed (Track B5): patch the edited cell in place from the
+    /// stashed context (no refetch), confirm with a toast. Scoped to the right
+    /// result by `epoch` so a reply for a since-replaced result is ignored.
+    fn on_edit_applied(&mut self, epoch: u64, affected: u64, cx: &mut Context<Self>) {
+        let Some(ctx) = self.pending_edit.take() else {
+            return;
+        };
+        if ctx.epoch != epoch {
+            return; // the result was replaced under the in-flight edit
+        }
+        if let (Some(value), Some(grid)) = (ctx.new_value, self.result_by_epoch(epoch)) {
+            grid.patch_cell(ctx.row, ctx.data_col, value);
+        }
+        self.notify(ToastVariant::Success, format!("{affected} row updated"), cx);
+        cx.notify();
+    }
+
+    /// A guarded edit failed (Track B5): drop the pending patch and surface the
+    /// engine/assertion message. (Pane-scoped error display is a later refinement;
+    /// a toast keeps the failure visible without losing the grid.)
+    fn on_edit_failed(&mut self, _epoch: u64, message: String, cx: &mut Context<Self>) {
+        self.pending_edit = None;
+        self.notify(ToastVariant::Error, message, cx);
         cx.notify();
     }
 

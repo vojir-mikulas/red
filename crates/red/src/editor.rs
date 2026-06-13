@@ -699,7 +699,7 @@ impl AppState {
             crate::sql::StatementKind::Destructive => {
                 // The safety rail is opt-out in settings; when off, run immediately.
                 if self.settings.query.confirm_destructive {
-                    self.confirm_exec = Some(sql);
+                    self.confirm_exec = Some(crate::app::PendingWrite::EditorSql(sql));
                     // Focus the modal so its own Enter/Esc handling is heard.
                     self.focus_modal = true;
                     cx.notify();

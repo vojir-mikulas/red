@@ -93,6 +93,13 @@ pub struct ConnectionConfig {
     pub color: u8,
     #[cfg_attr(feature = "serde", serde(default))]
     pub read_only: bool,
+    /// Opt-in to in-grid data editing (Track B5). Off by default and meaningful
+    /// only on a writable connection (`!read_only`): click-to-edit is a sharper
+    /// foot-gun than a deliberately typed `UPDATE`, so it gets its own switch on
+    /// top of writability. With both set, the grid offers guarded, PK-keyed,
+    /// previewed edits; otherwise the grid is read-only exactly as before.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub allow_edit: bool,
 }
 
 impl ConnectionConfig {
@@ -372,6 +379,146 @@ pub enum ResultFilter {
     Where(String),
 }
 
+/// A single guarded data edit (Track B5), keyed on a result's primary key. Built by
+/// the UI from the result's [`KeySpec`] + base table — a *semantic* edit carrying no
+/// SQL, so the UI stays engine-independent. The driver renders it to dialect SQL,
+/// **binds** every value (never interpolates), and asserts it touches exactly one
+/// row (rolling back otherwise). NULL values are emitted as the literal `NULL`
+/// keyword by the renderer, so the per-engine value binders only ever see non-null
+/// values.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EditOp {
+    /// Set one or more columns of the PK-identified row.
+    Update {
+        table: TableRef,
+        key: ColumnValue,
+        set: Vec<ColumnValue>,
+    },
+    /// Delete the PK-identified row.
+    Delete { table: TableRef, key: ColumnValue },
+    /// Insert a row with the given column values; omitted columns take their DB
+    /// default. After a successful insert the caller refetches to surface
+    /// server-assigned values (autoincrement PK, defaults).
+    Insert {
+        table: TableRef,
+        values: Vec<ColumnValue>,
+    },
+}
+
+/// A (schema, name) table reference for an [`EditOp`]. `schema` is the namespace a
+/// browse came from (`OpenResult.table`); the renderer qualifies and quotes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRef {
+    pub schema: Option<String>,
+    pub name: String,
+}
+
+/// One `column = value` pair of an [`EditOp`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnValue {
+    pub column: String,
+    pub value: Value,
+}
+
+impl EditOp {
+    /// The human verb for the confirm modal ("Update" / "Delete" / "Insert").
+    pub fn verb(&self) -> &'static str {
+        match self {
+            EditOp::Update { .. } => "Update",
+            EditOp::Delete { .. } => "Delete",
+            EditOp::Insert { .. } => "Insert",
+        }
+    }
+
+    /// A readable, **display-only** rendering of the statement, values inlined as
+    /// literals — what the confirm modal shows. This is *not* what executes: the
+    /// driver renders dialect SQL and binds the values as parameters. Quoting is
+    /// generic (double-quoted identifiers); the live statement uses the engine's.
+    pub fn preview_sql(&self) -> String {
+        let q = |id: &str| format!("\"{}\"", id.replace('"', "\"\""));
+        let qualify = |t: &TableRef| match &t.schema {
+            Some(s) if !s.is_empty() => format!("{}.{}", q(s), q(&t.name)),
+            _ => q(&t.name),
+        };
+        match self {
+            EditOp::Update { table, key, set } => {
+                let assigns = set
+                    .iter()
+                    .map(|cv| format!("{} = {}", q(&cv.column), literal(&cv.value)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "UPDATE {} SET {} WHERE {} = {}",
+                    qualify(table),
+                    assigns,
+                    q(&key.column),
+                    literal(&key.value)
+                )
+            }
+            EditOp::Delete { table, key } => format!(
+                "DELETE FROM {} WHERE {} = {}",
+                qualify(table),
+                q(&key.column),
+                literal(&key.value)
+            ),
+            EditOp::Insert { table, values } => {
+                let cols = values
+                    .iter()
+                    .map(|cv| q(&cv.column))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let vals = values
+                    .iter()
+                    .map(|cv| literal(&cv.value))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("INSERT INTO {} ({}) VALUES ({})", qualify(table), cols, vals)
+            }
+        }
+    }
+}
+
+/// Render a [`Value`] as a SQL literal for an [`EditOp`] **preview only** — quoting
+/// text with embedded quotes doubled. Never used to build executed SQL (the driver
+/// binds values), so it's a readability helper, not an injection surface.
+fn literal(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".to_string(),
+        Value::Integer(n) => n.to_string(),
+        Value::Real(x) => x.to_string(),
+        Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Blob(b) => format!("<{} bytes>", b.len()),
+        Value::Capped(c) if c.blob => format!("<{} bytes>", c.len),
+        Value::Capped(c) => format!("'{}…'", c.head.replace('\'', "''")),
+    }
+}
+
+/// Coerce user-entered `text` to a [`Value`] for an edit, guided by the column's
+/// declared type. An empty string maps to [`Value::Null`] (clearing a cell). Numeric
+/// columns parse to [`Value::Integer`]/[`Value::Real`]; a parse failure is an
+/// `Err(reason)` the editor shows inline, so the preview never opens with an
+/// un-bindable value. Everything else is [`Value::Text`].
+pub fn coerce_edit_value(text: &str, decl_type: Option<&str>) -> std::result::Result<Value, String> {
+    if text.is_empty() {
+        return Ok(Value::Null);
+    }
+    if decl_type.is_some_and(is_int_type) {
+        return text
+            .trim()
+            .parse::<i64>()
+            .map(Value::Integer)
+            .map_err(|_| format!("‘{text}’ is not a valid integer"));
+    }
+    if decl_type.is_some_and(is_real_type) {
+        return text
+            .trim()
+            .parse::<f64>()
+            .map(Value::Real)
+            .map_err(|_| format!("‘{text}’ is not a valid number"));
+    }
+    Ok(Value::Text(text.to_string()))
+}
+
 /// A query execution plan (Track B4 — EXPLAIN). A small, fully-materialized tree
 /// the driver builds from the engine's *native* EXPLAIN output — SQLite's
 /// `EXPLAIN QUERY PLAN` rows, Postgres's indented text plan, MySQL's `FORMAT=TREE`
@@ -643,6 +790,24 @@ fn is_int_type(type_name: &str) -> bool {
     )
 }
 
+/// Whether a declared type is a floating/decimal numeric column, for edit-value
+/// coercion (parse to [`Value::Real`]). Best-effort across the three engines.
+fn is_real_type(type_name: &str) -> bool {
+    let t = type_name.to_ascii_lowercase();
+    let base = t.split(['(', ' ']).next().unwrap_or("");
+    matches!(
+        base,
+        "real"
+            | "double"
+            | "float"
+            | "float4"
+            | "float8"
+            | "numeric"
+            | "decimal"
+            | "dec"
+    )
+}
+
 /// One bounded window of rows pulled from a streaming cursor. The streaming path
 /// never materializes a whole result — it yields these fixed-size windows.
 #[derive(Debug, Clone, Default)]
@@ -887,5 +1052,71 @@ mod conn_tests {
         assert_eq!(p.user, "u");
         assert_eq!(p.password, "pw");
         assert_eq!(p.database, "d");
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+
+    fn cv(column: &str, value: Value) -> ColumnValue {
+        ColumnValue {
+            column: column.into(),
+            value,
+        }
+    }
+
+    #[test]
+    fn preview_renders_readable_statements() {
+        let table = TableRef {
+            schema: Some("main".into()),
+            name: "users".into(),
+        };
+        let update = EditOp::Update {
+            table: table.clone(),
+            key: cv("id", Value::Integer(7)),
+            set: vec![cv("name", Value::Text("O'Brien".into()))],
+        };
+        // Identifiers double-quoted, the value single-quoted with the quote doubled.
+        assert_eq!(
+            update.preview_sql(),
+            "UPDATE \"main\".\"users\" SET \"name\" = 'O''Brien' WHERE \"id\" = 7"
+        );
+        assert_eq!(update.verb(), "Update");
+
+        let del = EditOp::Delete {
+            table: table.clone(),
+            key: cv("id", Value::Integer(7)),
+        };
+        assert_eq!(
+            del.preview_sql(),
+            "DELETE FROM \"main\".\"users\" WHERE \"id\" = 7"
+        );
+
+        let ins = EditOp::Insert {
+            table,
+            values: vec![cv("id", Value::Integer(2)), cv("name", Value::Null)],
+        };
+        assert_eq!(
+            ins.preview_sql(),
+            "INSERT INTO \"main\".\"users\" (\"id\", \"name\") VALUES (2, NULL)"
+        );
+    }
+
+    #[test]
+    fn coercion_follows_declared_type() {
+        // Empty input clears the cell regardless of type.
+        assert_eq!(coerce_edit_value("", Some("text")), Ok(Value::Null));
+        // Integer / real columns parse; everything else is text.
+        assert_eq!(coerce_edit_value("42", Some("integer")), Ok(Value::Integer(42)));
+        assert_eq!(coerce_edit_value("3.5", Some("numeric")), Ok(Value::Real(3.5)));
+        assert_eq!(
+            coerce_edit_value("hi", Some("varchar(20)")),
+            Ok(Value::Text("hi".into()))
+        );
+        // An untyped column keeps the text verbatim.
+        assert_eq!(coerce_edit_value("x", None), Ok(Value::Text("x".into())));
+        // A non-numeric value on an integer column is a coercion error (no preview).
+        assert!(coerce_edit_value("abc", Some("int")).is_err());
     }
 }

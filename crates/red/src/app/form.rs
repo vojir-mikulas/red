@@ -52,6 +52,7 @@ impl AppState {
             color: 3,
             // Read-only by default — RED's safe-by-default posture.
             read_only: true,
+            allow_edit: false,
             editing: None,
             test: TestState::Idle,
         });
@@ -80,6 +81,7 @@ impl AppState {
             kind: config.kind,
             color: config.color,
             read_only: config.read_only,
+            allow_edit: config.allow_edit,
             editing: Some(index),
             test: TestState::Idle,
         });
@@ -109,6 +111,9 @@ impl AppState {
             database: read(&self.database_input),
             color: form.color,
             read_only: form.read_only,
+            // Editing only makes sense on a writable connection; a read-only one
+            // can't write regardless, so clear the opt-in to keep the config honest.
+            allow_edit: form.allow_edit && !form.read_only,
         })
     }
 
@@ -299,6 +304,22 @@ impl AppState {
     pub(crate) fn set_form_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
         if let Some(form) = &mut self.form {
             form.read_only = read_only;
+            // Read-only and editing are mutually exclusive — turning on read-only
+            // clears the edit opt-in so the form can't show an impossible state.
+            if read_only {
+                form.allow_edit = false;
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn set_form_allow_edit(&mut self, allow_edit: bool, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.form {
+            form.allow_edit = allow_edit;
+            // Enabling editing implies a writable connection.
+            if allow_edit {
+                form.read_only = false;
+            }
         }
         cx.notify();
     }

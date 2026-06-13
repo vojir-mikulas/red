@@ -21,9 +21,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use red_core::{
-    Column, ColumnMeta, ExportFormat, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta,
-    QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail,
-    Value,
+    Column, ColumnMeta, EditOp, ExportFormat, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind,
+    ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta,
+    TableDetail, Value,
 };
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -522,6 +522,39 @@ impl DatabaseDriver for PostgresDriver {
             .map_err(driver_err)?;
         match self.client.execute(sql, &[]).await {
             Ok(affected) => {
+                self.client
+                    .batch_execute("COMMIT")
+                    .await
+                    .map_err(driver_err)?;
+                Ok(affected)
+            }
+            Err(e) => {
+                let _ = self.client.batch_execute("ROLLBACK").await;
+                Err(map_pg_err(e))
+            }
+        }
+    }
+
+    async fn apply_edit(&self, op: &EditOp) -> Result<u64> {
+        // Typed placeholders (`$n::int8`, …) like the seek path: the value's wire
+        // type is fixed by the Rust value, the cast keeps Postgres from re-inferring.
+        let (sql, params) = crate::edit_sql(op, pg_quote, |i, v| format!("${}{}", i + 1, pg_cast(v)));
+        let owned: Vec<Value> = params.iter().map(|v| (*v).clone()).collect();
+        let boxed = pg_params(Some(&owned))?;
+        let refs: Vec<&(dyn ToSql + Sync)> = boxed
+            .iter()
+            .map(|b| -> &(dyn ToSql + Sync) { b.as_ref() })
+            .collect();
+        self.client
+            .batch_execute("BEGIN")
+            .await
+            .map_err(driver_err)?;
+        match self.client.execute(&sql, &refs).await {
+            Ok(affected) => {
+                if affected != 1 {
+                    let _ = self.client.batch_execute("ROLLBACK").await;
+                    return Err(crate::edit_count_err(op, affected));
+                }
                 self.client
                     .batch_execute("COMMIT")
                     .await
@@ -1265,6 +1298,28 @@ mod tests {
         let url = url_or_skip!();
         let driver = PostgresDriver::connect(&url, true).await.unwrap();
         battery::read_only_rejects_write(&driver, "CREATE TABLE red_ro_should_fail (x INT)").await;
+    }
+
+    #[tokio::test]
+    async fn applies_edits_and_read_only_rejects() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, false).await.unwrap();
+        let t = tag("edit");
+        driver
+            .execute(&format!("CREATE TABLE {t} (id INT PRIMARY KEY, name TEXT)"))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!("INSERT INTO {t} VALUES (1, 'one')"))
+            .await
+            .unwrap();
+        let schema = current_schema(&driver).await;
+        battery::applies_edits(&driver, &schema, &t).await;
+
+        let ro = PostgresDriver::connect(&url, true).await.unwrap();
+        battery::read_only_rejects_edit(&ro, &schema, &t).await;
+
+        driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
     }
 
     #[tokio::test]

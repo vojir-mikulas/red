@@ -192,7 +192,7 @@ impl Render for AppState {
         let confirm = self
             .confirm_exec
             .clone()
-            .map(|sql| self.render_confirm(sql, cx));
+            .map(|pending| self.render_confirm(pending, cx));
 
         let confirm_close = self
             .confirm_close_tab
@@ -549,20 +549,37 @@ impl AppState {
     }
 
     /// The destructive-statement confirmation modal — the write safety rail.
-    fn render_confirm(&self, sql: String, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_confirm(
+        &self,
+        pending: crate::app::PendingWrite,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        use crate::app::PendingWrite;
         let theme = cx.theme();
         let close_view = cx.entity().downgrade();
         let confirm_view = cx.entity().downgrade();
+        // The destructive editor statement and the guarded grid edit share this
+        // modal; only the title, prose, preview text, and button label differ.
+        let (title, prose, sql, run_label) = match &pending {
+            PendingWrite::EditorSql(sql) => (
+                "Confirm destructive statement",
+                "This statement modifies data and can't be undone. Run it?",
+                sql.clone(),
+                "Run statement",
+            ),
+            PendingWrite::Edit { op, .. } => (
+                "Confirm edit",
+                "This will modify one row, keyed on its primary key. Apply it?",
+                op.preview_sql(),
+                "Apply edit",
+            ),
+        };
         let preview: String = sql.chars().take(200).collect();
         let body = div()
             .flex()
             .flex_col()
             .gap_2()
-            .child(
-                div()
-                    .text_color(theme.text_muted)
-                    .child("This statement modifies data and can't be undone. Run it?"),
-            )
+            .child(div().text_color(theme.text_muted).child(prose))
             .child(
                 div()
                     .p_2()
@@ -583,12 +600,12 @@ impl AppState {
                     .on_click(cx.listener(|this, _, _, cx| this.cancel_destructive(cx))),
             )
             .child(
-                Button::new("confirm-run", "Run statement")
+                Button::new("confirm-run", run_label)
                     .variant(ButtonVariant::Danger)
                     .on_click(cx.listener(|this, _, _, cx| this.confirm_destructive(cx))),
             );
         Modal::new("confirm-destructive")
-            .title("Confirm destructive statement")
+            .title(title)
             .width(px(440.))
             .focus_handle(self.modal_focus.clone())
             .footer(footer)

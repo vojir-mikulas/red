@@ -775,6 +775,42 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 }
             }
 
+            Command::ApplyEdit { epoch, op } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let driver = state.driver.clone();
+                let results = state.results.clone();
+                // One bounded write, asserted to touch exactly one row by the driver.
+                // Like `Execute`, a success may shift rows under any open result, so
+                // drop the checkpoint indexes; the failure is pane-local
+                // (`EditFailed`), not a global error toast.
+                match driver.apply_edit(&op).await {
+                    Ok(affected) => {
+                        for spec in lock(&results).values() {
+                            let mut idx = lock(&spec.checkpoints);
+                            idx.points.clear();
+                            idx.status = BuildStatus::Idle;
+                        }
+                        emit(
+                            &events,
+                            session_id,
+                            Event::EditApplied { epoch, affected },
+                        );
+                    }
+                    Err(e) => emit(
+                        &events,
+                        session_id,
+                        Event::EditFailed {
+                            epoch,
+                            message: e.to_string(),
+                        },
+                    ),
+                }
+            }
+
             Command::Explain {
                 sql,
                 analyze,

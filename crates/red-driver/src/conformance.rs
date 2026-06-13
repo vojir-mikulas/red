@@ -13,7 +13,9 @@
 
 use std::time::Duration;
 
-use red_core::{ExportFormat, KeySpec, ObjectKind, QueryOptions, RedError, Value};
+use red_core::{
+    ColumnValue, EditOp, ExportFormat, KeySpec, ObjectKind, QueryOptions, RedError, TableRef, Value,
+};
 
 use crate::{AbortSignal, DatabaseDriver, PageCap, DEFAULT_DISPLAY_CELL_CAP};
 
@@ -561,5 +563,128 @@ pub(crate) async fn read_only_rejects_write(driver: &dyn DatabaseDriver, write_s
     assert!(
         driver.execute(write_sql).await.is_err(),
         "read-only connection must reject a write"
+    );
+}
+
+/// Guarded data editing (Track B5): `apply_edit` renders a PK-keyed UPDATE / INSERT
+/// / DELETE, **binds** every value, and asserts exactly one affected row. The caller
+/// seeds a writable table `(id INTEGER PRIMARY KEY, name TEXT)` holding the single
+/// row `(1, 'one')`; `schema`/`table` name it. Verifies that an update rebinds one
+/// cell with a value that round-trips verbatim (a SQL-metacharacter value is stored
+/// as data, never executed — the injection guard), that NULL clears a cell, that a
+/// no-matching-key update errors and rolls back (the table is untouched), and that
+/// insert/delete each move the row count by exactly one.
+pub(crate) async fn applies_edits(driver: &dyn DatabaseDriver, schema: &str, table: &str) {
+    let tref = || TableRef {
+        schema: Some(schema.into()),
+        name: table.into(),
+    };
+    let id = |n: i64| ColumnValue {
+        column: "id".into(),
+        value: Value::Integer(n),
+    };
+    let name = |v: Value| ColumnValue {
+        column: "name".into(),
+        value: v,
+    };
+    let abort = AbortSignal::new();
+    let read = |sql: String| {
+        let abort = &abort;
+        async move {
+            driver
+                .fetch_page(&sql, 0, 5, PageCap::Full, abort)
+                .await
+                .unwrap()
+        }
+    };
+    let count = |sql: String| {
+        let abort = &abort;
+        async move { driver.count(&sql, abort).await.unwrap() }
+    };
+    let one_name = format!("SELECT id, name FROM {table} WHERE id = 1");
+    let all = format!("SELECT id FROM {table}");
+
+    // UPDATE binds the value: a SQL-injection-shaped string is stored verbatim.
+    let evil = "'); DROP TABLE x;--";
+    let affected = driver
+        .apply_edit(&EditOp::Update {
+            table: tref(),
+            key: id(1),
+            set: vec![name(Value::Text(evil.into()))],
+        })
+        .await
+        .unwrap();
+    assert_eq!(affected, 1, "update touches exactly one row");
+    let page = read(one_name.clone()).await;
+    assert_eq!(
+        page.rows[0][1],
+        Value::Text(evil.into()),
+        "value is bound, not interpolated — stored verbatim, not executed"
+    );
+
+    // NULL clears the cell.
+    driver
+        .apply_edit(&EditOp::Update {
+            table: tref(),
+            key: id(1),
+            set: vec![name(Value::Null)],
+        })
+        .await
+        .unwrap();
+    assert_eq!(read(one_name.clone()).await.rows[0][1], Value::Null, "NULL set");
+
+    // A non-matching key affects 0 rows → error, rolled back, table unchanged.
+    assert!(
+        driver
+            .apply_edit(&EditOp::Update {
+                table: tref(),
+                key: id(9999),
+                set: vec![name(Value::Text("ghost".into()))],
+            })
+            .await
+            .is_err(),
+        "no matching key → error (not a silent no-op)"
+    );
+    assert_eq!(count(all.clone()).await, 1, "still exactly one row");
+
+    // INSERT adds exactly one row; DELETE removes it.
+    driver
+        .apply_edit(&EditOp::Insert {
+            table: tref(),
+            values: vec![id(2), name(Value::Text("two".into()))],
+        })
+        .await
+        .unwrap();
+    assert_eq!(count(all.clone()).await, 2, "insert added one row");
+    driver
+        .apply_edit(&EditOp::Delete {
+            table: tref(),
+            key: id(2),
+        })
+        .await
+        .unwrap();
+    assert_eq!(count(all.clone()).await, 1, "delete removed one row");
+}
+
+/// A read-only connection rejects a data edit at the engine — defense in depth
+/// behind the UI's opt-in gate. `schema`/`table` name a `(id PK, name)` table.
+pub(crate) async fn read_only_rejects_edit(driver: &dyn DatabaseDriver, schema: &str, table: &str) {
+    let edit = EditOp::Update {
+        table: TableRef {
+            schema: Some(schema.into()),
+            name: table.into(),
+        },
+        key: ColumnValue {
+            column: "id".into(),
+            value: Value::Integer(1),
+        },
+        set: vec![ColumnValue {
+            column: "name".into(),
+            value: Value::Text("nope".into()),
+        }],
+    };
+    assert!(
+        driver.apply_edit(&edit).await.is_err(),
+        "read-only connection must reject a data edit"
     );
 }

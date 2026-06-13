@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use red_core::{
-    Column, ConnectionConfig, ExportFormat, KeySpec, QueryOptions, QueryPlan, ResultFilter,
+    Column, ConnectionConfig, EditOp, ExportFormat, KeySpec, QueryOptions, QueryPlan, ResultFilter,
     RowWindow, SchemaMeta, TableDetail, Value,
 };
 
@@ -119,6 +119,16 @@ pub enum Command {
     /// Run a non-row-returning statement (write/DDL) in a transaction.
     Execute {
         sql: String,
+    },
+    /// Apply one guarded, PK-keyed data edit (Track B5) on the active session. The
+    /// driver renders `op` to dialect SQL, binds every value, and asserts it touches
+    /// exactly one row. `epoch` is the active result's epoch so a reply for a
+    /// superseded result (tab switched / re-run) is dropped. Replied with
+    /// `EditApplied` (then the UI refetches the affected window) or `EditFailed`
+    /// (scoped to the result pane), never a global error toast.
+    ApplyEdit {
+        epoch: u64,
+        op: EditOp,
     },
     /// Run `EXPLAIN` (or `EXPLAIN ANALYZE` when `analyze`) for `sql` and report a
     /// normalized plan (Track B4). `epoch` is the active tab's result epoch so a
@@ -260,6 +270,20 @@ pub enum Event {
     /// A write/DDL statement committed; `affected` rows changed.
     Executed {
         affected: usize,
+    },
+    /// A guarded data edit (Track B5) committed on its result's session. Echoes
+    /// `epoch` so the UI refetches the affected window of the right result (and
+    /// drops a reply for a superseded one). `affected` is always 1 on success.
+    EditApplied {
+        epoch: u64,
+        affected: u64,
+    },
+    /// A guarded data edit failed (engine error, or it touched ≠1 row and rolled
+    /// back). Scoped to the result pane by `epoch` — shown there, not as a global
+    /// toast — like `PlanFailed`.
+    EditFailed {
+        epoch: u64,
+        message: String,
     },
     /// An `Explain` produced a plan. Echoes `epoch` so the UI drops a plan for a
     /// result it has already replaced.

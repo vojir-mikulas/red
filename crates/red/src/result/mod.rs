@@ -21,7 +21,7 @@ use gpui::{point, px, ClipboardItem, Context, Pixels, ScrollHandle, UniformListS
 use red_core::{Column as ResultColumn, ExportFormat, KeySpec, ResultFilter, Value};
 use red_service::{Command, CommandSender, RunFetch, SessionId, SortKey};
 
-use crate::app::{AppState, ExportProgress, Notification, Phase};
+use crate::app::{AppState, EditContext, ExportProgress, Notification, Phase};
 
 use buffer::{next_epoch, window_decision, BufferMode, GridBuffer, KeyedRun, WindowView, WINDOW};
 pub(crate) use render::group_digits;
@@ -54,6 +54,9 @@ pub(crate) struct ResultGrid {
     /// preview — sent with `OpenResult` so the backend can resolve a seek key.
     /// `None` for editor SQL and for sorted re-opens (which wrap the SQL).
     table: Option<(String, String)>,
+    /// The seek key the backend resolved (`ResultReady`). Track B5 reads its PK to
+    /// key a guarded edit; `None` (editor SQL / no usable PK) means not editable.
+    key: Option<KeySpec>,
     pub(in crate::result) buffer: Rc<RefCell<GridBuffer>>,
     pub(in crate::result) sender: CommandSender,
     pub(in crate::result) scroll: UniformListScrollHandle,
@@ -98,6 +101,7 @@ impl ResultGrid {
             filter: None,
             selection: None,
             table,
+            key: None,
             buffer: Rc::new(RefCell::new(GridBuffer::new(page_size))),
             sender,
             page_size,
@@ -171,6 +175,53 @@ impl ResultGrid {
             .and_then(|r| r.values.get(col).cloned())
     }
 
+    /// Assemble the guarded-edit target (Track B5) for the cell under the cursor —
+    /// the base table, its PK column + value (the row's identity), and the focused
+    /// column's name / declared type / current value. `None` when the result isn't
+    /// an editable single-table keyed browse, the cursor is on the PK column itself
+    /// (changing identity is out of scope), the PK value is missing or clipped, or
+    /// the target cell is binary / display-clipped (no safe inline round-trip).
+    /// `gutter` is the data-column table offset (see [`AppState::gutter`]).
+    pub(crate) fn edit_target(&self, gutter: usize) -> Option<EditContext> {
+        let table = self.table.clone()?;
+        let key = self.key.as_ref()?;
+        // The identity column: the tiebreaker (the PK) for a sorted browse, else the
+        // lead key (which is the PK for a plain browse).
+        let pk_column = key.tiebreak.clone().unwrap_or_else(|| key.column.clone());
+        let pk_idx = self.columns.iter().position(|c| c.name == pk_column)?;
+        let (row, col) = self.cursor_cell(gutter)?;
+        let target = self.columns.get(col)?;
+        if target.name == pk_column {
+            return None;
+        }
+        let pk_value = self.cell_value(row, pk_idx)?;
+        if matches!(pk_value, Value::Null | Value::Capped(_)) {
+            return None;
+        }
+        let original = self.cell_value(row, col)?;
+        if matches!(original, Value::Blob(_) | Value::Capped(_)) {
+            return None;
+        }
+        Some(EditContext {
+            epoch: self.epoch,
+            row,
+            data_col: col,
+            table,
+            pk_column,
+            pk_value,
+            column: target.name.clone(),
+            decl_type: target.decl_type.clone(),
+            original,
+            new_value: None,
+        })
+    }
+
+    /// Patch the resident cell at `(row, data_col)` to `value` in place, after a
+    /// committed edit (Track B5) — avoids a refetch round-trip for the common case.
+    pub(crate) fn patch_cell(&mut self, row: usize, data_col: usize, value: Value) {
+        self.buffer.borrow_mut().patch_cell(row, data_col, value);
+    }
+
     /// Total rows in the open result (0 until `ResultReady`) — for the
     /// go-to-row prompt's range hint and bound.
     pub(crate) fn total_rows(&self) -> usize {
@@ -198,6 +249,7 @@ impl ResultGrid {
                 .collect();
             (cols.len() == k.column_names().len()).then_some(cols)
         });
+        self.key = key;
         self.columns = columns;
         self.total = total;
         self.ready = true;
@@ -756,6 +808,16 @@ impl AppState {
     pub(crate) fn active_result_filter(&self) -> Option<ResultFilter> {
         match &self.phase {
             Phase::Connected(active) => active.active_result().and_then(|g| g.filter.clone()),
+            _ => None,
+        }
+    }
+
+    /// The foreground connection's open result carrying `epoch`, for epoch-scoped
+    /// replies on the visible workspace (e.g. a committed in-place cell edit,
+    /// Track B5). Delegates to [`ActiveConn::result_by_epoch`].
+    pub(crate) fn result_by_epoch(&mut self, epoch: u64) -> Option<&mut ResultGrid> {
+        match &mut self.phase {
+            Phase::Connected(active) => active.result_by_epoch(epoch),
             _ => None,
         }
     }

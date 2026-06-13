@@ -530,6 +530,28 @@ impl GridBuffer {
         }
     }
 
+    /// Replace data column `col` of the resident row at ordinal `ix` with `value`,
+    /// rebuilding its display cell and clipped-flag (Track B5 optimistic update after
+    /// a committed edit). No-op if the row isn't resident or `col` is out of range.
+    pub(super) fn patch_cell(&mut self, ix: usize, col: usize, value: Value) {
+        let row = match &mut self.mode {
+            BufferMode::Offset(pages) => pages.rows.get_mut(&ix),
+            BufferMode::Keyed(run) => ix
+                .checked_sub(run.anchor)
+                .and_then(|i| run.rows.get_mut(i)),
+        };
+        let Some(row) = row else { return };
+        if col >= row.values.len() {
+            return;
+        }
+        row.display[col] = DisplayCell::from_value(&value);
+        row.truncated.retain(|&c| c != col);
+        if matches!(&value, Value::Capped(c) if !c.blob) {
+            row.truncated.push(col);
+        }
+        row.values[col] = value;
+    }
+
     /// Whether the resident rows' ordinals are interpolation estimates.
     pub(super) fn is_estimated(&self) -> bool {
         match &self.mode {

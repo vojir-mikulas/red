@@ -294,6 +294,71 @@ async fn explains_a_query() {
     }
 }
 
+/// Apply a guarded data edit (Track B5): `ApplyEdit` on a writable session replies
+/// `EditApplied` echoing the result epoch, and an edit that matches no row comes
+/// back as a pane-local `EditFailed`, not a global `Error`.
+#[tokio::test]
+async fn applies_a_data_edit() {
+    use red_core::{ColumnValue, EditOp, TableRef};
+    let path = std::env::temp_dir().join(format!("red_svc_edit_{}.db", std::process::id()));
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO t VALUES (1, 'one');",
+        )
+        .unwrap();
+    }
+
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), false)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    let edit = |id: i64| EditOp::Update {
+        table: TableRef {
+            schema: Some("main".into()),
+            name: "t".into(),
+        },
+        key: ColumnValue {
+            column: "id".into(),
+            value: Value::Integer(id),
+        },
+        set: vec![ColumnValue {
+            column: "name".into(),
+            value: Value::Text("two".into()),
+        }],
+    };
+
+    send(&handle, Command::ApplyEdit { epoch: 4, op: edit(1) });
+    match next(&mut events).await {
+        Some(Event::EditApplied { epoch, affected }) => {
+            assert_eq!(epoch, 4, "the result epoch is echoed");
+            assert_eq!(affected, 1);
+        }
+        other => panic!("expected EditApplied, got {other:?}"),
+    }
+
+    // An edit whose key matches no row fails *in the pane*, rolled back.
+    send(&handle, Command::ApplyEdit { epoch: 5, op: edit(9999) });
+    match next(&mut events).await {
+        Some(Event::EditFailed { epoch, message }) => {
+            assert_eq!(epoch, 5);
+            assert!(!message.is_empty());
+        }
+        other => panic!("expected EditFailed, got {other:?}"),
+    }
+
+    send(&handle, Command::Shutdown);
+    std::fs::remove_file(&path).ok();
+}
+
 /// Open a result and page through it — the grid's load-on-scroll path.
 #[tokio::test]
 async fn opens_and_pages_result() {

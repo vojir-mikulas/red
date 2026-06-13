@@ -9,7 +9,7 @@
 
 use flint::prelude::*;
 use flint::Theme;
-use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, MouseButton, SharedString};
+use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, SharedString};
 
 use crate::app::{AppState, FontSelect};
 use crate::settings::{Density, ThemeMode};
@@ -96,8 +96,11 @@ impl AppState {
             )
             .child(settings_footer(cx));
 
-        // The scrim closes on a backdrop click; `occlude` keeps clicks off the app
-        // beneath, and the card stops its own clicks from reaching the scrim.
+        // The scrim closes on a backdrop click; `occlude` keeps clicks off the
+        // app beneath, and the card stops its own clicks from reaching the scrim.
+        // `on_scrim_dismiss` ignores the click that ends a window drag, so moving
+        // the window from behind the panel doesn't close it.
+        let view = cx.entity().downgrade();
         div()
             .id("settings")
             .absolute()
@@ -107,10 +110,9 @@ impl AppState {
             .justify_center()
             .bg(gpui::black().opacity(0.55))
             .occlude()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.close_settings(cx)),
-            )
+            .on_scrim_dismiss(move |_, cx| {
+                view.update(cx, |this, cx| this.close_settings(cx)).ok();
+            })
             .child(
                 div()
                     .occlude()

@@ -329,12 +329,11 @@ impl AppState {
     pub(crate) fn render_schema(
         &self,
         active: &ActiveConn,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
         let (bg_panel, faint) = (theme.bg_panel, theme.text_faint);
-        let focused = active.schema_focus.is_focused(window);
         let footer_size = theme.scale(10.);
         let footer_family = theme.font_family.clone();
         let view = cx.entity().downgrade();
@@ -371,6 +370,9 @@ impl AppState {
             .rows(items)
             .row_height(px(24.))
             .indent(px(14.))
+            // A click on a table row opens it (see `on_select` below); only the
+            // chevron expands/collapses the column list.
+            .toggle_on_row_click(false)
             .track_scroll(&s.tree_scroll)
             // Keyboard navigation: the sidebar's focus handle lives on the tree,
             // and ↑/↓ / ←/→ / Enter intents drive selection, expansion, and preview.
@@ -391,8 +393,22 @@ impl AppState {
                 }
             })
             .on_select(move |ix, _event, _window, cx| {
-                if let Some(node) = rows_select[ix].node.clone() {
-                    sv.update(cx, |this, cx| this.schema_select(node, cx)).ok();
+                let row = &rows_select[ix];
+                // A click opens a table (loads its data). A folder has nothing to
+                // open, so a click expands/collapses it instead — the chevron
+                // does the same. A leaf just moves the selection.
+                if let Some((schema, table)) = row.preview.clone() {
+                    sv.update(cx, |this, cx| this.schema_preview(schema, table, cx))
+                        .ok();
+                } else if let Some(node) = row.node.clone() {
+                    let expandable = row.item.has_children;
+                    sv.update(cx, |this, cx| {
+                        this.schema_select(node.clone(), cx);
+                        if expandable {
+                            this.schema_toggle(node, cx);
+                        }
+                    })
+                    .ok();
                 }
             })
             .on_activate(move |ix, _window, cx| {
@@ -423,11 +439,7 @@ impl AppState {
             .flex()
             .flex_col()
             // The tree itself owns the focus handle + navigation keys (see its
-            // `.focus_handle`/`.on_nav` above); this pane just draws the focus ring.
-            // The 1px transparent border reserves the ring's space (no layout shift).
-            .border_1()
-            .border_color(gpui::transparent_black())
-            .when(focused, |d| d.focus_ring(cx))
+            // `.focus_handle`/`.on_nav` above); the pane draws no focus ring.
             .bg(bg_panel)
             .child(filter_row)
             .child(div().flex_1().min_h(px(0.)).child(tree))

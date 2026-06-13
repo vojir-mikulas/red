@@ -11,6 +11,7 @@
 
 use flint::{Palette, PaletteEvent, PaletteItem, ToastVariant};
 use gpui::{actions, prelude::*, Context, ElementId, Entity, SharedString};
+use red_core::EditOp;
 
 use crate::app::{AppState, Phase};
 
@@ -61,6 +62,9 @@ pub(crate) enum Cmd {
     Explain,
     /// EXPLAIN ANALYZE the active tab's query (runs it — read queries only).
     ExplainAnalyze,
+    /// Edit the focused result cell (Track B5) — opens the value prompt. Offered
+    /// only on an editable cell of a writable, edit-enabled connection.
+    EditCell,
 }
 
 /// Which free-text prompt the single palette slot is currently serving, so a
@@ -70,6 +74,9 @@ pub(crate) enum Cmd {
 pub(crate) enum PromptKind {
     GoToRow,
     SaveQuery,
+    /// Entering a new value for the focused cell (Track B5). The target cell is
+    /// stashed in [`AppState::pending_edit`] while this prompt is open.
+    EditCell,
 }
 
 impl AppState {
@@ -162,6 +169,7 @@ impl AppState {
                 match kind {
                     PromptKind::GoToRow => self.submit_goto(text, cx),
                     PromptKind::SaveQuery => self.submit_save(text, cx),
+                    PromptKind::EditCell => self.submit_edit(text, cx),
                 }
             }
             PaletteEvent::Dismiss => self.close_palette(),
@@ -219,7 +227,101 @@ impl AppState {
             Cmd::OpenSavedQuery(index) => self.open_saved_query(index, cx),
             Cmd::Explain => self.explain_query(false, cx),
             Cmd::ExplainAnalyze => self.explain_query(true, cx),
+            Cmd::EditCell => self.open_edit_prompt(cx),
         }
+    }
+
+    /// Whether guarded in-grid editing is enabled for the active connection (Track
+    /// B5): writable *and* the per-connection editing opt-in. Both default safe.
+    pub(crate) fn editing_enabled(&self) -> bool {
+        matches!(
+            &self.phase,
+            Phase::Connected(active) if !active.config.read_only && active.config.allow_edit
+        )
+    }
+
+    /// The focused result cell's edit target, when editing is enabled and the cell
+    /// is editable (a single-table keyed browse, non-PK, non-clipped). `None`
+    /// otherwise — the entry point and palette gate both consult this.
+    pub(crate) fn active_edit_target(&self) -> Option<crate::app::EditContext> {
+        if !self.editing_enabled() {
+            return None;
+        }
+        let gutter = self.gutter();
+        match &self.phase {
+            Phase::Connected(active) => active.active_result().and_then(|g| g.edit_target(gutter)),
+            _ => None,
+        }
+    }
+
+    /// Open the value prompt for the focused cell (Track B5). No-op when the cell
+    /// isn't editable. Prefills the prompt with the cell's current text so a small
+    /// tweak is one keystroke; submitting routes to [`Self::submit_edit`].
+    pub(crate) fn open_edit_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(ctx) = self.active_edit_target() else {
+            return;
+        };
+        // Prefill with the current value's text (empty for NULL — an empty submit
+        // re-clears it). A blob/clipped cell never reaches here (filtered above).
+        let current = match &ctx.original {
+            red_core::Value::Null => String::new(),
+            other => other.to_string(),
+        };
+        let placeholder = format!("New value for “{}”", ctx.column);
+        let prompt = cx.new(|cx| {
+            let mut p = Palette::new(cx).prompt();
+            p.set_placeholder(placeholder, cx);
+            p.set_query(&current, cx);
+            p
+        });
+        cx.subscribe(&prompt, Self::on_palette_event).detach();
+        self.palette = Some(prompt);
+        self.palette_cmds.clear();
+        self.palette_prompt = PromptKind::EditCell;
+        self.pending_edit = Some(ctx);
+        cx.notify();
+    }
+
+    /// Coerce the typed value, build the `UPDATE` [`EditOp`], and open the confirm
+    /// preview (Track B5). A value equal to the original is a no-op (toast, no
+    /// write); a coercion failure (e.g. text in an integer column) toasts the reason.
+    fn submit_edit(&mut self, text: &str, cx: &mut Context<Self>) {
+        let Some(mut ctx) = self.pending_edit.take() else {
+            return;
+        };
+        let value = match red_core::coerce_edit_value(text, ctx.decl_type.as_deref()) {
+            Ok(v) => v,
+            Err(reason) => {
+                self.notify(ToastVariant::Error, reason, cx);
+                return;
+            }
+        };
+        if value == ctx.original {
+            self.notify(ToastVariant::Info, "No change — value is the same.", cx);
+            return;
+        }
+        let op = EditOp::Update {
+            table: red_core::TableRef {
+                schema: Some(ctx.table.0.clone()),
+                name: ctx.table.1.clone(),
+            },
+            key: red_core::ColumnValue {
+                column: ctx.pk_column.clone(),
+                value: ctx.pk_value.clone(),
+            },
+            set: vec![red_core::ColumnValue {
+                column: ctx.column.clone(),
+                value: value.clone(),
+            }],
+        };
+        let epoch = ctx.epoch;
+        // Hold the cell context (now carrying the new value) through the confirm so
+        // a committed edit can patch the resident cell in place.
+        ctx.new_value = Some(value);
+        self.pending_edit = Some(ctx);
+        self.confirm_exec = Some(crate::app::PendingWrite::Edit { op, epoch });
+        self.focus_modal = true;
+        cx.notify();
     }
 
     /// The commands available in the current phase, each paired with its `Cmd`.
@@ -264,6 +366,14 @@ impl AppState {
                     out.push((
                         PaletteItem::new("cmd:copy", "result: copy selection").hint("⌘C"),
                         Cmd::CopySelection,
+                    ));
+                }
+                // Guarded cell edit (B5) — only when the focused cell is editable
+                // (writable + edit-enabled connection, single-table keyed browse).
+                if self.active_edit_target().is_some() {
+                    out.push((
+                        PaletteItem::new("cmd:edit-cell", "data: edit cell…"),
+                        Cmd::EditCell,
                     ));
                 }
                 out.push((

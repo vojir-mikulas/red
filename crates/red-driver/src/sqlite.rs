@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ColumnMeta, ExportFormat, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta,
-    QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail,
-    Value,
+    Column, ColumnMeta, EditOp, ExportFormat, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind,
+    ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta,
+    TableDetail, Value,
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, ErrorCode, OpenFlags};
@@ -288,6 +288,15 @@ impl DatabaseDriver for SqliteDriver {
             .map_err(driver_err)?
     }
 
+    async fn apply_edit(&self, op: &EditOp) -> Result<u64> {
+        let path = self.path.clone();
+        let read_only = self.read_only;
+        let op = op.clone();
+        tokio::task::spawn_blocking(move || apply_edit_blocking(&path, read_only, &op))
+            .await
+            .map_err(driver_err)?
+    }
+
     async fn explain(&self, sql: &str, _analyze: bool) -> Result<QueryPlan> {
         // `EXPLAIN QUERY PLAN` is the readable plan (the bytecode `EXPLAIN` is
         // not); it never steps the statement, so it's safe regardless of the
@@ -346,6 +355,31 @@ fn execute_blocking(path: &Path, read_only: bool, sql: &str) -> Result<u64> {
         Ok(affected) => {
             conn.execute_batch("COMMIT").map_err(driver_err)?;
             Ok(affected as u64)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(map_step_err(e))
+        }
+    }
+}
+
+/// Render and run one [`EditOp`] in a transaction, asserting it touches exactly one
+/// row (rolling back otherwise). Values are bound (`?` placeholders); a read-only
+/// open rejects the write at the engine.
+fn apply_edit_blocking(path: &Path, read_only: bool, op: &EditOp) -> Result<u64> {
+    let (sql, params) = crate::edit_sql(op, quote_ident, |_, _| "?".to_string());
+    let bound: Vec<rusqlite::types::Value> = params.iter().map(|v| to_sqlite(v)).collect();
+    let conn = SqliteDriver::open(path, read_only)?;
+    conn.execute_batch("BEGIN").map_err(driver_err)?;
+    match conn.execute(&sql, rusqlite::params_from_iter(bound)) {
+        Ok(affected) => {
+            let affected = affected as u64;
+            if affected != 1 {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(crate::edit_count_err(op, affected));
+            }
+            conn.execute_batch("COMMIT").map_err(driver_err)?;
+            Ok(affected)
         }
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
@@ -935,6 +969,27 @@ mod tests {
         assert_eq!(affected, 2, "execute reports rows affected");
 
         battery::exports_csv_and_json(&driver, "SELECT * FROM t ORDER BY id", "sqlite_exec").await;
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn applies_edits_and_read_only_rejects() {
+        let path = temp_db_path("edit");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO t VALUES (1, 'one');",
+            )
+            .unwrap();
+        }
+        let driver = SqliteDriver::new(&path, false);
+        battery::applies_edits(&driver, "main", "t").await;
+
+        // A read-only open of the same file rejects the edit at the engine.
+        let ro = SqliteDriver::new(&path, true);
+        battery::read_only_rejects_edit(&ro, "main", "t").await;
 
         std::fs::remove_file(&path).ok();
     }

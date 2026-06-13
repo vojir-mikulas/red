@@ -28,9 +28,9 @@ use mysql_async::{
     Column as MyColumn, Error as MyError, Opts, OptsBuilder, Pool, Row, Value as MyValue,
 };
 use red_core::{
-    Column, ColumnMeta, ExportFormat, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta,
-    QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail,
-    Value,
+    Column, ColumnMeta, EditOp, ExportFormat, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind,
+    ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta,
+    TableDetail, Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, Mutex};
@@ -443,6 +443,39 @@ impl DatabaseDriver for MysqlDriver {
         match conn.query_drop(sql).await {
             Ok(()) => {
                 let affected = conn.affected_rows();
+                conn.query_drop("COMMIT").await.map_err(map_my_err)?;
+                Ok(affected)
+            }
+            Err(e) => {
+                let _ = conn.query_drop("ROLLBACK").await;
+                Err(map_my_err(e))
+            }
+        }
+    }
+
+    async fn apply_edit(&self, op: &EditOp) -> Result<u64> {
+        let (sql, params) = crate::edit_sql(
+            op,
+            |id| format!("`{}`", escape_ident(id)),
+            |_, _| "?".to_string(),
+        );
+        let bound: Vec<MyValue> = params.iter().map(|v| to_my(v)).collect();
+        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        conn.query_drop("BEGIN").await.map_err(map_my_err)?;
+        // `affected_rows` counts *changed* rows for an UPDATE (not matched), so a
+        // no-op edit reports 0 — the UI guards against submitting an unchanged value.
+        let result = if bound.is_empty() {
+            conn.exec_drop(sql.as_str(), ()).await
+        } else {
+            conn.exec_drop(sql.as_str(), bound).await
+        };
+        match result {
+            Ok(()) => {
+                let affected = conn.affected_rows();
+                if affected != 1 {
+                    let _ = conn.query_drop("ROLLBACK").await;
+                    return Err(crate::edit_count_err(op, affected));
+                }
                 conn.query_drop("COMMIT").await.map_err(map_my_err)?;
                 Ok(affected)
             }
@@ -991,6 +1024,30 @@ mod tests {
         let url = url_or_skip!();
         let driver = MysqlDriver::connect(&url, true).await.unwrap();
         battery::read_only_rejects_write(&driver, "CREATE TABLE red_ro_should_fail (x INT)").await;
+    }
+
+    #[tokio::test]
+    async fn applies_edits_and_read_only_rejects() {
+        let url = url_or_skip!();
+        let driver = MysqlDriver::connect(&url, false).await.unwrap();
+        let t = tag("edit");
+        driver
+            .execute(&format!(
+                "CREATE TABLE `{t}` (id INT PRIMARY KEY, name VARCHAR(64))"
+            ))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!("INSERT INTO `{t}` VALUES (1, 'one')"))
+            .await
+            .unwrap();
+        let schema = current_schema(&driver).await;
+        battery::applies_edits(&driver, &schema, &t).await;
+
+        let ro = MysqlDriver::connect(&url, true).await.unwrap();
+        battery::read_only_rejects_edit(&ro, &schema, &t).await;
+
+        driver.execute(&format!("DROP TABLE `{t}`")).await.unwrap();
     }
 
     #[tokio::test]

@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ColumnMeta, ExportFormat, KeySpec, QueryOptions, QueryPlan, RedError, Result,
-    ResultPage, RowWindow, SchemaMeta, TableDetail, Value,
+    Column, ColumnMeta, EditOp, ExportFormat, KeySpec, QueryOptions, QueryPlan, RedError, Result,
+    ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -169,6 +169,89 @@ pub(crate) fn seek_clauses(
         format!("WHERE ({lhs}) {cmp} ({rhs}) ")
     };
     (where_clause, order_by)
+}
+
+/// Render an [`EditOp`] into `(sql, ordered bind values)` for one engine — the
+/// shared half of every driver's `apply_edit`, so only quoting and placeholder
+/// syntax differ. `quote` quotes one identifier; `placeholder(i, v)` renders the
+/// `i`-th (0-based) bind slot for value `v` (e.g. `?` or `$1::int8`). A
+/// [`Value::Null`] is emitted as the literal `NULL` keyword and **not** bound — so
+/// the per-engine value binders never see a null (and a typeless null bind, which
+/// Postgres can't infer, never arises). Identifiers are quoted, values are bound:
+/// no part of an edit is string-interpolated.
+pub(crate) fn edit_sql<'a>(
+    op: &'a EditOp,
+    quote: impl Fn(&str) -> String,
+    placeholder: impl Fn(usize, &Value) -> String,
+) -> (String, Vec<&'a Value>) {
+    let qualify = |t: &TableRef| match &t.schema {
+        Some(s) if !s.is_empty() => format!("{}.{}", quote(s), quote(&t.name)),
+        _ => quote(&t.name),
+    };
+    // Render `v` as a bound placeholder (pushing it to `params`) or the literal NULL.
+    let slot = |v: &'a Value, params: &mut Vec<&'a Value>| -> String {
+        if matches!(v, Value::Null) {
+            "NULL".to_string()
+        } else {
+            let s = placeholder(params.len(), v);
+            params.push(v);
+            s
+        }
+    };
+
+    let mut params: Vec<&Value> = Vec::new();
+    let sql = match op {
+        EditOp::Update { table, key, set } => {
+            let mut assigns = Vec::with_capacity(set.len());
+            for cv in set {
+                assigns.push(format!("{} = {}", quote(&cv.column), slot(&cv.value, &mut params)));
+            }
+            let where_clause = format!("{} = {}", quote(&key.column), slot(&key.value, &mut params));
+            format!(
+                "UPDATE {} SET {} WHERE {}",
+                qualify(table),
+                assigns.join(", "),
+                where_clause
+            )
+        }
+        EditOp::Delete { table, key } => {
+            let where_clause = format!("{} = {}", quote(&key.column), slot(&key.value, &mut params));
+            format!("DELETE FROM {} WHERE {}", qualify(table), where_clause)
+        }
+        EditOp::Insert { table, values } => {
+            let cols = values
+                .iter()
+                .map(|cv| quote(&cv.column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut vals = Vec::with_capacity(values.len());
+            for cv in values {
+                vals.push(slot(&cv.value, &mut params));
+            }
+            format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                qualify(table),
+                cols,
+                vals.join(", ")
+            )
+        }
+    };
+    (sql, params)
+}
+
+/// The error for an edit whose row count wasn't the expected one — surfaced to the
+/// user in the result pane (not as a silent success). `affected = 0` means the row
+/// changed or vanished under us; `> 1` means the key was less unique than believed.
+/// Either way the driver rolled the statement back.
+pub(crate) fn edit_count_err(op: &EditOp, affected: u64) -> RedError {
+    let what = match op {
+        EditOp::Update { .. } => "update",
+        EditOp::Delete { .. } => "delete",
+        EditOp::Insert { .. } => "insert",
+    };
+    RedError::Query(format!(
+        "{what} matched {affected} rows (expected 1) — nothing was changed"
+    ))
 }
 
 /// Build a portable "any text-representable column contains `term`" predicate for
@@ -342,6 +425,14 @@ pub trait DatabaseDriver: Send + Sync {
     /// Run a non-row-returning statement wrapped in a transaction, returning the
     /// number of rows affected. A read-only driver rejects the write at the engine.
     async fn execute(&self, sql: &str) -> Result<u64>;
+
+    /// Apply one guarded, PK-keyed data edit (Track B5): render `op` to dialect SQL
+    /// with every value **bound** (see [`edit_sql`]), run it in a transaction, and
+    /// assert it affected exactly one row — rolling back and returning
+    /// [`edit_count_err`] otherwise, so a stale/non-unique key can't half-apply.
+    /// A read-only driver rejects the write at the engine (defense in depth behind
+    /// the UI's opt-in gate). Returns the affected count (always 1 on success).
+    async fn apply_edit(&self, op: &EditOp) -> Result<u64>;
 
     /// Run the engine's `EXPLAIN` for `sql` and return a normalized [`QueryPlan`]
     /// (Track B4). Plain `explain` (`analyze = false`) never executes the

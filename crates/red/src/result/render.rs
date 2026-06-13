@@ -78,11 +78,10 @@ impl AppState {
     pub(crate) fn render_result(
         &self,
         active: &ActiveConn,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let grid_focused = active.grid_focus.is_focused(window);
         let (bg, bg_app, border, border_soft) = (
             theme.bg_panel,
             theme.bg_app,
@@ -114,17 +113,12 @@ impl AppState {
             faint,
         };
         // The focus + cell-cursor keys live on the `Table` itself (see its
-        // `.focus_handle`/`.on_nav` below); this pane just draws the focus ring
-        // when the grid holds focus. The 1px transparent border reserves the
-        // ring's space so focus never shifts the layout.
+        // `.focus_handle`/`.on_nav` below); the pane draws no focus ring.
         let container = div()
             .size_full()
             .relative()
             .flex()
             .flex_col()
-            .border_1()
-            .border_color(gpui::transparent_black())
-            .when(grid_focused, |d| d.focus_ring(cx))
             .bg(bg);
 
         let grid = match active.active_result() {
