@@ -562,8 +562,8 @@ impl AppState {
             )
             .children(ro_chip);
 
-        let history = tab.history_open.then(|| {
-            let list: Vec<_> = tab.history.clone();
+        let history = active.history_open.then(|| {
+            let list: Vec<_> = active.history.clone();
             let selected = active.history_sel;
             let inner = if list.is_empty() {
                 div()
@@ -660,14 +660,12 @@ impl AppState {
         }
 
         if let Phase::Connected(active) = &mut self.phase {
-            if let Some(tab) = active.active_mut() {
-                // De-dupe consecutive identical runs at the head of the history.
-                if tab.history.first() != Some(&sql) {
-                    tab.history.insert(0, sql.clone());
-                    tab.history.truncate(50);
-                }
-                tab.history_open = false;
+            // De-dupe consecutive identical runs at the head of the history.
+            if active.history.first() != Some(&sql) {
+                active.history.insert(0, sql.clone());
+                active.history.truncate(50);
             }
+            active.history_open = false;
         }
 
         // Row-returning statements stream into the grid; writes execute in a
@@ -729,18 +727,12 @@ impl AppState {
 
     pub(crate) fn toggle_history(&mut self, cx: &mut Context<Self>) {
         let opened = if let Phase::Connected(active) = &mut self.phase {
-            let open = match active.active_mut() {
-                Some(tab) => {
-                    tab.history_open = !tab.history_open;
-                    Some(tab.history_open)
-                }
-                None => None,
-            };
+            active.history_open = !active.history_open;
             // Reset the keyboard highlight to the top whenever it opens.
-            if open == Some(true) {
+            if active.history_open {
                 active.history_sel = 0;
             }
-            open
+            Some(active.history_open)
         } else {
             None
         };
@@ -756,7 +748,7 @@ impl AppState {
     /// Move the history popover's highlight (↑/↓). No-op with an empty history.
     pub(crate) fn history_move(&mut self, delta: isize, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase {
-            let len = active.active().map(|t| t.history.len()).unwrap_or(0);
+            let len = active.history.len();
             if len == 0 {
                 return;
             }
@@ -769,9 +761,7 @@ impl AppState {
     /// Load the highlighted history entry into the editor (Enter in the popover).
     pub(crate) fn history_accept(&mut self, cx: &mut Context<Self>) {
         let sql = match &self.phase {
-            Phase::Connected(active) => active
-                .active()
-                .and_then(|t| t.history.get(active.history_sel).cloned()),
+            Phase::Connected(active) => active.history.get(active.history_sel).cloned(),
             _ => None,
         };
         if let Some(sql) = sql {
@@ -784,9 +774,7 @@ impl AppState {
     /// Close the history popover (Esc) and return focus to the editor.
     pub(crate) fn close_history(&mut self, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase {
-            if let Some(tab) = active.active_mut() {
-                tab.history_open = false;
-            }
+            active.history_open = false;
         }
         self.pending_focus = Some(crate::app::Pane::Editor);
         cx.notify();
@@ -794,13 +782,13 @@ impl AppState {
 
     pub(crate) fn load_history(&mut self, sql: String, cx: &mut Context<Self>) {
         let editor = match &mut self.phase {
-            Phase::Connected(active) => match active.active_mut() {
-                Some(tab) => {
-                    tab.history_open = false;
-                    tab.editor.clone()
+            Phase::Connected(active) => {
+                active.history_open = false;
+                match active.active_mut() {
+                    Some(tab) => tab.editor.clone(),
+                    None => return,
                 }
-                None => return,
-            },
+            }
             _ => return,
         };
         editor.update(cx, |editor, cx| editor.set_content(sql, cx));

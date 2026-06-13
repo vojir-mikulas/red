@@ -173,8 +173,12 @@ impl Render for AppState {
                     // close) and focus actually left the modal subtree.
                     let open = weak.upgrade().is_some_and(|e| e.read(cx).any_modal_open());
                     if open && !handle.contains_focused(window, cx) {
+                        // Bounce focus back to the modal root (the scrim, ancestor
+                        // of every modal control). The next Tab then walks *into*
+                        // the modal's children rather than the chrome behind it.
+                        // (A `focus_next` here would defer and re-escape, since the
+                        // out-of-modal element still holds focus this frame.)
                         window.focus(&handle, cx);
-                        window.focus_next(cx);
                     }
                 });
                 self.modal_focus_trap = Some(sub);
@@ -300,9 +304,14 @@ impl Render for AppState {
             // via Flint's `Modal` focus handling). ↑/↓ move the highlight, Enter
             // connects. Only acts on the disconnected screen with no form open.
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                // The command palette and connection switcher own the keyboard
+                // while open — their input has focus, so single-letter card
+                // shortcuts (e/⌫) must not fire underneath them.
                 if !matches!(this.phase, Phase::Disconnected)
                     || this.form.is_some()
                     || this.any_modal_open()
+                    || this.palette.is_some()
+                    || this.switcher.read(cx).is_open()
                 {
                     return;
                 }

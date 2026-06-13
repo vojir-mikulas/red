@@ -744,11 +744,17 @@ impl AppState {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let focus_ring = theme.text;
         let swatches = (0..6u8).map(|i| {
             let color = label_color(i, theme);
             let on = i == form.color;
             div()
                 .id(SharedString::from(format!("swatch-{i}")))
+                // A radio in a group, named so the keyboard user knows what each
+                // color does; Tab reaches it and Enter/Space selects it.
+                .role(Role::RadioButton)
+                .aria_label(SharedString::from(format!("Label color {}", i + 1)))
+                .tab_index(0)
                 .size(px(20.))
                 .rounded_full()
                 .bg(color)
@@ -756,6 +762,7 @@ impl AppState {
                 .border_2()
                 .border_color(if on { color } else { theme.bg_elevated })
                 .when(on, |s| s.shadow_sm())
+                .focus(move |s| s.border_color(focus_ring))
                 .on_click(cx.listener(move |this, _, _, cx| this.set_form_color(i, cx)))
         });
 
@@ -781,9 +788,11 @@ impl AppState {
                         .gap_2()
                         .h(px(32.))
                         .child(
-                            Toggle::new("read-only", form.read_only).on_change(cx.listener(
-                                |this, checked: &bool, _, cx| this.set_form_read_only(*checked, cx),
-                            )),
+                            Toggle::new("read-only", form.read_only)
+                                .label("Read-only")
+                                .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                    this.set_form_read_only(*checked, cx)
+                                })),
                         )
                         .child(
                             div()
@@ -810,11 +819,11 @@ impl AppState {
                         // Guarded in-grid editing (Track B5) — opt-in, and only on a
                         // writable connection, so it's disabled while read-only is on.
                         .child(
-                            Toggle::new("allow-edit", form.allow_edit).on_change(cx.listener(
-                                |this, checked: &bool, _, cx| {
+                            Toggle::new("allow-edit", form.allow_edit)
+                                .label("Allow editing")
+                                .on_change(cx.listener(|this, checked: &bool, _, cx| {
                                     this.set_form_allow_edit(*checked, cx)
-                                },
-                            )),
+                                })),
                         )
                         .child(
                             div()

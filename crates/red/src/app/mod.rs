@@ -236,8 +236,8 @@ pub(crate) struct Notification {
 /// exactly this (and no result) is "pristine" — closing it needs no confirmation.
 pub(crate) const EMPTY_QUERY: &str = "-- Write SQL, ⌘↵ to run\n";
 
-/// One query tab: its own SQL editor, result grid, and history. A connection
-/// holds several of these; the schema sidebar and split sizes are shared.
+/// One query tab: its own SQL editor and result grid. A connection holds several
+/// of these; the schema sidebar, split sizes, and query history are shared.
 pub(crate) struct QueryTab {
     /// Tab label: "query N" for a blank tab, or "schema.table" for a preview.
     pub title: String,
@@ -248,9 +248,6 @@ pub(crate) struct QueryTab {
     /// The query plan (Track B4 — EXPLAIN), when one is open. Occupies the result
     /// pane in place of the grid; running a query clears it. `None` is the grid.
     pub plan: Option<crate::plan::PlanView>,
-    /// Recent queries (newest first), for re-run from the history popover.
-    pub history: Vec<String>,
-    pub history_open: bool,
 }
 
 impl QueryTab {
@@ -281,8 +278,6 @@ impl QueryTab {
             editor,
             result: None,
             plan: None,
-            history: Vec::new(),
-            history_open: false,
         }
     }
 
@@ -333,6 +328,10 @@ pub(crate) struct ActiveConn {
     pub grid_focus: FocusHandle,
     /// Which pane currently holds focus — drives focus cycling and the pane ring.
     pub active_pane: Pane,
+    /// Recent queries (newest first), shared across all of this connection's
+    /// tabs — re-run any of them from the history popover.
+    pub history: Vec<String>,
+    pub history_open: bool,
     /// Focus anchor for the open history popover, and the keyboard-highlighted
     /// entry within it.
     pub history_focus: FocusHandle,
@@ -372,6 +371,8 @@ impl ActiveConn {
             schema_focus: cx.focus_handle(),
             grid_focus: cx.focus_handle(),
             active_pane: Pane::Editor,
+            history: Vec::new(),
+            history_open: false,
             history_focus: cx.focus_handle(),
             history_sel: 0,
             last_active_seq: 0,
@@ -688,7 +689,9 @@ impl AppState {
         let host_input = cx.new(|cx| TextInput::new(cx).with_placeholder("localhost"));
         let port_input = cx.new(TextInput::new);
         let user_input = cx.new(|cx| TextInput::new(cx).with_placeholder("postgres"));
-        let password_input = cx.new(|cx| TextInput::new(cx).obscured());
+        // Not obscured: the same value is echoed in plaintext in the generated
+        // connection-string field right below, so masking it here buys nothing.
+        let password_input = cx.new(TextInput::new);
         let database_input = cx.new(|cx| TextInput::new(cx).with_placeholder("analytics_prod"));
         let conn_str_input =
             cx.new(|cx| TextInput::new(cx).with_placeholder("postgres://user:pass@host:5432/db"));

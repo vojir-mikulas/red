@@ -33,6 +33,13 @@ pub(crate) fn new_epoch() -> u64 {
     next_epoch()
 }
 
+/// Fixed wide-mode column widths, shared between the renderer (which lays the
+/// table out at these widths) and the keyboard cursor's horizontal
+/// scroll-into-view (which derives a cell's x-extent arithmetically). Keep in
+/// sync with the `Column` widths built in [`render`].
+pub(in crate::result) const DATA_COL_WIDTH: f32 = 180.0;
+pub(in crate::result) const GUTTER_WIDTH: f32 = 56.0;
+
 /// All the state for one open result. When the row-number gutter is shown
 /// (`grid.row_numbers`) it occupies table column `0`, so data column `n` sits at
 /// table column `n + 1`; with the gutter hidden the data columns start at `0`. The
@@ -402,6 +409,40 @@ impl ResultGrid {
         };
         st.base_handle
             .set_offset(point(off.x, px(-(new_first as f32 * rh))));
+    }
+
+    /// Keep the keyboard cursor's *column* on screen after a horizontal move —
+    /// the wide-mode counterpart to [`scroll_cursor_into_view`]. Columns are
+    /// fixed-width (a [`GUTTER_WIDTH`] row-number column when shown, then
+    /// [`DATA_COL_WIDTH`] per data column), so the focused cell's x-extent is
+    /// pure arithmetic; nudge the horizontal handle by the minimum to bring the
+    /// cell fully into the viewport, leaving it untouched when already visible.
+    /// `table_col` is in table space (gutter included); `gutter` is its width in
+    /// columns (0 or 1).
+    pub(in crate::result) fn scroll_col_into_view(&self, table_col: usize, gutter: usize) {
+        let viewport_w = f32::from(self.h_scroll.bounds().size.width);
+        if viewport_w <= 0.0 {
+            return; // not laid out yet
+        }
+        let gutter_w = gutter as f32 * GUTTER_WIDTH;
+        let data_col = table_col.saturating_sub(gutter);
+        let col_left = gutter_w + data_col as f32 * DATA_COL_WIDTH;
+        let col_right = col_left + DATA_COL_WIDTH;
+        // The handle's x offset is 0 at the left edge and grows negative as the
+        // content scrolls left, so the visible window is `[-off.x, -off.x + w]`.
+        let off = self.h_scroll.offset();
+        let scroll_left = -f32::from(off.x);
+        let new_left = if col_left < scroll_left {
+            col_left
+        } else if col_right > scroll_left + viewport_w {
+            col_right - viewport_w
+        } else {
+            return; // already fully visible — leave the scroll untouched
+        };
+        let content_w = gutter_w + self.columns.len() as f32 * DATA_COL_WIDTH;
+        let max_left = (content_w - viewport_w).max(0.0);
+        self.h_scroll
+            .set_offset(point(px(-new_left.clamp(0.0, max_left)), off.y));
     }
 
     /// A glance at this grid's footprint for the dev perf HUD: resident rows,
@@ -914,6 +955,7 @@ impl AppState {
                     _ => CellRange::single(new_row, new_col),
                 });
                 grid.scroll_cursor_into_view(new_row, row_height);
+                grid.scroll_col_into_view(new_col, gutter);
             }
         }
         cx.notify();

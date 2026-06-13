@@ -7,6 +7,7 @@ use gpui::{div, prelude::*, px, Axis, Hsla, MouseButton, Pixels, Point, SharedSt
 use red_core::ExportFormat;
 
 use super::buffer::{CellKind, DisplayCell};
+use super::{DATA_COL_WIDTH, GUTTER_WIDTH};
 use crate::app::{ActiveConn, AppState, Pane, Phase};
 
 /// Group a number's digits in threes (`1234567` → `1,234,567`) so large row
@@ -246,10 +247,12 @@ impl AppState {
         let gutter = show_gutter as usize;
         let mut columns: Vec<Column> = Vec::with_capacity(grid.columns.len() + gutter);
         if show_gutter {
-            columns.push(Column::new("#").width(px(56.)).align_end());
+            columns.push(Column::new("#").width(px(GUTTER_WIDTH)).align_end());
         }
         for c in &grid.columns {
-            let mut col = Column::new(c.name.clone()).width(px(180.)).sortable();
+            let mut col = Column::new(c.name.clone())
+                .width(px(DATA_COL_WIDTH))
+                .sortable();
             if let Some(t) = &c.decl_type {
                 if !t.is_empty() {
                     col = col.subtitle(t.to_lowercase());
