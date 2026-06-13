@@ -107,9 +107,10 @@ impl ConnectSort {
 /// Which top-level screen is showing.
 pub(crate) enum Phase {
     Disconnected,
-    Connecting(Connecting),
-    // Boxed: `ActiveConn` carries the whole schema model, dwarfing the other
-    // variants — box it to keep `Phase` small.
+    // Both non-trivial variants are boxed to keep `Phase` small: `ActiveConn`
+    // carries the whole schema model, and `Connecting` carries a full config +
+    // status, dwarfing the unit `Disconnected`.
+    Connecting(Box<Connecting>),
     Connected(Box<ActiveConn>),
 }
 
@@ -120,6 +121,10 @@ pub(crate) enum Phase {
 pub(crate) struct Connecting {
     /// The session this connect is opening — minted UI-side so retries reuse it.
     pub session: SessionId,
+    /// Stable id of the saved connection being opened ([`StoredConnection::id`]),
+    /// so warm/foreground lookups match on identity rather than the display name
+    /// (two saved connections may share a name).
+    pub conn_id: String,
     /// The session that was foreground when this connect began (parked, kept
     /// warm). Restored on cancel; left parked on success (so both stay warm).
     pub previous: Option<SessionId>,
@@ -310,6 +315,10 @@ pub(crate) struct ActiveConn {
     /// The backend session backing this workspace. Stays warm while parked, so a
     /// switch back is instant; binds this conn's `CommandSender`.
     pub session: SessionId,
+    /// Stable id of the saved connection this workspace belongs to
+    /// ([`StoredConnection::id`]) — the switcher matches warm/foreground sessions
+    /// by this, not by `config.name` (names aren't unique).
+    pub conn_id: String,
     pub config: ConnectionConfig,
     pub version: String,
     pub sidebar_w: Pixels,
@@ -361,6 +370,7 @@ pub(crate) struct ActiveConn {
 impl ActiveConn {
     fn new(
         session: SessionId,
+        conn_id: String,
         config: ConnectionConfig,
         version: String,
         cx: &mut Context<AppState>,
@@ -368,6 +378,7 @@ impl ActiveConn {
         let tab = QueryTab::new("query 1".to_string(), cx);
         Self {
             session,
+            conn_id,
             config,
             version,
             sidebar_w: px(240.),

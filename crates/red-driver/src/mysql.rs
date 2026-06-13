@@ -57,7 +57,11 @@ impl MysqlDriver {
     /// verify connectivity, and read the server version.
     pub async fn connect(dsn: &str, read_only: bool) -> Result<Self> {
         let opts = Opts::from_url(dsn).map_err(|e| RedError::Connect(e.to_string()))?;
-        let mut builder = OptsBuilder::from_opts(opts);
+        // `CLIENT_FOUND_ROWS`: report *matched* rows from `affected_rows`, like
+        // Postgres and SQLite. Without it a no-op `UPDATE` (PK matched, value
+        // unchanged) reports 0 and `apply_edit`'s `affected != 1` check would roll
+        // an otherwise-valid edit back — a cross-driver behaviour difference.
+        let mut builder = OptsBuilder::from_opts(opts).client_found_rows(true);
         if read_only {
             // Runs on each new pooled connection, so writes are rejected at the
             // engine even in autocommit (each statement is its own read-only txn).
@@ -345,12 +349,15 @@ impl DatabaseDriver for MysqlDriver {
     }
 
     fn contains_predicate(&self, columns: &[ColumnMeta], term: &str) -> Option<String> {
+        // MySQL/MariaDB treat `\` as a string-literal escape in the default mode,
+        // so the pattern's backslashes need a second doubling — `true` here.
         crate::contains_clause(
             columns,
             term,
             |s| format!("`{}`", escape_ident(s)),
             |c| format!("CAST({c} AS CHAR)"),
             "LIKE",
+            true,
         )
     }
 
@@ -496,8 +503,9 @@ impl DatabaseDriver for MysqlDriver {
         let bound: Vec<MyValue> = params.iter().map(|v| to_my(v)).collect();
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
         conn.query_drop("BEGIN").await.map_err(map_my_err)?;
-        // `affected_rows` counts *changed* rows for an UPDATE (not matched), so a
-        // no-op edit reports 0 — the UI guards against submitting an unchanged value.
+        // With `CLIENT_FOUND_ROWS` set at connect, `affected_rows` reports *matched*
+        // rows (like Postgres/SQLite), so a PK-matched edit reports 1 even when the
+        // value is unchanged — the `affected != 1` guard below stays consistent.
         let result = if bound.is_empty() {
             conn.exec_drop(sql.as_str(), ()).await
         } else {

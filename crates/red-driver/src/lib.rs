@@ -277,20 +277,34 @@ pub(crate) fn edit_count_err(op: &EditOp, affected: u64) -> RedError {
 /// engine's text cast (`(c)::text`, `CAST(c AS TEXT)`, `CAST(c AS CHAR)`); `like_op`
 /// is the case-insensitive match keyword (`ILIKE` on Postgres, `LIKE` elsewhere —
 /// SQLite/MySQL `LIKE` is ASCII-case-insensitive by default).
+/// `backslash_escapes` must be `true` for engines that treat `\` as a string-
+/// literal escape (MySQL/MariaDB in the default mode), `false` where `\` is a
+/// plain literal byte (SQLite, and Postgres with `standard_conforming_strings`).
+/// It controls a second escaping layer so the backslashes the `LIKE` pattern uses
+/// survive the engine's *string-literal* parser intact — without it, a search for
+/// a literal `%`, `_`, or `\` silently misbehaves on MySQL.
 pub(crate) fn contains_clause(
     columns: &[ColumnMeta],
     term: &str,
     quote: impl Fn(&str) -> String,
     as_text: impl Fn(&str) -> String,
     like_op: &str,
+    backslash_escapes: bool,
 ) -> Option<String> {
-    let pattern = like_pattern(term);
+    let pattern = like_pattern(term, backslash_escapes);
+    // The escape char inside the literal is one backslash; on a backslash-escaping
+    // engine that backslash must itself be doubled in the literal to reach `LIKE`.
+    let escape_clause = if backslash_escapes {
+        r"ESCAPE '\\'"
+    } else {
+        r"ESCAPE '\'"
+    };
     let preds: Vec<String> = columns
         .iter()
         .filter(|c| !c.type_name.as_deref().is_some_and(is_blob_type))
         .map(|c| {
             format!(
-                "{} {like_op} {pattern} ESCAPE '\\'",
+                "{} {like_op} {pattern} {escape_clause}",
                 as_text(&quote(&c.name))
             )
         })
@@ -299,9 +313,11 @@ pub(crate) fn contains_clause(
 }
 
 /// The SQL string literal `'%term%'` for a `LIKE` contains-match: backslash-escape
-/// the `LIKE` metacharacters (`\` `%` `_`) so the term matches literally, then wrap
-/// in `%…%`, then single-quote with embedded quotes doubled. Pair with `ESCAPE '\'`.
-fn like_pattern(term: &str) -> String {
+/// the `LIKE` metacharacters (`\` `%` `_`) so the term matches literally, wrap in
+/// `%…%`, then single-quote with embedded quotes doubled. When `backslash_escapes`
+/// is set, every backslash is *also* doubled for the engine's string-literal layer
+/// (see [`contains_clause`]); pair with the matching `ESCAPE` clause there.
+fn like_pattern(term: &str, backslash_escapes: bool) -> String {
     let mut esc = String::with_capacity(term.len() + 2);
     for ch in term.chars() {
         if matches!(ch, '\\' | '%' | '_') {
@@ -309,7 +325,11 @@ fn like_pattern(term: &str) -> String {
         }
         esc.push(ch);
     }
-    format!("'%{}%'", esc.replace('\'', "''"))
+    let mut lit = format!("%{esc}%").replace('\'', "''");
+    if backslash_escapes {
+        lit = lit.replace('\\', "\\\\");
+    }
+    format!("'{lit}'")
 }
 
 /// Whether a declared type names a binary/blob column across the three engines —
@@ -611,12 +631,24 @@ mod tests {
     #[test]
     fn like_pattern_escapes_metacharacters_and_quotes() {
         // Plain term: wrapped in `%…%`, nothing escaped.
-        assert_eq!(like_pattern("foo"), "'%foo%'");
+        assert_eq!(like_pattern("foo", false), "'%foo%'");
         // LIKE metacharacters are backslash-escaped so they match literally.
-        assert_eq!(like_pattern("50%_x"), "'%50\\%\\_x%'");
-        assert_eq!(like_pattern("a\\b"), "'%a\\\\b%'");
+        assert_eq!(like_pattern("50%_x", false), "'%50\\%\\_x%'");
+        assert_eq!(like_pattern("a\\b", false), "'%a\\\\b%'");
         // Single quotes are doubled (can't break out of the literal).
-        assert_eq!(like_pattern("O'Brien"), "'%O''Brien%'");
+        assert_eq!(like_pattern("O'Brien", false), "'%O''Brien%'");
+    }
+
+    #[test]
+    fn like_pattern_doubles_backslashes_for_mysql_literals() {
+        // On a backslash-escaping engine every backslash is doubled again so the
+        // engine's string-literal parser hands `LIKE` the same pattern the
+        // non-escaping engines see. `%` → `\%` (escape) → `\\%` (literal layer).
+        assert_eq!(like_pattern("50%", true), "'%50\\\\%%'");
+        // A literal backslash: `\` → `\\` (escape) → `\\\\` (literal layer).
+        assert_eq!(like_pattern("a\\b", true), "'%a\\\\\\\\b%'");
+        // Quote-doubling still applies and isn't affected by the backslash pass.
+        assert_eq!(like_pattern("O'Brien", true), "'%O''Brien%'");
     }
 
     #[test]
@@ -642,6 +674,7 @@ mod tests {
             |c| format!("\"{c}\""),
             |c| format!("CAST({c} AS TEXT)"),
             "LIKE",
+            false,
         )
         .expect("text/int columns are searchable");
         assert_eq!(
@@ -656,14 +689,14 @@ mod tests {
     fn contains_clause_is_none_when_nothing_searchable() {
         // All-blob and empty column sets yield no predicate (→ no filter applied).
         let blobs = [col("a", Some("blob")), col("b", Some("bytea"))];
-        assert!(contains_clause(&blobs, "x", |c| c.into(), |c| c.into(), "LIKE").is_none());
-        assert!(contains_clause(&[], "x", |c| c.into(), |c| c.into(), "LIKE").is_none());
+        assert!(contains_clause(&blobs, "x", |c| c.into(), |c| c.into(), "LIKE", false).is_none());
+        assert!(contains_clause(&[], "x", |c| c.into(), |c| c.into(), "LIKE", false).is_none());
     }
 
     #[test]
     fn contains_clause_searches_untyped_columns() {
         // A computed/untyped column (`type_name: None`) is searched, not skipped.
         let columns = [col("expr", None)];
-        assert!(contains_clause(&columns, "x", |c| c.into(), |c| c.into(), "LIKE").is_some());
+        assert!(contains_clause(&columns, "x", |c| c.into(), |c| c.into(), "LIKE", false).is_some());
     }
 }

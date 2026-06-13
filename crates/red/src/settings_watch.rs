@@ -5,20 +5,30 @@
 //! how backend `Event`s are drained). Editing the file in any editor re-applies
 //! within a frame — no restart.
 //!
+//! **Trailing-edge debounce.** Editors fire several filesystem events per save
+//! (and some save non-atomically: truncate, then write). A dedicated debounce
+//! thread coalesces the burst and only reads/forwards once the file has been
+//! quiet for [`DEBOUNCE`], so a reload never reflects a half-written file.
+//!
 //! **Self-write suppression.** RED's own atomic save (temp file + rename) trips
 //! the watcher too. Before each save the app records a hash of the bytes it's
-//! about to write via [`SettingsWatcher::note_self_write`]; when the watcher then
-//! sees the file land with exactly those bytes it drops the event, so a UI-driven
-//! save never triggers a reload storm.
+//! about to write via [`SettingsWatcher::note_self_write`]; when the debounce
+//! thread then reads the settled file and sees exactly those bytes it drops the
+//! event, so a UI-driven save never triggers a reload storm.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::thread;
+use std::time::Duration;
 
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+
+/// How long the file must be quiet before a coalesced burst is forwarded.
+const DEBOUNCE: Duration = Duration::from_millis(120);
 
 /// Owns the OS watcher (kept alive for its lifetime) and the self-write guard.
 pub(crate) struct SettingsWatcher {
@@ -40,12 +50,12 @@ impl SettingsWatcher {
         let (tx, rx) = unbounded::<()>();
         let expected: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
 
-        let handler = ReloadHandler {
-            path,
-            tx,
-            expected: expected.clone(),
-            last_sent: Mutex::new(None),
-        };
+        // The notify callback only pings the debounce thread; that thread does the
+        // settle-wait, the settled read, self-write suppression, and the forward.
+        let (ping_tx, ping_rx) = mpsc::channel::<()>();
+        spawn_debounce(ping_rx, path.clone(), tx, expected.clone());
+
+        let handler = ReloadHandler { path, ping_tx };
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
             if let Ok(event) = res {
                 handler.handle(event);
@@ -72,19 +82,14 @@ impl SettingsWatcher {
     }
 }
 
-/// The watcher-thread side: filters events to our file, suppresses self-writes,
-/// and debounces the bursts editors emit on save.
+/// The watcher-thread side: filters events to our file and pings the debounce
+/// thread. Deliberately does no file IO — reading happens after the burst settles.
 struct ReloadHandler {
     path: PathBuf,
-    tx: UnboundedSender<()>,
-    expected: Arc<Mutex<Option<u64>>>,
-    last_sent: Mutex<Option<Instant>>,
+    ping_tx: mpsc::Sender<()>,
 }
 
 impl ReloadHandler {
-    /// Debounce window: editors fire several events per save; coalesce them.
-    const DEBOUNCE: Duration = Duration::from_millis(120);
-
     fn handle(&self, event: Event) {
         if !matches!(
             event.kind,
@@ -95,28 +100,46 @@ impl ReloadHandler {
         if !event.paths.iter().any(|p| p == &self.path) {
             return;
         }
+        // Wake the debounce thread; a closed channel (watcher dropped) is ignored.
+        let _ = self.ping_tx.send(());
+    }
+}
 
-        // Suppress the reload our own atomic save just triggered.
-        if let Ok(contents) = std::fs::read_to_string(&self.path) {
-            if let Ok(mut slot) = self.expected.lock() {
-                if *slot == Some(hash(&contents)) {
-                    *slot = None;
-                    return;
+/// Coalesce a burst of file events and forward one reload once the file has been
+/// quiet for [`DEBOUNCE`], reading the *settled* contents (so a partial mid-write
+/// read can't win) and suppressing the app's own atomic save. Exits when the
+/// watcher (and thus the ping sender) is dropped, or the UI receiver closes.
+fn spawn_debounce(
+    ping_rx: mpsc::Receiver<()>,
+    path: PathBuf,
+    tx: UnboundedSender<()>,
+    expected: Arc<Mutex<Option<u64>>>,
+) {
+    thread::spawn(move || {
+        // Block for the first event of a burst; exit when the watcher is dropped.
+        while ping_rx.recv().is_ok() {
+            // Drain follow-on events until the file is quiet for the window.
+            loop {
+                match ping_rx.recv_timeout(DEBOUNCE) {
+                    Ok(()) => continue,
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 }
             }
-        }
-
-        // Debounce: skip if we forwarded a notification a moment ago.
-        if let Ok(mut last) = self.last_sent.lock() {
-            let now = Instant::now();
-            if last.is_some_and(|t| now.duration_since(t) < Self::DEBOUNCE) {
-                return;
+            // Settled: suppress our own atomic save, else forward one reload.
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                if let Ok(mut slot) = expected.lock() {
+                    if *slot == Some(hash(&contents)) {
+                        *slot = None;
+                        continue;
+                    }
+                }
             }
-            *last = Some(now);
+            if tx.unbounded_send(()).is_err() {
+                return; // UI gone — stop watching.
+            }
         }
-
-        let _ = self.tx.unbounded_send(());
-    }
+    });
 }
 
 fn hash(contents: &str) -> u64 {

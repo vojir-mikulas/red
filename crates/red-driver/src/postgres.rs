@@ -380,7 +380,15 @@ impl DatabaseDriver for PostgresDriver {
     }
 
     fn contains_predicate(&self, columns: &[ColumnMeta], term: &str) -> Option<String> {
-        crate::contains_clause(columns, term, pg_quote, |c| format!("({c})::text"), "ILIKE")
+        // Postgres standard strings treat `\` literally — no extra literal escaping.
+        crate::contains_clause(
+            columns,
+            term,
+            pg_quote,
+            |c| format!("({c})::text"),
+            "ILIKE",
+            false,
+        )
     }
 
     async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64> {
@@ -514,23 +522,28 @@ impl DatabaseDriver for PostgresDriver {
     }
 
     async fn execute(&self, sql: &str) -> Result<u64> {
-        self.client
-            .batch_execute("BEGIN")
-            .await
-            .map_err(driver_err)?;
-        match self.client.execute(sql, &[]).await {
-            Ok(affected) => {
-                self.client
-                    .batch_execute("COMMIT")
-                    .await
-                    .map_err(driver_err)?;
-                Ok(affected)
-            }
-            Err(e) => {
-                let _ = self.client.batch_execute("ROLLBACK").await;
-                Err(map_pg_err(e))
+        // Run the write on a borrowed pool connection, never the shared `client`
+        // that backs the live cursor: a `BEGIN`/`COMMIT` pipelined onto the cursor's
+        // connection can entangle an in-flight stream ("another command is already in
+        // progress"). The pool connection carries the same read-only posture, so a
+        // write on a read-only session is still rejected at the engine.
+        let client = self.acquire().await?;
+        let result = async {
+            client.batch_execute("BEGIN").await.map_err(driver_err)?;
+            match client.execute(sql, &[]).await {
+                Ok(affected) => {
+                    client.batch_execute("COMMIT").await.map_err(driver_err)?;
+                    Ok(affected)
+                }
+                Err(e) => {
+                    let _ = client.batch_execute("ROLLBACK").await;
+                    Err(map_pg_err(e))
+                }
             }
         }
+        .await;
+        self.release(client);
+        result
     }
 
     async fn apply_edit(&self, op: &EditOp) -> Result<u64> {
@@ -544,27 +557,29 @@ impl DatabaseDriver for PostgresDriver {
             .iter()
             .map(|b| -> &(dyn ToSql + Sync) { b.as_ref() })
             .collect();
-        self.client
-            .batch_execute("BEGIN")
-            .await
-            .map_err(driver_err)?;
-        match self.client.execute(&sql, &refs).await {
-            Ok(affected) => {
-                if affected != 1 {
-                    let _ = self.client.batch_execute("ROLLBACK").await;
-                    return Err(crate::edit_count_err(op, affected));
+        // Borrow a pool connection so the edit's transaction never shares the
+        // cursor's connection — see `execute`.
+        let client = self.acquire().await?;
+        let result = async {
+            client.batch_execute("BEGIN").await.map_err(driver_err)?;
+            match client.execute(&sql, &refs).await {
+                Ok(affected) => {
+                    if affected != 1 {
+                        let _ = client.batch_execute("ROLLBACK").await;
+                        return Err(crate::edit_count_err(op, affected));
+                    }
+                    client.batch_execute("COMMIT").await.map_err(driver_err)?;
+                    Ok(affected)
                 }
-                self.client
-                    .batch_execute("COMMIT")
-                    .await
-                    .map_err(driver_err)?;
-                Ok(affected)
-            }
-            Err(e) => {
-                let _ = self.client.batch_execute("ROLLBACK").await;
-                Err(map_pg_err(e))
+                Err(e) => {
+                    let _ = client.batch_execute("ROLLBACK").await;
+                    Err(map_pg_err(e))
+                }
             }
         }
+        .await;
+        self.release(client);
+        result
     }
 
     async fn explain(&self, sql: &str, analyze: bool) -> Result<QueryPlan> {

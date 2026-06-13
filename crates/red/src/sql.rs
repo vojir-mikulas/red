@@ -130,7 +130,12 @@ pub fn tokenize(src: &str) -> Vec<(Range<usize>, TokenStyle)> {
             continue;
         }
 
-        // String / quoted literal (' or ").
+        // String / quoted literal (' or "). A doubled quote (`''`) is treated as
+        // close-then-reopen rather than an escaped inner quote — deliberately: it
+        // keeps the lexer trivial, and since the content between the doubled quotes
+        // stays "inside a string", a `;` there is still not a statement boundary, so
+        // `classify`/`split_statements` (the destructive-query guard) stay correct.
+        // The only cost is cosmetic: highlighting can split mid-literal on `''`.
         if c == b'\'' || c == b'"' {
             let quote = c;
             let start = i;

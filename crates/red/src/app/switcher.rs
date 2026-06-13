@@ -75,18 +75,19 @@ impl AppState {
     /// already warm (parked) → foreground it instantly (no reconnect); otherwise
     /// connect cold.
     pub(crate) fn switch_to_connection(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(target) = self.connections.get(index).map(|c| c.config.name.clone()) else {
+        let Some(target) = self.connections.get(index).map(|c| c.id.clone()) else {
             return;
         };
-        // Already the on-screen connection — nothing to do.
-        if matches!(&self.phase, Phase::Connected(a) if a.config.name == target) {
+        // Already the on-screen connection — nothing to do. Match on the stable id,
+        // not the display name (two saved connections may share a name).
+        if matches!(&self.phase, Phase::Connected(a) if a.conn_id == target) {
             return;
         }
         // A warm parked session for this connection — the instant-switch path.
         if let Some(&warm) = self
             .parked
             .iter()
-            .find(|(_, a)| a.config.name == target)
+            .find(|(_, a)| a.conn_id == target)
             .map(|(id, _)| id)
         {
             // Refresh recency for the switched-to connection.
@@ -121,19 +122,28 @@ pub(super) fn switcher_sections(
 ) -> (SharedString, Option<Hsla>, Vec<SwitcherSection>) {
     use crate::connect::{fmt_ago, label_color};
 
-    // The on-screen connection's name (live or mid-connect), and whether it's
-    // still dialing — drives the "This window" badge and the trigger.
-    let (active_name, connecting) = match phase {
-        Phase::Connected(active) => (Some(active.config.name.clone()), false),
-        Phase::Connecting(conn) => (Some(conn.config.name.clone()), true),
-        Phase::Disconnected => (None, false),
+    // The on-screen connection's stable id (for identity matching) and display
+    // name (for the trigger label when it's not in the saved list), plus whether
+    // it's still dialing — drives the "This window" badge and the trigger.
+    let (active_id, active_name, connecting) = match phase {
+        Phase::Connected(active) => (
+            Some(active.conn_id.clone()),
+            Some(active.config.name.clone()),
+            false,
+        ),
+        Phase::Connecting(conn) => (
+            Some(conn.conn_id.clone()),
+            Some(conn.config.name.clone()),
+            true,
+        ),
+        Phase::Disconnected => (None, None, false),
     };
-    let active_index = active_name
+    let active_index = active_id
         .as_ref()
-        .and_then(|name| connections.iter().position(|c| c.config.name == *name));
-    // Names of connections backed by a warm parked session (instant to switch to).
-    let warm_names: std::collections::HashSet<&str> =
-        parked.values().map(|a| a.config.name.as_str()).collect();
+        .and_then(|cid| connections.iter().position(|c| c.id == *cid));
+    // Ids of connections backed by a warm parked session (instant to switch to).
+    let warm_ids: std::collections::HashSet<&str> =
+        parked.values().map(|a| a.conn_id.as_str()).collect();
 
     let warm_badge = SwitcherBadge::new("warm", theme.green);
     let row = |index: usize| -> SwitcherItem {
@@ -166,7 +176,7 @@ pub(super) fn switcher_sections(
     let mut open: Vec<usize> = connections
         .iter()
         .enumerate()
-        .filter(|(i, c)| Some(*i) != active_index && warm_names.contains(c.config.name.as_str()))
+        .filter(|(i, c)| Some(*i) != active_index && warm_ids.contains(c.id.as_str()))
         .map(|(i, _)| i)
         .collect();
     open.sort_by_key(|&i| std::cmp::Reverse(connections[i].last_accessed));
@@ -188,7 +198,7 @@ pub(super) fn switcher_sections(
         .enumerate()
         .filter(|(i, c)| {
             Some(*i) != active_index
-                && !warm_names.contains(c.config.name.as_str())
+                && !warm_ids.contains(c.id.as_str())
                 && c.last_accessed.is_some()
         })
         .map(|(i, _)| i)

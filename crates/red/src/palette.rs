@@ -178,11 +178,17 @@ impl AppState {
     }
 
     /// Parse the go-to-row prompt's text and navigate, or toast on bad input.
-    /// Digit separators (`,` `_` spaces) are tolerated so a pasted "1,000" works.
+    /// Digit-group separators (`,` `_` spaces) are tolerated so a pasted "1,000"
+    /// works, but any *other* non-digit makes the input invalid (so "1abc2" is
+    /// rejected rather than silently read as 12).
     fn submit_goto(&mut self, text: &str, cx: &mut Context<Self>) {
-        let cleaned: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
-        match cleaned.parse::<usize>() {
-            Ok(n) if n >= 1 => self.go_to_row(n, cx),
+        let trimmed = text.trim();
+        let is_sep = |c: char| matches!(c, ',' | '_' | ' ');
+        let cleaned: Option<String> = (!trimmed.is_empty()
+            && trimmed.chars().all(|c| c.is_ascii_digit() || is_sep(c)))
+        .then(|| trimmed.chars().filter(|c| c.is_ascii_digit()).collect());
+        match cleaned.as_deref().and_then(|s| s.parse::<usize>().ok()) {
+            Some(n) if n >= 1 => self.go_to_row(n, cx),
             _ => {
                 self.notify(
                     ToastVariant::Error,

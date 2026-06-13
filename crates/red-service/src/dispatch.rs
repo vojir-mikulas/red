@@ -207,6 +207,12 @@ impl SessionState {
     /// the session is being dropped (disconnect / close / eviction).
     fn teardown(&mut self) {
         abort_all_inflight(&mut self.inflight);
+        // Signal any streaming exports to stop, so they remove their partial file
+        // and release their driver clone rather than streaming on for a session the
+        // UI considers gone (each export's per-row check picks the flag up).
+        for cancel in lock(&self.exports).values() {
+            cancel.store(true, Ordering::Relaxed);
+        }
         lock(&self.results).clear();
     }
 
@@ -737,7 +743,17 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 let limit_src = page_fetch_limit.clone();
                 let timeout = statement_timeout;
                 tokio::spawn(async move {
+                    // A flung scrollbar supersedes pages faster than the semaphore
+                    // drains; a page aborted before (or while) it waits for a permit
+                    // bails without touching the engine, so doomed fetches don't pile
+                    // up behind the limit or hit the server.
+                    if abort.is_aborted() {
+                        return;
+                    }
                     let _permit = limit_src.acquire_owned().await;
+                    if abort.is_aborted() {
+                        return;
+                    }
                     // Offset-mode display page — cap fat cells; no seek key to exempt.
                     let fetch = driver.fetch_page(
                         &sql,
@@ -756,6 +772,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                 epoch,
                             },
                         ),
+                        // Superseded mid-flight — a clean cancel, not an error toast.
+                        Err(RedError::Interrupted) => {}
                         Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
                     }
                 });
@@ -819,7 +837,16 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 let limit_src = page_fetch_limit.clone();
                 let timeout = statement_timeout;
                 tokio::spawn(async move {
+                    // Like `FetchPage`: a run superseded by a higher-`seq` fling bails
+                    // before/after waiting for a permit so it neither queues behind the
+                    // limit nor seeks at the engine.
+                    if abort.is_aborted() {
+                        return;
+                    }
                     let _permit = limit_src.acquire_owned().await;
+                    if abort.is_aborted() {
+                        return;
+                    }
                     let run = run_fetch(&*driver, &spec, &key, &fetch, limit, &abort);
                     match with_timeout(timeout, &abort, run).await {
                         Ok((rows, estimated)) => emit(
@@ -833,6 +860,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                 seq,
                             },
                         ),
+                        // Superseded mid-flight — the newer run will deliver; stay
+                        // silent rather than marking this seq failed or toasting.
+                        Err(RedError::Interrupted) => {}
                         Err(e) => {
                             tracing::warn!(%epoch, ?fetch, "run fetch failed: {e}");
                             emit(&events, session_id, Event::ResultRunFailed { epoch, seq });

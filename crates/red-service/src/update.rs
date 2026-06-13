@@ -277,28 +277,54 @@ fn is_allowed_download_url(url: &str) -> bool {
 }
 
 /// `true` when `latest` is a strictly higher semver than `current`. A tag that
-/// doesn't parse (or a prerelease suffix on either side) is treated as not-newer
-/// — we never downgrade or sidegrade on a tag we can't compare.
+/// doesn't parse is treated as not-newer — we never downgrade or sidegrade on a
+/// tag we can't compare. Prerelease precedence follows semver: a release outranks
+/// its own prerelease (so `v0.2.0` *is* newer than `v0.2.0-rc1` — a user on an rc
+/// is offered the final), and two prereleases of the same core compare by their
+/// identifier so `-rc2` > `-rc1`.
 fn is_newer(latest: &str, current: &str) -> bool {
     match (parse_semver(latest), parse_semver(current)) {
-        (Some(l), Some(c)) => l > c,
+        (Some(l), Some(c)) => semver_cmp(&l, &c) == std::cmp::Ordering::Greater,
         _ => false,
     }
 }
 
-/// Parse a `vMAJOR.MINOR.PATCH` tag into a comparable tuple, ignoring any
-/// prerelease/build suffix. Missing patch defaults to 0.
-fn parse_semver(tag: &str) -> Option<(u64, u64, u64)> {
-    let core = tag
-        .trim()
-        .trim_start_matches('v')
-        .split(['-', '+'])
-        .next()?;
+/// Major/minor/patch plus an optional prerelease identifier (the bit after `-`).
+type Semver = (u64, u64, u64, Option<String>);
+
+/// Parse a `vMAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]` tag. Build metadata is
+/// dropped (it has no precedence); the prerelease identifier is retained so
+/// release-vs-prerelease ordering is correct. Missing patch defaults to 0.
+fn parse_semver(tag: &str) -> Option<Semver> {
+    // Build metadata (`+…`) never affects precedence — strip it first.
+    let body = tag.trim().trim_start_matches('v');
+    let body = body.split('+').next().unwrap_or(body);
+    let (core, pre) = match body.split_once('-') {
+        Some((core, pre)) => (core, Some(pre.to_string())),
+        None => (body, None),
+    };
     let mut parts = core.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
     let patch = parts.next().unwrap_or("0").parse().ok()?;
-    Some((major, minor, patch))
+    Some((major, minor, patch, pre))
+}
+
+/// Semver precedence: compare the numeric core first; on a tie a release (no
+/// prerelease) outranks any prerelease of that core, and two prereleases compare
+/// lexically by identifier.
+fn semver_cmp(l: &Semver, r: &Semver) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let core = (l.0, l.1, l.2).cmp(&(r.0, r.1, r.2));
+    if core != Ordering::Equal {
+        return core;
+    }
+    match (&l.3, &r.3) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater, // release > its prerelease
+        (Some(_), None) => Ordering::Less,
+        (Some(a), Some(b)) => a.cmp(b),
+    }
 }
 
 /// The installed `.app` bundle root *if* we're allowed to swap it: the running
@@ -424,14 +450,19 @@ fn verify_authentic(mounted_app: &Path, running_app: &Path) -> Result<(), String
     let theirs = team_identifier(mounted_app)
         .ok_or("downloaded bundle has no Team ID — refusing to install")?;
     // The running app passed Gatekeeper at launch; if we can read its Team ID,
-    // require a match. If we can't (an unsigned dev build), the signature + spctl
-    // checks above still stand on their own.
-    if let Some(ours) = team_identifier(running_app) {
-        if theirs != ours {
+    // require a match. If we can't (an unsigned dev build, or a codesign-output
+    // change), the signature + spctl checks above still stand on their own — but
+    // log it, since it's the anti-substitution control silently dropping out.
+    match team_identifier(running_app) {
+        Some(ours) if theirs != ours => {
             return Err(format!(
                 "downloaded bundle Team ID ({theirs}) does not match the installed app ({ours})"
             ));
         }
+        Some(_) => {}
+        None => tracing::warn!(
+            "could not read the running app's Team ID; installing on signature + notarization alone"
+        ),
     }
     Ok(())
 }
@@ -531,10 +562,12 @@ mod tests {
 
     #[test]
     fn semver_parsing_tolerates_prefix_and_suffix() {
-        assert_eq!(parse_semver("v0.1.2"), Some((0, 1, 2)));
-        assert_eq!(parse_semver("0.1.2"), Some((0, 1, 2)));
-        assert_eq!(parse_semver("v1.2"), Some((1, 2, 0)));
-        assert_eq!(parse_semver("v0.2.0-rc1"), Some((0, 2, 0)));
+        assert_eq!(parse_semver("v0.1.2"), Some((0, 1, 2, None)));
+        assert_eq!(parse_semver("0.1.2"), Some((0, 1, 2, None)));
+        assert_eq!(parse_semver("v1.2"), Some((1, 2, 0, None)));
+        assert_eq!(parse_semver("v0.2.0-rc1"), Some((0, 2, 0, Some("rc1".into()))));
+        // Build metadata is dropped; the prerelease (if any) is kept.
+        assert_eq!(parse_semver("v1.0.0+build5"), Some((1, 0, 0, None)));
         assert_eq!(parse_semver("nightly"), None);
     }
 
@@ -549,6 +582,20 @@ mod tests {
         // Unparseable tags never trigger an update (no downgrade/sidegrade).
         assert!(!is_newer("garbage", "v0.1.4"));
         assert!(!is_newer("v0.2.0", "garbage"));
+    }
+
+    #[test]
+    fn prerelease_precedence_offers_the_final_release() {
+        // A user on a prerelease IS offered the matching final release.
+        assert!(is_newer("v0.2.0", "v0.2.0-rc1"));
+        // But not the other way round, and a release is never "newer" than itself.
+        assert!(!is_newer("v0.2.0-rc1", "v0.2.0"));
+        assert!(!is_newer("v0.2.0", "v0.2.0"));
+        // Later prerelease of the same core supersedes the earlier one.
+        assert!(is_newer("v0.2.0-rc2", "v0.2.0-rc1"));
+        assert!(!is_newer("v0.2.0-rc1", "v0.2.0-rc2"));
+        // A higher core beats any prerelease regardless of suffix.
+        assert!(is_newer("v0.3.0-rc1", "v0.2.0"));
     }
 
     #[test]

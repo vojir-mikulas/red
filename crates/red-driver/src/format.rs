@@ -47,7 +47,8 @@ impl ProgressThrottle {
     /// Maybe emit `written` (the running row count). A failed send (UI gone) is
     /// ignored — progress is best-effort.
     pub(crate) fn tick(&mut self, written: u64) {
-        if written - self.last_sent >= PROGRESS_ROWS || self.last_at.elapsed() >= PROGRESS_INTERVAL
+        if written.saturating_sub(self.last_sent) >= PROGRESS_ROWS
+            || self.last_at.elapsed() >= PROGRESS_INTERVAL
         {
             let _ = self.sender.send(written);
             self.last_sent = written;

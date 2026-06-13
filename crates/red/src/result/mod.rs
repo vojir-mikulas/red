@@ -745,6 +745,14 @@ impl AppState {
         let reopen = match &mut self.phase {
             Phase::Connected(active) => match active.active_result_mut() {
                 Some(grid) => {
+                    // A header click can arrive a frame after a re-open delivered a
+                    // narrower column set; ignore a click whose data column no longer
+                    // exists rather than indexing past `columns` (and before mutating
+                    // any sort state, so a stale click is a clean no-op).
+                    let Some(col_name) = grid.columns.get(dcol).map(|c| c.name.clone())
+                    else {
+                        return;
+                    };
                     let old_epoch = grid.epoch;
                     let asc = match grid.sort {
                         Some((c, asc)) if c == dcol => !asc,
@@ -762,7 +770,7 @@ impl AppState {
                     // composite `(sort_col, pk)` keyset key (or wraps for OFFSET).
                     let sort = SortKey {
                         position: dcol + 1,
-                        column: grid.columns[dcol].name.clone(),
+                        column: col_name,
                         descending: !asc,
                     };
                     Some((
@@ -812,11 +820,15 @@ impl AppState {
                     grid.restart_timer();
                     grid.reset_buffer();
                     grid.epoch = next_epoch();
-                    // Preserve the header-click sort across the re-open.
-                    let sort = grid.sort.map(|(dcol, asc)| SortKey {
-                        position: dcol + 1,
-                        column: grid.columns[dcol].name.clone(),
-                        descending: !asc,
+                    // Preserve the header-click sort across the re-open. If the
+                    // stored sort column no longer exists (the set shrank), drop the
+                    // sort rather than indexing past `columns`.
+                    let sort = grid.sort.and_then(|(dcol, asc)| {
+                        grid.columns.get(dcol).map(|col| SortKey {
+                            position: dcol + 1,
+                            column: col.name.clone(),
+                            descending: !asc,
+                        })
                     });
                     Some((
                         grid.base_sql.clone(),

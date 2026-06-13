@@ -110,7 +110,13 @@ impl AppState {
         if let Phase::Connecting(conn) = std::mem::replace(&mut self.phase, Phase::Disconnected) {
             // Invalidate any pending backoff timer from a prior attempt.
             self.connect_gen += 1;
-            self.phase = Phase::Connected(Box::new(ActiveConn::new(id, conn.config, version, cx)));
+            self.phase = Phase::Connected(Box::new(ActiveConn::new(
+                id,
+                conn.conn_id,
+                conn.config,
+                version,
+                cx,
+            )));
             self.foreground_session = Some(id);
             // Kick off the schema-tree skeleton load for the sidebar.
             self.service.send_to(id, Command::LoadObjects);
@@ -126,8 +132,15 @@ impl AppState {
         self.parked.remove(&id);
         if self.foreground_session == Some(id) {
             self.foreground_session = None;
-            // Prefer an already-warm connection over the welcome screen.
-            if let Some(&other) = self.parked.keys().next() {
+            // Prefer an already-warm connection over the welcome screen — the most
+            // recently foregrounded one (`parked` is a HashMap, so `keys().next()`
+            // would drop the user into an arbitrary session).
+            let mru = self
+                .parked
+                .iter()
+                .max_by_key(|(_, a)| a.last_active_seq)
+                .map(|(id, _)| *id);
+            if let Some(other) = mru {
                 self.foreground_parked(other, cx);
             } else {
                 self.service.send_global(Command::SetActiveSession(None));
@@ -204,13 +217,18 @@ impl AppState {
                 Err(e) => tracing::warn!("failed to read credential from keychain: {e}"),
             }
         }
-        self.start_connect(config, cx);
+        self.start_connect(id, config, cx);
     }
 
-    /// Open a fresh connect session: park whatever was foreground (kept warm),
-    /// mint a session id, bump the generation (abandoning any pending retry), show
-    /// the splash, and fire the first attempt.
-    pub(crate) fn start_connect(&mut self, config: ConnectionConfig, cx: &mut Context<Self>) {
+    /// Open a fresh connect session for saved connection `conn_id`: park whatever
+    /// was foreground (kept warm), mint a session id, bump the generation
+    /// (abandoning any pending retry), show the splash, and fire the first attempt.
+    pub(crate) fn start_connect(
+        &mut self,
+        conn_id: String,
+        config: ConnectionConfig,
+        cx: &mut Context<Self>,
+    ) {
         let previous = self.park_foreground();
         let session = self.mint_session();
         self.foreground_session = Some(session);
@@ -219,13 +237,14 @@ impl AppState {
             .send_to(session, Command::Connect(config.clone()));
         self.service
             .send_global(Command::SetActiveSession(Some(session)));
-        self.phase = Phase::Connecting(Connecting {
+        self.phase = Phase::Connecting(Box::new(Connecting {
             session,
+            conn_id,
             previous,
             config,
             attempt: 1,
             status: ConnectStatus::InProgress,
-        });
+        }));
         cx.notify();
     }
 

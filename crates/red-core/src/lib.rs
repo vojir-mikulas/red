@@ -74,7 +74,7 @@ impl fmt::Display for DbKind {
 /// file engine the path lives in `database`; `host`/`port`/`user`/`password` are
 /// unused. `color` is a label-palette index (UI-defined). `read_only` reflects
 /// RED's read-mostly safety posture (enforced by the driver).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ConnectionConfig {
     pub name: String,
@@ -99,6 +99,33 @@ pub struct ConnectionConfig {
     pub read_only: bool,
 }
 
+/// Hand-written so the password is **never** printed — a redacting `Debug` makes
+/// the "secrets stay out of logs" rule a compile-time guarantee rather than a
+/// convention a stray `{config:?}` could break. (`Serialize` for persistence goes
+/// through the password-free `WriteConnection`, so the disk path is already safe.)
+impl fmt::Debug for ConnectionConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionConfig")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field(
+                "password",
+                &if self.password.is_empty() {
+                    "<unset>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("database", &self.database)
+            .field("color", &self.color)
+            .field("read_only", &self.read_only)
+            .finish()
+    }
+}
+
 impl ConnectionConfig {
     /// The connection string handed to the driver. File engines yield the bare
     /// path; network engines compose `scheme://user:pass@host:port/database`, with
@@ -117,7 +144,7 @@ impl ConnectionConfig {
             }
             url.push('@');
         }
-        url.push_str(&self.host);
+        url.push_str(&bracket_host(&self.host));
         if let Some(port) = self.port {
             url.push(':');
             url.push_str(&port.to_string());
@@ -138,7 +165,7 @@ impl ConnectionConfig {
             s.push_str(&self.user);
             s.push('@');
         }
-        s.push_str(&self.host);
+        s.push_str(&bracket_host(&self.host));
         if let Some(port) = self.port {
             s.push(':');
             s.push_str(&port.to_string());
@@ -192,9 +219,22 @@ impl ConnectionConfig {
             },
             None => (String::new(), String::new()),
         };
-        let (host, port) = match hostport.rsplit_once(':') {
-            Some((h, p)) => (h.to_string(), p.parse::<u16>().ok()),
-            None => (hostport.to_string(), None),
+        // Bracketed IPv6 literal (`[::1]` / `[::1]:5432`): split the port off after
+        // the closing bracket so a colon *inside* the address isn't mistaken for the
+        // port separator, and store the host without its brackets.
+        let (host, port) = if let Some(rest) = hostport.strip_prefix('[') {
+            match rest.split_once(']') {
+                Some((addr, tail)) => (
+                    addr.to_string(),
+                    tail.strip_prefix(':').and_then(|p| p.parse::<u16>().ok()),
+                ),
+                None => (rest.to_string(), None),
+            }
+        } else {
+            match hostport.rsplit_once(':') {
+                Some((h, p)) => (h.to_string(), p.parse::<u16>().ok()),
+                None => (hostport.to_string(), None),
+            }
         };
         Some(ParsedDsn {
             kind,
@@ -229,6 +269,17 @@ impl ParsedDsn {
             password: String::new(),
             database: String::new(),
         }
+    }
+}
+
+/// Wrap an IPv6 literal host in `[...]` so the following `:port` separator stays
+/// unambiguous; any other host (hostname / IPv4 / already-bracketed) is returned
+/// unchanged. Mirrors [`ConnectionConfig::parse_conn_str`]'s bracket handling.
+fn bracket_host(host: &str) -> std::borrow::Cow<'_, str> {
+    if host.contains(':') && !host.starts_with('[') {
+        std::borrow::Cow::Owned(format!("[{host}]"))
+    } else {
+        std::borrow::Cow::Borrowed(host)
     }
 }
 

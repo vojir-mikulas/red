@@ -131,12 +131,14 @@ impl DatabaseDriver for SqliteDriver {
     }
 
     fn contains_predicate(&self, columns: &[ColumnMeta], term: &str) -> Option<String> {
+        // SQLite treats `\` literally in string literals — no extra escaping.
         crate::contains_clause(
             columns,
             term,
             quote_ident,
             |c| format!("CAST({c} AS TEXT)"),
             "LIKE",
+            false,
         )
     }
 

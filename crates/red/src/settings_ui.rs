@@ -214,6 +214,9 @@ fn settings_banner(
                 .text_color(theme.text_faint)
                 .hover(|s| s.text_color(theme.text))
                 // Focusable so Tab reaches it; Enter/Space fires the dismiss click.
+                // Hand-rolled div, so name it for assistive tech like Flint's buttons.
+                .role(gpui::Role::Button)
+                .aria_label("Dismiss")
                 .border_1()
                 .border_color(gpui::transparent_black())
                 .tab_index(0)
@@ -234,6 +237,9 @@ fn settings_nav_item(
     let focus_ring = theme.accent;
     div()
         .id(SharedString::from(format!("settings-nav-{}", tab.label())))
+        // A category selector — expose it as a tab to assistive tech.
+        .role(gpui::Role::Tab)
+        .aria_label(tab.label())
         .flex()
         .items_center()
         .px_3()
