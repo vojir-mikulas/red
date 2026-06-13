@@ -262,21 +262,40 @@ pub(crate) async fn filters_contains(
     };
 
     // Plain substring across the text columns, case-insensitive: 'apple' + 'apple pie'.
-    assert_eq!(count(filtered("apple")).await, 2, "matches across text columns");
+    assert_eq!(
+        count(filtered("apple")).await,
+        2,
+        "matches across text columns"
+    );
     assert_eq!(count(filtered("APPLE")).await, 2, "case-insensitive");
     // `%` is a LIKE wildcard; escaped, it matches only the literal-percent row.
     // Unescaped the pattern would be `%%%` and match every row — the regression
     // this guards against.
-    assert_eq!(count(filtered("%")).await, 1, "LIKE metacharacters match literally");
+    assert_eq!(
+        count(filtered("%")).await,
+        1,
+        "LIKE metacharacters match literally"
+    );
     // A single quote can't break out of the string literal (no injection / no error).
-    assert_eq!(count(filtered("O'Brien")).await, 1, "embedded quote is escaped");
+    assert_eq!(
+        count(filtered("O'Brien")).await,
+        1,
+        "embedded quote is escaped"
+    );
     // A non-match is empty, never an error.
-    assert_eq!(count(filtered("zzznope")).await, 0, "no match → empty result");
+    assert_eq!(
+        count(filtered("zzznope")).await,
+        0,
+        "no match → empty result"
+    );
 
     // The blob column is excluded from the cast (binary-to-text is engine-specific
     // noise) — its bytes spell `apple` but don't lift the count above.
     let pred = driver.contains_predicate(&detail.columns, "apple").unwrap();
-    assert!(!pred.contains("data"), "blob column is not searched: {pred}");
+    assert!(
+        !pred.contains("data"),
+        "blob column is not searched: {pred}"
+    );
 }
 
 /// Keyset (seek) paging is exact in both directions and reads key bounds. `sql`

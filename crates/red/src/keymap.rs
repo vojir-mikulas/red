@@ -71,6 +71,10 @@ actions!(
         CloseInspector,
         /// Open or close the result filter bar (⌘⇧F) — Track B2.
         ToggleFilter,
+        /// Save the active tab's query as a named snippet (⇧⌘S) — Track B3.
+        SaveQuery,
+        /// Open the saved-query picker (⇧⌘O) — Track B3.
+        OpenSavedQueries,
     ]
 );
 
@@ -105,6 +109,8 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
                 ("⌘W", "Close tab"),
                 ("⌃Tab / ⌃⇧Tab", "Next / previous tab"),
                 ("⌘↵", "Run query"),
+                ("⇧⌘S", "Save query"),
+                ("⇧⌘O", "Open saved query…"),
                 ("Esc", "Leave the editor for the result grid"),
             ],
         ),
@@ -188,6 +194,11 @@ pub(crate) fn bind_all(cx: &mut App) {
         KeyBinding::new("escape", CloseInspector, Some("RedRoot")),
         // Result filter bar (Track B2). ⌘⇧F to keep plain ⌘F as schema search.
         KeyBinding::new("cmd-shift-f", ToggleFilter, Some("RedRoot")),
+        // Saved queries (Track B3). ⇧⌘S saves the active query; ⇧⌘O opens the
+        // picker. Both reach `RedRoot` from the editor (the `CodeEditor` context
+        // binds neither), so they fire while the editor is focused.
+        KeyBinding::new("cmd-shift-s", SaveQuery, Some("RedRoot")),
+        KeyBinding::new("cmd-shift-o", OpenSavedQueries, Some("RedRoot")),
         // Tab management. `RedRoot` is an ancestor of the editor, so these still
         // fire while the editor is focused — none collide with the editor's keys
         // (it binds plain `tab`, not `ctrl-tab`).

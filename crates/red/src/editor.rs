@@ -181,8 +181,9 @@ fn completion_provider(
     }
 }
 
-/// First non-empty, non-comment line of a query, truncated — the history label.
-fn history_label(sql: &str) -> String {
+/// First non-empty, non-comment line of a query, truncated — the history label,
+/// and the suggested name when saving a query (B3).
+pub(crate) fn history_label(sql: &str) -> String {
     let line = sql
         .lines()
         .map(str::trim)
@@ -546,6 +547,12 @@ impl AppState {
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::Sm)
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx))),
+            )
+            .child(
+                Button::new("sql-save", "Save")
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Sm)
+                    .on_click(cx.listener(|this, _, _, cx| this.open_save_prompt(cx))),
             )
             .children(ro_chip);
 

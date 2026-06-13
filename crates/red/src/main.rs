@@ -17,6 +17,7 @@ mod inspector;
 mod keymap;
 mod menu;
 mod palette;
+mod queries;
 mod result;
 mod schema;
 mod secrets;

@@ -8,8 +8,9 @@ use gpui::{div, prelude::*, px, Focusable, KeyDownEvent, Render, Window};
 use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::keymap::{
     About, CloseInspector, CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid,
-    FocusSchema, NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, RunQuery, SearchSchema,
-    Settings, ShowShortcuts, SwitchConnection, ToggleFilter, ToggleInspector, ToggleSidebar,
+    FocusSchema, NewConnection, NewTab, NextTab, OpenSavedQueries, PrevTab, RefreshSchema,
+    RunQuery, SaveQuery, SearchSchema, Settings, ShowShortcuts, SwitchConnection, ToggleFilter,
+    ToggleInspector, ToggleSidebar,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
@@ -228,6 +229,9 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| this.toggle_inspector(cx)))
             .on_action(cx.listener(|this, _: &CloseInspector, _, cx| this.close_inspector(cx)))
             .on_action(cx.listener(|this, _: &ToggleFilter, _, cx| this.toggle_filter_bar(cx)))
+            // Saved queries (B3): ⇧⌘S opens the name prompt; ⇧⌘O the picker.
+            .on_action(cx.listener(|this, _: &SaveQuery, _, cx| this.open_save_prompt(cx)))
+            .on_action(cx.listener(|this, _: &OpenSavedQueries, _, cx| this.open_saved_picker(cx)))
             // App-chrome actions (tabs · sidebar · schema reload), bound in the
             // central keymap to `RedRoot` so they fire from any pane's focus.
             .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_query(cx)))

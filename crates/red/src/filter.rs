@@ -80,9 +80,11 @@ impl AppState {
     /// Apply the bar's current text as the result filter (Enter / the Apply
     /// button). An empty term clears the filter. Closes the bar afterward.
     pub(crate) fn submit_filter(&mut self, cx: &mut Context<Self>) {
-        let Some((text, mode)) = self.filter_bar.as_ref().map(|bar| {
-            (bar.input.read(cx).content().trim().to_string(), bar.mode)
-        }) else {
+        let Some((text, mode)) = self
+            .filter_bar
+            .as_ref()
+            .map(|bar| (bar.input.read(cx).content().trim().to_string(), bar.mode))
+        else {
             return;
         };
         let filter = if text.is_empty() {
@@ -146,7 +148,11 @@ impl AppState {
             .font_family(ui_family)
             .text_size(size)
             .child(div().text_color(muted).child("Filter"))
-            .child(seg("filter-mode-contains", "Contains", FilterMode::Contains))
+            .child(seg(
+                "filter-mode-contains",
+                "Contains",
+                FilterMode::Contains,
+            ))
             .child(seg("filter-mode-where", "WHERE", FilterMode::Where))
             .child(div().flex_1().min_w(px(120.)).child(bar.input.clone()))
             .child(

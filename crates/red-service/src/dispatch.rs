@@ -484,13 +484,11 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     // filter narrows all three, so the total and bounds reflect it.
                     let bounds = async {
                         match &key {
-                            Some(k) if k.kind == KeyKind::Int => {
-                                driver
-                                    .key_bounds(&filtered_sql, k, &abort)
-                                    .await
-                                    .ok()
-                                    .flatten()
-                            }
+                            Some(k) if k.kind == KeyKind::Int => driver
+                                .key_bounds(&filtered_sql, k, &abort)
+                                .await
+                                .ok()
+                                .flatten(),
                             _ => None,
                         }
                     };

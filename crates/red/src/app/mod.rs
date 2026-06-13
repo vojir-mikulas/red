@@ -24,7 +24,7 @@ use red_core::{ConnectionConfig, DbKind};
 use red_service::{Command, Event, ServiceHandle, SessionId};
 
 use crate::config::{self, StoredConnection};
-use crate::palette::Cmd;
+use crate::palette::{Cmd, PromptKind};
 use crate::result::ResultGrid;
 use crate::schema::SchemaState;
 use crate::settings::{Density, FileSettingsStore, Settings, ThemeMode, ThemeSetting};
@@ -408,6 +408,12 @@ pub struct AppState {
     /// commands it's currently showing (so an activation routes to the right one).
     pub(crate) palette: Option<Entity<Palette>>,
     pub(crate) palette_cmds: Vec<(ElementId, Cmd)>,
+    /// Which free-text prompt the palette slot is serving (go-to-row vs save), so
+    /// a submit routes to the right handler. Only meaningful in prompt mode.
+    pub(crate) palette_prompt: PromptKind,
+    /// The saved queries shown by the open picker, held only while it's open so an
+    /// activation can resolve its index. Loaded on demand — never at startup.
+    pub(crate) saved_queries: Vec<crate::queries::SavedQuery>,
     /// The connection switcher (⌘P): an always-mounted topbar trigger that opens a
     /// searchable, sectioned popover of the active + recent connections. Its
     /// sections are rebuilt from `connections` + `phase` via [`Self::rebuild_switcher`].
@@ -743,6 +749,8 @@ impl AppState {
             modal_focus_trap: None,
             palette: None,
             palette_cmds: Vec::new(),
+            palette_prompt: PromptKind::GoToRow,
+            saved_queries: Vec::new(),
             switcher,
             parked: HashMap::new(),
             foreground_session: None,

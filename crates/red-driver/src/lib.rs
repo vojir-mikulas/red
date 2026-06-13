@@ -198,7 +198,12 @@ pub(crate) fn contains_clause(
     let preds: Vec<String> = columns
         .iter()
         .filter(|c| !c.type_name.as_deref().is_some_and(is_blob_type))
-        .map(|c| format!("{} {like_op} {pattern} ESCAPE '\\'", as_text(&quote(&c.name))))
+        .map(|c| {
+            format!(
+                "{} {like_op} {pattern} ESCAPE '\\'",
+                as_text(&quote(&c.name))
+            )
+        })
         .collect();
     (!preds.is_empty()).then(|| format!("({})", preds.join(" OR ")))
 }
@@ -224,14 +229,7 @@ fn is_blob_type(type_name: &str) -> bool {
     let base = t.split(['(', ' ']).next().unwrap_or("");
     matches!(
         base,
-        "blob"
-            | "bytea"
-            | "binary"
-            | "varbinary"
-            | "tinyblob"
-            | "mediumblob"
-            | "longblob"
-            | "bit"
+        "blob" | "bytea" | "binary" | "varbinary" | "tinyblob" | "mediumblob" | "longblob" | "bit"
     )
 }
 

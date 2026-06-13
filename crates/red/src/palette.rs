@@ -51,6 +51,21 @@ pub(crate) enum Cmd {
     GoToRow,
     /// Open the keyboard-shortcuts reference overlay.
     ShowShortcuts,
+    /// Save the active tab's query as a named snippet (opens the name prompt).
+    SaveQuery,
+    /// Open the saved-query picker.
+    OpenSavedQueries,
+    /// Open the saved query at this index (into a new tab) — picker activation.
+    OpenSavedQuery(usize),
+}
+
+/// Which free-text prompt the single palette slot is currently serving, so a
+/// [`PaletteEvent::Submit`] routes to the right handler. Command-list palettes
+/// (the default and the saved-query picker) ignore this — they emit `Activate`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptKind {
+    GoToRow,
+    SaveQuery,
 }
 
 impl AppState {
@@ -96,6 +111,7 @@ impl AppState {
         cx.subscribe(&prompt, Self::on_palette_event).detach();
         self.palette = Some(prompt);
         self.palette_cmds.clear();
+        self.palette_prompt = PromptKind::GoToRow;
         cx.notify();
     }
 
@@ -135,10 +151,14 @@ impl AppState {
                     self.run_command(cmd, cx);
                 }
             }
-            // Prompt mode (the "go to row" input) submits free text.
+            // Prompt mode submits free text — route by which prompt is open.
             PaletteEvent::Submit(text) => {
+                let kind = self.palette_prompt;
                 self.close_palette();
-                self.submit_goto(text, cx);
+                match kind {
+                    PromptKind::GoToRow => self.submit_goto(text, cx),
+                    PromptKind::SaveQuery => self.submit_save(text, cx),
+                }
             }
             PaletteEvent::Dismiss => self.close_palette(),
         }
@@ -190,6 +210,9 @@ impl AppState {
             Cmd::NewConnection => self.open_new_form(cx),
             Cmd::GoToRow => self.open_goto_prompt(cx),
             Cmd::ShowShortcuts => self.toggle_shortcuts(cx),
+            Cmd::SaveQuery => self.open_save_prompt(cx),
+            Cmd::OpenSavedQueries => self.open_saved_picker(cx),
+            Cmd::OpenSavedQuery(index) => self.open_saved_query(index, cx),
         }
     }
 
@@ -240,6 +263,18 @@ impl AppState {
                 out.push((
                     PaletteItem::new("cmd:history", "query: toggle history"),
                     Cmd::ToggleHistory,
+                ));
+                // Saved queries (B3) — save needs an open tab to save *from*; the
+                // picker is always offered (it reports "none yet" when empty).
+                if active.active().is_some() {
+                    out.push((
+                        PaletteItem::new("cmd:save-query", "query: save…").hint("⇧⌘S"),
+                        Cmd::SaveQuery,
+                    ));
+                }
+                out.push((
+                    PaletteItem::new("cmd:open-saved", "query: open saved…").hint("⇧⌘O"),
+                    Cmd::OpenSavedQueries,
                 ));
                 // Pane focus.
                 out.push((
@@ -309,5 +344,137 @@ impl AppState {
             Cmd::OpenDefaultSettings,
         ));
         out
+    }
+
+    /// ⇧⌘S / "query: save…": open a prompt to name the active tab's query, then
+    /// persist it as a `.sql` file. The prompt's placeholder suggests a name
+    /// derived from the SQL (the history label); submitting empty accepts it.
+    pub(crate) fn open_save_prompt(&mut self, cx: &mut Context<Self>) {
+        let sql = match &self.phase {
+            Phase::Connected(active) => active.active().map(|t| t.editor.read(cx).content()),
+            _ => None,
+        };
+        let Some(sql) = sql else { return };
+        if sql.trim().is_empty() {
+            self.notify(
+                ToastVariant::Error,
+                "Nothing to save — the editor is empty.",
+                cx,
+            );
+            return;
+        }
+        let suggestion = crate::editor::history_label(&sql);
+        let placeholder = if suggestion.is_empty() {
+            "Name this query…".to_string()
+        } else {
+            format!("Save as “{suggestion}”")
+        };
+        let prompt = cx.new(|cx| {
+            let mut p = Palette::new(cx).prompt();
+            p.set_placeholder(placeholder, cx);
+            p
+        });
+        cx.subscribe(&prompt, Self::on_palette_event).detach();
+        self.palette = Some(prompt);
+        self.palette_cmds.clear();
+        self.palette_prompt = PromptKind::SaveQuery;
+        cx.notify();
+    }
+
+    /// Write the active tab's query under `name` (or the suggested name when the
+    /// prompt was submitted empty). Re-reads the editor at submit time so it can't
+    /// save stale text.
+    fn submit_save(&mut self, name: &str, cx: &mut Context<Self>) {
+        let sql = match &self.phase {
+            Phase::Connected(active) => active.active().map(|t| t.editor.read(cx).content()),
+            _ => None,
+        };
+        let Some(sql) = sql.filter(|s| !s.trim().is_empty()) else {
+            self.notify(ToastVariant::Error, "Nothing to save.", cx);
+            return;
+        };
+        let name = match name.trim() {
+            "" => crate::editor::history_label(&sql),
+            typed => typed.to_string(),
+        };
+        if name.trim().is_empty() {
+            self.notify(ToastVariant::Error, "Give the query a name.", cx);
+            return;
+        }
+        match crate::queries::save(&name, &sql) {
+            Ok(_) => {
+                self.notify(ToastVariant::Success, format!("Saved query “{name}”."), cx);
+            }
+            Err(e) => {
+                self.notify(ToastVariant::Error, format!("Couldn't save query: {e}"), cx);
+            }
+        }
+    }
+
+    /// ⇧⌘O / "query: open saved…": load the saved-query files and open a picker
+    /// over them. Enumerating happens here, on demand — never at startup — so saved
+    /// queries cost nothing at idle and external edits show up on each open.
+    pub(crate) fn open_saved_picker(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.phase, Phase::Connected(_)) {
+            return;
+        }
+        let queries = crate::queries::load();
+        if queries.is_empty() {
+            self.notify(
+                ToastVariant::Info,
+                "No saved queries yet — save one with ⇧⌘S.",
+                cx,
+            );
+            return;
+        }
+        let entries: Vec<(PaletteItem, Cmd)> = queries
+            .iter()
+            .enumerate()
+            .map(|(i, q)| {
+                let id = ElementId::from(SharedString::from(format!("saved:{i}")));
+                let mut item = PaletteItem::new(id, q.name.clone());
+                if let Some(desc) = &q.description {
+                    item = item.hint(desc.clone());
+                }
+                (item, Cmd::OpenSavedQuery(i))
+            })
+            .collect();
+        self.saved_queries = queries;
+        self.palette_cmds = entries
+            .iter()
+            .map(|(item, cmd)| (item.id.clone(), *cmd))
+            .collect();
+        let items: Vec<PaletteItem> = entries.into_iter().map(|(item, _)| item).collect();
+
+        let palette = cx.new(|cx| {
+            let mut p = Palette::new(cx);
+            p.set_placeholder("Open saved query…", cx);
+            p.set_items(items, cx);
+            p
+        });
+        cx.subscribe(&palette, Self::on_palette_event).detach();
+        self.palette = Some(palette);
+        cx.notify();
+    }
+
+    /// Open the picked saved query in a fresh tab titled with its name (rather than
+    /// stomping the active editor), ready to run.
+    fn open_saved_query(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(query) = self.saved_queries.get(index).cloned() else {
+            return;
+        };
+        if !matches!(self.phase, Phase::Connected(_)) {
+            return;
+        }
+        let tab = crate::app::QueryTab::new(query.name, cx);
+        let at = self.push_tab(tab, cx);
+        let editor = match &self.phase {
+            Phase::Connected(active) => active.tabs.get(at).map(|t| t.editor.clone()),
+            _ => None,
+        };
+        if let Some(editor) = editor {
+            editor.update(cx, |editor, cx| editor.set_content(query.sql, cx));
+        }
+        cx.notify();
     }
 }
