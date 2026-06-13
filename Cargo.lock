@@ -1729,7 +1729,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2067,6 +2067,7 @@ dependencies = [
 [[package]]
 name = "flint"
 version = "0.1.0"
+source = "git+https://github.com/vojir-mikulas/flint?rev=c51d81601b554ff3d5e09946c1cd3939930a24a1#c51d81601b554ff3d5e09946c1cd3939930a24a1"
 dependencies = [
  "gpui",
  "unicode-segmentation",
@@ -4197,7 +4198,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6591,7 +6592,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand 2.4.1",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.52.0",
