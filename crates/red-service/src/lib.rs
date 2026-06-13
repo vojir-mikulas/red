@@ -86,6 +86,16 @@ impl ServiceHandle {
 /// pool, so the dispatch loop never stalls.
 pub fn spawn() -> ServiceHandle {
     let (cmd_tx, cmd_rx) = unbounded_channel::<Envelope>();
+    // The event channel is unbounded, but its *heavy* producers are not: every
+    // row-carrying event (`ResultPageLoaded` / `ResultRunLoaded` / `CopyRowsLoaded`)
+    // is emitted only from a task holding a `page_fetch_limit` permit, and exports
+    // from an `export_limit` permit (see `dispatch`). So even if the GPUI consumer
+    // stalls (a modal, a slow frame), at most `MAX_CONCURRENT_PAGE_FETCHES` row
+    // windows can be in flight — the queue can't balloon without bound. The
+    // remaining producers (errors, status, throttled progress counts) carry small
+    // payloads at human/throttled rates. Backpressure thus lives on the producer
+    // side (the semaphores) rather than on the channel, which keeps `emit` a cheap
+    // non-blocking call usable from the synchronous dispatch loop.
     let (evt_tx, evt_rx) = unbounded::<(Option<SessionId>, Event)>();
 
     std::thread::Builder::new()

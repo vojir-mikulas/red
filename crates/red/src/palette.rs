@@ -102,8 +102,8 @@ impl AppState {
             p.set_items(items, cx);
             p
         });
-        cx.subscribe(&palette, Self::on_palette_event).detach();
-        self.palette = Some(palette);
+        let sub = cx.subscribe(&palette, Self::on_palette_event);
+        self.palette = Some((palette, sub));
         cx.notify();
     }
 
@@ -119,8 +119,8 @@ impl AppState {
             p.set_placeholder(placeholder, cx);
             p
         });
-        cx.subscribe(&prompt, Self::on_palette_event).detach();
-        self.palette = Some(prompt);
+        let sub = cx.subscribe(&prompt, Self::on_palette_event);
+        self.palette = Some((prompt, sub));
         self.palette_cmds.clear();
         self.palette_prompt = PromptKind::GoToRow;
         cx.notify();
@@ -278,8 +278,8 @@ impl AppState {
             p.set_query(&current, cx);
             p
         });
-        cx.subscribe(&prompt, Self::on_palette_event).detach();
-        self.palette = Some(prompt);
+        let sub = cx.subscribe(&prompt, Self::on_palette_event);
+        self.palette = Some((prompt, sub));
         self.palette_cmds.clear();
         self.palette_prompt = PromptKind::EditCell;
         self.pending_edit = Some(ctx);
@@ -520,8 +520,8 @@ impl AppState {
             p.set_placeholder(placeholder, cx);
             p
         });
-        cx.subscribe(&prompt, Self::on_palette_event).detach();
-        self.palette = Some(prompt);
+        let sub = cx.subscribe(&prompt, Self::on_palette_event);
+        self.palette = Some((prompt, sub));
         self.palette_cmds.clear();
         self.palette_prompt = PromptKind::SaveQuery;
         cx.notify();
@@ -598,8 +598,8 @@ impl AppState {
             p.set_items(items, cx);
             p
         });
-        cx.subscribe(&palette, Self::on_palette_event).detach();
-        self.palette = Some(palette);
+        let sub = cx.subscribe(&palette, Self::on_palette_event);
+        self.palette = Some((palette, sub));
         cx.notify();
     }
 

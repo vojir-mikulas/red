@@ -38,7 +38,10 @@ pub(crate) fn from_sqlite_rows(rows: Vec<(i64, i64, String)>) -> QueryPlan {
         }
         node
     }
-    let nodes: Vec<PlanNode> = roots.iter().map(|r| build(*r, &detail, &children)).collect();
+    let nodes: Vec<PlanNode> = roots
+        .iter()
+        .map(|r| build(*r, &detail, &children))
+        .collect();
     let raw = render_outline(&nodes);
     QueryPlan {
         nodes,
@@ -108,9 +111,7 @@ pub(crate) fn from_text_tree(raw: &str, analyzed: bool) -> QueryPlan {
 /// labelled by the `table` column when present. Not nested — honestly flat — but
 /// readable, and `raw` carries the rendered table.
 pub(crate) fn from_table(columns: Vec<String>, rows: Vec<Vec<String>>) -> QueryPlan {
-    let table_col = columns
-        .iter()
-        .position(|c| c.eq_ignore_ascii_case("table"));
+    let table_col = columns.iter().position(|c| c.eq_ignore_ascii_case("table"));
     let nodes = rows
         .iter()
         .enumerate()
@@ -294,7 +295,10 @@ mod tests {
         assert_eq!(plan.nodes.len(), 1);
         assert_eq!(plan.nodes[0].label, "SCAN authors");
         assert_eq!(plan.nodes[0].children.len(), 2);
-        assert_eq!(plan.nodes[0].children[0].label, "SEARCH books USING INDEX ix");
+        assert_eq!(
+            plan.nodes[0].children[0].label,
+            "SEARCH books USING INDEX ix"
+        );
         assert!(plan.raw.contains("SCAN authors"));
         assert!(!plan.analyzed);
     }
@@ -328,7 +332,8 @@ mod tests {
         assert!(plan.analyzed);
         let m = &plan.nodes[0].metrics;
         assert!(
-            m.iter().any(|(k, v)| k == "actual time" && v == "0.011..0.013"),
+            m.iter()
+                .any(|(k, v)| k == "actual time" && v == "0.011..0.013"),
             "metrics: {m:?}"
         );
         assert!(m.iter().any(|(k, v)| k == "loops" && v == "1"));
@@ -355,7 +360,10 @@ mod tests {
         let plan = from_table(columns, rows);
         assert_eq!(plan.nodes.len(), 2);
         assert_eq!(plan.nodes[0].label, "users");
-        assert!(plan.nodes[0].metrics.iter().any(|(k, v)| k == "rows" && v == "42"));
+        assert!(plan.nodes[0]
+            .metrics
+            .iter()
+            .any(|(k, v)| k == "rows" && v == "42"));
         // Empty cells are dropped from metrics.
         assert!(!plan.nodes[1].metrics.iter().any(|(k, _)| k == "rows"));
     }

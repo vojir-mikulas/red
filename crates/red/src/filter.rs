@@ -24,10 +24,14 @@ pub(crate) enum FilterMode {
     Where,
 }
 
-/// State for the open filter bar (present iff the bar is showing).
+/// State for the open filter bar (present iff the bar is showing). The input's
+/// event `Subscription` is held here, not detached, so closing the bar (nulling
+/// the owning `Option`) drops the subscription with it rather than orphaning it.
 pub(crate) struct FilterBarState {
     pub(crate) input: Entity<TextInput>,
     pub(crate) mode: FilterMode,
+    #[allow(dead_code)]
+    pub(crate) sub: gpui::Subscription,
 }
 
 impl AppState {
@@ -49,13 +53,12 @@ impl AppState {
         }
         // Enter applies; Esc (the input's Cancel) closes the bar without clearing
         // any already-applied filter.
-        cx.subscribe(&input, |this, _input, evt: &TextInputEvent, cx| match evt {
+        let sub = cx.subscribe(&input, |this, _input, evt: &TextInputEvent, cx| match evt {
             TextInputEvent::Submit => this.submit_filter(cx),
             TextInputEvent::Cancel => this.close_filter_bar(cx),
             TextInputEvent::Change => {}
-        })
-        .detach();
-        self.filter_bar = Some(FilterBarState { input, mode });
+        });
+        self.filter_bar = Some(FilterBarState { input, mode, sub });
         // The Window isn't in hand here — focus the input on the next render.
         self.focus_filter = true;
         cx.notify();

@@ -163,7 +163,11 @@ impl AppState {
 
         // --- header: title, explained SQL, actions ---
         let analyzed = view.analyze;
-        let title = if analyzed { "Query plan · analyzed" } else { "Query plan" };
+        let title = if analyzed {
+            "Query plan · analyzed"
+        } else {
+            "Query plan"
+        };
         let sql_line = one_line(&view.sql, 96);
         let raw_for_copy: Option<SharedString> = match &view.state {
             PlanState::Ready(plan) => Some(plan.raw.clone().into()),
@@ -242,12 +246,7 @@ impl AppState {
                 .gap_2()
                 .font_family(mono_family.clone())
                 .child(div().text_size(s11).text_color(red).child("EXPLAIN failed"))
-                .child(
-                    div()
-                        .text_size(s12)
-                        .text_color(text)
-                        .child(message.clone()),
-                )
+                .child(div().text_size(s12).text_color(text).child(message.clone()))
                 .into_any_element(),
             PlanState::Ready(plan) if plan.nodes.is_empty() => div()
                 .id("plan-raw")

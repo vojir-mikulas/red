@@ -40,15 +40,40 @@ impl AppState {
     /// installs the next phase. A connecting/disconnected foreground parks nothing.
     pub(crate) fn park_foreground(&mut self) -> Option<SessionId> {
         if matches!(self.phase, Phase::Connected(_)) {
-            if let Phase::Connected(active) =
+            if let Phase::Connected(mut active) =
                 std::mem::replace(&mut self.phase, Phase::Disconnected)
             {
                 let id = active.session;
+                // Stamp the just-foregrounded conn as the most-recently-used, then
+                // make room: if parking would exceed the cap, evict the LRU parked
+                // session first (never this one — it has the freshest stamp).
+                self.next_active_seq += 1;
+                active.last_active_seq = self.next_active_seq;
+                self.evict_lru_parked();
                 self.parked.insert(id, active);
                 return Some(id);
             }
         }
         None
+    }
+
+    /// Drop parked warm sessions until the map has room for one more, evicting the
+    /// least-recently-foregrounded each time. The evicted workspace's heavy
+    /// `ActiveConn` is freed immediately; `CloseSession` tells the backend to tear
+    /// down its driver (its later `Disconnected` is a no-op — already gone here).
+    fn evict_lru_parked(&mut self) {
+        while self.parked.len() >= MAX_PARKED_SESSIONS {
+            let Some(lru) = self
+                .parked
+                .iter()
+                .min_by_key(|(_, a)| a.last_active_seq)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            self.parked.remove(&lru);
+            self.service.send_to(lru, Command::CloseSession);
+        }
     }
 
     /// Bring a parked warm session to the foreground — the instant-switch payoff:

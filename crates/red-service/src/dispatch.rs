@@ -30,6 +30,21 @@ type Events = UnboundedSender<(Option<SessionId>, Event)>;
 /// this is the backstop.
 const MAX_CONCURRENT_PAGE_FETCHES: usize = 6;
 
+/// Backstop cap on open results retained per session. The UI evicts a superseded
+/// result (re-sort / filter / tab-close) by sending `CloseResult`, so the live
+/// count tracks the user's open tabs — well under this. The cap is defense in
+/// depth: if a future UI path ever opens a result without closing its predecessor,
+/// the lowest-epoch (oldest) entries are reaped here instead of growing for the
+/// session's life. Epochs are process-global and monotonic, so "lowest epoch" is
+/// "oldest opened" — but it can belong to any tab, so the cap is set far above any
+/// realistic open-tab count to never reap a live result in normal use.
+const MAX_OPEN_RESULTS: usize = 256;
+
+/// How many exports may stream at once across all sessions. Each holds a driver
+/// connection for the file's lifetime, so this bounds connection pinning. Generous
+/// — exports are user-initiated (one per toast) — but no longer unbounded.
+const MAX_CONCURRENT_EXPORTS: usize = 4;
+
 /// Cap on how long one connect attempt may run before the backend gives up and
 /// reports a timeout. Bounds a hung connect (a black-hole host) so the dispatch
 /// loop frees up for the next command — the UI drives retry/backoff and cancel
@@ -194,6 +209,28 @@ impl SessionState {
         abort_all_inflight(&mut self.inflight);
         lock(&self.results).clear();
     }
+
+    /// Backstop GC: if open results exceed [`MAX_OPEN_RESULTS`], reap the
+    /// lowest-epoch (oldest-opened) ones — aborting their in-flight fetches — until
+    /// back under the cap. A no-op in normal use (the UI closes superseded results);
+    /// this only bites if a caller leaks epochs, turning unbounded growth into a
+    /// bounded, logged drop. Never touches `keep` (the just-opened epoch).
+    fn reap_excess_results(&mut self, keep: u64) {
+        let mut results = lock(&self.results);
+        while results.len() > MAX_OPEN_RESULTS {
+            let Some(victim) = results.keys().copied().filter(|&e| e != keep).min() else {
+                break;
+            };
+            results.remove(&victim);
+            if let Some(f) = self.inflight.remove(&victim) {
+                f.abort_all();
+            }
+            tracing::warn!(
+                epoch = victim,
+                "reaped leaked open result (exceeded MAX_OPEN_RESULTS)"
+            );
+        }
+    }
 }
 
 /// The result of a spawned connect/probe, delivered back to the dispatch loop so
@@ -270,6 +307,12 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
     // can't fan out dozens of deep scans. A busy session can briefly delay
     // another's page fetches; acceptable for a backstop.
     let page_fetch_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_PAGE_FETCHES));
+    // Bounds concurrent exports across *all* sessions. Each export holds a driver
+    // connection streaming for the file's whole lifetime, so without a cap a user
+    // firing many large exports could pin an unbounded number of connections. A
+    // separate pool from the page-fetch limit: a long export must not starve
+    // interactive paging, nor the reverse.
+    let export_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_EXPORTS));
     // Wakes the loop even when no command arrives, so idle sessions get swept.
     let mut sweep = tokio::time::interval(EVICT_SWEEP);
     // `Connect`/`TestConnection` dial off the loop (a slow connect mustn't freeze
@@ -500,6 +543,10 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         checkpoints: Arc::new(Mutex::new(CheckpointIndex::default())),
                     },
                 );
+                // Backstop GC: bound the open-result map against any future UI path
+                // that opens without closing its predecessor (epochs are monotonic,
+                // so this only ever reaps genuinely-leaked older results).
+                state.reap_excess_results(epoch);
                 // One abort handle for the whole probe bundle: re-sort / close
                 // cancels the (potentially full-table) `count` and column probe.
                 let abort = AbortSignal::new();
@@ -998,7 +1045,12 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // (a `CancelExport` or any other command lands while it streams).
                 let events = events.clone();
                 let exports = state.exports.clone();
+                let export_limit = export_limit.clone();
                 tokio::spawn(async move {
+                    // Hold a permit for the export's lifetime so concurrent exports
+                    // are capped (queued exports wait here; the cancel flag is
+                    // already registered, so a wait can still be cancelled).
+                    let _permit = export_limit.acquire_owned().await;
                     let path_str = path.to_string_lossy().into_owned();
                     let result = driver
                         .export(&sql, &path, format, cancel, progress_tx)
@@ -1578,5 +1630,49 @@ mod checkpoint_tests {
         assert!(claim_build(&spec, 500_000));
         assert!(!claim_build(&spec, 600_000));
         assert_eq!(lock(&checkpoints).status, BuildStatus::Building);
+    }
+
+    /// The open-result backstop GC: past [`MAX_OPEN_RESULTS`], reaping drops the
+    /// lowest-epoch entries (and their in-flight handles) down to the cap, never
+    /// touching the just-opened epoch — so a leaking caller is bounded, not
+    /// unbounded. Below the cap it's a no-op.
+    #[test]
+    fn reap_excess_results_caps_to_the_lowest_epochs() {
+        let (path, driver) = driver_with(1, "reap");
+        let mut state = SessionState::new(driver);
+
+        // Open one more than the cap, epochs 1..=MAX+1. Every epoch also has an
+        // in-flight handle, so we can assert those are reaped in lockstep.
+        let over = MAX_OPEN_RESULTS as u64 + 1;
+        for epoch in 1..=over {
+            let checkpoints = Arc::new(Mutex::new(CheckpointIndex::default()));
+            lock(&state.results).insert(epoch, spec_for(&checkpoints, 1));
+            state.inflight.entry(epoch).or_default();
+        }
+        assert_eq!(lock(&state.results).len(), MAX_OPEN_RESULTS + 1);
+
+        // The just-opened epoch is `over`; reaping keeps it and trims to the cap.
+        state.reap_excess_results(over);
+
+        let results = lock(&state.results);
+        assert_eq!(results.len(), MAX_OPEN_RESULTS, "trimmed back to the cap");
+        assert!(results.contains_key(&over), "the kept epoch survives");
+        assert!(!results.contains_key(&1), "the lowest epoch was reaped");
+        assert!(
+            !state.inflight.contains_key(&1),
+            "the reaped epoch's in-flight handle is dropped too"
+        );
+        assert_eq!(
+            state.inflight.len(),
+            MAX_OPEN_RESULTS,
+            "in-flight map tracks the result map"
+        );
+        drop(results);
+
+        // Under the cap, reaping is a no-op.
+        state.reap_excess_results(over);
+        assert_eq!(lock(&state.results).len(), MAX_OPEN_RESULTS);
+
+        std::fs::remove_file(&path).ok();
     }
 }

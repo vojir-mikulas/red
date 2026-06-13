@@ -162,6 +162,19 @@ pub(crate) struct EditContext {
 /// user closes them or the operation resolves.
 const TOAST_AUTO_DISMISS: Duration = Duration::from_secs(4);
 
+/// Most warm parked sessions kept resident at once. Each is a heavy `ActiveConn`
+/// (editor entities, schema detail map, result buffers), so the map is capped:
+/// parking past this LRU-evicts the least-recently-foregrounded session (closing
+/// its backend session too). The cap makes a missed backend `Disconnected` a
+/// bounded annoyance instead of unbounded growth.
+const MAX_PARKED_SESSIONS: usize = 8;
+
+/// Most persistent (error / warning) notifications retained at once. Transient
+/// info/success toasts self-dismiss; persistent ones are removed only by a user
+/// click, so a burst of query errors is capped here — the oldest persistent toast
+/// is dropped past this. Visible toasts are already capped lower in the renderer.
+const MAX_NOTIFICATIONS: usize = 50;
+
 /// The live state of the export-progress toast: how many rows have streamed out
 /// of the known `total`, keyed by the export `id` so a `CancelExport` / progress
 /// update targets the right one. Only the export toast carries this.
@@ -286,6 +299,11 @@ pub(crate) struct ActiveConn {
     /// entry within it.
     pub history_focus: FocusHandle,
     pub history_sel: usize,
+    /// Recency stamp: bumped from [`AppState::next_active_seq`] each time this
+    /// workspace is parked (it was foreground until that moment). Drives LRU
+    /// eviction when [`MAX_PARKED_SESSIONS`] is exceeded — the lowest stamp is the
+    /// least-recently-foregrounded parked session.
+    pub last_active_seq: u64,
 }
 
 impl ActiveConn {
@@ -318,6 +336,7 @@ impl ActiveConn {
             active_pane: Pane::Editor,
             history_focus: cx.focus_handle(),
             history_sel: 0,
+            last_active_seq: 0,
         }
     }
 
@@ -478,7 +497,11 @@ pub struct AppState {
     pub(crate) modal_focus_trap: Option<gpui::Subscription>,
     /// The command palette overlay, when open, plus the `id → Cmd` map for the
     /// commands it's currently showing (so an activation routes to the right one).
-    pub(crate) palette: Option<Entity<Palette>>,
+    /// The open command palette / prompt, paired with the `Subscription` to its
+    /// events. Bundling the subscription with the entity makes the lifetime
+    /// explicit: nulling this `Option` (only via `close_palette`) drops both, so a
+    /// missed close can't orphan a detached subscription on `AppState`.
+    pub(crate) palette: Option<(Entity<Palette>, gpui::Subscription)>,
     pub(crate) palette_cmds: Vec<(ElementId, Cmd)>,
     /// Which free-text prompt the palette slot is serving (go-to-row vs save), so
     /// a submit routes to the right handler. Only meaningful in prompt mode.
@@ -503,6 +526,9 @@ pub struct AppState {
     /// Monotonic source of `SessionId`s. The UI mints them so it can address a
     /// connection (splash, cancel, retry) before the backend confirms it.
     pub(crate) next_session_id: u64,
+    /// Monotonic source of parked-session recency stamps ([`ActiveConn::last_active_seq`]).
+    /// Bumped each time a workspace is parked, so LRU eviction can pick the oldest.
+    pub(crate) next_active_seq: u64,
     /// Set when an overlay closed: the next render pulls focus back to the root
     /// so the global ⌘K keeps dispatching (see `close_palette`).
     pub(crate) refocus_root: bool,
@@ -854,6 +880,7 @@ impl AppState {
             parked: HashMap::new(),
             foreground_session: None,
             next_session_id: 0,
+            next_active_seq: 0,
             // Focus the root on first paint so the very first ⌘K dispatches.
             refocus_root: true,
             shortcuts_open: false,
@@ -957,6 +984,20 @@ impl AppState {
         notification.id = id;
         let auto_dismiss = notification.auto_dismiss;
         self.notifications.push(notification);
+        // Persistent (error / warning) toasts are removed only by a user click, so
+        // a burst of query errors could pile up unbounded. Cap the stack: drop the
+        // oldest persistent, non-export toast first (transient ones self-dismiss;
+        // an export toast owns live cancel state, so it's never auto-dropped).
+        while self.notifications.len() > MAX_NOTIFICATIONS {
+            let Some(stale) = self
+                .notifications
+                .iter()
+                .position(|n| n.auto_dismiss.is_none() && n.export.is_none())
+            else {
+                break;
+            };
+            self.notifications.remove(stale);
+        }
         if let Some(delay) = auto_dismiss {
             cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                 cx.background_executor().timer(delay).await;

@@ -51,10 +51,14 @@ pub(crate) struct InspectorState {
     editing: Option<InspectorEdit>,
 }
 
-/// An in-progress inline cell edit hosted in the inspector (Track B5).
+/// An in-progress inline cell edit hosted in the inspector (Track B5). The input's
+/// event `Subscription` is held here, not detached, so clearing `editing` (on
+/// move-off / Save / Cancel) drops it rather than orphaning it on `AppState`.
 struct InspectorEdit {
     input: Entity<TextInput>,
     ctx: EditContext,
+    #[allow(dead_code)]
+    sub: gpui::Subscription,
 }
 
 impl InspectorState {
@@ -259,14 +263,13 @@ impl AppState {
         });
         // Enter in the field saves; Esc cancels — the same submit/cancel idiom the
         // form fields use.
-        cx.subscribe(&input, |this, _, event: &TextInputEvent, cx| match event {
+        let sub = cx.subscribe(&input, |this, _, event: &TextInputEvent, cx| match event {
             TextInputEvent::Submit => this.save_inspector_edit(cx),
             TextInputEvent::Cancel => this.cancel_inspector_edit(cx),
             TextInputEvent::Change => {}
-        })
-        .detach();
+        });
         if let Some(insp) = &mut self.inspector {
-            insp.editing = Some(InspectorEdit { input, ctx });
+            insp.editing = Some(InspectorEdit { input, ctx, sub });
         }
         self.focus_inspector_edit = true;
         cx.notify();

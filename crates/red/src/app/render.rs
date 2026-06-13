@@ -358,7 +358,7 @@ impl Render for AppState {
             // the switcher's "New connection…").
             .children(self.form.as_ref().map(|f| self.render_form(f, cx)))
             // The palette renders its own full-screen overlay; last = on top.
-            .children(self.palette.clone());
+            .children(self.palette.as_ref().map(|(p, _)| p.clone()));
 
         // Dev perf HUD: register its toggle, overlay the panel last (on top), and
         // close the frame so the rings capture this render's cost.
