@@ -8,9 +8,10 @@
 //! and a text CSV/JSON of raw binary is rarely what a user wants. Binary-faithful
 //! export is a later format option.
 
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use red_core::Value;
+use red_core::{ExportFormat, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Strip surrounding whitespace and a single trailing `;` so a user statement can
@@ -52,6 +53,83 @@ impl ProgressThrottle {
             self.last_sent = written;
             self.last_at = Instant::now();
         }
+    }
+}
+
+/// The shared CSV/JSON framing for every driver's `export`: header/opening token,
+/// per-row escaping + comma separation + JSON object framing, and the closing
+/// token. Each driver keeps its own row pump (sync `rusqlite` vs. async streams)
+/// and cancel check, but drives this writer so the on-disk format is byte-identical
+/// and the easy-to-drift framing lives in one place.
+pub(crate) struct ExportWriter<W: Write> {
+    out: W,
+    format: ExportFormat,
+    names: Vec<String>,
+    written: u64,
+}
+
+impl<W: Write> ExportWriter<W> {
+    /// Begin an export: write the CSV header row, or the opening JSON `[`.
+    pub(crate) fn begin(mut out: W, format: ExportFormat, names: Vec<String>) -> io::Result<Self> {
+        match format {
+            ExportFormat::Csv => {
+                writeln!(out, "{}", csv_record(names.iter().map(String::as_str)))?;
+            }
+            ExportFormat::Json => write!(out, "[")?,
+        }
+        Ok(Self {
+            out,
+            format,
+            names,
+            written: 0,
+        })
+    }
+
+    /// Write one row (cells positionally aligned with the column names): CSV
+    /// escaping for CSV, object framing + comma separation for JSON.
+    pub(crate) fn write_row(&mut self, cells: &[Value]) -> io::Result<()> {
+        match self.format {
+            ExportFormat::Csv => {
+                let fields: Vec<String> = cells.iter().map(csv_cell).collect();
+                writeln!(
+                    self.out,
+                    "{}",
+                    csv_record(fields.iter().map(String::as_str))
+                )?;
+            }
+            ExportFormat::Json => {
+                if self.written > 0 {
+                    write!(self.out, ",")?;
+                }
+                write!(self.out, "\n  {{")?;
+                for (i, value) in cells.iter().enumerate() {
+                    if i > 0 {
+                        write!(self.out, ",")?;
+                    }
+                    // A row wider than the header falls back to an empty key name.
+                    let name = self.names.get(i).map(String::as_str).unwrap_or("");
+                    write!(self.out, "{}:{}", json_string(name), json_value(value))?;
+                }
+                write!(self.out, "}}")?;
+            }
+        }
+        self.written += 1;
+        Ok(())
+    }
+
+    /// Close the export (JSON gets its trailing `]`; CSV needs no footer), flush,
+    /// and return the row count written.
+    pub(crate) fn finish(mut self) -> io::Result<u64> {
+        if let ExportFormat::Json = self.format {
+            write!(self.out, "\n]\n")?;
+        }
+        self.out.flush()?;
+        Ok(self.written)
+    }
+
+    /// Rows written so far — feeds the progress throttle.
+    pub(crate) fn written(&self) -> u64 {
+        self.written
     }
 }
 

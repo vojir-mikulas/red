@@ -200,7 +200,10 @@ pub fn tokenize(src: &str) -> Vec<(Range<usize>, TokenStyle)> {
 
 /// What kind of statement the editor is about to run — drives whether it streams
 /// into the result grid, executes in a transaction, or first asks for confirmation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Variant order is the severity order (`Query` < `Write` < `Destructive`) so a
+/// batch's kind is the `max` of its statements' kinds — see [`classify`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StatementKind {
     /// Row-returning — opens in the result grid.
     Query,
@@ -210,8 +213,23 @@ pub enum StatementKind {
     Destructive,
 }
 
-/// Classify a statement by its leading keyword (comments + whitespace skipped).
+/// Classify a statement *batch* by its most-destructive statement. A paste like
+/// `SELECT 1; DROP TABLE users` must confirm, so each `;`-delimited statement is
+/// classified and the highest severity wins (`Destructive` > `Write` > `Query`) —
+/// classifying only the leading keyword would let a destructive tail slip past the
+/// confirm modal. A trailing empty statement (after the last `;`) is ignored.
 pub fn classify(sql: &str) -> StatementKind {
+    split_statements(sql)
+        .into_iter()
+        .filter(|s| !first_keyword(s).is_empty())
+        .map(classify_one)
+        .max()
+        .unwrap_or(StatementKind::Query)
+}
+
+/// Classify a single statement by its leading keyword (comments + whitespace
+/// skipped). See [`classify`] for the batch entry point.
+fn classify_one(sql: &str) -> StatementKind {
     match first_keyword(sql).to_ascii_uppercase().as_str() {
         "SELECT" | "WITH" | "PRAGMA" | "EXPLAIN" | "VALUES" => StatementKind::Query,
         "DROP" | "DELETE" | "UPDATE" | "ALTER" | "TRUNCATE" | "REPLACE" => {
@@ -219,6 +237,56 @@ pub fn classify(sql: &str) -> StatementKind {
         }
         _ => StatementKind::Write,
     }
+}
+
+/// Split `sql` into its top-level `;`-delimited statements, with `;` inside string
+/// literals and comments ignored (the same boundary rules [`statement_bounds`]
+/// uses). Borrows; no allocation per statement.
+fn split_statements(sql: &str) -> Vec<&str> {
+    let b = sql.as_bytes();
+    let n = b.len();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < n {
+        let c = b[i];
+        // Line comment: -- to end of line.
+        if c == b'-' && i + 1 < n && b[i + 1] == b'-' {
+            i += 2;
+            while i < n && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment: /* ... */
+        if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(n);
+            continue;
+        }
+        // String / quoted literal.
+        if c == b'\'' || c == b'"' {
+            let quote = c;
+            i += 1;
+            while i < n && b[i] != quote {
+                i += 1;
+            }
+            if i < n {
+                i += 1;
+            }
+            continue;
+        }
+        if c == b';' {
+            out.push(&sql[start..i]);
+            start = i + 1;
+        }
+        i += 1;
+    }
+    out.push(&sql[start..]);
+    out
 }
 
 /// Append `LIMIT n` to a bare row-returning `SELECT` that doesn't already limit
@@ -584,6 +652,36 @@ mod tests {
         // Disabled by a zero limit, and skipped for multi-statement batches.
         assert_eq!(auto_limit("SELECT * FROM t", 0), None);
         assert_eq!(auto_limit("SELECT 1; SELECT 2", 1000), None);
+    }
+
+    #[test]
+    fn classify_batch_uses_most_destructive_statement() {
+        // A single statement classifies by its leading keyword.
+        assert_eq!(classify("SELECT * FROM t"), StatementKind::Query);
+        assert_eq!(classify("INSERT INTO t VALUES (1)"), StatementKind::Write);
+        assert_eq!(classify("DROP TABLE t"), StatementKind::Destructive);
+        // A multi-statement paste confirms on the destructive tail — the bug this
+        // guards: a leading SELECT must not mask a trailing DROP.
+        assert_eq!(
+            classify("SELECT 1; DROP TABLE users"),
+            StatementKind::Destructive
+        );
+        assert_eq!(
+            classify("INSERT INTO t VALUES (1); SELECT 1"),
+            StatementKind::Write
+        );
+        assert_eq!(classify("SELECT 1; SELECT 2"), StatementKind::Query);
+        // A `;` inside a string or comment doesn't start a new statement.
+        assert_eq!(
+            classify("SELECT 'a; DROP TABLE t' AS x"),
+            StatementKind::Query
+        );
+        assert_eq!(
+            classify("SELECT 1 -- DROP TABLE t\n; SELECT 2"),
+            StatementKind::Query
+        );
+        // Trailing terminator / empty statements are ignored.
+        assert_eq!(classify("DELETE FROM t;"), StatementKind::Destructive);
     }
 
     #[test]

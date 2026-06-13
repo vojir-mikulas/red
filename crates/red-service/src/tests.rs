@@ -607,6 +607,11 @@ async fn resolves_key_and_serves_runs() {
 async fn mariadb_keyset_end_to_end() {
     use red_core::KeyKind;
     let Ok(url) = std::env::var("RED_TEST_MYSQL_URL") else {
+        // Visible skip (with `--nocapture`): never a silent pass. CI sets the URL.
+        eprintln!(
+            "SKIP {}::mariadb_keyset_end_to_end: RED_TEST_MYSQL_URL not set",
+            module_path!()
+        );
         return;
     };
     let p = ConnectionConfig::parse_conn_str(&url).expect("parsable test url");
@@ -860,7 +865,13 @@ async fn text_key_jump_falls_back_to_offset() {
 async fn connect_and_query_roundtrip() {
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
+    // Connect dials off the dispatch loop, so a session-bound command is only
+    // valid once `Connected` lands — exactly how the UI sequences it.
     send(&handle, Command::Connect(sqlite(":memory:", false)));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
     send(
         &handle,
         Command::Query {
@@ -868,11 +879,6 @@ async fn connect_and_query_roundtrip() {
             opts: QueryOptions::default(),
         },
     );
-
-    assert!(matches!(
-        next(&mut events).await,
-        Some(Event::Connected { .. })
-    ));
     assert!(matches!(
         next(&mut events).await,
         Some(Event::QueryStarted { .. })

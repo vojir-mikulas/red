@@ -5,7 +5,7 @@
 //! bounded row windows over channels; the async side holds only a thin handle.
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -21,9 +21,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::format::{
-    csv_cell, csv_record, json_string, json_value, strip_trailing, ProgressThrottle,
-};
+use crate::format::{strip_trailing, ExportWriter, ProgressThrottle};
 use crate::{driver_err, AbortSignal, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor};
 
 /// A SQLite connection target: a file path (or `:memory:`) plus the read-only
@@ -411,9 +409,9 @@ fn export_blocking(
         .collect();
 
     let file = File::create(out_path).map_err(driver_err)?;
-    let mut out = BufWriter::new(file);
+    let out = BufWriter::new(file);
     let mut rows_iter = stmt.query([]).map_err(driver_err)?;
-    let mut written: u64 = 0;
+    let mut writer = ExportWriter::begin(out, format, names).map_err(driver_err)?;
     let mut throttle = ProgressThrottle::new(progress);
 
     // Bail on cancel: drop the writer, remove the partial file, and report
@@ -421,58 +419,20 @@ fn export_blocking(
     macro_rules! bail_if_cancelled {
         () => {
             if cancel.load(Ordering::Relaxed) {
-                drop(out);
+                drop(writer);
                 let _ = std::fs::remove_file(out_path);
                 return Err(RedError::Interrupted);
             }
         };
     }
 
-    match format {
-        ExportFormat::Csv => {
-            writeln!(out, "{}", csv_record(names.iter().map(|s| s.as_str())))
-                .map_err(driver_err)?;
-            while let Some(row) = rows_iter.next().map_err(map_step_err)? {
-                bail_if_cancelled!();
-                let cells = extract_row(row, column_count, None)?;
-                let line = csv_record(
-                    cells
-                        .iter()
-                        .map(csv_cell)
-                        .collect::<Vec<_>>()
-                        .iter()
-                        .map(String::as_str),
-                );
-                writeln!(out, "{line}").map_err(driver_err)?;
-                written += 1;
-                throttle.tick(written);
-            }
-        }
-        ExportFormat::Json => {
-            write!(out, "[").map_err(driver_err)?;
-            while let Some(row) = rows_iter.next().map_err(map_step_err)? {
-                bail_if_cancelled!();
-                let cells = extract_row(row, column_count, None)?;
-                if written > 0 {
-                    write!(out, ",").map_err(driver_err)?;
-                }
-                write!(out, "\n  {{").map_err(driver_err)?;
-                for (i, value) in cells.iter().enumerate() {
-                    if i > 0 {
-                        write!(out, ",").map_err(driver_err)?;
-                    }
-                    write!(out, "{}:{}", json_string(&names[i]), json_value(value))
-                        .map_err(driver_err)?;
-                }
-                write!(out, "}}").map_err(driver_err)?;
-                written += 1;
-                throttle.tick(written);
-            }
-            write!(out, "\n]\n").map_err(driver_err)?;
-        }
+    while let Some(row) = rows_iter.next().map_err(map_step_err)? {
+        bail_if_cancelled!();
+        let cells = extract_row(row, column_count, None)?;
+        writer.write_row(&cells).map_err(driver_err)?;
+        throttle.tick(writer.written());
     }
-    out.flush().map_err(driver_err)?;
-    Ok(written)
+    writer.finish().map_err(driver_err)
 }
 
 /// A cell value as a bindable SQLite parameter (for seek bounds). A seek bound is

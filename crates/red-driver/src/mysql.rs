@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::BufWriter;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -35,10 +35,10 @@ use red_core::{
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::format::{
-    csv_cell, csv_record, json_string, json_value, strip_trailing, ProgressThrottle,
+use crate::format::{strip_trailing, ExportWriter, ProgressThrottle};
+use crate::{
+    driver_err, AbortSignal, ArmGuard, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor,
 };
-use crate::{driver_err, AbortSignal, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor};
 
 /// A live MySQL/MariaDB session. Holds a connection `Pool`: cursors take a
 /// dedicated connection for the duration of their stream, and the out-of-band
@@ -90,19 +90,46 @@ impl MysqlDriver {
     }
 
     /// An out-of-band cancel that `KILL QUERY <conn_id>`s on a *separate* pooled
-    /// connection — MySQL has no in-band cancel-request protocol. Idempotent: a
-    /// `KILL` that lands after the query finished (or the connection went idle) is
-    /// a harmless no-op. Shared by the streaming cursor and the one-shot fetches.
-    fn kill_token(&self, conn_id: u32) -> CancelToken {
+    /// connection — MySQL has no in-band cancel-request protocol. Shared by the
+    /// streaming cursor and the one-shot fetches.
+    ///
+    /// `alive` guards the connection-reuse race: MySQL thread ids are recycled, so
+    /// a `KILL` spawned by an `abort` that fired just as the query finished could
+    /// otherwise land on the *next* fetch handed the same id. The fetch flips
+    /// `alive` to `false` the instant it's done with its connection (before the
+    /// connection returns to the pool); the spawned `KILL` re-checks `alive` right
+    /// before firing, so a recycled id is left alone. (A genuine in-flight abort
+    /// still finds `alive == true` and kills the right query.)
+    fn kill_token(&self, conn_id: u32, alive: Arc<AtomicBool>) -> CancelToken {
         let pool = self.pool.clone();
         CancelToken::new(move || {
             let pool = pool.clone();
+            let alive = alive.clone();
             tokio::spawn(async move {
+                // Cheap pre-check, then a second check once we hold the kill
+                // connection — narrowing the window between "is our query still
+                // running?" and issuing the KILL to acquiring that connection.
+                if !alive.load(Ordering::SeqCst) {
+                    return;
+                }
                 if let Ok(mut c) = pool.get_conn().await {
-                    let _ = c.query_drop(format!("KILL QUERY {conn_id}")).await;
+                    if alive.load(Ordering::SeqCst) {
+                        let _ = c.query_drop(format!("KILL QUERY {conn_id}")).await;
+                    }
                 }
             });
         })
+    }
+
+    /// Arm `abort` with a `KILL QUERY` for `conn_id`, returning a guard that — on
+    /// drop at fetch completion — both disarms the signal *and* marks the fetch
+    /// finished (so a concurrently-spawned `KILL` skips the now-recycled id). The
+    /// guard is declared after the `Conn` at every call site, so it drops (and
+    /// flips `alive`) before the connection returns to the pool. See [`kill_token`].
+    fn arm_kill(&self, abort: &AbortSignal, conn_id: u32) -> KillGuard {
+        let alive = Arc::new(AtomicBool::new(true));
+        let arm = abort.arm(self.kill_token(conn_id, alive.clone()));
+        KillGuard { _arm: arm, alive }
     }
 
     /// Run a prepared display-capped seek query on a dedicated pooled connection,
@@ -116,7 +143,7 @@ impl MysqlDriver {
         abort: &AbortSignal,
     ) -> Result<ResultPage> {
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
-        let _guard = abort.arm(self.kill_token(conn.id()));
+        let _guard = self.arm_kill(abort, conn.id());
         if abort.is_aborted() {
             return Err(RedError::Interrupted);
         }
@@ -155,8 +182,11 @@ impl DatabaseDriver for MysqlDriver {
         let columns: Vec<Column> = stmt.columns().iter().map(col_meta).collect();
 
         // Out-of-band cancel: `KILL QUERY` on a *separate* pooled connection aborts
-        // the thread running this cursor's query.
-        let cancel = self.kill_token(conn_id);
+        // the thread running this cursor's query. `alive` guards the same
+        // connection-reuse race as the one-shot fetches (see `kill_token`): the
+        // pump flips it false before its connection returns to the pool.
+        let alive = Arc::new(AtomicBool::new(true));
+        let cancel = self.kill_token(conn_id, alive.clone());
 
         let (tx, rx) = mpsc::channel::<Result<Vec<Value>>>(opts.window.max(1));
         tokio::spawn(async move {
@@ -184,6 +214,10 @@ impl DatabaseDriver for MysqlDriver {
                     }
                 }
             }
+            // The pump is done with the connection: mark it released *before*
+            // `result`/`conn` drop it back to the pool, so a late `KILL` spawned by
+            // a concurrent cancel skips the now-recyclable id (see `kill_token`).
+            alive.store(false, Ordering::SeqCst);
             // `result` then `conn` drop here, returning the connection to the pool.
         });
 
@@ -323,7 +357,7 @@ impl DatabaseDriver for MysqlDriver {
     async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64> {
         let sql = format!("SELECT count(*) FROM ({}) AS _red", strip_trailing(sql));
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
-        let _guard = abort.arm(self.kill_token(conn.id()));
+        let _guard = self.arm_kill(abort, conn.id());
         if abort.is_aborted() {
             return Err(RedError::Interrupted);
         }
@@ -344,7 +378,7 @@ impl DatabaseDriver for MysqlDriver {
             strip_trailing(sql)
         );
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
-        let _guard = abort.arm(self.kill_token(conn.id()));
+        let _guard = self.arm_kill(abort, conn.id());
         if abort.is_aborted() {
             return Err(RedError::Interrupted);
         }
@@ -423,7 +457,7 @@ impl DatabaseDriver for MysqlDriver {
             strip_trailing(sql)
         );
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
-        let _guard = abort.arm(self.kill_token(conn.id()));
+        let _guard = self.arm_kill(abort, conn.id());
         if abort.is_aborted() {
             return Err(RedError::Interrupted);
         }
@@ -537,8 +571,8 @@ impl DatabaseDriver for MysqlDriver {
         let mut result = conn.exec_iter(&stmt, ()).await.map_err(map_my_err)?;
 
         let file = File::create(path).map_err(driver_err)?;
-        let mut out = BufWriter::new(file);
-        let mut written: u64 = 0;
+        let out = BufWriter::new(file);
+        let mut writer = ExportWriter::begin(out, format, names).map_err(driver_err)?;
         let mut throttle = ProgressThrottle::new(progress);
 
         // Bail on cancel: drop the writer, remove the partial file, and report
@@ -546,52 +580,36 @@ impl DatabaseDriver for MysqlDriver {
         macro_rules! bail_if_cancelled {
             () => {
                 if cancel.load(Ordering::Relaxed) {
-                    drop(out);
+                    drop(writer);
                     let _ = std::fs::remove_file(path);
                     return Err(RedError::Interrupted);
                 }
             };
         }
 
-        match format {
-            ExportFormat::Csv => {
-                writeln!(out, "{}", csv_record(names.iter().map(String::as_str)))
-                    .map_err(driver_err)?;
-                while let Some(row) = result.next().await.map_err(map_my_err)? {
-                    bail_if_cancelled!();
-                    let cells = my_row(&row, None);
-                    let fields: Vec<String> = cells.iter().map(csv_cell).collect();
-                    writeln!(out, "{}", csv_record(fields.iter().map(String::as_str)))
-                        .map_err(driver_err)?;
-                    written += 1;
-                    throttle.tick(written);
-                }
-            }
-            ExportFormat::Json => {
-                write!(out, "[").map_err(driver_err)?;
-                while let Some(row) = result.next().await.map_err(map_my_err)? {
-                    bail_if_cancelled!();
-                    let cells = my_row(&row, None);
-                    if written > 0 {
-                        write!(out, ",").map_err(driver_err)?;
-                    }
-                    write!(out, "\n  {{").map_err(driver_err)?;
-                    for (i, value) in cells.iter().enumerate() {
-                        if i > 0 {
-                            write!(out, ",").map_err(driver_err)?;
-                        }
-                        write!(out, "{}:{}", json_string(&names[i]), json_value(value))
-                            .map_err(driver_err)?;
-                    }
-                    write!(out, "}}").map_err(driver_err)?;
-                    written += 1;
-                    throttle.tick(written);
-                }
-                write!(out, "\n]\n").map_err(driver_err)?;
-            }
+        while let Some(row) = result.next().await.map_err(map_my_err)? {
+            bail_if_cancelled!();
+            let cells = my_row(&row, None);
+            writer.write_row(&cells).map_err(driver_err)?;
+            throttle.tick(writer.written());
         }
-        out.flush().map_err(driver_err)?;
-        Ok(written)
+        writer.finish().map_err(driver_err)
+    }
+}
+
+/// Holds a one-shot fetch's `KILL` arm for the fetch's lifetime. On drop (fetch
+/// done) it marks the fetch finished — *before* the connection returns to the pool
+/// — then the wrapped [`ArmGuard`] disarms the signal. See [`MysqlDriver::arm_kill`].
+struct KillGuard {
+    _arm: ArmGuard,
+    alive: Arc<AtomicBool>,
+}
+
+impl Drop for KillGuard {
+    fn drop(&mut self) {
+        // Flip `alive` first so an already-spawned `KILL` sees the connection is
+        // being released; the `_arm` field then disarms as it drops.
+        self.alive.store(false, Ordering::SeqCst);
     }
 }
 
@@ -867,7 +885,12 @@ mod tests {
         () => {
             match test_url() {
                 Some(u) => u,
-                None => return,
+                None => {
+                    // Visible skip (with `--nocapture`): a missing URL must read as
+                    // "not run", never a silent pass. CI sets the URL so it runs.
+                    eprintln!("SKIP {}: RED_TEST_MYSQL_URL not set", module_path!());
+                    return;
+                }
             }
         };
     }

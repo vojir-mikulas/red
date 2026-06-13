@@ -179,9 +179,9 @@ impl AppState {
             .id("connect-screen")
             .window_control_area(WindowControlArea::Drag)
             .on_click(|event, window, _| {
-                tracing::info!(count = event.click_count(), "connect-screen click");
+                tracing::trace!(count = event.click_count(), "connect-screen click");
                 if event.click_count() == 2 {
-                    tracing::info!("connect-screen double-click -> titlebar_double_click");
+                    tracing::trace!("connect-screen double-click -> titlebar_double_click");
                     #[cfg(target_os = "macos")]
                     window.titlebar_double_click();
                     #[cfg(not(target_os = "macos"))]

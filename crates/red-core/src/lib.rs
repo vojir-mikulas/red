@@ -839,11 +839,15 @@ pub enum ExportFormat {
 /// Per-query knobs carried UI → service → driver.
 #[derive(Debug, Clone)]
 pub struct QueryOptions {
-    /// Max rows per fetched window.
+    /// Max rows per fetched window. Read by the streaming cursor (`open_cursor`)
+    /// to size its row channel.
     pub window: usize,
-    /// Abort a single fetch that stalls longer than this — guards a runaway
-    /// query that computes a huge intermediate before yielding row 1.
-    /// `None` = no cap.
+    /// Abort a single streamed fetch that stalls longer than this — guards a
+    /// runaway query that computes a huge intermediate before yielding row 1.
+    /// Enforced by the *service*, not the driver: the dispatch loop races the
+    /// cursor's `next_window` against this deadline and fires the engine cancel on
+    /// expiry (see `drive_fetch`). The windowed `OpenResult` path uses the global
+    /// `statement_timeout` instead. `None` = no cap.
     pub timeout: Option<std::time::Duration>,
 }
 

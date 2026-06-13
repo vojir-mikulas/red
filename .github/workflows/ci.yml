@@ -40,6 +40,56 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  drivers:
+    name: network driver conformance (pg · mysql)
+    # The network drivers (Postgres/MySQL) live in `red-driver`/`red-service`,
+    # which don't depend on GPUI — so they build + test on the cheap Linux runner,
+    # where GitHub Actions service containers are available (they aren't on macOS).
+    # This exercises the conformance battery (NULL handling, cancel, keyset merge,
+    # capped-vs-full bytes) against real engines instead of skipping silently.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: red
+          POSTGRES_DB: red_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: red
+          MARIADB_DATABASE: red_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      RED_TEST_POSTGRES_URL: host=127.0.0.1 user=postgres password=red dbname=red_test
+      RED_TEST_MYSQL_URL: mysql://root:red@127.0.0.1:3306/red_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Only the engine-facing crates — no GPUI build on Linux. `--nocapture` so a
+      # missing service surfaces the `SKIP …` line instead of a silent pass.
+      - name: Test (red-driver · red-service, live engines)
+        run: cargo test -p red-driver -p red-service -- --nocapture
+
   deny:
     name: cargo-deny (supply chain)
     # No compile needed — cargo-deny reads the dependency graph — so the cheap

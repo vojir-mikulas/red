@@ -13,6 +13,18 @@
 //! the dmg, so Gatekeeper validates it on mount — a tampered or truncated
 //! download fails to attach. See the "checksum vs. notarization" decision in the
 //! plan.
+//!
+//! Authenticity is enforced on top of that integrity story: before the swap the
+//! mounted bundle is run through `codesign --verify --deep --strict` and
+//! `spctl --assess --type execute`, and its Team ID is required to match the
+//! *running* (already-Gatekeeper-validated) bundle's — so a compromised release
+//! serving some *other* notarized app can't be installed over Red. The download
+//! host is pinned to GitHub's asset hosts, and `curl` carries connect/total
+//! timeouts so a black-hole host can't tie up a blocking thread.
+//!
+//! The swap is staged, not in place: the new bundle is rsynced to a sibling
+//! `Red.app.new`, then swapped in with atomic renames (with rollback) — a failure
+//! mid-copy never leaves a half-written, unrunnable `Red.app` behind.
 
 use std::path::Path;
 
@@ -190,6 +202,14 @@ fn fetch_latest_release(repo: &str) -> Result<Release, String> {
         .args([
             "-sSL",
             "--fail",
+            "--proto",
+            "=https",
+            "--connect-timeout",
+            "30",
+            "--max-time",
+            "60",
+            "--max-redirs",
+            "5",
             "-H",
             "Accept: application/vnd.github+json",
             "-H",
@@ -212,13 +232,18 @@ fn fetch_latest_release(repo: &str) -> Result<Release, String> {
         .ok_or_else(|| "GitHub release has no tag_name".to_string())?
         .to_string();
     let html_url = json["html_url"].as_str().unwrap_or_default().to_string();
+    // Only accept a dmg whose download URL points at a GitHub asset host — the
+    // bytes are fed straight to `curl`, so a release that named some other host
+    // (a compromised API response) is treated as "no installable asset" and the
+    // UI falls back to the manual-download link.
     let dmg_url = json["assets"].as_array().and_then(|assets| {
         assets.iter().find_map(|asset| {
             let name = asset["name"].as_str()?;
-            name.ends_with(".dmg")
+            let url = name
+                .ends_with(".dmg")
                 .then(|| asset["browser_download_url"].as_str())
-                .flatten()
-                .map(str::to_string)
+                .flatten()?;
+            is_allowed_download_url(url).then(|| url.to_string())
         })
     });
 
@@ -227,6 +252,28 @@ fn fetch_latest_release(repo: &str) -> Result<Release, String> {
         html_url,
         dmg_url,
     })
+}
+
+/// Whether `url` is an `https` URL on a GitHub asset host. GitHub serves release
+/// assets from `github.com` (302-redirecting to `objects.githubusercontent.com`),
+/// so both are allowed; anything else is rejected before the bytes reach `curl`.
+fn is_allowed_download_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    // Host is everything up to the first `/`, `?`, or `#`; reject any userinfo
+    // (`@`) or port (`:`) so `github.com` can't be spoofed by `github.com@evil`.
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if host.contains('@') || host.contains(':') {
+        return false;
+    }
+    host == "github.com"
+        || host == "objects.githubusercontent.com"
+        || host.ends_with(".githubusercontent.com")
 }
 
 /// `true` when `latest` is a strictly higher semver than `current`. A tag that
@@ -278,19 +325,56 @@ fn installed_app_root() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Download the dmg, mount it (Gatekeeper validates the staple here), and replace
-/// the installed bundle from the mounted copy. The mount is always detached and
-/// the temp dir cleaned, even on a failed swap.
+/// Download the dmg, mount it (Gatekeeper validates the staple here), verify the
+/// mounted bundle's signature + Team ID against the running app, then stage-and-
+/// swap it over the installed bundle with atomic renames. The mount is always
+/// detached and the temp dir cleaned, even on a failed swap.
 #[cfg(target_os = "macos")]
 fn download_and_swap(dmg_url: &str, app_root: &Path) -> Result<(), String> {
-    let tmp = std::env::temp_dir().join(format!("red-update-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).map_err(|e| format!("creating temp dir: {e}"))?;
+    // Defence in depth: the URL was already screened when the release was parsed,
+    // but re-check here so this entry point can't be handed an arbitrary host.
+    if !is_allowed_download_url(dmg_url) {
+        return Err("refusing to download from a non-GitHub host".into());
+    }
+
+    // A private, hard-to-pre-create temp dir: `create_dir` (not `_all`) fails if
+    // the path already exists — defeating a symlink planted at a predictable name
+    // — and a nanosecond-stamped name keeps two updates (or an attacker's guess)
+    // from colliding. 0700 so only we can read the bytes mid-download.
+    let tmp = std::env::temp_dir().join(format!(
+        "red-update-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    std::fs::create_dir(&tmp).map_err(|e| format!("creating temp dir: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700));
+    }
     let dmg = tmp.join("Red.dmg");
     let mount = tmp.join("mnt");
 
     let result = (|| -> Result<(), String> {
         let dmg_path = dmg.to_str().ok_or("non-UTF-8 temp path")?;
-        run_cmd("curl", &["-sSL", "--fail", "-o", dmg_path, dmg_url])?;
+        run_cmd(
+            "curl",
+            &[
+                "-sSL",
+                "--fail",
+                "--proto",
+                "=https",
+                "--connect-timeout",
+                "30",
+                "--max-time",
+                "600",
+                "--max-redirs",
+                "5",
+                "-o",
+                dmg_path,
+                dmg_url,
+            ],
+        )?;
 
         std::fs::create_dir_all(&mount).map_err(|e| format!("creating mount dir: {e}"))?;
         let mount_path = mount.to_str().ok_or("non-UTF-8 mount path")?;
@@ -306,15 +390,13 @@ fn download_and_swap(dmg_url: &str, app_root: &Path) -> Result<(), String> {
             ],
         )?;
 
-        // rsync over the bundle in place. Trailing slashes copy *contents*;
-        // `--delete` removes files the new build dropped, so no stale binary
-        // lingers. Detach happens below regardless of this result.
-        let src = format!(
-            "{}/",
-            mount.join("Red.app").to_str().ok_or("bad mount path")?
-        );
-        let dst = format!("{}/", app_root.to_str().ok_or("bad app path")?);
-        let swap = run_cmd("rsync", &["-a", "--delete", &src, &dst]);
+        let mounted_app = mount.join("Red.app");
+        // Authenticity gate: the staple proved integrity on mount, but not that
+        // the contained app is *ours*. Verify the signature and require its Team
+        // ID to match the running bundle's, then stage-and-swap. Detach happens
+        // below regardless of this result.
+        let swap = verify_authentic(&mounted_app, app_root)
+            .and_then(|()| staged_swap(&mounted_app, app_root));
 
         let _ = std::process::Command::new("hdiutil")
             .args(["detach", mount_path])
@@ -324,6 +406,100 @@ fn download_and_swap(dmg_url: &str, app_root: &Path) -> Result<(), String> {
 
     let _ = std::fs::remove_dir_all(&tmp);
     result
+}
+
+/// Verify the mounted bundle is a genuine, Gatekeeper-acceptable Red build signed
+/// by the same Team ID as the *running* app. Three independent checks: a strict
+/// signature verification, a Gatekeeper assessment (notarization), and a Team ID
+/// match — so a compromised release serving a different (but notarized) app can't
+/// be installed over Red.
+#[cfg(target_os = "macos")]
+fn verify_authentic(mounted_app: &Path, running_app: &Path) -> Result<(), String> {
+    let app = mounted_app.to_str().ok_or("non-UTF-8 mounted app path")?;
+    run_cmd("codesign", &["--verify", "--deep", "--strict", app])
+        .map_err(|e| format!("downloaded bundle failed signature verification: {e}"))?;
+    run_cmd("spctl", &["--assess", "--type", "execute", app])
+        .map_err(|e| format!("downloaded bundle is not notarized/accepted: {e}"))?;
+
+    let theirs = team_identifier(mounted_app)
+        .ok_or("downloaded bundle has no Team ID — refusing to install")?;
+    // The running app passed Gatekeeper at launch; if we can read its Team ID,
+    // require a match. If we can't (an unsigned dev build), the signature + spctl
+    // checks above still stand on their own.
+    if let Some(ours) = team_identifier(running_app) {
+        if theirs != ours {
+            return Err(format!(
+                "downloaded bundle Team ID ({theirs}) does not match the installed app ({ours})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The `TeamIdentifier=` from `codesign -dvv` (printed to stderr). `None` when the
+/// bundle is unsigned or has no team (an ad-hoc / dev build).
+#[cfg(target_os = "macos")]
+fn team_identifier(app: &Path) -> Option<String> {
+    let out = std::process::Command::new("codesign")
+        .args(["-dvv", app.to_str()?])
+        .output()
+        .ok()?;
+    // `-dvv` writes the display to stderr.
+    let text = String::from_utf8_lossy(&out.stderr);
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("TeamIdentifier="))
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty() && id != "not set")
+}
+
+/// Replace `app_root` with `staged` (a mounted `Red.app`) without ever leaving a
+/// half-written bundle on disk: rsync into a sibling `Red.app.new`, then swap it in
+/// with atomic renames — the running process keeps its already-mapped pages, so a
+/// live swap is safe. On a failed final rename the previous bundle is restored.
+#[cfg(target_os = "macos")]
+fn staged_swap(staged: &Path, app_root: &Path) -> Result<(), String> {
+    let parent = app_root.parent().ok_or("app has no parent dir")?;
+    let new_app = parent.join("Red.app.new");
+    let old_app = parent.join(format!("Red.app.old-{}", std::process::id()));
+
+    // Clean any leftovers from a previous interrupted update.
+    let _ = std::fs::remove_dir_all(&new_app);
+    let _ = std::fs::remove_dir_all(&old_app);
+
+    // Materialize the new bundle fully *beside* the live one. A failure here leaves
+    // the running app untouched.
+    let src = format!("{}/", staged.to_str().ok_or("bad mount path")?);
+    let dst = format!("{}/", new_app.to_str().ok_or("bad staging path")?);
+    if let Err(e) = run_cmd("rsync", &["-a", "--delete", &src, &dst]) {
+        let _ = std::fs::remove_dir_all(&new_app);
+        return Err(e);
+    }
+
+    // Two atomic renames: move the live bundle aside, move the new one in. If the
+    // second fails, roll the original back so we never end up with no app.
+    std::fs::rename(app_root, &old_app).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&new_app);
+        format!("moving current bundle aside: {e}")
+    })?;
+    if let Err(e) = std::fs::rename(&new_app, app_root) {
+        let _ = std::fs::rename(&old_app, app_root); // rollback
+        let _ = std::fs::remove_dir_all(&new_app);
+        return Err(format!("installing new bundle: {e}"));
+    }
+
+    let _ = std::fs::remove_dir_all(&old_app);
+    Ok(())
+}
+
+/// A short, hard-to-guess suffix for the temp dir name, derived from the wall
+/// clock's nanoseconds. Not a security boundary on its own (the 0700 dir +
+/// `create_dir`-fails-if-exists are) — just makes the path unpredictable.
+#[cfg(target_os = "macos")]
+fn unique_suffix() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -373,5 +549,31 @@ mod tests {
         // Unparseable tags never trigger an update (no downgrade/sidegrade).
         assert!(!is_newer("garbage", "v0.1.4"));
         assert!(!is_newer("v0.2.0", "garbage"));
+    }
+
+    #[test]
+    fn download_host_is_pinned_to_github() {
+        // GitHub's two asset hosts are accepted.
+        assert!(is_allowed_download_url(
+            "https://github.com/o/r/releases/download/v1/Red.dmg"
+        ));
+        assert!(is_allowed_download_url(
+            "https://objects.githubusercontent.com/github-production-release-asset/x/Red.dmg"
+        ));
+        // Everything else is refused before the bytes reach curl.
+        assert!(!is_allowed_download_url(
+            "http://github.com/o/r/Red.dmg" // not https
+        ));
+        assert!(!is_allowed_download_url("https://evil.example.com/Red.dmg"));
+        assert!(!is_allowed_download_url(
+            "https://evil.com/github.com/Red.dmg"
+        ));
+        // Userinfo / port spoofs that embed `github.com` in the authority.
+        assert!(!is_allowed_download_url(
+            "https://github.com@evil.com/Red.dmg"
+        ));
+        assert!(!is_allowed_download_url(
+            "https://github.com.evil.com/Red.dmg"
+        ));
     }
 }

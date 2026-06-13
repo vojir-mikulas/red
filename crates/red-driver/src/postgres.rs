@@ -26,16 +26,14 @@ use red_core::{
     TableDetail, Value,
 };
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::BufWriter;
 use std::sync::Mutex as StdMutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, NoTls, Row, RowStream, Statement};
 
-use crate::format::{
-    csv_cell, csv_record, json_string, json_value, strip_trailing, ProgressThrottle,
-};
+use crate::format::{strip_trailing, ExportWriter, ProgressThrottle};
 use crate::pg_text;
 use crate::{
     driver_err, AbortSignal, ArmGuard, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor,
@@ -609,8 +607,8 @@ impl DatabaseDriver for PostgresDriver {
         futures_util::pin_mut!(stream);
 
         let file = File::create(path).map_err(driver_err)?;
-        let mut out = BufWriter::new(file);
-        let mut written: u64 = 0;
+        let out = BufWriter::new(file);
+        let mut writer = ExportWriter::begin(out, format, names).map_err(driver_err)?;
         let mut throttle = ProgressThrottle::new(progress);
 
         // Bail on cancel: drop the writer, remove the partial file, and report
@@ -618,54 +616,21 @@ impl DatabaseDriver for PostgresDriver {
         macro_rules! bail_if_cancelled {
             () => {
                 if cancel.load(Ordering::Relaxed) {
-                    drop(out);
+                    drop(writer);
                     let _ = std::fs::remove_file(path);
                     return Err(RedError::Interrupted);
                 }
             };
         }
 
-        match format {
-            ExportFormat::Csv => {
-                writeln!(out, "{}", csv_record(names.iter().map(String::as_str)))
-                    .map_err(driver_err)?;
-                while let Some(row) = stream.next().await {
-                    bail_if_cancelled!();
-                    let row = row.map_err(map_pg_err)?;
-                    let cells = pg_row(&row, None);
-                    let fields: Vec<String> = cells.iter().map(csv_cell).collect();
-                    writeln!(out, "{}", csv_record(fields.iter().map(String::as_str)))
-                        .map_err(driver_err)?;
-                    written += 1;
-                    throttle.tick(written);
-                }
-            }
-            ExportFormat::Json => {
-                write!(out, "[").map_err(driver_err)?;
-                while let Some(row) = stream.next().await {
-                    bail_if_cancelled!();
-                    let row = row.map_err(map_pg_err)?;
-                    let cells = pg_row(&row, None);
-                    if written > 0 {
-                        write!(out, ",").map_err(driver_err)?;
-                    }
-                    write!(out, "\n  {{").map_err(driver_err)?;
-                    for (i, value) in cells.iter().enumerate() {
-                        if i > 0 {
-                            write!(out, ",").map_err(driver_err)?;
-                        }
-                        write!(out, "{}:{}", json_string(&names[i]), json_value(value))
-                            .map_err(driver_err)?;
-                    }
-                    write!(out, "}}").map_err(driver_err)?;
-                    written += 1;
-                    throttle.tick(written);
-                }
-                write!(out, "\n]\n").map_err(driver_err)?;
-            }
+        while let Some(row) = stream.next().await {
+            bail_if_cancelled!();
+            let row = row.map_err(map_pg_err)?;
+            let cells = pg_row(&row, None);
+            writer.write_row(&cells).map_err(driver_err)?;
+            throttle.tick(writer.written());
         }
-        out.flush().map_err(driver_err)?;
-        Ok(written)
+        writer.finish().map_err(driver_err)
     }
 }
 
@@ -760,37 +725,12 @@ fn pg_row(row: &Row, cap: Option<CellCap>) -> Vec<Value> {
 
 fn pg_value(row: &Row, i: usize, max: Option<usize>) -> Value {
     match *row.columns()[i].type_() {
-        Type::BOOL => row
-            .try_get::<_, Option<bool>>(i)
-            .ok()
-            .flatten()
-            .map(|b| Value::Integer(b as i64))
-            .unwrap_or(Value::Null),
-        Type::INT2 => int_value(
-            row.try_get::<_, Option<i16>>(i)
-                .ok()
-                .flatten()
-                .map(i64::from),
-        ),
-        Type::INT4 => int_value(
-            row.try_get::<_, Option<i32>>(i)
-                .ok()
-                .flatten()
-                .map(i64::from),
-        ),
-        Type::INT8 => int_value(row.try_get::<_, Option<i64>>(i).ok().flatten()),
-        Type::FLOAT4 => row
-            .try_get::<_, Option<f32>>(i)
-            .ok()
-            .flatten()
-            .map(|x| Value::Real(x as f64))
-            .unwrap_or(Value::Null),
-        Type::FLOAT8 => row
-            .try_get::<_, Option<f64>>(i)
-            .ok()
-            .flatten()
-            .map(Value::Real)
-            .unwrap_or(Value::Null),
+        Type::BOOL => scalar(row, i, max, |b: bool| Value::Integer(b as i64)),
+        Type::INT2 => scalar(row, i, max, |n: i16| Value::Integer(i64::from(n))),
+        Type::INT4 => scalar(row, i, max, |n: i32| Value::Integer(i64::from(n))),
+        Type::INT8 => scalar(row, i, max, |n: i64| Value::Integer(n)),
+        Type::FLOAT4 => scalar(row, i, max, |x: f32| Value::Real(x as f64)),
+        Type::FLOAT8 => scalar(row, i, max, Value::Real),
         // Types `tokio-postgres` won't decode without an optional crate: render the
         // raw wire bytes to text ourselves (see `pg_text`) so they don't decode-fail
         // into a silent NULL. Each result is short except JSON, which honours `max`.
@@ -848,8 +788,19 @@ fn pg_value(row: &Row, i: usize, max: Option<usize>) -> Value {
     }
 }
 
-fn int_value(v: Option<i64>) -> Value {
-    v.map(Value::Integer).unwrap_or(Value::Null)
+/// Decode a scalar cell of type `T` and map it with `f`. A SQL NULL is
+/// [`Value::Null`]; a decode *error* (the column isn't the `T` we expected) falls
+/// back to the raw wire bytes as text via [`raw_text_fallback`] rather than
+/// collapsing to a silent NULL — the same safety the text `_` arm relies on.
+fn scalar<'a, T>(row: &'a Row, i: usize, max: Option<usize>, f: impl FnOnce(T) -> Value) -> Value
+where
+    T: tokio_postgres::types::FromSql<'a>,
+{
+    match row.try_get::<_, Option<T>>(i) {
+        Ok(Some(v)) => f(v),
+        Ok(None) => Value::Null,
+        Err(_) => raw_text_fallback(row, i, max),
+    }
 }
 
 /// Captures a column's raw binary wire bytes verbatim, so the driver can render the
@@ -968,7 +919,12 @@ mod tests {
         () => {
             match test_url() {
                 Some(u) => u,
-                None => return,
+                None => {
+                    // Visible skip (with `--nocapture`): a missing URL must read as
+                    // "not run", never a silent pass. CI sets the URL so it runs.
+                    eprintln!("SKIP {}: RED_TEST_POSTGRES_URL not set", module_path!());
+                    return;
+                }
             }
         };
     }

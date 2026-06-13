@@ -41,6 +41,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// so it stays O(stride) regardless of depth.
 const CHECKPOINT_STRIDE: usize = 10_000;
 
+/// Hard ceiling on rows pulled by one `CopyRows` (clipboard) request. `CopyRows`
+/// fetches at full fidelity into a single `Vec` carried in one event, so a
+/// "select all" over a 50M-row result would otherwise spike memory and the event
+/// queue. A million rows is far more than any clipboard usefully holds; beyond it
+/// the copy is capped (and the cap logged) rather than letting the backend balloon.
+const MAX_COPY_ROWS: usize = 1_000_000;
+
 /// An exact "go to row N" deeper than this kicks off a checkpoint-index build.
 /// Shallower jumps are served by a plain `OFFSET` (already fast), so tables
 /// nobody jumps deep into are never scanned.
@@ -189,6 +196,60 @@ impl SessionState {
     }
 }
 
+/// The result of a spawned connect/probe, delivered back to the dispatch loop so
+/// the (single-threaded) loop owns every mutation of `sessions`. Dialing runs off
+/// the loop — see [`CONNECT_TIMEOUT`] and the `Connect` arm — so one slow connect
+/// to a black-hole host can't freeze every other warm session's commands.
+enum ConnectOutcome {
+    /// A `Connect` finished. `gen` is the connect generation captured when it was
+    /// spawned; a stale one (superseded by a newer `Connect` on the same id) is
+    /// dropped rather than inserted.
+    Session {
+        id: SessionId,
+        generation: u64,
+        result: Result<Arc<dyn DatabaseDriver>, String>,
+    },
+    /// A session-less `TestConnection` finished — carries the server version on
+    /// success, the error message otherwise.
+    Test { result: Result<String, String> },
+}
+
+/// Apply a spawned connect/probe result on the dispatch loop. Insertion into
+/// `sessions` and the `Connected`/`TestSucceeded` emit happen here, never in the
+/// spawned task, so the loop stays the single owner of session state.
+fn apply_connect_outcome(
+    outcome: ConnectOutcome,
+    sessions: &mut HashMap<SessionId, SessionState>,
+    connect_gen: &HashMap<SessionId, u64>,
+    events: &Events,
+) {
+    match outcome {
+        ConnectOutcome::Session {
+            id,
+            generation,
+            result,
+        } => {
+            // A newer `Connect` on this id superseded the one that produced this
+            // result — drop it so a slow dial can't clobber a fresh session.
+            if connect_gen.get(&id).copied() != Some(generation) {
+                return;
+            }
+            match result {
+                Ok(driver) => {
+                    let version = driver.server_version();
+                    sessions.insert(id, SessionState::new(driver));
+                    emit(events, Some(id), Event::Connected { version });
+                }
+                Err(message) => emit(events, Some(id), Event::Error(message)),
+            }
+        }
+        ConnectOutcome::Test { result } => match result {
+            Ok(version) => emit(events, None, Event::TestSucceeded { version }),
+            Err(message) => emit(events, None, Event::TestFailed { message }),
+        },
+    }
+}
+
 pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events) {
     // The warm sessions, keyed by `SessionId`. Several stay live at once so the UI
     // can switch between connections instantly (no reconnect); each owns its
@@ -211,6 +272,12 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
     let page_fetch_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_PAGE_FETCHES));
     // Wakes the loop even when no command arrives, so idle sessions get swept.
     let mut sweep = tokio::time::interval(EVICT_SWEEP);
+    // `Connect`/`TestConnection` dial off the loop (a slow connect mustn't freeze
+    // other sessions) and report back over this channel; the loop applies the
+    // result. `connect_gen` tags each spawned connect so a superseded one is
+    // dropped instead of clobbering a newer session on the same id.
+    let (connect_tx, mut connect_rx) = tokio::sync::mpsc::unbounded_channel::<ConnectOutcome>();
+    let mut connect_gen: HashMap<SessionId, u64> = HashMap::new();
 
     // The self-updater runs as its own task on this runtime (off this loop, so a
     // download never stalls query dispatch). We forward its two global commands
@@ -232,6 +299,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 evict_idle(&mut sessions, foreground, &events);
                 continue;
             }
+            outcome = connect_rx.recv() => {
+                // The sender is held for the loop's lifetime, so `recv` only
+                // resolves with a real outcome (never `None`).
+                if let Some(outcome) = outcome {
+                    apply_connect_outcome(outcome, &mut sessions, &connect_gen, &events);
+                }
+                continue;
+            }
         };
         // Any command routed to a session counts as activity, deferring eviction.
         if let Some(id) = session_id {
@@ -247,14 +322,21 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 if let Some(mut old) = sessions.remove(&id) {
                     old.teardown();
                 }
-                match attempt_connect(&config).await {
-                    Ok(driver) => {
-                        let version = driver.server_version();
-                        sessions.insert(id, SessionState::new(driver));
-                        emit(&events, Some(id), Event::Connected { version });
-                    }
-                    Err(message) => emit(&events, Some(id), Event::Error(message)),
-                }
+                // Dial off the loop so a hung connect doesn't wedge dispatch; the
+                // result comes back over `connect_rx`. Bump the generation so a
+                // slower earlier attempt on this id is discarded when it lands.
+                let generation = connect_gen.entry(id).or_default();
+                *generation += 1;
+                let generation = *generation;
+                let tx = connect_tx.clone();
+                tokio::spawn(async move {
+                    let result = attempt_connect(&config).await;
+                    let _ = tx.send(ConnectOutcome::Session {
+                        id,
+                        generation,
+                        result,
+                    });
+                });
             }
 
             Command::SetActiveSession(id) => foreground = id,
@@ -274,22 +356,26 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             Command::TestConnection(config) => {
                 // A throwaway probe: connect, report, and let the driver drop. No
                 // session is created or disturbed — it's session-less (`None`).
-                match attempt_connect(&config).await {
-                    Ok(driver) => emit(
-                        &events,
-                        None,
-                        Event::TestSucceeded {
-                            version: driver.server_version(),
-                        },
-                    ),
-                    Err(message) => emit(&events, None, Event::TestFailed { message }),
-                }
+                // Spawned off the loop like `Connect`, so probing a dead host
+                // doesn't stall every warm session.
+                let tx = connect_tx.clone();
+                tokio::spawn(async move {
+                    let result = attempt_connect(&config)
+                        .await
+                        .map(|driver| driver.server_version());
+                    let _ = tx.send(ConnectOutcome::Test { result });
+                });
             }
 
             Command::Disconnect | Command::CloseSession => {
                 let Some(id) = session_id else { continue };
                 if let Some(mut state) = sessions.remove(&id) {
                     state.teardown();
+                }
+                // Invalidate any in-flight connect for this id so its late outcome
+                // can't resurrect the session the user just closed.
+                if let Some(g) = connect_gen.get_mut(&id) {
+                    *g += 1;
                 }
                 if foreground == session_id {
                     foreground = None;
@@ -727,6 +813,18 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 };
                 // Same windowed read as a page fetch, but `Full` so the rows carry the
                 // real values (the grid's display cap is bypassed) for the clipboard.
+                // Bounded by `MAX_COPY_ROWS` so a select-all can't pull an unbounded
+                // result into one Vec/event.
+                let limit = if limit > MAX_COPY_ROWS {
+                    tracing::warn!(
+                        requested = limit,
+                        cap = MAX_COPY_ROWS,
+                        "CopyRows capped to the row ceiling"
+                    );
+                    MAX_COPY_ROWS
+                } else {
+                    limit
+                };
                 let events = events.clone();
                 let limit_src = page_fetch_limit.clone();
                 tokio::spawn(async move {

@@ -371,24 +371,30 @@ pub fn github_dark() -> Theme {
 
 /// Ayu Dark carrying Red's brand accent (`#dc2626`) — the dark face of the app.
 /// `accent_hover` is the lighter red-500, white text sits atop the red.
+/// `bg_selected` is recoloured from Ayu's stock blue wash to a dark brand-red tint
+/// so selections read on-brand rather than blue.
 pub fn ayu_dark() -> Theme {
     Theme {
         accent: h(0xdc2626),
         accent_hover: h(0xef4444),
         accent_ghost: h(0xdc2626).opacity(0.18),
         on_accent: h(0xffffff),
+        bg_selected: h(0x4a2126),
         ..Theme::ayu_dark()
     }
 }
 
 /// Ayu Light carrying Red's brand accent (`#dc2626`) — the light counterpart for
 /// `mode = light` (or `mode = system` on a light OS). White text sits atop the red.
+/// `bg_selected` is recoloured from Ayu's stock blue wash to a soft brand-red tint
+/// so selections read on-brand rather than blue.
 pub fn ayu_light() -> Theme {
     Theme {
         accent: h(0xdc2626),
         accent_hover: h(0xef4444),
         accent_ghost: h(0xdc2626).opacity(0.12),
         on_accent: h(0xffffff),
+        bg_selected: h(0xfbdcdc),
         ..Theme::ayu_light()
     }
 }
