@@ -62,6 +62,43 @@ pub(crate) enum Pane {
     Grid,
 }
 
+/// Which key the welcome screen's saved-connection list is ordered by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectSortField {
+    Name,
+    Recent,
+}
+
+/// How the welcome screen's saved-connection list is ordered: a key plus a
+/// direction. `ascending` is the key's natural order — A→Z for `Name`, oldest
+/// (and never-used) first for `Recent`. Each toolbar button selects its field;
+/// clicking the active field again flips the direction. Default is `Recent`
+/// descending (most-recently-used first), matching the on-load order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConnectSort {
+    pub field: ConnectSortField,
+    pub ascending: bool,
+}
+
+impl ConnectSort {
+    /// The direction a field defaults to when first selected: names read A→Z,
+    /// recency reads newest-first.
+    fn default_ascending(field: ConnectSortField) -> bool {
+        matches!(field, ConnectSortField::Name)
+    }
+
+    /// Select `field`, or — if it's already active — flip the direction. The
+    /// welcome screen's sort buttons drive this.
+    pub(crate) fn toggle(&mut self, field: ConnectSortField) {
+        if self.field == field {
+            self.ascending = !self.ascending;
+        } else {
+            self.field = field;
+            self.ascending = Self::default_ascending(field);
+        }
+    }
+}
+
 /// Which top-level screen is showing.
 pub(crate) enum Phase {
     Disconnected,
@@ -536,7 +573,13 @@ pub struct AppState {
     /// Whether the keyboard-shortcuts reference overlay (`⌘/`) is showing.
     pub(crate) shortcuts_open: bool,
     /// Keyboard-highlighted saved-connection card on the disconnected screen.
+    /// Indexes the *visible* (filtered + sorted) list, not `connections`.
     pub(crate) connect_sel: usize,
+    /// The welcome screen's connection search box. Filters the saved-connection
+    /// list by name / target as the user types (see [`Self::visible_connections`]).
+    pub(crate) connect_search: Entity<TextInput>,
+    /// The active sort order for the welcome screen's connection list.
+    pub(crate) connect_sort: ConnectSort,
     /// A pane to focus on the next render, when the focus move originates from a
     /// place without a `Window` (e.g. an editor `Escape` event). Drained in
     /// `render`, which has the `Window` `focus` needs.
@@ -727,6 +770,41 @@ impl AppState {
 
         let connections = config::load();
 
+        // The welcome screen's connection search box. Bare (the styled toolbar
+        // wraps it) and out of the Tab ring (it's a standalone filter, not a form
+        // field). A `Change` re-renders the list and resets the keyboard highlight;
+        // Enter connects to the highlighted card; Esc clears the query.
+        let connect_search = cx.new(|cx| {
+            TextInput::new(cx)
+                .bare()
+                .tab_stop(false)
+                .with_placeholder("Search connections…")
+        });
+        cx.subscribe(
+            &connect_search,
+            |this, _, event: &TextInputEvent, cx| match event {
+                TextInputEvent::Change => {
+                    this.connect_sel = 0;
+                    cx.notify();
+                }
+                TextInputEvent::Submit => {
+                    let visible = this.visible_connections(cx);
+                    if let Some(&ix) =
+                        visible.get(this.connect_sel.min(visible.len().saturating_sub(1)))
+                    {
+                        this.connect(ix, cx);
+                    }
+                }
+                TextInputEvent::Cancel => {
+                    this.connect_search
+                        .update(cx, |i, cx| i.set_content("", cx));
+                    this.connect_sel = 0;
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+
         // The connection switcher (⌘P). Seed its sections off the just-loaded
         // connections; `rebuild_switcher` refreshes them on every connect/disconnect.
         let switcher = cx.new(|cx| {
@@ -890,6 +968,11 @@ impl AppState {
             refocus_root: true,
             shortcuts_open: false,
             connect_sel: 0,
+            connect_search,
+            connect_sort: ConnectSort {
+                field: ConnectSortField::Recent,
+                ascending: false,
+            },
             pending_focus: None,
             focus_name_field: false,
             focus_history: false,

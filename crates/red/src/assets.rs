@@ -28,6 +28,7 @@ const FONT_FILES: &[&str] = &[
 #[folder = "$CARGO_MANIFEST_DIR/../../assets"]
 #[include = "fonts/*"]
 #[include = "icons/*"]
+#[include = "red.svg"]
 pub struct Assets;
 
 /// The bundled, fully-commented reference settings — RED's settings docs. Baked

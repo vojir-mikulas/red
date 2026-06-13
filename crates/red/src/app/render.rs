@@ -118,10 +118,15 @@ impl Render for AppState {
             }
         }
 
-        // ⌘F / search command — reveal the sidebar and focus the schema filter.
+        // ⌘F / search command — on the welcome screen, focus the connection search
+        // box; in the connected shell, reveal the sidebar and focus the schema filter.
         if self.focus_search {
             self.focus_search = false;
-            self.open_schema_search(window, cx);
+            if matches!(self.phase, Phase::Disconnected) {
+                window.focus(&self.connect_search.focus_handle(cx), cx);
+            } else {
+                self.open_schema_search(window, cx);
+            }
         }
 
         // ⌘⇧F — the result filter bar just opened; focus its input to type at once.
@@ -294,44 +299,48 @@ impl Render for AppState {
             // Welcome-screen card navigation (the modals own their own Esc/Enter
             // via Flint's `Modal` focus handling). ↑/↓ move the highlight, Enter
             // connects. Only acts on the disconnected screen with no form open.
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if !matches!(this.phase, Phase::Disconnected)
                     || this.form.is_some()
                     || this.any_modal_open()
                 {
                     return;
                 }
-                let n = this.connections.len();
+                // Navigate the *visible* (filtered + sorted) list; `connect_sel` is a
+                // position within it, mapped back to the stored index for actions.
+                let visible = this.visible_connections(cx);
+                let n = visible.len();
                 if n == 0 {
                     return;
                 }
+                // While the search box has focus, letters/backspace must edit the
+                // query — only the navigation keys act as card shortcuts there.
+                let search_focused = this.connect_search.focus_handle(cx).is_focused(window);
+                let sel = this.connect_sel.min(n - 1);
                 match event.keystroke.key.as_str() {
                     "up" => {
-                        this.connect_sel = this.connect_sel.saturating_sub(1);
+                        this.connect_sel = sel.saturating_sub(1);
                         cx.stop_propagation();
                         cx.notify();
                     }
                     "down" => {
-                        this.connect_sel = (this.connect_sel + 1).min(n - 1);
+                        this.connect_sel = (sel + 1).min(n - 1);
                         cx.stop_propagation();
                         cx.notify();
                     }
                     "enter" => {
-                        let ix = this.connect_sel.min(n - 1);
                         cx.stop_propagation();
-                        this.connect(ix, cx);
+                        this.connect(visible[sel], cx);
                     }
                     // E edits the highlighted connection, ⌫/⌦ asks to remove it —
                     // the keyboard mirrors the hover edit/trash buttons on each card.
-                    "e" => {
-                        let ix = this.connect_sel.min(n - 1);
+                    "e" if !search_focused => {
                         cx.stop_propagation();
-                        this.open_edit_form(ix, cx);
+                        this.open_edit_form(visible[sel], cx);
                     }
-                    "backspace" | "delete" => {
-                        let ix = this.connect_sel.min(n - 1);
+                    "backspace" | "delete" if !search_focused => {
                         cx.stop_propagation();
-                        this.request_delete_connection(ix, cx);
+                        this.request_delete_connection(visible[sel], cx);
                     }
                     _ => {}
                 }

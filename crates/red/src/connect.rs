@@ -11,7 +11,7 @@ use gpui::{
 };
 use red_core::DbKind;
 
-use crate::app::{AppState, FormState, TestState};
+use crate::app::{AppState, ConnectSortField, FormState, TestState};
 
 /// The six label colors a connection can be tagged with, mapped onto semantic
 /// theme tokens so they track the active theme. A connection stores the index.
@@ -51,8 +51,8 @@ pub(crate) fn fmt_ago(secs: Option<u64>) -> String {
     }
 }
 
-/// A section heading ("Saved connections", "Recent") with a hairline rule that
-/// fills the rest of the row — the divider the welcome layout uses.
+/// A section heading ("Saved connections") with a hairline rule that fills the
+/// rest of the row — the divider the welcome layout uses.
 fn section_label(label: &'static str, theme: &flint::Theme) -> impl IntoElement {
     div()
         .flex()
@@ -75,28 +75,28 @@ impl AppState {
         // Build the cards first — they reborrow `cx` mutably — then read the theme
         // for the surrounding chrome (it holds an immutable borrow). The form modal
         // is rendered at the root (see `render.rs`) so it works in any phase.
-        let cards: Vec<AnyElement> = self
-            .connections
+        //
+        // Cards follow the visible (filtered + sorted) order; each carries its
+        // original index into `connections` so connect/edit/delete still address the
+        // stored connection regardless of display order, while the keyboard
+        // highlight (`connect_sel`) tracks the display position.
+        let visible = self.visible_connections(cx);
+        let cards: Vec<AnyElement> = visible
             .iter()
             .enumerate()
-            .map(|(ix, stored)| {
-                self.connection_card(ix, &stored.config, cx)
-                    .into_any_element()
+            .map(|(display_ix, &orig_ix)| {
+                let stored = &self.connections[orig_ix];
+                self.connection_card(
+                    display_ix,
+                    orig_ix,
+                    &stored.config,
+                    stored.last_accessed,
+                    cx,
+                )
+                .into_any_element()
             })
             .collect();
-        // "Recent" = the saved connections that have actually been opened, newest
-        // first (the list arrives recency-sorted from `config::load`), capped at 3.
-        let recents: Vec<AnyElement> = self
-            .connections
-            .iter()
-            .enumerate()
-            .filter(|(_, stored)| stored.last_accessed.is_some())
-            .take(3)
-            .map(|(ix, stored)| {
-                self.recent_row(ix, &stored.config, stored.last_accessed, cx)
-                    .into_any_element()
-            })
-            .collect();
+        let toolbar = (!self.connections.is_empty()).then(|| self.connect_toolbar(cx));
         let new_button = self.new_button(cx);
         let settings_gear = IconButton::new(
             "connect-settings",
@@ -109,48 +109,43 @@ impl AppState {
 
         let theme = cx.theme();
 
-        // Red's wordmark sits in Nyx's logo slot — the square brand mark above the
-        // word, the tagline as the title tier, then a one-line descriptor, all
-        // centered. The mark and wordmark take the accent so they re-tint with the
-        // active theme (`red.svg` renders as an accent-masked square).
+        // The brand lockup: the square mark beside the wordmark, centered. Both take
+        // the accent so they re-tint with the active theme (`red.svg` renders as an
+        // accent-masked square).
         let header = div()
             .flex()
-            .flex_col()
             .items_center()
-            .text_center()
+            .justify_center()
+            .gap_3()
             .child(
                 gpui::svg()
                     .path("red.svg")
-                    .size(theme.scale(64.))
+                    .size(theme.scale(40.))
                     .flex_none()
                     .text_color(theme.accent),
             )
             .child(
+                // The wordmark sits in the primary text color (white on the dark
+                // themes), so it reads as a label beside the red brand mark.
                 div()
-                    .mt_3()
-                    .text_color(theme.accent)
+                    .text_color(theme.text)
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_size(theme.scale(34.))
                     .child("Red"),
-            )
-            .child(
-                div()
-                    .text_size(theme.scale(20.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .mt_1()
-                    .child("Roughly Enough Data"),
-            )
-            .child(div().text_size(theme.scale(14.)).text_color(theme.text_faint).mt_1().child(
-                "A fast, native database explorer. Pick a connection below, or create a new one.",
-            ));
+            );
 
-        let saved: AnyElement = if self.connections.is_empty() {
+        let empty_note = |msg: &'static str, theme: &Theme| {
             div()
                 .py_2()
                 .text_size(theme.scale(12.))
                 .text_color(theme.text_faint)
-                .child("No saved connections yet.")
+                .child(msg)
                 .into_any_element()
+        };
+        let saved: AnyElement = if self.connections.is_empty() {
+            empty_note("No saved connections yet.", theme)
+        } else if cards.is_empty() {
+            empty_note("No connections match your search.", theme)
         } else {
             div()
                 .flex()
@@ -168,28 +163,12 @@ impl AppState {
             .pb(px(60.))
             .child(header)
             .child(section_label("Saved connections", theme))
+            .children(toolbar)
             .child(saved)
-            .child(new_button)
-            .when(!recents.is_empty(), |this| {
-                this.child(section_label("Recent", theme))
-                    .child(div().flex().flex_col().gap_1p5().children(recents))
-            });
+            .child(new_button);
 
-        // The whole backdrop drags the window (seamless traffic lights float over
-        // it); the rows + buttons keep their own hitboxes.
         let screen = div()
             .id("connect-screen")
-            .window_control_area(WindowControlArea::Drag)
-            .on_click(|event, window, _| {
-                tracing::trace!(count = event.click_count(), "connect-screen click");
-                if event.click_count() == 2 {
-                    tracing::trace!("connect-screen double-click -> titlebar_double_click");
-                    #[cfg(target_os = "macos")]
-                    window.titlebar_double_click();
-                    #[cfg(not(target_os = "macos"))]
-                    window.zoom_window();
-                }
-            })
             .size_full()
             .overflow_y_scroll()
             .flex()
@@ -200,6 +179,27 @@ impl AppState {
             .font_family(theme.font_family.clone())
             .child(column);
 
+        // Only a slim strip at the top drags the window (double-click zooms) —
+        // mirroring the connected shell, where dragging is confined to the topbar.
+        // The rest of the welcome screen stays clickable without moving the window.
+        // It sits in the column's empty top padding, behind the settings gear.
+        let drag_strip = div()
+            .id("connect-drag")
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(38.))
+            .window_control_area(WindowControlArea::Drag)
+            .on_click(|event, window, _| {
+                if event.click_count() == 2 {
+                    #[cfg(target_os = "macos")]
+                    window.titlebar_double_click();
+                    #[cfg(not(target_os = "macos"))]
+                    window.zoom_window();
+                }
+            });
+
         // Settings gear floats top-right (the disconnected screen has no top bar).
         let gear = div()
             .absolute()
@@ -207,7 +207,152 @@ impl AppState {
             .right(px(16.))
             .child(settings_gear);
 
-        div().size_full().relative().child(screen).child(gear)
+        div()
+            .size_full()
+            .relative()
+            .child(screen)
+            .child(drag_strip)
+            .child(gear)
+    }
+
+    /// The saved-connection indices to show, in display order: filtered by the
+    /// welcome-screen search box, then ordered by the active sort mode. Returns
+    /// indices into `self.connections` so the cards and keyboard actions still
+    /// address the stored connection regardless of display order.
+    pub(crate) fn visible_connections(&self, cx: &Context<Self>) -> Vec<usize> {
+        let query = self.connect_search.read(cx).content().trim().to_lowercase();
+        let mut indices: Vec<usize> = self
+            .connections
+            .iter()
+            .enumerate()
+            .filter(|(_, stored)| {
+                query.is_empty()
+                    || stored.config.name.to_lowercase().contains(&query)
+                    || stored
+                        .config
+                        .display_target()
+                        .to_lowercase()
+                        .contains(&query)
+            })
+            .map(|(ix, _)| ix)
+            .collect();
+        // Compare by the active key in its natural (ascending) order, then flip for
+        // a descending sort. For `Recent`, `Option<u64>` orders `None` (never used)
+        // before any timestamp, so ascending lists never-used/oldest first.
+        let asc = self.connect_sort.ascending;
+        indices.sort_by(|&a, &b| {
+            let ord = match self.connect_sort.field {
+                ConnectSortField::Recent => self.connections[a]
+                    .last_accessed
+                    .cmp(&self.connections[b].last_accessed),
+                ConnectSortField::Name => self.connections[a]
+                    .config
+                    .name
+                    .to_lowercase()
+                    .cmp(&self.connections[b].config.name.to_lowercase()),
+            };
+            if asc {
+                ord
+            } else {
+                ord.reverse()
+            }
+        });
+        indices
+    }
+
+    /// The toolbar above the saved-connection list: a search box that filters the
+    /// list as you type, and the Name / Recent sort toggle.
+    fn connect_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Build the sort cells first (they reborrow `cx` for their listeners), then
+        // read the theme for the search box's chrome.
+        let sort_name = self.sort_cell("Name", ConnectSortField::Name, cx);
+        let sort_recent = self.sort_cell("Recent", ConnectSortField::Recent, cx);
+        let theme = cx.theme();
+
+        let search = div()
+            .flex_1()
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(px(34.))
+            .px_2p5()
+            .rounded(theme.radius)
+            .bg(theme.bg_input)
+            .border_1()
+            .border_color(theme.border)
+            .text_size(theme.scale(13.))
+            .text_color(theme.text)
+            .child(crate::icons::icon(
+                "search",
+                theme.scale(14.),
+                theme.text_faint,
+            ))
+            .child(div().flex_1().min_w_0().child(self.connect_search.clone()));
+
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .mb_2()
+            .child(search)
+            .child(sort_name)
+            .child(sort_recent)
+    }
+
+    /// One cell of the Name / Recent sort toggle. The active field takes the accent
+    /// treatment and its arrow shows the live direction; an inactive cell shows the
+    /// direction a first click would apply. Clicking the active field flips the
+    /// direction (see [`ConnectSort::toggle`]). Both share the cards' subtle hover
+    /// so the welcome screen's interactive surfaces feel consistent.
+    fn sort_cell(
+        &self,
+        label: &'static str,
+        field: ConnectSortField,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let on = self.connect_sort.field == field;
+        // The arrow reflects the current direction when active, else the direction
+        // this cell would select on a first click.
+        let ascending = if on {
+            self.connect_sort.ascending
+        } else {
+            matches!(field, ConnectSortField::Name)
+        };
+        let icon_name = if ascending { "sort-asc" } else { "sort-desc" };
+        let (bg, border, text) = if on {
+            (theme.accent_ghost, theme.accent, theme.text)
+        } else {
+            (theme.bg_input, theme.border, theme.text_muted)
+        };
+        let icon_tint = if on { theme.accent } else { theme.text_faint };
+        div()
+            .id(SharedString::from(format!("connect-sort-{label}")))
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .h(px(34.))
+            .px_2p5()
+            .rounded(theme.radius)
+            .bg(bg)
+            .border_1()
+            .border_color(border)
+            .text_size(theme.scale(12.5))
+            .text_color(text)
+            .cursor_pointer()
+            // Keep the accent border on the active cell while still giving feedback;
+            // the inactive cells strengthen their border like the connection cards.
+            .when(on, |d| d.hover(|s| s.bg(theme.bg_active)))
+            .when(!on, |d| {
+                d.hover(|s| s.border_color(theme.border_strong).bg(theme.bg_active))
+            })
+            .child(crate::icons::icon(icon_name, theme.scale(13.), icon_tint))
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.connect_sort.toggle(field);
+                this.connect_sel = 0;
+                cx.notify();
+            }))
     }
 
     fn new_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -257,8 +402,10 @@ impl AppState {
 
     fn connection_card(
         &self,
-        index: usize,
+        display_ix: usize,
+        orig_ix: usize,
         config: &red_core::ConnectionConfig,
+        last_accessed: Option<u64>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
@@ -270,7 +417,7 @@ impl AppState {
             DbKind::Postgres => (BadgeVariant::Special, "Postgres"),
             DbKind::Mysql => (BadgeVariant::Warning, "MySQL"),
         };
-        let group = SharedString::from(format!("connect-card-{index}"));
+        let group = SharedString::from(format!("connect-card-{orig_ix}"));
         // Accessible name: the connection's name, engine, and read-only state —
         // the card is the welcome screen's primary action, announced as a button.
         let a11y_name = if config.read_only {
@@ -280,7 +427,7 @@ impl AppState {
         };
 
         div()
-            .id(SharedString::from(format!("connect-{index}")))
+            .id(SharedString::from(format!("connect-{orig_ix}")))
             .role(Role::Button)
             .aria_label(a11y_name)
             .group(group.clone())
@@ -294,7 +441,7 @@ impl AppState {
             .border_1()
             // The keyboard-highlighted card (↑/↓ on the welcome screen) gets the
             // accent border; the rest sit on the neutral border until hovered.
-            .border_color(if index == self.connect_sel {
+            .border_color(if display_ix == self.connect_sel {
                 theme.accent
             } else {
                 theme.border
@@ -367,6 +514,16 @@ impl AppState {
                             .child(config.display_target()),
                     ),
             )
+            // The last-used recency, shown by default and hidden on hover to make
+            // room for the actions — so sorting by "Recent" is legible at a glance.
+            .child(
+                div()
+                    .flex_none()
+                    .group_hover(group.clone(), |s| s.invisible())
+                    .text_size(theme.scale(11.5))
+                    .text_color(theme.text_faint)
+                    .child(fmt_ago(last_accessed)),
+            )
             // Chevron by default, swapped for Edit / Remove on hover (the buttons
             // stop propagation so they don't open the connection).
             .child(
@@ -390,7 +547,7 @@ impl AppState {
                             .group_hover(group, |s| s.visible())
                             .child(
                                 IconButton::new(
-                                    SharedString::from(format!("edit-{index}")),
+                                    SharedString::from(format!("edit-{orig_ix}")),
                                     crate::icons::icon("edit", theme.scale(14.), theme.text_muted),
                                 )
                                 .size(IconButtonSize::Sm)
@@ -398,13 +555,13 @@ impl AppState {
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         cx.stop_propagation();
-                                        this.open_edit_form(index, cx);
+                                        this.open_edit_form(orig_ix, cx);
                                     },
                                 )),
                             )
                             .child(
                                 IconButton::new(
-                                    SharedString::from(format!("delete-{index}")),
+                                    SharedString::from(format!("delete-{orig_ix}")),
                                     crate::icons::icon("trash", theme.scale(14.), theme.red),
                                 )
                                 .size(IconButtonSize::Sm)
@@ -412,75 +569,13 @@ impl AppState {
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         cx.stop_propagation();
-                                        this.request_delete_connection(index, cx);
+                                        this.request_delete_connection(orig_ix, cx);
                                     },
                                 )),
                             ),
                     ),
             )
-            .on_click(cx.listener(move |this, _, _, cx| this.connect(index, cx)))
-    }
-
-    fn recent_row(
-        &self,
-        index: usize,
-        config: &red_core::ConnectionConfig,
-        last_accessed: Option<u64>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = cx.theme();
-        div()
-            .id(SharedString::from(format!("connect-recent-{index}")))
-            .flex()
-            .items_center()
-            .gap(px(13.))
-            .py(px(9.))
-            .px(px(14.))
-            .rounded(theme.radius)
-            .bg(theme.bg_elevated)
-            .border_1()
-            .border_color(theme.border)
-            .cursor_pointer()
-            .hover(|s| s.border_color(theme.border_strong).bg(theme.bg_active))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .size(px(28.))
-                    .rounded(px(8.))
-                    .bg(theme.bg_input)
-                    .border_1()
-                    .border_color(theme.border_soft)
-                    .child(crate::icons::icon(
-                        "clock",
-                        theme.scale(14.),
-                        theme.text_faint,
-                    )),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .text_size(theme.scale(14.))
-                            .truncate()
-                            .child(config.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(theme.scale(12.))
-                            .text_color(theme.text_faint)
-                            .child(fmt_ago(last_accessed)),
-                    ),
-            )
-            .child(crate::icons::icon(
-                "chevron",
-                theme.scale(15.),
-                theme.text_dim,
-            ))
-            .on_click(cx.listener(move |this, _, _, cx| this.connect(index, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| this.connect(orig_ix, cx)))
     }
 
     pub(crate) fn render_form(&self, form: &FormState, cx: &mut Context<Self>) -> impl IntoElement {
