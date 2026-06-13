@@ -373,6 +373,11 @@ pub fn github_dark() -> Theme {
 /// `accent_hover` is the lighter red-500, white text sits atop the red.
 /// `bg_selected` is recoloured from Ayu's stock blue wash to a dark brand-red tint
 /// so selections read on-brand rather than blue.
+///
+/// The surface ramp is widened past Flint's near-flat Ayu defaults so the editor,
+/// bars and side panels read as distinct depths (the Zed Ayu look): the editor is
+/// the deepest canvas, bars sit one step up, side panels are the raised "ui" tone,
+/// popovers float highest.
 pub fn ayu_dark() -> Theme {
     Theme {
         accent: h(0xdc2626),
@@ -380,6 +385,13 @@ pub fn ayu_dark() -> Theme {
         accent_ghost: h(0xdc2626).opacity(0.18),
         on_accent: h(0xffffff),
         bg_selected: h(0x4a2126),
+        border: h(0x3f4043),
+
+        bg_app: h(0x0e1015),      // editor / results canvas
+        bg_panel_2: h(0x181a1f),  // deep wells (tab-strip troughs)
+        bg_panel: h(0x1f2126),    // side panels
+        bg_bar: h(0x2d2f33),      // toolbars / tab strip
+        bg_elevated: h(0x2d2f33), // popovers / modals
         ..Theme::ayu_dark()
     }
 }

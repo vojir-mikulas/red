@@ -208,6 +208,7 @@ impl QueryTab {
         let editor = cx.new(|cx| {
             CodeEditor::new(cx)
                 .highlighter(crate::sql::tokenize)
+                .corner_radius(px(0.))
                 .with_content(EMPTY_QUERY)
         });
         // ⌘↵ runs the active tab's statement / selection; Esc (with no completion

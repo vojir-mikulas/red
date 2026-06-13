@@ -483,6 +483,7 @@ impl AppState {
                 SplitPane::new("result-split-inspector", Axis::Horizontal)
                     .sized(SplitSide::Trailing)
                     .size(active.inspector_w)
+                    .gutter(px(1.))
                     .drag(active.inspector_drag)
                     .min_first(px(260.))
                     .max_first(px(720.))

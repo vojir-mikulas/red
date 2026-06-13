@@ -120,6 +120,7 @@ impl AppState {
             let end = view.clone();
             SplitPane::new("shell-split-v", Axis::Vertical)
                 .size(active.editor_h)
+                .gutter(px(1.))
                 .drag(active.editor_drag)
                 .min_first(px(80.))
                 .on_drag_start(move |anchor, _, cx| {
@@ -167,6 +168,7 @@ impl AppState {
             let end = view.clone();
             let outer = SplitPane::new("shell-split-h", Axis::Horizontal)
                 .size(active.sidebar_w)
+                .gutter(px(1.))
                 .drag(active.sidebar_drag)
                 .min_first(px(160.))
                 .max_first(px(480.))
