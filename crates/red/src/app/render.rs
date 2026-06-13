@@ -187,6 +187,11 @@ impl Render for AppState {
             self.modal_focus_trap = None;
         }
 
+        // Keep a tabbed-to settings control on screen: detect the focused dropdown/
+        // size input and scroll the content pane to it if it's off the fold. Runs
+        // before the panel is built so the focused control can tag its bounds.
+        self.update_settings_scroll(window, cx);
+
         // Detail inspector: drop a loaded/in-flight full value once the cursor has
         // moved off the cell it belonged to, so a big inspected value never outlives
         // the cursor sitting on it (the "bytes dropped when focus moves" promise).

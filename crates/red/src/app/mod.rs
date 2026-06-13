@@ -40,8 +40,13 @@ use crate::palette::{Cmd, PromptKind};
 use crate::result::ResultGrid;
 use crate::schema::SchemaState;
 use crate::settings::{Density, FileSettingsStore, Settings, ThemeMode, ThemeSetting};
-use crate::settings_ui::SettingsTab;
+use crate::settings_ui::{RevealTarget, SettingsTab};
 use crate::theme::ThemeRegistry;
+
+/// Shared slot for the focused settings control's window-space bounds, tagged with
+/// which control it belongs to. Written by a canvas overlay during paint, read on
+/// the next render to scroll the control into view. See [`AppState::settings_focus_box`].
+type RevealBox = std::rc::Rc<std::cell::RefCell<Option<(RevealTarget, gpui::Bounds<Pixels>)>>>;
 
 /// Which font-family picker (UI sans / UI mono / editor) a settings action refers
 /// to — routes a choice to the matching setter and the matching combo box.
@@ -496,6 +501,17 @@ pub struct AppState {
     /// bad value) — surfaced as a dismissible banner so a hand-edit gets feedback
     /// instead of a silent reset.
     pub(crate) settings_warnings: Vec<String>,
+    /// Scroll state of the settings content pane, tracked so a control reached by
+    /// Tab can be scrolled into view (see [`Self::update_settings_scroll`]).
+    pub(crate) settings_scroll: ScrollHandle,
+    /// The reveal-able Appearance control (a dropdown or font-size input) that
+    /// currently holds keyboard focus, recomputed each render so the page can tag
+    /// it for bounds capture. `None` when no such control is focused.
+    pub(crate) settings_focused_reveal: Option<RevealTarget>,
+    /// Window-space bounds of the focused reveal control, written by a canvas
+    /// overlay during paint and read on the next frame to scroll it into view. The
+    /// tag guards against acting on a stale capture in the frame focus moves.
+    pub(crate) settings_focus_box: RevealBox,
     /// Whether the OS is in a dark appearance, for `theme = { mode = "system" }`.
     pub(crate) os_dark: bool,
     /// Installed once on first render: keeps the OS-appearance observer alive so
@@ -951,6 +967,9 @@ impl AppState {
             settings_open: false,
             settings_tab: SettingsTab::Appearance,
             settings_warnings: report.warnings,
+            settings_scroll: ScrollHandle::new(),
+            settings_focused_reveal: None,
+            settings_focus_box: Default::default(),
             os_dark,
             appearance_sub: None,
             settings_watcher: None,

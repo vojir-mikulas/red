@@ -652,7 +652,10 @@ impl AppState {
         if is_file {
             return labeled_field("Database file", theme)
                 .child(self.database_input.clone())
-                .children(field_error_line(theme, field_err(errors, FormField::Database)))
+                .children(field_error_line(
+                    theme,
+                    field_err(errors, FormField::Database),
+                ))
                 .into_any_element();
         }
         div()
@@ -670,10 +673,7 @@ impl AppState {
                         labeled_field("Host", theme)
                             .flex_1()
                             .child(self.host_input.clone())
-                            .children(field_error_line(
-                                theme,
-                                field_err(errors, FormField::Host),
-                            )),
+                            .children(field_error_line(theme, field_err(errors, FormField::Host))),
                     )
                     .child(
                         labeled_field("Port", theme)
@@ -694,7 +694,10 @@ impl AppState {
                     theme,
                 )
                 .child(self.database_input.clone())
-                .children(field_error_line(theme, field_err(errors, FormField::Database))),
+                .children(field_error_line(
+                    theme,
+                    field_err(errors, FormField::Database),
+                )),
             )
             .child(
                 div()
@@ -914,12 +917,11 @@ impl AppState {
                 .p(px(9.))
                 .rounded(theme.radius)
                 .bg(color.opacity(0.10))
-                .child(
-                    div()
-                        .flex_none()
-                        .mt(px(1.))
-                        .child(crate::icons::icon(icon_name, theme.scale(13.), color)),
-                )
+                .child(div().flex_none().mt(px(1.)).child(crate::icons::icon(
+                    icon_name,
+                    theme.scale(13.),
+                    color,
+                )))
                 .child(
                     div()
                         .flex_1()

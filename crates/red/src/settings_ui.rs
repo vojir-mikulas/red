@@ -9,10 +9,25 @@
 
 use flint::prelude::*;
 use flint::Theme;
-use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, SharedString};
+use gpui::{canvas, div, prelude::*, px, AnyElement, Context, FontWeight, SharedString};
 
 use crate::app::{AppState, FontSelect};
 use crate::settings::{Density, ThemeMode};
+
+/// The Appearance-tab controls that can sit below the fold and so are scrolled
+/// into view when Tab focuses them: the five dropdowns and the two font-size
+/// inputs (the controls with a queryable focus handle). See
+/// [`AppState::update_settings_scroll`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RevealTarget {
+    ThemeLight,
+    ThemeDark,
+    FontUi,
+    FontUiMono,
+    FontEditor,
+    UiSize,
+    EditorSize,
+}
 
 /// The settings categories, in nav order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +105,7 @@ impl AppState {
                     .id("settings-body")
                     .flex_1()
                     .overflow_y_scroll()
+                    .track_scroll(&self.settings_scroll)
                     .px_6()
                     .py_5()
                     .child(page),
@@ -319,7 +335,11 @@ fn appearance_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             .child(setting_row(
                 "Interface font size",
                 "Base interface text size, in pixels. Both interface fonts scale from this.",
-                state.ui_font_size_input.clone(),
+                reveal_wrap(
+                    state,
+                    RevealTarget::UiSize,
+                    state.ui_font_size_input.clone(),
+                ),
                 &theme,
             ))
             .child(setting_row(
@@ -332,7 +352,11 @@ fn appearance_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             .child(setting_row(
                 "Editor font size",
                 "SQL editor text size, in pixels. Independent of the interface size.",
-                state.editor_font_size_input.clone(),
+                reveal_wrap(
+                    state,
+                    RevealTarget::EditorSize,
+                    state.editor_font_size_input.clone(),
+                ),
                 &theme,
             ))
             .child(setting_block(
@@ -350,22 +374,55 @@ fn appearance_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
 /// a long-lived entity on [`AppState`]; its options + selection are filled by
 /// `AppState::rebuild_settings_pickers` when the panel opens, and it routes the
 /// chosen theme name to `set_light_theme` / `set_dark_theme`.
-fn theme_picker(state: &AppState, light: bool) -> impl IntoElement {
+fn theme_picker(state: &AppState, light: bool) -> AnyElement {
     if light {
-        state.theme_combo_light.clone()
+        reveal_wrap(
+            state,
+            RevealTarget::ThemeLight,
+            state.theme_combo_light.clone(),
+        )
     } else {
-        state.theme_combo_dark.clone()
+        reveal_wrap(
+            state,
+            RevealTarget::ThemeDark,
+            state.theme_combo_dark.clone(),
+        )
     }
 }
 
 /// The searchable dropdown for one font slot (UI sans / UI mono / editor). Mirrors
 /// [`theme_picker`]: a long-lived combo box on [`AppState`], filled on panel open.
-fn font_picker(state: &AppState, which: FontSelect) -> impl IntoElement {
-    match which {
-        FontSelect::Ui => state.font_combo_ui.clone(),
-        FontSelect::UiMono => state.font_combo_ui_mono.clone(),
-        FontSelect::Editor => state.font_combo_editor.clone(),
+fn font_picker(state: &AppState, which: FontSelect) -> AnyElement {
+    let (combo, target) = match which {
+        FontSelect::Ui => (state.font_combo_ui.clone(), RevealTarget::FontUi),
+        FontSelect::UiMono => (state.font_combo_ui_mono.clone(), RevealTarget::FontUiMono),
+        FontSelect::Editor => (state.font_combo_editor.clone(), RevealTarget::FontEditor),
+    };
+    reveal_wrap(state, target, combo)
+}
+
+/// Wrap a reveal-able control so that, while it holds focus, an invisible canvas
+/// overlay records its window-space bounds into [`AppState::settings_focus_box`].
+/// The next render reads that to scroll the control into view (see
+/// [`AppState::update_settings_scroll`]). Untracked controls render unwrapped, so
+/// only the focused one pays for the overlay.
+fn reveal_wrap(state: &AppState, target: RevealTarget, control: impl IntoElement) -> AnyElement {
+    if state.settings_focused_reveal != Some(target) {
+        return control.into_any_element();
     }
+    let cell = state.settings_focus_box.clone();
+    div()
+        .relative()
+        .child(control)
+        .child(
+            canvas(
+                move |bounds, _, _| *cell.borrow_mut() = Some((target, bounds)),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        )
+        .into_any_element()
 }
 
 /// The theme manager: an Import button, then every theme as a row — built-ins

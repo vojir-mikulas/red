@@ -285,7 +285,94 @@ impl AppState {
 
     pub(crate) fn set_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
         self.settings_tab = tab;
+        // Start each category at the top, and drop any stale reveal capture from
+        // the tab we're leaving.
+        self.settings_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        *self.settings_focus_box.borrow_mut() = None;
         cx.notify();
+    }
+
+    /// Which reveal-able Appearance control (if any) holds keyboard focus now,
+    /// checked in nav order. The dropdowns report focus in either state via
+    /// [`ComboBox::is_focused`]; the size inputs via their text field.
+    pub(crate) fn focused_reveal(&self, window: &Window, cx: &gpui::App) -> Option<RevealTarget> {
+        let combos = [
+            (RevealTarget::ThemeLight, &self.theme_combo_light),
+            (RevealTarget::ThemeDark, &self.theme_combo_dark),
+            (RevealTarget::FontUi, &self.font_combo_ui),
+            (RevealTarget::FontUiMono, &self.font_combo_ui_mono),
+            (RevealTarget::FontEditor, &self.font_combo_editor),
+        ];
+        for (target, combo) in combos {
+            if combo.read(cx).is_focused(window, cx) {
+                return Some(target);
+            }
+        }
+        for (target, input) in [
+            (RevealTarget::UiSize, &self.ui_font_size_input),
+            (RevealTarget::EditorSize, &self.editor_font_size_input),
+        ] {
+            if input.read(cx).focus_handle(cx).is_focused(window) {
+                return Some(target);
+            }
+        }
+        None
+    }
+
+    /// On each settings render, scroll the content pane the minimal amount to bring
+    /// the focused reveal-able control fully into view — only when it's actually
+    /// off-screen, so tabbing between already-visible controls never jumps. The
+    /// focused control tags its window-space bounds via a canvas overlay (see
+    /// [`crate::settings_ui`]'s `reveal_wrap`); we read the previous frame's capture
+    /// and act a frame after focus lands — the `target` tag rejects a stale box left
+    /// by the control we just moved off.
+    pub(crate) fn update_settings_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.settings_open {
+            self.settings_focused_reveal = None;
+            return;
+        }
+        let focused = self.focused_reveal(window, cx);
+        self.settings_focused_reveal = focused;
+        let Some(target) = focused else { return };
+
+        // Wait a frame if the capture isn't this control's yet (its canvas hasn't
+        // painted since focus moved).
+        let Some((tagged, rb)) = *self.settings_focus_box.borrow() else {
+            cx.notify();
+            return;
+        };
+        if tagged != target {
+            cx.notify();
+            return;
+        }
+
+        let vp = self.settings_scroll.bounds();
+        if vp.size.height <= px(0.) {
+            return;
+        }
+        let offset = self.settings_scroll.offset();
+        let pad = px(8.);
+        let mut new_y = offset.y;
+        if rb.size.height >= vp.size.height {
+            // Taller than the viewport: just align its top (aligning both edges is
+            // impossible and would oscillate). Idempotent once the top is in place.
+            if (rb.origin.y - vp.origin.y).as_f32().abs() > 1.0 {
+                new_y += vp.origin.y - rb.origin.y;
+            }
+        } else if rb.origin.y < vp.origin.y {
+            // Above the fold — bring its top into view.
+            new_y += vp.origin.y - rb.origin.y + pad;
+        } else if rb.origin.y + rb.size.height > vp.origin.y + vp.size.height {
+            // Below the fold — bring its bottom into view.
+            new_y -= rb.origin.y + rb.size.height - (vp.origin.y + vp.size.height) + pad;
+        }
+        // Clamp into the valid scroll range ([-max, 0]).
+        let max = self.settings_scroll.max_offset().y;
+        let new_y = new_y.clamp(-max, px(0.));
+        if (new_y.as_f32() - offset.y.as_f32()).abs() > 0.5 {
+            self.settings_scroll.set_offset(gpui::point(px(0.), new_y));
+            cx.notify();
+        }
     }
 
     /// Re-resolve the active theme from settings + OS appearance and install it.
