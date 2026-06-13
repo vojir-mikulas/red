@@ -57,6 +57,10 @@ pub(crate) enum Cmd {
     OpenSavedQueries,
     /// Open the saved query at this index (into a new tab) — picker activation.
     OpenSavedQuery(usize),
+    /// EXPLAIN the active tab's query and open the plan view (B4).
+    Explain,
+    /// EXPLAIN ANALYZE the active tab's query (runs it — read queries only).
+    ExplainAnalyze,
 }
 
 /// Which free-text prompt the single palette slot is currently serving, so a
@@ -213,6 +217,8 @@ impl AppState {
             Cmd::SaveQuery => self.open_save_prompt(cx),
             Cmd::OpenSavedQueries => self.open_saved_picker(cx),
             Cmd::OpenSavedQuery(index) => self.open_saved_query(index, cx),
+            Cmd::Explain => self.explain_query(false, cx),
+            Cmd::ExplainAnalyze => self.explain_query(true, cx),
         }
     }
 
@@ -276,6 +282,21 @@ impl AppState {
                     PaletteItem::new("cmd:open-saved", "query: open saved…").hint("⇧⌘O"),
                     Cmd::OpenSavedQueries,
                 ));
+                // EXPLAIN (B4) — explain needs a query to explain; analyze runs the
+                // statement and is offered only on engines that support it (not
+                // SQLite, which has no ANALYZE).
+                if active.active().is_some() {
+                    out.push((
+                        PaletteItem::new("cmd:explain", "query: explain plan").hint("⇧⌘E"),
+                        Cmd::Explain,
+                    ));
+                    if active.config.kind != red_core::DbKind::Sqlite {
+                        out.push((
+                            PaletteItem::new("cmd:explain-analyze", "query: explain analyze"),
+                            Cmd::ExplainAnalyze,
+                        ));
+                    }
+                }
                 // Pane focus.
                 out.push((
                     PaletteItem::new("cmd:focus-schema", "focus: schema sidebar").hint("⌥⌘1"),

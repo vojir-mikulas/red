@@ -372,6 +372,57 @@ pub enum ResultFilter {
     Where(String),
 }
 
+/// A query execution plan (Track B4 — EXPLAIN). A small, fully-materialized tree
+/// the driver builds from the engine's *native* EXPLAIN output — SQLite's
+/// `EXPLAIN QUERY PLAN` rows, Postgres's indented text plan, MySQL's `FORMAT=TREE`
+/// — so the UI renders it readably without any engine knowledge. A plan is
+/// inherently tiny and bounded, so unlike a result set it is held whole; the
+/// "never materialize" rule targets row data, not a fixed-size plan.
+///
+/// Metrics stay *engine-named* on purpose: SQLite reports none, Postgres reports
+/// `cost`/`rows`/`width` (plus `actual time`/`rows`/`loops` under ANALYZE), MySQL
+/// its own. We render whatever the engine names rather than inventing a false
+/// cross-engine cost unit.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QueryPlan {
+    /// The plan's root operations — usually one. A SQLite plan is a shallow tree
+    /// of steps; a Postgres/MySQL plan nests.
+    pub nodes: Vec<PlanNode>,
+    /// The engine's verbatim EXPLAIN text — the "Copy plan" payload and the
+    /// guaranteed fallback the UI shows when `nodes` is empty (an exotic plan the
+    /// structural parse couldn't tree).
+    pub raw: String,
+    /// `true` iff this came from `EXPLAIN ANALYZE` — actual-row/time metrics are
+    /// present and the UI may tint the costliest node. SQLite has no ANALYZE.
+    pub analyzed: bool,
+}
+
+/// One operation in a [`QueryPlan`] tree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanNode {
+    /// The operation line, e.g. `"Seq Scan on users"` / `"SEARCH t USING INDEX ix"`.
+    pub label: String,
+    /// Engine extras attached to this node (a filter, index condition, join key),
+    /// joined for display. `None` when the node carries none.
+    pub detail: Option<String>,
+    /// Engine-named metrics rendered as-is: `("cost", "0.00..18.50")`,
+    /// `("rows", "850")`, `("actual time", "0.011..0.012")`. Empty for SQLite.
+    pub metrics: Vec<(String, String)>,
+    pub children: Vec<PlanNode>,
+}
+
+impl PlanNode {
+    /// A leaf node with just a label — the building block the parsers grow.
+    pub fn leaf(label: impl Into<String>) -> PlanNode {
+        PlanNode {
+            label: label.into(),
+            detail: None,
+            metrics: Vec::new(),
+            children: Vec::new(),
+        }
+    }
+}
+
 /// What a schema object is. SQLite has tables and views; Postgres maps onto
 /// the same two for the explorer's purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

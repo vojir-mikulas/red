@@ -22,7 +22,8 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use red_core::{
     Column, ColumnMeta, ExportFormat, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta,
-    QueryOptions, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail, Value,
+    QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail,
+    Value,
 };
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -532,6 +533,22 @@ impl DatabaseDriver for PostgresDriver {
                 Err(map_pg_err(e))
             }
         }
+    }
+
+    async fn explain(&self, sql: &str, analyze: bool) -> Result<QueryPlan> {
+        // Default `FORMAT TEXT` — the most stable parse target, and avoids the
+        // JSON dependency. Plain `EXPLAIN` never executes the statement;
+        // `EXPLAIN ANALYZE` does (the caller gates it to read queries, and a
+        // read-only connection rejects an underlying write at the engine anyway).
+        let verb = if analyze { "EXPLAIN ANALYZE " } else { "EXPLAIN " };
+        let sql = format!("{verb}{}", strip_trailing(sql));
+        let rows = self.client.query(&sql, &[]).await.map_err(map_pg_err)?;
+        let text = rows
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(crate::plan::from_text_tree(&text, analyze))
     }
 
     async fn export(
@@ -1248,6 +1265,43 @@ mod tests {
         let url = url_or_skip!();
         let driver = PostgresDriver::connect(&url, true).await.unwrap();
         battery::read_only_rejects_write(&driver, "CREATE TABLE red_ro_should_fail (x INT)").await;
+    }
+
+    #[tokio::test]
+    async fn explains_a_query() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, false).await.unwrap();
+        let t = tag("explain");
+        driver
+            .execute(&format!("CREATE TABLE {t} (id INT PRIMARY KEY, name TEXT)"))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!(
+                "INSERT INTO {t} SELECT g, 'row ' || g FROM generate_series(1, 100) g"
+            ))
+            .await
+            .unwrap();
+
+        battery::explains_query(&driver, &format!("SELECT * FROM {t}"), &t).await;
+
+        // EXPLAIN ANALYZE carries actual-time metrics and is flagged analyzed.
+        let plan = driver
+            .explain(&format!("SELECT count(*) FROM {t}"), true)
+            .await
+            .unwrap();
+        assert!(plan.analyzed, "analyze flag set");
+        let has_actual = |n: &red_core::PlanNode| {
+            n.metrics.iter().any(|(k, _)| k.starts_with("actual"))
+        };
+        assert!(
+            plan.nodes.iter().any(has_actual)
+                || plan.nodes.iter().flat_map(|n| &n.children).any(has_actual),
+            "ANALYZE plan carries actual metrics: {}",
+            plan.raw
+        );
+
+        driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
     }
 
     #[tokio::test]

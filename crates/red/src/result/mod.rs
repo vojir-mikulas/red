@@ -26,6 +26,13 @@ use crate::app::{AppState, ExportProgress, Notification, Phase};
 use buffer::{next_epoch, window_decision, BufferMode, GridBuffer, KeyedRun, WindowView, WINDOW};
 pub(crate) use render::group_digits;
 
+/// Mint a fresh, process-unique epoch for a non-grid consumer (the plan view,
+/// Track B4) so its echoed replies are dropped once superseded — shares the
+/// grid's monotonic source so the two never collide.
+pub(crate) fn new_epoch() -> u64 {
+    next_epoch()
+}
+
 /// All the state for one open result. When the row-number gutter is shown
 /// (`grid.row_numbers`) it occupies table column `0`, so data column `n` sits at
 /// table column `n + 1`; with the gutter hidden the data columns start at `0`. The
@@ -517,8 +524,11 @@ impl AppState {
                     self.settings.grid.page_size,
                 );
                 let opened = (grid.base_sql.clone(), grid.epoch, grid.table.clone());
-                // Safe: the guard above ensured a focused tab exists.
-                active.active_mut().unwrap().result = Some(grid);
+                // Safe: the guard above ensured a focused tab exists. A fresh run
+                // replaces any open plan (Track B4) with its grid.
+                let tab = active.active_mut().unwrap();
+                tab.result = Some(grid);
+                tab.plan = None;
                 opened
             }
             _ => return,

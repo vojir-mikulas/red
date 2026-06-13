@@ -245,6 +245,55 @@ async fn loads_and_describes_schema() {
     std::fs::remove_file(&path).ok();
 }
 
+/// Explain a query: the `Explain` command replies with a `PlanReady` carrying a
+/// non-empty plan and echoing the request epoch (Track B4). A bad statement comes
+/// back as a pane-local `PlanFailed`, not a global `Error`.
+#[tokio::test]
+async fn explains_a_query() {
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(&handle, Command::Connect(sqlite(":memory:", true)));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    send(
+        &handle,
+        Command::Explain {
+            sql: counting_sql(10),
+            analyze: false,
+            epoch: 7,
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::PlanReady { epoch, plan }) => {
+            assert_eq!(epoch, 7, "the request epoch is echoed");
+            assert!(!plan.nodes.is_empty(), "a plan node was parsed");
+            assert!(!plan.raw.is_empty(), "raw EXPLAIN text is present");
+            assert!(!plan.analyzed);
+        }
+        other => panic!("expected PlanReady, got {other:?}"),
+    }
+
+    // A syntactically broken statement fails *in the plan pane*.
+    send(
+        &handle,
+        Command::Explain {
+            sql: "SELECT FROM WHERE".into(),
+            analyze: false,
+            epoch: 8,
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::PlanFailed { epoch, message }) => {
+            assert_eq!(epoch, 8);
+            assert!(!message.is_empty());
+        }
+        other => panic!("expected PlanFailed, got {other:?}"),
+    }
+}
+
 /// Open a result and page through it — the grid's load-on-scroll path.
 #[tokio::test]
 async fn opens_and_pages_result() {

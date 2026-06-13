@@ -13,7 +13,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use red_core::{
     Column, ColumnMeta, ExportFormat, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta,
-    QueryOptions, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail, Value,
+    QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail,
+    Value,
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, ErrorCode, OpenFlags};
@@ -285,6 +286,34 @@ impl DatabaseDriver for SqliteDriver {
         tokio::task::spawn_blocking(move || execute_blocking(&path, read_only, &sql))
             .await
             .map_err(driver_err)?
+    }
+
+    async fn explain(&self, sql: &str, _analyze: bool) -> Result<QueryPlan> {
+        // `EXPLAIN QUERY PLAN` is the readable plan (the bytecode `EXPLAIN` is
+        // not); it never steps the statement, so it's safe regardless of the
+        // (ignored — SQLite has no ANALYZE) `analyze` flag. Columns: id, parent,
+        // notused, detail.
+        let path = self.path.clone();
+        let read_only = self.read_only;
+        let sql = format!("EXPLAIN QUERY PLAN {}", strip_trailing(sql));
+        tokio::task::spawn_blocking(move || {
+            let conn = SqliteDriver::open(&path, read_only)?;
+            let mut stmt = conn.prepare(&sql).map_err(driver_err)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(driver_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_step_err)?;
+            Ok(crate::plan::from_sqlite_rows(rows))
+        })
+        .await
+        .map_err(driver_err)?
     }
 
     async fn export(
@@ -1025,6 +1054,28 @@ mod tests {
     async fn read_only_rejects_writes() {
         let driver = SqliteDriver::new(":memory:", true);
         battery::read_only_rejects_write(&driver, "CREATE TABLE t(x)").await;
+    }
+
+    #[tokio::test]
+    async fn explains_a_query() {
+        let path = temp_db_path("explain");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT);")
+                .unwrap();
+        }
+        let driver = SqliteDriver::new(&path, true);
+        battery::explains_query(&driver, "SELECT * FROM widgets WHERE name = 'x'", "widgets").await;
+
+        // The plan tree carries SQLite's QUERY PLAN detail text.
+        let plan = driver
+            .explain("SELECT * FROM widgets", false)
+            .await
+            .unwrap();
+        assert!(!plan.nodes.is_empty());
+        assert!(plan.nodes[0].label.to_uppercase().contains("WIDGETS"));
+
+        std::fs::remove_file(&path).ok();
     }
 
     /// A flagged cancel bails the export and removes the partial file, so no

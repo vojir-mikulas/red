@@ -549,6 +549,12 @@ impl AppState {
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx))),
             )
             .child(
+                Button::new("sql-explain", "Explain")
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Sm)
+                    .on_click(cx.listener(|this, _, _, cx| this.explain_query(false, cx))),
+            )
+            .child(
                 Button::new("sql-save", "Save")
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::Sm)

@@ -7,10 +7,10 @@ use gpui::{div, prelude::*, px, Focusable, KeyDownEvent, Render, Window};
 
 use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::keymap::{
-    About, CloseInspector, CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid,
-    FocusSchema, NewConnection, NewTab, NextTab, OpenSavedQueries, PrevTab, RefreshSchema,
-    RunQuery, SaveQuery, SearchSchema, Settings, ShowShortcuts, SwitchConnection, ToggleFilter,
-    ToggleInspector, ToggleSidebar,
+    About, CloseInspector, CloseTab, CycleFocusNext, CycleFocusPrev, Explain, FocusEditor,
+    FocusGrid, FocusSchema, NewConnection, NewTab, NextTab, OpenSavedQueries, PrevTab,
+    RefreshSchema, RunQuery, SaveQuery, SearchSchema, Settings, ShowShortcuts, SwitchConnection,
+    ToggleFilter, ToggleInspector, ToggleSidebar,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
@@ -232,6 +232,8 @@ impl Render for AppState {
             // Saved queries (B3): ⇧⌘S opens the name prompt; ⇧⌘O the picker.
             .on_action(cx.listener(|this, _: &SaveQuery, _, cx| this.open_save_prompt(cx)))
             .on_action(cx.listener(|this, _: &OpenSavedQueries, _, cx| this.open_saved_picker(cx)))
+            // EXPLAIN (B4): ⇧⌘E opens the plan view for the active query.
+            .on_action(cx.listener(|this, _: &Explain, _, cx| this.explain_query(false, cx)))
             // App-chrome actions (tabs · sidebar · schema reload), bound in the
             // central keymap to `RedRoot` so they fire from any pane's focus.
             .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_query(cx)))

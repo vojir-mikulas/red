@@ -775,6 +775,32 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 }
             }
 
+            Command::Explain {
+                sql,
+                analyze,
+                epoch,
+            } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let driver = state.driver.clone();
+                // A plan is one bounded round-trip — no cursor, no windowing. The
+                // failure is pane-local (`PlanFailed`), not a global error toast.
+                match driver.explain(&sql, analyze).await {
+                    Ok(plan) => emit(&events, session_id, Event::PlanReady { epoch, plan }),
+                    Err(e) => emit(
+                        &events,
+                        session_id,
+                        Event::PlanFailed {
+                            epoch,
+                            message: e.to_string(),
+                        },
+                    ),
+                }
+            }
+
             Command::Export {
                 format,
                 path,

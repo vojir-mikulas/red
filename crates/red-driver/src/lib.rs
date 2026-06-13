@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ColumnMeta, ExportFormat, KeySpec, QueryOptions, RedError, Result, ResultPage,
-    RowWindow, SchemaMeta, TableDetail, Value,
+    Column, ColumnMeta, ExportFormat, KeySpec, QueryOptions, QueryPlan, RedError, Result,
+    ResultPage, RowWindow, SchemaMeta, TableDetail, Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -23,6 +23,7 @@ mod conformance;
 mod format;
 mod mysql;
 mod pg_text;
+mod plan;
 mod postgres;
 mod sqlite;
 pub use mysql::MysqlDriver;
@@ -341,6 +342,15 @@ pub trait DatabaseDriver: Send + Sync {
     /// Run a non-row-returning statement wrapped in a transaction, returning the
     /// number of rows affected. A read-only driver rejects the write at the engine.
     async fn execute(&self, sql: &str) -> Result<u64>;
+
+    /// Run the engine's `EXPLAIN` for `sql` and return a normalized [`QueryPlan`]
+    /// (Track B4). Plain `explain` (`analyze = false`) never executes the
+    /// statement — it's read-only-safe for any SQL. `analyze = true` runs
+    /// `EXPLAIN ANALYZE`, which *executes* the statement to gather actuals; the
+    /// caller gates that to read queries (SQLite has no ANALYZE and ignores the
+    /// flag). Each driver reads its native textual/tabular plan and maps it — no
+    /// `FORMAT JSON`, so no JSON parser enters the layer.
+    async fn explain(&self, sql: &str, analyze: bool) -> Result<QueryPlan>;
 
     /// Stream `sql`'s result straight to `path` in `format`, row-by-row — never
     /// materializing the whole result. Returns the number of data rows written.

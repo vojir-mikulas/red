@@ -75,6 +75,8 @@ actions!(
         SaveQuery,
         /// Open the saved-query picker (⇧⌘O) — Track B3.
         OpenSavedQueries,
+        /// Explain the active tab's query — open the plan view (⇧⌘E) — Track B4.
+        Explain,
     ]
 );
 
@@ -109,6 +111,7 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
                 ("⌘W", "Close tab"),
                 ("⌃Tab / ⌃⇧Tab", "Next / previous tab"),
                 ("⌘↵", "Run query"),
+                ("⇧⌘E", "Explain query (plan)"),
                 ("⇧⌘S", "Save query"),
                 ("⇧⌘O", "Open saved query…"),
                 ("Esc", "Leave the editor for the result grid"),
@@ -199,6 +202,9 @@ pub(crate) fn bind_all(cx: &mut App) {
         // binds neither), so they fire while the editor is focused.
         KeyBinding::new("cmd-shift-s", SaveQuery, Some("RedRoot")),
         KeyBinding::new("cmd-shift-o", OpenSavedQueries, Some("RedRoot")),
+        // EXPLAIN the active query (Track B4). ⇧⌘E pairs with the Run idiom; the
+        // analyze variant is palette / run-bar only (it executes the statement).
+        KeyBinding::new("cmd-shift-e", Explain, Some("RedRoot")),
         // Tab management. `RedRoot` is an ancestor of the editor, so these still
         // fire while the editor is focused — none collide with the editor's keys
         // (it binds plain `tab`, not `ctrl-tab`).

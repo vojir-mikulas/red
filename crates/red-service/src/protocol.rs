@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use red_core::{
-    Column, ConnectionConfig, ExportFormat, KeySpec, QueryOptions, ResultFilter, RowWindow,
-    SchemaMeta, TableDetail, Value,
+    Column, ConnectionConfig, ExportFormat, KeySpec, QueryOptions, QueryPlan, ResultFilter,
+    RowWindow, SchemaMeta, TableDetail, Value,
 };
 
 /// Identifies one keep-alive backend session. Minted UI-side at connect start so
@@ -119,6 +119,15 @@ pub enum Command {
     /// Run a non-row-returning statement (write/DDL) in a transaction.
     Execute {
         sql: String,
+    },
+    /// Run `EXPLAIN` (or `EXPLAIN ANALYZE` when `analyze`) for `sql` and report a
+    /// normalized plan (Track B4). `epoch` is the active tab's result epoch so a
+    /// stale reply (tab switched / query re-run) is dropped. Plain explain never
+    /// executes the statement; `analyze` does — the UI gates it to read queries.
+    Explain {
+        sql: String,
+        analyze: bool,
+        epoch: u64,
     },
     /// Stream an open result to `path` in `format`, row-by-row. `epoch` selects
     /// which open result (the active tab's grid); `id` identifies the export so
@@ -251,6 +260,18 @@ pub enum Event {
     /// A write/DDL statement committed; `affected` rows changed.
     Executed {
         affected: usize,
+    },
+    /// An `Explain` produced a plan. Echoes `epoch` so the UI drops a plan for a
+    /// result it has already replaced.
+    PlanReady {
+        epoch: u64,
+        plan: QueryPlan,
+    },
+    /// An `Explain` failed (bad SQL, unsupported statement). Scoped to the plan
+    /// pane by `epoch` — shown there rather than as a global error toast.
+    PlanFailed {
+        epoch: u64,
+        message: String,
     },
     /// A streamed export made progress: `rows` rows written so far (throttled,
     /// not per-row). `id` selects the export's toast.

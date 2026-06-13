@@ -534,6 +534,26 @@ pub(crate) async fn caps_display_keeps_key_and_export(
     std::fs::remove_file(&csv_path).ok();
 }
 
+/// `explain` returns a readable plan for a row-returning query *without running
+/// it* (Track B4): the plan has at least one node, its `raw` text is non-empty and
+/// names the scanned `table`, and it isn't flagged analyzed. `sql` must be a
+/// `SELECT` over `table`.
+pub(crate) async fn explains_query(driver: &dyn DatabaseDriver, sql: &str, table: &str) {
+    let plan = driver.explain(sql, false).await.unwrap();
+    assert!(!plan.raw.is_empty(), "raw EXPLAIN text is present");
+    assert!(
+        !plan.nodes.is_empty(),
+        "at least one plan node parsed from: {}",
+        plan.raw
+    );
+    assert!(!plan.analyzed, "plain explain is not analyzed");
+    assert!(
+        plan.raw.to_lowercase().contains(&table.to_lowercase()),
+        "plan names the scanned table {table}: {}",
+        plan.raw
+    );
+}
+
 /// A read-only connection rejects a write at the engine. `write_sql` is any
 /// statement that mutates (DDL or DML); the driver must surface an error rather
 /// than silently succeeding.

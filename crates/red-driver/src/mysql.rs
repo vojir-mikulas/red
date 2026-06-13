@@ -29,7 +29,8 @@ use mysql_async::{
 };
 use red_core::{
     Column, ColumnMeta, ExportFormat, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta,
-    QueryOptions, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail, Value,
+    QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail,
+    Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, Mutex};
@@ -452,6 +453,36 @@ impl DatabaseDriver for MysqlDriver {
         }
     }
 
+    async fn explain(&self, sql: &str, analyze: bool) -> Result<QueryPlan> {
+        let base = strip_trailing(sql);
+        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        if analyze {
+            // `EXPLAIN ANALYZE` (MySQL 8.0.18+) yields the tree format and runs
+            // the statement. MariaDB's syntax differs; that surfaces as a normal
+            // error the UI shows in the plan pane.
+            let rows: Vec<String> = conn
+                .query(format!("EXPLAIN ANALYZE {base}"))
+                .await
+                .map_err(map_my_err)?;
+            return Ok(crate::plan::from_text_tree(&rows.join("\n"), true));
+        }
+        // Prefer the readable `FORMAT=TREE` (MySQL 8.0.16+); on the engines that
+        // lack it (older MySQL, MariaDB) fall back to the tabular `EXPLAIN`, which
+        // every version supports, rendered as a flat node list.
+        let tree: std::result::Result<Vec<String>, MyError> =
+            conn.query(format!("EXPLAIN FORMAT=TREE {base}")).await;
+        match tree {
+            Ok(rows) if !rows.is_empty() => Ok(crate::plan::from_text_tree(&rows.join("\n"), false)),
+            _ => {
+                let rows: Vec<Row> = conn
+                    .query(format!("EXPLAIN {base}"))
+                    .await
+                    .map_err(map_my_err)?;
+                Ok(plan_from_table(&rows))
+            }
+        }
+    }
+
     async fn export(
         &self,
         sql: &str,
@@ -596,6 +627,40 @@ fn to_my(value: &Value) -> MyValue {
         Value::Real(x) => MyValue::Double(*x),
         Value::Text(s) => MyValue::Bytes(s.clone().into_bytes()),
         Value::Blob(b) => MyValue::Bytes(b.clone()),
+    }
+}
+
+/// Map a tabular `EXPLAIN` result (the `FORMAT=TREE` fallback) to a flat plan:
+/// column names from the result metadata, each row's cells as display strings.
+fn plan_from_table(rows: &[Row]) -> QueryPlan {
+    let columns: Vec<String> = rows
+        .first()
+        .map(|r| {
+            r.columns_ref()
+                .iter()
+                .map(|c| c.name_str().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let table_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| (0..r.len()).map(|i| my_cell_string(r.as_ref(i))).collect())
+        .collect();
+    crate::plan::from_table(columns, table_rows)
+}
+
+/// One tabular-`EXPLAIN` cell as a plain display string (no capping — plan cells
+/// are tiny). Binary/temporal cells fall back to their debug form; they don't
+/// appear in `EXPLAIN` output in practice.
+fn my_cell_string(value: Option<&MyValue>) -> String {
+    match value {
+        None | Some(MyValue::NULL) => String::new(),
+        Some(MyValue::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
+        Some(MyValue::Int(n)) => n.to_string(),
+        Some(MyValue::UInt(n)) => n.to_string(),
+        Some(MyValue::Float(f)) => f.to_string(),
+        Some(MyValue::Double(f)) => f.to_string(),
+        Some(other) => format!("{other:?}"),
     }
 }
 
@@ -926,6 +991,29 @@ mod tests {
         let url = url_or_skip!();
         let driver = MysqlDriver::connect(&url, true).await.unwrap();
         battery::read_only_rejects_write(&driver, "CREATE TABLE red_ro_should_fail (x INT)").await;
+    }
+
+    #[tokio::test]
+    async fn explains_a_query() {
+        let url = url_or_skip!();
+        let driver = MysqlDriver::connect(&url, false).await.unwrap();
+        let t = tag("explain");
+        driver
+            .execute(&format!(
+                "CREATE TABLE `{t}` (id INT PRIMARY KEY, name VARCHAR(50))"
+            ))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!("INSERT INTO `{t}` VALUES (1, 'a'), (2, 'b')"))
+            .await
+            .unwrap();
+
+        // FORMAT=TREE on MySQL 8, the tabular fallback on MariaDB — either way the
+        // plan parses to ≥1 node and names the table in `raw`.
+        battery::explains_query(&driver, &format!("SELECT * FROM `{t}`"), &t).await;
+
+        driver.execute(&format!("DROP TABLE `{t}`")).await.unwrap();
     }
 
     #[tokio::test]

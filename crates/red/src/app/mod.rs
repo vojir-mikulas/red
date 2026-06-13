@@ -147,6 +147,9 @@ pub(crate) struct QueryTab {
     pub editor: Entity<CodeEditor>,
     /// The open result browsed in the grid: a table preview or an editor run.
     pub result: Option<ResultGrid>,
+    /// The query plan (Track B4 — EXPLAIN), when one is open. Occupies the result
+    /// pane in place of the grid; running a query clears it. `None` is the grid.
+    pub plan: Option<crate::plan::PlanView>,
     /// Recent queries (newest first), for re-run from the history popover.
     pub history: Vec<String>,
     pub history_open: bool,
@@ -177,6 +180,7 @@ impl QueryTab {
             title,
             editor,
             result: None,
+            plan: None,
             history: Vec::new(),
             history_open: false,
         }
@@ -295,6 +299,20 @@ impl ActiveConn {
             .iter_mut()
             .filter_map(|t| t.result.as_mut())
             .find(|g| g.epoch == epoch)
+    }
+
+    /// The focused tab's open plan, if any (Track B4).
+    pub(crate) fn active_plan(&self) -> Option<&crate::plan::PlanView> {
+        self.active().and_then(|t| t.plan.as_ref())
+    }
+
+    /// Find the open plan carrying `epoch`, across all tabs — `PlanReady`/
+    /// `PlanFailed` route by epoch like result events.
+    pub(crate) fn plan_by_epoch(&mut self, epoch: u64) -> Option<&mut crate::plan::PlanView> {
+        self.tabs
+            .iter_mut()
+            .filter_map(|t| t.plan.as_mut())
+            .find(|p| p.epoch == epoch)
     }
 }
 
@@ -986,6 +1004,10 @@ impl AppState {
             Event::ExportProgress { id, rows } => self.on_export_progress(id, rows, cx),
             Event::ExportFinished { id, path, rows } => self.on_export_finished(id, path, rows, cx),
             Event::ExportCancelled { id } => self.on_export_cancelled(id, cx),
+
+            // --- query plan (Track B4) ---
+            Event::PlanReady { epoch, plan } => self.on_plan_ready(session, epoch, plan),
+            Event::PlanFailed { epoch, message } => self.on_plan_failed(session, epoch, message),
 
             // The streaming `Query`/`FetchMore` path stays in the protocol for
             // headless use + tests; the UI now drives results via `OpenResult`.
