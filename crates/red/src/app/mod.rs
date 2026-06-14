@@ -531,6 +531,17 @@ pub struct AppState {
     /// Live-reload watcher over `settings.toml`, plus the self-write guard that
     /// suppresses the reload our own atomic save would otherwise trigger.
     pub(crate) settings_watcher: Option<crate::settings_watch::SettingsWatcher>,
+    /// Store + live-reload watcher for the user keymap (`keymap.toml`). The
+    /// overrides themselves live in GPUI's keymap once applied, so we keep only the
+    /// store (to re-read on edit) and the watcher; no parsed copy is held here.
+    pub(crate) keymap_store: Option<crate::keymap_config::KeymapStore>,
+    pub(crate) keymap_watcher: Option<crate::settings_watch::SettingsWatcher>,
+    /// Live-reload watcher over `connections.toml`, with the same self-write guard
+    /// as the settings watcher so a UI-driven save never echoes back as a reload.
+    pub(crate) connections_watcher: Option<crate::settings_watch::SettingsWatcher>,
+    /// Non-fatal problems from the last keymap load (a bad keystroke, an unknown
+    /// action) — shown in the same banner as [`Self::settings_warnings`].
+    pub(crate) keymap_warnings: Vec<String>,
     /// One-shot guard so the appearance observer + file-watcher install on the
     /// first render (when a `Window` exists) rather than on every frame.
     pub(crate) observers_installed: bool,
@@ -710,6 +721,17 @@ impl AppState {
         // configured cadence — unless `auto_update = false`, which sends a disabled
         // config so the backend keeps the timer (and network) parked.
         service.send_global(Command::ConfigureUpdates(update_config(&settings)));
+
+        // Load the user keymap and re-apply the full keymap over the defaults `main`
+        // installed, so `keymap.toml` overrides take effect before the first paint.
+        // Parse warnings and per-binding warnings are merged for the banner.
+        let keymap_store = crate::keymap_config::KeymapStore::open_default();
+        let keymap_report = keymap_store
+            .as_ref()
+            .map(crate::keymap_config::KeymapStore::load_report)
+            .unwrap_or_default();
+        let mut keymap_warnings = keymap_report.warnings;
+        keymap_warnings.extend(crate::keymap::apply(cx, &keymap_report.blocks));
 
         let os_dark = matches!(
             cx.window_appearance(),
@@ -984,6 +1006,10 @@ impl AppState {
             os_dark,
             appearance_sub: None,
             settings_watcher: None,
+            keymap_store,
+            keymap_watcher: None,
+            connections_watcher: None,
+            keymap_warnings,
             observers_installed: false,
             themes,
             theme_combo_light,

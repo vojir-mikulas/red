@@ -15,6 +15,7 @@ mod filter;
 mod icons;
 mod inspector;
 mod keymap;
+mod keymap_config;
 mod menu;
 mod palette;
 mod plan;
@@ -65,9 +66,8 @@ fn main() {
         // Items reference the same action structs `keymap` binds, so their
         // shortcuts render and stay in sync automatically.
         cx.set_menus(menu::build_menus());
-        // Dev-only: ⌥⌘P toggles the perf HUD overlay.
-        #[cfg(feature = "dev-stats")]
-        cx.bind_keys([gpui::KeyBinding::new("cmd-alt-p", ToggleDevStats, None)]);
+        // Dev-only ⌥⌘P (perf HUD) is bound inside `keymap::apply` so a keymap
+        // reload's clear doesn't drop it; the action stays declared below.
 
         // Spawn the Tokio backend and hand its event stream to the root view.
         let mut service = red_service::spawn();

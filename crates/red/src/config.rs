@@ -175,7 +175,10 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
-fn config_path() -> Option<PathBuf> {
+/// The path to the saved-connections file (`connections.toml`), for the loader,
+/// the atomic save, and the file-first "edit connections" workflow. `None` when
+/// the platform has no config directory.
+pub fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("red").join("connections.toml"))
 }
 
@@ -265,12 +268,17 @@ pub fn save(connections: &[StoredConnection]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    std::fs::write(&path, serialize(connections)?)?;
+    Ok(())
+}
+
+/// Render the connection list to the exact TOML bytes [`save`] writes — so a
+/// caller can hash them ahead of a save to suppress the watcher's self-reload.
+pub fn serialize(connections: &[StoredConnection]) -> Result<String> {
     let cfg = ConfigFile {
         connections: connections.iter().map(WriteConnection::from).collect(),
     };
-    let text = toml::to_string_pretty(&cfg)?;
-    std::fs::write(&path, text)?;
-    Ok(())
+    Ok(toml::to_string_pretty(&cfg)?)
 }
 
 #[cfg(test)]

@@ -1,0 +1,65 @@
+# RED keymap — customize your keyboard shortcuts.
+#
+# RED ships with the built-in bindings listed at the bottom of this file. To
+# change one, add a [[keymap]] block here that re-binds (or unbinds) a keystroke.
+# Your overrides layer on top of the defaults — last wins — so you only list the
+# keys you want to change; everything else keeps its default. Edits apply live,
+# no restart.
+#
+# A bad line degrades gracefully: an unknown action, an unparseable keystroke, or
+# a malformed context is skipped with a warning banner — it never strips your
+# other bindings or the defaults.
+#
+# Location:
+#   macOS    ~/Library/Application Support/red/keymap.toml
+#   Linux    ~/.config/red/keymap.toml          (XDG)
+#   Windows  %APPDATA%\red\keymap.toml
+#
+# ── Format ───────────────────────────────────────────────────────────────────
+#
+# Each [[keymap]] block is one context, with a table of keystroke = action:
+#
+#   [[keymap]]
+#   context = "RedRoot"                 # omit `context` for a true global
+#   bindings = { "cmd-l" = "ToggleFilter" }
+#
+# • Keystrokes use `cmd` / `ctrl` / `alt` / `shift` + a key, joined by `-`
+#   (e.g. "cmd-shift-f"). A chord is space-separated (e.g. "cmd-k cmd-s").
+# • To remove a default, bind its keystroke to "unbind":
+#       bindings = { "cmd-shift-f" = "unbind" }
+# • context = "RedRoot" reaches app chrome from any focus inside the app. Omit
+#   `context` for a binding that fires from any phase (a true global). Bindings
+#   typed inside the SQL editor / a text field keep that surface's own keys —
+#   those contexts sit deeper in the focus path and win.
+#
+# ── Example ──────────────────────────────────────────────────────────────────
+#
+# [[keymap]]
+# context = "RedRoot"
+# bindings = { "cmd-l" = "ToggleFilter", "cmd-shift-f" = "unbind" }
+#
+# [[keymap]]
+# bindings = { "cmd-shift-k" = "SwitchConnection" }
+#
+# ── Bindable actions ─────────────────────────────────────────────────────────
+#
+# Globals (default keystroke):
+#   ToggleCommandPalette   cmd-k        SwitchConnection       cmd-p
+#   GoToRow                ctrl-g       Quit                   cmd-q
+#
+# App chrome — bind under context = "RedRoot" (default keystroke):
+#   CopyResult             cmd-c        ToggleInspector        cmd-i
+#   CloseInspector         escape       ToggleFilter           cmd-shift-f
+#   SaveQuery              cmd-shift-s  OpenSavedQueries       cmd-shift-o
+#   Explain                cmd-shift-e  NewTab                 cmd-t
+#   CloseTab               cmd-w        NextTab                ctrl-tab
+#   PrevTab                ctrl-shift-tab
+#   ToggleSidebar          cmd-b        RefreshSchema          cmd-r
+#   SearchSchema           cmd-f        FocusSchema            cmd-alt-1
+#   FocusEditor            cmd-alt-2    FocusGrid              cmd-alt-3
+#   CycleFocusNext         f6           CycleFocusPrev         shift-f6
+#   ShowShortcuts          cmd-/        RunQuery               cmd-enter
+#   NewConnection          cmd-n        Settings               cmd-,
+#
+# The SQL editor, result-grid navigation, and dialog keys (arrows, copy/paste,
+# Tab cycling) are fixed in this release and not yet rebindable here.

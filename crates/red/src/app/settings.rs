@@ -53,6 +53,44 @@ impl AppState {
             }
         }
 
+        // A second watcher over `keymap.toml`, reusing the same debounce + self-
+        // write suppression. A hand-edit re-applies the whole keymap live.
+        if let Some(store) = &self.keymap_store {
+            if let Some((watcher, mut rx)) =
+                crate::settings_watch::SettingsWatcher::start(store.path().to_path_buf())
+            {
+                self.keymap_watcher = Some(watcher);
+                cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                    while rx.next().await.is_some() {
+                        if this.update(cx, |this, cx| this.reload_keymap(cx)).is_err() {
+                            break; // view dropped — window closed
+                        }
+                    }
+                })
+                .detach();
+            }
+        }
+
+        // A third watcher over `connections.toml`, so editing the saved-connection
+        // file by hand (the welcome screen's "Edit file" affordance) re-reads the
+        // list live — the same debounce + self-write suppression as the others.
+        if let Some(path) = crate::config::config_path() {
+            if let Some((watcher, mut rx)) = crate::settings_watch::SettingsWatcher::start(path) {
+                self.connections_watcher = Some(watcher);
+                cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                    while rx.next().await.is_some() {
+                        if this
+                            .update(cx, |this, cx| this.reload_connections(cx))
+                            .is_err()
+                        {
+                            break; // view dropped — window closed
+                        }
+                    }
+                })
+                .detach();
+            }
+        }
+
         // Reconnect to the most recently used connection on launch, when the user
         // opted in. The list arrives recency-sorted (newest first), so the first
         // entry that's actually been opened is the one to restore; credentials come
@@ -98,6 +136,31 @@ impl AppState {
         self.service
             .send_global(Command::ConfigureUpdates(update_config(&self.settings)));
         self.apply_theme(cx);
+        cx.notify();
+    }
+
+    /// Re-read `keymap.toml` after an external edit and re-apply the whole keymap
+    /// (defaults + overrides). Reuses [`crate::keymap::apply`], so a removed or
+    /// fixed override reverts cleanly to the default — no stale binding lingers.
+    pub(crate) fn reload_keymap(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = &self.keymap_store else {
+            return;
+        };
+        let report = store.load_report();
+        let mut warnings = report.warnings;
+        warnings.extend(crate::keymap::apply(cx, &report.blocks));
+        self.keymap_warnings = warnings;
+        cx.notify();
+    }
+
+    /// Re-read `connections.toml` after an external edit and swap in the new list.
+    /// Only the saved-connection roster changes — live/parked sessions are keyed by
+    /// `SessionId`, not list index, so a connected workspace is untouched. The
+    /// welcome-screen selection is clamped in case the edit shortened the list.
+    pub(crate) fn reload_connections(&mut self, cx: &mut Context<Self>) {
+        self.connections = config::load();
+        let max = self.connections.len().saturating_sub(1);
+        self.connect_sel = self.connect_sel.min(max);
         cx.notify();
     }
 
@@ -174,6 +237,51 @@ impl AppState {
                 tracing::warn!("failed to seed settings file: {e}");
             }
         }
+        self.reveal_path(&path, cx);
+    }
+
+    /// Open `keymap.toml` in the user's editor, seeding it with the commented
+    /// reference on first open so there's a full key list + format to edit from.
+    pub(crate) fn open_keymap_file(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = &self.keymap_store else {
+            self.notify(
+                ToastVariant::Error,
+                "No config directory available on this platform.",
+                cx,
+            );
+            return;
+        };
+        let path = store.path().to_path_buf();
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // Announce the seed so the watcher doesn't echo it back as an edit.
+            if let Some(watcher) = &self.keymap_watcher {
+                watcher.note_self_write(crate::assets::DEFAULT_KEYMAP);
+            }
+            if let Err(e) = std::fs::write(&path, crate::assets::DEFAULT_KEYMAP) {
+                tracing::warn!("failed to seed keymap file: {e}");
+            }
+        }
+        self.reveal_path(&path, cx);
+    }
+
+    /// Open `connections.toml` in the user's editor — the file-first counterpart to
+    /// the welcome screen's connection cards. The file is written from the current
+    /// in-memory list first ([`Self::persist`] announces the write to the watcher,
+    /// so it doesn't echo back as a reload) so there's always real content to edit,
+    /// even on a fresh install with no saved connections yet.
+    pub(crate) fn open_connections_file(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = crate::config::config_path() else {
+            self.notify(
+                ToastVariant::Error,
+                "No config directory available on this platform.",
+                cx,
+            );
+            return;
+        };
+        self.persist(cx);
         self.reveal_path(&path, cx);
     }
 
@@ -653,9 +761,11 @@ impl AppState {
         cx.notify();
     }
 
-    /// Dismiss the settings-warning banner until the next problematic load.
+    /// Dismiss the settings-warning banner until the next problematic load. Clears
+    /// both settings and keymap warnings — they share one banner.
     pub(crate) fn dismiss_settings_warnings(&mut self, cx: &mut Context<Self>) {
         self.settings_warnings.clear();
+        self.keymap_warnings.clear();
         cx.notify();
     }
 
@@ -677,8 +787,15 @@ impl AppState {
         }
     }
 
-    /// Save the connection list, surfacing a write failure as a toast.
+    /// Save the connection list, surfacing a write failure as a toast. The bytes
+    /// are announced to the watcher first so this UI-driven save doesn't echo back
+    /// through `connections.toml` as a reload (mirrors [`Self::save_settings`]).
     pub(crate) fn persist(&mut self, cx: &mut Context<Self>) {
+        if let Some(watcher) = &self.connections_watcher {
+            if let Ok(text) = config::serialize(&self.connections) {
+                watcher.note_self_write(&text);
+            }
+        }
         if let Err(e) = config::save(&self.connections) {
             tracing::warn!("failed to save connections: {e}");
             self.notify(

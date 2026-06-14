@@ -749,8 +749,7 @@ impl AppState {
                     // narrower column set; ignore a click whose data column no longer
                     // exists rather than indexing past `columns` (and before mutating
                     // any sort state, so a stale click is a clean no-op).
-                    let Some(col_name) = grid.columns.get(dcol).map(|c| c.name.clone())
-                    else {
+                    let Some(col_name) = grid.columns.get(dcol).map(|c| c.name.clone()) else {
                         return;
                     };
                     let old_epoch = grid.epoch;

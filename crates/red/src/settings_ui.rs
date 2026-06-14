@@ -91,8 +91,8 @@ impl AppState {
             nav = nav.child(settings_nav_item(tab, self.settings_tab, &theme, cx));
         }
 
-        let banner =
-            (!self.settings_warnings.is_empty()).then(|| settings_banner(self, &theme, cx));
+        let banner = (!self.settings_warnings.is_empty() || !self.keymap_warnings.is_empty())
+            .then(|| settings_banner(self, &theme, cx));
 
         let content = div()
             .flex_1()
@@ -183,7 +183,13 @@ fn settings_banner(
     theme: &Theme,
     cx: &mut Context<AppState>,
 ) -> impl IntoElement {
-    let message = state.settings_warnings.join("  •  ");
+    let message = state
+        .settings_warnings
+        .iter()
+        .chain(&state.keymap_warnings)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("  •  ");
     let focus_ring = theme.accent;
     div()
         .flex()

@@ -565,7 +565,10 @@ mod tests {
         assert_eq!(parse_semver("v0.1.2"), Some((0, 1, 2, None)));
         assert_eq!(parse_semver("0.1.2"), Some((0, 1, 2, None)));
         assert_eq!(parse_semver("v1.2"), Some((1, 2, 0, None)));
-        assert_eq!(parse_semver("v0.2.0-rc1"), Some((0, 2, 0, Some("rc1".into()))));
+        assert_eq!(
+            parse_semver("v0.2.0-rc1"),
+            Some((0, 2, 0, Some("rc1".into())))
+        );
         // Build metadata is dropped; the prerelease (if any) is kept.
         assert_eq!(parse_semver("v1.0.0+build5"), Some((1, 0, 0, None)));
         assert_eq!(parse_semver("nightly"), None);

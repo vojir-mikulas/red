@@ -36,6 +36,11 @@ pub struct Assets;
 /// into a fresh `settings.toml` on first open.
 pub const DEFAULT_SETTINGS: &str = include_str!("../../../assets/default-settings.toml");
 
+/// The bundled, fully-commented reference keymap — RED's keybinding docs. Seeded
+/// into a fresh `keymap.toml` on first open so a user has the full default list
+/// (and the override format) in front of them to edit.
+pub const DEFAULT_KEYMAP: &str = include_str!("../../../assets/default-keymap.toml");
+
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         Ok(Self::get(path).map(|file| file.data))

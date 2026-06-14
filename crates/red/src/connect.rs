@@ -51,26 +51,52 @@ pub(crate) fn fmt_ago(secs: Option<u64>) -> String {
     }
 }
 
-/// A section heading ("Saved connections") with a hairline rule that fills the
-/// rest of the row — the divider the welcome layout uses.
-fn section_label(label: &'static str, theme: &flint::Theme) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .mt(px(26.))
-        .mb_2()
-        .child(
-            div()
-                .text_size(theme.scale(12.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.text_dim)
-                .child(label),
-        )
-        .child(div().flex_1().h(px(1.)).bg(theme.border_soft))
-}
-
 impl AppState {
+    /// The "Saved connections" heading: the label, a hairline rule that fills the
+    /// row, and a subtle "Edit file" affordance on the right — the file-first escape
+    /// hatch that opens `connections.toml` (mirrors the settings panel's "Open
+    /// settings file"). Edits to the file re-read live via the connections watcher.
+    fn connections_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let edit_file = div()
+            .id("connect-edit-file")
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .flex_none()
+            .px_1p5()
+            .py(px(2.))
+            .rounded(theme.radius_sm)
+            .text_size(theme.scale(11.5))
+            .text_color(theme.text_faint)
+            .cursor_pointer()
+            .hover(|s| s.text_color(theme.text_muted).bg(theme.bg_active))
+            .child(crate::icons::icon(
+                "edit",
+                theme.scale(12.),
+                theme.text_faint,
+            ))
+            .child("Edit file")
+            .tooltip(Tooltip::text("Open connections.toml"))
+            .on_click(cx.listener(|this, _, _, cx| this.open_connections_file(cx)));
+
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .mt(px(26.))
+            .mb_2()
+            .child(
+                div()
+                    .text_size(theme.scale(12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.text_dim)
+                    .child("Saved connections"),
+            )
+            .child(div().flex_1().h(px(1.)).bg(theme.border_soft))
+            .child(edit_file)
+    }
+
     pub(crate) fn render_connect(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // Build the cards first — they reborrow `cx` mutably — then read the theme
         // for the surrounding chrome (it holds an immutable borrow). The form modal
@@ -98,6 +124,7 @@ impl AppState {
             .collect();
         let toolbar = (!self.connections.is_empty()).then(|| self.connect_toolbar(cx));
         let new_button = self.new_button(cx);
+        let connections_header = self.connections_header(cx);
         let settings_gear = IconButton::new(
             "connect-settings",
             crate::icons::icon("settings", cx.theme().scale(16.), cx.theme().text_muted),
@@ -162,7 +189,7 @@ impl AppState {
             .pt(px(72.))
             .pb(px(60.))
             .child(header)
-            .child(section_label("Saved connections", theme))
+            .child(connections_header)
             .children(toolbar)
             .child(saved)
             .child(new_button);

@@ -697,6 +697,8 @@ mod tests {
     fn contains_clause_searches_untyped_columns() {
         // A computed/untyped column (`type_name: None`) is searched, not skipped.
         let columns = [col("expr", None)];
-        assert!(contains_clause(&columns, "x", |c| c.into(), |c| c.into(), "LIKE", false).is_some());
+        assert!(
+            contains_clause(&columns, "x", |c| c.into(), |c| c.into(), "LIKE", false).is_some()
+        );
     }
 }
