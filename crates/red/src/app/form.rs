@@ -67,16 +67,29 @@ impl AppState {
         let id = stored.id.clone();
         let mut config = stored.config.clone();
         // Materialize the stored password from the keychain so the form shows it
-        // (and the Test/Save paths, which read the input, reuse it). A read miss
-        // or denial just leaves the field blank — the user can re-enter it.
+        // (and the Test/Save paths, which read the input, reuse it). A genuine miss
+        // (`Ok(None)`) leaves the field blank silently; a read *error* — most often
+        // the OS keychain prompt being denied — is surfaced, so a blank field is
+        // explained rather than mistaken for "no password saved".
+        let mut keychain_err = None;
         if config.password.is_empty() && !config.kind.is_file() {
             match crate::secrets::get_password(&id) {
                 Ok(Some(pw)) => config.password = pw,
                 Ok(None) => {}
-                Err(e) => tracing::warn!("failed to read credential from keychain: {e}"),
+                Err(e) => {
+                    tracing::warn!("failed to read credential from keychain: {e}");
+                    keychain_err = Some(e);
+                }
             }
         }
         self.fill_form_inputs(&config, cx);
+        if keychain_err.is_some() {
+            self.notify(
+                ToastVariant::Error,
+                "Couldn't read the saved password from the keychain — re-enter it to update it.",
+                cx,
+            );
+        }
         self.form = Some(FormState {
             kind: config.kind,
             color: config.color,

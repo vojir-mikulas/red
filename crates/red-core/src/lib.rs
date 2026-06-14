@@ -913,6 +913,12 @@ impl Default for QueryOptions {
 pub enum RedError {
     #[error("connection failed: {0}")]
     Connect(String),
+    /// A connect attempt the user must fix before retrying makes sense: bad
+    /// credentials, a missing database, an unknown role. Distinct from
+    /// [`RedError::Connect`] (a transient/network failure) so the UI can stop the
+    /// backoff loop and prompt for an edit instead of retrying forever.
+    #[error("authentication failed: {0}")]
+    Auth(String),
     #[error("query failed: {0}")]
     Query(String),
     #[error("driver error: {0}")]

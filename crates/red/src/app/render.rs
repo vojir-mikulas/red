@@ -16,8 +16,10 @@ use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
 impl AppState {
     /// The connecting splash: an indeterminate progress bar while an attempt is
-    /// in flight, the error plus a backoff countdown between retries, and always
-    /// a Cancel (quit-the-load) button — with "Retry now" while backing off.
+    /// in flight, the error plus a backoff countdown between transient retries, a
+    /// terminal error with "Edit connection" on a fatal failure (bad credentials,
+    /// missing database), and always a Cancel button — plus "Retry now" while
+    /// backing off.
     fn render_connecting(&self, conn: &Connecting, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let name = conn.config.name.clone();
@@ -53,6 +55,20 @@ impl AppState {
                         .child(format!("Retrying in {}s…", delay.as_secs())),
                 )
                 .child(ProgressBar::new("connect-progress", 0.0).indeterminate(true)),
+            // Terminal: no countdown, no progress bar — the user must fix the
+            // connection. The red tint marks it as a stop, not a transient wait.
+            ConnectStatus::Failed { error } => status
+                .child(
+                    div()
+                        .text_color(theme.text)
+                        .child(format!("Couldn't connect to {name}")),
+                )
+                .child(
+                    div()
+                        .text_color(theme.red)
+                        .text_size(theme.scale(12.))
+                        .child(error.clone()),
+                ),
         };
 
         let mut actions = div().flex().justify_center().gap_2();
@@ -61,6 +77,13 @@ impl AppState {
                 Button::new("connect-retry", "Retry now")
                     .variant(ButtonVariant::Secondary)
                     .on_click(cx.listener(|this, _, _, cx| this.retry_now(cx))),
+            );
+        }
+        if matches!(conn.status, ConnectStatus::Failed { .. }) {
+            actions = actions.child(
+                Button::new("connect-edit", "Edit connection")
+                    .variant(ButtonVariant::Primary)
+                    .on_click(cx.listener(|this, _, _, cx| this.edit_failed_connection(cx))),
             );
         }
         actions = actions.child(

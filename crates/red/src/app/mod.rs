@@ -144,6 +144,10 @@ pub(crate) enum ConnectStatus {
         error: SharedString,
         delay: Duration,
     },
+    /// The attempt failed for a user-correctable reason (bad credentials, missing
+    /// database) — terminal, no retry. The splash shows the error and offers an
+    /// "Edit connection" action instead of a countdown. See [`Event::ConnectFailed`].
+    Failed { error: SharedString },
 }
 
 /// The result of the latest "Test connection" probe, shown in the form footer.
@@ -1210,19 +1214,20 @@ impl AppState {
                     form.test = TestState::Fail(message.into());
                 }
             }
+            Event::ConnectFailed { message, fatal } => {
+                tracing::error!(?session, fatal, "{message}");
+                // Only act if this reply is for the connect still on screen; a stale
+                // reply from a superseded/cancelled attempt is ignored.
+                if matches!(&self.phase, Phase::Connecting(c) if Some(c.session) == session) {
+                    self.on_connect_failed(message, fatal, cx);
+                }
+            }
             Event::Error(message) => {
                 // Log the full text to stderr (RUST_LOG) — a toast is ephemeral and
                 // can truncate, so the console keeps the complete error to inspect.
                 tracing::error!(?session, "{message}");
-                // While the foreground is connecting, the only thing in flight is
-                // that connect — so an error is a failed attempt: keep the splash
-                // and schedule a backoff retry instead of dropping to the screen.
-                if matches!(&self.phase, Phase::Connecting(c) if Some(c.session) == session) {
-                    self.on_connect_failed(message, cx);
-                } else {
-                    self.on_result_error(session, &message);
-                    self.notify(ToastVariant::Error, message, cx);
-                }
+                self.on_result_error(session, &message);
+                self.notify(ToastVariant::Error, message, cx);
             }
 
             // --- schema explorer ---

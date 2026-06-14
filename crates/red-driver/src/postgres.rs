@@ -85,7 +85,10 @@ fn pg_cancel_token(client: &Client) -> CancelToken {
 
 /// Prepare `sql` on `client` and read its column metadata (works for an empty result).
 async fn prepare_columns(client: &Client, sql: &str) -> Result<(Statement, Vec<Column>)> {
-    let stmt = client.prepare(sql).await.map_err(driver_err)?;
+    // Postgres validates SQL at prepare time, so a user's bad custom query
+    // surfaces here — map through `map_pg_err` to keep the server's message
+    // instead of the bare `"db error"` that `tokio_postgres::Error` renders.
+    let stmt = client.prepare(sql).await.map_err(map_pg_err)?;
     let columns = stmt
         .columns()
         .iter()
@@ -103,7 +106,7 @@ impl PostgresDriver {
     pub async fn connect(dsn: &str, read_only: bool) -> Result<Self> {
         let (client, connection) = tokio_postgres::connect(dsn, NoTls)
             .await
-            .map_err(|e| RedError::Connect(e.to_string()))?;
+            .map_err(map_connect_err)?;
         tokio::spawn(async move {
             // When the client drops, this resolves and the task ends.
             let _ = connection.await;
@@ -877,12 +880,41 @@ fn be_i32(b: &[u8]) -> Option<i32> {
     b.try_into().ok().map(i32::from_be_bytes)
 }
 
-/// Map a cancel (SQLSTATE 57014) to the distinct `Interrupted`, else a driver error.
+/// Map a failed dial to a *fatal* [`RedError::Auth`] (the user must fix the
+/// connection before a retry helps) or a transient [`RedError::Connect`]. Bad
+/// credentials (28xxx) and a missing database (3D000) are user-correctable; a
+/// refused/unreachable host has no server `DbError` and stays a retryable
+/// `Connect`. The server's own message is surfaced (its `Display` is a bare
+/// `"db error"` — the text lives only in the attached `DbError`).
+fn map_connect_err(e: tokio_postgres::Error) -> RedError {
+    if let Some(db) = e.as_db_error() {
+        let class = &db.code().code()[..2];
+        // SQLSTATE class 28 = invalid authorization; 3D000 = invalid catalog
+        // (database does not exist). Both need a credential/target fix, not a wait.
+        if class == "28" || db.code() == &tokio_postgres::error::SqlState::INVALID_CATALOG_NAME {
+            return RedError::Auth(db.message().to_string());
+        }
+        return RedError::Connect(format!("{}: {}", db.code().code(), db.message()));
+    }
+    RedError::Connect(e.to_string())
+}
+
+/// Map a cancel (SQLSTATE 57014) to the distinct `Interrupted`, else a driver
+/// error. A database-side failure (bad SQL, missing relation, type mismatch) is
+/// the common case, and `tokio_postgres::Error`'s own `Display` renders it as a
+/// bare `"db error"` — the useful text lives only in the attached `DbError`. So
+/// surface the server's message (with SQLSTATE and any hint) rather than letting
+/// the round-trip bounce back as the cryptic `"db error"`.
 fn map_pg_err(e: tokio_postgres::Error) -> RedError {
     if let Some(db) = e.as_db_error() {
         if db.code() == &tokio_postgres::error::SqlState::QUERY_CANCELED {
             return RedError::Interrupted;
         }
+        let mut msg = format!("{}: {}", db.code().code(), db.message());
+        if let Some(hint) = db.hint() {
+            msg.push_str(&format!(" (hint: {hint})"));
+        }
+        return RedError::Driver(msg);
     }
     driver_err(e)
 }

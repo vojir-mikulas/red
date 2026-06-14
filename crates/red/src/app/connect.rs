@@ -255,10 +255,27 @@ impl AppState {
         Duration::from_secs(secs.min(30))
     }
 
-    /// A connect attempt failed: record the error on the splash and schedule a
-    /// backoff retry. No-op if we've left the connecting phase meanwhile.
-    pub(crate) fn on_connect_failed(&mut self, message: String, cx: &mut Context<Self>) {
+    /// A connect attempt failed. A `fatal` failure (bad credentials, missing
+    /// database) is terminal — show the error and an Edit affordance, no retry. A
+    /// transient one records the error and schedules a backoff retry. No-op if
+    /// we've left the connecting phase meanwhile.
+    pub(crate) fn on_connect_failed(
+        &mut self,
+        message: String,
+        fatal: bool,
+        cx: &mut Context<Self>,
+    ) {
         let delay = match &mut self.phase {
+            Phase::Connecting(conn) if fatal => {
+                // Bump the generation so any backoff timer from a prior transient
+                // attempt can't fire and override this terminal state.
+                conn.status = ConnectStatus::Failed {
+                    error: message.into(),
+                };
+                self.connect_gen += 1;
+                cx.notify();
+                return;
+            }
             Phase::Connecting(conn) => {
                 let delay = Self::backoff_delay(conn.attempt);
                 conn.status = ConnectStatus::Backoff {
@@ -270,6 +287,21 @@ impl AppState {
             _ => return,
         };
         self.schedule_retry(delay, cx);
+    }
+
+    /// "Edit connection" on a fatal connect splash: leave the splash (restoring
+    /// whatever was foreground before, like Cancel) and open the edit form for the
+    /// connection that failed, so the user can fix the credentials and reconnect.
+    pub(crate) fn edit_failed_connection(&mut self, cx: &mut Context<Self>) {
+        let conn_id = match &self.phase {
+            Phase::Connecting(conn) => conn.conn_id.clone(),
+            _ => return,
+        };
+        let index = self.connections.iter().position(|c| c.id == conn_id);
+        self.cancel_connect(cx);
+        if let Some(index) = index {
+            self.open_edit_form(index, cx);
+        }
     }
 
     /// Arm a one-shot timer that retries the connection after `delay`, unless a

@@ -69,10 +69,7 @@ impl MysqlDriver {
         }
         let pool = Pool::new(builder);
 
-        let mut conn = pool
-            .get_conn()
-            .await
-            .map_err(|e| RedError::Connect(e.to_string()))?;
+        let mut conn = pool.get_conn().await.map_err(map_connect_err)?;
         let version: Option<String> = conn
             .query_first("SELECT VERSION()")
             .await
@@ -852,6 +849,19 @@ fn group_indexes(rows: &[Row]) -> Vec<IndexMeta> {
 /// `pg_quote`, which both wrap *and* escape.
 fn escape_ident(s: &str) -> String {
     s.replace('`', "``")
+}
+
+/// Map a failed dial to a *fatal* [`RedError::Auth`] (a credential/target the
+/// user must fix) or a transient [`RedError::Connect`]. 1045 = access denied,
+/// 1044 = access denied to database, 1049 = unknown database — none retry away.
+/// Anything else (refused/unreachable host) stays a retryable `Connect`.
+fn map_connect_err(e: MyError) -> RedError {
+    if let MyError::Server(ref se) = e {
+        if matches!(se.code, 1045 | 1044 | 1049) {
+            return RedError::Auth(se.message.clone());
+        }
+    }
+    RedError::Connect(e.to_string())
 }
 
 /// Map a killed query (`KILL QUERY` → error 1317, SQLSTATE `70100`) to the

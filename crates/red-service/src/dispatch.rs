@@ -250,11 +250,19 @@ enum ConnectOutcome {
     Session {
         id: SessionId,
         generation: u64,
-        result: Result<Arc<dyn DatabaseDriver>, String>,
+        result: Result<Arc<dyn DatabaseDriver>, ConnectFail>,
     },
     /// A session-less `TestConnection` finished — carries the server version on
     /// success, the error message otherwise.
     Test { result: Result<String, String> },
+}
+
+/// A failed connect attempt: the user-facing message plus whether it's `fatal`
+/// (user-correctable — bad credentials, missing database) and so should stop the
+/// UI's backoff loop rather than schedule another retry.
+struct ConnectFail {
+    message: String,
+    fatal: bool,
 }
 
 /// Apply a spawned connect/probe result on the dispatch loop. Insertion into
@@ -283,7 +291,14 @@ fn apply_connect_outcome(
                     sessions.insert(id, SessionState::new(driver));
                     emit(events, Some(id), Event::Connected { version });
                 }
-                Err(message) => emit(events, Some(id), Event::Error(message)),
+                Err(fail) => emit(
+                    events,
+                    Some(id),
+                    Event::ConnectFailed {
+                        message: fail.message,
+                        fatal: fail.fatal,
+                    },
+                ),
             }
         }
         ConnectOutcome::Test { result } => match result {
@@ -409,9 +424,12 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // doesn't stall every warm session.
                 let tx = connect_tx.clone();
                 tokio::spawn(async move {
+                    // The Test reply only reports a message; fatality only matters
+                    // for the retry loop, which a probe doesn't have.
                     let result = attempt_connect(&config)
                         .await
-                        .map(|driver| driver.server_version());
+                        .map(|driver| driver.server_version())
+                        .map_err(|f| f.message);
                     let _ = tx.send(ConnectOutcome::Test { result });
                 });
             }
@@ -1514,35 +1532,39 @@ async fn with_timeout<T>(
 
 /// [`connect`] bounded by [`CONNECT_TIMEOUT`]. A timeout surfaces as a connect
 /// error like any other failure, so the UI's retry/backoff path handles it.
-async fn attempt_connect(config: &ConnectionConfig) -> Result<Arc<dyn DatabaseDriver>, String> {
+async fn attempt_connect(
+    config: &ConnectionConfig,
+) -> Result<Arc<dyn DatabaseDriver>, ConnectFail> {
     match tokio::time::timeout(CONNECT_TIMEOUT, connect(config)).await {
-        Ok(result) => result,
-        Err(_) => Err(format!(
-            "connection timed out after {}s",
-            CONNECT_TIMEOUT.as_secs()
-        )),
+        // A driver `RedError::Auth` is the one user-correctable failure — flag it
+        // fatal so the UI stops retrying; every other connect error is transient.
+        Ok(result) => result.map_err(|e| ConnectFail {
+            fatal: matches!(e, RedError::Auth(_)),
+            message: e.to_string(),
+        }),
+        Err(_) => Err(ConnectFail {
+            message: format!("connection timed out after {}s", CONNECT_TIMEOUT.as_secs()),
+            fatal: false,
+        }),
     }
 }
 
-async fn connect(config: &ConnectionConfig) -> Result<Arc<dyn DatabaseDriver>, String> {
+async fn connect(config: &ConnectionConfig) -> red_core::Result<Arc<dyn DatabaseDriver>> {
     match config.kind {
         DbKind::Sqlite => {
             let driver = SqliteDriver::new(config.dsn(), config.read_only);
-            driver.ping().await.map_err(|e| e.to_string())?;
+            driver.ping().await?;
             Ok(Arc::new(driver))
         }
         DbKind::Postgres => {
-            let driver = PostgresDriver::connect(&config.dsn(), config.read_only)
-                .await
-                .map_err(|e| e.to_string())?;
+            let driver = PostgresDriver::connect(&config.dsn(), config.read_only).await?;
             Ok(Arc::new(driver))
         }
         DbKind::Mysql => {
             // A MySQL connection can see every database on the server; scope the
             // schema tree to the chosen one when the connection names a database.
             let driver = MysqlDriver::connect(&config.dsn(), config.read_only)
-                .await
-                .map_err(|e| e.to_string())?
+                .await?
                 .with_scope(Some(config.database.clone()));
             Ok(Arc::new(driver))
         }

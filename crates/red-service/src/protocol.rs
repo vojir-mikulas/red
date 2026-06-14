@@ -206,6 +206,15 @@ pub enum Event {
     TestFailed {
         message: String,
     },
+    /// A `Connect` attempt failed. `fatal` is `true` for a user-correctable cause
+    /// (bad credentials, missing database) the UI should stop retrying and prompt
+    /// to edit; `false` for a transient/network failure that warrants a backoff
+    /// retry. Distinct from the generic [`Event::Error`] so the connecting splash
+    /// can branch without sniffing the message text.
+    ConnectFailed {
+        message: String,
+        fatal: bool,
+    },
     /// A query opened; column metadata is known before any rows arrive.
     QueryStarted {
         columns: Vec<Column>,
