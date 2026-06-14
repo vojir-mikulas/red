@@ -44,6 +44,7 @@ serde.workspace = true
 toml.workspace = true
 dirs.workspace = true
 notify.workspace = true
+zeroize.workspace = true
 
 # macOS uses font-kit (CoreText) for font loading; Windows/Linux use GPUI's own
 # backend. Features are additive, so this only adds to the base workspace deps.

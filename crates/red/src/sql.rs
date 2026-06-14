@@ -358,6 +358,83 @@ pub fn auto_limit(sql: &str, n: u32) -> Option<String> {
     Some(format!("{trimmed} LIMIT {n}"))
 }
 
+/// Replace non-ASCII Unicode whitespace — most commonly U+00A0, the non-breaking
+/// space macOS types for Option+Space — with a plain ASCII space, *outside* string
+/// literals, quoted identifiers, and comments where such a character could be
+/// intentional. Engines reject a bare U+00A0 as an invalid token rather than
+/// treating it as whitespace, so one slipped into a query turns a valid-looking
+/// statement into a cryptic `syntax error`; the editor run path scrubs it first.
+/// Returns `None` (leave the SQL untouched) when there's nothing to normalize, so
+/// the common path never allocates.
+pub fn normalize_spaces(sql: &str) -> Option<String> {
+    // Fast path: only bother scanning when a non-ASCII whitespace char is present.
+    if !sql.chars().any(|c| c.is_whitespace() && !c.is_ascii()) {
+        return None;
+    }
+    let chars: Vec<char> = sql.chars().collect();
+    let n = chars.len();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let mut changed = false;
+    while i < n {
+        let c = chars[i];
+        // Line comment: copy verbatim to (not including) the newline.
+        if c == '-' && i + 1 < n && chars[i + 1] == '-' {
+            while i < n && chars[i] != '\n' {
+                out.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment: copy verbatim through the closing `*/` (or to the end).
+        if c == '/' && i + 1 < n && chars[i + 1] == '*' {
+            out.push('/');
+            out.push('*');
+            i += 2;
+            while i < n && !(chars[i] == '*' && i + 1 < n && chars[i + 1] == '/') {
+                out.push(chars[i]);
+                i += 1;
+            }
+            for _ in 0..2 {
+                if i < n {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // String literal / quoted identifier: copy verbatim, honoring `''`/`""`
+        // doubled-quote escapes so an escaped quote doesn't end the span early.
+        if c == '\'' || c == '"' {
+            out.push(c);
+            i += 1;
+            while i < n {
+                out.push(chars[i]);
+                if chars[i] == c {
+                    if i + 1 < n && chars[i + 1] == c {
+                        out.push(chars[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Ordinary text: swap any non-ASCII whitespace for a normal space.
+        if c.is_whitespace() && !c.is_ascii() {
+            out.push(' ');
+            changed = true;
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    changed.then_some(out)
+}
+
 /// Whether `sql` already carries a `LIMIT` keyword. Word-boundary, case-insensitive
 /// scan; a false positive (a column literally named `limit`, or `limit` inside a
 /// string) only *suppresses* the auto-limit, which is the safe direction.
@@ -700,6 +777,38 @@ mod tests {
         // Disabled by a zero limit, and skipped for multi-statement batches.
         assert_eq!(auto_limit("SELECT * FROM t", 0), None);
         assert_eq!(auto_limit("SELECT 1; SELECT 2", 1000), None);
+    }
+
+    #[test]
+    fn normalize_spaces_scrubs_nbsp_outside_literals() {
+        // U+00A0 (Option+Space) between tokens becomes a normal space.
+        assert_eq!(
+            normalize_spaces("SELECT *\u{a0}FROM t").as_deref(),
+            Some("SELECT * FROM t")
+        );
+        // Other non-ASCII whitespace (narrow/figure/ideographic spaces) too.
+        assert_eq!(
+            normalize_spaces("SELECT\u{202f}1,\u{2007}2,\u{3000}3").as_deref(),
+            Some("SELECT 1, 2, 3")
+        );
+        // Plain ASCII whitespace is left untouched (nothing to normalize).
+        assert_eq!(normalize_spaces("SELECT * FROM t\n WHERE a = 1"), None);
+    }
+
+    #[test]
+    fn normalize_spaces_preserves_nbsp_inside_literals_and_comments() {
+        // Inside a string literal an NBSP is data — keep it (and report no change).
+        assert_eq!(normalize_spaces("SELECT 'a\u{a0}b' FROM t"), None);
+        // Inside a quoted identifier likewise.
+        assert_eq!(normalize_spaces("SELECT \"a\u{a0}b\" FROM t"), None);
+        // Inside comments too; an NBSP outside is still scrubbed in the same pass.
+        assert_eq!(
+            normalize_spaces("SELECT 1 -- a\u{a0}b\nFROM\u{a0}t").as_deref(),
+            Some("SELECT 1 -- a\u{a0}b\nFROM t")
+        );
+        // A doubled-quote escape doesn't end the literal early, so an NBSP after it
+        // but still inside the string is preserved.
+        assert_eq!(normalize_spaces("SELECT 'O''\u{a0}x' FROM t"), None);
     }
 
     #[test]

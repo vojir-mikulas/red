@@ -724,7 +724,7 @@ fn fetch_window(
     // The cursor backs the editor-run / initial-window stream — offset-mode
     // display, so cap every cell (no seek key resolved here to exempt).
     let cap = CellCap::display([None, None]);
-    let mut out = Vec::with_capacity(max);
+    let mut out = Vec::with_capacity(crate::window_prealloc(max));
     for _ in 0..max {
         match rows.next() {
             Ok(Some(row)) => out.push(extract_row(row, column_count, cap)?),

@@ -670,7 +670,7 @@ impl QueryCursor for PgCursor {
         // Offset-mode display stream (editor run) — cap every cell, no key exempt.
         let cap = CellCap::display([None, None]);
         let mut stream = self.stream.lock().await;
-        let mut rows = Vec::with_capacity(max);
+        let mut rows = Vec::with_capacity(crate::window_prealloc(max));
         for _ in 0..max {
             match stream.next().await {
                 Some(Ok(row)) => rows.push(pg_row(&row, cap)),

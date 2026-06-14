@@ -51,6 +51,8 @@ dirs = "5"
 # Backend features are additive and per-OS, so the consuming crate selects them
 # per target (see crates/red/Cargo.toml); the public API is backend-agnostic.
 keyring = "3"
+# Wipes cached plaintext credentials from memory on drop (see secrets.rs cache).
+zeroize = "1"
 
 # --- Errors / logging ---
 anyhow = "1"

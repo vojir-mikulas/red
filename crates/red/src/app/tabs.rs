@@ -187,6 +187,9 @@ impl AppState {
             _ => return,
         };
         self.push_tab(tab, cx);
+        // Focus the new tab's editor on the next paint (this path has no `Window`,
+        // and the palette path likewise routes focus through render).
+        self.pending_focus = Some(Pane::Editor);
         cx.notify();
     }
 

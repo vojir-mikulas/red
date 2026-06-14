@@ -504,6 +504,17 @@ pub trait QueryCursor: Send {
     fn cancel_token(&self) -> CancelToken;
 }
 
+/// Initial capacity to reserve for a `next_window(max)` row buffer.
+///
+/// `max` is caller-supplied and can be enormous — the cancel-mid-fetch path asks
+/// for a billion rows precisely so the fetch is still running when the abort
+/// fires. Reserving `max` up front would try to allocate ~24 GB before a single
+/// row is read and abort the process. Cap the reservation to one display page's
+/// worth; the `Vec` still grows past it for the rare genuinely large window.
+pub(crate) fn window_prealloc(max: usize) -> usize {
+    max.min(4096)
+}
+
 /// Engine-agnostic cancel handle. SQLite wraps `rusqlite`'s `InterruptHandle`;
 /// Postgres wraps its out-of-band cancel request. Cloning is cheap and the token
 /// is safe to call from any thread.

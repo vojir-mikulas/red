@@ -666,6 +666,11 @@ impl AppState {
             _ => return,
         };
         let sql = sql.trim().to_string();
+        // An editor can slip in a non-breaking space (macOS Option+Space) that the
+        // engine rejects as an invalid token rather than whitespace — scrub those to
+        // plain spaces (outside literals/comments) so a valid-looking query runs
+        // instead of bouncing back a cryptic `syntax error at or near " FROM"`.
+        let sql = crate::sql::normalize_spaces(&sql).unwrap_or(sql);
         // Nothing runnable (empty, or only comments/`;`) — skip it rather than let
         // the empty `SELECT * FROM (<sql>)` paging wrap bounce back a bare "db error".
         if crate::sql::is_blank(&sql) {

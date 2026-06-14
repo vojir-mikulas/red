@@ -634,7 +634,7 @@ impl QueryCursor for MyCursor {
 
     async fn next_window(&self, max: usize) -> Result<RowWindow> {
         let mut rx = self.rows.lock().await;
-        let mut rows = Vec::with_capacity(max);
+        let mut rows = Vec::with_capacity(crate::window_prealloc(max));
         for _ in 0..max {
             match rx.recv().await {
                 Some(Ok(row)) => rows.push(row),
