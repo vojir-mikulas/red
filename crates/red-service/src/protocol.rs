@@ -120,15 +120,16 @@ pub enum Command {
     Execute {
         sql: String,
     },
-    /// Apply one guarded, PK-keyed data edit (Track B5) on the active session. The
-    /// driver renders `op` to dialect SQL, binds every value, and asserts it touches
-    /// exactly one row. `epoch` is the active result's epoch so a reply for a
+    /// Apply a batch of guarded, PK-keyed data edits (Track B6) **atomically** on the
+    /// active session. The driver renders each `op` to dialect SQL, binds every
+    /// value, runs them in one transaction, and asserts each touches exactly one row
+    /// — all-or-nothing. `epoch` is the active result's epoch so a reply for a
     /// superseded result (tab switched / re-run) is dropped. Replied with
-    /// `EditApplied` (then the UI refetches the affected window) or `EditFailed`
-    /// (scoped to the result pane), never a global error toast.
-    ApplyEdit {
+    /// `BatchApplied` (then the UI patches/refetches) or `BatchFailed` (scoped to the
+    /// result pane), never a global error toast.
+    ApplyBatch {
         epoch: u64,
-        op: EditOp,
+        ops: Vec<EditOp>,
     },
     /// Run `EXPLAIN` (or `EXPLAIN ANALYZE` when `analyze`) for `sql` and report a
     /// normalized plan (Track B4). `epoch` is the active tab's result epoch so a
@@ -287,18 +288,21 @@ pub enum Event {
     Executed {
         affected: usize,
     },
-    /// A guarded data edit (Track B5) committed on its result's session. Echoes
-    /// `epoch` so the UI refetches the affected window of the right result (and
-    /// drops a reply for a superseded one). `affected` is always 1 on success.
-    EditApplied {
+    /// A guarded edit batch (Track B6) committed on its result's session. Echoes
+    /// `epoch` so the UI patches/refetches the right result (and drops a reply for a
+    /// superseded one). `applied` is the total ops committed.
+    BatchApplied {
         epoch: u64,
-        affected: u64,
+        applied: u64,
     },
-    /// A guarded data edit failed (engine error, or it touched ≠1 row and rolled
-    /// back). Scoped to the result pane by `epoch` — shown there, not as a global
+    /// A guarded edit batch failed (engine error, or an op touched ≠1 row) and the
+    /// whole transaction rolled back — nothing changed. `failed_index` is the 0-based
+    /// position of the offending op when known, so the UI can point at the staged
+    /// change. Scoped to the result pane by `epoch` — shown there, not as a global
     /// toast — like `PlanFailed`.
-    EditFailed {
+    BatchFailed {
         epoch: u64,
+        failed_index: Option<usize>,
         message: String,
     },
     /// An `Explain` produced a plan. Echoes `epoch` so the UI drops a plan for a

@@ -7,10 +7,10 @@ use gpui::{div, prelude::*, px, Focusable, KeyDownEvent, Render, Window};
 
 use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::keymap::{
-    About, CloseInspector, CloseTab, CycleFocusNext, CycleFocusPrev, Explain, FocusEditor,
-    FocusGrid, FocusSchema, NewConnection, NewTab, NextTab, OpenSavedQueries, PrevTab,
-    RefreshSchema, RunQuery, SaveQuery, SearchSchema, Settings, ShowShortcuts, SwitchConnection,
-    ToggleFilter, ToggleInspector, ToggleSidebar,
+    About, AddRow, BeginEdit, CloseInspector, CloseTab, CycleFocusNext, CycleFocusPrev, DeleteRow,
+    Explain, FocusEditor, FocusGrid, FocusSchema, NewConnection, NewTab, NextTab, OpenSavedQueries,
+    PrevTab, RefreshSchema, RevertChanges, RunQuery, SaveQuery, SearchSchema, SetNull, Settings,
+    ShowShortcuts, SubmitChanges, SwitchConnection, ToggleFilter, ToggleInspector, ToggleSidebar,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
@@ -169,6 +169,40 @@ impl Render for AppState {
             }
         }
 
+        // An inline cell edit just opened in the grid (Track B6) — focus its field.
+        if self.focus_grid_edit {
+            self.focus_grid_edit = false;
+            if let Some(handle) = self.grid_edit_focus(cx) {
+                window.focus(&handle, cx);
+            }
+        }
+
+        // Commit-on-blur: while an inline editor is open, a focus-out listener on its
+        // field stages the edit when the user clicks away (like a spreadsheet) — the
+        // cell then shows as dirty. Registered once when an editor opens, dropped when
+        // it closes. Mirrors `modal_focus_trap`.
+        if self.grid_edit.is_some() {
+            if self.grid_edit_blur.is_none() {
+                if let Some(handle) = self.grid_edit_focus(cx) {
+                    let weak = cx.entity().downgrade();
+                    let sub = window.on_focus_out(&handle, cx, move |_event, _window, cx| {
+                        if let Some(app) = weak.upgrade() {
+                            // Commit only if an editor is still open (a Submit/Cancel
+                            // already cleared it, so its focus move is a no-op here).
+                            app.update(cx, |this, cx| {
+                                if this.grid_edit.is_some() {
+                                    this.commit_grid_edit(cx);
+                                }
+                            });
+                        }
+                    });
+                    self.grid_edit_blur = Some(sub);
+                }
+            }
+        } else {
+            self.grid_edit_blur = None;
+        }
+
         // The palette's "switch connection" command — open the switcher popover
         // now that the `Window` its field-focus needs is in hand.
         if self.open_switcher {
@@ -312,6 +346,22 @@ impl Render for AppState {
             // Settings panel: ⌘, and the RED → Settings… / About RED menu items.
             .on_action(cx.listener(|this, _: &Settings, _, cx| this.open_settings(cx)))
             .on_action(cx.listener(|this, _: &About, _, cx| this.open_about(cx)))
+            // --- staged grid editing (Track B6) ---
+            .on_action(cx.listener(|this, _: &BeginEdit, _, cx| this.begin_grid_edit(cx)))
+            // ⌘↵ in the grid submits staged changes; with nothing staged it falls
+            // through to running the active query (so the key still does the
+            // expected thing on a clean grid).
+            .on_action(cx.listener(|this, _: &SubmitChanges, _, cx| {
+                if this.has_pending_changes() {
+                    this.submit_changes(cx);
+                } else {
+                    this.run_editor_query(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &RevertChanges, _, cx| this.revert_changes(cx)))
+            .on_action(cx.listener(|this, _: &DeleteRow, _, cx| this.toggle_delete_rows(cx)))
+            .on_action(cx.listener(|this, _: &AddRow, _, cx| this.add_draft_row(cx)))
+            .on_action(cx.listener(|this, _: &SetNull, _, cx| this.set_cell_null(cx)))
             // ⌘↵ runs the active tab's query from any pane — or tests the connection
             // while the form is open. ⌘N on the welcome screen adds a connection.
             .on_action(cx.listener(|this, _: &RunQuery, _, cx| {
@@ -667,21 +717,34 @@ impl AppState {
         let confirm_view = cx.entity().downgrade();
         // The destructive editor statement and the guarded grid edit share this
         // modal; only the title, prose, preview text, and button label differ.
-        let (title, prose, sql, run_label) = match &pending {
+        let (title, prose, sql, run_label): (&str, String, String, &str) = match &pending {
             PendingWrite::EditorSql(sql) => (
                 "Confirm destructive statement",
-                "This statement modifies data and can't be undone. Run it?",
+                "This statement modifies data and can't be undone. Run it?".to_string(),
                 sql.clone(),
                 "Run statement",
             ),
-            PendingWrite::Edit { op, .. } => (
-                "Confirm edit",
-                "This will modify one row, keyed on its primary key. Apply it?",
-                op.preview_sql(),
-                "Apply edit",
-            ),
+            PendingWrite::Batch { ops, .. } => {
+                let n = ops.len();
+                let prose = if n == 1 {
+                    "This will apply 1 staged change in a single transaction. Submit it?"
+                        .to_string()
+                } else {
+                    format!(
+                        "This will apply {n} staged changes in a single transaction. Submit them?"
+                    )
+                };
+                let combined = ops
+                    .iter()
+                    .map(|op| op.preview_sql())
+                    .collect::<Vec<_>>()
+                    .join(";\n");
+                ("Submit changes", prose, combined, "Submit")
+            }
         };
-        let preview: String = sql.chars().take(200).collect();
+        // The batch preview can be many statements; show more than a single edit's
+        // one-liner but still cap it so a huge change-set can't blow up the modal.
+        let preview: String = sql.chars().take(1200).collect();
         let body = div()
             .flex()
             .flex_col()

@@ -986,7 +986,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 }
             }
 
-            Command::ApplyEdit { epoch, op } => {
+            Command::ApplyBatch { epoch, ops } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get(&id) else {
                     emit(&events, session_id, Event::Error("not connected".into()));
@@ -994,24 +994,26 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 };
                 let driver = state.driver.clone();
                 let results = state.results.clone();
-                // One bounded write, asserted to touch exactly one row by the driver.
-                // Like `Execute`, a success may shift rows under any open result, so
-                // drop the checkpoint indexes; the failure is pane-local
-                // (`EditFailed`), not a global error toast.
-                match driver.apply_edit(&op).await {
-                    Ok(affected) => {
+                // An atomic batch of bounded writes, each asserted to touch exactly
+                // one row by the driver (all-or-nothing). Like `Execute`, a success
+                // may shift rows under any open result, so drop the checkpoint
+                // indexes; the failure is pane-local (`BatchFailed`), not a global
+                // error toast.
+                match driver.apply_edits(&ops).await {
+                    Ok(applied) => {
                         for spec in lock(&results).values() {
                             let mut idx = lock(&spec.checkpoints);
                             idx.points.clear();
                             idx.status = BuildStatus::Idle;
                         }
-                        emit(&events, session_id, Event::EditApplied { epoch, affected });
+                        emit(&events, session_id, Event::BatchApplied { epoch, applied });
                     }
                     Err(e) => emit(
                         &events,
                         session_id,
-                        Event::EditFailed {
+                        Event::BatchFailed {
                             epoch,
+                            failed_index: None,
                             message: e.to_string(),
                         },
                     ),

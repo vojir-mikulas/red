@@ -452,13 +452,22 @@ pub trait DatabaseDriver: Send + Sync {
     /// number of rows affected. A read-only driver rejects the write at the engine.
     async fn execute(&self, sql: &str) -> Result<u64>;
 
-    /// Apply one guarded, PK-keyed data edit (Track B5): render `op` to dialect SQL
-    /// with every value **bound** (see [`edit_sql`]), run it in a transaction, and
-    /// assert it affected exactly one row — rolling back and returning
-    /// [`edit_count_err`] otherwise, so a stale/non-unique key can't half-apply.
-    /// A read-only driver rejects the write at the engine (defense in depth behind
-    /// the UI's opt-in gate). Returns the affected count (always 1 on success).
-    async fn apply_edit(&self, op: &EditOp) -> Result<u64>;
+    /// Apply a batch of guarded, PK-keyed data edits (Track B6) **atomically** in a
+    /// single transaction: render each `op` to dialect SQL with every value **bound**
+    /// (see [`edit_sql`]), run them in order, and assert each touches exactly one row
+    /// — rolling the *whole* batch back and returning [`edit_count_err`] (or the
+    /// engine error) the moment any op fails or matches ≠1 row, so a multi-edit
+    /// submit is all-or-nothing and a stale/non-unique key can't half-apply. A
+    /// read-only driver rejects the writes at the engine (defense in depth behind the
+    /// UI's opt-in gate). Returns the total affected count (`== ops.len()` on
+    /// success). An empty batch is a no-op returning 0 without opening a transaction.
+    async fn apply_edits(&self, ops: &[EditOp]) -> Result<u64>;
+
+    /// Apply one guarded data edit — the single-row common case, delegating to the
+    /// transactional [`apply_edits`](DatabaseDriver::apply_edits) batch path.
+    async fn apply_edit(&self, op: &EditOp) -> Result<u64> {
+        self.apply_edits(std::slice::from_ref(op)).await
+    }
 
     /// Run the engine's `EXPLAIN` for `sql` and return a normalized [`QueryPlan`]
     /// (Track B4). Plain `explain` (`analyze = false`) never executes the

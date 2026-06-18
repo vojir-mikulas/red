@@ -90,7 +90,7 @@ pub(super) struct DisplayCell {
 }
 
 impl DisplayCell {
-    fn from_value(value: &Value) -> DisplayCell {
+    pub(super) fn from_value(value: &Value) -> DisplayCell {
         match value {
             Value::Null => DisplayCell {
                 text: SharedString::new_static("NULL"),

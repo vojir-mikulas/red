@@ -288,11 +288,11 @@ impl DatabaseDriver for SqliteDriver {
             .map_err(driver_err)?
     }
 
-    async fn apply_edit(&self, op: &EditOp) -> Result<u64> {
+    async fn apply_edits(&self, ops: &[EditOp]) -> Result<u64> {
         let path = self.path.clone();
         let read_only = self.read_only;
-        let op = op.clone();
-        tokio::task::spawn_blocking(move || apply_edit_blocking(&path, read_only, &op))
+        let ops = ops.to_vec();
+        tokio::task::spawn_blocking(move || apply_edits_blocking(&path, read_only, &ops))
             .await
             .map_err(driver_err)?
     }
@@ -363,29 +363,37 @@ fn execute_blocking(path: &Path, read_only: bool, sql: &str) -> Result<u64> {
     }
 }
 
-/// Render and run one [`EditOp`] in a transaction, asserting it touches exactly one
-/// row (rolling back otherwise). Values are bound (`?` placeholders); a read-only
-/// open rejects the write at the engine.
-fn apply_edit_blocking(path: &Path, read_only: bool, op: &EditOp) -> Result<u64> {
-    let (sql, params) = crate::edit_sql(op, quote_ident, |_, _| "?".to_string());
-    let bound: Vec<rusqlite::types::Value> = params.iter().map(|v| to_sqlite(v)).collect();
+/// Render and run a batch of [`EditOp`]s in one transaction, asserting each touches
+/// exactly one row (rolling the whole batch back otherwise). Values are bound (`?`
+/// placeholders); a read-only open rejects the write at the engine. An empty batch
+/// is a no-op (no transaction opened).
+fn apply_edits_blocking(path: &Path, read_only: bool, ops: &[EditOp]) -> Result<u64> {
+    if ops.is_empty() {
+        return Ok(0);
+    }
     let conn = SqliteDriver::open(path, read_only)?;
     conn.execute_batch("BEGIN").map_err(driver_err)?;
-    match conn.execute(&sql, rusqlite::params_from_iter(bound)) {
-        Ok(affected) => {
-            let affected = affected as u64;
-            if affected != 1 {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(crate::edit_count_err(op, affected));
+    let mut total = 0u64;
+    for op in ops {
+        let (sql, params) = crate::edit_sql(op, quote_ident, |_, _| "?".to_string());
+        let bound: Vec<rusqlite::types::Value> = params.iter().map(|v| to_sqlite(v)).collect();
+        match conn.execute(&sql, rusqlite::params_from_iter(bound)) {
+            Ok(affected) => {
+                let affected = affected as u64;
+                if affected != 1 {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(crate::edit_count_err(op, affected));
+                }
+                total += affected;
             }
-            conn.execute_batch("COMMIT").map_err(driver_err)?;
-            Ok(affected)
-        }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(map_step_err(e))
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(map_step_err(e));
+            }
         }
     }
+    conn.execute_batch("COMMIT").map_err(driver_err)?;
+    Ok(total)
 }
 
 /// Stream the result of `sql` to `path`, one row at a time — never collecting the
@@ -952,6 +960,18 @@ mod tests {
         // A read-only open of the same file rejects the edit at the engine.
         let ro = SqliteDriver::new(&path, true);
         battery::read_only_rejects_edit(&ro, "main", "t").await;
+
+        // Atomic batch editing (B6) on a fresh seed table.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tb(id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO tb VALUES (1, 'one');",
+            )
+            .unwrap();
+        }
+        battery::applies_batch_atomic(&driver, "main", "tb").await;
+        battery::read_only_rejects_batch(&ro, "main", "tb").await;
 
         std::fs::remove_file(&path).ok();
     }
