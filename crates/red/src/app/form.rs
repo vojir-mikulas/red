@@ -124,6 +124,8 @@ impl AppState {
             database: read(&self.database_input),
             color: form.color,
             read_only: form.read_only,
+            // SSH tunnel is wired into the form in a later phase; direct for now.
+            ssh: None,
         })
     }
 

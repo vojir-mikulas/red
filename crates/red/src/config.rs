@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use red_core::{ConnectionConfig, DbKind};
+use red_core::{ConnectionConfig, DbKind, SshAuth, SshConfig};
 use serde::{Deserialize, Serialize};
 
 /// A saved connection plus a recency stamp for "recent" ordering. The in-memory
@@ -66,6 +66,52 @@ struct RawConnection {
     read_only: bool,
     #[serde(default)]
     last_accessed: Option<u64>,
+    /// Optional SSH jump host. Absent in pre-SSH configs; secrets are never here.
+    #[serde(default)]
+    ssh: Option<RawSsh>,
+}
+
+/// On-disk SSH config — flat scalars (no enum) so it round-trips through TOML
+/// cleanly as a `[connection.ssh]` sub-table. Secrets are never stored here;
+/// they live in the keychain keyed by the connection id.
+#[derive(Default, Deserialize)]
+struct RawSsh {
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    port: u16,
+    #[serde(default)]
+    user: String,
+    /// `agent` (default) | `password` | `key`.
+    #[serde(default)]
+    auth: String,
+    #[serde(default)]
+    key_path: String,
+}
+
+impl RawSsh {
+    /// Decode into an [`SshConfig`], or `None` when no jump host is named (an
+    /// empty `host` means "no tunnel", however the rest of the table looks).
+    fn into_config(self) -> Option<SshConfig> {
+        if self.host.trim().is_empty() {
+            return None;
+        }
+        let auth = match self.auth.as_str() {
+            "password" => SshAuth::Password,
+            "key" => SshAuth::Key {
+                path: self.key_path,
+            },
+            _ => SshAuth::Agent,
+        };
+        Some(SshConfig {
+            host: self.host,
+            port: if self.port == 0 { 22 } else { self.port },
+            user: self.user,
+            auth,
+            password: String::new(),
+            passphrase: String::new(),
+        })
+    }
 }
 
 impl RawConnection {
@@ -80,6 +126,7 @@ impl RawConnection {
             database: self.database,
             color: self.color,
             read_only: self.read_only,
+            ssh: self.ssh.and_then(RawSsh::into_config),
         };
         // Legacy migration: an old `dsn` with no structured fields populated. For a
         // file engine the DSN *is* the path; otherwise parse it back into fields.
@@ -128,6 +175,39 @@ struct WriteConnection {
     color: u8,
     read_only: bool,
     last_accessed: Option<u64>,
+    /// Optional `[connection.ssh]` sub-table. Must stay the **last** field: TOML
+    /// requires a table-valued key to follow all of a struct's scalar keys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssh: Option<WriteSsh>,
+}
+
+/// On-disk SSH config (save side) — mirror of [`RawSsh`], password-free. `auth`
+/// is a plain string so the table needs no TOML enum gymnastics.
+#[derive(Serialize)]
+struct WriteSsh {
+    host: String,
+    port: u16,
+    user: String,
+    auth: &'static str,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    key_path: String,
+}
+
+impl WriteSsh {
+    fn from_config(s: &SshConfig) -> Self {
+        let (auth, key_path) = match &s.auth {
+            SshAuth::Agent => ("agent", String::new()),
+            SshAuth::Password => ("password", String::new()),
+            SshAuth::Key { path } => ("key", path.clone()),
+        };
+        WriteSsh {
+            host: s.host.clone(),
+            port: s.port,
+            user: s.user.clone(),
+            auth,
+            key_path,
+        }
+    }
 }
 
 impl From<&StoredConnection> for WriteConnection {
@@ -144,6 +224,7 @@ impl From<&StoredConnection> for WriteConnection {
             color: c.color,
             read_only: c.read_only,
             last_accessed: s.last_accessed,
+            ssh: c.ssh.as_ref().map(WriteSsh::from_config),
         }
     }
 }
@@ -313,6 +394,7 @@ mod tests {
                     database: "analytics".into(),
                     color: 3,
                     read_only: false,
+                    ssh: None,
                 },
                 last_accessed: None,
             },
@@ -345,6 +427,67 @@ mod tests {
         // Password is not persisted; it comes back empty.
         assert_eq!(back[1].config.password, "");
         assert_eq!(back[1].last_accessed, None);
+    }
+
+    #[test]
+    fn ssh_config_round_trips_without_secrets() {
+        let connections = [StoredConnection {
+            id: "conn-ssh".into(),
+            config: ConnectionConfig {
+                name: "tunneled".into(),
+                kind: DbKind::Postgres,
+                host: "10.0.0.5".into(),
+                port: Some(5432),
+                user: "analytics".into(),
+                database: "shop".into(),
+                ssh: Some(SshConfig {
+                    host: "bastion.example.com".into(),
+                    port: 2222,
+                    user: "jump".into(),
+                    auth: SshAuth::Key {
+                        path: "/home/me/.ssh/id_ed25519".into(),
+                    },
+                    // Secrets must never reach the file.
+                    password: "should-not-persist".into(),
+                    passphrase: "neither-should-this".into(),
+                }),
+                ..Default::default()
+            },
+            last_accessed: None,
+        }];
+
+        let cfg = ConfigFile {
+            connections: connections.iter().map(WriteConnection::from).collect(),
+        };
+        let text = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(
+            !text.contains("should-not-persist") && !text.contains("neither-should-this"),
+            "ssh secret leaked into config file"
+        );
+
+        let back: RawConfigFile = toml::from_str(&text).expect("deserialize");
+        let back: Vec<StoredConnection> = back
+            .connections
+            .into_iter()
+            .map(RawConnection::into_stored)
+            .collect();
+        let ssh = back[0]
+            .config
+            .ssh
+            .as_ref()
+            .expect("ssh survives round-trip");
+        assert_eq!(ssh.host, "bastion.example.com");
+        assert_eq!(ssh.port, 2222);
+        assert_eq!(ssh.user, "jump");
+        assert_eq!(
+            ssh.auth,
+            SshAuth::Key {
+                path: "/home/me/.ssh/id_ed25519".into()
+            }
+        );
+        // Secrets come back empty — they belong in the keychain.
+        assert_eq!(ssh.password, "");
+        assert_eq!(ssh.passphrase, "");
     }
 
     #[test]

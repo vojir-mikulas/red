@@ -12,10 +12,12 @@ authors.workspace = true
 [dependencies]
 red-core.workspace = true
 red-driver.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time", "net", "io-util"] }
 futures.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
+# SSH tunnels (jump-host connections) — pure-Rust client, no system libssh.
+russh.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }

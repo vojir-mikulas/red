@@ -190,10 +190,10 @@ impl AppState {
             self.connect_sel = self
                 .connect_sel
                 .min(self.connections.len().saturating_sub(1));
-            // Drop the connection's keychain credential too, so deleting a
-            // connection doesn't orphan its password.
-            if let Err(e) = crate::secrets::delete_password(&removed.id) {
-                tracing::warn!("failed to remove keychain credential: {e}");
+            // Drop the connection's keychain credentials too (DB password and any
+            // SSH secrets), so deleting a connection doesn't orphan them.
+            if let Err(e) = crate::secrets::delete_all(&removed.id) {
+                tracing::warn!("failed to remove keychain credentials: {e}");
             }
             self.persist(cx);
             cx.notify();

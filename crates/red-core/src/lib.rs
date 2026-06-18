@@ -68,12 +68,68 @@ impl fmt::Display for DbKind {
     }
 }
 
+/// How RED authenticates to an SSH jump host. Mirrors DataGrip's three modes: a
+/// running ssh-agent, a password, or an OpenSSH private-key file (optionally
+/// passphrase-protected). The secrets these need — the password, the key
+/// passphrase — are **never** serialized; like a connection's DB password they
+/// live in the OS keychain and are materialized only transiently.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(tag = "mode", rename_all = "snake_case"))]
+pub enum SshAuth {
+    /// Reuse a running agent (ssh-agent / Pageant). Carries no secret of its own.
+    #[default]
+    Agent,
+    /// Password authentication; the password lives in the keychain.
+    Password,
+    /// An OpenSSH private key at `path`, decrypted with a keychain-stored
+    /// passphrase when the key is encrypted.
+    Key { path: String },
+}
+
+/// Reach the database *through* an SSH jump host (the `ssh -L` model). When a
+/// [`ConnectionConfig`] carries one of these, the service opens a local port
+/// forward and points the driver at it; the connection's `host`/`port` are the
+/// target as seen *from the jump host*. Secrets (`password`, `passphrase`) are
+/// keychain-backed and never persisted — hence the redacting `Debug` and the
+/// `serde(skip)` on those fields.
+#[derive(Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SshConfig {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub auth: SshAuth,
+    /// Password for [`SshAuth::Password`]; empty otherwise. Keychain-backed,
+    /// never serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub password: String,
+    /// Passphrase for an encrypted [`SshAuth::Key`]; empty otherwise.
+    /// Keychain-backed, never serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub passphrase: String,
+}
+
+impl fmt::Debug for SshConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SshConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("auth", &self.auth)
+            .field("password", &redact(&self.password))
+            .field("passphrase", &redact(&self.passphrase))
+            .finish()
+    }
+}
+
 /// A saved connection target. Stored as structured fields rather than one opaque
 /// DSN so the form can offer both entry modes and so engines stay swappable; the
 /// driver-facing connection string is composed on demand by [`Self::dsn`]. For a
 /// file engine the path lives in `database`; `host`/`port`/`user`/`password` are
 /// unused. `color` is a label-palette index (UI-defined). `read_only` reflects
-/// RED's read-mostly safety posture (enforced by the driver).
+/// RED's read-mostly safety posture (enforced by the driver). An optional
+/// [`ssh`](Self::ssh) tunnels the whole connection through a jump host.
 #[derive(Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ConnectionConfig {
@@ -97,6 +153,20 @@ pub struct ConnectionConfig {
     /// every write path is refused up front.
     #[cfg_attr(feature = "serde", serde(default))]
     pub read_only: bool,
+    /// Optional SSH jump host. When set, the service tunnels the connection
+    /// through it (see [`SshConfig`]); `None` connects directly.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ssh: Option<SshConfig>,
+}
+
+/// Render a secret for `Debug`: `<unset>` when empty, `<redacted>` otherwise — so
+/// a stray `{config:?}` can never spill a credential into the logs.
+fn redact(secret: &str) -> &'static str {
+    if secret.is_empty() {
+        "<unset>"
+    } else {
+        "<redacted>"
+    }
 }
 
 /// Hand-written so the password is **never** printed — a redacting `Debug` makes
@@ -111,17 +181,11 @@ impl fmt::Debug for ConnectionConfig {
             .field("host", &self.host)
             .field("port", &self.port)
             .field("user", &self.user)
-            .field(
-                "password",
-                &if self.password.is_empty() {
-                    "<unset>"
-                } else {
-                    "<redacted>"
-                },
-            )
+            .field("password", &redact(&self.password))
             .field("database", &self.database)
             .field("color", &self.color)
             .field("read_only", &self.read_only)
+            .field("ssh", &self.ssh)
             .finish()
     }
 }
@@ -152,6 +216,21 @@ impl ConnectionConfig {
         url.push('/');
         url.push_str(&encode(&self.database));
         url
+    }
+
+    /// The DSN for reaching this database through a local forwarded port: the
+    /// normal [`dsn`](Self::dsn) but with `host`/`port` swapped for the tunnel's
+    /// local endpoint. Reuses `dsn`'s userinfo/database encoding and IPv6
+    /// bracketing, so the only difference is where the driver dials. Meaningful
+    /// only for network engines — an SSH tunnel never fronts a file engine.
+    pub fn local_dsn(&self, host: &str, port: u16) -> String {
+        ConnectionConfig {
+            host: host.to_string(),
+            port: Some(port),
+            ssh: None,
+            ..self.clone()
+        }
+        .dsn()
     }
 
     /// A short human label for the connection's target — the file path, or
@@ -1139,6 +1218,50 @@ mod conn_tests {
         assert_eq!(p.user, "u");
         assert_eq!(p.password, "pw");
         assert_eq!(p.database, "d");
+    }
+
+    #[test]
+    fn local_dsn_swaps_only_host_and_port() {
+        // The tunnel rewrite keeps userinfo/database (and their encoding) intact,
+        // changing only where the driver dials.
+        let cfg = ConnectionConfig {
+            kind: DbKind::Postgres,
+            host: "remote.internal".into(),
+            port: Some(5432),
+            user: "u".into(),
+            password: "p@ss".into(),
+            database: "shop".into(),
+            ssh: Some(SshConfig {
+                host: "bastion".into(),
+                port: 22,
+                user: "jump".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.local_dsn("127.0.0.1", 49152),
+            "postgres://u:p%40ss@127.0.0.1:49152/shop"
+        );
+    }
+
+    #[test]
+    fn ssh_debug_redacts_secrets() {
+        let ssh = SshConfig {
+            host: "bastion".into(),
+            port: 22,
+            user: "jump".into(),
+            auth: SshAuth::Password,
+            password: "hunter2".into(),
+            passphrase: "swordfish".into(),
+        };
+        let shown = format!("{ssh:?}");
+        assert!(!shown.contains("hunter2"), "ssh password leaked into Debug");
+        assert!(
+            !shown.contains("swordfish"),
+            "ssh passphrase leaked into Debug"
+        );
+        assert!(shown.contains("<redacted>"));
     }
 }
 

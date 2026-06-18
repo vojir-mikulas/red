@@ -39,6 +39,9 @@ tokio-postgres = "0.7"
 # MySQL / MariaDB — pure-Rust async client (no system libmysqlclient).
 mysql_async = { version = "0.34", default-features = false, features = ["default-rustls"] }
 futures-util = { version = "0.3", default-features = false }
+# SSH tunnels for jump-host DB connections — pure-Rust client (no system libssh),
+# bundles key parsing, known_hosts checks, and an ssh-agent client.
+russh = "0.61"
 
 # --- Config persistence (connection list at the app edge) ---
 serde = { version = "1", features = ["derive"] }

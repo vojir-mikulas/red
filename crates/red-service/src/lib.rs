@@ -19,6 +19,7 @@ mod dispatch;
 mod protocol;
 #[cfg(test)]
 mod tests;
+mod tunnel;
 mod update;
 
 pub use protocol::{Command, Event, RunFetch, SessionId, SortKey, UpdateConfig};

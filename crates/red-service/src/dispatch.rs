@@ -17,6 +17,7 @@ use red_driver::{
 use tokio::sync::mpsc::UnboundedReceiver as CmdReceiver;
 use tokio::sync::Semaphore;
 
+use crate::tunnel::Tunnel;
 use crate::{Command, Envelope, Event, RunFetch, SessionId};
 
 /// The event sender carries each event tagged with the session it belongs to
@@ -181,6 +182,10 @@ struct ActiveQuery {
 /// switching between connections is instant — no reconnect, no schema reload.
 struct SessionState {
     driver: Arc<dyn DatabaseDriver>,
+    /// The SSH tunnel this connection rides, if any. Held only to keep it alive
+    /// for the session's lifetime: dropping it (on teardown/eviction) closes the
+    /// forward and the SSH session. `None` for a direct connection.
+    _tunnel: Option<Tunnel>,
     /// The streaming `Query`/`FetchMore` cursor. Single-active per session; this
     /// path is legacy/test-only (the UI drives results via `OpenResult`).
     active: Option<ActiveQuery>,
@@ -192,9 +197,10 @@ struct SessionState {
 }
 
 impl SessionState {
-    fn new(driver: Arc<dyn DatabaseDriver>) -> Self {
+    fn new(driver: Arc<dyn DatabaseDriver>, tunnel: Option<Tunnel>) -> Self {
         Self {
             driver,
+            _tunnel: tunnel,
             active: None,
             results: Arc::new(Mutex::new(HashMap::new())),
             inflight: HashMap::new(),
@@ -250,7 +256,7 @@ enum ConnectOutcome {
     Session {
         id: SessionId,
         generation: u64,
-        result: Result<Arc<dyn DatabaseDriver>, ConnectFail>,
+        result: Result<(Arc<dyn DatabaseDriver>, Option<Tunnel>), ConnectFail>,
     },
     /// A session-less `TestConnection` finished — carries the server version on
     /// success, the error message otherwise.
@@ -286,9 +292,9 @@ fn apply_connect_outcome(
                 return;
             }
             match result {
-                Ok(driver) => {
+                Ok((driver, tunnel)) => {
                     let version = driver.server_version();
-                    sessions.insert(id, SessionState::new(driver));
+                    sessions.insert(id, SessionState::new(driver, tunnel));
                     emit(events, Some(id), Event::Connected { version });
                 }
                 Err(fail) => emit(
@@ -428,7 +434,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     // for the retry loop, which a probe doesn't have.
                     let result = attempt_connect(&config)
                         .await
-                        .map(|driver| driver.server_version())
+                        // The probe drops the driver (and any tunnel) right after
+                        // reading the version — it's throwaway.
+                        .map(|(driver, _tunnel)| driver.server_version())
                         .map_err(|f| f.message);
                     let _ = tx.send(ConnectOutcome::Test { result });
                 });
@@ -1536,7 +1544,7 @@ async fn with_timeout<T>(
 /// error like any other failure, so the UI's retry/backoff path handles it.
 async fn attempt_connect(
     config: &ConnectionConfig,
-) -> Result<Arc<dyn DatabaseDriver>, ConnectFail> {
+) -> Result<(Arc<dyn DatabaseDriver>, Option<Tunnel>), ConnectFail> {
     match tokio::time::timeout(CONNECT_TIMEOUT, connect(config)).await {
         // A driver `RedError::Auth` is the one user-correctable failure — flag it
         // fatal so the UI stops retrying; every other connect error is transient.
@@ -1551,26 +1559,48 @@ async fn attempt_connect(
     }
 }
 
-async fn connect(config: &ConnectionConfig) -> red_core::Result<Arc<dyn DatabaseDriver>> {
-    match config.kind {
-        DbKind::Sqlite => {
-            let driver = SqliteDriver::new(config.dsn(), config.read_only);
-            driver.ping().await?;
-            Ok(Arc::new(driver))
+async fn connect(
+    config: &ConnectionConfig,
+) -> red_core::Result<(Arc<dyn DatabaseDriver>, Option<Tunnel>)> {
+    // SQLite is a local file — no network, so SSH never applies.
+    if let DbKind::Sqlite = config.kind {
+        let driver = SqliteDriver::new(config.dsn(), config.read_only);
+        driver.ping().await?;
+        return Ok((Arc::new(driver), None));
+    }
+
+    // For a network engine, stand up the SSH tunnel first (when configured) and
+    // dial the local forwarded port instead of the real host. `dsn` is what the
+    // driver connects to; `tunnel` must outlive it, so it rides into the session.
+    let (dsn, tunnel) = match &config.ssh {
+        Some(ssh) => {
+            let port = config
+                .port
+                .or_else(|| config.kind.default_port())
+                .unwrap_or(0);
+            let tunnel = Tunnel::open(ssh, &config.host, port).await?;
+            (
+                config.local_dsn("127.0.0.1", tunnel.local_addr().port()),
+                Some(tunnel),
+            )
         }
-        DbKind::Postgres => {
-            let driver = PostgresDriver::connect(&config.dsn(), config.read_only).await?;
-            Ok(Arc::new(driver))
-        }
+        None => (config.dsn(), None),
+    };
+
+    let driver: Arc<dyn DatabaseDriver> = match config.kind {
+        DbKind::Postgres => Arc::new(PostgresDriver::connect(&dsn, config.read_only).await?),
         DbKind::Mysql => {
             // A MySQL connection can see every database on the server; scope the
             // schema tree to the chosen one when the connection names a database.
-            let driver = MysqlDriver::connect(&config.dsn(), config.read_only)
-                .await?
-                .with_scope(Some(config.database.clone()));
-            Ok(Arc::new(driver))
+            Arc::new(
+                MysqlDriver::connect(&dsn, config.read_only)
+                    .await?
+                    .with_scope(Some(config.database.clone())),
+            )
         }
-    }
+        DbKind::Sqlite => unreachable!("handled above"),
+    };
+    Ok((driver, tunnel))
 }
 
 /// The UI may have dropped its receiver (window closed) — a failed send is the
@@ -1693,7 +1723,7 @@ mod checkpoint_tests {
     #[test]
     fn reap_excess_results_caps_to_the_lowest_epochs() {
         let (path, driver) = driver_with(1, "reap");
-        let mut state = SessionState::new(driver);
+        let mut state = SessionState::new(driver, None);
 
         // Open one more than the cap, epochs 1..=MAX+1. Every epoch also has an
         // in-flight handle, so we can assert those are reaped in lockstep.

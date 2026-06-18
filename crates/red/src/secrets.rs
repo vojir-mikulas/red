@@ -33,53 +33,118 @@ const SERVICE: &str = "red";
 static CACHE: LazyLock<Mutex<HashMap<String, Zeroizing<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Build a keychain entry for a connection's password, keyed by its stable id.
-fn entry(id: &str) -> Result<keyring::Entry> {
-    keyring::Entry::new(SERVICE, id).context("open keychain entry")
+/// Build a keychain entry for a secret, keyed by its `account` string. A
+/// connection's DB password uses the bare connection id; its SSH secrets use
+/// suffixed accounts (see [`ssh_password_account`]/[`ssh_passphrase_account`]),
+/// so one connection can hold several distinct credentials.
+fn entry(account: &str) -> Result<keyring::Entry> {
+    keyring::Entry::new(SERVICE, account).context("open keychain entry")
 }
 
-/// Fetch a connection's stored password, or `None` if the keychain has no entry
-/// for it (which simply means "ask the user"). Served from [`CACHE`] when present
-/// so only the first read per id touches the OS keychain.
-pub fn get_password(id: &str) -> Result<Option<String>> {
-    if let Some(cached) = CACHE.lock().unwrap().get(id) {
+/// Keychain account for a connection's SSH password.
+fn ssh_password_account(id: &str) -> String {
+    format!("{id}#ssh-pw")
+}
+
+/// Keychain account for a connection's SSH private-key passphrase.
+fn ssh_passphrase_account(id: &str) -> String {
+    format!("{id}#ssh-key")
+}
+
+/// Read a secret by keychain account, or `None` when there's no entry (which
+/// simply means "ask the user"). Served from [`CACHE`] when present so only the
+/// first read per account touches the OS keychain.
+fn read(account: &str) -> Result<Option<String>> {
+    if let Some(cached) = CACHE.lock().unwrap().get(account) {
         return Ok(Some(cached.to_string()));
     }
-    match entry(id)?.get_password() {
-        Ok(password) => {
+    match entry(account)?.get_password() {
+        Ok(secret) => {
             CACHE
                 .lock()
                 .unwrap()
-                .insert(id.to_string(), Zeroizing::new(password.clone()));
-            Ok(Some(password))
+                .insert(account.to_string(), Zeroizing::new(secret.clone()));
+            Ok(Some(secret))
         }
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(anyhow::Error::new(e).context("read keychain password")),
+        Err(e) => Err(anyhow::Error::new(e).context("read keychain secret")),
     }
 }
 
-/// Store (or replace) a connection's password in the keychain and refresh the
-/// cache, so a later [`get_password`] serves the new value without a prompt.
-pub fn set_password(id: &str, password: &str) -> Result<()> {
-    entry(id)?
-        .set_password(password)
-        .context("write keychain password")?;
+/// Store (or replace) a secret by keychain account and refresh the cache, so a
+/// later [`read`] serves the new value without an OS prompt.
+fn write(account: &str, secret: &str) -> Result<()> {
+    entry(account)?
+        .set_password(secret)
+        .context("write keychain secret")?;
     CACHE
         .lock()
         .unwrap()
-        .insert(id.to_string(), Zeroizing::new(password.to_string()));
+        .insert(account.to_string(), Zeroizing::new(secret.to_string()));
     Ok(())
 }
 
-/// Remove a connection's password from the keychain and drop any cached copy
-/// (zeroizing it). Idempotent: a missing entry is success, so this is safe to
-/// call on delete regardless of whether a password was ever stored.
-pub fn delete_password(id: &str) -> Result<()> {
-    CACHE.lock().unwrap().remove(id);
-    match entry(id)?.delete_credential() {
+/// Remove a secret by keychain account and drop any cached copy (zeroizing it).
+/// Idempotent: a missing entry is success.
+fn remove(account: &str) -> Result<()> {
+    CACHE.lock().unwrap().remove(account);
+    match entry(account)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(anyhow::Error::new(e).context("delete keychain password")),
+        Err(e) => Err(anyhow::Error::new(e).context("delete keychain secret")),
     }
+}
+
+/// Fetch a connection's stored DB password, or `None` if the keychain has no
+/// entry for it.
+pub fn get_password(id: &str) -> Result<Option<String>> {
+    read(id)
+}
+
+/// Store (or replace) a connection's DB password.
+pub fn set_password(id: &str, password: &str) -> Result<()> {
+    write(id, password)
+}
+
+/// Remove a connection's DB password. Idempotent; safe to call on delete whether
+/// or not a password was ever stored. Prefer [`delete_all`] on connection delete.
+pub fn delete_password(id: &str) -> Result<()> {
+    remove(id)
+}
+
+// The SSH secret accessors below land with the persistence layer but aren't
+// called until the tunnel + form phases wire them; allow until then.
+
+/// Fetch a connection's stored SSH password (password-auth mode), or `None`.
+#[allow(dead_code)]
+pub fn get_ssh_password(id: &str) -> Result<Option<String>> {
+    read(&ssh_password_account(id))
+}
+
+/// Store (or replace) a connection's SSH password.
+#[allow(dead_code)]
+pub fn set_ssh_password(id: &str, secret: &str) -> Result<()> {
+    write(&ssh_password_account(id), secret)
+}
+
+/// Fetch a connection's stored SSH key passphrase, or `None`.
+#[allow(dead_code)]
+pub fn get_ssh_passphrase(id: &str) -> Result<Option<String>> {
+    read(&ssh_passphrase_account(id))
+}
+
+/// Store (or replace) a connection's SSH key passphrase.
+#[allow(dead_code)]
+pub fn set_ssh_passphrase(id: &str, secret: &str) -> Result<()> {
+    write(&ssh_passphrase_account(id), secret)
+}
+
+/// Remove every secret filed under a connection id — DB password plus both SSH
+/// secrets — so deleting a connection never orphans a credential. Idempotent.
+pub fn delete_all(id: &str) -> Result<()> {
+    remove(id)?;
+    remove(&ssh_password_account(id))?;
+    remove(&ssh_passphrase_account(id))?;
+    Ok(())
 }
 
 #[cfg(test)]
