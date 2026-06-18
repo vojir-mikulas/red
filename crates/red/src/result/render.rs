@@ -467,10 +467,12 @@ impl AppState {
                 }
                 let resident = buffer.row(abs);
                 for c in 0..ncols {
-                    // The open inline editor takes over its cell.
+                    // The open inline editor takes over its cell. The field is
+                    // `bare`, so it fills the cell (the Flint cell wrapper supplies
+                    // the height/padding) rather than drawing a smaller box inside.
                     if let Some((er, ec, input)) = &inline {
                         if *er == abs && *ec == c {
-                            out.push(div().size_full().child(input.clone()).into_any_element());
+                            out.push(input.clone().into_any_element());
                             continue;
                         }
                     }
@@ -493,7 +495,9 @@ impl AppState {
         // the design's "N rows · K columns" status strip under the grid.
         let footer = div()
             .flex_shrink_0()
-            .h(px(28.))
+            // Tall enough to seat the 24px Sm Submit/Revert buttons with breathing
+            // room (the old 28px strip clipped them).
+            .h(px(38.))
             .flex()
             .items_center()
             .gap_2()
@@ -716,6 +720,9 @@ impl AppState {
                                 .w(px(DATA_COL_WIDTH))
                                 .flex_shrink_0()
                                 .h_full()
+                                .px_2p5()
+                                .flex()
+                                .items_center()
                                 .border_r_1()
                                 .border_color(line)
                                 .child(input.clone())

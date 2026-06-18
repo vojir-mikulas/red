@@ -177,6 +177,32 @@ impl Render for AppState {
             }
         }
 
+        // Commit-on-blur: while an inline editor is open, a focus-out listener on its
+        // field stages the edit when the user clicks away (like a spreadsheet) — the
+        // cell then shows as dirty. Registered once when an editor opens, dropped when
+        // it closes. Mirrors `modal_focus_trap`.
+        if self.grid_edit.is_some() {
+            if self.grid_edit_blur.is_none() {
+                if let Some(handle) = self.grid_edit_focus(cx) {
+                    let weak = cx.entity().downgrade();
+                    let sub = window.on_focus_out(&handle, cx, move |_event, _window, cx| {
+                        if let Some(app) = weak.upgrade() {
+                            // Commit only if an editor is still open (a Submit/Cancel
+                            // already cleared it, so its focus move is a no-op here).
+                            app.update(cx, |this, cx| {
+                                if this.grid_edit.is_some() {
+                                    this.commit_grid_edit(cx);
+                                }
+                            });
+                        }
+                    });
+                    self.grid_edit_blur = Some(sub);
+                }
+            }
+        } else {
+            self.grid_edit_blur = None;
+        }
+
         // The palette's "switch connection" command — open the switcher popover
         // now that the `Window` its field-focus needs is in hand.
         if self.open_switcher {

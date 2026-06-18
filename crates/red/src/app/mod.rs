@@ -504,6 +504,10 @@ pub struct AppState {
     /// Render-time focus drain: focus the open inline editor's field on the next
     /// frame (set when one opens, like `focus_inspector_edit`).
     pub(crate) focus_grid_edit: bool,
+    /// Focus-out listener on the open inline editor: clicking away commits (stages)
+    /// the edit, like a spreadsheet. Held while an editor is open, dropped when it
+    /// closes — mirrors `modal_focus_trap`.
+    pub(crate) grid_edit_blur: Option<gpui::Subscription>,
     /// A non-pristine query tab the user asked to close, awaiting confirmation.
     pub(crate) confirm_close_tab: Option<usize>,
     /// A saved connection the user asked to delete, awaiting confirmation.
@@ -999,6 +1003,7 @@ impl AppState {
             confirm_exec: None,
             grid_edit: None,
             focus_grid_edit: false,
+            grid_edit_blur: None,
             confirm_close_tab: None,
             confirm_delete_conn: None,
             settings,

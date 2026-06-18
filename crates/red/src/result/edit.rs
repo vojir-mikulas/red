@@ -331,7 +331,10 @@ impl AppState {
             other => other.to_string(),
         };
         let input = cx.new(|cx| {
-            let mut input = TextInput::new(cx);
+            // `bare`: no box of its own — it fills the grid cell, inheriting the
+            // row's height, padding, font, and selection highlight, so the cell
+            // itself becomes the input rather than a smaller box inside it.
+            let mut input = TextInput::new(cx).bare();
             input.set_content(prefill, cx);
             input
         });
@@ -347,6 +350,9 @@ impl AppState {
             epoch,
             _sub: sub,
         });
+        // Drop any prior commit-on-blur listener so render re-registers it against
+        // this new field's focus handle (moving straight from one cell to another).
+        self.grid_edit_blur = None;
         self.focus_grid_edit = true;
         cx.notify();
     }
