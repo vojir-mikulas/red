@@ -218,6 +218,16 @@ impl AppState {
                     .flex()
                     .items_center()
                     .gap_1()
+                    // "+ Row" appends a draft (insert) row — shown only on an
+                    // editable keyed browse of a writable connection (Track B6).
+                    .when(self.editing_enabled() && grid.editable_browse(), |d| {
+                        d.child(
+                            Button::new("result-add-row", "+ Row")
+                                .variant(ButtonVariant::Ghost)
+                                .size(ButtonSize::Sm)
+                                .on_click(cx.listener(|this, _, _, cx| this.add_draft_row(cx))),
+                        )
+                    })
                     .child(
                         // ⌘⇧F — toggle the filter bar. Reads as "filled" while a
                         // filter is applied (Track B2).
