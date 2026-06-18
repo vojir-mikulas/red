@@ -280,6 +280,7 @@ impl QueryTab {
             CodeEditor::new(cx)
                 .highlighter(crate::sql::tokenize)
                 .corner_radius(px(0.))
+                .resting_border(false)
                 .a11y_label("Query editor")
                 .with_content(EMPTY_QUERY)
         });
