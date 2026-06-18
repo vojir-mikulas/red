@@ -283,10 +283,9 @@ impl AppState {
         cx.notify();
     }
 
-    /// Save the inline edit: coerce the typed value to the column's type and open
-    /// the guarded confirm preview (shared with the palette path via
-    /// [`AppState::stage_cell_edit`]). A coercion failure toasts the reason and
-    /// keeps the field open to fix.
+    /// Save the inline edit: coerce the typed value to the column's type and stage
+    /// it into the result's change-set (Track B6), the same set the in-grid editor
+    /// feeds. A coercion failure toasts the reason and keeps the field open to fix.
     pub(crate) fn save_inspector_edit(&mut self, cx: &mut Context<Self>) {
         let Some(insp) = &self.inspector else { return };
         let Some(edit) = &insp.editing else { return };
@@ -299,11 +298,19 @@ impl AppState {
                 return;
             }
         };
-        // Close the inline editor; the confirm preview takes over from here.
+        // Close the inline editor and stage the change (the footer Submit flushes it).
         if let Some(insp) = &mut self.inspector {
             insp.editing = None;
         }
-        self.stage_cell_edit(ctx, value, cx);
+        self.stage_existing_value(
+            ctx.epoch,
+            ctx.row,
+            ctx.data_col,
+            ctx.pk_value,
+            ctx.original,
+            value,
+        );
+        cx.notify();
     }
 
     /// The focus handle of the open inline-edit field, for the render-time focus

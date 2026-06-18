@@ -2,11 +2,17 @@
 //! (numbers accented, UUIDs dimmed, JSON-ish text cyan) and assembles the
 //! toolbar · grid · footer · scrollbar that make up the pane.
 
+use std::rc::Rc;
+
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Axis, Hsla, MouseButton, Pixels, Point, SharedString, Window};
+use flint::TextInput;
+use gpui::{
+    div, prelude::*, px, Axis, Entity, Hsla, MouseButton, Pixels, Point, SharedString, Window,
+};
 use red_core::ExportFormat;
 
 use super::buffer::{CellKind, DisplayCell};
+use super::edit::EditSlot;
 use super::{DATA_COL_WIDTH, GUTTER_WIDTH};
 use crate::app::{ActiveConn, AppState, Pane, Phase};
 
@@ -52,7 +58,12 @@ struct CellColors {
 /// typed cells). The display string and kind were computed once when the row
 /// landed in the buffer, so this only picks a color and clones a `SharedString`
 /// (an `Arc` bump) — no per-frame formatting, copying, or classification.
-fn render_cell(cell: &DisplayCell, c: CellColors, null_display: &SharedString) -> gpui::AnyElement {
+fn render_cell(
+    cell: &DisplayCell,
+    c: CellColors,
+    null_display: &SharedString,
+    struck: bool,
+) -> gpui::AnyElement {
     let color = match cell.kind {
         CellKind::Null | CellKind::Blob => c.faint,
         CellKind::Num => c.num,
@@ -75,7 +86,10 @@ fn render_cell(cell: &DisplayCell, c: CellColors, null_display: &SharedString) -
     // the grid's accessible-name announcement.
     let italic = matches!(cell.kind, CellKind::Null | CellKind::Blob);
     div()
-        .text_color(color)
+        .text_color(if struck { c.faint } else { color })
+        // A row pending deletion (Track B6) reads struck-through, so the marking is
+        // legible without relying on the soft red tint alone.
+        .when(struck, |d| d.line_through())
         .when(italic, |d| d.italic())
         .child(text)
         .into_any_element()
@@ -287,6 +301,22 @@ impl AppState {
             r
         });
 
+        // Staged-edit overlay (Track B6): the dirty cells + deleted rows for this
+        // frame, shared (via `Rc`) between the cell renderer and the cell-tint hook.
+        // Tints: a soft amber under a staged cell, a soft red under a row pending
+        // deletion (the selection highlight still wins on top).
+        let overlay = Rc::new(grid.pending.overlay());
+        let dirty_tint = Hsla { a: 0.22, ..num };
+        let delete_tint = Hsla { a: 0.16, ..red };
+        let (overlay_cells, overlay_bg) = (overlay.clone(), overlay.clone());
+        // The open inline editor's target cell (existing rows only; draft rows host
+        // their own editor in the bottom zone), so the renderer swaps in its field.
+        let inline: Option<(usize, usize, Entity<TextInput>)> =
+            self.grid_edit.as_ref().and_then(|e| match &e.slot {
+                EditSlot::Row { row, data_col, .. } => Some((*row, *data_col, e.input.clone())),
+                EditSlot::Draft { .. } => None,
+            });
+
         // The focused cell, spoken aloud: the grid reports this as its accessible
         // name (a `Grid` landmark), so a screen reader announces "<column>:
         // <value>, row N of M" each time the cell cursor moves — the one piece of
@@ -337,6 +367,17 @@ impl AppState {
                     .ok();
             })
             .selected_cells(local_selection)
+            .cell_bg(move |ix, table_col| {
+                let abs = base + ix;
+                if overlay_bg.deleted.contains(&abs) {
+                    return Some(delete_tint);
+                }
+                if table_col >= gutter && overlay_bg.cells.contains_key(&(abs, table_col - gutter))
+                {
+                    return Some(dirty_tint);
+                }
+                None
+            })
             .a11y_label(a11y_label)
             .sort(sort)
             .sort_carets(
@@ -383,9 +424,13 @@ impl AppState {
                         // selection, not a still-focused editor/field.
                         this.focus_pane(Pane::Grid, window, cx);
                         this.result_select(abs_row, table_col, extend, cx);
-                        // Double-click reveals the detail inspector for the cell.
+                        // Double-click edits the cell in place when it's editable
+                        // (Track B6); otherwise it reveals the detail inspector.
                         if inspect {
-                            this.open_inspector(cx);
+                            this.begin_grid_edit(cx);
+                            if this.grid_edit.is_none() {
+                                this.open_inspector(cx);
+                            }
                         }
                     })
                     .ok();
@@ -409,6 +454,7 @@ impl AppState {
                 let abs = base + ix;
                 let mut out = Vec::with_capacity(ncols + gutter);
                 let buffer = buffer_row.borrow();
+                let struck = overlay_cells.deleted.contains(&abs);
                 if show_gutter {
                     // After an interpolated jump the run's ordinals are estimates;
                     // the gutter marks them `≈` until a true end pins them exact.
@@ -419,23 +465,25 @@ impl AppState {
                     };
                     out.push(div().text_color(faint).child(label).into_any_element());
                 }
-                match buffer.row(abs) {
-                    Some(row) => {
-                        for c in 0..ncols {
-                            match row.display.get(c) {
-                                Some(cell) => {
-                                    out.push(render_cell(cell, cell_colors, &null_display))
-                                }
-                                None => {
-                                    out.push(div().text_color(faint).child("·").into_any_element())
-                                }
-                            }
+                let resident = buffer.row(abs);
+                for c in 0..ncols {
+                    // The open inline editor takes over its cell.
+                    if let Some((er, ec, input)) = &inline {
+                        if *er == abs && *ec == c {
+                            out.push(div().size_full().child(input.clone()).into_any_element());
+                            continue;
                         }
                     }
-                    None => {
-                        for _ in 0..ncols {
-                            out.push(div().text_color(faint).child("·").into_any_element());
+                    // A staged value (dirty cell) shadows the resident one.
+                    if let Some(cell) = overlay_cells.cells.get(&(abs, c)) {
+                        out.push(render_cell(cell, cell_colors, &null_display, struck));
+                        continue;
+                    }
+                    match resident.and_then(|r| r.display.get(c)) {
+                        Some(cell) => {
+                            out.push(render_cell(cell, cell_colors, &null_display, struck))
                         }
+                        None => out.push(div().text_color(faint).child("·").into_any_element()),
                     }
                 }
                 out
@@ -471,6 +519,24 @@ impl AppState {
                         "offset"
                     }),
             )
+            // Staged-edit controls (Track B6): a count + Submit / Revert, shown only
+            // when the change-set is non-empty. Submit opens the confirm preview.
+            .when_some(grid.pending.summary(), |f, summary| {
+                f.child(div().text_color(border_soft).child("·"))
+                    .child(div().text_color(accent).child(summary))
+                    .child(
+                        Button::new("changes-submit", "Submit")
+                            .variant(ButtonVariant::Primary)
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(|this, _, _, cx| this.submit_changes(cx))),
+                    )
+                    .child(
+                        Button::new("changes-revert", "Revert")
+                            .variant(ButtonVariant::Ghost)
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(|this, _, _, cx| this.revert_changes(cx))),
+                    )
+            })
             .child(div().ml_auto().text_color(dim).child(grid.label.clone()));
 
         // The draggable, fraction-mapped scrollbar: the thumb mirrors the list's
@@ -506,6 +572,10 @@ impl AppState {
                     .child(table)
                     .child(scrollbar),
             )
+            // Draft (insert) rows pinned below the grid (Track B6).
+            .when_some(self.render_draft_rows(grid, cx), |c, drafts| {
+                c.child(drafts)
+            })
             .child(footer)
             // The cell right-click menu floats above the pane, anchored at the
             // cursor; a full-cover backdrop dismisses it on an outside click.
@@ -567,12 +637,167 @@ impl AppState {
         }
     }
 
+    /// The draft (insert) rows zone (Track B6), pinned below the grid: one row per
+    /// staged `INSERT`, each cell click-to-edit, a leading ✕ to drop the draft.
+    /// Shares the grid's horizontal scroll so its columns track the grid's. `None`
+    /// when there are no drafts.
+    fn render_draft_rows(
+        &self,
+        grid: &super::ResultGrid,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if grid.pending.inserts.is_empty() {
+            return None;
+        }
+        let theme = cx.theme();
+        let (faint, text, accent, border, line, bg) = (
+            theme.text_faint,
+            theme.text,
+            theme.accent,
+            theme.border,
+            theme.border_soft,
+            theme.bg_panel,
+        );
+        let null_display: SharedString = self.settings.grid.null_display.clone().into();
+        let cell_colors = CellColors {
+            text,
+            muted: theme.text_muted,
+            num: theme.orange,
+            cyan: theme.cyan,
+            faint,
+        };
+        let row_height = self.settings.grid.density.row_height();
+        let mono_family = theme.mono_family.clone();
+        let cell_size = theme.font_size;
+        let show_gutter = self.settings.grid.row_numbers;
+        let gutter_w = if show_gutter { GUTTER_WIDTH } else { 0.0 };
+        let ncols = grid.columns.len();
+        let content_w = gutter_w + ncols as f32 * DATA_COL_WIDTH;
+        // The cell of an open editor that targets a draft row.
+        let draft_inline: Option<(usize, usize, Entity<TextInput>)> =
+            self.grid_edit.as_ref().and_then(|e| match &e.slot {
+                EditSlot::Draft { index, data_col } => Some((*index, *data_col, e.input.clone())),
+                EditSlot::Row { .. } => None,
+            });
+
+        let mut rows = Vec::with_capacity(grid.pending.inserts.len());
+        for (index, draft) in grid.pending.inserts.iter().enumerate() {
+            let mut cells = Vec::with_capacity(ncols + show_gutter as usize);
+            if show_gutter {
+                cells.push(
+                    div()
+                        .w(px(GUTTER_WIDTH))
+                        .flex_shrink_0()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .border_r_1()
+                        .border_color(line)
+                        .child(
+                            div()
+                                .id(("draft-remove", index))
+                                .cursor_pointer()
+                                .text_color(faint)
+                                .hover(|s| s.text_color(accent))
+                                .child("✕")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.remove_draft_row(index, cx)
+                                })),
+                        )
+                        .into_any_element(),
+                );
+            }
+            for c in 0..ncols {
+                if let Some((di, dc, input)) = &draft_inline {
+                    if *di == index && *dc == c {
+                        cells.push(
+                            div()
+                                .w(px(DATA_COL_WIDTH))
+                                .flex_shrink_0()
+                                .h_full()
+                                .border_r_1()
+                                .border_color(line)
+                                .child(input.clone())
+                                .into_any_element(),
+                        );
+                        continue;
+                    }
+                }
+                let content = match draft.cells.get(&c) {
+                    Some(v) => render_cell(
+                        &DisplayCell::from_value(v),
+                        cell_colors,
+                        &null_display,
+                        false,
+                    ),
+                    None => div()
+                        .text_color(faint)
+                        .italic()
+                        .child("default")
+                        .into_any_element(),
+                };
+                cells.push(
+                    div()
+                        .id(("draft-cell", index * ncols + c))
+                        .w(px(DATA_COL_WIDTH))
+                        .flex_shrink_0()
+                        .h_full()
+                        .px_2p5()
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .border_r_1()
+                        .border_color(line)
+                        .cursor_pointer()
+                        .child(content)
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.begin_draft_edit(index, c, cx)),
+                        )
+                        .into_any_element(),
+                );
+            }
+            rows.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .w(px(content_w))
+                    .h(row_height)
+                    .border_b_1()
+                    .border_color(line)
+                    .children(cells),
+            );
+        }
+
+        Some(
+            div()
+                .id("draft-rows")
+                .flex_shrink_0()
+                .max_h(px(f32::from(row_height) * 6.0))
+                .overflow_x_scroll()
+                .overflow_y_scroll()
+                .bg(bg)
+                .border_t_1()
+                .border_color(border)
+                .font_family(mono_family)
+                .text_size(cell_size)
+                .track_scroll(&grid.h_scroll)
+                .child(div().flex().flex_col().w(px(content_w)).children(rows))
+                .into_any_element(),
+        )
+    }
+
     /// The result cell's right-click context menu — the per-cell actions (Inspect
     /// · Copy) that used to sit in the toolbar, anchored at `pos` (the cursor).
     /// Both act on the cell the right-click just selected. A full-cover backdrop
     /// closes the menu on an outside click.
     fn render_cell_menu(&self, pos: Point<Pixels>, cx: &mut Context<Self>) -> impl IntoElement {
-        let menu = ContextMenu::new("result-cell-menu")
+        // Editing entries (Track B6) appear only when the focused cell / row is
+        // editable on a writable connection's keyed browse.
+        let editable_cell = self.active_edit_target().is_some();
+        let editable_browse = self.editing_enabled()
+            && matches!(&self.phase, Phase::Connected(a) if a.active_result().is_some_and(|g| g.editable_browse()));
+        let mut menu = ContextMenu::new("result-cell-menu")
             .item(
                 ContextMenuItem::new("cell-inspect", "Inspect")
                     .shortcut("⌘I")
@@ -591,6 +816,38 @@ impl AppState {
                         cx.notify();
                     })),
             );
+        if editable_cell {
+            menu = menu
+                .item(
+                    ContextMenuItem::new("cell-edit", "Edit cell")
+                        .shortcut("↵")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cell_menu = None;
+                            this.begin_grid_edit(cx);
+                            cx.notify();
+                        })),
+                )
+                .item(
+                    ContextMenuItem::new("cell-null", "Set NULL")
+                        .shortcut("⌥⌘0")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cell_menu = None;
+                            this.set_cell_null(cx);
+                            cx.notify();
+                        })),
+                );
+        }
+        if editable_browse {
+            menu = menu.item(
+                ContextMenuItem::new("row-delete", "Toggle row deletion")
+                    .shortcut("⌘⌫")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.cell_menu = None;
+                        this.toggle_delete_rows(cx);
+                        cx.notify();
+                    })),
+            );
+        }
         div()
             .absolute()
             .inset_0()

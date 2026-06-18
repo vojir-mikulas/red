@@ -549,36 +549,44 @@ impl DatabaseDriver for PostgresDriver {
         result
     }
 
-    async fn apply_edit(&self, op: &EditOp) -> Result<u64> {
-        // Typed placeholders (`$n::int8`, …) like the seek path: the value's wire
-        // type is fixed by the Rust value, the cast keeps Postgres from re-inferring.
-        let (sql, params) =
-            crate::edit_sql(op, pg_quote, |i, v| format!("${}{}", i + 1, pg_cast(v)));
-        let owned: Vec<Value> = params.iter().map(|v| (*v).clone()).collect();
-        let boxed = pg_params(Some(&owned))?;
-        let refs: Vec<&(dyn ToSql + Sync)> = boxed
-            .iter()
-            .map(|b| -> &(dyn ToSql + Sync) { b.as_ref() })
-            .collect();
-        // Borrow a pool connection so the edit's transaction never shares the
+    async fn apply_edits(&self, ops: &[EditOp]) -> Result<u64> {
+        if ops.is_empty() {
+            return Ok(0);
+        }
+        // Borrow a pool connection so the batch's transaction never shares the
         // cursor's connection — see `execute`.
         let client = self.acquire().await?;
         let result = async {
             client.batch_execute("BEGIN").await.map_err(driver_err)?;
-            match client.execute(&sql, &refs).await {
-                Ok(affected) => {
-                    if affected != 1 {
-                        let _ = client.batch_execute("ROLLBACK").await;
-                        return Err(crate::edit_count_err(op, affected));
+            let mut total = 0u64;
+            for op in ops {
+                // Typed placeholders (`$n::int8`, …) like the seek path: the value's
+                // wire type is fixed by the Rust value, the cast keeps Postgres from
+                // re-inferring.
+                let (sql, params) =
+                    crate::edit_sql(op, pg_quote, |i, v| format!("${}{}", i + 1, pg_cast(v)));
+                let owned: Vec<Value> = params.iter().map(|v| (*v).clone()).collect();
+                let boxed = pg_params(Some(&owned))?;
+                let refs: Vec<&(dyn ToSql + Sync)> = boxed
+                    .iter()
+                    .map(|b| -> &(dyn ToSql + Sync) { b.as_ref() })
+                    .collect();
+                match client.execute(&sql, &refs).await {
+                    Ok(affected) => {
+                        if affected != 1 {
+                            let _ = client.batch_execute("ROLLBACK").await;
+                            return Err(crate::edit_count_err(op, affected));
+                        }
+                        total += affected;
                     }
-                    client.batch_execute("COMMIT").await.map_err(driver_err)?;
-                    Ok(affected)
-                }
-                Err(e) => {
-                    let _ = client.batch_execute("ROLLBACK").await;
-                    Err(map_pg_err(e))
+                    Err(e) => {
+                        let _ = client.batch_execute("ROLLBACK").await;
+                        return Err(map_pg_err(e));
+                    }
                 }
             }
+            client.batch_execute("COMMIT").await.map_err(driver_err)?;
+            Ok(total)
         }
         .await;
         self.release(client);
@@ -1327,7 +1335,23 @@ mod tests {
         let ro = PostgresDriver::connect(&url, true).await.unwrap();
         battery::read_only_rejects_edit(&ro, &schema, &t).await;
 
+        // Atomic batch editing (B6) on a fresh seed table.
+        let tb = tag("batch");
+        driver
+            .execute(&format!(
+                "CREATE TABLE {tb} (id INT PRIMARY KEY, name TEXT)"
+            ))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!("INSERT INTO {tb} VALUES (1, 'one')"))
+            .await
+            .unwrap();
+        battery::applies_batch_atomic(&driver, &schema, &tb).await;
+        battery::read_only_rejects_batch(&ro, &schema, &tb).await;
+
         driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
+        driver.execute(&format!("DROP TABLE {tb}")).await.unwrap();
     }
 
     #[tokio::test]

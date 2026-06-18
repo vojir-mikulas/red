@@ -82,3 +82,9 @@ opt-level = 2
 #
 #   [patch."https://github.com/vojir-mikulas/flint"]
 #   flint = { path = "../flint" }
+
+# LOCAL-ONLY (do not commit): build against the sibling ../flint checkout for the
+# Track B6 grid-editing work (needs the new `Table::cell_bg` there). Before merging,
+# publish the flint change and bump the pinned rev above, then remove this patch.
+[patch."https://github.com/vojir-mikulas/flint"]
+flint = { path = "../flint" }

@@ -11,7 +11,6 @@
 
 use flint::{Palette, PaletteEvent, PaletteItem, ToastVariant};
 use gpui::{actions, prelude::*, Context, ElementId, Entity, SharedString};
-use red_core::{ColumnValue, EditOp, TableRef, Value};
 
 use crate::app::{AppState, Phase};
 
@@ -64,9 +63,12 @@ pub(crate) enum Cmd {
     Explain,
     /// EXPLAIN ANALYZE the active tab's query (runs it — read queries only).
     ExplainAnalyze,
-    /// Edit the focused result cell (Track B5) — opens the value prompt. Offered
-    /// only on an editable cell of a writable, edit-enabled connection.
-    EditCell,
+    /// Submit the staged grid edits as one batch (Track B6) — opens the confirm.
+    SubmitChanges,
+    /// Discard the staged grid edits (Track B6).
+    RevertChanges,
+    /// Append a new draft (insert) row to the result (Track B6).
+    AddRow,
 }
 
 /// Which free-text prompt the single palette slot is currently serving, so a
@@ -76,9 +78,6 @@ pub(crate) enum Cmd {
 pub(crate) enum PromptKind {
     GoToRow,
     SaveQuery,
-    /// Entering a new value for the focused cell (Track B5). The target cell is
-    /// stashed in [`AppState::pending_edit`] while this prompt is open.
-    EditCell,
 }
 
 impl AppState {
@@ -171,7 +170,6 @@ impl AppState {
                 match kind {
                     PromptKind::GoToRow => self.submit_goto(text, cx),
                     PromptKind::SaveQuery => self.submit_save(text, cx),
-                    PromptKind::EditCell => self.submit_edit(text, cx),
                 }
             }
             PaletteEvent::Dismiss => self.close_palette(),
@@ -240,7 +238,9 @@ impl AppState {
             Cmd::OpenSavedQuery(index) => self.open_saved_query(index, cx),
             Cmd::Explain => self.explain_query(false, cx),
             Cmd::ExplainAnalyze => self.explain_query(true, cx),
-            Cmd::EditCell => self.open_edit_prompt(cx),
+            Cmd::SubmitChanges => self.submit_changes(cx),
+            Cmd::RevertChanges => self.revert_changes(cx),
+            Cmd::AddRow => self.add_draft_row(cx),
         }
     }
 
@@ -265,87 +265,6 @@ impl AppState {
             Phase::Connected(active) => active.active_result().and_then(|g| g.edit_target(gutter)),
             _ => None,
         }
-    }
-
-    /// Open the value prompt for the focused cell (Track B5). No-op when the cell
-    /// isn't editable. Prefills the prompt with the cell's current text so a small
-    /// tweak is one keystroke; submitting routes to [`Self::submit_edit`].
-    pub(crate) fn open_edit_prompt(&mut self, cx: &mut Context<Self>) {
-        let Some(ctx) = self.active_edit_target() else {
-            return;
-        };
-        // Prefill with the current value's text (empty for NULL — an empty submit
-        // re-clears it). A blob/clipped cell never reaches here (filtered above).
-        let current = match &ctx.original {
-            red_core::Value::Null => String::new(),
-            other => other.to_string(),
-        };
-        let placeholder = format!("New value for “{}”", ctx.column);
-        let prompt = cx.new(|cx| {
-            let mut p = Palette::new(cx).prompt();
-            p.set_placeholder(placeholder, cx);
-            p.set_query(&current, cx);
-            p
-        });
-        let sub = cx.subscribe(&prompt, Self::on_palette_event);
-        self.palette = Some((prompt, sub));
-        self.palette_cmds.clear();
-        self.palette_prompt = PromptKind::EditCell;
-        self.pending_edit = Some(ctx);
-        cx.notify();
-    }
-
-    /// Coerce the value typed into the edit prompt and stage it for confirmation
-    /// (Track B5). A coercion failure (e.g. text in an integer column) toasts the
-    /// reason instead of opening the preview.
-    fn submit_edit(&mut self, text: &str, cx: &mut Context<Self>) {
-        let Some(ctx) = self.pending_edit.take() else {
-            return;
-        };
-        match red_core::coerce_edit_value(text, ctx.decl_type.as_deref()) {
-            Ok(value) => self.stage_cell_edit(ctx, value, cx),
-            Err(reason) => {
-                self.notify(ToastVariant::Error, reason, cx);
-            }
-        }
-    }
-
-    /// Build the `UPDATE` [`EditOp`] for `ctx`'s cell with `value` and open the
-    /// guarded confirm preview (Track B5) — the single staging point both the
-    /// inspector's inline editor and the palette prompt funnel through. A value
-    /// equal to the original is a no-op (toast, no write). The cell context (now
-    /// carrying `value`) rides `pending_edit` through the confirm so a committed
-    /// edit can patch the resident cell in place.
-    pub(crate) fn stage_cell_edit(
-        &mut self,
-        mut ctx: crate::app::EditContext,
-        value: Value,
-        cx: &mut Context<Self>,
-    ) {
-        if value == ctx.original {
-            self.notify(ToastVariant::Info, "No change — value is the same.", cx);
-            return;
-        }
-        let op = EditOp::Update {
-            table: TableRef {
-                schema: Some(ctx.table.0.clone()),
-                name: ctx.table.1.clone(),
-            },
-            key: ColumnValue {
-                column: ctx.pk_column.clone(),
-                value: ctx.pk_value.clone(),
-            },
-            set: vec![ColumnValue {
-                column: ctx.column.clone(),
-                value: value.clone(),
-            }],
-        };
-        let epoch = ctx.epoch;
-        ctx.new_value = Some(value);
-        self.pending_edit = Some(ctx);
-        self.confirm_exec = Some(crate::app::PendingWrite::Edit { op, epoch });
-        self.focus_modal = true;
-        cx.notify();
     }
 
     /// The commands available in the current phase, each paired with its `Cmd`.
@@ -392,13 +311,28 @@ impl AppState {
                         Cmd::CopySelection,
                     ));
                 }
-                // Guarded cell edit (B5) — only when the focused cell is editable
-                // (writable + edit-enabled connection, single-table keyed browse).
-                if self.active_edit_target().is_some() {
+                // Staged data editing (B6) — offered on a writable, edit-enabled
+                // connection browsing an editable (single-table keyed) result. Add
+                // row is always available there; submit/revert only with changes.
+                if self.editing_enabled()
+                    && active.active_result().is_some_and(|g| g.editable_browse())
+                {
                     out.push((
-                        PaletteItem::new("cmd:edit-cell", "data: edit cell…"),
-                        Cmd::EditCell,
+                        PaletteItem::new("cmd:add-row", "data: add row").hint("⌥⌘N"),
+                        Cmd::AddRow,
                     ));
+                    if self.has_pending_changes() {
+                        out.push((
+                            PaletteItem::new("cmd:submit-changes", "data: submit changes")
+                                .hint("⌘↵"),
+                            Cmd::SubmitChanges,
+                        ));
+                        out.push((
+                            PaletteItem::new("cmd:revert-changes", "data: revert changes")
+                                .hint("⌥⌘Z"),
+                            Cmd::RevertChanges,
+                        ));
+                    }
                 }
                 out.push((
                     PaletteItem::new("cmd:history", "query: toggle history"),

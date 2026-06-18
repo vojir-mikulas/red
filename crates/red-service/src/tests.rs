@@ -294,9 +294,9 @@ async fn explains_a_query() {
     }
 }
 
-/// Apply a guarded data edit (Track B5): `ApplyEdit` on a writable session replies
-/// `EditApplied` echoing the result epoch, and an edit that matches no row comes
-/// back as a pane-local `EditFailed`, not a global `Error`.
+/// Apply a guarded edit batch (Track B6): `ApplyBatch` on a writable session replies
+/// `BatchApplied` echoing the result epoch, and a batch whose op matches no row comes
+/// back as a pane-local `BatchFailed`, not a global `Error`.
 #[tokio::test]
 async fn applies_a_data_edit() {
     use red_core::{ColumnValue, EditOp, TableRef};
@@ -338,33 +338,33 @@ async fn applies_a_data_edit() {
 
     send(
         &handle,
-        Command::ApplyEdit {
+        Command::ApplyBatch {
             epoch: 4,
-            op: edit(1),
+            ops: vec![edit(1)],
         },
     );
     match next(&mut events).await {
-        Some(Event::EditApplied { epoch, affected }) => {
+        Some(Event::BatchApplied { epoch, applied }) => {
             assert_eq!(epoch, 4, "the result epoch is echoed");
-            assert_eq!(affected, 1);
+            assert_eq!(applied, 1);
         }
-        other => panic!("expected EditApplied, got {other:?}"),
+        other => panic!("expected BatchApplied, got {other:?}"),
     }
 
-    // An edit whose key matches no row fails *in the pane*, rolled back.
+    // A batch whose op matches no row fails *in the pane*, rolled back.
     send(
         &handle,
-        Command::ApplyEdit {
+        Command::ApplyBatch {
             epoch: 5,
-            op: edit(9999),
+            ops: vec![edit(9999)],
         },
     );
     match next(&mut events).await {
-        Some(Event::EditFailed { epoch, message }) => {
+        Some(Event::BatchFailed { epoch, message, .. }) => {
             assert_eq!(epoch, 5);
             assert!(!message.is_empty());
         }
-        other => panic!("expected EditFailed, got {other:?}"),
+        other => panic!("expected BatchFailed, got {other:?}"),
     }
 
     send(&handle, Command::Shutdown);

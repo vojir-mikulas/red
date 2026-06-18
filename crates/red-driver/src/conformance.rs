@@ -692,3 +692,112 @@ pub(crate) async fn read_only_rejects_edit(driver: &dyn DatabaseDriver, schema: 
         "read-only connection must reject a data edit"
     );
 }
+
+/// Atomic batch editing (Track B6): `apply_edits` commits a heterogeneous batch
+/// (insert + update + delete) as one transaction, and rolls the *whole* batch back
+/// if any op fails. The caller seeds the same writable `(id PK, name)` table holding
+/// `(1, 'one')`. Verifies a 3-op batch commits together and lands every change, then
+/// that a batch whose later op matches no row leaves the table exactly as the
+/// successful batch left it (the earlier op in the failing batch was rolled back).
+pub(crate) async fn applies_batch_atomic(driver: &dyn DatabaseDriver, schema: &str, table: &str) {
+    let tref = || TableRef {
+        schema: Some(schema.into()),
+        name: table.into(),
+    };
+    let id = |n: i64| ColumnValue {
+        column: "id".into(),
+        value: Value::Integer(n),
+    };
+    let name = |v: &str| ColumnValue {
+        column: "name".into(),
+        value: Value::Text(v.into()),
+    };
+    let abort = AbortSignal::new();
+    let read = |sql: String| {
+        let abort = &abort;
+        async move {
+            driver
+                .fetch_page(&sql, 0, 10, PageCap::Full, abort)
+                .await
+                .unwrap()
+        }
+    };
+    let all = format!("SELECT id, name FROM {table} ORDER BY id");
+
+    // A 3-op batch — insert row 2, rename row 1, insert row 3 — commits as one unit.
+    let applied = driver
+        .apply_edits(&[
+            EditOp::Insert {
+                table: tref(),
+                values: vec![id(2), name("two")],
+            },
+            EditOp::Update {
+                table: tref(),
+                key: id(1),
+                set: vec![name("uno")],
+            },
+            EditOp::Insert {
+                table: tref(),
+                values: vec![id(3), name("three")],
+            },
+        ])
+        .await
+        .unwrap();
+    assert_eq!(applied, 3, "batch reports total affected across all ops");
+    let page = read(all.clone()).await;
+    assert_eq!(page.rows.len(), 3, "all three rows present after batch");
+    assert_eq!(page.rows[0][1], Value::Text("uno".into()), "row 1 renamed");
+
+    // A batch whose second op matches no row rolls back the first op too — the
+    // delete of row 2 must NOT persist.
+    let before = read(all.clone()).await.rows;
+    assert!(
+        driver
+            .apply_edits(&[
+                EditOp::Delete {
+                    table: tref(),
+                    key: id(2),
+                },
+                EditOp::Update {
+                    table: tref(),
+                    key: id(9999),
+                    set: vec![name("ghost")],
+                },
+            ])
+            .await
+            .is_err(),
+        "a batch with a non-matching op must error"
+    );
+    assert_eq!(
+        read(all).await.rows,
+        before,
+        "failed batch rolled back entirely — row 2 was not deleted"
+    );
+}
+
+/// A read-only connection rejects a batch edit at the engine, like the single-edit
+/// path. `schema`/`table` name a `(id PK, name)` table.
+pub(crate) async fn read_only_rejects_batch(
+    driver: &dyn DatabaseDriver,
+    schema: &str,
+    table: &str,
+) {
+    let ops = vec![EditOp::Update {
+        table: TableRef {
+            schema: Some(schema.into()),
+            name: table.into(),
+        },
+        key: ColumnValue {
+            column: "id".into(),
+            value: Value::Integer(1),
+        },
+        set: vec![ColumnValue {
+            column: "name".into(),
+            value: Value::Text("nope".into()),
+        }],
+    }];
+    assert!(
+        driver.apply_edits(&ops).await.is_err(),
+        "read-only connection must reject a batch edit"
+    );
+}

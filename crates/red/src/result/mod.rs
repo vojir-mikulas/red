@@ -9,7 +9,10 @@
 //! state plus the `AppState` command handlers that drive it).
 
 mod buffer;
+mod edit;
 mod render;
+
+pub(crate) use edit::GridEdit;
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -65,6 +68,9 @@ pub(crate) struct ResultGrid {
     /// key a guarded edit; `None` (editor SQL / no usable PK) means not editable.
     key: Option<KeySpec>,
     pub(in crate::result) buffer: Rc<RefCell<GridBuffer>>,
+    /// Staged, not-yet-submitted edits for this result (Track B6) — keyed by PK so
+    /// they survive the windowed buffer's eviction. Cleared on every (re)open.
+    pub(in crate::result) pending: edit::PendingChanges,
     pub(in crate::result) sender: CommandSender,
     pub(in crate::result) scroll: UniformListScrollHandle,
     pub(in crate::result) h_scroll: ScrollHandle,
@@ -110,6 +116,7 @@ impl ResultGrid {
             table,
             key: None,
             buffer: Rc::new(RefCell::new(GridBuffer::new(page_size))),
+            pending: edit::PendingChanges::default(),
             sender,
             page_size,
             scroll: UniformListScrollHandle::new(),
@@ -182,6 +189,21 @@ impl ResultGrid {
             .and_then(|r| r.values.get(col).cloned())
     }
 
+    /// Whether this result is an editable single-table keyed browse (a base table
+    /// plus a resolved PK) — the precondition for any staged edit / insert / delete.
+    pub(crate) fn editable_browse(&self) -> bool {
+        self.table.is_some() && self.key.is_some()
+    }
+
+    /// The data-column index of the identity (PK) column — the sorted browse's
+    /// tiebreaker, else the lead key — when this is an editable browse and the PK
+    /// column is present in the result.
+    pub(in crate::result) fn pk_column_index(&self) -> Option<usize> {
+        let key = self.key.as_ref()?;
+        let pk_column = key.tiebreak.clone().unwrap_or_else(|| key.column.clone());
+        self.columns.iter().position(|c| c.name == pk_column)
+    }
+
     /// Assemble the guarded-edit target (Track B5) for the cell under the cursor —
     /// the base table, its PK column + value (the row's identity), and the focused
     /// column's name / declared type / current value. `None` when the result isn't
@@ -190,7 +212,7 @@ impl ResultGrid {
     /// the target cell is binary / display-clipped (no safe inline round-trip).
     /// `gutter` is the data-column table offset (see [`AppState::gutter`]).
     pub(crate) fn edit_target(&self, gutter: usize) -> Option<EditContext> {
-        let table = self.table.clone()?;
+        self.table.as_ref()?; // must be a single-table browse to be editable
         let key = self.key.as_ref()?;
         // The identity column: the tiebreaker (the PK) for a sorted browse, else the
         // lead key (which is the PK for a plain browse).
@@ -213,13 +235,9 @@ impl ResultGrid {
             epoch: self.epoch,
             row,
             data_col: col,
-            table,
-            pk_column,
             pk_value,
-            column: target.name.clone(),
             decl_type: target.decl_type.clone(),
             original,
-            new_value: None,
         })
     }
 
@@ -261,6 +279,8 @@ impl ResultGrid {
         self.total = total;
         self.ready = true;
         self.error = None;
+        // A fresh result set starts with a clean change-set.
+        self.pending = edit::PendingChanges::default();
         self.stop_timer();
         self.window_base.set(0);
         let page = self.page_size;
@@ -330,6 +350,7 @@ impl ResultGrid {
     fn reset_buffer(&mut self) {
         *self.buffer.borrow_mut() = GridBuffer::new(self.page_size);
         self.window_base.set(0);
+        self.pending = edit::PendingChanges::default();
     }
 
     /// Jump the grid to `ordinal` (0-based) — the explicit "go to row N". Places

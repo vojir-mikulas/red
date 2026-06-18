@@ -491,38 +491,46 @@ impl DatabaseDriver for MysqlDriver {
         }
     }
 
-    async fn apply_edit(&self, op: &EditOp) -> Result<u64> {
-        let (sql, params) = crate::edit_sql(
-            op,
-            |id| format!("`{}`", escape_ident(id)),
-            |_, _| "?".to_string(),
-        );
-        let bound: Vec<MyValue> = params.iter().map(|v| to_my(v)).collect();
+    async fn apply_edits(&self, ops: &[EditOp]) -> Result<u64> {
+        if ops.is_empty() {
+            return Ok(0);
+        }
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
         conn.query_drop("BEGIN").await.map_err(map_my_err)?;
-        // With `CLIENT_FOUND_ROWS` set at connect, `affected_rows` reports *matched*
-        // rows (like Postgres/SQLite), so a PK-matched edit reports 1 even when the
-        // value is unchanged — the `affected != 1` guard below stays consistent.
-        let result = if bound.is_empty() {
-            conn.exec_drop(sql.as_str(), ()).await
-        } else {
-            conn.exec_drop(sql.as_str(), bound).await
-        };
-        match result {
-            Ok(()) => {
-                let affected = conn.affected_rows();
-                if affected != 1 {
-                    let _ = conn.query_drop("ROLLBACK").await;
-                    return Err(crate::edit_count_err(op, affected));
+        let mut total = 0u64;
+        for op in ops {
+            let (sql, params) = crate::edit_sql(
+                op,
+                |id| format!("`{}`", escape_ident(id)),
+                |_, _| "?".to_string(),
+            );
+            let bound: Vec<MyValue> = params.iter().map(|v| to_my(v)).collect();
+            // With `CLIENT_FOUND_ROWS` set at connect, `affected_rows` reports
+            // *matched* rows (like Postgres/SQLite), so a PK-matched edit reports 1
+            // even when the value is unchanged — the `affected != 1` guard stays
+            // consistent.
+            let result = if bound.is_empty() {
+                conn.exec_drop(sql.as_str(), ()).await
+            } else {
+                conn.exec_drop(sql.as_str(), bound).await
+            };
+            match result {
+                Ok(()) => {
+                    let affected = conn.affected_rows();
+                    if affected != 1 {
+                        let _ = conn.query_drop("ROLLBACK").await;
+                        return Err(crate::edit_count_err(op, affected));
+                    }
+                    total += affected;
                 }
-                conn.query_drop("COMMIT").await.map_err(map_my_err)?;
-                Ok(affected)
-            }
-            Err(e) => {
-                let _ = conn.query_drop("ROLLBACK").await;
-                Err(map_my_err(e))
+                Err(e) => {
+                    let _ = conn.query_drop("ROLLBACK").await;
+                    return Err(map_my_err(e));
+                }
             }
         }
+        conn.query_drop("COMMIT").await.map_err(map_my_err)?;
+        Ok(total)
     }
 
     async fn explain(&self, sql: &str, analyze: bool) -> Result<QueryPlan> {
@@ -1090,7 +1098,23 @@ mod tests {
         let ro = MysqlDriver::connect(&url, true).await.unwrap();
         battery::read_only_rejects_edit(&ro, &schema, &t).await;
 
+        // Atomic batch editing (B6) on a fresh seed table.
+        let tb = tag("batch");
+        driver
+            .execute(&format!(
+                "CREATE TABLE `{tb}` (id INT PRIMARY KEY, name VARCHAR(64))"
+            ))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!("INSERT INTO `{tb}` VALUES (1, 'one')"))
+            .await
+            .unwrap();
+        battery::applies_batch_atomic(&driver, &schema, &tb).await;
+        battery::read_only_rejects_batch(&ro, &schema, &tb).await;
+
         driver.execute(&format!("DROP TABLE `{t}`")).await.unwrap();
+        driver.execute(&format!("DROP TABLE `{tb}`")).await.unwrap();
     }
 
     #[tokio::test]

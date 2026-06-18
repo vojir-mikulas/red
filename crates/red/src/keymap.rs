@@ -83,6 +83,19 @@ actions!(
         OpenSavedQueries,
         /// Explain the active tab's query — open the plan view (⇧⌘E) — Track B4.
         Explain,
+        /// Begin editing the focused result cell in place (Enter / F2) — Track B6.
+        BeginEdit,
+        /// Submit the staged grid edits as one batch (⌘↵ in the grid) — Track B6.
+        /// Falls back to running the query when nothing is staged.
+        SubmitChanges,
+        /// Discard the staged grid edits (⌘⌥Z) — Track B6.
+        RevertChanges,
+        /// Toggle deletion of the selected result row(s) (⌘⌫) — Track B6.
+        DeleteRow,
+        /// Append a new draft (insert) row to the result (⌘⌥N) — Track B6.
+        AddRow,
+        /// Set the focused result cell to NULL (⌘⌥0) — Track B6.
+        SetNull,
     ]
 );
 
@@ -135,6 +148,17 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
                 ("⌘C", "Copy selection"),
                 ("⌘I", "Inspect cell"),
                 ("⌘⇧F", "Filter rows…"),
+            ],
+        ),
+        (
+            "Editing data",
+            vec![
+                ("↵ / F2", "Edit the focused cell"),
+                ("⌘↵", "Submit staged changes"),
+                ("⌥⌘Z", "Revert staged changes"),
+                ("⌘⌫", "Mark row(s) for deletion"),
+                ("⌥⌘N", "Add a new row"),
+                ("⌥⌘0", "Set cell to NULL"),
             ],
         ),
         (
@@ -239,6 +263,19 @@ const DEFAULTS: &[Entry] = &[
     // item displays this accelerator by looking the action up here. About has no
     // shortcut — it's reachable only from the menu.
     ("cmd-,", "Settings", Some("RedRoot")),
+    // --- staged grid editing (Track B6) ---
+    // Scoped to the `Table` context (the result grid's focus context, set by
+    // Flint's `Table`) so they fire only with the grid focused and never touch the
+    // editor / schema tree. The `Table` context sits below `RedRoot`, so its
+    // `cmd-enter` (Submit) wins over `RedRoot`'s Run while editing data; with
+    // nothing staged the handler falls through to running the query.
+    ("enter", "BeginEdit", Some("Table")),
+    ("f2", "BeginEdit", Some("Table")),
+    ("cmd-enter", "SubmitChanges", Some("Table")),
+    ("cmd-alt-z", "RevertChanges", Some("Table")),
+    ("cmd-backspace", "DeleteRow", Some("Table")),
+    ("cmd-alt-n", "AddRow", Some("Table")),
+    ("cmd-alt-0", "SetNull", Some("Table")),
 ];
 
 /// The reserved action names that mean "remove the default for this keystroke"
@@ -384,6 +421,12 @@ fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<Ke
         "RunQuery" => kb!(RunQuery),
         "NewConnection" => kb!(NewConnection),
         "Settings" => kb!(Settings),
+        "BeginEdit" => kb!(BeginEdit),
+        "SubmitChanges" => kb!(SubmitChanges),
+        "RevertChanges" => kb!(RevertChanges),
+        "DeleteRow" => kb!(DeleteRow),
+        "AddRow" => kb!(AddRow),
+        "SetNull" => kb!(SetNull),
         other => return Err(format!("unknown action “{other}” — skipping")),
     })
 }
