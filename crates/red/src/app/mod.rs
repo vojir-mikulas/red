@@ -148,6 +148,16 @@ pub(crate) enum ConnectStatus {
     /// database) — terminal, no retry. The splash shows the error and offers an
     /// "Edit connection" action instead of a countdown. See [`Event::ConnectFailed`].
     Failed { error: SharedString },
+    /// The SSH jump host's key isn't trusted yet. The splash shows the fingerprint
+    /// and offers "Trust & connect", which writes it to `known_hosts` and retries.
+    /// Carries what the retry needs. See [`Event::SshHostUnknown`].
+    NeedsHostTrust {
+        host: String,
+        port: u16,
+        fingerprint: SharedString,
+        /// OpenSSH-encoded key, sent back via [`Command::TrustSshHost`] on trust.
+        key: String,
+    },
 }
 
 /// The result of the latest "Test connection" probe, shown in the form footer.
@@ -1286,6 +1296,17 @@ impl AppState {
                 // reply from a superseded/cancelled attempt is ignored.
                 if matches!(&self.phase, Phase::Connecting(c) if Some(c.session) == session) {
                     self.on_connect_failed(message, fatal, cx);
+                }
+            }
+            Event::SshHostUnknown {
+                host,
+                port,
+                fingerprint,
+                key,
+            } => {
+                tracing::warn!(?session, %host, "unknown SSH host key ({fingerprint})");
+                if matches!(&self.phase, Phase::Connecting(c) if Some(c.session) == session) {
+                    self.on_ssh_host_unknown(host, port, fingerprint, key, cx);
                 }
             }
             Event::Error(message) => {

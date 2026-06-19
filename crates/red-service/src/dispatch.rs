@@ -265,10 +265,20 @@ enum ConnectOutcome {
 
 /// A failed connect attempt: the user-facing message plus whether it's `fatal`
 /// (user-correctable — bad credentials, missing database) and so should stop the
-/// UI's backoff loop rather than schedule another retry.
+/// UI's backoff loop rather than schedule another retry. `host_key`, when set,
+/// turns the failure into a trustable unknown-SSH-host prompt instead.
 struct ConnectFail {
     message: String,
     fatal: bool,
+    host_key: Option<HostKeyPrompt>,
+}
+
+/// An unknown SSH jump-host key, carried back so the UI can offer "trust & retry".
+struct HostKeyPrompt {
+    host: String,
+    port: u16,
+    fingerprint: String,
+    key: String,
 }
 
 /// Apply a spawned connect/probe result on the dispatch loop. Insertion into
@@ -297,6 +307,18 @@ fn apply_connect_outcome(
                     sessions.insert(id, SessionState::new(driver, tunnel));
                     emit(events, Some(id), Event::Connected { version });
                 }
+                Err(ConnectFail {
+                    host_key: Some(hk), ..
+                }) => emit(
+                    events,
+                    Some(id),
+                    Event::SshHostUnknown {
+                        host: hk.host,
+                        port: hk.port,
+                        fingerprint: hk.fingerprint,
+                        key: hk.key,
+                    },
+                ),
                 Err(fail) => emit(
                     events,
                     Some(id),
@@ -440,6 +462,16 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         .map_err(|f| f.message);
                     let _ = tx.send(ConnectOutcome::Test { result });
                 });
+            }
+
+            Command::TrustSshHost { host, port, key } => {
+                // Append the host key to ~/.ssh/known_hosts, on the loop (a quick
+                // file write). The UI re-sends `Connect` right after; processed in
+                // order on this single loop, so the retry sees the new entry. A
+                // failure is logged — the retry will just re-prompt.
+                if let Err(e) = crate::tunnel::trust_host(&host, port, &key) {
+                    tracing::warn!("failed to trust SSH host {host}: {e}");
+                }
             }
 
             Command::Disconnect | Command::CloseSession => {
@@ -1546,16 +1578,41 @@ async fn attempt_connect(
     config: &ConnectionConfig,
 ) -> Result<(Arc<dyn DatabaseDriver>, Option<Tunnel>), ConnectFail> {
     match tokio::time::timeout(CONNECT_TIMEOUT, connect(config)).await {
-        // A driver `RedError::Auth` is the one user-correctable failure — flag it
-        // fatal so the UI stops retrying; every other connect error is transient.
-        Ok(result) => result.map_err(|e| ConnectFail {
-            fatal: matches!(e, RedError::Auth(_)),
-            message: e.to_string(),
-        }),
+        Ok(result) => result.map_err(classify_connect_err),
         Err(_) => Err(ConnectFail {
             message: format!("connection timed out after {}s", CONNECT_TIMEOUT.as_secs()),
             fatal: false,
+            host_key: None,
         }),
+    }
+}
+
+/// Classify a connect error for the UI. An unknown SSH host key becomes a
+/// trustable `host_key` prompt; a driver `RedError::Auth` (bad credentials,
+/// missing database) is fatal so the UI stops retrying; everything else is a
+/// transient failure that warrants a backoff retry.
+fn classify_connect_err(e: RedError) -> ConnectFail {
+    match e {
+        RedError::SshHostUnknown {
+            host,
+            port,
+            fingerprint,
+            key,
+        } => ConnectFail {
+            message: format!("unknown SSH host key for {host}"),
+            fatal: true,
+            host_key: Some(HostKeyPrompt {
+                host,
+                port,
+                fingerprint,
+                key,
+            }),
+        },
+        other => ConnectFail {
+            fatal: matches!(other, RedError::Auth(_)),
+            message: other.to_string(),
+            host_key: None,
+        },
     }
 }
 

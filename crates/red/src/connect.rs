@@ -693,13 +693,29 @@ impl AppState {
             return None;
         }
 
-        let toggle = div().flex().items_center().gap_2().child(
-            Toggle::new("ssh-enabled", form.ssh_enabled)
-                .label("Tunnel via SSH")
-                .on_change(cx.listener(|this, checked: &bool, _, cx| {
-                    this.set_form_ssh_enabled(*checked, cx)
-                })),
-        );
+        // `Toggle::label` is a11y-only (sets aria-label, paints nothing), so pair it
+        // with a visible caption — tinted accent when on, like the Read-only row.
+        let toggle = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                Toggle::new("ssh-enabled", form.ssh_enabled)
+                    .label("Tunnel via SSH")
+                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                        this.set_form_ssh_enabled(*checked, cx)
+                    })),
+            )
+            .child(
+                div()
+                    .text_size(theme.scale(12.5))
+                    .text_color(if form.ssh_enabled {
+                        theme.accent
+                    } else {
+                        theme.text_muted
+                    })
+                    .child("Tunnel via SSH"),
+            );
 
         if !form.ssh_enabled {
             return Some(

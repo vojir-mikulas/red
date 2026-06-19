@@ -34,6 +34,15 @@ pub enum Command {
     /// Open a throwaway session to validate a config, then drop it. Reports back
     /// via `TestSucceeded`/`TestFailed` without disturbing the active session.
     TestConnection(ConnectionConfig),
+    /// Append an SSH jump host's key to `~/.ssh/known_hosts` — the "trust this
+    /// host" action behind an [`Event::SshHostUnknown`] failure. Session-less; the
+    /// UI re-sends `Connect` after this so the retry verifies against the new entry.
+    TrustSshHost {
+        host: String,
+        port: u16,
+        /// OpenSSH-encoded public key, as carried by [`Event::SshHostUnknown`].
+        key: String,
+    },
     /// Open a cursor for `sql` and stream the first window.
     Query {
         sql: String,
@@ -215,6 +224,17 @@ pub enum Event {
     ConnectFailed {
         message: String,
         fatal: bool,
+    },
+    /// A `Connect` failed because the SSH jump host's key isn't in
+    /// `~/.ssh/known_hosts`. The UI shows the `fingerprint` and offers "trust &
+    /// retry", which sends [`Command::TrustSshHost`] with `key` then reconnects.
+    /// Distinct from [`Event::ConnectFailed`] so the splash can offer the action
+    /// instead of a dead end.
+    SshHostUnknown {
+        host: String,
+        port: u16,
+        fingerprint: String,
+        key: String,
     },
     /// A query opened; column metadata is known before any rows arrive.
     QueryStarted {

@@ -998,6 +998,17 @@ pub enum RedError {
     /// backoff loop and prompt for an edit instead of retrying forever.
     #[error("authentication failed: {0}")]
     Auth(String),
+    /// An SSH jump host whose key isn't in `~/.ssh/known_hosts`. Distinct from
+    /// [`RedError::Auth`] so the UI can offer "trust this host & retry" instead of
+    /// a dead end: it carries the fingerprint to show and the OpenSSH-encoded key
+    /// to append to `known_hosts` on accept.
+    #[error("unknown SSH host key for {host}")]
+    SshHostUnknown {
+        host: String,
+        port: u16,
+        fingerprint: String,
+        key: String,
+    },
     #[error("query failed: {0}")]
     Query(String),
     #[error("driver error: {0}")]

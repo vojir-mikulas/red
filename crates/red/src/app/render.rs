@@ -69,6 +69,27 @@ impl AppState {
                         .text_size(theme.scale(12.))
                         .child(error.clone()),
                 ),
+            // Untrusted SSH host: show the fingerprint to verify before trusting.
+            ConnectStatus::NeedsHostTrust {
+                host, fingerprint, ..
+            } => status
+                .child(
+                    div()
+                        .text_color(theme.text)
+                        .child(format!("Unknown SSH host: {host}")),
+                )
+                .child(
+                    div()
+                        .text_color(theme.text_muted)
+                        .text_size(theme.scale(12.))
+                        .child(format!("Key fingerprint: {fingerprint}")),
+                )
+                .child(
+                    div()
+                        .text_color(theme.text_muted)
+                        .text_size(theme.scale(12.))
+                        .child("Verify the fingerprint, then trust this host to add it to ~/.ssh/known_hosts."),
+                ),
         };
 
         let mut actions = div().flex().justify_center().gap_2();
@@ -84,6 +105,13 @@ impl AppState {
                 Button::new("connect-edit", "Edit connection")
                     .variant(ButtonVariant::Primary)
                     .on_click(cx.listener(|this, _, _, cx| this.edit_failed_connection(cx))),
+            );
+        }
+        if matches!(conn.status, ConnectStatus::NeedsHostTrust { .. }) {
+            actions = actions.child(
+                Button::new("connect-trust", "Trust & connect")
+                    .variant(ButtonVariant::Primary)
+                    .on_click(cx.listener(|this, _, _, cx| this.trust_host_and_retry(cx))),
             );
         }
         actions = actions.child(

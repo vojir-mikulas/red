@@ -289,6 +289,52 @@ impl AppState {
         self.schedule_retry(delay, cx);
     }
 
+    /// The in-flight connect hit an untrusted SSH jump host. Show the fingerprint
+    /// and offer to trust it — terminal until the user acts, so (like a fatal
+    /// failure) bump the generation to cancel any pending backoff timer.
+    pub(crate) fn on_ssh_host_unknown(
+        &mut self,
+        host: String,
+        port: u16,
+        fingerprint: String,
+        key: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Phase::Connecting(conn) = &mut self.phase {
+            conn.status = ConnectStatus::NeedsHostTrust {
+                host,
+                port,
+                fingerprint: fingerprint.into(),
+                key,
+            };
+            self.connect_gen += 1;
+            cx.notify();
+        }
+    }
+
+    /// "Trust & connect": append the jump host's key to `~/.ssh/known_hosts` (via
+    /// the service) and retry the same connection — the retry verifies against the
+    /// freshly written entry and proceeds.
+    pub(crate) fn trust_host_and_retry(&mut self, cx: &mut Context<Self>) {
+        let trust = match &self.phase {
+            Phase::Connecting(conn) => match &conn.status {
+                ConnectStatus::NeedsHostTrust {
+                    host, port, key, ..
+                } => Some((host.clone(), *port, key.clone())),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some((host, port, key)) = trust else {
+            return;
+        };
+        self.service
+            .send_global(Command::TrustSshHost { host, port, key });
+        // Re-dial on the same session; the command channel is ordered, so the
+        // known_hosts write lands before this Connect is processed.
+        self.begin_attempt(cx);
+    }
+
     /// "Edit connection" on a fatal connect splash: leave the splash (restoring
     /// whatever was foreground before, like Cancel) and open the edit form for the
     /// connection that failed, so the user can fix the credentials and reconnect.

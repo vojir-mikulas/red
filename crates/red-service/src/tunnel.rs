@@ -48,9 +48,14 @@ impl Drop for Tunnel {
 enum HandlerError {
     /// A `russh` protocol/transport error during the handshake.
     Ssh(russh::Error),
-    /// The host isn't in `~/.ssh/known_hosts`; carries its fingerprint so the user
-    /// can verify and add it.
-    HostUnknown { host: String, fingerprint: String },
+    /// The host isn't in `~/.ssh/known_hosts`. Carries its fingerprint (to show)
+    /// and the OpenSSH-encoded key (to append to known_hosts if the user trusts it).
+    HostUnknown {
+        host: String,
+        port: u16,
+        fingerprint: String,
+        key: String,
+    },
     /// The host *is* in `known_hosts` but the key differs — a possible MITM.
     HostMismatch { host: String },
     /// `known_hosts` couldn't be read for some other reason.
@@ -81,7 +86,11 @@ impl russh::client::Handler for Handler {
             Ok(true) => Ok(true),
             Ok(false) => Err(HandlerError::HostUnknown {
                 host: self.host.clone(),
+                port: self.port,
                 fingerprint: key.fingerprint(Default::default()).to_string(),
+                // OpenSSH-encoded so it can be appended to known_hosts later; on
+                // the rare encode error, fall back to empty (no trust offer).
+                key: key.to_openssh().unwrap_or_default(),
             }),
             Err(russh::keys::Error::KeyChanged { .. }) => Err(HandlerError::HostMismatch {
                 host: self.host.clone(),
@@ -228,10 +237,17 @@ fn map_handler_err(e: HandlerError) -> RedError {
     match e {
         HandlerError::Ssh(e) => RedError::Connect(format!("SSH connection failed: {e}")),
         HandlerError::Other(msg) => RedError::Connect(format!("SSH known_hosts error: {msg}")),
-        HandlerError::HostUnknown { host, fingerprint } => RedError::Auth(format!(
-            "unknown SSH host key for {host} ({fingerprint}). Verify it and add the host to \
-             ~/.ssh/known_hosts to connect."
-        )),
+        HandlerError::HostUnknown {
+            host,
+            port,
+            fingerprint,
+            key,
+        } => RedError::SshHostUnknown {
+            host,
+            port,
+            fingerprint,
+            key,
+        },
         HandlerError::HostMismatch { host } => RedError::Auth(format!(
             "SSH host key for {host} does not match ~/.ssh/known_hosts — possible \
              man-in-the-middle. Connection refused."
@@ -239,21 +255,170 @@ fn map_handler_err(e: HandlerError) -> RedError {
     }
 }
 
+/// Append a server's host key to `~/.ssh/known_hosts` — the "trust this host"
+/// action behind an unknown-host connect failure. `key` is the OpenSSH-encoded
+/// public key carried by [`RedError::SshHostUnknown`].
+pub(crate) fn trust_host(host: &str, port: u16, key: &str) -> Result<()> {
+    let key = ssh_key::PublicKey::from_openssh(key)
+        .map_err(|e| RedError::Connect(format!("malformed SSH host key: {e}")))?;
+    russh::keys::known_hosts::learn_known_hosts(host, port, &key)
+        .map_err(|e| RedError::Connect(format!("could not update ~/.ssh/known_hosts: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A throwaway Ed25519 host key for the in-process SSH server below. Generated
+    /// for tests only — never used anywhere real.
+    const TEST_HOST_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACD8Wa/iX3qLQqdMR/aXzOAmutfnI1aLE/oUJYkLuqZZlAAAAJBjOv+EYzr/
+hAAAAAtzc2gtZWQyNTUxOQAAACD8Wa/iX3qLQqdMR/aXzOAmutfnI1aLE/oUJYkLuqZZlA
+AAAEAsgG66AZ1coZRS0N1OW3YSKfVp76vXarHs06agqv8p5/xZr+JfeotCp0xH9pfM4Ca6
+1+cjVosT+hQliQu6plmUAAAACHJlZC10ZXN0AQIDBAU=
+-----END OPENSSH PRIVATE KEY-----
+";
+
+    /// The in-process SSH server side: accept any password and forward each
+    /// direct-tcpip channel to the address the client asked for (our echo server).
+    struct TestServer;
+
+    impl russh::server::Handler for TestServer {
+        type Error = russh::Error;
+
+        async fn auth_password(
+            &mut self,
+            _user: &str,
+            _password: &str,
+        ) -> std::result::Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_direct_tcpip(
+            &mut self,
+            channel: russh::Channel<russh::server::Msg>,
+            host: &str,
+            port: u32,
+            _originator_address: &str,
+            _originator_port: u32,
+            _session: &mut russh::server::Session,
+        ) -> std::result::Result<bool, Self::Error> {
+            let addr = format!("{host}:{port}");
+            tokio::spawn(async move {
+                if let Ok(mut target) = tokio::net::TcpStream::connect(addr).await {
+                    let mut stream = channel.into_stream();
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut target).await;
+                }
+            });
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "spins up an in-process SSH server; run with --ignored"]
+    async fn forwards_bytes_through_the_tunnel() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        // 1. An echo "database" the tunnel will forward to.
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 || sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        // 2. The SSH server, keyed with our fixture host key.
+        let host_key = russh::keys::decode_secret_key(TEST_HOST_KEY, None).unwrap();
+        let server_pub = host_key.public_key().clone();
+        let server_config = Arc::new(russh::server::Config {
+            keys: vec![host_key],
+            ..Default::default()
+        });
+        let ssh_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ssh_port = ssh_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = ssh_listener.accept().await {
+                if let Ok(session) =
+                    russh::server::run_stream(server_config, stream, TestServer).await
+                {
+                    let _ = session.await;
+                }
+            }
+        });
+
+        // 3. Trust the server's key by pointing HOME at a temp known_hosts.
+        let home = std::env::temp_dir().join(format!("red-ssh-test-{}", std::process::id()));
+        let known_hosts = home.join(".ssh").join("known_hosts");
+        let _ = std::fs::remove_file(&known_hosts);
+        russh::keys::known_hosts::learn_known_hosts_path(
+            "127.0.0.1",
+            ssh_port,
+            &server_pub,
+            &known_hosts,
+        )
+        .unwrap();
+        // SAFETY: the only test mutating HOME, and it's `#[ignore]` (run alone).
+        unsafe { std::env::set_var("HOME", &home) };
+
+        // 4. Open the tunnel and round-trip bytes through the forward.
+        let ssh = SshConfig {
+            host: "127.0.0.1".into(),
+            port: ssh_port,
+            user: "tester".into(),
+            auth: SshAuth::Password,
+            password: "hunter2".into(),
+            passphrase: String::new(),
+        };
+        let tunnel = Tunnel::open(&ssh, "127.0.0.1", echo_port)
+            .await
+            .expect("tunnel opens");
+
+        let mut client = TcpStream::connect(tunnel.local_addr()).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping", "bytes round-trip through the SSH tunnel");
+    }
+
     #[test]
-    fn host_key_problems_are_fatal_auth_errors() {
-        // Unknown / changed host keys must map to `Auth` so the connect path
-        // treats them as fatal (user must act) rather than retrying forever.
+    fn unknown_host_carries_trust_payload() {
+        // An unknown host maps to the structured `SshHostUnknown` (not plain
+        // `Auth`) so the UI can offer "trust & retry" with the fingerprint + key.
         let unknown = map_handler_err(HandlerError::HostUnknown {
             host: "bastion".into(),
+            port: 2222,
             fingerprint: "SHA256:abc".into(),
+            key: "ssh-ed25519 AAAA...".into(),
         });
-        assert!(matches!(unknown, RedError::Auth(_)));
-        assert!(unknown.to_string().contains("SHA256:abc"));
+        match unknown {
+            RedError::SshHostUnknown {
+                host,
+                port,
+                fingerprint,
+                key,
+            } => {
+                assert_eq!(host, "bastion");
+                assert_eq!(port, 2222);
+                assert_eq!(fingerprint, "SHA256:abc");
+                assert_eq!(key, "ssh-ed25519 AAAA...");
+            }
+            other => panic!("expected SshHostUnknown, got {other:?}"),
+        }
+    }
 
+    #[test]
+    fn changed_host_key_is_a_fatal_auth_error() {
+        // A *changed* key is a hard stop (possible MITM) — fatal `Auth`, no trust.
         let mismatch = map_handler_err(HandlerError::HostMismatch {
             host: "bastion".into(),
         });
