@@ -28,6 +28,38 @@ pub(crate) enum ChatRole {
     Assistant,
 }
 
+/// A one-tap context action shown in the panel (M-S4). Each maps to a canned
+/// prompt; the live error / editor SQL it refers to is folded in by `ai_context`.
+#[derive(Clone, Copy)]
+pub(crate) enum QuickAction {
+    /// Explain the last query error and how to fix it (shown when one exists).
+    ExplainError,
+    /// Review the editor's SQL for correctness and performance (shown when the
+    /// editor holds a statement).
+    OptimizeQuery,
+}
+
+impl QuickAction {
+    /// The canned prompt sent for this action.
+    fn prompt(self) -> &'static str {
+        match self {
+            QuickAction::ExplainError => "Explain the error from my last query and how to fix it.",
+            QuickAction::OptimizeQuery => {
+                "Review the SQL in my editor for correctness and performance, and \
+                 suggest an improved version."
+            }
+        }
+    }
+
+    /// The chip's label.
+    fn label(self) -> &'static str {
+        match self {
+            QuickAction::ExplainError => "Explain error",
+            QuickAction::OptimizeQuery => "Optimize query",
+        }
+    }
+}
+
 /// One rendered turn in the panel. The assistant bubble accumulates streamed text
 /// and (optionally) summarized thinking as deltas arrive.
 pub(crate) struct ChatMessage {
@@ -71,6 +103,9 @@ pub(crate) struct AssistantState {
     /// A tool-permission prompt awaiting the user's Allow/Deny (M-S2). At most one
     /// is shown at a time; the agent blocks on the answer.
     pub(crate) pending_permission: Option<PendingPermission>,
+    /// The most recent finished turn's token/cost accounting (M-S4), shown as a
+    /// compact footer. `None` until the first turn completes.
+    pub(crate) last_usage: Option<red_service::AiUsage>,
 }
 
 impl AssistantState {
@@ -127,6 +162,7 @@ impl AppState {
                 status: None,
                 error: None,
                 pending_permission: None,
+                last_usage: None,
             });
             self.focus_assistant = true;
         }
@@ -146,7 +182,6 @@ impl AppState {
 
     /// Send the prompt box's contents as one turn.
     pub(crate) fn submit_assistant(&mut self, cx: &mut Context<Self>) {
-        // Gather everything that needs an immutable borrow first, then mutate.
         let Some(state) = self.assistant.as_ref() else {
             return;
         };
@@ -157,8 +192,29 @@ impl AppState {
         if message.is_empty() {
             return;
         }
-        let conversation_id = state.conversation_id;
+        // Clear the box; `send_turn` records the exchange and dispatches.
+        state.input.update(cx, |i, cx| i.set_content("", cx));
+        self.send_turn(message, cx);
+    }
 
+    /// A one-tap context action (M-S4): "Explain error" / "Optimize query". Each is
+    /// just a canned prompt — `ai_context` already folds in the live error / editor
+    /// SQL, so the turn is grounded without the user retyping it. Shared by both
+    /// providers (it rides the same `AiTurn` path).
+    pub(crate) fn assistant_quick_action(&mut self, kind: QuickAction, cx: &mut Context<Self>) {
+        self.send_turn(kind.prompt().to_string(), cx);
+    }
+
+    /// Record a user turn and dispatch it to the backend. The caller has already
+    /// resolved the message text (typed, or a quick-action prompt).
+    fn send_turn(&mut self, message: String, cx: &mut Context<Self>) {
+        let Some(state) = self.assistant.as_ref() else {
+            return;
+        };
+        if state.streaming || message.trim().is_empty() {
+            return;
+        }
+        let conversation_id = state.conversation_id;
         let (session, context) = {
             let Phase::Connected(active) = &self.phase else {
                 return;
@@ -166,10 +222,6 @@ impl AppState {
             (active.session, self.ai_context(active, cx))
         };
 
-        // Clear the box and record the exchange.
-        if let Some(state) = self.assistant.as_ref() {
-            state.input.update(cx, |i, cx| i.set_content("", cx));
-        }
         if let Some(state) = self.assistant.as_mut() {
             state.messages.push(ChatMessage {
                 role: ChatRole::User,
@@ -189,6 +241,28 @@ impl AppState {
                 context,
             },
         );
+        cx.notify();
+    }
+
+    /// Re-authenticate / switch the subscription account (M-S4). The agent owns
+    /// `/login`, so Red asks the backend to restart the conversation's agent; the
+    /// next turn re-runs the handshake and the agent pops its own browser login
+    /// when it isn't signed in. A no-op on the API-key path.
+    pub(crate) fn reauthenticate_assistant(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.assistant.as_ref() else {
+            return;
+        };
+        let conversation_id = state.conversation_id;
+        if let Phase::Connected(active) = &self.phase {
+            self.service.send_to(
+                active.session,
+                red_service::Command::AiReauthenticate { conversation_id },
+            );
+        }
+        if let Some(state) = self.assistant.as_mut() {
+            state.error = None;
+            state.status = Some("Restarting the assistant — sign in if the browser opens.".into());
+        }
         cx.notify();
     }
 
@@ -284,12 +358,22 @@ impl AppState {
         cx.notify();
     }
 
-    pub(crate) fn on_ai_finished(&mut self, conversation_id: u64, cx: &mut Context<Self>) {
+    pub(crate) fn on_ai_finished(
+        &mut self,
+        conversation_id: u64,
+        usage: red_service::AiUsage,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(state) = self.assistant.as_mut() {
             if state.conversation_id == conversation_id {
                 state.streaming = false;
                 state.status = None;
                 state.pending_permission = None;
+                // Keep a non-empty reading; a turn that reports nothing (some
+                // refusals / cancels) leaves the prior footer in place.
+                if usage != red_service::AiUsage::default() {
+                    state.last_usage = Some(usage);
+                }
                 cx.notify();
             }
         }
@@ -364,10 +448,17 @@ impl AppState {
             .active()
             .map(|t| t.editor.read(cx).content().to_string())
             .filter(|s| !s.trim().is_empty());
+        // The active result's last failure, so "Explain error" (and any turn after
+        // a failed query) is grounded in what the user just saw.
+        let last_error = active
+            .active()
+            .and_then(|t| t.result.as_ref())
+            .and_then(|r| r.error())
+            .map(str::to_string);
         red_service::AiContext {
             schema_summary: summarize_schema(&active.schema.schemas),
             editor_sql,
-            last_error: None,
+            last_error,
             selection: None,
             connection: format!(
                 "{} database \"{}\"",
@@ -391,7 +482,7 @@ impl AppState {
             .provider
             .eq_ignore_ascii_case("subscription");
 
-        // Header: title + close.
+        // Header: title + (subscription) switch-account + close.
         let close = div()
             .id("assistant-close")
             .flex()
@@ -403,6 +494,33 @@ impl AppState {
             .hover(|s| s.bg(theme.bg_elevated))
             .child(crate::icons::icon("x", theme.scale(13.), theme.text_muted))
             .on_click(cx.listener(|this, _, window, cx| this.close_assistant(window, cx)));
+
+        // The agent owns `/login`, so "Switch account" restarts it (M-S4); only
+        // meaningful on the subscription path.
+        let reauth = is_subscription.then(|| {
+            div()
+                .id("assistant-reauth")
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(20.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .tooltip(flint::Tooltip::text("Sign in / switch account"))
+                .hover(|s| s.bg(theme.bg_elevated))
+                .child(crate::icons::icon(
+                    "key-round",
+                    theme.scale(13.),
+                    theme.text_muted,
+                ))
+                .on_click(cx.listener(|this, _, _, cx| this.reauthenticate_assistant(cx)))
+        });
+        let header_actions = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .when_some(reauth, |row, r| row.child(r))
+            .child(close);
 
         let header = div()
             .flex_shrink_0()
@@ -432,7 +550,7 @@ impl AppState {
                         )
                     }),
             )
-            .child(close);
+            .child(header_actions);
 
         // Setup view: no key configured yet. Offer an inline key entry (stored in
         // the OS keyring, never in settings.toml).
@@ -594,8 +712,86 @@ impl AppState {
             .when_some(state.pending_permission.as_ref(), |col, pending| {
                 col.child(self.render_permission(pending, &theme, cx))
             })
+            .when_some(
+                self.render_quick_actions(state, &theme, cx),
+                |col, chips| col.child(chips),
+            )
             .child(composer)
+            .when_some(state.last_usage, |col, usage| {
+                col.child(render_usage(&usage, &theme))
+            })
             .into_any_element()
+    }
+
+    /// The context-action chips (M-S4): "Explain error" when the active result
+    /// failed, "Optimize query" when the editor holds SQL. Shared by both providers
+    /// (they ride the same `AiTurn`). Hidden while a turn streams, or when neither
+    /// applies. Docked above the composer so they're reachable regardless of scroll.
+    fn render_quick_actions(
+        &self,
+        state: &AssistantState,
+        theme: &flint::Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if state.streaming {
+            return None;
+        }
+        let Phase::Connected(active) = &self.phase else {
+            return None;
+        };
+        let tab = active.active();
+        let has_error = tab
+            .and_then(|t| t.result.as_ref())
+            .is_some_and(|r| r.error().is_some());
+        let has_sql = tab.is_some_and(|t| !t.editor.read(cx).content().trim().is_empty());
+
+        let mut actions = Vec::new();
+        if has_error {
+            actions.push(QuickAction::ExplainError);
+        }
+        if has_sql {
+            actions.push(QuickAction::OptimizeQuery);
+        }
+        if actions.is_empty() {
+            return None;
+        }
+
+        let mut row = div()
+            .flex_shrink_0()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1p5()
+            .px_2()
+            .pt_2();
+        for action in actions {
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("ai-quick-{}", action.label())))
+                    .px_2()
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_size(theme.scale(11.))
+                    .text_color(theme.text_muted)
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(theme.red).text_color(theme.red))
+                    .child(crate::icons::icon(
+                        "sparkles",
+                        theme.scale(11.),
+                        theme.text_muted,
+                    ))
+                    .child(action.label())
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.assistant_quick_action(action, cx)),
+                    ),
+            );
+        }
+        Some(row.into_any_element())
     }
 
     /// The tool-permission prompt (M-S2): what the agent wants to do, plus
@@ -790,6 +986,57 @@ impl AppState {
     }
 }
 
+/// The token/cost footer (M-S4): a compact, dim strip under the composer showing
+/// the latest turn's accounting. The subscription path reports the tokens in
+/// context plus a running session cost; the API-key path reports per-turn tokens
+/// and no cost. Only non-zero/present fields render.
+fn render_usage(usage: &red_service::AiUsage, theme: &flint::Theme) -> AnyElement {
+    let mut parts: Vec<String> = Vec::new();
+    if usage.input_tokens > 0 {
+        parts.push(format!("{} in", compact_count(usage.input_tokens)));
+    }
+    if usage.output_tokens > 0 {
+        parts.push(format!("{} out", compact_count(usage.output_tokens)));
+    }
+    if usage.cache_read_input_tokens > 0 {
+        parts.push(format!(
+            "{} cached",
+            compact_count(usage.cache_read_input_tokens)
+        ));
+    }
+    if let Some(cost) = usage.cost_usd {
+        // Sub-cent sessions still read as a real number rather than "$0.00".
+        parts.push(format!("${cost:.4}"));
+    }
+    let label = if parts.is_empty() {
+        "—".to_string()
+    } else {
+        parts.join(" · ")
+    };
+    div()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_end()
+        .px_3()
+        .pb_1p5()
+        .text_size(theme.scale(10.))
+        .text_color(theme.text_muted)
+        .child(label)
+        .into_any_element()
+}
+
+/// Render a token count compactly: `1234 → 1.2k`, `2_000_000 → 2.0M`.
+fn compact_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 /// A cheap stable-ish element key for a bubble (its text length + a prefix hash).
 /// Bubbles are rendered in order and the panel rebuilds each frame, so this only
 /// needs to be unique among the currently-shown bubbles.
@@ -849,5 +1096,22 @@ mod tests {
         assert_eq!(extract_sql(md).as_deref(), Some("SELECT 1;"));
         assert_eq!(extract_sql("no code here"), None);
         assert_eq!(extract_sql("```sql\n\n```"), None);
+    }
+
+    #[test]
+    fn compacts_token_counts() {
+        assert_eq!(compact_count(0), "0");
+        assert_eq!(compact_count(999), "999");
+        assert_eq!(compact_count(1_200), "1.2k");
+        assert_eq!(compact_count(2_000_000), "2.0M");
+    }
+
+    #[test]
+    fn quick_action_prompts_are_distinct_and_nonempty() {
+        let explain = QuickAction::ExplainError.prompt();
+        let optimize = QuickAction::OptimizeQuery.prompt();
+        assert!(!explain.trim().is_empty());
+        assert!(!optimize.trim().is_empty());
+        assert_ne!(explain, optimize);
     }
 }

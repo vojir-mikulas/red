@@ -1518,8 +1518,9 @@ impl AppState {
                 delta,
             } => self.on_ai_delta(conversation_id, delta, cx),
             Event::AiTurnFinished {
-                conversation_id, ..
-            } => self.on_ai_finished(conversation_id, cx),
+                conversation_id,
+                usage,
+            } => self.on_ai_finished(conversation_id, usage, cx),
             Event::AiError {
                 conversation_id,
                 message,

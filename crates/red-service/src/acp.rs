@@ -139,6 +139,18 @@ impl AcpManager {
         }
     }
 
+    /// Re-authenticate / switch account (M-S4): drop this conversation's agent so
+    /// the next turn re-spawns it and re-runs the ACP handshake. When the agent
+    /// isn't logged in (e.g. the user signed out of Claude Code elsewhere, or the
+    /// subscription token expired) that handshake advertises an auth method and the
+    /// agent pops its own browser login — Red never sees the tokens. A conversation
+    /// that was never started is a no-op (the first turn starts it fresh anyway).
+    pub(crate) fn reauthenticate(&mut self, conversation_id: u64) {
+        if self.conversations.remove(&conversation_id).is_some() {
+            tracing::debug!("re-authenticating ACP conversation {conversation_id} — agent restart");
+        }
+    }
+
     /// Tear down every conversation (window close / service shutdown). Done
     /// explicitly because the permission-relay tasks hold `Arc` clones of the
     /// manager, so letting the outer `Arc` drop would leave a reference cycle
@@ -402,12 +414,16 @@ async fn permission_relay(
     }
 }
 
-/// ACP reports cumulative context/cost, not per-turn input/output. Surface the
-/// context tokens in the footer's input slot; per-turn split + cost land in M-S4.
+/// ACP reports cumulative session figures, not per-turn input/output: the tokens
+/// currently in context and a running cost. Surface the context tokens in the
+/// footer's input slot and pass the cost through (the panel labels it as the
+/// session total). A per-turn input/output split isn't something the agent breaks
+/// out, so the other slots stay zero.
 fn map_usage(usage: &red_acp::AcpUsage) -> AiUsage {
     AiUsage {
         input_tokens: usage.used_tokens,
         output_tokens: 0,
         cache_read_input_tokens: 0,
+        cost_usd: usage.cost_usd,
     }
 }

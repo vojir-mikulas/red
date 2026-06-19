@@ -584,6 +584,15 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 );
             }
 
+            Command::AiReauthenticate { conversation_id } => {
+                // Tear down the conversation's agent (M-S4) so the next turn
+                // re-spawns it and re-runs the ACP handshake — which pops the
+                // agent's own login when it isn't authenticated. Off the loop like
+                // the other ACP calls.
+                let manager = ai_acp.clone();
+                tokio::spawn(async move { manager.lock().await.reauthenticate(conversation_id) });
+            }
+
             Command::TestConnection(config) => {
                 // A throwaway probe: connect, report, and let the driver drop. No
                 // session is created or disturbed — it's session-less (`None`).

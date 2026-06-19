@@ -220,6 +220,14 @@ pub enum Command {
         request_id: u64,
         allow: bool,
     },
+    /// Re-authenticate / switch account on the subscription path (M-S4). The agent
+    /// owns `/login`, so Red can't drive it directly — instead it tears down this
+    /// conversation's agent so the next turn re-spawns it and re-runs the ACP
+    /// handshake, which pops the agent's browser login when it isn't authenticated.
+    /// A no-op on the API-key path. Red never touches the subscription tokens.
+    AiReauthenticate {
+        conversation_id: u64,
+    },
     Shutdown,
 }
 
@@ -480,12 +488,18 @@ pub enum AiDelta {
     ToolFinished { name: String, ok: bool },
 }
 
-/// Token accounting for one assistant turn (the `AiTurnFinished` payload).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Token accounting for one assistant turn (the `AiTurnFinished` payload). The
+/// subscription (ACP) path reports cumulative session figures and, when the agent
+/// provides it, a running `cost_usd`; the API-key path reports per-turn tokens and
+/// no cost. The panel renders whichever fields are non-zero/present.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct AiUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
+    /// Running session cost in USD, when the backend reports it (subscription
+    /// path). `None` on the API-key path, which prices nothing.
+    pub cost_usd: Option<f64>,
 }
 
 /// How the self-updater should behave, carried by `ConfigureUpdates`. Built

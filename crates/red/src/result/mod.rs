@@ -161,6 +161,12 @@ impl ResultGrid {
         self.selection = None;
     }
 
+    /// The error this result failed with, if any — surfaced so the assistant's
+    /// "Explain error" action can ground a turn in the last query failure.
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     /// The `(absolute row, data column)` of the cell under the keyboard cursor —
     /// the selection's focus, mapped through the gutter and clamped to the data
     /// columns. `None` when nothing is selected or the result has no columns. The
