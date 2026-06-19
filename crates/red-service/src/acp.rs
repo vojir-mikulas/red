@@ -16,7 +16,7 @@ use red_core::AiPolicy;
 use red_driver::DatabaseDriver;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::ai::{system_prompt, tool_catalog, user_turn};
+use crate::ai::{system_prompt, tool_catalog, user_turn, ReportSink};
 use crate::dispatch::{emit, Events};
 use crate::mcp::McpServer;
 use crate::protocol::{AiContext, AiDelta, AiUsage};
@@ -330,7 +330,12 @@ async fn ensure_conversation(
         // the access policy (M-S7), then bring the agent up with it attached. The
         // policy is captured for the agent's lifetime; a settings change takes
         // effect on the next agent restart (reconnect / idle teardown / re-auth).
-        let mcp = McpServer::start(driver, policy)
+        // The report sink (Feature C): `generate_report` runs inside the MCP server
+        // here, so it carries the events channel to announce a finished report to the
+        // UI (the subscription path never routes individual tool calls back through
+        // `run_turn`). Built before `events` is moved into the permission relay.
+        let report = ReportSink::new(events.clone(), session, conversation_id);
+        let mcp = McpServer::start(driver, policy, report)
             .await
             .map_err(|e| format!("could not start the DB tool server: {e}"))?;
         let grounding = McpGrounding {

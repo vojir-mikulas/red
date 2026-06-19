@@ -426,6 +426,13 @@ pub enum Event {
         title: String,
         detail: Option<String>,
     },
+    /// A `generate_report` tool produced a standalone HTML report at `path`; the UI
+    /// opens it in the system browser. Scoped to its conversation so the originating
+    /// chat (sidebar or agent tab) could also note it.
+    AiReportReady {
+        conversation_id: u64,
+        path: String,
+    },
     Error(String),
 }
 

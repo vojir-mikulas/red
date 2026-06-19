@@ -1585,6 +1585,10 @@ impl AppState {
                 title,
                 detail,
             } => self.on_ai_permission_request(conversation_id, request_id, title, detail, cx),
+            Event::AiReportReady {
+                conversation_id,
+                path,
+            } => self.on_ai_report_ready(conversation_id, path, cx),
 
             // The streaming `Query`/`FetchMore` path stays in the protocol for
             // headless use + tests; the UI now drives results via `OpenResult`.

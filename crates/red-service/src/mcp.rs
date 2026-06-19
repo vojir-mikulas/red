@@ -32,7 +32,7 @@ use serde_json::{json, Value as Json};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-use crate::ai::{run_tool, tool_catalog};
+use crate::ai::{run_tool, tool_catalog, ReportSink};
 
 /// A running MCP server, one per ACP conversation. Holds the URL + bearer nonce
 /// to put in `session/new.mcp_servers`; aborts its accept loop on `Drop`, so the
@@ -52,6 +52,7 @@ impl McpServer {
     pub(crate) async fn start(
         driver: Arc<dyn DatabaseDriver>,
         policy: AiPolicy,
+        report: ReportSink,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let port = listener.local_addr()?.port();
@@ -74,9 +75,17 @@ impl McpServer {
                 let driver = driver.clone();
                 let token = token_task.clone();
                 let calls = calls.clone();
+                let report = report.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |req| {
-                        handle_request(req, driver.clone(), token.clone(), policy, calls.clone())
+                        handle_request(
+                            req,
+                            driver.clone(),
+                            token.clone(),
+                            policy,
+                            calls.clone(),
+                            report.clone(),
+                        )
                     });
                     // Errors here are per-connection (client hung up) — drop quietly.
                     let _ = http1::Builder::new().serve_connection(io, service).await;
@@ -112,6 +121,7 @@ async fn handle_request(
     token: String,
     policy: AiPolicy,
     calls: Arc<AtomicUsize>,
+    report: ReportSink,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     // JSON-RPC rides POST. We don't push, so a GET SSE stream is unsupported.
     if req.method() != Method::POST {
@@ -138,7 +148,7 @@ async fn handle_request(
         return Ok(empty(StatusCode::ACCEPTED));
     };
 
-    let envelope = match dispatch(method, &params, &driver, policy, &calls).await {
+    let envelope = match dispatch(method, &params, &driver, policy, &calls, &report).await {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
         Err((code, message)) => rpc_error(id, code, &message),
     };
@@ -153,6 +163,7 @@ async fn dispatch(
     driver: &Arc<dyn DatabaseDriver>,
     policy: AiPolicy,
     calls: &AtomicUsize,
+    report: &ReportSink,
 ) -> Result<Json, (i64, String)> {
     match method {
         // Echo the client's protocol version; we only need the `tools` capability.
@@ -206,7 +217,8 @@ async fn dispatch(
                 .unwrap_or_else(|| json!({}));
             // A fresh cancel token: the agent owns turn cancellation over ACP; a
             // single tool call is short and runs to completion here.
-            let (content, ok) = run_tool(driver, name, &args, &policy, &CancelToken::new()).await;
+            let (content, ok) =
+                run_tool(driver, name, &args, &policy, &CancelToken::new(), report).await;
             Ok(json!({
                 "content": [ { "type": "text", "text": content } ],
                 "isError": !ok,
@@ -268,7 +280,9 @@ mod tests {
             .unwrap();
         }
         let driver: Arc<dyn DatabaseDriver> = Arc::new(SqliteDriver::new(path, true));
-        let server = McpServer::start(driver, policy).await.unwrap();
+        let server = McpServer::start(driver, policy, ReportSink::disabled())
+            .await
+            .unwrap();
         (server, reqwest::Client::new())
     }
 
@@ -292,7 +306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_exposes_the_four_readonly_tools() {
+    async fn tools_list_exposes_the_readonly_tools() {
         let (server, client) = fixture().await;
         let reply = call(
             &server,
@@ -308,7 +322,13 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["list_schema", "describe_table", "run_select", "explain"]
+            [
+                "list_schema",
+                "describe_table",
+                "run_select",
+                "explain",
+                "generate_report"
+            ]
         );
     }
 

@@ -156,7 +156,7 @@ impl AiTier {
             AiTier::Schema => matches!(tool, "list_schema" | "describe_table"),
             AiTier::Read => matches!(
                 tool,
-                "list_schema" | "describe_table" | "run_select" | "explain"
+                "list_schema" | "describe_table" | "run_select" | "explain" | "generate_report"
             ),
         }
     }

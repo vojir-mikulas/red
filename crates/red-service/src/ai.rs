@@ -11,19 +11,68 @@
 //! mutate anything.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use red_ai::{
     AiProvider, CancelToken, ContentBlock, Message, Role, StopReason, ToolDef, TurnRequest,
 };
-use red_core::{AiPolicy, RedError, Value};
+use red_core::{AiPolicy, ExportFormat, RedError, Value};
 use red_driver::{AbortSignal, DatabaseDriver, PageCap};
 use serde_json::{json, Value as Json};
 
 use crate::dispatch::{emit, Events};
 use crate::protocol::{AiContext, AiDelta, AiUsage};
 use crate::{Event, SessionId};
+
+/// Where a `generate_report` tool's output file is delivered so the UI can open it
+/// (Feature C, agent-initiated reports). The tool layer stays UI-agnostic — it just
+/// announces "I wrote a report to `<path>`"; the caller turns that into the
+/// `AiReportReady` event the UI handles. Both backends construct one from the
+/// `events`/`session`/`conversation_id` they hold; a `disabled()` sink (no channel)
+/// drops the announcement and is used by tests.
+#[derive(Clone)]
+pub(crate) struct ReportSink {
+    events: Option<Events>,
+    session: Option<SessionId>,
+    conversation_id: u64,
+}
+
+impl ReportSink {
+    pub(crate) fn new(events: Events, session: Option<SessionId>, conversation_id: u64) -> Self {
+        Self {
+            events: Some(events),
+            session,
+            conversation_id,
+        }
+    }
+
+    /// A no-op sink — drops announcements. For tests and any path with no UI.
+    #[cfg(test)]
+    pub(crate) fn disabled() -> Self {
+        Self {
+            events: None,
+            session: None,
+            conversation_id: 0,
+        }
+    }
+
+    /// Announce a freshly-written report so the UI opens it.
+    fn announce(&self, path: &Path) {
+        if let Some(events) = &self.events {
+            emit(
+                events,
+                self.session,
+                Event::AiReportReady {
+                    conversation_id: self.conversation_id,
+                    path: path.display().to_string(),
+                },
+            );
+        }
+    }
+}
 
 /// Safety backstop on the model → tool → model loop: how many tool round-trips a
 /// single turn may take before we stop and report. Far above any real grounded
@@ -96,6 +145,8 @@ pub(crate) async fn run_turn(
     // The tier decides which tools the model is even offered (M-S7): `off` grounds
     // nothing, `schema` withholds row data, `read` is the full catalog.
     let tools = tool_catalog(&policy);
+    // Where `generate_report` delivers its file so the UI opens it (Feature C).
+    let report = ReportSink::new(events.clone(), session, conversation_id);
 
     // Seed the conversation with the grounded user message and pull the running
     // history so a follow-up keeps prior context.
@@ -195,7 +246,7 @@ pub(crate) async fn run_turn(
                     delta: AiDelta::ToolStarted { name: name.clone() },
                 },
             );
-            let (content, ok) = run_tool(&driver, name, input, &policy, &cancel).await;
+            let (content, ok) = run_tool(&driver, name, input, &policy, &cancel, &report).await;
             emit(
                 &events,
                 session,
@@ -317,6 +368,25 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
                 "additionalProperties": false,
             }),
         },
+        ToolDef {
+            name: "generate_report".into(),
+            description: format!(
+                "Render a read-only SELECT (or WITH ... SELECT) to a themed, standalone HTML \
+                report and open it in the user's browser. Use this when the user asks for a \
+                report or a shareable view of some data. The result is capped at {max_rows} rows \
+                (like run_select) — write a focused query (aggregate / top-N / explicit columns). \
+                Returns once the file is written and opened."
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "sql": { "type": "string", "description": "A single read-only SELECT/WITH query." },
+                    "title": { "type": "string", "description": "Optional human title for the report." },
+                },
+                "required": ["sql"],
+                "additionalProperties": false,
+            }),
+        },
     ];
     all.into_iter()
         .filter(|t| policy.tier.allows_tool(&t.name))
@@ -339,6 +409,7 @@ pub(crate) async fn run_tool(
     input: &Json,
     policy: &AiPolicy,
     _cancel: &CancelToken,
+    report: &ReportSink,
 ) -> (String, bool) {
     // Defense in depth: refuse a tool the tier doesn't expose, even if the model
     // somehow asks for it by name.
@@ -412,6 +483,68 @@ pub(crate) async fn run_tool(
             match driver.explain(sql, false).await {
                 Ok(plan) => (format_plan(&plan), true),
                 Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "generate_report" => {
+            let sql = input.get("sql").and_then(Json::as_str).unwrap_or("").trim();
+            if !is_read_only_select(sql) {
+                return (
+                    "error: generate_report needs a single read-only SELECT or WITH...SELECT query"
+                        .into(),
+                    false,
+                );
+            }
+            // Cap the report like run_select: wrap as a subquery with the row ceiling
+            // (the paging wrap shape) so a report can't stream unbounded rows to disk.
+            let max_rows = limits.max_rows.max(1);
+            let inner = sql.trim_end_matches(';').trim();
+            let capped = format!("SELECT * FROM ({inner}) AS _red LIMIT {max_rows}");
+            let path = std::env::temp_dir()
+                .join(format!("red-report-{}.html", uuid::Uuid::new_v4().simple()));
+            // Time-box the render: a watchdog flips the export's cancel flag after the
+            // statement timeout (the row cap bounds size; this bounds a slow query).
+            let cancel = Arc::new(AtomicBool::new(false));
+            let watchdog = (limits.statement_timeout_ms != 0).then(|| {
+                let c = cancel.clone();
+                let ms = limits.statement_timeout_ms;
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    c.store(true, Ordering::Relaxed);
+                })
+            });
+            // A throwaway progress channel — a one-shot report has no progress UI.
+            let (progress, _rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+            let result = driver
+                .export(&capped, &path, ExportFormat::Html, cancel, progress)
+                .await;
+            if let Some(w) = watchdog {
+                w.abort();
+            }
+            match result {
+                Ok(rows) => {
+                    // Hand the path to the UI so it opens the file in the browser.
+                    report.announce(&path);
+                    let label = input
+                        .get("title")
+                        .and_then(Json::as_str)
+                        .filter(|t| !t.trim().is_empty())
+                        .map(|t| format!(" “{}”", t.trim()))
+                        .unwrap_or_default();
+                    (
+                        format!(
+                            "Generated report{label} with {rows} row(s) and opened it in the \
+                            user's browser."
+                        ),
+                        true,
+                    )
+                }
+                Err(RedError::Interrupted) => (
+                    "error: the report query exceeded the assistant's statement timeout — narrow \
+                    it (aggregate / add WHERE / LIMIT)."
+                        .into(),
+                    false,
+                ),
+                Err(e) => (format!("error: could not generate the report: {e}"), false),
             }
         }
         other => (format!("error: unknown tool `{other}`"), false),
@@ -504,10 +637,11 @@ pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
         }
         AiTier::Read => {
             "You have read-only tools: list_schema, describe_table, run_select (capped SELECTs), \
-             and explain. Use them to ground every answer in the live database rather than \
-             guessing — discover objects with list_schema, inspect structure with describe_table, \
-             and read data with run_select. Prefer small, targeted queries with explicit columns \
-             and LIMIT."
+             explain, and generate_report (render a capped SELECT to an HTML report opened in the \
+             user's browser — use it when the user asks for a report). Use them to ground every \
+             answer in the live database rather than guessing — discover objects with list_schema, \
+             inspect structure with describe_table, and read data with run_select. Prefer small, \
+             targeted queries with explicit columns and LIMIT."
         }
     };
     let mut s = format!(
@@ -705,7 +839,13 @@ mod tests {
         assert_eq!(names(AiTier::Schema), ["list_schema", "describe_table"]);
         assert_eq!(
             names(AiTier::Read),
-            ["list_schema", "describe_table", "run_select", "explain"]
+            [
+                "list_schema",
+                "describe_table",
+                "run_select",
+                "explain",
+                "generate_report"
+            ]
         );
     }
 
@@ -740,13 +880,78 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_the_four_readonly_tools_at_read_tier() {
+    fn catalog_has_the_readonly_tools_at_read_tier() {
         let catalog = tool_catalog(&AiPolicy::default());
         let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(
             names,
-            ["list_schema", "describe_table", "run_select", "explain"]
+            [
+                "list_schema",
+                "describe_table",
+                "run_select",
+                "explain",
+                "generate_report"
+            ]
         );
+    }
+
+    #[tokio::test]
+    async fn generate_report_writes_an_html_file_and_announces_it() {
+        use futures::StreamExt;
+
+        // A tiny fixture DB.
+        let db = std::env::temp_dir().join(format!("red-gr-{}.db", uuid::Uuid::new_v4().simple()));
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER, name TEXT);
+                 INSERT INTO t VALUES (1, 'alpha'), (2, 'beta');",
+            )
+            .unwrap();
+        }
+        let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let sink = ReportSink::new(tx, None, 7);
+
+        let (content, ok) = run_tool(
+            &driver,
+            "generate_report",
+            &json!({ "sql": "SELECT id, name FROM t ORDER BY id", "title": "Widgets" }),
+            &AiPolicy::default(),
+            &CancelToken::new(),
+            &sink,
+        )
+        .await;
+        assert!(ok, "expected success, got: {content}");
+        assert!(content.contains("Generated report"));
+
+        // The announced path is a real, well-formed HTML file with the data.
+        let (_session, event) = rx.next().await.expect("an AiReportReady event");
+        let Event::AiReportReady {
+            conversation_id,
+            path,
+        } = event
+        else {
+            panic!("expected AiReportReady");
+        };
+        assert_eq!(conversation_id, 7);
+        let html = std::fs::read_to_string(&path).unwrap();
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.contains("alpha") && html.contains("beta"));
+
+        // A non-SELECT is refused, and nothing is announced.
+        let (_content, ok) = run_tool(
+            &driver,
+            "generate_report",
+            &json!({ "sql": "DELETE FROM t" }),
+            &AiPolicy::default(),
+            &CancelToken::new(),
+            &sink,
+        )
+        .await;
+        assert!(!ok);
+        // Nothing announced: the channel is empty but still open (Err), not an item.
+        assert!(rx.try_recv().is_err(), "a refused report must not announce");
     }
 
     #[test]

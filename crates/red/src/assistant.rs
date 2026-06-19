@@ -1402,6 +1402,37 @@ impl AppState {
         }
     }
 
+    /// A `generate_report` tool wrote a standalone HTML report (Feature C): open it
+    /// in the system browser and note it on the owning chat. The file was produced
+    /// service-side; the UI owns the OS hand-off, mirroring export.
+    pub(crate) fn on_ai_report_ready(
+        &mut self,
+        conversation_id: u64,
+        path: String,
+        cx: &mut Context<Self>,
+    ) {
+        match crate::app::open_in_os(std::path::Path::new(&path)) {
+            Ok(()) => {
+                self.with_chat_mut(conversation_id, |chat| {
+                    chat.status = Some("Report opened in your browser.".into());
+                });
+                self.notify(
+                    flint::ToastVariant::Success,
+                    "Opened report in your browser",
+                    cx,
+                );
+            }
+            Err(e) => {
+                self.notify(
+                    flint::ToastVariant::Error,
+                    format!("Report saved to {path}, but couldn't open it: {e}"),
+                    cx,
+                );
+            }
+        }
+        cx.notify();
+    }
+
     /// Answer the active chat's pending tool-permission prompt (its Allow/Deny
     /// buttons). The agent is blocked on this; denying is the safe default if it's
     /// dismissed.
