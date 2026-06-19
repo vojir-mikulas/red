@@ -113,6 +113,34 @@ async fn prompts_the_user_for_an_unknown_tool() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn detects_a_crashed_agent() {
+    let conv = AcpConversation::start(fake_agent_config())
+        .await
+        .expect("agent comes up");
+    assert!(conv.is_alive(), "a freshly started agent is alive");
+
+    // "EXIT" makes the fake agent kill its process mid-turn (a crash). The turn
+    // fails and the handle must report itself dead so the service restarts it.
+    let (sink, mut deltas) = mpsc::unbounded_channel();
+    let done = conv.prompt("please EXIT".to_string(), sink);
+    while deltas.recv().await.is_some() {}
+    let outcome = done.await;
+    assert!(
+        !matches!(outcome, Ok(Ok(_))),
+        "a crashed turn must not report success: {outcome:?}"
+    );
+
+    // The child monitor reports the dead process; the connection task winds down.
+    let dead = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while conv.is_alive() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(dead.is_ok(), "a crashed agent is reported dead");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn denies_an_unknown_tool_when_no_ui_is_wired() {
     // permissions: None → anything not auto-allowed is denied by default.
     let conv = AcpConversation::start(fake_agent_config())

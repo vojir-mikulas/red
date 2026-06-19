@@ -403,6 +403,11 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             },
             _ = sweep.tick() => {
                 evict_idle(&mut sessions, foreground, &events);
+                // Reclaim long-idle subscription agents too (M-S3). Off the loop,
+                // like the other ACP calls, since the manager is behind a tokio
+                // Mutex a slow start may be holding.
+                let manager = ai_acp.clone();
+                tokio::spawn(async move { manager.lock().await.evict_idle() });
                 continue;
             }
             outcome = connect_rx.recv() => {
@@ -427,6 +432,11 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // session) tears down whatever was there first.
                 if let Some(mut old) = sessions.remove(&id) {
                     old.teardown();
+                    // The new driver replaces the old one, so any subscription
+                    // agent bound to the old session must go too (M-S3) — the next
+                    // turn lazily rebinds a fresh agent to the new driver.
+                    let manager = ai_acp.clone();
+                    tokio::spawn(async move { manager.lock().await.evict_session(Some(id)) });
                 }
                 // Dial off the loop so a hung connect doesn't wedge dispatch; the
                 // result comes back over `connect_rx`. Bump the generation so a
@@ -608,6 +618,10 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 if let Some(mut state) = sessions.remove(&id) {
                     state.teardown();
                 }
+                // Tear down any subscription agent grounded in this session — its
+                // MCP server holds a now-dead driver clone (M-S3).
+                let manager = ai_acp.clone();
+                tokio::spawn(async move { manager.lock().await.evict_session(Some(id)) });
                 // Invalidate any in-flight connect for this id so its late outcome
                 // can't resurrect the session the user just closed.
                 if let Some(g) = connect_gen.get_mut(&id) {
@@ -1318,6 +1332,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             Command::Shutdown => break,
         }
     }
+
+    // The window closed or the service is shutting down. Explicitly tear down any
+    // live subscription agents (M-S3): the permission-relay tasks hold `Arc` clones
+    // of the manager, so dropping the loop's own `Arc` alone would leave a
+    // reference cycle and orphan the agent subprocesses. Clearing the map drops
+    // their command channels, which unwinds the cycle and reaps the processes.
+    ai_acp.lock().await.clear();
 }
 
 /// Drop every session that's been idle past [`IDLE_EVICT`] and isn't the

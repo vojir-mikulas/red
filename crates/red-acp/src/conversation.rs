@@ -90,6 +90,15 @@ impl AcpConversation {
     pub fn cancel(&self) {
         let _ = self.cmd_tx.send(Cmd::Cancel);
     }
+
+    /// Whether the connection task is still running. A closed command channel
+    /// means the connection ended — the agent exited or crashed — so the next
+    /// prompt would only ever return [`AcpError::Closed`]. The service checks
+    /// this to drop a dead conversation and start a fresh one instead of
+    /// prompting a corpse.
+    pub fn is_alive(&self) -> bool {
+        !self.cmd_tx.is_closed()
+    }
 }
 
 /// The whole connection lifecycle, run as a spawned task.

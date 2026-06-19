@@ -10,6 +10,8 @@
 //!   `PERMIT`, it first asks the client for tool permission (a `run_select`-named
 //!   tool unless the text also contains `UNKNOWN`) and streams `GRANTED`/`DENIED`
 //!   reflecting the client's decision — so the M-S2 permission path is testable.
+//!   If it contains `EXIT`, it exits non-zero mid-turn (simulating a crash) so the
+//!   client's death detection (M-S3 restart-on-crash) is testable.
 //!
 //! (The MCP tool round-trip is covered separately by `red-service`'s MCP server
 //! tests, so this fixture stays dependency-free — just the ACP SDK.)
@@ -58,6 +60,12 @@ async fn main() -> Result<()> {
                 async move |req: PromptRequest, responder, cx: ConnectionTo<Client>| {
                     let sid = SessionId::new(SESSION);
                     let text = prompt_text(&req);
+                    if text.contains("EXIT") {
+                        // Simulate a crash: bail with a non-zero status mid-turn so
+                        // the client's child monitor reports the connection dead
+                        // (exercises M-S3 restart-on-crash detection).
+                        std::process::exit(1);
+                    }
                     if text.contains("PERMIT") {
                         // The permission path streams its own GRANTED/DENIED chunk
                         // below; skip the default greeting so the test reads cleanly.
