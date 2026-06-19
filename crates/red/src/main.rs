@@ -9,6 +9,7 @@ mod assets;
 mod assistant;
 mod config;
 mod connect;
+mod conversations;
 #[cfg(feature = "dev-stats")]
 mod dev_stats;
 mod editor;

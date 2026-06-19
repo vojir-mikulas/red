@@ -106,6 +106,21 @@ pub(crate) struct AssistantState {
     /// The most recent finished turn's token/cost accounting (M-S4), shown as a
     /// compact footer. `None` until the first turn completes.
     pub(crate) last_usage: Option<red_service::AiUsage>,
+    /// Which backend this chat runs on (`"subscription"`, `"anthropic"`, …), as of
+    /// when it opened — persisted as the conversation's provider binding (M-S5).
+    pub(crate) provider: String,
+    /// The chat's title, derived from its first user message; the saved file's
+    /// display name. `None` until the first turn is sent.
+    pub(crate) title: Option<String>,
+    /// The backing file's stem once this chat has been saved (M-S5), so later turns
+    /// overwrite the same file. `None` for a never-saved chat.
+    pub(crate) file_stem: Option<String>,
+    /// Unix seconds this chat was first saved — kept stable across re-saves.
+    pub(crate) created_unix: Option<u64>,
+    /// A reopened conversation's prior transcript, folded into the *next* turn's
+    /// context so the model resumes where it left off (M-S5). Taken (cleared) when
+    /// that turn is sent; the backend session is fresh, so this seeds it once.
+    pub(crate) pending_seed: Option<String>,
 }
 
 impl AssistantState {
@@ -150,6 +165,11 @@ impl AppState {
                     this.save_ai_key(cx);
                 }
             });
+            let provider = if self.settings.ai.provider.is_empty() {
+                "anthropic".to_string()
+            } else {
+                self.settings.ai.provider.clone()
+            };
             self.assistant = Some(AssistantState {
                 input,
                 key_input,
@@ -163,6 +183,11 @@ impl AppState {
                 error: None,
                 pending_permission: None,
                 last_usage: None,
+                provider,
+                title: None,
+                file_stem: None,
+                created_unix: None,
+                pending_seed: None,
             });
             self.focus_assistant = true;
         }
@@ -215,7 +240,7 @@ impl AppState {
             return;
         }
         let conversation_id = state.conversation_id;
-        let (session, context) = {
+        let (session, mut context) = {
             let Phase::Connected(active) = &self.phase else {
                 return;
             };
@@ -223,6 +248,13 @@ impl AppState {
         };
 
         if let Some(state) = self.assistant.as_mut() {
+            // A reopened chat seeds its prior transcript into this one turn so the
+            // model resumes coherently despite a fresh backend session (M-S5).
+            context.prior_transcript = state.pending_seed.take();
+            // Title the chat from its first user message (used as the saved name).
+            if state.title.is_none() {
+                state.title = Some(derive_title(&message));
+            }
             state.messages.push(ChatMessage {
                 role: ChatRole::User,
                 text: message.clone(),
@@ -264,6 +296,189 @@ impl AppState {
             state.status = Some("Restarting the assistant — sign in if the browser opens.".into());
         }
         cx.notify();
+    }
+
+    // --- conversation history (M-S5) ---------------------------------------
+
+    /// Persist the open chat to its flat file (one JSON per conversation), titled
+    /// from its first user message. Called after each finished turn. A chat with no
+    /// real assistant reply yet (only a pending/aborted user turn) isn't saved —
+    /// there's nothing worth keeping. Best-effort: a write failure is logged, never
+    /// surfaced mid-turn.
+    fn persist_conversation(&mut self) {
+        let Some(state) = self.assistant.as_mut() else {
+            return;
+        };
+        // Need at least one assistant turn with content to be worth saving.
+        let has_answer = state
+            .messages
+            .iter()
+            .any(|m| m.role == ChatRole::Assistant && !m.text.trim().is_empty());
+        if !has_answer {
+            return;
+        }
+        let title = state
+            .title
+            .clone()
+            .unwrap_or_else(|| "Untitled chat".to_string());
+        // Choose a stable file stem the first time, then reuse it so later turns
+        // overwrite in place rather than spawning a new file per turn.
+        let stem = state
+            .file_stem
+            .get_or_insert_with(|| crate::conversations::unique_stem(&title))
+            .clone();
+        let now = crate::conversations::now_unix();
+        let created = *state.created_unix.get_or_insert(now);
+        let conv = crate::conversations::Conversation {
+            title,
+            provider: state.provider.clone(),
+            created_unix: created,
+            updated_unix: now,
+            messages: state
+                .messages
+                .iter()
+                .map(|m| crate::conversations::StoredMessage {
+                    role: match m.role {
+                        ChatRole::User => "user".into(),
+                        ChatRole::Assistant => "assistant".into(),
+                    },
+                    text: m.text.clone(),
+                    thinking: m.thinking.clone(),
+                })
+                .collect(),
+            path: Default::default(),
+            stem: stem.clone(),
+        };
+        if let Err(e) = crate::conversations::save(&stem, &conv) {
+            tracing::warn!("failed to persist conversation: {e}");
+        }
+    }
+
+    /// Start a fresh chat (the panel's New-chat affordance): persist the current one
+    /// first so nothing is lost, then clear the transcript and mint a new
+    /// conversation id so the backend keeps the threads separate.
+    pub(crate) fn new_chat(&mut self, cx: &mut Context<Self>) {
+        self.persist_conversation();
+        let id = self.next_conversation_id;
+        self.next_conversation_id += 1;
+        if let Some(state) = self.assistant.as_mut() {
+            state.messages.clear();
+            state.conversation_id = id;
+            state.title = None;
+            state.file_stem = None;
+            state.created_unix = None;
+            state.pending_seed = None;
+            state.error = None;
+            state.status = None;
+            state.last_usage = None;
+            state.pending_permission = None;
+            state.streaming = false;
+            state.input.update(cx, |i, cx| i.set_content("", cx));
+        }
+        self.focus_assistant = true;
+        cx.notify();
+    }
+
+    /// Reopen a saved conversation into the panel (history-picker activation). The
+    /// visible transcript comes back as-is; a fresh conversation id + the prior
+    /// transcript folded into the next turn (`pending_seed`) means the backend
+    /// starts a clean session that's still grounded in what was said before.
+    pub(crate) fn restore_conversation(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(conv) = self.loaded_conversations.get(index).cloned() else {
+            return;
+        };
+        // Persist whatever's open before replacing it.
+        self.persist_conversation();
+        let id = self.next_conversation_id;
+        self.next_conversation_id += 1;
+        let seed = render_transcript(&conv.messages);
+        if let Some(state) = self.assistant.as_mut() {
+            state.messages = conv
+                .messages
+                .iter()
+                .map(|m| ChatMessage {
+                    role: if m.role == "assistant" {
+                        ChatRole::Assistant
+                    } else {
+                        ChatRole::User
+                    },
+                    text: m.text.clone(),
+                    thinking: m.thinking.clone(),
+                })
+                .collect();
+            state.conversation_id = id;
+            state.title = Some(conv.title.clone());
+            state.provider = conv.provider.clone();
+            state.file_stem = Some(conv.stem.clone());
+            state.created_unix = Some(conv.created_unix);
+            state.pending_seed = seed;
+            state.error = None;
+            state.status = None;
+            state.last_usage = None;
+            state.pending_permission = None;
+            state.streaming = false;
+        }
+        self.focus_assistant = true;
+        cx.notify();
+    }
+
+    /// Delete the open chat's saved file (the panel's Delete action) and start a
+    /// fresh one. A never-saved chat just resets. The file is also user-deletable by
+    /// hand — the next history open simply won't list it.
+    pub(crate) fn delete_current_conversation(&mut self, cx: &mut Context<Self>) {
+        let stem = self.assistant.as_ref().and_then(|s| s.file_stem.clone());
+        if let Some(stem) = stem {
+            if let Some(dir) = crate::conversations::conversations_dir() {
+                let path = dir.join(format!("{stem}.json"));
+                if let Err(e) = crate::conversations::delete(&path) {
+                    tracing::warn!("failed to delete conversation: {e}");
+                }
+            }
+        }
+        // Reset without re-saving the just-deleted chat.
+        let id = self.next_conversation_id;
+        self.next_conversation_id += 1;
+        if let Some(state) = self.assistant.as_mut() {
+            state.messages.clear();
+            state.conversation_id = id;
+            state.title = None;
+            state.file_stem = None;
+            state.created_unix = None;
+            state.pending_seed = None;
+            state.error = None;
+            state.status = None;
+            state.last_usage = None;
+            state.pending_permission = None;
+            state.streaming = false;
+            state.input.update(cx, |i, cx| i.set_content("", cx));
+        }
+        cx.notify();
+    }
+
+    /// Reveal the conversations directory in the OS file manager (the "Open
+    /// conversation storage" affordance). Files there are plain JSON — readable,
+    /// hand-editable, deletable. Mirrors the saved-queries / settings reveal.
+    pub(crate) fn reveal_conversation_storage(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = crate::conversations::conversations_dir() else {
+            self.notify(
+                flint::ToastVariant::Error,
+                "No config directory available on this platform.",
+                cx,
+            );
+            return;
+        };
+        // Create it so the reveal lands somewhere even before the first save.
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!("failed to create conversations directory: {e}");
+        }
+        self.reveal_path(&dir, cx);
+    }
+
+    /// Whether the open chat has been saved (gates the Delete affordance).
+    pub(crate) fn assistant_has_saved_chat(&self) -> bool {
+        self.assistant
+            .as_ref()
+            .is_some_and(|s| s.file_stem.is_some())
     }
 
     /// Save the API key from the setup view to the OS keyring and (re)configure
@@ -364,6 +579,7 @@ impl AppState {
         usage: red_service::AiUsage,
         cx: &mut Context<Self>,
     ) {
+        let mut finished = false;
         if let Some(state) = self.assistant.as_mut() {
             if state.conversation_id == conversation_id {
                 state.streaming = false;
@@ -374,8 +590,13 @@ impl AppState {
                 if usage != red_service::AiUsage::default() {
                     state.last_usage = Some(usage);
                 }
-                cx.notify();
+                finished = true;
             }
+        }
+        if finished {
+            // Persist the now-complete exchange so it survives a restart (M-S5).
+            self.persist_conversation();
+            cx.notify();
         }
     }
 
@@ -460,6 +681,8 @@ impl AppState {
             editor_sql,
             last_error,
             selection: None,
+            // Set per-turn by `send_turn` only on the first turn after a restore.
+            prior_transcript: None,
             connection: format!(
                 "{} database \"{}\"",
                 active.config.kind, active.config.database
@@ -515,11 +738,46 @@ impl AppState {
                 ))
                 .on_click(cx.listener(|this, _, _, cx| this.reauthenticate_assistant(cx)))
         });
+        // History affordances (M-S5), shown only in the chat view (not setup):
+        // reopen a past chat, start a fresh one, and delete the current saved chat.
+        let icon_btn = |id: &'static str, glyph: &'static str, tip: &'static str| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(20.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .tooltip(flint::Tooltip::text(tip))
+                .hover(|s| s.bg(theme.bg_elevated))
+                .child(crate::icons::icon(
+                    glyph,
+                    theme.scale(13.),
+                    theme.text_muted,
+                ))
+        };
+        let history = self.ai_configured.then(|| {
+            icon_btn("assistant-history", "clock", "Conversation history")
+                .on_click(cx.listener(|this, _, _, cx| this.open_conversation_picker(cx)))
+        });
+        let new_chat = self.ai_configured.then(|| {
+            icon_btn("assistant-new-chat", "plus", "New chat")
+                .on_click(cx.listener(|this, _, _, cx| this.new_chat(cx)))
+        });
+        let delete = (self.ai_configured && self.assistant_has_saved_chat()).then(|| {
+            icon_btn("assistant-delete", "trash", "Delete this conversation")
+                .on_click(cx.listener(|this, _, _, cx| this.delete_current_conversation(cx)))
+        });
+
         let header_actions = div()
             .flex()
             .items_center()
             .gap_1()
             .when_some(reauth, |row, r| row.child(r))
+            .when_some(history, |row, h| row.child(h))
+            .when_some(new_chat, |row, n| row.child(n))
+            .when_some(delete, |row, d| row.child(d))
             .child(close);
 
         let header = div()
@@ -1037,6 +1295,73 @@ fn compact_count(n: u64) -> String {
     }
 }
 
+/// Cap on a derived chat title's length (characters), so a long first message
+/// makes a sensible name rather than a wall of text in the picker.
+const TITLE_CAP: usize = 60;
+
+/// Cap on the prior-transcript digest folded back into a reopened chat's first
+/// turn (M-S5), so resuming a long conversation doesn't blow the context window.
+/// Keeps the most recent turns (the tail), which is what a follow-up references.
+const SEED_CAP: usize = 6_000;
+
+/// A one-line title from a chat's first user message: the first non-empty line,
+/// whitespace-collapsed and capped. Used as the saved file's display name.
+fn derive_title(message: &str) -> String {
+    let line = message
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > TITLE_CAP {
+        let truncated: String = collapsed.chars().take(TITLE_CAP).collect();
+        format!("{}…", truncated.trim_end())
+    } else if collapsed.is_empty() {
+        "Untitled chat".to_string()
+    } else {
+        collapsed
+    }
+}
+
+/// Render a saved transcript as a compact `You:` / `Assistant:` digest to seed a
+/// reopened chat's next turn (M-S5). Returns `None` for an empty transcript. The
+/// digest is capped to its tail ([`SEED_CAP`]) — the recent turns a follow-up
+/// actually depends on — so resuming a long chat stays within budget.
+fn render_transcript(messages: &[crate::conversations::StoredMessage]) -> Option<String> {
+    let mut out = String::new();
+    for m in messages {
+        let text = m.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let who = if m.role == "assistant" {
+            "Assistant"
+        } else {
+            "You"
+        };
+        out.push_str(who);
+        out.push_str(": ");
+        out.push_str(text);
+        out.push_str("\n\n");
+    }
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Keep the tail if it's over budget, on a turn-ish boundary where possible.
+    if trimmed.len() > SEED_CAP {
+        // Step the start forward to a UTF-8 char boundary so slicing can't panic.
+        let mut start = trimmed.len() - SEED_CAP;
+        while start < trimmed.len() && !trimmed.is_char_boundary(start) {
+            start += 1;
+        }
+        let slice = &trimmed[start..];
+        let cut = slice.find("\n\n").map(|i| i + 2).unwrap_or(0);
+        return Some(format!("…(earlier turns omitted)\n\n{}", &slice[cut..]));
+    }
+    Some(trimmed.to_string())
+}
+
 /// A cheap stable-ish element key for a bubble (its text length + a prefix hash).
 /// Bubbles are rendered in order and the panel rebuilds each frame, so this only
 /// needs to be unique among the currently-shown bubbles.
@@ -1104,6 +1429,51 @@ mod tests {
         assert_eq!(compact_count(999), "999");
         assert_eq!(compact_count(1_200), "1.2k");
         assert_eq!(compact_count(2_000_000), "2.0M");
+    }
+
+    #[test]
+    fn title_is_first_line_collapsed_and_capped() {
+        assert_eq!(derive_title("How many users?"), "How many users?");
+        // Leading blank lines skipped; whitespace collapsed.
+        assert_eq!(
+            derive_title("\n\n  list   the  tables \n"),
+            "list the tables"
+        );
+        // Over-long titles are truncated with an ellipsis.
+        let long = "a ".repeat(80);
+        let title = derive_title(&long);
+        assert!(title.ends_with('…'));
+        assert!(title.chars().count() <= TITLE_CAP + 1);
+        // Empty input has a sensible fallback.
+        assert_eq!(derive_title("   \n  "), "Untitled chat");
+    }
+
+    #[test]
+    fn transcript_digest_renders_roles_and_skips_empties() {
+        let msgs = vec![
+            crate::conversations::StoredMessage {
+                role: "user".into(),
+                text: "hi".into(),
+                thinking: String::new(),
+            },
+            crate::conversations::StoredMessage {
+                role: "assistant".into(),
+                text: "hello".into(),
+                thinking: "ignored".into(),
+            },
+            crate::conversations::StoredMessage {
+                role: "assistant".into(),
+                text: "   ".into(),
+                thinking: String::new(),
+            },
+        ];
+        let seed = render_transcript(&msgs).expect("non-empty");
+        assert!(seed.contains("You: hi"));
+        assert!(seed.contains("Assistant: hello"));
+        // Empty-text turns are skipped; thinking isn't seeded.
+        assert!(!seed.contains("ignored"));
+        // An all-empty transcript yields nothing to seed.
+        assert!(render_transcript(&[]).is_none());
     }
 
     #[test]

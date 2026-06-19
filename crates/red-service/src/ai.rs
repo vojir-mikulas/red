@@ -393,6 +393,17 @@ pub(crate) fn system_prompt(ctx: &AiContext) -> String {
 /// with the ACP path for the same per-turn grounding.
 pub(crate) fn user_turn(message: &str, ctx: &AiContext) -> String {
     let mut s = String::new();
+    // A reopened conversation (M-S5) seeds the prior exchange once, so the model
+    // picks up where the saved chat left off even though its session is fresh.
+    if let Some(prior) = ctx
+        .prior_transcript
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        s.push_str("Earlier in this conversation (for context):\n");
+        s.push_str(prior.trim());
+        s.push_str("\n\n---\n\n");
+    }
     if let Some(sql) = ctx.editor_sql.as_deref().filter(|s| !s.trim().is_empty()) {
         s.push_str("Current editor SQL:\n```sql\n");
         s.push_str(sql.trim());
@@ -534,6 +545,23 @@ mod tests {
         assert!(!is_read_only_select("DELETE FROM t"));
         assert!(!is_read_only_select("select 1; drop table t"));
         assert!(!is_read_only_select(""));
+    }
+
+    #[test]
+    fn user_turn_folds_prior_transcript_once() {
+        let ctx = AiContext {
+            prior_transcript: Some("You: hi\n\nAssistant: hello".into()),
+            ..Default::default()
+        };
+        let turn = user_turn("and now?", &ctx);
+        assert!(turn.contains("Earlier in this conversation"));
+        assert!(turn.contains("Assistant: hello"));
+        // The actual message still comes last.
+        assert!(turn.trim_end().ends_with("and now?"));
+        // No prior transcript → no preamble.
+        let plain = user_turn("hi", &AiContext::default());
+        assert!(!plain.contains("Earlier in this conversation"));
+        assert_eq!(plain, "hi");
     }
 
     #[test]

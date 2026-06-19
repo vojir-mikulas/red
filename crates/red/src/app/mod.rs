@@ -699,6 +699,9 @@ pub struct AppState {
     /// The saved queries shown by the open picker, held only while it's open so an
     /// activation can resolve its index. Loaded on demand — never at startup.
     pub(crate) saved_queries: Vec<crate::queries::SavedQuery>,
+    /// The saved conversations shown by the open history picker (M-S5), held only
+    /// while it's open so an activation can resolve its index. Loaded on demand.
+    pub(crate) loaded_conversations: Vec<crate::conversations::Conversation>,
     /// The connection switcher (⌘P): an always-mounted topbar trigger that opens a
     /// searchable, sectioned popover of the active + recent connections. Its
     /// sections are rebuilt from `connections` + `phase` via [`Self::rebuild_switcher`].
@@ -1228,6 +1231,7 @@ impl AppState {
             palette_cmds: Vec::new(),
             palette_prompt: PromptKind::GoToRow,
             saved_queries: Vec::new(),
+            loaded_conversations: Vec::new(),
             switcher,
             parked: HashMap::new(),
             foreground_session: None,

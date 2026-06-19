@@ -468,6 +468,12 @@ pub struct AiContext {
     pub last_error: Option<String>,
     /// A textual snapshot of the selected rows, if any.
     pub selection: Option<String>,
+    /// A rendered digest of an earlier, persisted conversation (M-S5), set only on
+    /// the first turn after a saved chat is reopened. The backend starts a fresh
+    /// session (the agent/history isn't restored), so this folds the prior exchange
+    /// back into the prompt as context — the conversation continues coherently
+    /// across app restarts on both the API-key and subscription paths.
+    pub prior_transcript: Option<String>,
     /// `kind` + database name, for the system prompt's grounding line.
     pub connection: String,
     /// Whether this connection forbids writes — folded into the prompt so the
