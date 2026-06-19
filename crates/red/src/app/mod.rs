@@ -174,6 +174,37 @@ pub(crate) struct FormState {
     /// empty form isn't pre-littered with errors.
     pub submitted: bool,
     pub test: TestState,
+    /// Tunnel the connection through an SSH jump host. Off by default; only
+    /// offered for network engines (a file engine has no host to reach).
+    pub ssh_enabled: bool,
+    /// Which SSH auth method the form has selected. The key path and the secrets
+    /// live in the shared SSH inputs; this only tracks the choice.
+    pub ssh_auth: SshAuthMode,
+}
+
+/// The SSH authentication method picked in the form. Mirrors `red_core::SshAuth`
+/// but carries no data — the key path / secrets live in the form's inputs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SshAuthMode {
+    Agent,
+    Password,
+    Key,
+}
+
+impl SshAuthMode {
+    /// Every mode, in the order the form's picker lists them.
+    pub(crate) const fn all() -> &'static [SshAuthMode] {
+        &[SshAuthMode::Agent, SshAuthMode::Password, SshAuthMode::Key]
+    }
+
+    /// The picker label for this mode.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            SshAuthMode::Agent => "Agent",
+            SshAuthMode::Password => "Password",
+            SshAuthMode::Key => "Key",
+        }
+    }
 }
 
 /// Which connection-form field a validation message belongs to, so it can render
@@ -183,6 +214,9 @@ pub(crate) enum FormField {
     Name,
     Host,
     Database,
+    SshHost,
+    SshUser,
+    SshKeyPath,
 }
 
 /// A write awaiting the confirm modal (Track B5 generalized the destructive-confirm
@@ -461,6 +495,14 @@ pub struct AppState {
     pub(crate) password_input: Entity<TextInput>,
     pub(crate) database_input: Entity<TextInput>,
     pub(crate) conn_str_input: Entity<TextInput>,
+    /// SSH-tunnel fields, shown when the form's `ssh_enabled` is on (network
+    /// engines only). The two secret inputs are obscured.
+    pub(crate) ssh_host_input: Entity<TextInput>,
+    pub(crate) ssh_port_input: Entity<TextInput>,
+    pub(crate) ssh_user_input: Entity<TextInput>,
+    pub(crate) ssh_key_path_input: Entity<TextInput>,
+    pub(crate) ssh_password_input: Entity<TextInput>,
+    pub(crate) ssh_passphrase_input: Entity<TextInput>,
     /// Numeric steppers for the two font sizes in the Appearance panel. Stateful
     /// (they own an editable field), so the panel renders these rather than
     /// rebuilding them per frame; `Change` writes straight through to settings.
@@ -764,6 +806,17 @@ impl AppState {
         let conn_str_input =
             cx.new(|cx| TextInput::new(cx).with_placeholder("postgres://user:pass@host:5432/db"));
 
+        let ssh_host_input =
+            cx.new(|cx| TextInput::new(cx).with_placeholder("bastion.example.com"));
+        let ssh_port_input = cx.new(|cx| TextInput::new(cx).with_placeholder("22"));
+        let ssh_user_input = cx.new(|cx| TextInput::new(cx).with_placeholder("ubuntu"));
+        let ssh_key_path_input =
+            cx.new(|cx| TextInput::new(cx).with_placeholder("~/.ssh/id_ed25519"));
+        // SSH secrets are obscured — unlike the DB password they're not echoed in
+        // the connection-string mirror, so masking them costs nothing.
+        let ssh_password_input = cx.new(|cx| TextInput::new(cx).obscured());
+        let ssh_passphrase_input = cx.new(|cx| TextInput::new(cx).obscured());
+
         // Live two-way sync: editing any structured field rebuilds the connection
         // string, and editing the string parses it back into the fields. Only user
         // edits emit `Change`; the programmatic `set_content` used by the sync does
@@ -989,6 +1042,12 @@ impl AppState {
             password_input,
             database_input,
             conn_str_input,
+            ssh_host_input,
+            ssh_port_input,
+            ssh_user_input,
+            ssh_key_path_input,
+            ssh_password_input,
+            ssh_passphrase_input,
             ui_font_size_input,
             editor_font_size_input,
             form: None,

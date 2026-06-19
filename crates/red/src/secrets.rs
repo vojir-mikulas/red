@@ -111,31 +111,34 @@ pub fn delete_password(id: &str) -> Result<()> {
     remove(id)
 }
 
-// The SSH secret accessors below land with the persistence layer but aren't
-// called until the tunnel + form phases wire them; allow until then.
-
 /// Fetch a connection's stored SSH password (password-auth mode), or `None`.
-#[allow(dead_code)]
 pub fn get_ssh_password(id: &str) -> Result<Option<String>> {
     read(&ssh_password_account(id))
 }
 
 /// Store (or replace) a connection's SSH password.
-#[allow(dead_code)]
 pub fn set_ssh_password(id: &str, secret: &str) -> Result<()> {
     write(&ssh_password_account(id), secret)
 }
 
+/// Remove a connection's SSH password. Idempotent.
+pub fn delete_ssh_password(id: &str) -> Result<()> {
+    remove(&ssh_password_account(id))
+}
+
 /// Fetch a connection's stored SSH key passphrase, or `None`.
-#[allow(dead_code)]
 pub fn get_ssh_passphrase(id: &str) -> Result<Option<String>> {
     read(&ssh_passphrase_account(id))
 }
 
 /// Store (or replace) a connection's SSH key passphrase.
-#[allow(dead_code)]
 pub fn set_ssh_passphrase(id: &str, secret: &str) -> Result<()> {
     write(&ssh_passphrase_account(id), secret)
+}
+
+/// Remove a connection's SSH key passphrase. Idempotent.
+pub fn delete_ssh_passphrase(id: &str) -> Result<()> {
+    remove(&ssh_passphrase_account(id))
 }
 
 /// Remove every secret filed under a connection id — DB password plus both SSH

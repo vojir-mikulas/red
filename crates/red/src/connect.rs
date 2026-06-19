@@ -11,7 +11,7 @@ use gpui::{
 };
 use red_core::DbKind;
 
-use crate::app::{AppState, ConnectSortField, FormField, FormState, TestState};
+use crate::app::{AppState, ConnectSortField, FormField, FormState, SshAuthMode, TestState};
 
 /// The six label colors a connection can be tagged with, mapped onto semantic
 /// theme tokens so they track the active theme. A connection stores the index.
@@ -653,9 +653,15 @@ impl AppState {
             })
             .child(
                 div()
+                    // Stateful id + capped height: the form scrolls within the
+                    // modal when the SSH section is expanded on a short window,
+                    // keeping the footer buttons reachable.
+                    .id("connection-form-body")
                     .flex()
                     .flex_col()
                     .gap_3()
+                    .max_h(px(540.))
+                    .overflow_y_scroll()
                     .child(
                         labeled_field("Name", theme)
                             .child(self.name_input.clone())
@@ -667,9 +673,156 @@ impl AppState {
                     )
                     .children(conn_str_field)
                     .child(self.render_connection_fields(form, is_file, &errors, theme))
+                    .children(self.render_ssh_section(form, is_file, &errors, theme, cx))
                     .child(self.render_label_access_row(form, theme, cx))
                     .children(self.render_form_status(form, cx)),
             )
+    }
+
+    /// The SSH-tunnel section: a toggle to enable it and, when on, the jump-host
+    /// fields and auth inputs. `None` for file engines (no host to tunnel to).
+    fn render_ssh_section(
+        &self,
+        form: &FormState,
+        is_file: bool,
+        errors: &[(FormField, &'static str)],
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if is_file {
+            return None;
+        }
+
+        let toggle = div().flex().items_center().gap_2().child(
+            Toggle::new("ssh-enabled", form.ssh_enabled)
+                .label("Tunnel via SSH")
+                .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                    this.set_form_ssh_enabled(*checked, cx)
+                })),
+        );
+
+        if !form.ssh_enabled {
+            return Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(toggle)
+                    .into_any_element(),
+            );
+        }
+
+        // Host + Port, top-aligned so a Host error doesn't stretch the Port input.
+        let host_row = div()
+            .flex()
+            .items_start()
+            .gap_3()
+            .child(
+                labeled_field("SSH host", theme)
+                    .flex_1()
+                    .child(self.ssh_host_input.clone())
+                    .children(field_error_line(
+                        theme,
+                        field_err(errors, FormField::SshHost),
+                    )),
+            )
+            .child(
+                labeled_field("SSH port", theme)
+                    .w(px(88.))
+                    .flex_none()
+                    .child(self.ssh_port_input.clone()),
+            );
+
+        let user_row = labeled_field("SSH user", theme)
+            .child(self.ssh_user_input.clone())
+            .children(field_error_line(
+                theme,
+                field_err(errors, FormField::SshUser),
+            ));
+
+        let auth_row = labeled_field("Authentication", theme).child(self.render_ssh_auth_picker(
+            form.ssh_auth,
+            theme,
+            cx,
+        ));
+
+        // Only the inputs the chosen auth mode needs. Agent needs none.
+        let secret_row = match form.ssh_auth {
+            SshAuthMode::Agent => None,
+            SshAuthMode::Password => Some(
+                labeled_field("SSH password", theme)
+                    .child(self.ssh_password_input.clone())
+                    .into_any_element(),
+            ),
+            SshAuthMode::Key => Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        labeled_field("Private key file", theme)
+                            .child(self.ssh_key_path_input.clone())
+                            .children(field_error_line(
+                                theme,
+                                field_err(errors, FormField::SshKeyPath),
+                            )),
+                    )
+                    .child(
+                        labeled_field("Key passphrase (optional)", theme)
+                            .child(self.ssh_passphrase_input.clone()),
+                    )
+                    .into_any_element(),
+            ),
+        };
+
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(toggle)
+                .child(host_row)
+                .child(user_row)
+                .child(auth_row)
+                .children(secret_row)
+                .into_any_element(),
+        )
+    }
+
+    /// The SSH auth-mode segmented control (Agent / Password / Key), mirroring the
+    /// engine picker's look.
+    fn render_ssh_auth_picker(
+        &self,
+        selected: SshAuthMode,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let cells = SshAuthMode::all().iter().map(|&mode| {
+            let on = mode == selected;
+            let (bg, border, text) = if on {
+                (theme.accent_ghost, theme.accent, theme.text)
+            } else {
+                (theme.bg_input, theme.border_soft, theme.text_muted)
+            };
+            div()
+                .id(SharedString::from(format!("ssh-auth-{}", mode.label())))
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(32.))
+                .rounded(theme.radius)
+                .bg(bg)
+                .border_1()
+                .border_color(border)
+                .text_size(theme.scale(12.))
+                .text_color(text)
+                .cursor_pointer()
+                .hover(|s| s.text_color(theme.text))
+                .child(mode.label())
+                .on_click(cx.listener(move |this, _, _, cx| this.set_form_ssh_auth(mode, cx)))
+        });
+        div().flex().gap_1p5().children(cells)
     }
 
     /// The per-engine connection fields: a file path, or host/port/database/
