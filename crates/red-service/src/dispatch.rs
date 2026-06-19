@@ -381,12 +381,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
         tx
     };
 
-    // The AI assistant provider (built from `ConfigureAi`; `None` until a key is
-    // configured), the resolved model, and the thinking-display flag. A turn runs
-    // as a spawned task off this loop (like exports), sharing `ai_state` for its
-    // conversation history and cancel registry.
+    // The AI assistant's shared config (built from `ConfigureAi`): the API-key
+    // provider (`None` until a key is configured), the agent launch command, the
+    // resolved model, and the thinking-display flag. These are the resources both
+    // backends draw on; *which* backend a turn uses is decided per-turn by
+    // `AiTurn.provider` (M-S6), so several conversations on different backends run
+    // concurrently. A turn runs as a spawned task off this loop (like exports),
+    // sharing `ai_state` for its conversation history and cancel registry.
     let mut ai_provider: Option<Arc<dyn red_ai::AiProvider>> = None;
-    let mut ai_kind = crate::protocol::AiProviderKind::ApiKey;
     let mut ai_agent_command = String::new();
     let mut ai_model: String = red_ai::MODEL_OPUS.to_string();
     let mut ai_show_thinking = false;
@@ -470,7 +472,6 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::ConfigureAi(cfg) => {
-                ai_kind = cfg.provider;
                 ai_agent_command = cfg.agent_command;
                 ai_model = if cfg.model.is_empty() {
                     red_ai::MODEL_OPUS.to_string()
@@ -491,6 +492,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
 
             Command::AiTurn {
                 conversation_id,
+                provider,
                 message,
                 context,
             } => {
@@ -510,7 +512,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
 
-                match ai_kind {
+                match provider {
                     crate::protocol::AiProviderKind::ApiKey => {
                         let Some(provider) = ai_provider.clone() else {
                             emit(

@@ -141,6 +141,7 @@ impl AppState {
         // path is "ready" only once a key is present.
         self.ai_configured =
             ai.provider == red_service::AiProviderKind::Subscription || !ai.api_key.is_empty();
+        self.ai_api_key_available = !ai.api_key.is_empty();
         self.service.send_global(Command::ConfigureAi(ai));
         self.apply_theme(cx);
         cx.notify();

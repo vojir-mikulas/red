@@ -561,9 +561,14 @@ pub struct AppState {
     /// restores it. Resizable via the shell split.
     pub(crate) assistant_w: Pixels,
     pub(crate) assistant_drag: Option<DragAnchor>,
-    /// Whether an AI provider API key is configured (keyring or env). Drives the
-    /// panel's setup-vs-chat view. Recomputed at launch and on settings reload.
+    /// Whether the assistant is usable at all (a key is configured, or the default
+    /// provider is the subscription, which needs none). Drives the panel's
+    /// setup-vs-chat view. Recomputed at launch and on settings reload.
     pub(crate) ai_configured: bool,
+    /// Whether an Anthropic API key is available (keyring or env), independent of
+    /// the default provider. Gates offering an API-key chat alongside a
+    /// subscription one (mixed providers, M-S6). Recomputed with `ai_configured`.
+    pub(crate) ai_api_key_available: bool,
     /// Monotonic id source for assistant conversations, so the backend keeps each
     /// panel's turn history separate.
     pub(crate) next_conversation_id: u64,
@@ -799,21 +804,21 @@ pub(crate) fn ai_config(settings: &Settings) -> red_service::AiConfig {
         settings.ai.provider.clone()
     };
     // `subscription` drives Claude Code over ACP (no key); anything else is the
-    // API-key path. The key is only read for the latter.
+    // API-key path. `kind` is only the *default* for new chats now — turns carry
+    // their own provider (M-S6), so a chat can be on either backend regardless.
     let kind = if provider.eq_ignore_ascii_case("subscription") {
         red_service::AiProviderKind::Subscription
     } else {
         red_service::AiProviderKind::ApiKey
     };
-    let api_key = if kind == red_service::AiProviderKind::ApiKey {
-        crate::secrets::get_ai_key(&provider)
-            .ok()
-            .flatten()
-            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
+    // Always resolve the API key, even when the default is the subscription, so an
+    // API-key chat works alongside a subscription one (mixed providers, M-S6). The
+    // key lives under the canonical `anthropic` provider name (or the env var).
+    let api_key = crate::secrets::get_ai_key("anthropic")
+        .ok()
+        .flatten()
+        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+        .unwrap_or_default();
     red_service::AiConfig {
         provider: kind,
         model: settings.ai.model.clone(),
@@ -1185,6 +1190,7 @@ impl AppState {
                 let cfg = ai_config(&settings);
                 cfg.provider == red_service::AiProviderKind::Subscription || !cfg.api_key.is_empty()
             },
+            ai_api_key_available: !ai_config(&settings).api_key.is_empty(),
             next_conversation_id: 0,
             filter_bar: None,
             cell_menu: None,

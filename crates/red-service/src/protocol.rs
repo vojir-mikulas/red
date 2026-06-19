@@ -202,9 +202,13 @@ pub enum Command {
     /// model → tool → model loop (read-only schema/`SELECT` tools, auto-run and
     /// row-capped) and streams `AiDelta` events, ending with `AiTurnFinished` or
     /// `AiError`. `conversation_id` lets the UI route deltas to the right thread
-    /// and cancel a specific turn.
+    /// and cancel a specific turn. `provider` is the backend *this* conversation
+    /// is bound to (M-S6) — turns carry it so several chats on different backends
+    /// (one API-key, one subscription) can run concurrently, rather than every
+    /// turn following one global provider.
     AiTurn {
         conversation_id: u64,
+        provider: AiProviderKind,
         message: String,
         context: AiContext,
     },
