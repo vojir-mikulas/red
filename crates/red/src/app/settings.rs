@@ -726,6 +726,73 @@ impl AppState {
         cx.notify();
     }
 
+    // --- settings: AI assistant ---
+
+    /// Re-push the full AI config to the backend so a knob change (tier, limits,
+    /// thinking) applies to the next turn for both backends.
+    fn push_ai_config(&mut self) {
+        self.service
+            .send_global(Command::ConfigureAi(crate::app::ai_config(&self.settings)));
+    }
+
+    /// Flip the master switch. Off is a true kill switch (M-S7): persist it, push
+    /// it to the backend (which stops spawning agents/MCP servers), and close any
+    /// open panel so the effect is immediate. Honors per-connection overrides via
+    /// [`Self::ai_enabled`].
+    pub(crate) fn set_ai_enabled(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.ai.enabled = on;
+        self.save_settings();
+        self.push_ai_config();
+        if self.assistant.is_some() && !self.ai_enabled() {
+            self.assistant = None;
+        }
+        cx.notify();
+    }
+
+    /// Set the default database-access tier (`off` / `schema` / `read`). Re-pushed
+    /// so the catalog the model sees changes on the next turn.
+    pub(crate) fn set_ai_tier(&mut self, tier: &str, cx: &mut Context<Self>) {
+        self.settings.ai.tier = tier.to_string();
+        self.save_settings();
+        self.push_ai_config();
+        cx.notify();
+    }
+
+    pub(crate) fn set_ai_max_rows(&mut self, n: usize, cx: &mut Context<Self>) {
+        self.settings.ai.limits.max_rows = n;
+        self.save_settings();
+        self.push_ai_config();
+        cx.notify();
+    }
+
+    pub(crate) fn set_ai_timeout(&mut self, ms: u64, cx: &mut Context<Self>) {
+        self.settings.ai.limits.statement_timeout_ms = ms;
+        self.save_settings();
+        self.push_ai_config();
+        cx.notify();
+    }
+
+    pub(crate) fn set_ai_max_bytes(&mut self, bytes: usize, cx: &mut Context<Self>) {
+        self.settings.ai.limits.max_result_bytes = bytes;
+        self.save_settings();
+        self.push_ai_config();
+        cx.notify();
+    }
+
+    pub(crate) fn set_ai_max_calls(&mut self, n: usize, cx: &mut Context<Self>) {
+        self.settings.ai.limits.max_tool_calls = n;
+        self.save_settings();
+        self.push_ai_config();
+        cx.notify();
+    }
+
+    pub(crate) fn set_ai_show_thinking(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.ai.show_thinking = on;
+        self.save_settings();
+        self.push_ai_config();
+        cx.notify();
+    }
+
     /// Toggle background self-updates. Re-arms the backend updater immediately —
     /// turning it on kicks off a check; turning it off parks the timer + network.
     pub(crate) fn set_auto_update(&mut self, on: bool, cx: &mut Context<Self>) {

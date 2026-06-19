@@ -37,16 +37,18 @@ pub(crate) enum SettingsTab {
     Query,
     Keymap,
     Behavior,
+    Ai,
     About,
 }
 
 impl SettingsTab {
-    pub(crate) const ALL: [SettingsTab; 6] = [
+    pub(crate) const ALL: [SettingsTab; 7] = [
         SettingsTab::Appearance,
         SettingsTab::Grid,
         SettingsTab::Query,
         SettingsTab::Keymap,
         SettingsTab::Behavior,
+        SettingsTab::Ai,
         SettingsTab::About,
     ];
 
@@ -57,6 +59,7 @@ impl SettingsTab {
             SettingsTab::Query => "Query",
             SettingsTab::Keymap => "Keymap",
             SettingsTab::Behavior => "Behavior",
+            SettingsTab::Ai => "AI assistant",
             SettingsTab::About => "About",
         }
     }
@@ -289,6 +292,7 @@ fn settings_page(tab: SettingsTab, state: &AppState, cx: &mut Context<AppState>)
         SettingsTab::Query => query_page(state, cx),
         SettingsTab::Keymap => keymap_page(state, cx),
         SettingsTab::Behavior => behavior_page(state, cx),
+        SettingsTab::Ai => ai_page(state, cx),
         SettingsTab::About => about_page(state, cx),
     }
 }
@@ -1081,6 +1085,201 @@ fn behavior_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             restore,
             &theme,
         )),
+        &theme,
+    )
+    .into_any_element()
+}
+
+/// The AI tab: the master kill switch, the database-access tier (how much the
+/// assistant's tools can see), and the resource guards those tools run under.
+/// Everything here writes `[ai]` in `settings.toml` and is re-pushed to the
+/// backend live, so a tier change applies to the next turn and flipping the
+/// switch off removes the sidepanel immediately (see [`AppState::set_ai_enabled`]).
+/// Provider, model, and the agent command stay in the file — the convenience
+/// surface holds the safety knobs, the file holds the plumbing.
+fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
+    let theme = cx.theme().clone();
+    let view = cx.entity();
+    let ai = &state.settings.ai;
+    let enabled = ai.enabled;
+
+    // The master switch. Off is a true kill switch — no panel, no MCP server, no
+    // agent process. Flipping it off also closes any open panel.
+    let switch = Toggle::new("set-ai-enabled", enabled)
+        .on_change(cx.listener(|this, on: &bool, _, cx| this.set_ai_enabled(*on, cx)));
+
+    // Database access tier — the capability boundary. Out-of-tier tools are never
+    // even offered to the model (M-S7), so this is the real "how much can it see".
+    let tier_sel = match red_core::AiTier::parse(&ai.tier) {
+        red_core::AiTier::Off => 0,
+        red_core::AiTier::Schema => 1,
+        red_core::AiTier::Read => 2,
+    };
+    let tier_view = view.clone();
+    let tier = Segmented::new("set-ai-tier")
+        .segment("Off")
+        .segment("Schema")
+        .segment("Read")
+        .selected(tier_sel)
+        .on_select(move |ix, _, cx| {
+            let t = ["off", "schema", "read"][ix.min(2)];
+            tier_view.update(cx, |this, cx| this.set_ai_tier(t, cx));
+        });
+
+    // Resource guards on the `read` tier. Each is a preset segmented; a hand-edited
+    // off-preset value shows no selection (usize::MAX) rather than snapping.
+    const ROW_PRESETS: [usize; 4] = [100, 500, 1000, 5000];
+    let rows_sel = ROW_PRESETS
+        .iter()
+        .position(|&n| n == ai.limits.max_rows)
+        .unwrap_or(usize::MAX);
+    let rows_view = view.clone();
+    let max_rows = Segmented::new("set-ai-max-rows")
+        .segment("100")
+        .segment("500")
+        .segment("1000")
+        .segment("5000")
+        .selected(rows_sel)
+        .on_select(move |ix, _, cx| {
+            let n = ROW_PRESETS[ix.min(ROW_PRESETS.len() - 1)];
+            rows_view.update(cx, |this, cx| this.set_ai_max_rows(n, cx));
+        });
+
+    // Statement timeout, in milliseconds (0 = off).
+    const TIMEOUT_PRESETS: [u64; 4] = [0, 5_000, 15_000, 30_000];
+    let timeout_sel = TIMEOUT_PRESETS
+        .iter()
+        .position(|&n| n == ai.limits.statement_timeout_ms)
+        .unwrap_or(usize::MAX);
+    let timeout_view = view.clone();
+    let timeout = Segmented::new("set-ai-timeout")
+        .segment("Off")
+        .segment("5s")
+        .segment("15s")
+        .segment("30s")
+        .selected(timeout_sel)
+        .on_select(move |ix, _, cx| {
+            let n = TIMEOUT_PRESETS[ix.min(TIMEOUT_PRESETS.len() - 1)];
+            timeout_view.update(cx, |this, cx| this.set_ai_timeout(n, cx));
+        });
+
+    // Result byte cap (0 = off).
+    const BYTE_PRESETS: [usize; 3] = [64 * 1024, 256 * 1024, 1024 * 1024];
+    let bytes_sel = BYTE_PRESETS
+        .iter()
+        .position(|&n| n == ai.limits.max_result_bytes)
+        .unwrap_or(usize::MAX);
+    let bytes_view = view.clone();
+    let max_bytes = Segmented::new("set-ai-max-bytes")
+        .segment("64 KB")
+        .segment("256 KB")
+        .segment("1 MB")
+        .selected(bytes_sel)
+        .on_select(move |ix, _, cx| {
+            let n = BYTE_PRESETS[ix.min(BYTE_PRESETS.len() - 1)];
+            bytes_view.update(cx, |this, cx| this.set_ai_max_bytes(n, cx));
+        });
+
+    // Tool-call budget per conversation (0 = off).
+    const CALL_PRESETS: [usize; 4] = [25, 50, 100, 200];
+    let calls_sel = CALL_PRESETS
+        .iter()
+        .position(|&n| n == ai.limits.max_tool_calls)
+        .unwrap_or(usize::MAX);
+    let calls_view = view.clone();
+    let max_calls = Segmented::new("set-ai-max-calls")
+        .segment("25")
+        .segment("50")
+        .segment("100")
+        .segment("200")
+        .selected(calls_sel)
+        .on_select(move |ix, _, cx| {
+            let n = CALL_PRESETS[ix.min(CALL_PRESETS.len() - 1)];
+            calls_view.update(cx, |this, cx| this.set_ai_max_calls(n, cx));
+        });
+
+    let show_thinking = Toggle::new("set-ai-thinking", ai.show_thinking)
+        .on_change(cx.listener(|this, on: &bool, _, cx| this.set_ai_show_thinking(*on, cx)));
+
+    settings_page_scaffold(
+        "AI assistant",
+        div()
+            .flex()
+            .flex_col()
+            .child(setting_row(
+                "Enable assistant",
+                "The grounded chat sidepanel (⌘L). Off is a true kill switch — it \
+                 removes the panel, runs no agent, and starts no local server.",
+                switch,
+                &theme,
+            ))
+            .child(settings_header("Database access", &theme))
+            .child(setting_row(
+                "Access tier",
+                "How much the assistant's tools can see. Off: no database tools at \
+                 all. Schema: structure only (tables, columns, types — never row \
+                 data). Read: the full read catalog (run capped SELECTs and EXPLAIN). \
+                 A tool above the tier is never offered to the model.",
+                tier,
+                &theme,
+            ))
+            .child(
+                div()
+                    .pt_2()
+                    .pb_1()
+                    .text_size(theme.scale(12.))
+                    .text_color(theme.text_muted)
+                    .child(
+                        "A connection can pin a stricter tier in connections.toml \
+                         (ai_tier / ai_enabled); the assistant always runs at the \
+                         stricter of the two.",
+                    ),
+            )
+            .child(settings_header("Read-tier resource guards", &theme))
+            .child(setting_row(
+                "Max rows per query",
+                "Hard ceiling on rows one tool SELECT returns; a larger LIMIT is \
+                 clamped down to this.",
+                max_rows,
+                &theme,
+            ))
+            .child(setting_row(
+                "Statement timeout",
+                "Abort a single tool query that runs longer than this.",
+                timeout,
+                &theme,
+            ))
+            .child(setting_row(
+                "Result size cap",
+                "Trim a tool result larger than this before it's handed back to the \
+                 model, so a wide row set can't blow up the context.",
+                max_bytes,
+                &theme,
+            ))
+            .child(setting_row(
+                "Tool calls per chat",
+                "Bound a runaway agent loop — the cumulative tool-call budget for one \
+                 conversation.",
+                max_calls,
+                &theme,
+            ))
+            .child(settings_header("Display", &theme))
+            .child(setting_row(
+                "Show thinking",
+                "Surface a summarized “thinking…” affordance while the model reasons.",
+                show_thinking,
+                &theme,
+            ))
+            .child(
+                div()
+                    .pt_4()
+                    .text_size(theme.scale(12.))
+                    .text_color(theme.text_faint)
+                    .child(
+                        "Provider, model, and the subscription agent command live in \
+                         the settings file ([ai] provider / model / agent_command).",
+                    ),
+            ),
         &theme,
     )
     .into_any_element()
