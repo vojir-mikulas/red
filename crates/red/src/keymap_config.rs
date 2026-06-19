@@ -20,15 +20,18 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use anyhow::{Context as _, Result};
+use serde::{Deserialize, Serialize};
 
 /// One context-scoped block of overrides. `context = None` binds a true global
 /// (fires from any focus); otherwise the bindings are scoped to that key-context.
 /// `bindings` maps a keystroke string to an action name (or the reserved
 /// `"unbind"` / `"none"`, which removes the default for that keystroke).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct KeymapBlock {
-    #[serde(default)]
+    // Omit `context` when writing a true global, so a serialized block reads the
+    // same way a hand-written one does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
     /// `BTreeMap` so the order bindings are applied is deterministic (a map can't
     /// hold a duplicate keystroke, so intra-block precedence never matters).
@@ -37,7 +40,7 @@ pub struct KeymapBlock {
 }
 
 /// The file shape: a top-level `keymap` array of blocks.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct KeymapFile {
     #[serde(default)]
     keymap: Vec<KeymapBlock>,
@@ -90,6 +93,42 @@ impl KeymapStore {
             },
         }
     }
+
+    /// Serialize override blocks to the `keymap.toml` text the editor will write.
+    /// An empty override set serializes to an empty file (a reset-to-defaults), not
+    /// a bare `keymap = []`, so the file stays clean. Shared with the save path so
+    /// the watcher can be told the exact bytes about to land (self-write suppress).
+    pub fn serialize(blocks: &[KeymapBlock]) -> Result<String> {
+        if blocks.is_empty() {
+            return Ok(String::new());
+        }
+        let file = KeymapFile {
+            keymap: blocks.to_vec(),
+        };
+        toml::to_string_pretty(&file).context("serializing the keymap")
+    }
+
+    /// Write override blocks atomically — a sibling temp file, flushed, then
+    /// renamed over `keymap.toml` so a crash can't leave a partial file. Mirrors
+    /// [`crate::settings::FileSettingsStore::save`].
+    pub fn save(&self, blocks: &[KeymapBlock]) -> Result<()> {
+        use std::io::Write;
+
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).context("creating the config directory")?;
+        }
+        let serialized = Self::serialize(blocks)?;
+
+        let tmp = self
+            .path
+            .with_extension(format!("toml.tmp.{}", std::process::id()));
+        let mut file = std::fs::File::create(&tmp).context("creating the keymap temp file")?;
+        file.write_all(serialized.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, &self.path).context("renaming the keymap temp file")?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -126,5 +165,34 @@ mod tests {
             file.keymap[1].bindings.get("cmd-x").map(String::as_str),
             Some("unbind")
         );
+    }
+
+    #[test]
+    fn serialize_round_trips_through_load() {
+        let blocks = vec![
+            KeymapBlock {
+                context: None,
+                bindings: [("cmd-shift-k".to_string(), "SwitchConnection".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+            KeymapBlock {
+                context: Some("RedRoot".to_string()),
+                bindings: [
+                    ("cmd-l".to_string(), "ToggleFilter".to_string()),
+                    ("cmd-shift-f".to_string(), "unbind".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        ];
+        let text = KeymapStore::serialize(&blocks).expect("serialize");
+        let parsed: KeymapFile = toml::from_str(&text).expect("re-parse");
+        assert_eq!(parsed.keymap, blocks);
+    }
+
+    #[test]
+    fn empty_blocks_serialize_to_empty_file() {
+        assert_eq!(KeymapStore::serialize(&[]).expect("serialize"), "");
     }
 }

@@ -386,6 +386,11 @@ impl AppState {
 
     pub(crate) fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = false;
+        // Tear down the keymap recorder if a capture was mid-flight — a leaked
+        // keystroke interceptor would otherwise eat every keypress app-wide.
+        self.keymap_recording = None;
+        self.keymap_intercept = None;
+        self.keymap_capture = None;
         // Return focus to the root so the app stays keyboard-driven after closing.
         self.refocus_root = true;
         cx.notify();
@@ -393,6 +398,11 @@ impl AppState {
 
     pub(crate) fn set_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
         self.settings_tab = tab;
+        // Leaving (or re-entering) a tab ends any in-flight keymap capture, so the
+        // recorder's interceptor never outlives the Keymap tab being visible.
+        self.keymap_recording = None;
+        self.keymap_intercept = None;
+        self.keymap_capture = None;
         // Start each category at the top, and drop any stale reveal capture from
         // the tab we're leaving.
         self.settings_scroll.set_offset(gpui::point(px(0.), px(0.)));

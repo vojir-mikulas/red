@@ -14,6 +14,7 @@
 
 mod connect;
 mod form;
+mod keymap_edit;
 mod render;
 mod settings;
 mod switcher;
@@ -494,6 +495,19 @@ impl ActiveConn {
     }
 }
 
+/// A captured-but-not-yet-committed rebind in the Keymap settings tab: the row
+/// being rebound, the chord the recorder caught (canonical `cmd-shift-f` form),
+/// and the row it collides with, if any. Held only between capture and the user's
+/// Confirm / Cancel; cleared on either.
+pub(crate) struct KeymapCapture {
+    /// Index into [`crate::keymap::action_defs`] of the row being rebound.
+    pub(crate) row: usize,
+    /// The captured keystroke, ready to write to `keymap.toml`.
+    pub(crate) chord: String,
+    /// The row this chord already binds in the same context, if it's a conflict.
+    pub(crate) conflict: Option<usize>,
+}
+
 pub struct AppState {
     pub(crate) service: ServiceHandle,
     pub(crate) connections: Vec<StoredConnection>,
@@ -603,6 +617,19 @@ pub struct AppState {
     /// Non-fatal problems from the last keymap load (a bad keystroke, an unknown
     /// action) — shown in the same banner as [`Self::settings_warnings`].
     pub(crate) keymap_warnings: Vec<String>,
+    /// The Keymap tab's search box, filtering the bindable-action list by label or
+    /// keystroke.
+    pub(crate) keymap_search: Entity<TextInput>,
+    /// The row currently capturing a chord (index into [`crate::keymap::action_defs`]),
+    /// while the recorder's keystroke interceptor is live. `None` when not recording.
+    pub(crate) keymap_recording: Option<usize>,
+    /// The live keystroke interceptor for the recorder. Held exactly as long as
+    /// [`Self::keymap_recording`] is `Some`; dropping it (on capture, cancel, tab
+    /// switch, or panel close) ends capture so normal shortcuts resume — a leaked
+    /// interceptor would eat every keystroke app-wide.
+    pub(crate) keymap_intercept: Option<gpui::Subscription>,
+    /// A captured chord awaiting the user's Confirm / Cancel (see [`KeymapCapture`]).
+    pub(crate) keymap_capture: Option<KeymapCapture>,
     /// One-shot guard so the appearance observer + file-watcher install on the
     /// first render (when a `Window` exists) rather than on every frame.
     pub(crate) observers_installed: bool,
@@ -939,6 +966,27 @@ impl AppState {
         )
         .detach();
 
+        // The Keymap settings tab's search box. Bare (the row wraps it) and out of
+        // the Tab ring; a `Change` just re-filters the action list.
+        let keymap_search = cx.new(|cx| {
+            TextInput::new(cx)
+                .bare()
+                .tab_stop(false)
+                .with_placeholder("Search actions or shortcuts…")
+        });
+        cx.subscribe(
+            &keymap_search,
+            |this, _, event: &TextInputEvent, cx| match event {
+                TextInputEvent::Change => cx.notify(),
+                TextInputEvent::Cancel => {
+                    this.keymap_search.update(cx, |i, cx| i.set_content("", cx));
+                    cx.notify();
+                }
+                TextInputEvent::Submit => {}
+            },
+        )
+        .detach();
+
         // The connection switcher (⌘P). Seed its sections off the just-loaded
         // connections; `rebuild_switcher` refreshes them on every connect/disconnect.
         let switcher = cx.new(|cx| {
@@ -1090,6 +1138,10 @@ impl AppState {
             keymap_watcher: None,
             connections_watcher: None,
             keymap_warnings,
+            keymap_search,
+            keymap_recording: None,
+            keymap_intercept: None,
+            keymap_capture: None,
             observers_installed: false,
             themes,
             theme_combo_light,

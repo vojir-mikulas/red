@@ -35,15 +35,17 @@ pub(crate) enum SettingsTab {
     Appearance,
     Grid,
     Query,
+    Keymap,
     Behavior,
     About,
 }
 
 impl SettingsTab {
-    pub(crate) const ALL: [SettingsTab; 5] = [
+    pub(crate) const ALL: [SettingsTab; 6] = [
         SettingsTab::Appearance,
         SettingsTab::Grid,
         SettingsTab::Query,
+        SettingsTab::Keymap,
         SettingsTab::Behavior,
         SettingsTab::About,
     ];
@@ -53,6 +55,7 @@ impl SettingsTab {
             SettingsTab::Appearance => "Appearance",
             SettingsTab::Grid => "Result grid",
             SettingsTab::Query => "Query",
+            SettingsTab::Keymap => "Keymap",
             SettingsTab::Behavior => "Behavior",
             SettingsTab::About => "About",
         }
@@ -139,6 +142,14 @@ impl AppState {
             .on_action(|_: &flint::components::modal::FocusNext, window, cx| window.focus_next(cx))
             .on_action(|_: &flint::components::modal::FocusPrev, window, cx| window.focus_prev(cx))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                // While the keymap recorder is live it owns the keyboard (its
+                // interceptor ran first and stopped propagation, but this listener
+                // fires regardless), so stand down — Esc/Enter there cancel/confirm
+                // the capture, not close the panel.
+                if this.keymap_intercept.is_some() {
+                    cx.stop_propagation();
+                    return;
+                }
                 match event.keystroke.key.as_str() {
                     // Esc is one of the two ways out (the other is the Done button).
                     "escape" => {
@@ -276,6 +287,7 @@ fn settings_page(tab: SettingsTab, state: &AppState, cx: &mut Context<AppState>)
         SettingsTab::Appearance => appearance_page(state, cx),
         SettingsTab::Grid => grid_page(state, cx),
         SettingsTab::Query => query_page(state, cx),
+        SettingsTab::Keymap => keymap_page(state, cx),
         SettingsTab::Behavior => behavior_page(state, cx),
         SettingsTab::About => about_page(state, cx),
     }
@@ -710,6 +722,345 @@ fn query_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
         &theme,
     )
     .into_any_element()
+}
+
+/// The Keymap tab: a searchable list of every bindable action with its effective
+/// shortcut, a per-row Rebind (capture the next chord) / Reset, and a Reset-all.
+/// The effective bindings are read fresh from `keymap.toml` each render (see
+/// [`AppState::keymap_slots`]) so a hand-edit and the tab stay in sync.
+fn keymap_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
+    let theme = cx.theme().clone();
+    let defs = crate::keymap::action_defs();
+    let slots = state.keymap_slots();
+    let query = state.keymap_search.read(cx).content().trim().to_lowercase();
+
+    // The search box, styled like the welcome screen's connection filter.
+    let search = div()
+        .flex_1()
+        .flex()
+        .items_center()
+        .gap_2()
+        .h(px(34.))
+        .px_2p5()
+        .rounded(theme.radius)
+        .bg(theme.bg_input)
+        .border_1()
+        .border_color(theme.border)
+        .text_size(theme.scale(13.))
+        .text_color(theme.text)
+        .child(crate::icons::icon(
+            "search",
+            theme.scale(14.),
+            theme.text_faint,
+        ))
+        .child(div().flex_1().min_w_0().child(state.keymap_search.clone()));
+
+    let toolbar = div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .mb_1()
+        .child(search)
+        .child(
+            Button::new("keymap-open-file", "Open keymap file")
+                .variant(ButtonVariant::Secondary)
+                .size(ButtonSize::Sm)
+                .on_click(cx.listener(|this, _, _, cx| this.open_keymap_file(cx))),
+        )
+        .child(
+            Button::new("keymap-reset-all", "Reset all")
+                .variant(ButtonVariant::Ghost)
+                .size(ButtonSize::Sm)
+                .on_click(cx.listener(|this, _, _, cx| this.reset_all_keymap(cx))),
+        );
+
+    let mut list = div().flex().flex_col();
+    let mut shown = 0usize;
+    for (i, d) in defs.iter().enumerate() {
+        let eff = slots[i].as_deref();
+        // Filter by label or effective keystroke.
+        if !query.is_empty() {
+            let hit = d.label.to_lowercase().contains(&query)
+                || eff.is_some_and(|k| k.to_lowercase().contains(&query));
+            if !hit {
+                continue;
+            }
+        }
+        shown += 1;
+        list = list.child(keymap_row(state, i, d, eff, &theme, cx));
+    }
+    if shown == 0 {
+        list = list.child(
+            div()
+                .py_3()
+                .text_size(theme.scale(13.))
+                .text_color(theme.text_faint)
+                .child("No actions match your search."),
+        );
+    }
+
+    settings_page_scaffold(
+        "Keymap",
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .pb_2()
+                    .text_size(theme.scale(12.))
+                    .text_color(theme.text_muted)
+                    .child(
+                        "Rebind captures the next shortcut you press — even one already in use. \
+                         The SQL editor, text-field, and dialog keys stay fixed.",
+                    ),
+            )
+            .child(toolbar)
+            .child(list),
+        &theme,
+    )
+    .into_any_element()
+}
+
+/// One row of the Keymap tab: the action label + context on the left, and on the
+/// right one of three states — the idle chip with Rebind/Reset, the live
+/// "press a shortcut" affordance, or the captured-chord confirm (with a conflict
+/// note when the chord is taken).
+fn keymap_row(
+    state: &AppState,
+    row: usize,
+    def: &crate::keymap::ActionDef,
+    effective: Option<&str>,
+    theme: &Theme,
+    cx: &mut Context<AppState>,
+) -> impl IntoElement {
+    let recording = state.keymap_recording == Some(row);
+    let pending = state.keymap_capture.as_ref().filter(|c| c.row == row);
+    let is_customized = effective != Some(def.keystroke);
+
+    // The right-hand control swaps with the row's state.
+    let control = if recording {
+        recording_affordance(theme, cx).into_any_element()
+    } else if let Some(cap) = pending {
+        capture_confirm(cap, theme, cx).into_any_element()
+    } else {
+        idle_control(row, effective, is_customized, theme, cx).into_any_element()
+    };
+
+    // The context a binding lives in, as a faint sub-label so a user knows where
+    // it fires (globals show nothing — they fire everywhere).
+    let context_note = def.context.map(|c| match c {
+        "RedRoot" => "App",
+        "Table" => "Result grid",
+        other => other,
+    });
+    let mut label = div().flex().flex_col().gap_0p5().min_w_0().child(
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(theme.scale(14.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(SharedString::from(def.label.to_string())),
+            )
+            .when(is_customized && pending.is_none() && !recording, |d| {
+                d.child(
+                    div()
+                        .px_1p5()
+                        .rounded(theme.radius_sm)
+                        .bg(theme.accent.opacity(0.14))
+                        .text_size(theme.scale(10.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.accent)
+                        .child("CUSTOM"),
+                )
+            }),
+    );
+    if let Some(note) = context_note {
+        label = label.child(
+            div()
+                .text_size(theme.scale(12.))
+                .text_color(theme.text_faint)
+                .child(note),
+        );
+    }
+
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_6()
+        .py_2()
+        .border_b_1()
+        .border_color(theme.border_soft)
+        .child(label)
+        .child(div().flex_shrink_0().child(control))
+}
+
+/// The idle right-hand control: the effective-shortcut chip (or "Unset"), a Rebind
+/// button, and a Reset button shown only when the row differs from its default.
+fn idle_control(
+    row: usize,
+    effective: Option<&str>,
+    is_customized: bool,
+    theme: &Theme,
+    cx: &mut Context<AppState>,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(match effective {
+            Some(k) => shortcut_chip(k, theme).into_any_element(),
+            None => div()
+                .text_size(theme.scale(12.))
+                .text_color(theme.text_faint)
+                .child("Unset")
+                .into_any_element(),
+        })
+        .child(
+            Button::new(("keymap-rebind", row), "Rebind")
+                .variant(ButtonVariant::Secondary)
+                .size(ButtonSize::Sm)
+                .on_click(cx.listener(move |this, _, _, cx| this.begin_keymap_record(row, cx))),
+        )
+        .when(is_customized, |d| {
+            d.child(
+                Button::new(("keymap-reset", row), "Reset")
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Sm)
+                    .on_click(cx.listener(move |this, _, _, cx| this.reset_keymap_row(row, cx))),
+            )
+        })
+}
+
+/// The "now recording" affordance: a pulsing prompt to press a shortcut, with a
+/// Cancel that ends capture (Esc does the same from the keyboard).
+fn recording_affordance(theme: &Theme, cx: &mut Context<AppState>) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .px_2p5()
+                .py_1()
+                .rounded(theme.radius_sm)
+                .border_1()
+                .border_color(theme.accent)
+                .bg(theme.accent.opacity(0.1))
+                .text_size(theme.scale(12.))
+                .text_color(theme.accent)
+                .child("Press a shortcut… · Esc to cancel"),
+        )
+        .child(
+            Button::new("keymap-record-cancel", "Cancel")
+                .variant(ButtonVariant::Ghost)
+                .size(ButtonSize::Sm)
+                .on_click(cx.listener(|this, _, _, cx| this.cancel_keymap_record(cx))),
+        )
+}
+
+/// The captured-chord confirmation: the chord chip, a conflict note when the
+/// chord is already bound in the same context, and Confirm / Cancel.
+fn capture_confirm(
+    cap: &crate::app::KeymapCapture,
+    theme: &Theme,
+    cx: &mut Context<AppState>,
+) -> impl IntoElement {
+    let conflict_label = cap
+        .conflict
+        .map(|j| crate::keymap::action_defs()[j].label.to_string());
+
+    let confirm_label = if conflict_label.is_some() {
+        "Rebind anyway"
+    } else {
+        "Confirm"
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .items_end()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(shortcut_chip(&cap.chord, theme))
+                .child(
+                    Button::new("keymap-confirm", confirm_label)
+                        .variant(ButtonVariant::Primary)
+                        .size(ButtonSize::Sm)
+                        .on_click(cx.listener(|this, _, _, cx| this.confirm_keymap_rebind(cx))),
+                )
+                .child(
+                    Button::new("keymap-confirm-cancel", "Cancel")
+                        .variant(ButtonVariant::Ghost)
+                        .size(ButtonSize::Sm)
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_keymap_record(cx))),
+                ),
+        )
+        .children(conflict_label.map(|other| {
+            div()
+                .max_w(px(260.))
+                .text_size(theme.scale(11.))
+                .text_color(theme.yellow)
+                .child(SharedString::from(format!(
+                    "Already bound to “{other}” — rebinding unbinds it."
+                )))
+        }))
+}
+
+/// A small monospace chip rendering a keystroke as macOS glyphs (`cmd-shift-f` →
+/// `⌘⇧F`), matching the app's keyboard-shortcut chrome.
+fn shortcut_chip(keystroke: &str, theme: &Theme) -> impl IntoElement {
+    div()
+        .px_2()
+        .py_0p5()
+        .rounded(theme.radius_sm)
+        .bg(theme.bg_active)
+        .border_1()
+        .border_color(theme.border_soft)
+        .text_size(theme.scale(12.))
+        .text_color(theme.text_muted)
+        .child(SharedString::from(keystroke_glyphs(keystroke)))
+}
+
+/// Render a `keymap.toml` keystroke string as readable glyphs. Space-separated
+/// chords (a sequence) are kept space-separated; within a chord the modifier
+/// glyphs run together (`⌘⇧F`).
+fn keystroke_glyphs(keystroke: &str) -> String {
+    keystroke
+        .split(' ')
+        .map(|chord| {
+            chord
+                .split('-')
+                .map(|part| match part {
+                    "cmd" => "⌘".to_string(),
+                    "shift" => "⇧".to_string(),
+                    "alt" => "⌥".to_string(),
+                    "ctrl" => "⌃".to_string(),
+                    "fn" => "fn".to_string(),
+                    "enter" => "↵".to_string(),
+                    "escape" => "Esc".to_string(),
+                    "backspace" => "⌫".to_string(),
+                    "delete" => "⌦".to_string(),
+                    "tab" => "⇥".to_string(),
+                    "space" => "Space".to_string(),
+                    "up" => "↑".to_string(),
+                    "down" => "↓".to_string(),
+                    "left" => "←".to_string(),
+                    "right" => "→".to_string(),
+                    other => other.to_uppercase(),
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn behavior_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
