@@ -10,11 +10,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use red_acp::{AcpConfig, AcpConversation, AcpDelta, AcpStop, McpGrounding};
+use red_acp::{AcpConfig, AcpConversation, AcpDelta, AcpPermission, AcpStop, McpGrounding};
 use red_driver::DatabaseDriver;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
-use crate::ai::{system_prompt, user_turn};
+use crate::ai::{system_prompt, tool_catalog, user_turn};
 use crate::dispatch::{emit, Events};
 use crate::mcp::McpServer;
 use crate::protocol::{AiContext, AiDelta, AiUsage};
@@ -39,13 +39,44 @@ struct Conversation {
 #[derive(Default)]
 pub(crate) struct AcpManager {
     conversations: HashMap<u64, Conversation>,
+    /// Permission prompts (M-S2) awaiting the user's answer, keyed by request id.
+    /// The relay task parks the agent's decision sink here; `AiPermission` takes
+    /// it back out and fires it. Capped so a runaway agent can't grow it forever.
+    pending: HashMap<u64, oneshot::Sender<bool>>,
+    /// Monotonic id handed to each surfaced permission prompt.
+    next_request_id: u64,
 }
+
+/// Cap on outstanding (un-answered) permission prompts. The UI serializes one
+/// prompt at a time; a higher number means an agent is spamming requests — deny
+/// the overflow rather than let the map grow without bound.
+const MAX_PENDING_PERMISSIONS: usize = 32;
 
 impl AcpManager {
     /// Cancel the in-flight turn for a conversation, if it exists.
     pub(crate) fn cancel(&self, conversation_id: u64) {
         if let Some(c) = self.conversations.get(&conversation_id) {
             c.agent.cancel();
+        }
+    }
+
+    /// Park a permission decision sink and return the request id to surface, or
+    /// `None` (deny by dropping `decide`) when too many are already outstanding.
+    fn park_permission(&mut self, decide: oneshot::Sender<bool>) -> Option<u64> {
+        if self.pending.len() >= MAX_PENDING_PERMISSIONS {
+            return None;
+        }
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        self.pending.insert(id, decide);
+        Some(id)
+    }
+
+    /// Answer a parked permission prompt (the panel's Allow/Deny). A stale id (the
+    /// prompt was already resolved or the agent went away) is a no-op.
+    pub(crate) fn resolve_permission(&mut self, request_id: u64, allow: bool) {
+        if let Some(decide) = self.pending.remove(&request_id) {
+            let _ = decide.send(allow);
         }
     }
 }
@@ -66,21 +97,30 @@ pub(crate) async fn run_turn(
     context: AiContext,
 ) {
     // Ensure the conversation exists, and learn whether this is its first turn.
-    let (agent, first_turn) =
-        match ensure_conversation(&manager, driver, command, cwd, conversation_id).await {
-            Ok(pair) => pair,
-            Err(message) => {
-                emit(
-                    &events,
-                    session,
-                    Event::AiError {
-                        conversation_id,
-                        message,
-                    },
-                );
-                return;
-            }
-        };
+    let (agent, first_turn) = match ensure_conversation(
+        &manager,
+        driver,
+        command,
+        cwd,
+        events.clone(),
+        session,
+        conversation_id,
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(message) => {
+            emit(
+                &events,
+                session,
+                Event::AiError {
+                    conversation_id,
+                    message,
+                },
+            );
+            return;
+        }
+    };
 
     // Fold grounding into the prompt text: the full instruction once (ACP has no
     // system role), then just the volatile per-turn context on follow-ups.
@@ -168,12 +208,14 @@ pub(crate) async fn run_turn(
 /// whether this is its first turn. The first turn flips the stored flag.
 // `map_entry` would have us use the `entry` API, but starting a conversation
 // awaits (MCP server + agent handshake) and the borrow can't be held across it.
-#[allow(clippy::map_entry)]
+#[allow(clippy::map_entry, clippy::too_many_arguments)]
 async fn ensure_conversation(
     manager: &Arc<tokio::sync::Mutex<AcpManager>>,
     driver: Arc<dyn DatabaseDriver>,
     command: String,
     cwd: PathBuf,
+    events: Events,
+    session: Option<SessionId>,
     conversation_id: u64,
 ) -> Result<(AcpConversation, bool), String> {
     let mut guard = manager.lock().await;
@@ -188,10 +230,23 @@ async fn ensure_conversation(
             url: mcp.url().to_string(),
             token: mcp.token().to_string(),
         };
+        // Permission policy (M-S2): auto-allow our read-only DB tools; route
+        // anything else to the user via the relay task below. The agent is also
+        // capability-restricted (no fs/terminal) in `red-acp`.
+        let (perm_tx, perm_rx) = mpsc::unbounded_channel::<AcpPermission>();
+        tokio::spawn(permission_relay(
+            manager.clone(),
+            events,
+            session,
+            conversation_id,
+            perm_rx,
+        ));
         let config = AcpConfig {
             command,
             cwd,
             mcp: Some(grounding),
+            allow_tools: tool_catalog().into_iter().map(|t| t.name).collect(),
+            permissions: Some(perm_tx),
         };
         let agent = AcpConversation::start(config)
             .await
@@ -213,6 +268,41 @@ async fn ensure_conversation(
     let first_turn = entry.first_turn;
     entry.first_turn = false;
     Ok((entry.agent.clone(), first_turn))
+}
+
+/// Relay non-auto-allowed permission requests (M-S2) from one conversation to the
+/// UI: park the agent's decision sink, surface an `AiPermissionRequest`, and let
+/// `Command::AiPermission` answer it. Ends when the conversation is torn down (the
+/// agent drops its sender, closing `perm_rx`).
+async fn permission_relay(
+    manager: Arc<tokio::sync::Mutex<AcpManager>>,
+    events: Events,
+    session: Option<SessionId>,
+    conversation_id: u64,
+    mut perm_rx: mpsc::UnboundedReceiver<AcpPermission>,
+) {
+    while let Some(perm) = perm_rx.recv().await {
+        let AcpPermission {
+            title,
+            detail,
+            decide,
+        } = perm;
+        // Park the decision sink; dropping it on overflow denies the call.
+        let Some(request_id) = manager.lock().await.park_permission(decide) else {
+            tracing::warn!("too many pending AI permission prompts — denying");
+            continue;
+        };
+        emit(
+            &events,
+            session,
+            Event::AiPermissionRequest {
+                conversation_id,
+                request_id,
+                title,
+                detail,
+            },
+        );
+    }
 }
 
 /// ACP reports cumulative context/cost, not per-turn input/output. Surface the

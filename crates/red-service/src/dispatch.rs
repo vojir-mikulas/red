@@ -561,6 +561,19 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 tokio::spawn(async move { manager.lock().await.cancel(conversation_id) });
             }
 
+            Command::AiPermission {
+                conversation_id: _,
+                request_id,
+                allow,
+            } => {
+                // Answer a parked subscription-path permission prompt (M-S2). Off
+                // the loop like cancel, since it locks the (awaitable) ACP manager.
+                let manager = ai_acp.clone();
+                tokio::spawn(
+                    async move { manager.lock().await.resolve_permission(request_id, allow) },
+                );
+            }
+
             Command::TestConnection(config) => {
                 // A throwaway probe: connect, report, and let the driver drop. No
                 // session is created or disturbed — it's session-less (`None`).

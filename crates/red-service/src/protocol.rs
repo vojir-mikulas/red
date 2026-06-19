@@ -212,6 +212,14 @@ pub enum Command {
     AiCancel {
         conversation_id: u64,
     },
+    /// Answer a pending agent tool-permission prompt (M-S2, subscription path).
+    /// `allow` runs the tool; otherwise it's denied. Routed to the parked request
+    /// by `request_id` so a stale answer for a superseded prompt is dropped.
+    AiPermission {
+        conversation_id: u64,
+        request_id: u64,
+        allow: bool,
+    },
     Shutdown,
 }
 
@@ -395,6 +403,16 @@ pub enum Event {
     AiError {
         conversation_id: u64,
         message: String,
+    },
+    /// The subscription agent wants to run a tool Red didn't auto-allow (M-S2):
+    /// the panel shows a confirm prompt and answers with `Command::AiPermission`.
+    /// `title` is what the agent intends to do; `detail` is a compact rendering of
+    /// the tool's input, if any. Scoped to its conversation, shown inline.
+    AiPermissionRequest {
+        conversation_id: u64,
+        request_id: u64,
+        title: String,
+        detail: Option<String>,
     },
     Error(String),
 }

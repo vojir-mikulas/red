@@ -24,6 +24,10 @@ enum Block {
     Code(String),
     Bullets(Vec<String>),
     Numbers(Vec<String>),
+    Table {
+        headers: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
     Rule,
 }
 
@@ -98,6 +102,27 @@ fn parse_blocks(src: &str) -> Vec<Block> {
             continue;
         }
 
+        // GFM table: a row of `|`-separated cells immediately followed by a
+        // delimiter row (`| --- | --- |`). Collect the contiguous body rows.
+        if trimmed.contains('|') && lines.peek().is_some_and(|n| is_delimiter_row(n.trim())) {
+            flush_para(&mut blocks, &mut para);
+            flush_bullets(&mut blocks, &mut bullets);
+            flush_numbers(&mut blocks, &mut numbers);
+            let headers = table_cells(trimmed);
+            lines.next(); // consume the delimiter row
+            let mut rows = Vec::new();
+            while let Some(peeked) = lines.peek() {
+                let lt = peeked.trim();
+                if lt.is_empty() || !lt.contains('|') {
+                    break;
+                }
+                rows.push(table_cells(lt));
+                lines.next();
+            }
+            blocks.push(Block::Table { headers, rows });
+            continue;
+        }
+
         // Bullet list item.
         if let Some(rest) = bullet_item(trimmed) {
             flush_para(&mut blocks, &mut para);
@@ -133,6 +158,35 @@ fn heading(line: &str) -> Option<(u8, String)> {
     } else {
         None
     }
+}
+
+/// A table delimiter row: every `|`-separated cell is dashes (with optional
+/// `:` alignment markers), e.g. `| :--- | ---: |`.
+fn is_delimiter_row(line: &str) -> bool {
+    if !line.contains('-') {
+        return false;
+    }
+    let cells = split_cells(line);
+    !cells.is_empty()
+        && cells.iter().all(|c| {
+            let c = c.trim();
+            !c.is_empty() && c.contains('-') && c.chars().all(|ch| ch == '-' || ch == ':')
+        })
+}
+
+/// Split one table row into trimmed cell strings (outer pipes stripped).
+fn table_cells(line: &str) -> Vec<String> {
+    split_cells(line)
+        .into_iter()
+        .map(|c| c.trim().to_string())
+        .collect()
+}
+
+fn split_cells(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    t.split('|').map(str::to_string).collect()
 }
 
 fn bullet_item(line: &str) -> Option<&str> {
@@ -221,8 +275,41 @@ fn render_block(block: &Block, theme: &Theme) -> AnyElement {
             }
             list.into_any_element()
         }
+        Block::Table { headers, rows } => {
+            let mut table = div()
+                .flex()
+                .flex_col()
+                .rounded(px(5.))
+                .border_1()
+                .border_color(theme.border)
+                .overflow_hidden()
+                .text_size(theme.scale(11.5));
+            table = table.child(table_row(headers, theme, true));
+            for row in rows {
+                table = table.child(table_row(row, theme, false));
+            }
+            table.into_any_element()
+        }
         Block::Rule => div().h(px(1.)).my_1().bg(theme.border).into_any_element(),
     }
+}
+
+/// One table row — equal-width cells, a bottom rule, and a subtle header tint.
+fn table_row(cells: &[String], theme: &Theme, header: bool) -> AnyElement {
+    let mut row = div()
+        .flex()
+        .border_b_1()
+        .border_color(theme.border)
+        .when(header, |r| r.bg(theme.bg_elevated));
+    for cell in cells {
+        let body = if header {
+            inline_bold(cell, theme)
+        } else {
+            inline(cell, theme)
+        };
+        row = row.child(div().flex_1().min_w(px(0.)).px_2().py_1().child(body));
+    }
+    row.into_any_element()
 }
 
 /// Inline span styles we recognise.
@@ -382,5 +469,18 @@ mod tests {
         assert!(matches!(blocks[1], Block::Paragraph(_)));
         assert!(matches!(&blocks[2], Block::Bullets(v) if v.len() == 2));
         assert!(matches!(blocks[3], Block::Code(_)));
+    }
+
+    #[test]
+    fn parses_a_gfm_table() {
+        let md = "| Name | Rows |\n| --- | ---: |\n| widgets | 3 |\n| gadgets | 7 |";
+        let blocks = parse_blocks(md);
+        assert_eq!(blocks.len(), 1);
+        let Block::Table { headers, rows } = &blocks[0] else {
+            panic!("expected a table, got something else");
+        };
+        assert_eq!(headers, &["Name", "Rows"]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec!["widgets".to_string(), "3".to_string()]);
     }
 }

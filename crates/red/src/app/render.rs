@@ -345,7 +345,9 @@ impl Render for AppState {
             // ⌘I toggles the cell detail inspector; Esc closes it (no-op when shut).
             .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| this.toggle_inspector(cx)))
             .on_action(cx.listener(|this, _: &CloseInspector, _, cx| this.close_inspector(cx)))
-            .on_action(cx.listener(|this, _: &ToggleAssistant, _, cx| this.toggle_assistant(cx)))
+            .on_action(cx.listener(|this, _: &ToggleAssistant, window, cx| {
+                this.toggle_assistant(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ToggleFilter, _, cx| this.toggle_filter_bar(cx)))
             // Saved queries (B3): ⇧⌘S opens the name prompt; ⇧⌘O the picker.
             .on_action(cx.listener(|this, _: &SaveQuery, _, cx| this.open_save_prompt(cx)))

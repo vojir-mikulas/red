@@ -162,9 +162,13 @@ impl AppState {
 
         // When collapsed, the schema pane (and its resize split) drop out entirely
         // and the editor/results fill the width; the status-bar toggle brings it
-        // back, restoring the retained `sidebar_w`.
-        let body = if active.sidebar_collapsed {
-            div().flex_1().min_h(px(0.)).child(inner)
+        // back, restoring the retained `sidebar_w`. `workspace` is the bare,
+        // self-sizing (`size_full`) split — the `flex_1` fill wrapper is applied
+        // below, *after* deciding whether the assistant dock wraps it. (Wrapping a
+        // `flex_1` element inside the dock's non-flex pane would collapse it — the
+        // dock pane stretches a `size_full` child but doesn't grow a `flex_1` one.)
+        let workspace = if active.sidebar_collapsed {
+            inner.into_any_element()
         } else {
             let schema_pane = self.render_schema(active, window, cx);
             let start = view.clone();
@@ -207,7 +211,7 @@ impl AppState {
                 })
                 .first(schema_pane)
                 .second(inner);
-            div().flex_1().min_h(px(0.)).child(outer)
+            outer.into_any_element()
         };
 
         // With the assistant open, dock it to the right of the whole workspace via
@@ -249,11 +253,11 @@ impl AppState {
                         })
                         .ok();
                     })
-                    .first(body)
+                    .first(workspace)
                     .second(panel),
             )
         } else {
-            body
+            div().flex_1().min_h(px(0.)).child(workspace)
         };
 
         // --- status bar: endpoint · db · read-only | rows · cols · UTF-8 · SQL ·
@@ -361,7 +365,7 @@ impl AppState {
                     theme.text_muted
                 },
             ))
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_assistant(cx)));
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_assistant(window, cx)));
 
         let statusbar = div()
             .flex_shrink_0()

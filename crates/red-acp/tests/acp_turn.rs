@@ -3,7 +3,7 @@
 //! Asserts the handshake + session come up, a turn streams text and finishes, and
 //! cancel stops an in-flight turn.
 
-use red_acp::{AcpConfig, AcpConversation, AcpDelta, AcpStop};
+use red_acp::{AcpConfig, AcpConversation, AcpDelta, AcpPermission, AcpStop};
 use tokio::sync::mpsc;
 
 /// Point the conversation at the fake-agent binary Cargo built for this test.
@@ -12,7 +12,21 @@ fn fake_agent_config() -> AcpConfig {
         command: env!("CARGO_BIN_EXE_red-acp-fake-agent").to_string(),
         cwd: std::env::temp_dir(),
         mcp: None,
+        // The fake agent titles its permission tool `run_select`; auto-allow it.
+        allow_tools: vec!["run_select".to_string()],
+        permissions: None,
     }
+}
+
+/// Drain the streamed answer text of a turn to completion.
+async fn collect_text(deltas: &mut mpsc::UnboundedReceiver<AcpDelta>) -> String {
+    let mut text = String::new();
+    while let Some(delta) = deltas.recv().await {
+        if let AcpDelta::Text(t) = delta {
+            text.push_str(&t);
+        }
+    }
+    text
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -57,4 +71,58 @@ async fn cancel_stops_an_inflight_turn() {
     while deltas.recv().await.is_some() {}
     let result = done.await.expect("reply").expect("turn ok");
     assert_eq!(result.stop, AcpStop::Cancelled);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_allows_a_known_readonly_tool() {
+    // No permissions sink: an auto-allowed tool must still be granted silently.
+    let conv = AcpConversation::start(fake_agent_config())
+        .await
+        .expect("agent comes up");
+
+    let (sink, mut deltas) = mpsc::unbounded_channel();
+    let done = conv.prompt("PERMIT please".to_string(), sink);
+
+    let text = collect_text(&mut deltas).await;
+    done.await.expect("reply").expect("turn ok");
+    assert_eq!(text, "GRANTED");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prompts_the_user_for_an_unknown_tool() {
+    let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<AcpPermission>();
+    let config = AcpConfig {
+        permissions: Some(perm_tx),
+        ..fake_agent_config()
+    };
+    let conv = AcpConversation::start(config)
+        .await
+        .expect("agent comes up");
+
+    // `UNKNOWN` makes the fake agent request an un-allowlisted tool → user decides.
+    let (sink, mut deltas) = mpsc::unbounded_channel();
+    let done = conv.prompt("PERMIT UNKNOWN".to_string(), sink);
+
+    let perm = perm_rx.recv().await.expect("a permission to surface");
+    assert_eq!(perm.title, "transmogrify");
+    perm.decide.send(true).expect("decision delivered");
+
+    let text = collect_text(&mut deltas).await;
+    done.await.expect("reply").expect("turn ok");
+    assert_eq!(text, "GRANTED");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn denies_an_unknown_tool_when_no_ui_is_wired() {
+    // permissions: None → anything not auto-allowed is denied by default.
+    let conv = AcpConversation::start(fake_agent_config())
+        .await
+        .expect("agent comes up");
+
+    let (sink, mut deltas) = mpsc::unbounded_channel();
+    let done = conv.prompt("PERMIT UNKNOWN".to_string(), sink);
+
+    let text = collect_text(&mut deltas).await;
+    done.await.expect("reply").expect("turn ok");
+    assert_eq!(text, "DENIED");
 }

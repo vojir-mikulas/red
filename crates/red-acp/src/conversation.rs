@@ -15,14 +15,17 @@ use std::sync::{Arc, Mutex};
 use agent_client_protocol::schema::{
     AuthenticateRequest, CancelNotification, ClientCapabilities, ContentBlock,
     FileSystemCapabilities, HttpHeader, Implementation, InitializeRequest, McpServer,
-    McpServerHttp, NewSessionRequest, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome, SessionId,
-    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCallStatus, ToolCallUpdate,
+    McpServerHttp, NewSessionRequest, PermissionOption, PermissionOptionId, PermissionOptionKind,
+    PromptRequest, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
+    SessionUpdate, StopReason, TextContent, ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use agent_client_protocol::{AcpAgent, Agent, ConnectionTo};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::types::{AcpConfig, AcpDelta, AcpError, AcpStop, AcpTurnResult, AcpUsage, McpGrounding};
+use crate::types::{
+    AcpConfig, AcpDelta, AcpError, AcpPermission, AcpStop, AcpTurnResult, AcpUsage, McpGrounding,
+};
 
 /// The active turn's delta sink, swapped in before each prompt and cleared after.
 /// Shared between the connection's notification handler and the turn loop.
@@ -114,6 +117,10 @@ async fn run_connection(
     let ready_closure = ready.clone();
     let cwd = config.cwd.clone();
     let mcp = config.mcp.clone();
+    // Permission policy (M-S2): the auto-allow catalog and the user-decision sink,
+    // shared into the request handler (which the connection may invoke per call).
+    let allow_tools = Arc::new(config.allow_tools.clone());
+    let permissions = config.permissions.clone();
 
     let result = agent_client_protocol::Client
         .builder()
@@ -126,21 +133,16 @@ async fn run_connection(
             },
             agent_client_protocol::on_receive_notification!(),
         )
-        // Permission requests: in M1 only read-only DB MCP tools are exposed and
-        // fs/terminal are disabled, so auto-approve. M-S2 will prompt for anything
-        // that isn't an auto-allowed read-only tool.
+        // Permission requests (M-S2): auto-allow Red's read-only DB tools (the
+        // agent is already capability-restricted to no filesystem/terminal); route
+        // anything else to the user for a decision, defaulting to deny.
         .on_receive_request(
-            async move |request: RequestPermissionRequest, responder, _cx| match request
-                .options
-                .first()
-                .map(|o| o.option_id.clone())
-            {
-                Some(id) => responder.respond(RequestPermissionResponse::new(
-                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)),
-                )),
-                None => responder.respond(RequestPermissionResponse::new(
-                    RequestPermissionOutcome::Cancelled,
-                )),
+            async move |request: RequestPermissionRequest, responder, _cx| {
+                let allow = decide_permission(&request, &allow_tools, &permissions).await;
+                responder.respond(RequestPermissionResponse::new(resolve(
+                    &request.options,
+                    allow,
+                )))
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -325,6 +327,99 @@ fn restricted_capabilities() -> ClientCapabilities {
         .terminal(false)
 }
 
+/// Decide one permission request (M-S2): `true` allows the agent's tool call.
+/// Red's read-only DB tools auto-allow; anything else is forwarded to the user
+/// (via `permissions`) and blocks on their answer, defaulting to deny when no UI
+/// is wired or the sink has gone away.
+async fn decide_permission(
+    request: &RequestPermissionRequest,
+    allow_tools: &[String],
+    permissions: &Option<mpsc::UnboundedSender<AcpPermission>>,
+) -> bool {
+    if is_auto_allowed(&request.tool_call, allow_tools) {
+        return true;
+    }
+    let Some(tx) = permissions else {
+        return false;
+    };
+    let (decide, decided) = oneshot::channel();
+    let perm = AcpPermission {
+        title: tool_title(&request.tool_call),
+        detail: tool_detail(&request.tool_call),
+        decide,
+    };
+    if tx.send(perm).is_err() {
+        return false;
+    }
+    // The UI answers (or the sender is dropped on teardown → deny).
+    decided.await.unwrap_or(false)
+}
+
+/// Whether a tool call is one of Red's known read-only DB tools and so may run
+/// without prompting. A mutating tool kind is never auto-allowed even if its
+/// title matches — the gate for a future write tool stays closed by default.
+fn is_auto_allowed(tool_call: &ToolCallUpdate, allow_tools: &[String]) -> bool {
+    if matches!(
+        tool_call.fields.kind,
+        Some(ToolKind::Edit | ToolKind::Delete | ToolKind::Move | ToolKind::Execute)
+    ) {
+        return false;
+    }
+    let title = tool_title(tool_call).to_ascii_lowercase();
+    allow_tools
+        .iter()
+        .any(|name| title.contains(&name.to_ascii_lowercase()))
+}
+
+/// The agent's human-readable title for a tool call (used for both matching and
+/// the user prompt); falls back to a generic label when absent.
+fn tool_title(tool_call: &ToolCallUpdate) -> String {
+    tool_call
+        .fields
+        .title
+        .clone()
+        .unwrap_or_else(|| "a tool".to_string())
+}
+
+/// A compact one-line rendering of the tool's raw input for the prompt, if any.
+fn tool_detail(tool_call: &ToolCallUpdate) -> Option<String> {
+    tool_call
+        .fields
+        .raw_input
+        .as_ref()
+        .map(|v| v.to_string())
+        .filter(|s| s != "null" && s != "{}")
+}
+
+/// Turn an allow/deny decision into a concrete ACP outcome by picking the
+/// matching option the agent offered. Prefers the "once" variant; denying with no
+/// reject option falls back to `Cancelled`, which the agent treats as a refusal.
+fn resolve(options: &[PermissionOption], allow: bool) -> RequestPermissionOutcome {
+    let (primary, secondary) = if allow {
+        (
+            PermissionOptionKind::AllowOnce,
+            PermissionOptionKind::AllowAlways,
+        )
+    } else {
+        (
+            PermissionOptionKind::RejectOnce,
+            PermissionOptionKind::RejectAlways,
+        )
+    };
+    match pick(options, primary).or_else(|| pick(options, secondary)) {
+        Some(id) => RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id)),
+        None => RequestPermissionOutcome::Cancelled,
+    }
+}
+
+/// The id of the first option of `kind`, if the agent offered one.
+fn pick(options: &[PermissionOption], kind: PermissionOptionKind) -> Option<PermissionOptionId> {
+    options
+        .iter()
+        .find(|o| o.kind == kind)
+        .map(|o| o.option_id.clone())
+}
+
 fn map_stop(stop: StopReason) -> AcpStop {
     match stop {
         StopReason::EndTurn => AcpStop::EndTurn,
@@ -339,5 +434,92 @@ fn map_stop(stop: StopReason) -> AcpStop {
 fn signal(ready: &ReadyCell, result: Result<(), AcpError>) {
     if let Some(tx) = ready.lock().unwrap().take() {
         let _ = tx.send(result);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_client_protocol::schema::{PermissionOption, ToolCallId, ToolCallUpdateFields};
+    use serde_json::json;
+
+    fn call(title: &str, kind: Option<ToolKind>) -> ToolCallUpdate {
+        let mut fields = ToolCallUpdateFields::new().title(title.to_string());
+        fields.kind = kind;
+        ToolCallUpdate::new(ToolCallId::new("call-1"), fields)
+    }
+
+    fn db_tools() -> Vec<String> {
+        ["list_schema", "describe_table", "run_select", "explain"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn auto_allows_known_readonly_tools() {
+        let tools = db_tools();
+        // The agent's MCP title carries the tool name.
+        assert!(is_auto_allowed(
+            &call("run_select", Some(ToolKind::Read)),
+            &tools
+        ));
+        assert!(is_auto_allowed(
+            &call("red-db: describe_table", None),
+            &tools
+        ));
+    }
+
+    #[test]
+    fn prompts_for_unknown_or_mutating_tools() {
+        let tools = db_tools();
+        // Not one of ours → prompt.
+        assert!(!is_auto_allowed(
+            &call("write_file", Some(ToolKind::Edit)),
+            &tools
+        ));
+        // Named like ours but flagged mutating → never silently allowed.
+        assert!(!is_auto_allowed(
+            &call("run_select", Some(ToolKind::Execute)),
+            &tools
+        ));
+    }
+
+    #[test]
+    fn resolve_picks_allow_then_reject_then_cancels() {
+        let opts = vec![
+            PermissionOption::new("ok", "Allow", PermissionOptionKind::AllowOnce),
+            PermissionOption::new("no", "Deny", PermissionOptionKind::RejectOnce),
+        ];
+        match resolve(&opts, true) {
+            RequestPermissionOutcome::Selected(s) => assert_eq!(&*s.option_id.0, "ok"),
+            other => panic!("expected allow, got {other:?}"),
+        }
+        match resolve(&opts, false) {
+            RequestPermissionOutcome::Selected(s) => assert_eq!(&*s.option_id.0, "no"),
+            other => panic!("expected reject, got {other:?}"),
+        }
+        // No reject option offered → deny falls back to Cancelled.
+        let allow_only = vec![PermissionOption::new(
+            "ok",
+            "Allow",
+            PermissionOptionKind::AllowOnce,
+        )];
+        assert!(matches!(
+            resolve(&allow_only, false),
+            RequestPermissionOutcome::Cancelled
+        ));
+    }
+
+    #[test]
+    fn detail_renders_raw_input_but_skips_empties() {
+        let mut fields = ToolCallUpdateFields::new().title("run_select".to_string());
+        fields.raw_input = Some(json!({ "sql": "SELECT 1" }));
+        let detail = tool_detail(&ToolCallUpdate::new(ToolCallId::new("c"), fields)).unwrap();
+        assert!(detail.contains("SELECT 1"));
+
+        let mut empty = ToolCallUpdateFields::new();
+        empty.raw_input = Some(json!({}));
+        assert!(tool_detail(&ToolCallUpdate::new(ToolCallId::new("c"), empty)).is_none());
     }
 }

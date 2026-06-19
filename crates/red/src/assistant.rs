@@ -12,7 +12,7 @@
 
 use flint::prelude::*;
 use flint::{TextInput, TextInputEvent};
-use gpui::{div, prelude::*, px, AnyElement, Context, Entity, ScrollHandle, SharedString};
+use gpui::{div, prelude::*, px, AnyElement, Context, Entity, ScrollHandle, SharedString, Window};
 
 use crate::app::{ActiveConn, AppState, Phase};
 
@@ -34,6 +34,15 @@ pub(crate) struct ChatMessage {
     pub(crate) role: ChatRole,
     pub(crate) text: String,
     pub(crate) thinking: String,
+}
+
+/// A pending agent tool-permission prompt (M-S2, subscription path): the agent
+/// wants to run a tool Red didn't auto-allow. The panel shows Allow/Deny and the
+/// answer routes back as `Command::AiPermission`, keyed by `request_id`.
+pub(crate) struct PendingPermission {
+    pub(crate) request_id: u64,
+    pub(crate) title: SharedString,
+    pub(crate) detail: Option<SharedString>,
 }
 
 /// All the assistant panel's state. Present iff the panel is open.
@@ -59,6 +68,9 @@ pub(crate) struct AssistantState {
     pub(crate) status: Option<SharedString>,
     /// The last turn's error, shown inline (not as a global toast).
     pub(crate) error: Option<SharedString>,
+    /// A tool-permission prompt awaiting the user's Allow/Deny (M-S2). At most one
+    /// is shown at a time; the agent blocks on the answer.
+    pub(crate) pending_permission: Option<PendingPermission>,
 }
 
 impl AssistantState {
@@ -77,12 +89,16 @@ impl AssistantState {
 
 impl AppState {
     /// Open or close the assistant panel (⌘L). Only meaningful while connected.
-    pub(crate) fn toggle_assistant(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_assistant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.phase, Phase::Connected(_)) {
             return;
         }
         if self.assistant.is_some() {
             self.assistant = None;
+            // Closing drops the panel's focused input; hand focus back to the root
+            // so the ⌘L action keeps routing (otherwise focus is lost and the panel
+            // can't be reopened — the action's owner is no longer in the focus path).
+            window.focus(&self.root_focus, cx);
         } else {
             let conversation_id = self.next_conversation_id;
             self.next_conversation_id += 1;
@@ -110,6 +126,7 @@ impl AppState {
                 streaming: false,
                 status: None,
                 error: None,
+                pending_permission: None,
             });
             self.focus_assistant = true;
         }
@@ -117,9 +134,12 @@ impl AppState {
     }
 
     /// Close the assistant panel (no-op when shut).
-    pub(crate) fn close_assistant(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn close_assistant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.assistant.is_some() {
             self.assistant = None;
+            // Return focus to the root so keyboard actions keep routing (see
+            // `toggle_assistant`).
+            window.focus(&self.root_focus, cx);
             cx.notify();
         }
     }
@@ -269,6 +289,7 @@ impl AppState {
             if state.conversation_id == conversation_id {
                 state.streaming = false;
                 state.status = None;
+                state.pending_permission = None;
                 cx.notify();
             }
         }
@@ -285,9 +306,55 @@ impl AppState {
                 state.streaming = false;
                 state.status = None;
                 state.error = Some(message.into());
+                // A prompt can't outlive its turn — drop any unanswered one.
+                state.pending_permission = None;
                 cx.notify();
             }
         }
+    }
+
+    /// The agent asked to run a tool Red didn't auto-allow (M-S2): show the prompt.
+    pub(crate) fn on_ai_permission_request(
+        &mut self,
+        conversation_id: u64,
+        request_id: u64,
+        title: String,
+        detail: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.assistant.as_mut() {
+            if state.conversation_id == conversation_id {
+                state.pending_permission = Some(PendingPermission {
+                    request_id,
+                    title: title.into(),
+                    detail: detail.map(Into::into),
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    /// Answer the pending tool-permission prompt (its Allow/Deny buttons). The
+    /// agent is blocked on this; denying is the safe default if it's dismissed.
+    pub(crate) fn answer_permission(&mut self, allow: bool, cx: &mut Context<Self>) {
+        let Some(state) = self.assistant.as_mut() else {
+            return;
+        };
+        let Some(pending) = state.pending_permission.take() else {
+            return;
+        };
+        let conversation_id = state.conversation_id;
+        if let Phase::Connected(active) = &self.phase {
+            self.service.send_to(
+                active.session,
+                red_service::Command::AiPermission {
+                    conversation_id,
+                    request_id: pending.request_id,
+                    allow,
+                },
+            );
+        }
+        cx.notify();
     }
 
     /// Assemble the on-screen grounding for a turn (the UI knows the screen; the
@@ -335,7 +402,7 @@ impl AppState {
             .cursor_pointer()
             .hover(|s| s.bg(theme.bg_elevated))
             .child(crate::icons::icon("x", theme.scale(13.), theme.text_muted))
-            .on_click(cx.listener(|this, _, _, cx| this.close_assistant(cx)));
+            .on_click(cx.listener(|this, _, window, cx| this.close_assistant(window, cx)));
 
         let header = div()
             .flex_shrink_0()
@@ -524,8 +591,88 @@ impl AppState {
             .border_color(theme.border)
             .child(header)
             .child(body)
+            .when_some(state.pending_permission.as_ref(), |col, pending| {
+                col.child(self.render_permission(pending, &theme, cx))
+            })
             .child(composer)
             .into_any_element()
+    }
+
+    /// The tool-permission prompt (M-S2): what the agent wants to do, plus
+    /// Allow/Deny. Docked above the composer so it's visible regardless of scroll;
+    /// the agent is blocked until the user answers.
+    fn render_permission(
+        &self,
+        pending: &PendingPermission,
+        theme: &flint::Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let button = |id: &'static str, label: &'static str, accent: bool| {
+            let base = div()
+                .id(id)
+                .px_3()
+                .h(px(26.))
+                .flex()
+                .items_center()
+                .rounded(px(6.))
+                .text_size(theme.scale(12.))
+                .cursor_pointer()
+                .child(label);
+            if accent {
+                base.bg(theme.red)
+                    .text_color(theme.bg_app)
+                    .hover(|s| s.opacity(0.9))
+            } else {
+                base.border_1()
+                    .border_color(theme.border)
+                    .text_color(theme.text_muted)
+                    .hover(|s| s.border_color(theme.text).text_color(theme.text))
+            }
+        };
+
+        let mut card = div()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .bg(theme.bg_panel)
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .text_size(theme.scale(12.))
+                    .text_color(theme.text)
+                    .child(crate::icons::icon("lock", theme.scale(13.), theme.red))
+                    .child(format!("Allow the assistant to run {}?", pending.title)),
+            );
+        if let Some(detail) = &pending.detail {
+            card = card.child(
+                div()
+                    .text_size(theme.scale(10.5))
+                    .text_color(theme.text_muted)
+                    .font_family(theme.mono_family.clone())
+                    .child(detail.clone()),
+            );
+        }
+        card.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    button("ai-permission-deny", "Deny", false)
+                        .on_click(cx.listener(|this, _, _, cx| this.answer_permission(false, cx))),
+                )
+                .child(
+                    button("ai-permission-allow", "Allow", true)
+                        .on_click(cx.listener(|this, _, _, cx| this.answer_permission(true, cx))),
+                ),
+        )
+        .into_any_element()
     }
 
     /// One chat bubble.

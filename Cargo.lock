@@ -6238,6 +6238,7 @@ name = "red-acp"
 version = "0.7.0"
 dependencies = [
  "agent-client-protocol",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
