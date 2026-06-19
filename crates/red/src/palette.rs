@@ -77,9 +77,6 @@ pub(crate) enum Cmd {
     AssistantDeleteConversation,
     /// Reveal the conversations directory in the OS file manager (M-S5).
     RevealConversationStorage,
-    /// Reopen the saved conversation at this index into the panel — picker
-    /// activation (M-S5).
-    RestoreConversation(usize),
 }
 
 /// Which free-text prompt the single palette slot is currently serving, so a
@@ -252,11 +249,10 @@ impl AppState {
             Cmd::SubmitChanges => self.submit_changes(cx),
             Cmd::RevertChanges => self.revert_changes(cx),
             Cmd::AddRow => self.add_draft_row(cx),
-            Cmd::AssistantHistory => self.open_conversation_picker(cx),
+            Cmd::AssistantHistory => self.open_history_sidebar(cx),
             Cmd::AssistantNewChat => self.new_chat(cx),
             Cmd::AssistantDeleteConversation => self.delete_current_conversation(cx),
             Cmd::RevealConversationStorage => self.reveal_conversation_storage(cx),
-            Cmd::RestoreConversation(index) => self.restore_conversation(index, cx),
         }
     }
 
@@ -605,54 +601,6 @@ impl AppState {
         if let Some(editor) = editor {
             editor.update(cx, |editor, cx| editor.set_content(query.sql, cx));
         }
-        cx.notify();
-    }
-
-    /// Open the assistant conversation-history picker (M-S5). Loads the saved files
-    /// on demand (so external edits/deletions show up on each open) and opens a
-    /// picker over them; activating one reopens it into the panel. A no-op when the
-    /// panel isn't open; reports when there's no history yet.
-    pub(crate) fn open_conversation_picker(&mut self, cx: &mut Context<Self>) {
-        if self.assistant.is_none() {
-            return;
-        }
-        let conversations = crate::conversations::load();
-        if conversations.is_empty() {
-            self.notify(
-                ToastVariant::Info,
-                "No saved conversations yet — they're kept as you chat.",
-                cx,
-            );
-            return;
-        }
-        let entries: Vec<(PaletteItem, Cmd)> = conversations
-            .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let id = ElementId::from(SharedString::from(format!("conv:{i}")));
-                let mut item = PaletteItem::new(id, c.title.clone());
-                // A compact hint: turn count + provider, so similarly-titled chats
-                // are still tellable apart.
-                let turns = c.messages.iter().filter(|m| m.role == "user").count();
-                item = item.hint(format!("{turns} turns · {}", c.provider));
-                (item, Cmd::RestoreConversation(i))
-            })
-            .collect();
-        self.loaded_conversations = conversations;
-        self.palette_cmds = entries
-            .iter()
-            .map(|(item, cmd)| (item.id.clone(), *cmd))
-            .collect();
-        let items: Vec<PaletteItem> = entries.into_iter().map(|(item, _)| item).collect();
-
-        let palette = cx.new(|cx| {
-            let mut p = Palette::new(cx);
-            p.set_placeholder("Reopen a conversation…", cx);
-            p.set_items(items, cx);
-            p
-        });
-        let sub = cx.subscribe(&palette, Self::on_palette_event);
-        self.palette = Some((palette, sub));
         cx.notify();
     }
 }

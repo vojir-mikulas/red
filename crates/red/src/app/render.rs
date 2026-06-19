@@ -197,6 +197,14 @@ impl Render for AppState {
             }
         }
 
+        // An inline conversation rename just began; focus its edit field.
+        if self.focus_rename {
+            self.focus_rename = false;
+            if let Some(rename) = self.assistant.as_ref().and_then(|p| p.renaming.as_ref()) {
+                window.focus(&rename.input.focus_handle(cx), cx);
+            }
+        }
+
         // An inline cell edit just opened in the inspector (Track B5) — focus its
         // field so the user types the new value immediately.
         if self.focus_inspector_edit {

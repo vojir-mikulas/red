@@ -335,6 +335,9 @@ impl QueryTab {
                     this.pending_focus = Some(Pane::Grid);
                     cx.notify();
                 }
+                // The query editor never sends (it's not a `submit_on_enter`
+                // composer); Enter inserts a line here.
+                CodeEditorEvent::Submit => {}
             },
         )
         .detach();
@@ -557,6 +560,9 @@ pub struct AppState {
     pub(crate) assistant: Option<crate::assistant::AssistantState>,
     /// Set when the assistant panel just opened: the next render focuses its input.
     pub(crate) focus_assistant: bool,
+    /// Set when an inline conversation rename just began: the next render focuses
+    /// its edit field so the user types the new title at once.
+    pub(crate) focus_rename: bool,
     /// Docked width of the assistant panel, retained while it's closed so reopening
     /// restores it. Resizable via the shell split.
     pub(crate) assistant_w: Pixels,
@@ -1194,6 +1200,7 @@ impl AppState {
             inspector: None,
             assistant: None,
             focus_assistant: false,
+            focus_rename: false,
             assistant_w: px(380.),
             assistant_drag: None,
             ai_configured: {

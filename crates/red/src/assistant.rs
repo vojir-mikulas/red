@@ -17,9 +17,14 @@
 //! background chats keep streaming (events route by `conversation_id` to whichever
 //! chat owns them) and a switcher lists them all.
 
+use std::time::Duration;
+
 use flint::prelude::*;
-use flint::{TextInput, TextInputEvent};
-use gpui::{div, prelude::*, px, AnyElement, Context, Entity, ScrollHandle, SharedString, Window};
+use flint::{CodeEditor, CodeEditorEvent, TextInput, TextInputEvent};
+use gpui::{
+    div, prelude::*, px, Animation, AnimationExt, AnyElement, AsyncApp, Context, Entity,
+    ScrollHandle, SharedString, WeakEntity, Window,
+};
 
 use crate::app::{ActiveConn, AppState, Phase};
 
@@ -27,6 +32,16 @@ use crate::app::{ActiveConn, AppState, Phase};
 /// thousands of tables doesn't blow the context window. The model pulls full
 /// detail on demand via `describe_table`, so a names-only overview is enough.
 const SCHEMA_SUMMARY_CAP: usize = 200;
+
+/// Streaming reveal cadence: the assistant's answer types out at this tick rate
+/// (≈40fps), decoupling the on-screen reveal from the uneven network bursts the
+/// model's text actually arrives in — the ChatGPT-style steady stream.
+const REVEAL_TICK: Duration = Duration::from_millis(24);
+/// Reveal speed: each tick uncovers `remaining / DIVISOR` more characters (a
+/// natural ease-out — fast when far behind, slowing as it catches up), but never
+/// fewer than `MIN_STEP`, so a big backlog drains quickly and the tail still moves.
+const REVEAL_DIVISOR: usize = 6;
+const REVEAL_MIN_STEP: usize = 2;
 
 /// Who authored a chat bubble.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -124,6 +139,18 @@ pub(crate) struct ChatSession {
     /// context so the model resumes where it left off (M-S5). Taken (cleared) when
     /// that turn is sent; the backend session is fresh, so this seeds it once.
     pub(crate) pending_seed: Option<String>,
+    /// A never-sent chat's prepared prompt, preserved across switches so the one
+    /// "draft" keeps its text when you leave it and come back. Empty once the chat
+    /// has sent a turn; the composer mirrors it while the draft is active.
+    pub(crate) draft: String,
+    /// Characters of the streaming assistant bubble currently revealed. The model's
+    /// text arrives in uneven network bursts; a steady reveal ticker walks this up
+    /// to the received length so the answer types out smoothly (ChatGPT-style)
+    /// rather than jumping in chunks. Reset at the start of each turn.
+    pub(crate) revealed: usize,
+    /// Whether a reveal ticker is currently scheduled for this chat (so deltas don't
+    /// spawn a second one). See `ensure_reveal_ticker`.
+    pub(crate) revealing: bool,
 }
 
 impl ChatSession {
@@ -143,7 +170,23 @@ impl ChatSession {
             file_stem: None,
             created_unix: None,
             pending_seed: None,
+            draft: String::new(),
+            revealed: 0,
+            revealing: false,
         }
+    }
+
+    /// Char length of the streaming assistant bubble's text (the reveal target).
+    fn streaming_text_chars(&self) -> usize {
+        match self.messages.last() {
+            Some(m) if m.role == ChatRole::Assistant => m.text.chars().count(),
+            _ => 0,
+        }
+    }
+
+    /// Whether this chat has nothing sent yet — the panel's single editable draft.
+    fn is_draft(&self) -> bool {
+        self.messages.is_empty()
     }
 
     /// Whether this chat runs on the Claude subscription (ACP) path.
@@ -188,23 +231,72 @@ impl ChatSession {
     }
 }
 
+/// Which conversation a history-sidebar row refers to — an open chat (by its
+/// stable id) or a saved-but-closed conversation (by its file stem). Used to
+/// target rename/delete without threading indices around.
+#[derive(Clone, PartialEq)]
+pub(crate) enum RowKey {
+    Open(u64),
+    Saved(String),
+}
+
+/// An in-progress inline rename in the history sidebar: which row, and the field
+/// holding the edited title. Enter commits, Esc cancels.
+pub(crate) struct Rename {
+    key: RowKey,
+    pub(crate) input: Entity<TextInput>,
+    #[allow(dead_code)]
+    sub: gpui::Subscription,
+}
+
+/// One flattened row of the merged history sidebar — an open chat (the draft, or a
+/// sent one) or a saved-but-closed conversation. Built fresh each render.
+struct HistoryRow {
+    key: RowKey,
+    /// Index into `chats` for an open row (drives switch); `None` for a saved one.
+    open_index: Option<usize>,
+    /// Index into `loaded_conversations` for a saved row (drives restore).
+    saved_index: Option<usize>,
+    title: String,
+    subtitle: String,
+    subscription: bool,
+    active: bool,
+    attention: bool,
+    /// The single editable draft — no rename/delete affordances; named live.
+    draft: bool,
+}
+
+/// Whether a saved conversation's recorded provider is the subscription path.
+fn provider_is_subscription(provider: &str) -> bool {
+    provider.eq_ignore_ascii_case("subscription")
+}
+
 /// All the assistant panel's state. Present iff the panel is open.
 pub(crate) struct AssistantState {
-    /// The prompt box. Submitting it (Enter) sends a turn on the active chat.
-    pub(crate) input: Entity<TextInput>,
+    /// The prompt box — a multiline composer. Enter sends a turn on the active
+    /// chat; Shift+Enter inserts a newline (see Flint `CodeEditor::submit_on_enter`).
+    pub(crate) input: Entity<CodeEditor>,
     /// The API-key box, shown in the setup view when no key is configured.
     pub(crate) key_input: Entity<TextInput>,
+    /// The history sidebar's search box; filters the merged list by title.
+    pub(crate) list_search: Entity<TextInput>,
     /// Submit listeners (prompt + key); held here so closing the panel drops them.
     #[allow(dead_code)]
     sub: gpui::Subscription,
     #[allow(dead_code)]
     key_sub: gpui::Subscription,
+    /// Re-renders the sidebar as the search query changes.
+    #[allow(dead_code)]
+    search_sub: gpui::Subscription,
     /// The open conversations (M-S6). Never empty while the panel is open.
     pub(crate) chats: Vec<ChatSession>,
     /// Index of the active chat in `chats` — the one the composer/transcript show.
     pub(crate) active: usize,
-    /// Whether the chat-list switcher is shown instead of the active transcript.
+    /// Whether the history sidebar (open chats + saved conversations) is shown in
+    /// place of the active transcript.
     pub(crate) show_list: bool,
+    /// An in-progress inline title rename, if any.
+    pub(crate) renaming: Option<Rename>,
 }
 
 impl AssistantState {
@@ -257,12 +349,19 @@ impl AppState {
         } else {
             let conversation_id = self.next_conversation_id;
             self.next_conversation_id += 1;
-            let input =
-                cx.new(|cx| TextInput::new(cx).with_placeholder("Ask about this database…"));
-            let sub = cx.subscribe(&input, |this, _, e: &TextInputEvent, cx| {
-                if matches!(e, TextInputEvent::Submit) {
-                    this.submit_assistant(cx);
-                }
+            // A multiline composer: no gutter, Enter sends, Shift+Enter newlines.
+            let input = cx.new(|cx| {
+                CodeEditor::new(cx)
+                    .gutter(false)
+                    .submit_on_enter(true)
+                    .a11y_label("Assistant prompt")
+                    .placeholder("Ask about this database…")
+            });
+            let sub = cx.subscribe(&input, |this, _, e: &CodeEditorEvent, cx| match e {
+                // Enter (or ⌘↵) sends; Esc stops an in-flight turn from the keyboard
+                // (a no-op when nothing is streaming).
+                CodeEditorEvent::Submit | CodeEditorEvent::Run => this.submit_assistant(cx),
+                CodeEditorEvent::Escape => this.cancel_assistant(cx),
             });
             let key_input = cx.new(|cx| TextInput::new(cx).obscured().with_placeholder("sk-ant-…"));
             let key_sub = cx.subscribe(&key_input, |this, _, e: &TextInputEvent, cx| {
@@ -270,15 +369,34 @@ impl AppState {
                     this.save_ai_key(cx);
                 }
             });
+            let list_search = cx.new(|cx| {
+                TextInput::new(cx)
+                    .bare()
+                    .tab_stop(false)
+                    .with_placeholder("Search conversations…")
+            });
+            // A Change on the search box re-renders the filtered list.
+            let search_sub = cx.subscribe(&list_search, |this, _, e: &TextInputEvent, cx| {
+                if matches!(e, TextInputEvent::Change) {
+                    if let Some(state) = this.assistant.as_ref() {
+                        if state.show_list {
+                            cx.notify();
+                        }
+                    }
+                }
+            });
             let provider = self.default_ai_provider();
             self.assistant = Some(AssistantState {
                 input,
                 key_input,
+                list_search,
                 sub,
                 key_sub,
+                search_sub,
                 chats: vec![ChatSession::new(conversation_id, provider)],
                 active: 0,
                 show_list: false,
+                renaming: None,
             });
             self.focus_assistant = true;
         }
@@ -367,6 +485,10 @@ impl AppState {
             chat.error = None;
             chat.status = None;
             chat.streaming = true;
+            // Fresh turn: the next assistant bubble reveals from the start.
+            chat.revealed = 0;
+            // It's no longer a draft — drop any preserved prompt text.
+            chat.draft.clear();
         }
 
         self.service.send_to(
@@ -406,48 +528,118 @@ impl AppState {
 
     // --- conversation history (M-S5) ---------------------------------------
 
-    /// Start a fresh chat on the panel's default provider, switching to it. The
-    /// previously-open chats stay open (M-S6) — they're listed in the switcher and
-    /// keep streaming. Each chat persists itself when its turns finish, so nothing
-    /// is lost by leaving them.
+    /// Save the active chat's composer text into it, but only while it's the one
+    /// editable draft (nothing sent yet). This is what lets the draft keep its
+    /// prepared prompt when you switch away and come back, and what makes a cleared
+    /// composer drop the draft out of the history list. A no-op for a sent chat.
+    fn stash_active_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.assistant.as_mut() else {
+            return;
+        };
+        let i = state.active.min(state.chats.len() - 1);
+        if state.chats[i].is_draft() {
+            let text = state.input.read(cx).content();
+            state.chats[i].draft = text;
+        }
+    }
+
+    /// Load the composer with `text` (a chat's preserved draft, empty for a sent
+    /// chat) and put the caret ready to type.
+    fn load_composer(&mut self, text: String, cx: &mut Context<Self>) {
+        if let Some(state) = self.assistant.as_ref() {
+            state.input.update(cx, |i, cx| i.set_content(text, cx));
+        }
+    }
+
+    /// Go to the panel's single draft — the one chat with nothing sent yet (the
+    /// "prepared prompt"). Reuses the existing empty chat if there is one rather
+    /// than spawning duplicates, so "new chat" always lands on the same draft.
     pub(crate) fn new_chat(&mut self, cx: &mut Context<Self>) {
         let provider = self.default_ai_provider();
         self.new_chat_with(provider, cx);
     }
 
-    /// Start a fresh chat bound to `provider`, switching to it. The entry point for
-    /// the switcher's per-provider new-chat buttons — this is how a second chat on
-    /// a *different* backend is opened (mixed providers, M-S6).
+    /// Go to the draft, binding it to `provider` if a fresh one is created. If a
+    /// draft already exists its provider is left as-is (change it via the empty
+    /// chat's provider picker); this just avoids piling up empty chats.
     pub(crate) fn new_chat_with(&mut self, provider: String, cx: &mut Context<Self>) {
+        self.stash_active_draft(cx);
         let id = self.next_conversation_id;
-        self.next_conversation_id += 1;
+        let existing = self
+            .assistant
+            .as_ref()
+            .and_then(|s| s.chats.iter().position(|c| c.is_draft()));
+        let mut created = false;
         if let Some(state) = self.assistant.as_mut() {
-            state.chats.push(ChatSession::new(id, provider));
-            state.active = state.chats.len() - 1;
+            let idx = match existing {
+                Some(i) => i,
+                None => {
+                    state.chats.push(ChatSession::new(id, provider));
+                    created = true;
+                    state.chats.len() - 1
+                }
+            };
+            state.active = idx;
             state.show_list = false;
-            state.input.update(cx, |i, cx| i.set_content("", cx));
+            state.renaming = None;
+            let text = state.chats[idx].draft.clone();
+            state.input.update(cx, |i, cx| i.set_content(text, cx));
+        }
+        if created {
+            self.next_conversation_id += 1;
         }
         self.focus_assistant = true;
         cx.notify();
     }
 
-    /// Switch the active chat to the one at `index` (a switcher row click).
+    /// Switch the active chat to the one at `index` (a sidebar row click), keeping
+    /// the outgoing draft's text and restoring the incoming chat's.
     pub(crate) fn switch_chat(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Some(state) = self.assistant.as_mut() {
-            if index < state.chats.len() {
-                state.active = index;
-                state.show_list = false;
-                state.input.update(cx, |i, cx| i.set_content("", cx));
+        self.stash_active_draft(cx);
+        let text = if let Some(state) = self.assistant.as_mut() {
+            if index >= state.chats.len() {
+                return;
             }
-        }
+            state.active = index;
+            state.show_list = false;
+            state.renaming = None;
+            state.chats[index].draft.clone()
+        } else {
+            return;
+        };
+        self.load_composer(text, cx);
         self.focus_assistant = true;
         cx.notify();
     }
 
-    /// Toggle the chat-list switcher.
+    /// Toggle the history sidebar. Opening it stashes the live draft (so a cleared
+    /// composer drops the draft from the list) and loads saved conversations from
+    /// disk so external edits/deletions show up.
     pub(crate) fn toggle_chat_list(&mut self, cx: &mut Context<Self>) {
+        let opening = self.assistant.as_ref().is_some_and(|s| !s.show_list);
+        if opening {
+            self.open_history_sidebar(cx);
+        } else if let Some(state) = self.assistant.as_mut() {
+            state.show_list = false;
+            state.renaming = None;
+            self.focus_assistant = true;
+            cx.notify();
+        }
+    }
+
+    /// Open the merged history sidebar (open chats + saved conversations). The
+    /// command-palette "conversation history" entry routes here too, so there's one
+    /// place history lives. Loads the saved files on demand.
+    pub(crate) fn open_history_sidebar(&mut self, cx: &mut Context<Self>) {
+        if self.assistant.is_none() {
+            return;
+        }
+        self.stash_active_draft(cx);
+        self.loaded_conversations = crate::conversations::load();
         if let Some(state) = self.assistant.as_mut() {
-            state.show_list = !state.show_list;
+            state.show_list = true;
+            state.renaming = None;
+            state.list_search.update(cx, |i, cx| i.set_content("", cx));
         }
         cx.notify();
     }
@@ -519,6 +711,7 @@ impl AppState {
                 return;
             }
         }
+        self.stash_active_draft(cx);
         let id = self.next_conversation_id;
         self.next_conversation_id += 1;
         let seed = render_transcript(&conv.messages);
@@ -544,8 +737,111 @@ impl AppState {
             state.chats.push(chat);
             state.active = state.chats.len() - 1;
             state.show_list = false;
+            state.renaming = None;
         }
+        // A restored chat is sent, so the composer starts empty.
+        self.load_composer(String::new(), cx);
         self.focus_assistant = true;
+        cx.notify();
+    }
+
+    /// Remove a history-sidebar row: delete its saved file (if any) and close the
+    /// chat if it's open. Used by the per-row trash; the merged list *is* the
+    /// history, so removing a row deletes the conversation for good.
+    pub(crate) fn delete_conversation_row(&mut self, key: RowKey, cx: &mut Context<Self>) {
+        let stem = match &key {
+            RowKey::Open(id) => self
+                .assistant
+                .as_ref()
+                .and_then(|s| s.chats.iter().find(|c| c.conversation_id == *id))
+                .and_then(|c| c.file_stem.clone()),
+            RowKey::Saved(stem) => Some(stem.clone()),
+        };
+        if let Some(stem) = &stem {
+            if let Some(dir) = crate::conversations::conversations_dir() {
+                let path = dir.join(format!("{stem}.json"));
+                if let Err(e) = crate::conversations::delete(&path) {
+                    tracing::warn!("failed to delete conversation: {e}");
+                }
+            }
+            // Forget the just-deleted file so the list won't re-list it.
+            self.loaded_conversations.retain(|c| &c.stem != stem);
+        }
+        if let RowKey::Open(id) = key {
+            // Clear the stem first so closing doesn't re-save the deleted file.
+            if let Some(state) = self.assistant.as_mut() {
+                if let Some(chat) = state.find_mut(id) {
+                    chat.file_stem = None;
+                    chat.messages.clear();
+                }
+            }
+            self.close_chat(id, cx);
+        }
+        cx.notify();
+    }
+
+    /// Begin renaming a row's title inline (its pencil button). Seeds a field with
+    /// the current title; Enter commits, Esc cancels.
+    pub(crate) fn begin_rename(&mut self, key: RowKey, title: String, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| {
+            TextInput::new(cx)
+                .bare()
+                .tab_stop(false)
+                .with_content(title)
+        });
+        let sub = cx.subscribe(&input, |this, _, e: &TextInputEvent, cx| match e {
+            TextInputEvent::Submit => this.commit_rename(cx),
+            TextInputEvent::Cancel => this.cancel_rename(cx),
+            TextInputEvent::Change => {}
+        });
+        if let Some(state) = self.assistant.as_mut() {
+            state.renaming = Some(Rename { key, input, sub });
+        }
+        self.focus_rename = true;
+        cx.notify();
+    }
+
+    /// Commit the inline rename to the open chat and/or its saved file.
+    pub(crate) fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(rename) = self.assistant.as_mut().and_then(|s| s.renaming.take()) else {
+            return;
+        };
+        let title = rename.input.read(cx).content().trim().to_string();
+        if !title.is_empty() {
+            match &rename.key {
+                RowKey::Open(id) => {
+                    if let Some(state) = self.assistant.as_mut() {
+                        if let Some(chat) = state.find_mut(*id) {
+                            chat.title = Some(title.clone());
+                            // Rewrite the saved file's title if it's been saved.
+                            if chat.file_stem.is_some() {
+                                persist_chat(chat);
+                            }
+                        }
+                    }
+                }
+                RowKey::Saved(stem) => {
+                    if let Some(conv) = self
+                        .loaded_conversations
+                        .iter_mut()
+                        .find(|c| &c.stem == stem)
+                    {
+                        conv.title = title.clone();
+                        if let Err(e) = crate::conversations::save(stem, conv) {
+                            tracing::warn!("failed to rename conversation: {e}");
+                        }
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Abandon an in-progress inline rename.
+    pub(crate) fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.assistant.as_mut() {
+            state.renaming = None;
+        }
         cx.notify();
     }
 
@@ -669,32 +965,107 @@ impl AppState {
         delta: red_service::AiDelta,
         cx: &mut Context<Self>,
     ) {
+        // Under a reduced-motion preference, skip the typewriter entirely: text
+        // appears the instant it arrives.
+        let reduce_motion = cx.reduce_motion();
+        let grew_text = {
+            let Some(state) = self.assistant.as_mut() else {
+                return;
+            };
+            // Route to whichever chat owns the turn — not just the active one, so a
+            // background chat keeps streaming while another is shown (M-S6).
+            let Some(chat) = state.find_mut(conversation_id) else {
+                return;
+            };
+            let mut grew = false;
+            match delta {
+                red_service::AiDelta::Text(t) => {
+                    chat.assistant_bubble().text.push_str(&t);
+                    grew = true;
+                }
+                red_service::AiDelta::Thinking(t) => chat.assistant_bubble().thinking.push_str(&t),
+                red_service::AiDelta::ToolStarted { name } => {
+                    chat.status = Some(format!("Running {name}…").into());
+                }
+                red_service::AiDelta::ToolFinished { name, ok } => {
+                    chat.status = Some(
+                        if ok {
+                            format!("{name} ✓")
+                        } else {
+                            format!("{name} failed")
+                        }
+                        .into(),
+                    );
+                }
+            }
+            // Reduced motion reveals everything at once; otherwise the ticker walks
+            // `revealed` up to the received length (started below).
+            if grew && reduce_motion {
+                chat.revealed = chat.streaming_text_chars();
+            }
+            grew
+        };
+        cx.notify();
+        if grew_text && !reduce_motion {
+            self.ensure_reveal_ticker(conversation_id, cx);
+        }
+    }
+
+    /// Start the steady reveal ticker for a chat if one isn't already running and
+    /// there's text waiting to be revealed. The ticker reschedules itself until the
+    /// reveal catches up to the received text (see `tick_reveal`); a later burst
+    /// restarts it. Cheap to call on every delta.
+    fn ensure_reveal_ticker(&mut self, conversation_id: u64, cx: &mut Context<Self>) {
+        {
+            let Some(state) = self.assistant.as_mut() else {
+                return;
+            };
+            let Some(chat) = state.find_mut(conversation_id) else {
+                return;
+            };
+            if chat.revealing || chat.revealed >= chat.streaming_text_chars() {
+                return;
+            }
+            chat.revealing = true;
+        }
+        cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| loop {
+                cx.background_executor().timer(REVEAL_TICK).await;
+                let keep_going = this
+                    .update(cx, |this, cx| this.tick_reveal(conversation_id, cx))
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// One reveal step: uncover more of the streaming bubble and repaint. Returns
+    /// whether the ticker should fire again (false once it's caught up — a new burst
+    /// will restart it via `ensure_reveal_ticker`).
+    fn tick_reveal(&mut self, conversation_id: u64, cx: &mut Context<Self>) -> bool {
         let Some(state) = self.assistant.as_mut() else {
-            return;
+            return false;
         };
-        // Route to whichever chat owns the turn — not just the active one, so a
-        // background chat keeps streaming while another is shown (M-S6).
         let Some(chat) = state.find_mut(conversation_id) else {
-            return;
+            return false;
         };
-        match delta {
-            red_service::AiDelta::Text(t) => chat.assistant_bubble().text.push_str(&t),
-            red_service::AiDelta::Thinking(t) => chat.assistant_bubble().thinking.push_str(&t),
-            red_service::AiDelta::ToolStarted { name } => {
-                chat.status = Some(format!("Running {name}…").into());
-            }
-            red_service::AiDelta::ToolFinished { name, ok } => {
-                chat.status = Some(
-                    if ok {
-                        format!("{name} ✓")
-                    } else {
-                        format!("{name} failed")
-                    }
-                    .into(),
-                );
-            }
+        let target = chat.streaming_text_chars();
+        if chat.revealed >= target {
+            chat.revealing = false;
+            return false;
+        }
+        let remaining = target - chat.revealed;
+        let step = (remaining / REVEAL_DIVISOR).max(REVEAL_MIN_STEP);
+        chat.revealed = (chat.revealed + step).min(target);
+        let caught_up = chat.revealed >= target;
+        if caught_up {
+            chat.revealing = false;
         }
         cx.notify();
+        !caught_up
     }
 
     pub(crate) fn on_ai_finished(
@@ -721,6 +1092,8 @@ impl AppState {
         }
         if finished {
             cx.notify();
+            // Drain any still-hidden tail now that no more text is coming.
+            self.ensure_reveal_ticker(conversation_id, cx);
         }
     }
 
@@ -873,8 +1246,14 @@ impl AppState {
                 body = body.child(picker);
             }
         }
-        for msg in &chat.messages {
-            body = body.child(self.render_bubble(msg, &theme, cx));
+        // The trailing assistant bubble types out while the turn streams (or while
+        // the reveal is still draining just after it finishes); the rest show whole.
+        let last = chat.messages.len().saturating_sub(1);
+        for (i, msg) in chat.messages.iter().enumerate() {
+            let live =
+                i == last && msg.role == ChatRole::Assistant && (chat.streaming || chat.revealing);
+            let reveal = live.then_some(chat.revealed);
+            body = body.child(self.render_bubble(msg, reveal, &theme, cx));
         }
         if let Some(status) = &chat.status {
             body = body.child(
@@ -893,38 +1272,39 @@ impl AppState {
             );
         }
 
-        // Composer: input + send/stop.
+        // Composer: a multiline prompt box with a send (or stop) icon button. The
+        // box is a fixed few lines tall and scrolls internally for longer prompts.
         let action: AnyElement = if chat.streaming {
             div()
                 .id("assistant-stop")
-                .px_3()
-                .h(px(28.))
+                .size(px(30.))
                 .flex()
                 .items_center()
+                .justify_center()
                 .rounded(px(6.))
                 .border_1()
                 .border_color(theme.border)
-                .text_size(theme.scale(12.))
-                .text_color(theme.text_muted)
                 .cursor_pointer()
-                .hover(|s| s.border_color(theme.red).text_color(theme.red))
-                .child("Stop")
+                .tooltip(flint::Tooltip::text("Stop (Esc)"))
+                .hover(|s| s.border_color(theme.red))
+                .child(crate::icons::icon("x", theme.scale(14.), theme.text_muted))
                 .on_click(cx.listener(|this, _, _, cx| this.cancel_assistant(cx)))
                 .into_any_element()
         } else {
             div()
                 .id("assistant-send")
-                .px_3()
-                .h(px(28.))
+                .size(px(30.))
                 .flex()
                 .items_center()
+                .justify_center()
                 .rounded(px(6.))
                 .bg(theme.red)
-                .text_size(theme.scale(12.))
-                .text_color(theme.bg_app)
                 .cursor_pointer()
+                .tooltip(flint::Tooltip::text(
+                    "Send (Enter · Shift+Enter for a new line)",
+                ))
                 .hover(|s| s.opacity(0.9))
-                .child("Send")
+                .child(crate::icons::icon("send", theme.scale(15.), theme.bg_app))
                 .on_click(cx.listener(|this, _, _, cx| this.submit_assistant(cx)))
                 .into_any_element()
         };
@@ -932,12 +1312,18 @@ impl AppState {
         let composer = div()
             .flex_shrink_0()
             .flex()
-            .items_center()
+            .items_end()
             .gap_2()
             .p_2()
             .border_t_1()
             .border_color(theme.border)
-            .child(div().flex_1().child(state.input.clone()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h(px(64.))
+                    .child(state.input.clone()),
+            )
             .child(action);
 
         div()
@@ -1007,11 +1393,12 @@ impl AppState {
             .iter()
             .enumerate()
             .any(|(i, c)| i != state.active && c.needs_attention());
-        // Tooltip carries the open-chat count; a dot flags background attention.
+        // The toggle opens the merged history sidebar (open chats + saved); the
+        // tooltip carries the open-chat count and a dot flags background attention.
         let list_tip = if state.chats.len() > 1 {
-            SharedString::from(format!("Conversations ({})", state.chats.len()))
+            SharedString::from(format!("History ({} open)", state.chats.len()))
         } else {
-            SharedString::from("Conversations")
+            SharedString::from("History")
         };
         let list_btn = self.ai_configured.then(|| {
             div()
@@ -1048,10 +1435,6 @@ impl AppState {
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_chat_list(cx)))
         });
 
-        let history = self.ai_configured.then(|| {
-            icon_btn("assistant-history", "clock", "Conversation history")
-                .on_click(cx.listener(|this, _, _, cx| this.open_conversation_picker(cx)))
-        });
         let new_chat = self.ai_configured.then(|| {
             icon_btn("assistant-new-chat", "plus", "New chat")
                 .on_click(cx.listener(|this, _, _, cx| this.new_chat(cx)))
@@ -1067,7 +1450,6 @@ impl AppState {
             .gap_1()
             .when_some(reauth, |row, r| row.child(r))
             .when_some(list_btn, |row, l| row.child(l))
-            .when_some(history, |row, h| row.child(h))
             .when_some(new_chat, |row, n| row.child(n))
             .when_some(delete, |row, d| row.child(d))
             .child(close);
@@ -1163,9 +1545,9 @@ impl AppState {
             .into_any_element()
     }
 
-    /// The chat-list switcher (M-S6): every open conversation, the active one
-    /// highlighted, with a click to switch and a ✕ to close, plus per-provider
-    /// new-chat buttons so a second chat on a different backend can be opened.
+    /// The merged history sidebar: the single editable draft, the open chats, and
+    /// the saved conversations on disk — one searchable list. Clicking a row opens
+    /// or restores it; each non-draft row can be renamed or deleted in place.
     fn render_assistant_list(
         &self,
         state: &AssistantState,
@@ -1173,6 +1555,92 @@ impl AppState {
         theme: &flint::Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let query = state.list_search.read(cx).content().trim().to_lowercase();
+        let matches = |title: &str| query.is_empty() || title.to_lowercase().contains(&query);
+
+        // Stems already open, so a saved conversation isn't listed twice.
+        let open_stems: Vec<&str> = state
+            .chats
+            .iter()
+            .filter_map(|c| c.file_stem.as_deref())
+            .collect();
+
+        // Flatten into ordered rows: the draft first, then open chats, then saved.
+        let mut rows: Vec<HistoryRow> = Vec::new();
+        for (i, c) in state.chats.iter().enumerate() {
+            if c.is_draft() {
+                let title = derive_title(&c.draft);
+                if c.draft.trim().is_empty() || !matches(&title) {
+                    continue;
+                }
+                rows.push(HistoryRow {
+                    key: RowKey::Open(c.conversation_id),
+                    open_index: Some(i),
+                    saved_index: None,
+                    title,
+                    subtitle: "Draft".to_string(),
+                    subscription: c.is_subscription(),
+                    active: i == state.active,
+                    attention: false,
+                    draft: true,
+                });
+            }
+        }
+        for (i, c) in state.chats.iter().enumerate() {
+            if c.is_draft() {
+                continue;
+            }
+            let title = c
+                .title
+                .clone()
+                .unwrap_or_else(|| "Untitled chat".to_string());
+            if !matches(&title) {
+                continue;
+            }
+            let turns = c
+                .messages
+                .iter()
+                .filter(|m| m.role == ChatRole::User)
+                .count();
+            let mut subtitle = format!("{} · {turns} turns", c.provider_label());
+            if c.streaming {
+                subtitle.push_str(" · streaming");
+            }
+            rows.push(HistoryRow {
+                key: RowKey::Open(c.conversation_id),
+                open_index: Some(i),
+                saved_index: None,
+                title,
+                subtitle,
+                subscription: c.is_subscription(),
+                active: i == state.active,
+                attention: c.needs_attention(),
+                draft: false,
+            });
+        }
+        for (j, conv) in self.loaded_conversations.iter().enumerate() {
+            if open_stems.contains(&conv.stem.as_str()) || !matches(&conv.title) {
+                continue;
+            }
+            let turns = conv.messages.iter().filter(|m| m.role == "user").count();
+            let label = if provider_is_subscription(&conv.provider) {
+                "Subscription"
+            } else {
+                "API key"
+            };
+            rows.push(HistoryRow {
+                key: RowKey::Saved(conv.stem.clone()),
+                open_index: None,
+                saved_index: Some(j),
+                title: conv.title.clone(),
+                subtitle: format!("{label} · {turns} turns"),
+                subscription: provider_is_subscription(&conv.provider),
+                active: false,
+                attention: false,
+                draft: false,
+            });
+        }
+
         let mut list = div()
             .id("assistant-chat-list")
             .flex_1()
@@ -1182,139 +1650,75 @@ impl AppState {
             .flex_col()
             .gap_1()
             .p_2();
-
-        for (i, c) in state.chats.iter().enumerate() {
-            let active = i == state.active;
-            let title = c.title.clone().unwrap_or_else(|| "New chat".to_string());
-            let turns = c
-                .messages
-                .iter()
-                .filter(|m| m.role == ChatRole::User)
-                .count();
-            let mut hint = format!("{} · {turns} turns", c.provider_label());
-            if c.streaming {
-                hint.push_str(" · streaming");
-            }
-
-            let row_id = SharedString::from(format!("chat-row-{}", c.conversation_id));
-            let close_id = SharedString::from(format!("chat-close-{}", c.conversation_id));
-            let conversation_id = c.conversation_id;
-
-            let mut row = div()
-                .id(row_id)
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .py_1p5()
-                .rounded(px(5.))
-                .cursor_pointer()
-                .when(active, |r| r.bg(theme.bg_elevated))
-                .hover(|s| s.bg(theme.bg_elevated))
-                .on_click(cx.listener(move |this, _, _, cx| this.switch_chat(i, cx)));
-
-            // Provider glyph: a key for API-key chats, sparkles for subscription.
-            row = row.child(crate::icons::icon(
-                if c.is_subscription() {
-                    "sparkles"
-                } else {
-                    "key-round"
-                },
-                theme.scale(13.),
-                theme.text_muted,
-            ));
-
-            let text = div()
-                .flex_1()
-                .min_w(px(0.))
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .text_size(theme.scale(12.))
-                        .text_color(theme.text)
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .text_size(theme.scale(10.))
-                        .text_color(theme.text_muted)
-                        .child(hint),
-                );
-            row = row.child(text);
-
-            // Attention dot (a parked permission) so a background chat is visible.
-            if c.needs_attention() {
-                row = row.child(div().size(px(6.)).rounded_full().bg(theme.red));
-            }
-
-            row = row.child(
+        if rows.is_empty() {
+            let hint = if query.is_empty() {
+                "No conversations yet — they're kept here as you chat."
+            } else {
+                "No conversations match your search."
+            };
+            list = list.child(
                 div()
-                    .id(close_id)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .size(px(18.))
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .tooltip(flint::Tooltip::text("Close chat"))
-                    .hover(|s| s.bg(theme.bg_panel))
-                    .child(crate::icons::icon("x", theme.scale(11.), theme.text_muted))
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.close_chat(conversation_id, cx)),
-                    ),
+                    .p_2()
+                    .text_size(theme.scale(11.5))
+                    .text_color(theme.text_muted)
+                    .child(hint),
             );
-
-            list = list.child(row);
+        } else {
+            for row in rows {
+                list = list.child(self.render_history_row(row, state.renaming.as_ref(), theme, cx));
+            }
         }
 
-        // New-chat buttons, one per available provider (mixed providers, M-S6).
-        let new_button = |id: &'static str, label: String, provider: String| {
-            div()
-                .id(SharedString::from(id))
-                .flex()
-                .items_center()
-                .gap_1p5()
-                .px_2()
-                .h(px(28.))
-                .rounded(px(6.))
-                .border_1()
-                .border_color(theme.border)
-                .text_size(theme.scale(11.5))
-                .text_color(theme.text_muted)
-                .cursor_pointer()
-                .hover(|s| s.border_color(theme.red).text_color(theme.red))
-                .child(crate::icons::icon(
-                    "plus",
-                    theme.scale(11.),
-                    theme.text_muted,
-                ))
-                .child(label)
-                .on_click(
-                    cx.listener(move |this, _, _, cx| this.new_chat_with(provider.clone(), cx)),
-                )
-        };
-
-        let mut new_row = div()
+        // Search box, docked under the header.
+        let search = div()
             .flex_shrink_0()
             .flex()
-            .flex_wrap()
+            .items_center()
             .gap_1p5()
+            .px_3()
+            .h(px(30.))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(crate::icons::icon(
+                "search",
+                theme.scale(12.),
+                theme.text_muted,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .child(state.list_search.clone()),
+            );
+
+        // Footer: a single "New chat" that lands on the draft.
+        let new_button = div()
+            .id("assistant-new-chat-footer")
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_1p5()
+            .h(px(30.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme.border)
+            .text_size(theme.scale(11.5))
+            .text_color(theme.text_muted)
+            .cursor_pointer()
+            .hover(|s| s.border_color(theme.red).text_color(theme.red))
+            .child(crate::icons::icon(
+                "plus",
+                theme.scale(11.),
+                theme.text_muted,
+            ))
+            .child("New chat")
+            .on_click(cx.listener(|this, _, _, cx| this.new_chat(cx)));
+        let footer = div()
+            .flex_shrink_0()
             .p_2()
             .border_t_1()
-            .border_color(theme.border);
-        if self.ai_api_key_available {
-            new_row = new_row.child(new_button(
-                "assistant-new-apikey",
-                "New API-key chat".to_string(),
-                "anthropic".to_string(),
-            ));
-        }
-        new_row = new_row.child(new_button(
-            "assistant-new-subscription",
-            "New subscription chat".to_string(),
-            "subscription".to_string(),
-        ));
+            .border_color(theme.border)
+            .child(new_button);
 
         div()
             .size_full()
@@ -1324,9 +1728,136 @@ impl AppState {
             .border_l_1()
             .border_color(theme.border)
             .child(header)
+            .child(search)
             .child(list)
-            .child(new_row)
+            .child(footer)
             .into_any_element()
+    }
+
+    /// One row of the merged history sidebar (see [`HistoryRow`]). Click opens or
+    /// restores the conversation; a pencil renames it inline and a trash deletes it
+    /// (both hidden for the live draft). While a row is being renamed, its title is
+    /// replaced by an edit field.
+    fn render_history_row(
+        &self,
+        row: HistoryRow,
+        renaming: Option<&Rename>,
+        theme: &flint::Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id_key = match &row.key {
+            RowKey::Open(id) => format!("open-{id}"),
+            RowKey::Saved(stem) => format!("saved-{stem}"),
+        };
+        let renaming_here = renaming.filter(|r| r.key == row.key);
+
+        let mut el = div()
+            .id(SharedString::from(format!("history-row-{id_key}")))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1p5()
+            .rounded(px(5.))
+            .when(row.active, |r| r.bg(theme.bg_elevated))
+            .hover(|s| s.bg(theme.bg_elevated));
+
+        // Provider glyph: sparkles for subscription, a key for API-key.
+        el = el.child(crate::icons::icon(
+            if row.subscription {
+                "sparkles"
+            } else {
+                "key-round"
+            },
+            theme.scale(13.),
+            theme.text_muted,
+        ));
+
+        if let Some(rename) = renaming_here {
+            // Inline rename: the title becomes an edit field (Enter commits).
+            el = el.child(div().flex_1().min_w(px(0.)).child(rename.input.clone()));
+            return el.into_any_element();
+        }
+
+        // Clicking the row body opens/restores it.
+        let open_index = row.open_index;
+        let saved_index = row.saved_index;
+        el = el
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(i) = open_index {
+                    this.switch_chat(i, cx);
+                } else if let Some(j) = saved_index {
+                    this.restore_conversation(j, cx);
+                }
+            }));
+
+        let title = if row.title.trim().is_empty() {
+            "Untitled chat".to_string()
+        } else {
+            row.title.clone()
+        };
+        let text = div()
+            .flex_1()
+            .min_w(px(0.))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .text_size(theme.scale(12.))
+                    .text_color(theme.text)
+                    .child(title.clone()),
+            )
+            .child(
+                div()
+                    .text_size(theme.scale(10.))
+                    .text_color(theme.text_muted)
+                    .child(row.subtitle.clone()),
+            );
+        el = el.child(text);
+
+        if row.attention {
+            el = el.child(div().size(px(6.)).rounded_full().bg(theme.red));
+        }
+
+        // Rename + delete affordances (not for the live draft, which is named live).
+        if !row.draft {
+            let small_btn = |id: String, glyph: &'static str, tip: &'static str| {
+                div()
+                    .id(SharedString::from(id))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(18.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .tooltip(flint::Tooltip::text(tip))
+                    .hover(|s| s.bg(theme.bg_panel))
+                    .child(crate::icons::icon(
+                        glyph,
+                        theme.scale(11.),
+                        theme.text_muted,
+                    ))
+            };
+            let key_rename = row.key.clone();
+            el = el.child(
+                small_btn(format!("history-rename-{id_key}"), "edit", "Rename").on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.begin_rename(key_rename.clone(), title.clone(), cx)
+                    }),
+                ),
+            );
+            let key_delete = row.key.clone();
+            el = el.child(
+                small_btn(format!("history-delete-{id_key}"), "trash", "Delete").on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.delete_conversation_row(key_delete.clone(), cx)
+                    }),
+                ),
+            );
+        }
+
+        el.into_any_element()
     }
 
     /// The empty-chat provider picker (M-S6): two pills to bind a new chat to a
@@ -1540,13 +2071,22 @@ impl AppState {
         .into_any_element()
     }
 
-    /// One chat bubble.
+    /// One chat bubble. `reveal` is `Some(n)` for the live, still-typing assistant
+    /// bubble — only its first `n` characters show and a blinking caret trails them;
+    /// `None` renders the whole message (every settled turn).
     fn render_bubble(
         &self,
         msg: &ChatMessage,
+        reveal: Option<usize>,
         theme: &flint::Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let live = reveal.is_some();
+        // The text currently on screen: the revealed prefix while typing, else all.
+        let shown: &str = match reveal {
+            Some(n) => take_chars(&msg.text, n),
+            None => &msg.text,
+        };
         let (label, label_color) = match msg.role {
             ChatRole::User => ("You", theme.text_muted),
             ChatRole::Assistant => ("Assistant", theme.red),
@@ -1554,13 +2094,14 @@ impl AppState {
 
         // Label row: the author, plus a copy-to-clipboard affordance for the
         // message text (assistant turns can be long; this beats hand-selecting).
+        // Hidden while typing — the text isn't final yet.
         let mut label_row = div().flex().items_center().justify_between().child(
             div()
                 .text_size(theme.scale(10.5))
                 .text_color(label_color)
                 .child(label),
         );
-        if !msg.text.trim().is_empty() {
+        if !live && !msg.text.trim().is_empty() {
             let to_copy = msg.text.clone();
             label_row = label_row.child(
                 div()
@@ -1598,27 +2139,29 @@ impl AppState {
             bubble = bubble.child(think);
         }
 
-        // Answer text. Assistant turns are Markdown — render them; user turns are
-        // plain. A still-empty assistant bubble shows a streaming ellipsis.
-        let answer = if msg.text.is_empty() && msg.role == ChatRole::Assistant {
-            div()
-                .text_size(theme.scale(12.5))
-                .text_color(theme.text_muted)
-                .child("…")
-                .into_any_element()
-        } else if msg.role == ChatRole::Assistant {
-            crate::markdown::render(&msg.text, theme)
-        } else {
-            div()
-                .text_size(theme.scale(12.5))
-                .text_color(theme.text)
-                .child(msg.text.clone())
-                .into_any_element()
-        };
-        bubble = bubble.child(answer);
-
-        // "Insert into editor" for the first fenced SQL block in an assistant turn.
+        // Answer text. Assistant turns are Markdown — render them (on the revealed
+        // prefix while typing); user turns are plain.
         if msg.role == ChatRole::Assistant {
+            if !shown.is_empty() {
+                bubble = bubble.child(crate::markdown::render(shown, theme));
+            }
+            // A blinking caret trails the revealed text while the model is typing
+            // (and signals "still working" through tool calls / token gaps).
+            if live {
+                bubble = bubble.child(stream_caret(theme, cx.reduce_motion()));
+            }
+        } else {
+            bubble = bubble.child(
+                div()
+                    .text_size(theme.scale(12.5))
+                    .text_color(theme.text)
+                    .child(msg.text.clone()),
+            );
+        }
+
+        // "Insert into editor" for the first fenced SQL block in a *settled*
+        // assistant turn (suppressed while still typing).
+        if !live && msg.role == ChatRole::Assistant {
             if let Some(sql) = extract_sql(&msg.text) {
                 let id = SharedString::from(format!("ai-insert-{}", bubble_key(msg)));
                 bubble = bubble.child(
@@ -1653,6 +2196,37 @@ impl AppState {
 
         bubble.into_any_element()
     }
+}
+
+/// The first `n` characters of `s` (a byte-safe prefix), or all of it when shorter.
+/// Drives the streaming reveal — slicing on a char boundary so multibyte text never
+/// panics mid-codepoint.
+fn take_chars(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
+/// The streaming caret: a small block trailing the typed-out answer. It pulses
+/// (ChatGPT-style) to read as "still generating"; under a reduced-motion
+/// preference it rests solid.
+fn stream_caret(theme: &flint::Theme, reduce_motion: bool) -> AnyElement {
+    let bar = div().w(px(7.)).h(px(15.)).rounded(px(1.5)).bg(theme.text);
+    if reduce_motion {
+        return bar.into_any_element();
+    }
+    bar.with_animation(
+        "ai-stream-caret",
+        Animation::new(Duration::from_millis(1100)).repeat(),
+        |bar, delta| {
+            // A smooth 1→0→1 pulse over the period (cosine), floored so it never
+            // fully vanishes.
+            let o = 0.2 + 0.8 * (0.5 + 0.5 * (delta * std::f32::consts::TAU).cos());
+            bar.opacity(o)
+        },
+    )
+    .into_any_element()
 }
 
 /// Persist one chat to its flat file (one JSON per conversation), titled from its
