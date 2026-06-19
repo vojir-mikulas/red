@@ -142,9 +142,15 @@ pub enum AiTier {
     Schema,
     /// The full read catalog: adds `run_select` and `explain`, subject to the
     /// resource guards in [`AiLimits`]. Honors a connection's `read_only` posture.
-    /// The shipped default — a write tier is intentionally absent until B5 lands.
+    /// The shipped default.
     #[default]
     Read,
+    /// Read **plus** the gated write tool (`propose_write`): a single
+    /// INSERT/UPDATE/DELETE that requires explicit, per-statement user approval and
+    /// is blocked on a read-only connection and for destructive shapes (DDL,
+    /// unqualified UPDATE/DELETE). Off unless a connection opts in
+    /// (`ai_tier = "write"`); never the global default.
+    Write,
 }
 
 impl AiTier {
@@ -158,6 +164,8 @@ impl AiTier {
                 tool,
                 "list_schema" | "describe_table" | "run_select" | "explain" | "generate_report"
             ),
+            // Write inherits the full read catalog and adds the gated write tool.
+            AiTier::Write => tool == "propose_write" || AiTier::Read.allows_tool(tool),
         }
     }
 
@@ -167,15 +175,19 @@ impl AiTier {
             AiTier::Off => "off",
             AiTier::Schema => "schema",
             AiTier::Read => "read",
+            AiTier::Write => "write",
         }
     }
 
     /// Parse a settings string leniently: an unrecognized value resolves to the
-    /// safe default rather than failing, so a typo never wedges the AI off.
+    /// safe default rather than failing, so a typo never wedges the AI off. Note
+    /// `write` is accepted (for a per-connection `ai_tier`) but is never the global
+    /// default.
     pub fn parse(s: &str) -> AiTier {
         match s.trim().to_ascii_lowercase().as_str() {
             "off" => AiTier::Off,
             "schema" => AiTier::Schema,
+            "write" => AiTier::Write,
             _ => AiTier::Read,
         }
     }
@@ -221,6 +233,11 @@ pub struct AiPolicy {
     pub enabled: bool,
     pub tier: AiTier,
     pub limits: AiLimits,
+    /// The connection's read-only posture, carried into the tool layer so the write
+    /// tool is withheld (and rejected, defense in depth) on a read-only connection —
+    /// the same guard the human write path is held to. Authoritative (set from the
+    /// session), not the UI-supplied `AiContext.read_only`.
+    pub read_only: bool,
 }
 
 impl Default for AiPolicy {
@@ -229,6 +246,7 @@ impl Default for AiPolicy {
             enabled: true,
             tier: AiTier::Read,
             limits: AiLimits::default(),
+            read_only: false,
         }
     }
 }
@@ -244,6 +262,7 @@ impl AiPolicy {
             enabled: enabled.unwrap_or(self.enabled),
             tier: tier.unwrap_or(self.tier),
             limits: self.limits,
+            read_only: self.read_only,
         }
     }
 }
@@ -1502,8 +1521,15 @@ mod ai_policy_tests {
         assert!(!AiTier::Schema.allows_tool("explain"));
         assert!(AiTier::Read.allows_tool("run_select"));
         assert!(AiTier::Read.allows_tool("explain"));
-        // Unknown tools are never allowed at any tier.
+        assert!(AiTier::Read.allows_tool("generate_report"));
+        // The write tool is gated to the Write tier — and Write inherits the read
+        // catalog on top of it.
         assert!(!AiTier::Read.allows_tool("propose_write"));
+        assert!(AiTier::Write.allows_tool("propose_write"));
+        assert!(AiTier::Write.allows_tool("run_select"));
+        // Unknown tools are never allowed at any tier.
+        assert!(!AiTier::Read.allows_tool("frobnicate"));
+        assert!(!AiTier::Write.allows_tool("frobnicate"));
     }
 
     #[test]
@@ -1511,6 +1537,7 @@ mod ai_policy_tests {
         assert_eq!(AiTier::parse("off"), AiTier::Off);
         assert_eq!(AiTier::parse(" Schema "), AiTier::Schema);
         assert_eq!(AiTier::parse("READ"), AiTier::Read);
+        assert_eq!(AiTier::parse("write"), AiTier::Write);
         // A typo or empty string falls back to the safe default rather than erroring.
         assert_eq!(AiTier::parse("nonsense"), AiTier::Read);
         assert_eq!(AiTier::parse(""), AiTier::Read);
@@ -1522,6 +1549,7 @@ mod ai_policy_tests {
             enabled: true,
             tier: AiTier::Read,
             limits: AiLimits::default(),
+            read_only: false,
         };
         // Unset overrides inherit the global policy verbatim.
         assert_eq!(global.with_overrides(None, None), global);

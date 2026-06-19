@@ -375,6 +375,18 @@ impl AppState {
         }
     }
 
+    /// The AI access tier in effect for the current context (Feature B): the active
+    /// connection's `ai_tier` override, falling back to the global `[ai] tier`.
+    /// Drives the "writes" safety badge — `Write` means the agent can propose
+    /// data changes (each one still gated by per-statement approval).
+    pub(crate) fn ai_tier_effective(&self) -> red_core::AiTier {
+        let global = red_core::AiTier::parse(&self.settings.ai.tier);
+        match &self.phase {
+            Phase::Connected(active) => active.config.ai_tier.unwrap_or(global),
+            _ => global,
+        }
+    }
+
     /// Open or close the assistant panel (⌘L). Only meaningful while connected and
     /// while the assistant is enabled for this connection (M-S7).
     pub(crate) fn toggle_assistant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1775,6 +1787,29 @@ impl AppState {
                                 .text_size(theme.scale(10.5))
                                 .text_color(theme.text_muted)
                                 .child("· Subscription"),
+                        )
+                    })
+                    // A "writes" badge when this connection opted into the write tier
+                    // (Feature B), so the user knows the agent can propose data changes
+                    // (each one still gated by per-statement approval).
+                    .when(self.ai_tier_effective() == red_core::AiTier::Write, |row| {
+                        row.child(
+                            div()
+                                .id("ai-writes-badge")
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .px_1p5()
+                                .rounded(theme.radius_sm)
+                                .bg(theme.yellow.opacity(0.12))
+                                .text_size(theme.scale(10.))
+                                .text_color(theme.yellow)
+                                .child(crate::icons::icon("edit", theme.scale(10.), theme.yellow))
+                                .child("writes")
+                                .tooltip(flint::Tooltip::text(
+                                    "This connection allows the assistant to propose writes — \
+                                         each one needs your approval.",
+                                )),
                         )
                     }),
             )

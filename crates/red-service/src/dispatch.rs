@@ -187,6 +187,10 @@ struct SessionState {
     /// turn runs on this session, so a sensitive connection can disable the
     /// assistant or pin its tier without touching the global setting.
     ai_override: AiOverride,
+    /// The connection's read-only posture, captured at connect. Carried into the AI
+    /// policy so the write tool (`AiTier::Write`) is withheld on a read-only
+    /// connection — the same guard the human write path is held to.
+    read_only: bool,
     /// The SSH tunnel this connection rides, if any. Held only to keep it alive
     /// for the session's lifetime: dropping it (on teardown/eviction) closes the
     /// forward and the SSH session. `None` for a direct connection.
@@ -215,10 +219,12 @@ impl SessionState {
         driver: Arc<dyn DatabaseDriver>,
         tunnel: Option<Tunnel>,
         ai_override: AiOverride,
+        read_only: bool,
     ) -> Self {
         Self {
             driver,
             ai_override,
+            read_only,
             _tunnel: tunnel,
             active: None,
             results: Arc::new(Mutex::new(HashMap::new())),
@@ -278,6 +284,8 @@ enum ConnectOutcome {
         /// The connection's AI policy overrides (M-S7), captured at connect so the
         /// resulting session carries them.
         ai_override: AiOverride,
+        /// The connection's read-only posture, captured at connect for the AI policy.
+        read_only: bool,
         result: Result<(Arc<dyn DatabaseDriver>, Option<Tunnel>), ConnectFail>,
     },
     /// A session-less `TestConnection` finished — carries the server version on
@@ -317,6 +325,7 @@ fn apply_connect_outcome(
             id,
             generation,
             ai_override,
+            read_only,
             result,
         } => {
             // A newer `Connect` on this id superseded the one that produced this
@@ -327,7 +336,10 @@ fn apply_connect_outcome(
             match result {
                 Ok((driver, tunnel)) => {
                     let version = driver.server_version();
-                    sessions.insert(id, SessionState::new(driver, tunnel, ai_override));
+                    sessions.insert(
+                        id,
+                        SessionState::new(driver, tunnel, ai_override, read_only),
+                    );
                     emit(events, Some(id), Event::Connected { version });
                 }
                 Err(ConnectFail {
@@ -480,6 +492,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     enabled: config.ai_enabled,
                     tier: config.ai_tier,
                 };
+                // The connection's read-only posture, captured before `config` moves
+                // into the dial task, so the session can gate the AI write tool.
+                let read_only = config.read_only;
                 let tx = connect_tx.clone();
                 tokio::spawn(async move {
                     let result = attempt_connect(&config).await;
@@ -487,6 +502,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         id,
                         generation,
                         ai_override,
+                        read_only,
                         result,
                     });
                 });
@@ -518,6 +534,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     enabled: cfg.enabled,
                     tier: cfg.tier,
                     limits: cfg.limits,
+                    // The global default is writable-posture; each turn overrides
+                    // this with the connection's authoritative read-only flag.
+                    read_only: false,
                 };
                 // An empty key leaves the API-key path off — a turn then replies
                 // with a clear AiError rather than a failed network call. The
@@ -560,7 +579,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     .and_then(|id| sessions.get(&id))
                     .map(|s| s.ai_override)
                     .unwrap_or_default();
-                let effective = ai_policy.with_overrides(ai_override.enabled, ai_override.tier);
+                // The connection's authoritative read-only posture gates the write
+                // tool (defense in depth alongside the driver's own rejection).
+                let read_only = session_id
+                    .and_then(|id| sessions.get(&id))
+                    .map(|s| s.read_only)
+                    .unwrap_or(false);
+                let mut effective = ai_policy.with_overrides(ai_override.enabled, ai_override.tier);
+                effective.read_only = read_only;
                 if !effective.enabled {
                     emit(
                         &events,
@@ -641,8 +667,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 request_id,
                 allow,
             } => {
-                // Answer a parked subscription-path permission prompt (M-S2). Off
-                // the loop like cancel, since it locks the (awaitable) ACP manager.
+                // Answer a parked permission prompt. It belongs to exactly one
+                // backend: the subscription path's ACP manager (M-S2 tool prompts) or
+                // the API-key path's AiState (Feature B write prompts). Their request-
+                // id spaces are disjoint (AiState offsets its ids), so resolving both
+                // is safe — only the owning side has the id. The API-key resolve is a
+                // quick sync lock; the ACP one awaits, so it runs off the loop.
+                lock(&ai_state).resolve_permission(request_id, allow);
                 let manager = ai_acp.clone();
                 tokio::spawn(
                     async move { manager.lock().await.resolve_permission(request_id, allow) },
@@ -2004,7 +2035,7 @@ mod checkpoint_tests {
     #[test]
     fn reap_excess_results_caps_to_the_lowest_epochs() {
         let (path, driver) = driver_with(1, "reap");
-        let mut state = SessionState::new(driver, None, AiOverride::default());
+        let mut state = SessionState::new(driver, None, AiOverride::default(), false);
 
         // Open one more than the cap, epochs 1..=MAX+1. Every epoch also has an
         // in-flight handle, so we can assert those are reaped in lockstep.

@@ -19,9 +19,10 @@ use std::time::Duration;
 use red_ai::{
     AiProvider, CancelToken, ContentBlock, Message, Role, StopReason, ToolDef, TurnRequest,
 };
-use red_core::{AiPolicy, ExportFormat, RedError, Value};
+use red_core::{AiPolicy, AiTier, ExportFormat, RedError, Value};
 use red_driver::{AbortSignal, DatabaseDriver, PageCap};
 use serde_json::{json, Value as Json};
+use tokio::sync::oneshot;
 
 use crate::dispatch::{emit, Events};
 use crate::protocol::{AiContext, AiDelta, AiUsage};
@@ -91,12 +92,51 @@ pub(crate) struct AiState {
     histories: HashMap<u64, Vec<Message>>,
     cancels: HashMap<u64, CancelToken>,
     tool_calls: HashMap<u64, usize>,
+    /// Write-tool approval prompts (Feature B) awaiting the user's Allow/Deny, keyed
+    /// by request id. The turn task parks a decision sink here; `AiPermission` takes
+    /// it back out and fires it — the API-key analogue of the ACP path's
+    /// `AcpManager.pending`.
+    pending_perms: HashMap<u64, oneshot::Sender<bool>>,
+    /// Monotonic counter for the request ids handed out by [`Self::park_permission`].
+    /// Handed-out ids are offset by [`AI_REQUEST_BASE`] so they never collide with
+    /// the ACP manager's (which counts up from 0) — `AiPermission` can then resolve
+    /// both sides unconditionally.
+    next_request: u64,
 }
+
+/// Base offset for API-key permission request ids, keeping them disjoint from the
+/// ACP manager's id space so a single `AiPermission` resolves exactly one prompt.
+const AI_REQUEST_BASE: u64 = 1 << 48;
+
+/// Cap on outstanding (un-answered) write-approval prompts on the API-key path —
+/// past it, deny rather than grow the map. Mirrors the ACP manager's cap.
+const MAX_PENDING_PERMS: usize = 32;
 
 impl AiState {
     /// Record an in-flight turn's cancel token so `AiCancel` can reach it.
     pub(crate) fn register(&mut self, conversation_id: u64, token: CancelToken) {
         self.cancels.insert(conversation_id, token);
+    }
+
+    /// Park a write-approval decision sink and return the request id to surface, or
+    /// `None` (deny) when too many are already outstanding.
+    fn park_permission(&mut self, decide: oneshot::Sender<bool>) -> Option<u64> {
+        if self.pending_perms.len() >= MAX_PENDING_PERMS {
+            return None;
+        }
+        let id = AI_REQUEST_BASE + self.next_request;
+        self.next_request += 1;
+        self.pending_perms.insert(id, decide);
+        Some(id)
+    }
+
+    /// Answer a parked write-approval prompt (the panel's Allow/Deny). A stale id
+    /// (already resolved, or owned by the ACP path) is a no-op. Also used to forget a
+    /// prompt abandoned on cancel (`allow` is irrelevant then — the receiver is gone).
+    pub(crate) fn resolve_permission(&mut self, request_id: u64, allow: bool) {
+        if let Some(decide) = self.pending_perms.remove(&request_id) {
+            let _ = decide.send(allow);
+        }
     }
 
     /// Flip the cancel token for an in-flight turn, if any (the panel's Stop).
@@ -238,6 +278,43 @@ pub(crate) async fn run_turn(
                 });
                 continue;
             }
+            // Gate a mutating tool behind explicit per-call user approval (Feature
+            // B). A blocked shape (wrong tier, read-only, DDL, unqualified
+            // UPDATE/DELETE) is reported to the model without ever prompting; an
+            // allowed shape surfaces the exact SQL as an Allow/Deny prompt and runs
+            // only on Allow. A read tool falls straight through.
+            match assess_write(name, input, &policy) {
+                WriteAssessment::Reject(why) => {
+                    results.push(ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: format!("error: {why}"),
+                        is_error: true,
+                    });
+                    continue;
+                }
+                WriteAssessment::NeedsApproval { sql } => {
+                    let allowed = await_write_approval(
+                        &state,
+                        &events,
+                        session,
+                        conversation_id,
+                        &sql,
+                        &cancel,
+                    )
+                    .await;
+                    if !allowed {
+                        results.push(ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: "the user denied this write — do not retry it; explain it or \
+                                propose an alternative"
+                                .into(),
+                            is_error: true,
+                        });
+                        continue;
+                    }
+                }
+                WriteAssessment::NotWrite => {}
+            }
             emit(
                 &events,
                 session,
@@ -300,6 +377,49 @@ pub(crate) async fn run_turn(
             },
         ),
     }
+}
+
+/// Surface a write-approval prompt and block this turn until the user answers it —
+/// the API-key path's analogue of the ACP permission flow (Feature B). Parks a
+/// decision sink in [`AiState`], emits an `AiPermissionRequest` carrying the exact
+/// SQL, then awaits the answer while polling the turn's cancel token (a cancelled
+/// turn, or too many outstanding prompts, denies). Returns whether to run the write.
+async fn await_write_approval(
+    state: &Arc<Mutex<AiState>>,
+    events: &Events,
+    session: Option<SessionId>,
+    conversation_id: u64,
+    sql: &str,
+    cancel: &CancelToken,
+) -> bool {
+    let (tx, mut rx) = oneshot::channel();
+    let Some(request_id) = lock(state).park_permission(tx) else {
+        return false; // too many outstanding prompts → deny
+    };
+    emit(
+        events,
+        session,
+        Event::AiPermissionRequest {
+            conversation_id,
+            request_id,
+            title: "run this write statement".into(),
+            detail: Some(sql.to_string()),
+        },
+    );
+    let decision = loop {
+        tokio::select! {
+            answer = &mut rx => break answer.unwrap_or(false),
+            _ = tokio::time::sleep(Duration::from_millis(150)) => {
+                if cancel.is_cancelled() {
+                    break false;
+                }
+            }
+        }
+    };
+    // Drop the parked sink if we bailed on cancel; a normal answer already removed
+    // it in `resolve_permission`, so this is a harmless no-op then.
+    lock(state).resolve_permission(request_id, false);
+    decision
 }
 
 /// The read-only tool catalog, filtered to the policy's access tier (M-S7). Each
@@ -387,9 +507,31 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
                 "additionalProperties": false,
             }),
         },
+        ToolDef {
+            name: "propose_write".into(),
+            description: "Execute a SINGLE data-modifying statement: INSERT, UPDATE, or DELETE. \
+                EVERY call requires explicit per-statement approval — the user sees the exact SQL \
+                and must Allow it before it runs; assume it may be denied. UPDATE and DELETE MUST \
+                include a WHERE clause. DDL (DROP/TRUNCATE/ALTER/CREATE) and any multi-statement \
+                input are rejected — tell the user to run those by hand. Use this only when the \
+                user has asked you to change data; otherwise read with run_select."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "sql": { "type": "string", "description": "A single INSERT/UPDATE/DELETE statement (UPDATE/DELETE need a WHERE)." },
+                },
+                "required": ["sql"],
+                "additionalProperties": false,
+            }),
+        },
     ];
     all.into_iter()
-        .filter(|t| policy.tier.allows_tool(&t.name))
+        // The tier gates membership; additionally, the write tool is withheld on a
+        // read-only connection so it's never even offered there (Feature B).
+        .filter(|t| {
+            policy.tier.allows_tool(&t.name) && !(policy.read_only && is_write_tool(&t.name))
+        })
         .collect()
 }
 
@@ -547,6 +689,29 @@ pub(crate) async fn run_tool(
                 Err(e) => (format!("error: could not generate the report: {e}"), false),
             }
         }
+        "propose_write" => {
+            // Re-vet at execution (defense in depth): tier, read-only, and the
+            // statement shape are all re-checked, never trusting that the caller
+            // already gated it. By here the per-call user approval has been granted
+            // (run_turn / the ACP permission flow); we only *run* an allowed shape.
+            match assess_write(name, input, policy) {
+                WriteAssessment::NeedsApproval { sql } => match driver.execute(&sql).await {
+                    Ok(affected) => (
+                        format!(
+                            "Executed the write — {affected} row(s) affected. Verify with a \
+                             SELECT if it matters."
+                        ),
+                        true,
+                    ),
+                    Err(e) => (format!("error: the write failed: {e}"), false),
+                },
+                WriteAssessment::Reject(why) => (format!("error: {why}"), false),
+                WriteAssessment::NotWrite => (
+                    "error: propose_write needs an INSERT/UPDATE/DELETE statement".into(),
+                    false,
+                ),
+            }
+        }
         other => (format!("error: unknown tool `{other}`"), false),
     };
     (cap_result_bytes(content, limits.max_result_bytes), ok)
@@ -618,13 +783,113 @@ fn is_read_only_select(sql: &str) -> bool {
     lower.starts_with("select") || lower.starts_with("with")
 }
 
+/// Whether `name` is a mutating tool — it never auto-runs and never auto-allows;
+/// it rides the per-call approval gate on both backends (Feature B).
+pub(crate) fn is_write_tool(name: &str) -> bool {
+    name == "propose_write"
+}
+
+/// The outcome of vetting a `propose_write` call before it runs (Feature B). The
+/// single source of truth, called by `run_turn` (to decide reject vs. prompt) and
+/// by `run_tool` (to re-validate before executing). Keeping it in one place means
+/// the gate the user sees and the gate the write rides can't drift apart.
+pub(crate) enum WriteAssessment {
+    /// Not a write tool — run it normally (no approval).
+    NotWrite,
+    /// Blocked outright (wrong tier, read-only connection, or a destructive shape):
+    /// report this to the model without prompting the user.
+    Reject(String),
+    /// An allowed single INSERT/UPDATE/DELETE — prompt the user with this exact SQL,
+    /// and only run it on Allow.
+    NeedsApproval { sql: String },
+}
+
+/// Vet a tool call for the write gate. A `propose_write` is allowed only at the
+/// `Write` tier, on a writable connection, and for a safe statement shape; anything
+/// else is rejected (never silently run, never even prompted).
+pub(crate) fn assess_write(name: &str, input: &Json, policy: &AiPolicy) -> WriteAssessment {
+    if !is_write_tool(name) {
+        return WriteAssessment::NotWrite;
+    }
+    if policy.tier != AiTier::Write {
+        return WriteAssessment::Reject(
+            "the write tool is not available at this access tier".into(),
+        );
+    }
+    if policy.read_only {
+        return WriteAssessment::Reject(
+            "this connection is read-only — writes are disabled. Tell the user; do not retry."
+                .into(),
+        );
+    }
+    let sql = input.get("sql").and_then(Json::as_str).unwrap_or("").trim();
+    match write_shape(sql) {
+        WriteShape::Ok => WriteAssessment::NeedsApproval {
+            sql: sql.to_string(),
+        },
+        WriteShape::NotWrite => WriteAssessment::Reject(
+            "propose_write is only for INSERT/UPDATE/DELETE — use run_select to read".into(),
+        ),
+        WriteShape::Blocked(why) => WriteAssessment::Reject(why.into()),
+    }
+}
+
+/// The shape verdict for a candidate write statement.
+enum WriteShape {
+    /// A single, qualified INSERT/UPDATE/DELETE — eligible (still needs approval).
+    Ok,
+    /// Not a write at all (SELECT/WITH/empty).
+    NotWrite,
+    /// A shape blocked even with approval, with the reason to report.
+    Blocked(&'static str),
+}
+
+/// Classify a candidate write conservatively (Feature B). The hard blocks — DDL and
+/// privilege statements, an unqualified UPDATE/DELETE (no WHERE), and any chained
+/// statement — are the cases per-call approval alone shouldn't be trusted to catch
+/// (a rubber-stamped `DELETE` with no WHERE is catastrophic). False negatives are
+/// fine: the user can always run those by hand in a query tab.
+fn write_shape(sql: &str) -> WriteShape {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    if trimmed.is_empty() {
+        return WriteShape::Blocked("the statement is empty");
+    }
+    // No embedded terminator — a `;` mid-string could chain a second statement past
+    // the keyword check (and past the user's eyes).
+    if trimmed.contains(';') {
+        return WriteShape::Blocked("multiple statements are not allowed — submit one at a time");
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let first = lower.split_whitespace().next().unwrap_or("");
+    match first {
+        "select" | "with" => WriteShape::NotWrite,
+        "insert" => WriteShape::Ok,
+        "update" | "delete" => {
+            // Require a WHERE clause so a whole-table mutation can't slip through.
+            if lower.contains(" where ") || lower.contains("\nwhere ") {
+                WriteShape::Ok
+            } else {
+                WriteShape::Blocked(
+                    "an UPDATE/DELETE without a WHERE clause is blocked — add a WHERE, or run a \
+                     full-table change yourself in a query tab",
+                )
+            }
+        }
+        // DROP / TRUNCATE / ALTER / CREATE / RENAME / GRANT / REVOKE / … — DDL and
+        // privilege changes are never run through the assistant.
+        _ => WriteShape::Blocked(
+            "only INSERT/UPDATE/DELETE are allowed here — DDL (DROP/TRUNCATE/ALTER/…) must be run \
+             manually in a query tab",
+        ),
+    }
+}
+
 /// The stable grounding instruction, tailored to the access tier (M-S7). Shared
 /// with the ACP path, which folds it into the agent's first prompt (ACP
 /// `session/prompt` has no system role). The tier line keeps the model's
 /// expectations in step with the catalog it actually receives, but the *catalog*
 /// is the real gate — the prompt is just courtesy.
 pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
-    use red_core::AiTier;
     let tools_line = match policy.tier {
         AiTier::Off => {
             "You have NO database tools available — answer from the schema overview and the \
@@ -642,6 +907,15 @@ pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
              answer in the live database rather than guessing — discover objects with list_schema, \
              inspect structure with describe_table, and read data with run_select. Prefer small, \
              targeted queries with explicit columns and LIMIT."
+        }
+        AiTier::Write => {
+            "You have the read tools (list_schema, describe_table, run_select, explain, \
+             generate_report) AND a gated write tool, propose_write, for a SINGLE \
+             INSERT/UPDATE/DELETE. Every propose_write call requires the user's explicit Allow on \
+             the exact SQL — assume it may be denied, and never batch or chain statements. \
+             UPDATE/DELETE must have a WHERE clause; DDL (DROP/TRUNCATE/ALTER/CREATE) is not \
+             available — tell the user to run those by hand. Only write when the user has asked you \
+             to change data; read first to get it right, and verify after."
         }
     };
     let mut s = format!(
@@ -952,6 +1226,100 @@ mod tests {
         assert!(!ok);
         // Nothing announced: the channel is empty but still open (Err), not an item.
         assert!(rx.try_recv().is_err(), "a refused report must not announce");
+    }
+
+    #[test]
+    fn write_gate_blocks_dangerous_shapes_and_allows_qualified() {
+        let write = AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        };
+        let assess = |sql: &str| assess_write("propose_write", &json!({ "sql": sql }), &write);
+        let allowed = |sql: &str| matches!(assess(sql), WriteAssessment::NeedsApproval { .. });
+        let rejected = |sql: &str| matches!(assess(sql), WriteAssessment::Reject(_));
+
+        // Qualified writes are eligible (they still need approval).
+        assert!(allowed("INSERT INTO t (a) VALUES (1)"));
+        assert!(allowed("UPDATE t SET a = 1 WHERE id = 5"));
+        assert!(allowed("DELETE FROM t WHERE id = 5"));
+        // Unqualified mass mutations are hard-blocked.
+        assert!(rejected("UPDATE t SET a = 1"));
+        assert!(rejected("DELETE FROM t"));
+        // DDL / privilege statements are never run via the tool.
+        assert!(rejected("DROP TABLE t"));
+        assert!(rejected("TRUNCATE t"));
+        assert!(rejected("ALTER TABLE t ADD c int"));
+        // No chaining a second statement past the gate.
+        assert!(rejected("UPDATE t SET a=1 WHERE id=1; DROP TABLE t"));
+        // A read query isn't a write.
+        assert!(rejected("SELECT * FROM t"));
+    }
+
+    #[test]
+    fn write_gate_respects_tier_and_read_only() {
+        let qualified = json!({ "sql": "DELETE FROM t WHERE id = 1" });
+        // Below the Write tier the write tool is rejected outright.
+        let read = AiPolicy::default();
+        assert!(matches!(
+            assess_write("propose_write", &qualified, &read),
+            WriteAssessment::Reject(_)
+        ));
+        // A read-only connection rejects it even at the Write tier.
+        let read_only = AiPolicy {
+            tier: AiTier::Write,
+            read_only: true,
+            ..AiPolicy::default()
+        };
+        assert!(matches!(
+            assess_write("propose_write", &qualified, &read_only),
+            WriteAssessment::Reject(_)
+        ));
+        // A read tool is never gated as a write.
+        assert!(matches!(
+            assess_write("run_select", &json!({ "sql": "SELECT 1" }), &read),
+            WriteAssessment::NotWrite
+        ));
+    }
+
+    #[test]
+    fn catalog_offers_write_tool_only_at_write_tier_and_not_read_only() {
+        let names = |p: AiPolicy| {
+            tool_catalog(&p)
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+        };
+        // Read tier never offers the write tool.
+        assert!(names(AiPolicy::default())
+            .iter()
+            .all(|n| n != "propose_write"));
+        // Write tier offers it…
+        let write = AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        };
+        assert!(names(write).iter().any(|n| n == "propose_write"));
+        // …but withholds it on a read-only connection.
+        let write_ro = AiPolicy {
+            tier: AiTier::Write,
+            read_only: true,
+            ..AiPolicy::default()
+        };
+        assert!(names(write_ro).iter().all(|n| n != "propose_write"));
+    }
+
+    #[test]
+    fn write_approval_registry_parks_resolves_and_offsets_ids() {
+        let mut st = AiState::default();
+        let (tx, mut rx) = oneshot::channel();
+        let id = st.park_permission(tx).expect("a fresh prompt parks");
+        // Ids are offset so they never collide with the ACP manager's id space.
+        assert!(id >= AI_REQUEST_BASE);
+        st.resolve_permission(id, true);
+        assert_eq!(rx.try_recv(), Ok(true));
+        // Resolving a stale/unknown id is a harmless no-op.
+        st.resolve_permission(id, false);
+        st.resolve_permission(424242, false);
     }
 
     #[test]

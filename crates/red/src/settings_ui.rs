@@ -1110,10 +1110,13 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
 
     // Database access tier — the capability boundary. Out-of-tier tools are never
     // even offered to the model (M-S7), so this is the real "how much can it see".
+    // The global selector tops out at Read; the write tier is per-connection only
+    // (connections.toml `ai_tier = "write"`), so it's never a one-click global
+    // default. A hand-set global `write` shows as Read here.
     let tier_sel = match red_core::AiTier::parse(&ai.tier) {
         red_core::AiTier::Off => 0,
         red_core::AiTier::Schema => 1,
-        red_core::AiTier::Read => 2,
+        red_core::AiTier::Read | red_core::AiTier::Write => 2,
     };
     let tier_view = view.clone();
     let tier = Segmented::new("set-ai-tier")
@@ -1230,9 +1233,12 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                     .text_size(theme.scale(12.))
                     .text_color(theme.text_muted)
                     .child(
-                        "A connection can pin a stricter tier in connections.toml \
-                         (ai_tier / ai_enabled); the assistant always runs at the \
-                         stricter of the two.",
+                        "A connection can override the tier in connections.toml \
+                         (ai_tier / ai_enabled). Write access is per-connection only — \
+                         set ai_tier = \"write\" on a specific connection to let the \
+                         assistant propose INSERT/UPDATE/DELETE. Every write still needs \
+                         your explicit per-statement approval, is blocked on a read-only \
+                         connection, and never runs DDL or an unqualified UPDATE/DELETE.",
                     ),
             )
             .child(settings_header("Read-tier resource guards", &theme))

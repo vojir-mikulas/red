@@ -99,8 +99,13 @@ provider = "anthropic"
 #   "off"    — no database tools; the assistant chats without DB grounding.
 #   "schema" — structure only (tables, columns, types) — never row data.
 #   "read"   — the full read catalog: capped SELECTs + EXPLAIN. A tool above the
-#              tier is never offered to the model. A connection can pin a stricter
-#              tier in connections.toml (ai_tier); the stricter of the two wins.
+#              tier is never offered to the model.
+# A connection can override this in connections.toml (ai_tier). The "write" tier —
+# which adds the gated propose_write tool (a single INSERT/UPDATE/DELETE that needs
+# your explicit per-statement approval, is blocked on read-only connections, and
+# never runs DDL or an unqualified UPDATE/DELETE) — is PER-CONNECTION ONLY: set
+# `ai_tier = "write"` on a specific connection. It is intentionally not a global
+# default here.
 tier = "read"
 
 # Model id for the API-key path. Empty falls back to the Opus default. The

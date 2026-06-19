@@ -359,7 +359,14 @@ async fn ensure_conversation(
             command,
             cwd,
             mcp: Some(grounding),
-            allow_tools: tool_catalog(&policy).into_iter().map(|t| t.name).collect(),
+            // Auto-allow only the read-only tools; the write tool (Feature B) is
+            // deliberately excluded so every write is routed to the user for an
+            // explicit Allow/Deny, never silently run by the agent.
+            allow_tools: tool_catalog(&policy)
+                .into_iter()
+                .map(|t| t.name)
+                .filter(|n| !crate::ai::is_write_tool(n))
+                .collect(),
             permissions: Some(perm_tx),
         };
         let agent = AcpConversation::start(config)
