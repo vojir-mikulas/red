@@ -313,6 +313,12 @@ pub(crate) struct QueryTab {
     /// The query plan (Track B4 — EXPLAIN), when one is open. Occupies the result
     /// pane in place of the grid; running a query clears it. `None` is the grid.
     pub plan: Option<crate::plan::PlanView>,
+    /// Present iff this is an **AI agent tab** (Feature A): the tab renders the
+    /// agent conversation + its composer in place of the SQL editor, and reuses
+    /// `result` above as the inline grid for SQL the agent ran. `None` for a
+    /// normal query tab. The `editor` field still exists (unused) so every tab
+    /// shares one construction/lifecycle path.
+    pub agent: Option<crate::assistant::AgentSession>,
 }
 
 impl QueryTab {
@@ -347,12 +353,17 @@ impl QueryTab {
             editor,
             result: None,
             plan: None,
+            agent: None,
         }
     }
 
     /// A blank tab the user hasn't touched — no result and the default text still
-    /// in the editor. Closing one of these doesn't warrant a confirmation.
+    /// in the editor. Closing one of these doesn't warrant a confirmation. An agent
+    /// tab is pristine while its conversation is still empty (nothing asked yet).
     pub(crate) fn is_pristine(&self, cx: &Context<AppState>) -> bool {
+        if let Some(agent) = &self.agent {
+            return agent.chat.messages.is_empty();
+        }
         self.result.is_none() && self.editor.read(cx).content() == EMPTY_QUERY
     }
 }
@@ -387,6 +398,8 @@ pub(crate) struct ActiveConn {
     pub active_tab: usize,
     /// Monotonic counter for naming blank tabs ("query 1", "query 2", …).
     pub query_seq: usize,
+    /// Monotonic counter for naming AI agent tabs ("Agent 1", "Agent 2", …).
+    pub agent_seq: usize,
     /// While a tab is being dragged, the gap (insertion index `0..=tabs.len()`)
     /// where it would land — drives the drop indicator. Only meaningful when a
     /// drag is active; the strip gates rendering on `has_active_drag`.
@@ -441,6 +454,7 @@ impl ActiveConn {
             tabs: vec![tab],
             active_tab: 0,
             query_seq: 1,
+            agent_seq: 0,
             tab_drop_target: None,
             tab_scroll: ScrollHandle::new(),
             schema_focus: cx.focus_handle(),
@@ -545,6 +559,13 @@ pub struct AppState {
     /// Monotonic id source for exports, so progress / finished / cancelled events
     /// and a `CancelExport` route to the right in-flight export.
     pub(crate) next_export_id: u64,
+    /// Export ids that are HTML *reports* — opened in the browser (not just toasted)
+    /// once `ExportFinished` lands (Feature C). Drained on completion / cancel.
+    pub(crate) report_export_ids: Vec<u64>,
+    /// An open-result epoch awaiting a one-click report: once its rows land
+    /// (`on_result_ready`), it's exported to a temp HTML file and opened. Set by the
+    /// agent tab's "Report" affordance (Feature C); taken when the result is ready.
+    pub(crate) report_after_epoch: Option<u64>,
     /// Monotonic id source for clipboard re-fetches, matching a `CopyRowsLoaded`
     /// reply to the copy that asked for it.
     pub(crate) next_copy_id: u64,
@@ -563,6 +584,9 @@ pub struct AppState {
     /// Set when an inline conversation rename just began: the next render focuses
     /// its edit field so the user types the new title at once.
     pub(crate) focus_rename: bool,
+    /// Set when an AI agent tab just opened or became active: the next render
+    /// focuses its composer so the user can type the request immediately.
+    pub(crate) focus_agent_input: bool,
     /// Docked width of the assistant panel, retained while it's closed so reopening
     /// restores it. Resizable via the shell split.
     pub(crate) assistant_w: Pixels,
@@ -1195,12 +1219,15 @@ impl AppState {
             notifications: Vec::new(),
             next_notification_id: 0,
             next_export_id: 0,
+            report_export_ids: Vec::new(),
+            report_after_epoch: None,
             next_copy_id: 0,
             pending_copy: None,
             inspector: None,
             assistant: None,
             focus_assistant: false,
             focus_rename: false,
+            focus_agent_input: false,
             assistant_w: px(380.),
             assistant_drag: None,
             ai_configured: {
@@ -1703,7 +1730,7 @@ impl AppState {
 
 /// Open `path` with the OS's default handler — the file-first "open in editor"
 /// seam. Platform shell-out lives at the app edge; the UI never blocks on it.
-fn open_in_os(path: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn open_in_os(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     let mut cmd = {
         let mut c = std::process::Command::new("open");

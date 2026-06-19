@@ -26,7 +26,7 @@ use gpui::{
     ScrollHandle, SharedString, WeakEntity, Window,
 };
 
-use crate::app::{ActiveConn, AppState, Phase};
+use crate::app::{ActiveConn, AppState, Phase, QueryTab};
 
 /// Cap on schema objects folded into the grounding summary, so a database with
 /// thousands of tables doesn't blow the context window. The model pulls full
@@ -155,7 +155,7 @@ pub(crate) struct ChatSession {
 
 impl ChatSession {
     /// A fresh, empty chat on `provider` with the given stable id.
-    fn new(conversation_id: u64, provider: String) -> Self {
+    pub(crate) fn new(conversation_id: u64, provider: String) -> Self {
         ChatSession {
             scroll: ScrollHandle::new(),
             messages: Vec::new(),
@@ -228,6 +228,47 @@ impl ChatSession {
             });
         }
         self.messages.last_mut().expect("just ensured")
+    }
+}
+
+/// An **AI agent tab**'s state (Feature A): a full conversation rehomed into a
+/// query-tab peer. It carries the same [`ChatSession`] the sidebar uses — so the
+/// shipped streaming, provider binding, permission gate, and usage footer all work
+/// unchanged, and events route by `conversation_id` to whichever chat owns them,
+/// sidebar or tab. The tab additionally owns its own composer; the inline result
+/// grid lives in the host [`QueryTab::result`], so all the windowed-cursor paging
+/// plumbing applies for free.
+pub(crate) struct AgentSession {
+    /// The conversation: transcript, streaming state, provider binding, usage.
+    pub(crate) chat: ChatSession,
+    /// This tab's prompt composer — a multiline box; Enter sends, Shift+Enter
+    /// newlines (mirrors the sidebar composer).
+    pub(crate) input: Entity<CodeEditor>,
+    /// Kept alive so closing the tab drops the composer's submit listener.
+    #[allow(dead_code)]
+    sub: gpui::Subscription,
+}
+
+impl AgentSession {
+    /// Build a fresh agent session bound to `conversation_id` on `provider`, wiring
+    /// the composer's Enter/Esc to the active agent tab's send/cancel.
+    fn new(conversation_id: u64, provider: String, cx: &mut Context<AppState>) -> Self {
+        let input = cx.new(|cx| {
+            CodeEditor::new(cx)
+                .gutter(false)
+                .submit_on_enter(true)
+                .a11y_label("AI agent prompt")
+                .placeholder("Ask for data in plain language…")
+        });
+        let sub = cx.subscribe(&input, |this, _, e: &CodeEditorEvent, cx| match e {
+            CodeEditorEvent::Submit | CodeEditorEvent::Run => this.submit_agent_tab(cx),
+            CodeEditorEvent::Escape => this.cancel_agent_tab(cx),
+        });
+        AgentSession {
+            chat: ChatSession::new(conversation_id, provider),
+            input,
+            sub,
+        }
     }
 }
 
@@ -448,49 +489,69 @@ impl AppState {
         self.send_turn(kind.prompt().to_string(), cx);
     }
 
-    /// Record a user turn and dispatch it to the backend on the active chat. The
-    /// caller has already resolved the message text (typed, or a quick-action
-    /// prompt). The chat's own provider binding (M-S6) decides which backend runs
-    /// it, so concurrent chats on different backends each route correctly.
+    /// Record a user turn and dispatch it to the backend on the active *sidebar*
+    /// chat. The caller has already resolved the message text (typed, or a
+    /// quick-action prompt). Delegates to [`Self::dispatch_turn`], the shared core
+    /// used by the sidebar and the agent tabs alike.
     fn send_turn(&mut self, message: String, cx: &mut Context<Self>) {
         let Some(state) = self.assistant.as_ref() else {
             return;
         };
-        if state.active().streaming || message.trim().is_empty() {
-            return;
-        }
         let conversation_id = state.active().conversation_id;
         let provider = state.active().provider_kind();
+        self.dispatch_turn(conversation_id, provider, message, cx);
+    }
+
+    /// The shared turn-dispatch core: record the user message on whichever chat owns
+    /// `conversation_id` (sidebar *or* agent tab), then send `Command::AiTurn`. The
+    /// chat's own provider binding (M-S6) decides which backend runs it, so
+    /// concurrent chats on different backends each route correctly.
+    fn dispatch_turn(
+        &mut self,
+        conversation_id: u64,
+        provider: red_service::AiProviderKind,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        if message.trim().is_empty() {
+            return;
+        }
         let (session, mut context) = {
             let Phase::Connected(active) = &self.phase else {
                 return;
             };
             (active.session, self.ai_context(active, cx))
         };
-
-        if let Some(state) = self.assistant.as_mut() {
-            let chat = state.active_mut();
-            // A reopened chat seeds its prior transcript into this one turn so the
-            // model resumes coherently despite a fresh backend session (M-S5).
-            context.prior_transcript = chat.pending_seed.take();
-            // Title the chat from its first user message (used as the saved name).
-            if chat.title.is_none() {
-                chat.title = Some(derive_title(&message));
-            }
-            chat.messages.push(ChatMessage {
-                role: ChatRole::User,
-                text: message.clone(),
-                thinking: String::new(),
-            });
-            chat.error = None;
-            chat.status = None;
-            chat.streaming = true;
-            // Fresh turn: the next assistant bubble reveals from the start.
-            chat.revealed = 0;
-            // It's no longer a draft — drop any preserved prompt text.
-            chat.draft.clear();
+        let sent = self
+            .with_chat_mut(conversation_id, |chat| {
+                if chat.streaming {
+                    return false;
+                }
+                // A reopened chat seeds its prior transcript into this one turn so
+                // the model resumes coherently despite a fresh session (M-S5).
+                context.prior_transcript = chat.pending_seed.take();
+                // Title the chat from its first user message (used as the saved name).
+                if chat.title.is_none() {
+                    chat.title = Some(derive_title(&message));
+                }
+                chat.messages.push(ChatMessage {
+                    role: ChatRole::User,
+                    text: message.clone(),
+                    thinking: String::new(),
+                });
+                chat.error = None;
+                chat.status = None;
+                chat.streaming = true;
+                // Fresh turn: the next assistant bubble reveals from the start.
+                chat.revealed = 0;
+                // It's no longer a draft — drop any preserved prompt text.
+                chat.draft.clear();
+                true
+            })
+            .unwrap_or(false);
+        if !sent {
+            return;
         }
-
         self.service.send_to(
             session,
             red_service::Command::AiTurn {
@@ -500,7 +561,206 @@ impl AppState {
                 context,
             },
         );
+        // Keep an agent tab's strip label in step with its now-titled chat.
+        self.sync_agent_tab_title();
         cx.notify();
+    }
+
+    /// Run `f` against whichever [`ChatSession`] owns `conversation_id` — the
+    /// sidebar's chats first, then any open agent tab. Returns `f`'s result, or
+    /// `None` if no chat matches. The closure returns an owned value so no borrow
+    /// of `self` escapes (sidesteps the two-field borrow pitfall).
+    fn with_chat_mut<R>(
+        &mut self,
+        conversation_id: u64,
+        f: impl FnOnce(&mut ChatSession) -> R,
+    ) -> Option<R> {
+        if let Some(state) = self.assistant.as_mut() {
+            if let Some(chat) = state.find_mut(conversation_id) {
+                return Some(f(chat));
+            }
+        }
+        if let Phase::Connected(active) = &mut self.phase {
+            for tab in &mut active.tabs {
+                if let Some(agent) = &mut tab.agent {
+                    if agent.chat.conversation_id == conversation_id {
+                        return Some(f(&mut agent.chat));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // --- AI agent tabs (Feature A) ------------------------------------------
+
+    /// Open a fresh AI agent tab — a worksheet peer of a query tab where the agent
+    /// writes + runs read-only SQL and shows its work. Gated on the assistant being
+    /// enabled for this connection (M-S7); the backend tier still bounds what it can
+    /// do. Focuses the new tab's composer.
+    pub(crate) fn new_agent_tab(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.phase, Phase::Connected(_)) || !self.ai_enabled() {
+            return;
+        }
+        let conversation_id = self.next_conversation_id;
+        self.next_conversation_id += 1;
+        let provider = self.default_ai_provider();
+        let seq = if let Phase::Connected(active) = &mut self.phase {
+            active.agent_seq += 1;
+            active.agent_seq
+        } else {
+            return;
+        };
+        let mut tab = QueryTab::new(format!("Agent {seq}"), cx);
+        tab.agent = Some(AgentSession::new(conversation_id, provider, cx));
+        self.push_tab(tab, cx);
+        self.focus_agent_input = true;
+        cx.notify();
+    }
+
+    /// Send the active agent tab's composer text as one turn.
+    pub(crate) fn submit_agent_tab(&mut self, cx: &mut Context<Self>) {
+        let (conversation_id, provider, message, input) = {
+            let Phase::Connected(active) = &self.phase else {
+                return;
+            };
+            let Some(agent) = active.active().and_then(|t| t.agent.as_ref()) else {
+                return;
+            };
+            if agent.chat.streaming {
+                return;
+            }
+            (
+                agent.chat.conversation_id,
+                agent.chat.provider_kind(),
+                agent.input.read(cx).content().trim().to_string(),
+                agent.input.clone(),
+            )
+        };
+        if message.is_empty() {
+            return;
+        }
+        input.update(cx, |i, cx| i.set_content("", cx));
+        self.dispatch_turn(conversation_id, provider, message, cx);
+    }
+
+    /// Stop the active agent tab's in-flight turn (its Stop button / Esc).
+    pub(crate) fn cancel_agent_tab(&mut self, cx: &mut Context<Self>) {
+        let conversation_id = match &self.phase {
+            Phase::Connected(active) => match active.active().and_then(|t| t.agent.as_ref()) {
+                Some(agent) if agent.chat.streaming => agent.chat.conversation_id,
+                _ => return,
+            },
+            _ => return,
+        };
+        if let Phase::Connected(active) = &self.phase {
+            self.service.send_to(
+                active.session,
+                red_service::Command::AiCancel { conversation_id },
+            );
+        }
+        cx.notify();
+    }
+
+    /// Answer the active agent tab's pending tool-permission prompt (its Allow/Deny).
+    pub(crate) fn answer_agent_permission(&mut self, allow: bool, cx: &mut Context<Self>) {
+        let (conversation_id, request_id) = {
+            let Phase::Connected(active) = &self.phase else {
+                return;
+            };
+            let Some(agent) = active.active().and_then(|t| t.agent.as_ref()) else {
+                return;
+            };
+            match &agent.chat.pending_permission {
+                Some(p) => (agent.chat.conversation_id, p.request_id),
+                None => return,
+            }
+        };
+        self.with_chat_mut(conversation_id, |chat| chat.pending_permission = None);
+        if let Phase::Connected(active) = &self.phase {
+            self.service.send_to(
+                active.session,
+                red_service::Command::AiPermission {
+                    conversation_id,
+                    request_id,
+                    allow,
+                },
+            );
+        }
+        cx.notify();
+    }
+
+    /// Open the agent-proposed `sql` in the active agent tab's *inline* grid (the
+    /// host tab's `result`) and return the new result's epoch. Read-only by design —
+    /// the worksheet shows the same rows the model reasoned over; a write belongs in
+    /// a real query tab. Returns `None` (after a toast) if it isn't a single SELECT.
+    fn agent_open_select(&mut self, sql: String, cx: &mut Context<Self>) -> Option<u64> {
+        let sql = sql.trim().to_string();
+        if sql.is_empty() {
+            return None;
+        }
+        if !matches!(crate::sql::classify(&sql), crate::sql::StatementKind::Query) {
+            self.notify(
+                flint::ToastVariant::Error,
+                "The agent worksheet runs read-only SELECTs — use “Open in a query tab” to run writes.",
+                cx,
+            );
+            return None;
+        }
+        if crate::sql::statement_count(&sql) > 1 {
+            self.notify(
+                flint::ToastVariant::Error,
+                "Select a single statement to run.",
+                cx,
+            );
+            return None;
+        }
+        let sql = crate::sql::auto_limit(&sql, self.settings.query.auto_limit).unwrap_or(sql);
+        self.open_result("agent", sql, None, cx);
+        match &self.phase {
+            Phase::Connected(active) => active.active_result().map(|g| g.epoch),
+            _ => None,
+        }
+    }
+
+    /// Run the agent-proposed `sql` inline in the active agent tab.
+    pub(crate) fn agent_run_sql(&mut self, sql: String, cx: &mut Context<Self>) {
+        let _ = self.agent_open_select(sql, cx);
+    }
+
+    /// Run the agent-proposed `sql` inline and, once its rows land, render them to a
+    /// themed HTML report and open it in the browser (Feature C) — the one-click
+    /// "generate a report" payoff.
+    pub(crate) fn agent_report_sql(&mut self, sql: String, cx: &mut Context<Self>) {
+        if let Some(epoch) = self.agent_open_select(sql, cx) {
+            self.report_after_epoch = Some(epoch);
+        }
+    }
+
+    /// Open the agent-proposed `sql` in a fresh query tab and run it — the
+    /// "promote to a worksheet I own" affordance.
+    pub(crate) fn open_sql_in_query_tab(&mut self, sql: String, cx: &mut Context<Self>) {
+        self.new_query(cx);
+        if let Phase::Connected(active) = &self.phase {
+            if let Some(tab) = active.active() {
+                tab.editor
+                    .update(cx, |e, cx| e.set_content(sql.clone(), cx));
+            }
+        }
+        self.run_editor_query(cx);
+    }
+
+    /// Mirror the active agent tab's chat title onto its strip label, once the chat
+    /// derives one from the first message.
+    fn sync_agent_tab_title(&mut self) {
+        if let Phase::Connected(active) = &mut self.phase {
+            if let Some(tab) = active.tabs.get_mut(active.active_tab) {
+                let title = tab.agent.as_ref().and_then(|a| a.chat.title.clone());
+                if let Some(title) = title {
+                    tab.title = title;
+                }
+            }
+        }
     }
 
     /// Re-authenticate / switch the subscription account (M-S4). The agent owns
@@ -968,15 +1228,10 @@ impl AppState {
         // Under a reduced-motion preference, skip the typewriter entirely: text
         // appears the instant it arrives.
         let reduce_motion = cx.reduce_motion();
-        let grew_text = {
-            let Some(state) = self.assistant.as_mut() else {
-                return;
-            };
-            // Route to whichever chat owns the turn — not just the active one, so a
-            // background chat keeps streaming while another is shown (M-S6).
-            let Some(chat) = state.find_mut(conversation_id) else {
-                return;
-            };
+        // Route to whichever chat owns the turn — not just the active one, and
+        // across both surfaces (sidebar + agent tabs), so a background chat keeps
+        // streaming while another is shown (M-S6).
+        let grew_text = self.with_chat_mut(conversation_id, |chat| {
             let mut grew = false;
             match delta {
                 red_service::AiDelta::Text(t) => {
@@ -1004,6 +1259,9 @@ impl AppState {
                 chat.revealed = chat.streaming_text_chars();
             }
             grew
+        });
+        let Some(grew_text) = grew_text else {
+            return;
         };
         cx.notify();
         if grew_text && !reduce_motion {
@@ -1016,17 +1274,17 @@ impl AppState {
     /// reveal catches up to the received text (see `tick_reveal`); a later burst
     /// restarts it. Cheap to call on every delta.
     fn ensure_reveal_ticker(&mut self, conversation_id: u64, cx: &mut Context<Self>) {
-        {
-            let Some(state) = self.assistant.as_mut() else {
-                return;
-            };
-            let Some(chat) = state.find_mut(conversation_id) else {
-                return;
-            };
-            if chat.revealing || chat.revealed >= chat.streaming_text_chars() {
-                return;
-            }
-            chat.revealing = true;
+        let started = self
+            .with_chat_mut(conversation_id, |chat| {
+                if chat.revealing || chat.revealed >= chat.streaming_text_chars() {
+                    return false;
+                }
+                chat.revealing = true;
+                true
+            })
+            .unwrap_or(false);
+        if !started {
+            return;
         }
         cx.spawn(
             async move |this: WeakEntity<Self>, cx: &mut AsyncApp| loop {
@@ -1046,26 +1304,29 @@ impl AppState {
     /// whether the ticker should fire again (false once it's caught up — a new burst
     /// will restart it via `ensure_reveal_ticker`).
     fn tick_reveal(&mut self, conversation_id: u64, cx: &mut Context<Self>) -> bool {
-        let Some(state) = self.assistant.as_mut() else {
-            return false;
-        };
-        let Some(chat) = state.find_mut(conversation_id) else {
-            return false;
-        };
-        let target = chat.streaming_text_chars();
-        if chat.revealed >= target {
-            chat.revealing = false;
-            return false;
+        // Returns (advanced?, keep_going?) — `advanced` gates the repaint so a
+        // no-op tick (chat gone, or already caught up) doesn't churn a frame.
+        let (advanced, keep) = self
+            .with_chat_mut(conversation_id, |chat| {
+                let target = chat.streaming_text_chars();
+                if chat.revealed >= target {
+                    chat.revealing = false;
+                    return (false, false);
+                }
+                let remaining = target - chat.revealed;
+                let step = (remaining / REVEAL_DIVISOR).max(REVEAL_MIN_STEP);
+                chat.revealed = (chat.revealed + step).min(target);
+                let caught_up = chat.revealed >= target;
+                if caught_up {
+                    chat.revealing = false;
+                }
+                (true, !caught_up)
+            })
+            .unwrap_or((false, false));
+        if advanced {
+            cx.notify();
         }
-        let remaining = target - chat.revealed;
-        let step = (remaining / REVEAL_DIVISOR).max(REVEAL_MIN_STEP);
-        chat.revealed = (chat.revealed + step).min(target);
-        let caught_up = chat.revealed >= target;
-        if caught_up {
-            chat.revealing = false;
-        }
-        cx.notify();
-        !caught_up
+        keep
     }
 
     pub(crate) fn on_ai_finished(
@@ -1074,9 +1335,8 @@ impl AppState {
         usage: red_service::AiUsage,
         cx: &mut Context<Self>,
     ) {
-        let mut finished = false;
-        if let Some(state) = self.assistant.as_mut() {
-            if let Some(chat) = state.find_mut(conversation_id) {
+        let finished = self
+            .with_chat_mut(conversation_id, |chat| {
                 chat.streaming = false;
                 chat.status = None;
                 chat.pending_permission = None;
@@ -1087,13 +1347,14 @@ impl AppState {
                 }
                 // Persist the now-complete exchange so it survives a restart (M-S5).
                 persist_chat(chat);
-                finished = true;
-            }
-        }
+            })
+            .is_some();
         if finished {
             cx.notify();
             // Drain any still-hidden tail now that no more text is coming.
             self.ensure_reveal_ticker(conversation_id, cx);
+            // An agent tab's first reply may have just titled the chat.
+            self.sync_agent_tab_title();
         }
     }
 
@@ -1103,15 +1364,17 @@ impl AppState {
         message: String,
         cx: &mut Context<Self>,
     ) {
-        if let Some(state) = self.assistant.as_mut() {
-            if let Some(chat) = state.find_mut(conversation_id) {
+        if self
+            .with_chat_mut(conversation_id, |chat| {
                 chat.streaming = false;
                 chat.status = None;
                 chat.error = Some(message.into());
                 // A prompt can't outlive its turn — drop any unanswered one.
                 chat.pending_permission = None;
-                cx.notify();
-            }
+            })
+            .is_some()
+        {
+            cx.notify();
         }
     }
 
@@ -1125,15 +1388,17 @@ impl AppState {
         detail: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(state) = self.assistant.as_mut() {
-            if let Some(chat) = state.find_mut(conversation_id) {
+        if self
+            .with_chat_mut(conversation_id, |chat| {
                 chat.pending_permission = Some(PendingPermission {
                     request_id,
                     title: title.into(),
                     detail: detail.map(Into::into),
                 });
-                cx.notify();
-            }
+            })
+            .is_some()
+        {
+            cx.notify();
         }
     }
 
@@ -1253,7 +1518,7 @@ impl AppState {
             let live =
                 i == last && msg.role == ChatRole::Assistant && (chat.streaming || chat.revealing);
             let reveal = live.then_some(chat.revealed);
-            body = body.child(self.render_bubble(msg, reveal, &theme, cx));
+            body = body.child(self.render_bubble(msg, reveal, false, &theme, cx));
         }
         if let Some(status) = &chat.status {
             body = body.child(
@@ -1336,7 +1601,7 @@ impl AppState {
             .child(header)
             .child(body)
             .when_some(chat.pending_permission.as_ref(), |col, pending| {
-                col.child(self.render_permission(pending, &theme, cx))
+                col.child(self.render_permission(pending, false, &theme, cx))
             })
             .when_some(self.render_quick_actions(chat, &theme, cx), |col, chips| {
                 col.child(chips)
@@ -2000,6 +2265,7 @@ impl AppState {
     fn render_permission(
         &self,
         pending: &PendingPermission,
+        agent_tab: bool,
         theme: &flint::Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2054,18 +2320,35 @@ impl AppState {
                     .child(detail.clone()),
             );
         }
+        // Route the answer to the surface the prompt is shown on: an agent tab's
+        // own chat, or the active sidebar chat. `agent_tab` is Copy, so each
+        // listener captures its own copy.
         card.child(
             div()
                 .flex()
                 .items_center()
                 .gap_2()
                 .child(
-                    button("ai-permission-deny", "Deny", false)
-                        .on_click(cx.listener(|this, _, _, cx| this.answer_permission(false, cx))),
+                    button("ai-permission-deny", "Deny", false).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            if agent_tab {
+                                this.answer_agent_permission(false, cx);
+                            } else {
+                                this.answer_permission(false, cx);
+                            }
+                        },
+                    )),
                 )
                 .child(
-                    button("ai-permission-allow", "Allow", true)
-                        .on_click(cx.listener(|this, _, _, cx| this.answer_permission(true, cx))),
+                    button("ai-permission-allow", "Allow", true).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            if agent_tab {
+                                this.answer_agent_permission(true, cx);
+                            } else {
+                                this.answer_permission(true, cx);
+                            }
+                        },
+                    )),
                 ),
         )
         .into_any_element()
@@ -2078,6 +2361,7 @@ impl AppState {
         &self,
         msg: &ChatMessage,
         reveal: Option<usize>,
+        in_agent_tab: bool,
         theme: &flint::Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2159,16 +2443,16 @@ impl AppState {
             );
         }
 
-        // "Insert into editor" for the first fenced SQL block in a *settled*
-        // assistant turn (suppressed while still typing).
+        // SQL affordances for the first fenced SQL block in a *settled* assistant
+        // turn (suppressed while still typing). In an agent tab the worksheet runs
+        // it inline or promotes it to a query tab; in the sidebar it's inserted into
+        // the active editor.
         if !live && msg.role == ChatRole::Assistant {
             if let Some(sql) = extract_sql(&msg.text) {
-                let id = SharedString::from(format!("ai-insert-{}", bubble_key(msg)));
-                bubble = bubble.child(
+                let key = bubble_key(msg);
+                let chip = |id: SharedString, glyph: &'static str, label: &'static str| {
                     div()
                         .id(id)
-                        .mt_1()
-                        .self_start()
                         .px_2()
                         .h(px(22.))
                         .flex()
@@ -2182,19 +2466,234 @@ impl AppState {
                         .cursor_pointer()
                         .hover(|s| s.border_color(theme.red).text_color(theme.red))
                         .child(crate::icons::icon(
-                            "corner-down-left",
+                            glyph,
                             theme.scale(11.),
                             theme.text_muted,
                         ))
-                        .child("Insert into editor")
+                        .child(label)
+                };
+                if in_agent_tab {
+                    let run_sql = sql.clone();
+                    let report_sql = sql.clone();
+                    let open_sql = sql.clone();
+                    bubble = bubble.child(
+                        div()
+                            .mt_1()
+                            .flex()
+                            .flex_wrap()
+                            .gap_1p5()
+                            .child(
+                                chip(
+                                    SharedString::from(format!("ai-run-{key}")),
+                                    "play",
+                                    "Run here",
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| this.agent_run_sql(run_sql.clone(), cx),
+                                )),
+                            )
+                            .child(
+                                chip(
+                                    SharedString::from(format!("ai-report-{key}")),
+                                    "sparkles",
+                                    "Report",
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.agent_report_sql(report_sql.clone(), cx)
+                                    },
+                                )),
+                            )
+                            .child(
+                                chip(
+                                    SharedString::from(format!("ai-open-{key}")),
+                                    "table",
+                                    "Open in a query tab",
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.open_sql_in_query_tab(open_sql.clone(), cx)
+                                    },
+                                )),
+                            ),
+                    );
+                } else {
+                    bubble = bubble.child(
+                        chip(
+                            SharedString::from(format!("ai-insert-{key}")),
+                            "corner-down-left",
+                            "Insert into editor",
+                        )
+                        .mt_1()
                         .on_click(
                             cx.listener(move |this, _, _, cx| this.ai_insert_sql(sql.clone(), cx)),
                         ),
-                );
+                    );
+                }
             }
         }
 
         bubble.into_any_element()
+    }
+
+    /// An AI agent tab's body (Feature A): the conversation transcript, the
+    /// composer, any pending tool-permission prompt, and the usage footer. The tab
+    /// strip is the header (drawn by `render_editor`); the inline result grid is the
+    /// host tab's `result`, drawn in the pane below by the shell.
+    pub(crate) fn render_agent_tab(
+        &self,
+        agent: &AgentSession,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let chat = &agent.chat;
+
+        // Not configured yet: point the user at setup rather than a dead composer.
+        if !self.ai_configured {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_4()
+                .bg(theme.bg_app)
+                .child(
+                    div()
+                        .text_size(theme.scale(13.))
+                        .text_color(theme.text)
+                        .child("Add an Anthropic API key to use the agent."),
+                )
+                .child(
+                    div()
+                        .text_size(theme.scale(11.5))
+                        .text_color(theme.text_muted)
+                        .child(
+                            "Open the assistant panel (⌘L) to add a key, or set the \
+                             ANTHROPIC_API_KEY environment variable. The key is stored in \
+                             your OS keychain.",
+                        ),
+                )
+                .into_any_element();
+        }
+
+        // Transcript.
+        let mut body = div()
+            .id("agent-body")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .track_scroll(&chat.scroll)
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_3();
+
+        if chat.messages.is_empty() {
+            body = body.child(
+                div()
+                    .text_size(theme.scale(12.5))
+                    .text_color(theme.text_muted)
+                    .child(
+                        "Describe the data you want in plain language. The agent reads the \
+                         schema, writes and runs read-only SQL, checks the result, and shows \
+                         its work — run any SQL it proposes here, or open it in a query tab.",
+                    ),
+            );
+            if let Some(picker) = self.render_provider_picker(chat, &theme, cx) {
+                body = body.child(picker);
+            }
+        }
+        let last = chat.messages.len().saturating_sub(1);
+        for (i, msg) in chat.messages.iter().enumerate() {
+            let live =
+                i == last && msg.role == ChatRole::Assistant && (chat.streaming || chat.revealing);
+            let reveal = live.then_some(chat.revealed);
+            body = body.child(self.render_bubble(msg, reveal, true, &theme, cx));
+        }
+        if let Some(status) = &chat.status {
+            body = body.child(
+                div()
+                    .text_size(theme.scale(11.))
+                    .text_color(theme.text_muted)
+                    .child(status.clone()),
+            );
+        }
+        if let Some(err) = &chat.error {
+            body = body.child(
+                div()
+                    .text_size(theme.scale(11.5))
+                    .text_color(theme.red)
+                    .child(err.clone()),
+            );
+        }
+
+        // Composer: a multiline prompt box with a send (or stop) icon button.
+        let action: AnyElement = if chat.streaming {
+            div()
+                .id("agent-stop")
+                .size(px(30.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(theme.border)
+                .cursor_pointer()
+                .tooltip(flint::Tooltip::text("Stop (Esc)"))
+                .hover(|s| s.border_color(theme.red))
+                .child(crate::icons::icon("x", theme.scale(14.), theme.text_muted))
+                .on_click(cx.listener(|this, _, _, cx| this.cancel_agent_tab(cx)))
+                .into_any_element()
+        } else {
+            div()
+                .id("agent-send")
+                .size(px(30.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .bg(theme.red)
+                .cursor_pointer()
+                .tooltip(flint::Tooltip::text(
+                    "Send (Enter · Shift+Enter for a new line)",
+                ))
+                .hover(|s| s.opacity(0.9))
+                .child(crate::icons::icon("send", theme.scale(15.), theme.bg_app))
+                .on_click(cx.listener(|this, _, _, cx| this.submit_agent_tab(cx)))
+                .into_any_element()
+        };
+
+        let composer = div()
+            .flex_shrink_0()
+            .flex()
+            .items_end()
+            .gap_2()
+            .p_2()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h(px(64.))
+                    .child(agent.input.clone()),
+            )
+            .child(action);
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme.bg_app)
+            .child(body)
+            .when_some(chat.pending_permission.as_ref(), |col, pending| {
+                col.child(self.render_permission(pending, true, &theme, cx))
+            })
+            .child(composer)
+            .when_some(chat.last_usage, |col, usage| {
+                col.child(render_usage(&usage, &theme))
+            })
+            .into_any_element()
     }
 }
 

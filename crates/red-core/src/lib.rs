@@ -1097,6 +1097,10 @@ pub struct ResultPage {
 pub enum ExportFormat {
     Csv,
     Json,
+    /// A themed, self-contained HTML report — a standalone document (inline CSS,
+    /// light/dark via `prefers-color-scheme`) opened in the system browser, not a
+    /// data interchange file. Streamed row-by-row like the others.
+    Html,
 }
 
 /// Per-query knobs carried UI → service → driver.

@@ -31,13 +31,21 @@ impl AppState {
         // Pane contents: SQL editor · result grid. The schema explorer is built
         // below, only when the sidebar is shown.
         let editor_pane = self.render_editor(active, cx);
+        // An AI agent tab (Feature A) fills the upper pane with its conversation;
+        // until it has run SQL there's no grid to show, so it takes the whole body.
+        // Once it has a result the normal vertical split applies — chat on top, the
+        // grid the agent's SQL produced below.
+        let agent_full =
+            active.active().is_some_and(|t| t.agent.is_some()) && active.active_result().is_none();
         // The lower pane shows the query plan (Track B4) when one is open, else the
         // result grid — the two share the slot; running a query clears the plan.
-        let results_pane = if self.has_active_plan() {
-            self.render_plan(active, cx).into_any_element()
-        } else {
-            self.render_result(active, window, cx).into_any_element()
-        };
+        let results_pane = (!agent_full).then(|| {
+            if self.has_active_plan() {
+                self.render_plan(active, cx).into_any_element()
+            } else {
+                self.render_result(active, window, cx).into_any_element()
+            }
+        });
 
         let config = &active.config;
 
@@ -118,7 +126,7 @@ impl AppState {
             .child(topbar_right);
 
         // --- nested split: schema | (editor / results) ---
-        let inner = {
+        let inner = if let Some(results_pane) = results_pane {
             let start = view.clone();
             let resize = view.clone();
             let end = view.clone();
@@ -158,6 +166,10 @@ impl AppState {
                 })
                 .first(editor_pane)
                 .second(results_pane)
+                .into_any_element()
+        } else {
+            // Agent tab with no result yet: the conversation fills the whole body.
+            div().size_full().child(editor_pane).into_any_element()
         };
 
         // When collapsed, the schema pane (and its resize split) drop out entirely

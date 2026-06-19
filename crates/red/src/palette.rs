@@ -69,6 +69,8 @@ pub(crate) enum Cmd {
     RevertChanges,
     /// Append a new draft (insert) row to the result (Track B6).
     AddRow,
+    /// Open a fresh AI agent tab — a natural-language SQL worksheet (Feature A).
+    NewAgentTab,
     /// Open the assistant's conversation-history picker (M-S5).
     AssistantHistory,
     /// Start a fresh assistant chat, saving the current one (M-S5).
@@ -249,6 +251,7 @@ impl AppState {
             Cmd::SubmitChanges => self.submit_changes(cx),
             Cmd::RevertChanges => self.revert_changes(cx),
             Cmd::AddRow => self.add_draft_row(cx),
+            Cmd::NewAgentTab => self.new_agent_tab(cx),
             Cmd::AssistantHistory => self.open_history_sidebar(cx),
             Cmd::AssistantNewChat => self.new_chat(cx),
             Cmd::AssistantDeleteConversation => self.delete_current_conversation(cx),
@@ -295,6 +298,14 @@ impl AppState {
                     PaletteItem::new("cmd:new-tab", "query: new tab").hint("⌘T"),
                     Cmd::NewTab,
                 ));
+                // AI agent worksheet tab (Feature A) — only while the assistant is
+                // enabled for this connection (M-S7).
+                if self.ai_enabled() {
+                    out.push((
+                        PaletteItem::new("cmd:new-agent-tab", "ai: new agent tab"),
+                        Cmd::NewAgentTab,
+                    ));
+                }
                 // Tab management — close needs an open tab; switching needs two.
                 if active.active().is_some() {
                     out.push((
