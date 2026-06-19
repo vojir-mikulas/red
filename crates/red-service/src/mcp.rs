@@ -15,6 +15,7 @@
 
 use std::convert::Infallible;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -25,6 +26,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use red_ai::CancelToken;
+use red_core::AiPolicy;
 use red_driver::DatabaseDriver;
 use serde_json::{json, Value as Json};
 use tokio::net::TcpListener;
@@ -42,14 +44,25 @@ pub(crate) struct McpServer {
 }
 
 impl McpServer {
-    /// Bind a fresh loopback server backed by `driver` and start accepting.
-    pub(crate) async fn start(driver: Arc<dyn DatabaseDriver>) -> std::io::Result<Self> {
+    /// Bind a fresh loopback server backed by `driver`, gated by `policy`, and
+    /// start accepting. The policy (access tier + resource guards, M-S7) is
+    /// captured here and enforced on every `tools/list`/`tools/call` — so the
+    /// subscription agent sees exactly the catalog the tier allows and can't
+    /// exceed the limits, the same gate the API-key path runs under.
+    pub(crate) async fn start(
+        driver: Arc<dyn DatabaseDriver>,
+        policy: AiPolicy,
+    ) -> std::io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let port = listener.local_addr()?.port();
         // Two v4 UUIDs of entropy — a loopback-only secret, not a long-term key.
         let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let url = format!("http://127.0.0.1:{port}/mcp");
 
+        // One cumulative tool-call tally for the agent's whole lifetime, bounding a
+        // runaway loop (the subscription-path analogue of the API path's
+        // per-conversation budget).
+        let calls = Arc::new(AtomicUsize::new(0));
         let token_task = token.clone();
         let task = tokio::spawn(async move {
             loop {
@@ -60,9 +73,11 @@ impl McpServer {
                 let io = TokioIo::new(stream);
                 let driver = driver.clone();
                 let token = token_task.clone();
+                let calls = calls.clone();
                 tokio::spawn(async move {
-                    let service =
-                        service_fn(move |req| handle_request(req, driver.clone(), token.clone()));
+                    let service = service_fn(move |req| {
+                        handle_request(req, driver.clone(), token.clone(), policy, calls.clone())
+                    });
                     // Errors here are per-connection (client hung up) — drop quietly.
                     let _ = http1::Builder::new().serve_connection(io, service).await;
                 });
@@ -95,6 +110,8 @@ async fn handle_request(
     req: Request<Incoming>,
     driver: Arc<dyn DatabaseDriver>,
     token: String,
+    policy: AiPolicy,
+    calls: Arc<AtomicUsize>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     // JSON-RPC rides POST. We don't push, so a GET SSE stream is unsupported.
     if req.method() != Method::POST {
@@ -121,19 +138,21 @@ async fn handle_request(
         return Ok(empty(StatusCode::ACCEPTED));
     };
 
-    let envelope = match dispatch(method, &params, &driver).await {
+    let envelope = match dispatch(method, &params, &driver, policy, &calls).await {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
         Err((code, message)) => rpc_error(id, code, &message),
     };
     Ok(json_body(envelope))
 }
 
-/// Dispatch one MCP method. Returns the JSON-RPC `result` payload, or a
-/// `(code, message)` JSON-RPC error.
+/// Dispatch one MCP method under the access policy. Returns the JSON-RPC `result`
+/// payload, or a `(code, message)` JSON-RPC error.
 async fn dispatch(
     method: &str,
     params: &Json,
     driver: &Arc<dyn DatabaseDriver>,
+    policy: AiPolicy,
+    calls: &AtomicUsize,
 ) -> Result<Json, (i64, String)> {
     match method {
         // Echo the client's protocol version; we only need the `tools` capability.
@@ -150,7 +169,9 @@ async fn dispatch(
         }
         "ping" => Ok(json!({})),
         "tools/list" => {
-            let tools: Vec<Json> = tool_catalog()
+            // The tier filters the catalog (M-S7) — the agent never even sees a
+            // tool above its access tier.
+            let tools: Vec<Json> = tool_catalog(&policy)
                 .into_iter()
                 .map(|t| {
                     json!({
@@ -167,13 +188,25 @@ async fn dispatch(
             if name.is_empty() {
                 return Err((-32602, "missing tool name".into()));
             }
+            // Charge the agent's cumulative tool-call budget before running anything
+            // (M-S7). Over budget → a tool error the model can recover from, not a
+            // transport failure.
+            let max = policy.limits.max_tool_calls;
+            if max != 0 && calls.fetch_add(1, Ordering::Relaxed) >= max {
+                return Ok(json!({
+                    "content": [ { "type": "text", "text":
+                        "error: this conversation's tool-call budget is exhausted; answer with \
+                        what you have or ask the user to start a new chat" } ],
+                    "isError": true,
+                }));
+            }
             let args = params
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             // A fresh cancel token: the agent owns turn cancellation over ACP; a
             // single tool call is short and runs to completion here.
-            let (content, ok) = run_tool(driver, name, &args, &CancelToken::new()).await;
+            let (content, ok) = run_tool(driver, name, &args, &policy, &CancelToken::new()).await;
             Ok(json!({
                 "content": [ { "type": "text", "text": content } ],
                 "isError": !ok,
@@ -222,8 +255,9 @@ mod tests {
     use super::*;
     use red_driver::SqliteDriver;
 
-    /// Spin up the server over a tiny fixture DB and return `(server, client)`.
-    async fn fixture() -> (McpServer, reqwest::Client) {
+    /// Spin up the server over a tiny fixture DB at `policy` and return
+    /// `(server, client)`.
+    async fn fixture_with(policy: AiPolicy) -> (McpServer, reqwest::Client) {
         let path = std::env::temp_dir().join(format!("red-mcp-{}.db", Uuid::new_v4()));
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
@@ -234,8 +268,13 @@ mod tests {
             .unwrap();
         }
         let driver: Arc<dyn DatabaseDriver> = Arc::new(SqliteDriver::new(path, true));
-        let server = McpServer::start(driver).await.unwrap();
+        let server = McpServer::start(driver, policy).await.unwrap();
         (server, reqwest::Client::new())
+    }
+
+    /// The common case: the full `read` tier with default limits.
+    async fn fixture() -> (McpServer, reqwest::Client) {
+        fixture_with(AiPolicy::default()).await
     }
 
     /// POST a JSON-RPC message with the bearer nonce and return the parsed reply.
@@ -318,6 +357,72 @@ mod tests {
         // The read-only gate (shared with the API-key path) reports a tool error,
         // not a transport error — the model can recover from it.
         assert_eq!(reply["result"]["isError"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn schema_tier_withholds_the_data_tools() {
+        let (server, client) = fixture_with(AiPolicy {
+            tier: red_core::AiTier::Schema,
+            ..AiPolicy::default()
+        })
+        .await;
+        // tools/list shows only the structure tools.
+        let list = call(
+            &server,
+            &client,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        )
+        .await;
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["list_schema", "describe_table"]);
+        // And a run_select call is refused by the server-side tier check (defense in
+        // depth), as an in-band tool error rather than a transport failure.
+        let reply = call(
+            &server,
+            &client,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": "run_select", "arguments": { "sql": "SELECT 1" } },
+            }),
+        )
+        .await;
+        assert_eq!(reply["result"]["isError"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn tool_call_budget_is_enforced_server_side() {
+        let (server, client) = fixture_with(AiPolicy {
+            limits: red_core::AiLimits {
+                max_tool_calls: 1,
+                ..red_core::AiLimits::default()
+            },
+            ..AiPolicy::default()
+        })
+        .await;
+        let select = || {
+            json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": { "name": "run_select", "arguments": { "sql": "SELECT 1" } },
+            })
+        };
+        // First call runs; the second exceeds the budget and is refused in-band.
+        let first = call(&server, &client, select()).await;
+        assert_eq!(first["result"]["isError"], json!(false));
+        let second = call(&server, &client, select()).await;
+        assert_eq!(second["result"]["isError"], json!(true));
+        assert!(second["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("budget"));
     }
 
     #[tokio::test]

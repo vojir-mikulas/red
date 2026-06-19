@@ -314,11 +314,19 @@ impl UpdateSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AiSettings {
+    /// The master switch. `false` is a true kill switch — no panel entry point,
+    /// no MCP server, no agent process (M-S7). A connection can override it.
+    pub enabled: bool,
     /// Which backend handles turns:
     /// - `"anthropic"` (default) — the Claude Messages API, billed to an API key.
     /// - `"subscription"` — Claude Code over ACP, billed to the user's Pro/Max
     ///   subscription (the agent owns its own login; no key needed).
     pub provider: String,
+    /// Database access tier the assistant's tools run at (M-S7): `"off"` (no DB
+    /// tools), `"schema"` (structure only, no row data), or `"read"` (the full
+    /// read catalog). A connection can override it; unknown values resolve to
+    /// `"read"`.
+    pub tier: String,
     /// Model id, e.g. `claude-opus-4-8`. Empty falls back to the Opus default.
     /// (API-key path only; the subscription agent picks its own model.)
     pub model: String,
@@ -327,15 +335,49 @@ pub struct AiSettings {
     /// Advanced: override the subscription agent's launch command. Empty falls
     /// back to the default `npx -y @agentclientprotocol/claude-agent-acp`.
     pub agent_command: String,
+    /// Resource guards on the `read` tier (`[ai.limits]`, M-S7).
+    pub limits: AiLimitsSettings,
 }
 
 impl Default for AiSettings {
     fn default() -> Self {
         Self {
+            enabled: true,
             provider: "anthropic".to_string(),
+            tier: "read".to_string(),
             model: "claude-opus-4-8".to_string(),
             show_thinking: false,
             agent_command: String::new(),
+            limits: AiLimitsSettings::default(),
+        }
+    }
+}
+
+/// The `[ai.limits]` block: defense-in-depth caps the assistant's tools run
+/// under, mirroring [`red_core::AiLimits`]. Defaults to the same sane ceilings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiLimitsSettings {
+    /// Hard row ceiling on one `run_select`; a larger LIMIT is clamped.
+    pub max_rows: usize,
+    /// Per-tool-call statement timeout in milliseconds. `0` disables it.
+    pub statement_timeout_ms: u64,
+    /// Cap on the bytes of one tool result handed back to the model. `0` disables.
+    pub max_result_bytes: usize,
+    /// Cap on tool calls per conversation, bounding a runaway loop. `0` disables.
+    pub max_tool_calls: usize,
+}
+
+impl Default for AiLimitsSettings {
+    fn default() -> Self {
+        // Mirror `red_core::AiLimits::default()` so the wired default matches the
+        // backend's own fallback.
+        let d = red_core::AiLimits::default();
+        Self {
+            max_rows: d.max_rows,
+            statement_timeout_ms: d.statement_timeout_ms,
+            max_result_bytes: d.max_result_bytes,
+            max_tool_calls: d.max_tool_calls,
         }
     }
 }

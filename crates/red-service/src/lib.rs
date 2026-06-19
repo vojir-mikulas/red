@@ -30,6 +30,7 @@ pub use protocol::{
     SortKey, UpdateConfig,
 };
 pub use red_acp::DEFAULT_AGENT_COMMAND;
+pub use red_core::{AiLimits, AiPolicy, AiTier};
 
 use futures::channel::mpsc::{unbounded, UnboundedReceiver};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender as CmdSender};

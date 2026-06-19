@@ -825,6 +825,16 @@ pub(crate) fn ai_config(settings: &Settings) -> red_service::AiConfig {
         api_key,
         show_thinking: settings.ai.show_thinking,
         agent_command: settings.ai.agent_command.clone(),
+        // The global AI access policy (M-S7); a connection's overrides layer over
+        // it on the backend. The tier string parses leniently (a typo → `read`).
+        enabled: settings.ai.enabled,
+        tier: red_service::AiTier::parse(&settings.ai.tier),
+        limits: red_service::AiLimits {
+            max_rows: settings.ai.limits.max_rows,
+            statement_timeout_ms: settings.ai.limits.statement_timeout_ms,
+            max_result_bytes: settings.ai.limits.max_result_bytes,
+            max_tool_calls: settings.ai.limits.max_tool_calls,
+        },
     }
 }
 

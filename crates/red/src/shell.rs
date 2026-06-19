@@ -344,6 +344,9 @@ impl AppState {
 
         // Assistant toggle, pinned to the far-right of the status bar (mirrors the
         // schema sidebar toggle on the left). Accent-tinted while the panel is open.
+        // Hidden entirely when the assistant is disabled for this connection (the
+        // M-S7 kill switch) — no entry point, not just a no-op button.
+        let assistant_enabled = self.ai_enabled();
         let assistant_open = self.assistant.is_some();
         let assistant_toggle = div()
             .id("toggle-assistant")
@@ -392,7 +395,7 @@ impl AppState {
                     .flex()
                     .items_center()
                     .child(status_right)
-                    .child(assistant_toggle),
+                    .children(assistant_enabled.then_some(assistant_toggle)),
             );
 
         div()

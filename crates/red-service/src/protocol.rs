@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use red_core::{
-    Column, ConnectionConfig, EditOp, ExportFormat, KeySpec, QueryOptions, QueryPlan, ResultFilter,
-    RowWindow, SchemaMeta, TableDetail, UpdateState, Value,
+    AiLimits, AiTier, Column, ConnectionConfig, EditOp, ExportFormat, KeySpec, QueryOptions,
+    QueryPlan, ResultFilter, RowWindow, SchemaMeta, TableDetail, UpdateState, Value,
 };
 
 /// Identifies one keep-alive backend session. Minted UI-side at connect start so
@@ -455,6 +455,16 @@ pub struct AiConfig {
     /// The subscription agent launch command; empty falls back to the default npx
     /// invocation. Advanced override (`[ai] agent_command`).
     pub agent_command: String,
+    /// The global AI master switch (`[ai] enabled`, M-S7). When `false`, the
+    /// service refuses turns and never starts an MCP server or agent — a true kill
+    /// switch. A connection's `ai_enabled` override can flip it per session.
+    pub enabled: bool,
+    /// The global access tier (`[ai] tier`, M-S7) deciding which DB tools the model
+    /// is offered. A connection's `ai_tier` override can tighten it per session.
+    pub tier: AiTier,
+    /// The global resource guards (`[ai.limits]`, M-S7): row cap, statement
+    /// timeout, result byte cap, and per-conversation tool-call budget.
+    pub limits: AiLimits,
 }
 
 /// What's on screen when the user sends a turn, assembled by the UI (it knows the

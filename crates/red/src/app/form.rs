@@ -187,6 +187,15 @@ impl AppState {
                 passphrase: self.ssh_passphrase_input.read(cx).content().to_string(),
             }
         });
+        // Per-connection AI overrides (M-S7) aren't surfaced in the form — they're
+        // set by hand-editing connections.toml. Carry the editing connection's
+        // values through so rebuilding the config from inputs doesn't silently drop
+        // them on save; a brand-new connection inherits the global policy (`None`).
+        let (ai_enabled, ai_tier) = form
+            .editing
+            .and_then(|i| self.connections.get(i))
+            .map(|c| (c.config.ai_enabled, c.config.ai_tier))
+            .unwrap_or((None, None));
         Some(ConnectionConfig {
             name: read(&self.name_input),
             kind: form.kind,
@@ -198,6 +207,8 @@ impl AppState {
             database: read(&self.database_input),
             color: form.color,
             read_only: form.read_only,
+            ai_enabled,
+            ai_tier,
             ssh,
         })
     }

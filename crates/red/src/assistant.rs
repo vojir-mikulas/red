@@ -228,9 +228,24 @@ impl AssistantState {
 }
 
 impl AppState {
-    /// Open or close the assistant panel (⌘L). Only meaningful while connected.
+    /// Whether the AI assistant is enabled for the current context (M-S7): the
+    /// active connection's `ai_enabled` override, falling back to the global
+    /// `[ai] enabled`. `false` is a true kill switch — the panel can't be opened,
+    /// its status-bar toggle is hidden, and the backend refuses turns and starts
+    /// no agent. The tier (`off`/`schema`/`read`) is a separate, in-panel concern;
+    /// this gate is purely on/off.
+    pub(crate) fn ai_enabled(&self) -> bool {
+        let global = self.settings.ai.enabled;
+        match &self.phase {
+            Phase::Connected(active) => active.config.ai_enabled.unwrap_or(global),
+            _ => global,
+        }
+    }
+
+    /// Open or close the assistant panel (⌘L). Only meaningful while connected and
+    /// while the assistant is enabled for this connection (M-S7).
     pub(crate) fn toggle_assistant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.phase, Phase::Connected(_)) {
+        if !matches!(self.phase, Phase::Connected(_)) || !self.ai_enabled() {
             return;
         }
         if self.assistant.is_some() {

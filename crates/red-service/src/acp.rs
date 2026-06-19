@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use red_acp::{AcpConfig, AcpConversation, AcpDelta, AcpPermission, AcpStop, McpGrounding};
+use red_core::AiPolicy;
 use red_driver::DatabaseDriver;
 use tokio::sync::{mpsc, oneshot};
 
@@ -180,6 +181,7 @@ pub(crate) async fn run_turn(
     events: Events,
     session: Option<SessionId>,
     conversation_id: u64,
+    policy: AiPolicy,
     user_message: String,
     context: AiContext,
 ) {
@@ -192,6 +194,7 @@ pub(crate) async fn run_turn(
         events.clone(),
         session,
         conversation_id,
+        policy,
     )
     .await
     {
@@ -214,7 +217,7 @@ pub(crate) async fn run_turn(
     let text = if first_turn {
         format!(
             "{}\n\n{}",
-            system_prompt(&context),
+            system_prompt(&context, &policy),
             user_turn(&user_message, &context)
         )
     } else {
@@ -310,6 +313,7 @@ async fn ensure_conversation(
     events: Events,
     session: Option<SessionId>,
     conversation_id: u64,
+    policy: AiPolicy,
 ) -> Result<(AcpConversation, bool), String> {
     let mut guard = manager.lock().await;
     // Restart on crash (M-S3): a conversation whose connection task has ended
@@ -322,9 +326,11 @@ async fn ensure_conversation(
         }
     }
     if !guard.conversations.contains_key(&conversation_id) {
-        // Host the DB grounding server bound to this session's driver, then bring
-        // the agent up with it attached.
-        let mcp = McpServer::start(driver)
+        // Host the DB grounding server bound to this session's driver and gated by
+        // the access policy (M-S7), then bring the agent up with it attached. The
+        // policy is captured for the agent's lifetime; a settings change takes
+        // effect on the next agent restart (reconnect / idle teardown / re-auth).
+        let mcp = McpServer::start(driver, policy)
             .await
             .map_err(|e| format!("could not start the DB tool server: {e}"))?;
         let grounding = McpGrounding {
@@ -332,9 +338,10 @@ async fn ensure_conversation(
             url: mcp.url().to_string(),
             token: mcp.token().to_string(),
         };
-        // Permission policy (M-S2): auto-allow our read-only DB tools; route
-        // anything else to the user via the relay task below. The agent is also
-        // capability-restricted (no fs/terminal) in `red-acp`.
+        // Permission policy (M-S2): auto-allow the DB tools the tier actually
+        // exposes; route anything else (including a tool above the tier) to the
+        // user via the relay task below. The agent is also capability-restricted
+        // (no fs/terminal) in `red-acp`.
         let (perm_tx, perm_rx) = mpsc::unbounded_channel::<AcpPermission>();
         tokio::spawn(permission_relay(
             manager.clone(),
@@ -347,7 +354,7 @@ async fn ensure_conversation(
             command,
             cwd,
             mcp: Some(grounding),
-            allow_tools: tool_catalog().into_iter().map(|t| t.name).collect(),
+            allow_tools: tool_catalog(&policy).into_iter().map(|t| t.name).collect(),
             permissions: Some(perm_tx),
         };
         let agent = AcpConversation::start(config)

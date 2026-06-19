@@ -12,11 +12,12 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use red_ai::{
     AiProvider, CancelToken, ContentBlock, Message, Role, StopReason, ToolDef, TurnRequest,
 };
-use red_core::Value;
+use red_core::{AiPolicy, RedError, Value};
 use red_driver::{AbortSignal, DatabaseDriver, PageCap};
 use serde_json::{json, Value as Json};
 
@@ -26,20 +27,21 @@ use crate::{Event, SessionId};
 
 /// Safety backstop on the model → tool → model loop: how many tool round-trips a
 /// single turn may take before we stop and report. Far above any real grounded
-/// answer; prevents a misbehaving model from looping forever.
+/// answer; prevents a misbehaving model from looping forever. The per-conversation
+/// [`AiLimits::max_tool_calls`](red_core::AiLimits) bound (M-S7) sits on top of
+/// this, spanning turns rather than resetting each one.
 const MAX_TOOL_STEPS: usize = 16;
 
-/// Row ceiling for one `run_select` tool call. The model browses, it doesn't bulk
-/// export — a few hundred rows is plenty of grounding and keeps the context lean.
-const SELECT_ROW_CAP: usize = 200;
-
 /// Per-conversation state shared between the dispatch loop and the spawned turn
-/// tasks: the running message history (so follow-up turns keep context) and the
-/// in-flight cancel tokens (so `AiCancel` can stop a specific turn).
+/// tasks: the running message history (so follow-up turns keep context), the
+/// in-flight cancel tokens (so `AiCancel` can stop a specific turn), and the
+/// cumulative tool-call tally (so the resource-guard budget spans the whole
+/// conversation, not just one turn).
 #[derive(Default)]
 pub(crate) struct AiState {
     histories: HashMap<u64, Vec<Message>>,
     cancels: HashMap<u64, CancelToken>,
+    tool_calls: HashMap<u64, usize>,
 }
 
 impl AiState {
@@ -53,6 +55,18 @@ impl AiState {
         if let Some(tok) = self.cancels.get(&conversation_id) {
             tok.cancel();
         }
+    }
+
+    /// Charge one tool call against the conversation's cumulative budget. Returns
+    /// `false` once the budget (`max`, `0` = unlimited) is exhausted, so the loop
+    /// can stop a runaway agent instead of letting it spin tools forever.
+    fn charge_tool_call(&mut self, conversation_id: u64, max: usize) -> bool {
+        let count = self.tool_calls.entry(conversation_id).or_default();
+        if max != 0 && *count >= max {
+            return false;
+        }
+        *count += 1;
+        true
     }
 }
 
@@ -73,12 +87,15 @@ pub(crate) async fn run_turn(
     conversation_id: u64,
     model: String,
     show_thinking: bool,
+    policy: AiPolicy,
     user_message: String,
     context: AiContext,
     cancel: CancelToken,
 ) {
-    let system = system_prompt(&context);
-    let tools = tool_catalog();
+    let system = system_prompt(&context, &policy);
+    // The tier decides which tools the model is even offered (M-S7): `off` grounds
+    // nothing, `schema` withholds row data, `read` is the full catalog.
+    let tools = tool_catalog(&policy);
 
     // Seed the conversation with the grounded user message and pull the running
     // history so a follow-up keeps prior context.
@@ -157,6 +174,19 @@ pub(crate) async fn run_turn(
             let ContentBlock::ToolUse { id, name, input } = block else {
                 continue;
             };
+            // Charge the conversation's cumulative tool-call budget (M-S7). When it
+            // is exhausted, hand the model an error result instead of running the
+            // tool — it can wrap up its answer, but it can't keep looping.
+            if !lock(&state).charge_tool_call(conversation_id, policy.limits.max_tool_calls) {
+                results.push(ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: "error: this conversation's tool-call budget is exhausted; \
+                        answer with what you have or ask the user to start a new chat"
+                        .into(),
+                    is_error: true,
+                });
+                continue;
+            }
             emit(
                 &events,
                 session,
@@ -165,7 +195,7 @@ pub(crate) async fn run_turn(
                     delta: AiDelta::ToolStarted { name: name.clone() },
                 },
             );
-            let (content, ok) = run_tool(&driver, name, input, &cancel).await;
+            let (content, ok) = run_tool(&driver, name, input, &policy, &cancel).await;
             emit(
                 &events,
                 session,
@@ -221,16 +251,20 @@ pub(crate) async fn run_turn(
     }
 }
 
-/// The read-only tool catalog (M1). Each tool is backed by a `DatabaseDriver`
-/// method and auto-runs; none can mutate. Shared with the MCP server (the
-/// subscription/ACP path serves the same four tools over MCP).
-pub(crate) fn tool_catalog() -> Vec<ToolDef> {
-    vec![
+/// The read-only tool catalog, filtered to the policy's access tier (M-S7). Each
+/// tool is backed by a `DatabaseDriver` method and auto-runs; none can mutate.
+/// Filtering happens *here*, at construction, so a tool above the tier is never
+/// offered — the model can't call what isn't in the catalog. Shared with the MCP
+/// server, so the API-key and subscription/ACP paths expose the identical set.
+pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
+    let max_rows = policy.limits.max_rows;
+    let all = [
         ToolDef {
             name: "list_schema".into(),
-            description: "List the database's schemas and their tables and views (names and kinds \
+            description:
+                "List the database's schemas and their tables and views (names and kinds \
                 only). Call this to discover what objects exist before describing or querying them."
-                .into(),
+                    .into(),
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
         ToolDef {
@@ -251,9 +285,10 @@ pub(crate) fn tool_catalog() -> Vec<ToolDef> {
         ToolDef {
             name: "run_select".into(),
             description: format!(
-                "Run a read-only SELECT (or WITH ... SELECT) query and return up to {SELECT_ROW_CAP} \
-                rows. Non-SELECT statements are rejected. Results are row- and cell-capped — use \
-                LIMIT and targeted columns. This is the only way to read actual data."
+                "Run a read-only SELECT (or WITH ... SELECT) query and return up to {max_rows} \
+                rows. Non-SELECT statements are rejected. Results are row- and cell-capped and \
+                subject to a statement timeout — use LIMIT and targeted columns. This is the only \
+                way to read actual data."
             ),
             input_schema: json!({
                 "type": "object",
@@ -261,7 +296,7 @@ pub(crate) fn tool_catalog() -> Vec<ToolDef> {
                     "sql": { "type": "string", "description": "A single SELECT/WITH query." },
                     "limit": {
                         "type": "integer",
-                        "description": format!("Max rows to return (1..{SELECT_ROW_CAP})."),
+                        "description": format!("Max rows to return (1..{max_rows})."),
                     },
                 },
                 "required": ["sql"],
@@ -282,19 +317,39 @@ pub(crate) fn tool_catalog() -> Vec<ToolDef> {
                 "additionalProperties": false,
             }),
         },
-    ]
+    ];
+    all.into_iter()
+        .filter(|t| policy.tier.allows_tool(&t.name))
+        .collect()
 }
 
-/// Execute one tool call against the driver. Returns `(content, ok)`; `ok = false`
-/// becomes an `is_error` tool result the model can recover from. Shared with the
-/// MCP server so the API-key and subscription paths run identical, guarded tools.
+/// Execute one tool call against the driver, under the access policy (M-S7).
+/// Returns `(content, ok)`; `ok = false` becomes an `is_error` tool result the
+/// model can recover from. Shared with the MCP server so the API-key and
+/// subscription paths run identical, guarded tools.
+///
+/// Two layers of guard apply here, both server-side so neither backend can slip
+/// past them: the tier is re-checked (defense in depth — the catalog already
+/// withholds out-of-tier tools, but a misbehaving agent could still *name* one),
+/// and the [`AiLimits`](red_core::AiLimits) clamp rows, time-box the query, and
+/// cap the result bytes handed back to the model.
 pub(crate) async fn run_tool(
     driver: &Arc<dyn DatabaseDriver>,
     name: &str,
     input: &Json,
+    policy: &AiPolicy,
     _cancel: &CancelToken,
 ) -> (String, bool) {
-    match name {
+    // Defense in depth: refuse a tool the tier doesn't expose, even if the model
+    // somehow asks for it by name.
+    if !policy.tier.allows_tool(name) {
+        return (
+            format!("error: the `{name}` tool is not available at this access tier"),
+            false,
+        );
+    }
+    let limits = &policy.limits;
+    let (content, ok) = match name {
         "list_schema" => match driver.list_objects().await {
             Ok(schemas) => (format_schema(&schemas), true),
             Err(e) => (format!("error: {e}"), false),
@@ -318,17 +373,34 @@ pub(crate) async fn run_tool(
                     false,
                 );
             }
-            let limit = input
+            // Clamp the requested LIMIT to the hard row cap — the model browses, it
+            // doesn't bulk-export — and remember whether we clamped so the result
+            // can tell the model it's partial.
+            let max_rows = limits.max_rows.max(1);
+            let requested = input
                 .get("limit")
                 .and_then(Json::as_u64)
-                .map(|n| (n as usize).clamp(1, SELECT_ROW_CAP))
-                .unwrap_or(SELECT_ROW_CAP);
+                .map(|n| n as usize);
+            let limit = requested.unwrap_or(max_rows).clamp(1, max_rows);
             let abort = AbortSignal::new();
-            match driver
-                .fetch_page(sql, 0, limit, PageCap::Display { key: None }, &abort)
-                .await
-            {
-                Ok(page) => (format_page(&page), true),
+            let fetch = driver.fetch_page(sql, 0, limit, PageCap::Display { key: None }, &abort);
+            match guard_timeout(limits.statement_timeout_ms, &abort, fetch).await {
+                Ok(page) => {
+                    let mut out = format_page(&page);
+                    if page.rows.len() >= limit {
+                        out.push_str(&format!(
+                            "\n(truncated to {limit} rows — the result may have more; add LIMIT or \
+                            a WHERE clause to narrow it)"
+                        ));
+                    }
+                    (out, true)
+                }
+                Err(RedError::Timeout) => (
+                    "error: the query exceeded the assistant's statement timeout — it was \
+                    cancelled. Narrow it (add WHERE/LIMIT) or inspect the plan with explain."
+                        .into(),
+                    false,
+                ),
                 Err(e) => (format!("error: {e}"), false),
             }
         }
@@ -343,7 +415,58 @@ pub(crate) async fn run_tool(
             }
         }
         other => (format!("error: unknown tool `{other}`"), false),
+    };
+    (cap_result_bytes(content, limits.max_result_bytes), ok)
+}
+
+/// Race a one-shot tool fetch against the policy's statement timeout. On expiry,
+/// fire the fetch's [`AbortSignal`] so the engine stops, then surface
+/// [`RedError::Timeout`]. A `0` timeout never fires. Mirrors the dispatch loop's
+/// `with_timeout` so the AI path bounds queries the same way human paging does.
+async fn guard_timeout<T>(
+    timeout_ms: u64,
+    abort: &AbortSignal,
+    fut: impl std::future::Future<Output = red_core::Result<T>>,
+) -> red_core::Result<T> {
+    tokio::pin!(fut);
+    let mut timed_out = false;
+    let out = loop {
+        tokio::select! {
+            res = &mut fut => break res,
+            _ = sleep_ms(timeout_ms), if !timed_out && timeout_ms != 0 => {
+                timed_out = true;
+                abort.abort();
+            }
+        }
+    };
+    match out {
+        Err(RedError::Interrupted) if timed_out => Err(RedError::Timeout),
+        other => other,
     }
+}
+
+/// Sleep `ms` milliseconds, or never (a `0` timeout means "no cap").
+async fn sleep_ms(ms: u64) {
+    if ms == 0 {
+        std::future::pending::<()>().await
+    } else {
+        tokio::time::sleep(Duration::from_millis(ms)).await
+    }
+}
+
+/// Cap one tool result at `max` bytes so a wide/long result can't balloon the
+/// model's context. Truncates on a char boundary and appends a note. `0` disables.
+fn cap_result_bytes(mut content: String, max: usize) -> String {
+    if max == 0 || content.len() <= max {
+        return content;
+    }
+    let mut cut = max;
+    while cut > 0 && !content.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    content.truncate(cut);
+    content.push_str("\n…(result truncated — it exceeded the size cap; narrow the query)");
+    content
 }
 
 /// A conservative read-only gate: the statement must be a single SELECT or a CTE
@@ -362,16 +485,35 @@ fn is_read_only_select(sql: &str) -> bool {
     lower.starts_with("select") || lower.starts_with("with")
 }
 
-/// The stable grounding instruction. Shared with the ACP path, which folds it
-/// into the agent's first prompt (ACP `session/prompt` has no system role).
-pub(crate) fn system_prompt(ctx: &AiContext) -> String {
-    let mut s = String::from(
+/// The stable grounding instruction, tailored to the access tier (M-S7). Shared
+/// with the ACP path, which folds it into the agent's first prompt (ACP
+/// `session/prompt` has no system role). The tier line keeps the model's
+/// expectations in step with the catalog it actually receives, but the *catalog*
+/// is the real gate — the prompt is just courtesy.
+pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
+    use red_core::AiTier;
+    let tools_line = match policy.tier {
+        AiTier::Off => {
+            "You have NO database tools available — answer from the schema overview and the \
+             conversation alone, and tell the user you cannot read the live database."
+        }
+        AiTier::Schema => {
+            "You have schema-only tools: list_schema and describe_table. You can inspect \
+             structure (tables, columns, types, keys) but you CANNOT read row data — there is no \
+             query tool, so do not promise to run one."
+        }
+        AiTier::Read => {
+            "You have read-only tools: list_schema, describe_table, run_select (capped SELECTs), \
+             and explain. Use them to ground every answer in the live database rather than \
+             guessing — discover objects with list_schema, inspect structure with describe_table, \
+             and read data with run_select. Prefer small, targeted queries with explicit columns \
+             and LIMIT."
+        }
+    };
+    let mut s = format!(
         "You are Red's database assistant, embedded in a native SQL explorer. You help the user \
          explore and understand the database they are connected to.\n\n\
-         You have read-only tools: list_schema, describe_table, run_select (capped SELECTs), and \
-         explain. Use them to ground every answer in the live database rather than guessing — \
-         discover objects with list_schema, inspect structure with describe_table, and read data \
-         with run_select. Prefer small, targeted queries with explicit columns and LIMIT.\n\n\
+         {tools_line}\n\n\
          When you write SQL for the user, put it in a fenced ```sql block so they can run it. Be \
          concise: lead with the answer, then the supporting query or detail.\n",
     );
@@ -548,6 +690,39 @@ mod tests {
     }
 
     #[test]
+    fn catalog_filters_by_tier() {
+        use red_core::{AiPolicy, AiTier};
+        let names = |tier| -> Vec<String> {
+            tool_catalog(&AiPolicy {
+                tier,
+                ..AiPolicy::default()
+            })
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+        };
+        assert!(names(AiTier::Off).is_empty());
+        assert_eq!(names(AiTier::Schema), ["list_schema", "describe_table"]);
+        assert_eq!(
+            names(AiTier::Read),
+            ["list_schema", "describe_table", "run_select", "explain"]
+        );
+    }
+
+    #[test]
+    fn result_byte_cap_truncates_on_char_boundary() {
+        // Under the cap: returned verbatim.
+        assert_eq!(cap_result_bytes("hello".into(), 10), "hello");
+        // `0` disables the cap.
+        assert_eq!(cap_result_bytes("hello".into(), 0), "hello");
+        // A multi-byte string capped mid-codepoint truncates at the boundary below
+        // the cap (never splitting a char) and notes the truncation.
+        let capped = cap_result_bytes("ééééé".into(), 5);
+        assert!(capped.starts_with("éé")); // 4 bytes ≤ 5; the 3rd 'é' would cross it
+        assert!(capped.contains("result truncated"));
+    }
+
+    #[test]
     fn user_turn_folds_prior_transcript_once() {
         let ctx = AiContext {
             prior_transcript: Some("You: hi\n\nAssistant: hello".into()),
@@ -565,12 +740,26 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_the_four_readonly_tools() {
-        let catalog = tool_catalog();
+    fn catalog_has_the_four_readonly_tools_at_read_tier() {
+        let catalog = tool_catalog(&AiPolicy::default());
         let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(
             names,
             ["list_schema", "describe_table", "run_select", "explain"]
         );
+    }
+
+    #[test]
+    fn tool_call_budget_is_per_conversation_and_capped() {
+        let mut state = AiState::default();
+        // A cap of 2 admits two calls, then refuses the third on the same conversation.
+        assert!(state.charge_tool_call(1, 2));
+        assert!(state.charge_tool_call(1, 2));
+        assert!(!state.charge_tool_call(1, 2));
+        // A different conversation has its own fresh budget.
+        assert!(state.charge_tool_call(2, 2));
+        // `0` means unlimited.
+        assert!(state.charge_tool_call(3, 0));
+        assert!(state.charge_tool_call(3, 0));
     }
 }

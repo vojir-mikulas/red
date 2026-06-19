@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::UnboundedSender;
-use red_core::{ConnectionConfig, DbKind, KeyKind, KeySpec, RedError, ResultFilter, Value};
+use red_core::{AiTier, ConnectionConfig, DbKind, KeyKind, KeySpec, RedError, ResultFilter, Value};
 use red_driver::{
     AbortSignal, CancelToken, DatabaseDriver, MysqlDriver, PageCap, PostgresDriver, QueryCursor,
     SqliteDriver,
@@ -182,6 +182,11 @@ struct ActiveQuery {
 /// switching between connections is instant — no reconnect, no schema reload.
 struct SessionState {
     driver: Arc<dyn DatabaseDriver>,
+    /// This connection's optional AI policy overrides (M-S7), captured at connect
+    /// from its [`ConnectionConfig`]. Layered over the global `[ai]` policy when a
+    /// turn runs on this session, so a sensitive connection can disable the
+    /// assistant or pin its tier without touching the global setting.
+    ai_override: AiOverride,
     /// The SSH tunnel this connection rides, if any. Held only to keep it alive
     /// for the session's lifetime: dropping it (on teardown/eviction) closes the
     /// forward and the SSH session. `None` for a direct connection.
@@ -196,10 +201,24 @@ struct SessionState {
     last_used: Instant,
 }
 
+/// A connection's optional AI policy overrides (M-S7), carried from its
+/// [`ConnectionConfig`] to the session so a turn can resolve the effective policy.
+/// `None` fields inherit the global `[ai]` policy.
+#[derive(Clone, Copy, Default)]
+struct AiOverride {
+    enabled: Option<bool>,
+    tier: Option<AiTier>,
+}
+
 impl SessionState {
-    fn new(driver: Arc<dyn DatabaseDriver>, tunnel: Option<Tunnel>) -> Self {
+    fn new(
+        driver: Arc<dyn DatabaseDriver>,
+        tunnel: Option<Tunnel>,
+        ai_override: AiOverride,
+    ) -> Self {
         Self {
             driver,
+            ai_override,
             _tunnel: tunnel,
             active: None,
             results: Arc::new(Mutex::new(HashMap::new())),
@@ -256,6 +275,9 @@ enum ConnectOutcome {
     Session {
         id: SessionId,
         generation: u64,
+        /// The connection's AI policy overrides (M-S7), captured at connect so the
+        /// resulting session carries them.
+        ai_override: AiOverride,
         result: Result<(Arc<dyn DatabaseDriver>, Option<Tunnel>), ConnectFail>,
     },
     /// A session-less `TestConnection` finished — carries the server version on
@@ -294,6 +316,7 @@ fn apply_connect_outcome(
         ConnectOutcome::Session {
             id,
             generation,
+            ai_override,
             result,
         } => {
             // A newer `Connect` on this id superseded the one that produced this
@@ -304,7 +327,7 @@ fn apply_connect_outcome(
             match result {
                 Ok((driver, tunnel)) => {
                     let version = driver.server_version();
-                    sessions.insert(id, SessionState::new(driver, tunnel));
+                    sessions.insert(id, SessionState::new(driver, tunnel, ai_override));
                     emit(events, Some(id), Event::Connected { version });
                 }
                 Err(ConnectFail {
@@ -392,6 +415,11 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
     let mut ai_agent_command = String::new();
     let mut ai_model: String = red_ai::MODEL_OPUS.to_string();
     let mut ai_show_thinking = false;
+    // The global AI access policy (M-S7): master switch, access tier, and resource
+    // guards, set by `ConfigureAi`. A turn layers the session's per-connection
+    // overrides over this and enforces the result in the shared tool layer, so it
+    // covers both backends and the agent can't bypass it.
+    let mut ai_policy = red_core::AiPolicy::default();
     let ai_state = Arc::new(Mutex::new(crate::ai::AiState::default()));
     // The subscription (ACP) path keeps one live agent conversation per
     // `conversation_id`; the tokio Mutex lets a slow agent start await off-loop.
@@ -446,12 +474,19 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 let generation = connect_gen.entry(id).or_default();
                 *generation += 1;
                 let generation = *generation;
+                // Capture the connection's AI overrides before `config` moves into
+                // the dial task, so the resulting session carries them (M-S7).
+                let ai_override = AiOverride {
+                    enabled: config.ai_enabled,
+                    tier: config.ai_tier,
+                };
                 let tx = connect_tx.clone();
                 tokio::spawn(async move {
                     let result = attempt_connect(&config).await;
                     let _ = tx.send(ConnectOutcome::Session {
                         id,
                         generation,
+                        ai_override,
                         result,
                     });
                 });
@@ -479,6 +514,11 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     cfg.model
                 };
                 ai_show_thinking = cfg.show_thinking;
+                ai_policy = red_core::AiPolicy {
+                    enabled: cfg.enabled,
+                    tier: cfg.tier,
+                    limits: cfg.limits,
+                };
                 // An empty key leaves the API-key path off — a turn then replies
                 // with a clear AiError rather than a failed network call. The
                 // subscription path needs no key (the agent owns its auth).
@@ -512,6 +552,27 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
 
+                // Resolve the effective AI policy (M-S7): the session's per-connection
+                // overrides layered over the global one. The master switch is checked
+                // here, before anything spawns — a disabled assistant starts no MCP
+                // server and no agent process, it just reports the refusal.
+                let ai_override = session_id
+                    .and_then(|id| sessions.get(&id))
+                    .map(|s| s.ai_override)
+                    .unwrap_or_default();
+                let effective = ai_policy.with_overrides(ai_override.enabled, ai_override.tier);
+                if !effective.enabled {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::AiError {
+                            conversation_id,
+                            message: "the AI assistant is disabled for this connection".into(),
+                        },
+                    );
+                    continue;
+                }
+
                 match provider {
                     crate::protocol::AiProviderKind::ApiKey => {
                         let Some(provider) = ai_provider.clone() else {
@@ -537,6 +598,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             conversation_id,
                             ai_model.clone(),
                             ai_show_thinking,
+                            effective,
                             message,
                             context,
                             cancel,
@@ -560,6 +622,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             events.clone(),
                             session_id,
                             conversation_id,
+                            effective,
                             message,
                             context,
                         ));
@@ -1941,7 +2004,7 @@ mod checkpoint_tests {
     #[test]
     fn reap_excess_results_caps_to_the_lowest_epochs() {
         let (path, driver) = driver_with(1, "reap");
-        let mut state = SessionState::new(driver, None);
+        let mut state = SessionState::new(driver, None, AiOverride::default());
 
         // Open one more than the cap, epochs 1..=MAX+1. Every epoch also has an
         // in-flight handle, so we can assert those are reaped in lockstep.

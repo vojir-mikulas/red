@@ -143,6 +143,11 @@ impl AppState {
             ai.provider == red_service::AiProviderKind::Subscription || !ai.api_key.is_empty();
         self.ai_api_key_available = !ai.api_key.is_empty();
         self.service.send_global(Command::ConfigureAi(ai));
+        // If the reload (or a per-connection override) just flipped the master
+        // switch off (M-S7), close any open panel so the kill switch is immediate.
+        if self.assistant.is_some() && !self.ai_enabled() {
+            self.assistant = None;
+        }
         self.apply_theme(cx);
         cx.notify();
     }
