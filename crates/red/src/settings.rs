@@ -33,6 +33,7 @@ pub struct Settings {
     pub query: QuerySettings,
     pub behavior: BehaviorSettings,
     pub update: UpdateSettings,
+    pub ai: AiSettings,
 }
 
 // --- appearance --------------------------------------------------------------
@@ -304,6 +305,41 @@ impl UpdateSettings {
     }
 }
 
+// --- ai ----------------------------------------------------------------------
+
+/// AI assistant configuration (the right-docked chat sidebar). The API key does
+/// **not** live here — it routes through the OS keyring (see `crate::secrets`),
+/// the same secret store connection passwords use. Only the non-secret knobs
+/// (provider, model, the thinking-display toggle) are persisted in `settings.toml`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiSettings {
+    /// Which backend handles turns:
+    /// - `"anthropic"` (default) — the Claude Messages API, billed to an API key.
+    /// - `"subscription"` — Claude Code over ACP, billed to the user's Pro/Max
+    ///   subscription (the agent owns its own login; no key needed).
+    pub provider: String,
+    /// Model id, e.g. `claude-opus-4-8`. Empty falls back to the Opus default.
+    /// (API-key path only; the subscription agent picks its own model.)
+    pub model: String,
+    /// Surface a summarized "thinking…" affordance while the model reasons.
+    pub show_thinking: bool,
+    /// Advanced: override the subscription agent's launch command. Empty falls
+    /// back to the default `npx -y @agentclientprotocol/claude-agent-acp`.
+    pub agent_command: String,
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        Self {
+            provider: "anthropic".to_string(),
+            model: "claude-opus-4-8".to_string(),
+            show_thinking: false,
+            agent_command: String::new(),
+        }
+    }
+}
+
 // --- store -------------------------------------------------------------------
 
 /// The outcome of a load: the resolved settings, plus any non-fatal warnings to
@@ -371,6 +407,7 @@ impl FileSettingsStore {
             query: section(&value, "query", &mut warnings),
             behavior: section(&value, "behavior", &mut warnings),
             update: section(&value, "update", &mut warnings),
+            ai: section(&value, "ai", &mut warnings),
         };
         let migrated = apply_legacy(&mut settings, &value);
 

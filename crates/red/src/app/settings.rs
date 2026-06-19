@@ -135,6 +135,13 @@ impl AppState {
         // backend only re-polls if the cadence actually moved.
         self.service
             .send_global(Command::ConfigureUpdates(update_config(&self.settings)));
+        // Re-push the AI config in case `[ai]` (model / provider / thinking) changed.
+        let ai = crate::app::ai_config(&self.settings);
+        // Subscription mode needs no key (the agent owns its login); the API-key
+        // path is "ready" only once a key is present.
+        self.ai_configured =
+            ai.provider == red_service::AiProviderKind::Subscription || !ai.api_key.is_empty();
+        self.service.send_global(Command::ConfigureAi(ai));
         self.apply_theme(cx);
         cx.notify();
     }

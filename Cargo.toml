@@ -43,6 +43,30 @@ futures-util = { version = "0.3", default-features = false }
 # bundles key parsing, known_hosts checks, and an ssh-agent client.
 russh = "0.61"
 
+# --- Subscription assistant via ACP (red-acp) ---
+# Drives Claude Code as an external agent over the Agent Client Protocol so the
+# user's Pro/Max subscription grounds the assistant (the agent owns auth/billing;
+# Red never touches the OAuth tokens). Pinned exactly to the rev Zed uses;
+# independent of the gpui pin, so the cross-repo gpui contract is unaffected.
+agent-client-protocol = "=0.14.0"
+# The subscription assistant grounds the agent through a localhost MCP server Red
+# hosts (the agent advertises `mcp_capabilities.http`, not `acp`). hyper/hyper-util
+# are already in the tree via reqwest, so this adds no new dependency subtree; the
+# loopback server is plaintext (no TLS) behind a per-session bearer nonce.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+# Random per-session MCP bearer nonce + ACP/MCP ids (already compiled via the ACP
+# crate's tree).
+uuid = { version = "1", features = ["v4"] }
+
+# --- AI assistant provider (red-ai) ---
+# HTTP client for the Claude Messages API (SSE streaming). rustls-tls reuses the
+# same pure-Rust TLS stack the MySQL driver already pulls — no native-TLS / system
+# OpenSSL surface enters the build.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
 # --- Config persistence (connection list at the app edge) ---
 serde = { version = "1", features = ["derive"] }
 # Reads one GitHub Releases API response in the self-updater (red-service); kept
@@ -73,6 +97,8 @@ notify = "6"
 red-core = { path = "crates/red-core" }
 red-driver = { path = "crates/red-driver" }
 red-service = { path = "crates/red-service" }
+red-ai = { path = "crates/red-ai" }
+red-acp = { path = "crates/red-acp" }
 
 [profile.dev]
 # GPUI's dep tree is large; a touch of opt on deps keeps debug builds usable.

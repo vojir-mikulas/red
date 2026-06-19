@@ -15,14 +15,21 @@
 //! Layout: [`protocol`] holds the `Command`/`Event`/`RunFetch` wire types,
 //! [`dispatch`] the command pump, and this module the UI-facing handles.
 
+mod acp;
+mod ai;
 mod dispatch;
+mod mcp;
 mod protocol;
 #[cfg(test)]
 mod tests;
 mod tunnel;
 mod update;
 
-pub use protocol::{Command, Event, RunFetch, SessionId, SortKey, UpdateConfig};
+pub use protocol::{
+    AiConfig, AiContext, AiDelta, AiProviderKind, AiUsage, Command, Event, RunFetch, SessionId,
+    SortKey, UpdateConfig,
+};
+pub use red_acp::DEFAULT_AGENT_COMMAND;
 
 use futures::channel::mpsc::{unbounded, UnboundedReceiver};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender as CmdSender};

@@ -22,7 +22,7 @@ use crate::{Command, Envelope, Event, RunFetch, SessionId};
 
 /// The event sender carries each event tagged with the session it belongs to
 /// (`None` for the session-less probe replies).
-type Events = UnboundedSender<(Option<SessionId>, Event)>;
+pub(crate) type Events = UnboundedSender<(Option<SessionId>, Event)>;
 
 /// Cap on page fetches running at once. The grid can request a burst of pages
 /// (several tabs, or a viewport spanning page boundaries); without a cap a flung
@@ -381,6 +381,20 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
         tx
     };
 
+    // The AI assistant provider (built from `ConfigureAi`; `None` until a key is
+    // configured), the resolved model, and the thinking-display flag. A turn runs
+    // as a spawned task off this loop (like exports), sharing `ai_state` for its
+    // conversation history and cancel registry.
+    let mut ai_provider: Option<Arc<dyn red_ai::AiProvider>> = None;
+    let mut ai_kind = crate::protocol::AiProviderKind::ApiKey;
+    let mut ai_agent_command = String::new();
+    let mut ai_model: String = red_ai::MODEL_OPUS.to_string();
+    let mut ai_show_thinking = false;
+    let ai_state = Arc::new(Mutex::new(crate::ai::AiState::default()));
+    // The subscription (ACP) path keeps one live agent conversation per
+    // `conversation_id`; the tokio Mutex lets a slow agent start await off-loop.
+    let ai_acp = Arc::new(tokio::sync::Mutex::new(crate::acp::AcpManager::default()));
+
     loop {
         let (session_id, command) = tokio::select! {
             maybe = commands.recv() => match maybe {
@@ -443,6 +457,108 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
 
             Command::CheckForUpdate => {
                 let _ = updater.send(crate::update::UpdateControl::CheckNow);
+            }
+
+            Command::ConfigureAi(cfg) => {
+                ai_kind = cfg.provider;
+                ai_agent_command = cfg.agent_command;
+                ai_model = if cfg.model.is_empty() {
+                    red_ai::MODEL_OPUS.to_string()
+                } else {
+                    cfg.model
+                };
+                ai_show_thinking = cfg.show_thinking;
+                // An empty key leaves the API-key path off — a turn then replies
+                // with a clear AiError rather than a failed network call. The
+                // subscription path needs no key (the agent owns its auth).
+                ai_provider = if cfg.api_key.is_empty() {
+                    None
+                } else {
+                    Some(Arc::new(red_ai::AnthropicProvider::new(cfg.api_key))
+                        as Arc<dyn red_ai::AiProvider>)
+                };
+            }
+
+            Command::AiTurn {
+                conversation_id,
+                message,
+                context,
+            } => {
+                // Both backends ground in the connected session's driver.
+                let driver = session_id
+                    .and_then(|id| sessions.get(&id))
+                    .map(|s| s.driver.clone());
+                let Some(driver) = driver else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::AiError {
+                            conversation_id,
+                            message: "not connected".into(),
+                        },
+                    );
+                    continue;
+                };
+
+                match ai_kind {
+                    crate::protocol::AiProviderKind::ApiKey => {
+                        let Some(provider) = ai_provider.clone() else {
+                            emit(
+                                &events,
+                                session_id,
+                                Event::AiError {
+                                    conversation_id,
+                                    message: "AI assistant is not configured — add an API key in Settings."
+                                        .into(),
+                                },
+                            );
+                            continue;
+                        };
+                        let cancel = red_ai::CancelToken::new();
+                        lock(&ai_state).register(conversation_id, cancel.clone());
+                        tokio::spawn(crate::ai::run_turn(
+                            provider,
+                            driver,
+                            events.clone(),
+                            ai_state.clone(),
+                            session_id,
+                            conversation_id,
+                            ai_model.clone(),
+                            ai_show_thinking,
+                            message,
+                            context,
+                            cancel,
+                        ));
+                    }
+                    crate::protocol::AiProviderKind::Subscription => {
+                        let command = if ai_agent_command.is_empty() {
+                            crate::DEFAULT_AGENT_COMMAND.to_string()
+                        } else {
+                            ai_agent_command.clone()
+                        };
+                        // The agent loads its own config (and login) from cwd; use
+                        // the process working directory.
+                        let cwd = std::env::current_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("/"));
+                        tokio::spawn(crate::acp::run_turn(
+                            ai_acp.clone(),
+                            driver,
+                            command,
+                            cwd,
+                            events.clone(),
+                            session_id,
+                            conversation_id,
+                            message,
+                            context,
+                        ));
+                    }
+                }
+            }
+
+            Command::AiCancel { conversation_id } => {
+                lock(&ai_state).cancel(conversation_id);
+                let manager = ai_acp.clone();
+                tokio::spawn(async move { manager.lock().await.cancel(conversation_id) });
             }
 
             Command::TestConnection(config) => {
@@ -1663,7 +1779,7 @@ async fn connect(
 /// The UI may have dropped its receiver (window closed) — a failed send is the
 /// expected shutdown path, not an error. `session` tags the event so the UI
 /// routes it to the right workspace (`None` for the session-less probe replies).
-fn emit(events: &Events, session: Option<SessionId>, event: Event) {
+pub(crate) fn emit(events: &Events, session: Option<SessionId>, event: Event) {
     let _ = events.unbounded_send((session, event));
 }
 

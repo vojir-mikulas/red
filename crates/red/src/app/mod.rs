@@ -552,6 +552,21 @@ pub struct AppState {
     /// The cell detail inspector, when open (Track B1). Owns its scroll position
     /// and any on-demand full value fetched for a capped/evicted cell.
     pub(crate) inspector: Option<crate::inspector::InspectorState>,
+    /// The AI assistant chat panel, when open (right-docked). Owns its input,
+    /// transcript, and streaming state. Single panel across the workspace.
+    pub(crate) assistant: Option<crate::assistant::AssistantState>,
+    /// Set when the assistant panel just opened: the next render focuses its input.
+    pub(crate) focus_assistant: bool,
+    /// Docked width of the assistant panel, retained while it's closed so reopening
+    /// restores it. Resizable via the shell split.
+    pub(crate) assistant_w: Pixels,
+    pub(crate) assistant_drag: Option<DragAnchor>,
+    /// Whether an AI provider API key is configured (keyring or env). Drives the
+    /// panel's setup-vs-chat view. Recomputed at launch and on settings reload.
+    pub(crate) ai_configured: bool,
+    /// Monotonic id source for assistant conversations, so the backend keeps each
+    /// panel's turn history separate.
+    pub(crate) next_conversation_id: u64,
     /// The result filter bar, when open (Track B2). The transient editing UI; the
     /// *applied* filter lives on the grid (`ResultGrid::filter`).
     pub(crate) filter_bar: Option<crate::filter::FilterBarState>,
@@ -753,6 +768,11 @@ pub struct AppState {
 /// The GitHub `owner/repo` the self-updater polls (see docs/plans/self-update.md).
 pub(crate) const UPDATE_REPO: &str = "vojir-mikulas/red";
 
+/// Where the "report a bug" links point — the project's GitHub issue tracker.
+/// Shared by the welcome-screen footer, the About tab, and the Help menu so the
+/// three never drift.
+pub(crate) const ISSUES_URL: &str = "https://github.com/vojir-mikulas/red/issues";
+
 /// Build the backend's updater config from the persisted settings + this build's
 /// version. Used at launch and on each settings reload.
 fn update_config(settings: &Settings) -> UpdateConfig {
@@ -761,6 +781,42 @@ fn update_config(settings: &Settings) -> UpdateConfig {
         repo: UPDATE_REPO.to_string(),
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         interval: settings.update.interval(),
+    }
+}
+
+/// Build the backend's AI config from `[ai]` settings + the keyring-stored API
+/// key. The key is read from the OS keychain (the same store connection passwords
+/// use); as a convenience for first-run / headless setup it falls back to the
+/// `ANTHROPIC_API_KEY` environment variable. An empty key leaves the assistant
+/// off (a turn then replies with a clear error). Used at launch and on reload.
+pub(crate) fn ai_config(settings: &Settings) -> red_service::AiConfig {
+    let provider = if settings.ai.provider.is_empty() {
+        "anthropic".to_string()
+    } else {
+        settings.ai.provider.clone()
+    };
+    // `subscription` drives Claude Code over ACP (no key); anything else is the
+    // API-key path. The key is only read for the latter.
+    let kind = if provider.eq_ignore_ascii_case("subscription") {
+        red_service::AiProviderKind::Subscription
+    } else {
+        red_service::AiProviderKind::ApiKey
+    };
+    let api_key = if kind == red_service::AiProviderKind::ApiKey {
+        crate::secrets::get_ai_key(&provider)
+            .ok()
+            .flatten()
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    red_service::AiConfig {
+        provider: kind,
+        model: settings.ai.model.clone(),
+        api_key,
+        show_thinking: settings.ai.show_thinking,
+        agent_command: settings.ai.agent_command.clone(),
     }
 }
 
@@ -805,6 +861,9 @@ impl AppState {
         // setters and `reload_settings` re-push them when they change.
         service.send_global(Command::SetStatementTimeout(settings.query.timeout()));
         service.send_global(Command::SetDisplayCellCap(settings.grid.max_cell_chars));
+        // Configure the AI assistant provider (key from the keyring / env). An
+        // empty key leaves it off until one is set.
+        service.send_global(Command::ConfigureAi(ai_config(&settings)));
         // Arm the self-updater (Phase 3): an initial check at launch, then on the
         // configured cadence — unless `auto_update = false`, which sends a disabled
         // config so the backend keeps the timer (and network) parked.
@@ -1115,6 +1174,15 @@ impl AppState {
             next_copy_id: 0,
             pending_copy: None,
             inspector: None,
+            assistant: None,
+            focus_assistant: false,
+            assistant_w: px(380.),
+            assistant_drag: None,
+            ai_configured: {
+                let cfg = ai_config(&settings);
+                cfg.provider == red_service::AiProviderKind::Subscription || !cfg.api_key.is_empty()
+            },
+            next_conversation_id: 0,
             filter_bar: None,
             cell_menu: None,
             confirm_exec: None,
@@ -1443,6 +1511,19 @@ impl AppState {
 
             // --- self-update (Phases 3–4) ---
             Event::UpdateState(state) => self.on_update_state(state, cx),
+
+            // --- AI assistant ---
+            Event::AiDelta {
+                conversation_id,
+                delta,
+            } => self.on_ai_delta(conversation_id, delta, cx),
+            Event::AiTurnFinished {
+                conversation_id, ..
+            } => self.on_ai_finished(conversation_id, cx),
+            Event::AiError {
+                conversation_id,
+                message,
+            } => self.on_ai_error(conversation_id, message, cx),
 
             // The streaming `Query`/`FetchMore` path stays in the protocol for
             // headless use + tests; the UI now drives results via `OpenResult`.

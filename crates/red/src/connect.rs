@@ -134,6 +134,31 @@ impl AppState {
         .a11y_label("Settings")
         .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
 
+        // Quiet footer: Red is pre-1.0, so invite bug reports straight from the
+        // first screen. The link reuses the shared `open_external` seam.
+        let footer_theme = cx.theme().clone();
+        let footer =
+            div()
+                .pt(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .text_size(footer_theme.scale(12.))
+                .text_color(footer_theme.text_faint)
+                .child("Red is in early development — found a bug?")
+                .child(
+                    div()
+                        .id("connect-report-bug")
+                        .cursor_pointer()
+                        .text_color(footer_theme.accent)
+                        .hover(|s| s.underline())
+                        .child("Report it")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.open_external(crate::app::ISSUES_URL, cx)
+                        })),
+                );
+
         let theme = cx.theme();
 
         // The brand lockup: the square mark beside the wordmark, centered. Both take
@@ -192,7 +217,8 @@ impl AppState {
             .child(connections_header)
             .children(toolbar)
             .child(saved)
-            .child(new_button);
+            .child(new_button)
+            .child(footer);
 
         let screen = div()
             .id("connect-screen")

@@ -1129,7 +1129,22 @@ fn about_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 auto_update,
                 &theme,
             ))
-            .child(update_status_row(state, &theme, cx)),
+            .child(update_status_row(state, &theme, cx))
+            .child(settings_header("Feedback", &theme))
+            .child(setting_row(
+                "Report a bug",
+                "Red is in early development. Found something wrong? Open an \
+                 issue on GitHub.",
+                Button::new("report-bug", "Report a bug…")
+                    .variant(ButtonVariant::Secondary)
+                    .size(ButtonSize::Sm)
+                    .on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.open_external(crate::app::ISSUES_URL, cx)
+                        }),
+                    ),
+                &theme,
+            )),
         &theme,
     )
     .into_any_element()

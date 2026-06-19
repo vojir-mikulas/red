@@ -192,6 +192,26 @@ pub enum Command {
     /// Force an immediate update check ("Check for updates" in the About tab).
     /// Global.
     CheckForUpdate,
+    /// (Re)configure the AI assistant provider. Global — sent at launch and on
+    /// each settings reload, like the other tuning knobs. An empty `api_key`
+    /// leaves the assistant unconfigured (a turn then replies with `AiError`).
+    /// The key never touches `settings.toml`; the UI reads it from the OS keyring
+    /// and hands it across here.
+    ConfigureAi(AiConfig),
+    /// Run one assistant turn on the envelope's session. The backend drives the
+    /// model → tool → model loop (read-only schema/`SELECT` tools, auto-run and
+    /// row-capped) and streams `AiDelta` events, ending with `AiTurnFinished` or
+    /// `AiError`. `conversation_id` lets the UI route deltas to the right thread
+    /// and cancel a specific turn.
+    AiTurn {
+        conversation_id: u64,
+        message: String,
+        context: AiContext,
+    },
+    /// Abort an in-flight assistant turn by `conversation_id` (the panel's Stop).
+    AiCancel {
+        conversation_id: u64,
+    },
     Shutdown,
 }
 
@@ -358,7 +378,96 @@ pub enum Event {
     /// The self-updater's state changed (Phases 3–4). Global (`None` session) —
     /// the UI stores it and renders the titlebar pill + About-tab status from it.
     UpdateState(UpdateState),
+    /// A streamed increment of an assistant turn. Echoes `conversation_id` so the
+    /// panel appends it to the right thread.
+    AiDelta {
+        conversation_id: u64,
+        delta: AiDelta,
+    },
+    /// An assistant turn completed normally; `usage` is its token accounting.
+    AiTurnFinished {
+        conversation_id: u64,
+        usage: AiUsage,
+    },
+    /// An assistant turn failed (no provider, auth, network, refusal, cancel).
+    /// Scoped to its conversation so the panel shows it inline, not as a global
+    /// toast.
+    AiError {
+        conversation_id: u64,
+        message: String,
+    },
     Error(String),
+}
+
+/// Which assistant backend runs a turn. `ApiKey` is the shipped Claude Messages
+/// API path (`red-ai`); `Subscription` drives Claude Code over ACP (`red-acp`) so
+/// the turn is billed to the user's Pro/Max subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AiProviderKind {
+    #[default]
+    ApiKey,
+    Subscription,
+}
+
+/// How the AI assistant is configured, carried by `ConfigureAi`. Built UI-side
+/// from `settings.toml` (`[ai]`) plus the API key read from the OS keyring.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiConfig {
+    /// Which backend handles turns (API key vs Claude subscription over ACP).
+    pub provider: AiProviderKind,
+    /// Model id, e.g. `claude-opus-4-8`. Empty falls back to the Opus default.
+    /// (API-key path only; the subscription agent picks its own model.)
+    pub model: String,
+    /// Provider API key, read from the keyring. Empty leaves the API-key path off.
+    pub api_key: String,
+    /// Surface a summarized "thinking…" affordance (adaptive thinking).
+    pub show_thinking: bool,
+    /// The subscription agent launch command; empty falls back to the default npx
+    /// invocation. Advanced override (`[ai] agent_command`).
+    pub agent_command: String,
+}
+
+/// What's on screen when the user sends a turn, assembled by the UI (it knows the
+/// screen; the service knows the model). The service folds this into the system
+/// prompt / first user message so the model is grounded in *this* database.
+#[derive(Debug, Clone, Default)]
+pub struct AiContext {
+    /// A compact `table(col type, …)` summary of the connected schema. The model
+    /// pulls full detail on demand via the `describe_table` tool, so this stays
+    /// small even for large databases.
+    pub schema_summary: String,
+    /// The SQL currently in the editor, if any.
+    pub editor_sql: Option<String>,
+    /// The last query/result error shown, if any ("Explain this error").
+    pub last_error: Option<String>,
+    /// A textual snapshot of the selected rows, if any.
+    pub selection: Option<String>,
+    /// `kind` + database name, for the system prompt's grounding line.
+    pub connection: String,
+    /// Whether this connection forbids writes — folded into the prompt so the
+    /// model doesn't propose edits it can't run.
+    pub read_only: bool,
+}
+
+/// One streamed increment of an assistant turn (the `Event::AiDelta` payload).
+#[derive(Debug, Clone)]
+pub enum AiDelta {
+    /// A chunk of summarized thinking text.
+    Thinking(String),
+    /// A chunk of visible answer text.
+    Text(String),
+    /// The model began running a read-only tool (shown as a transient status).
+    ToolStarted { name: String },
+    /// A tool finished; `ok` is false when it errored.
+    ToolFinished { name: String, ok: bool },
+}
+
+/// Token accounting for one assistant turn (the `AiTurnFinished` payload).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AiUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
 }
 
 /// How the self-updater should behave, carried by `ConfigureUpdates`. Built

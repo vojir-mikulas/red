@@ -6,6 +6,7 @@
 
 mod app;
 mod assets;
+mod assistant;
 mod config;
 mod connect;
 #[cfg(feature = "dev-stats")]
@@ -16,6 +17,7 @@ mod icons;
 mod inspector;
 mod keymap;
 mod keymap_config;
+mod markdown;
 mod menu;
 mod palette;
 mod plan;

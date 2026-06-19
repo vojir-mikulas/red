@@ -210,6 +210,52 @@ impl AppState {
             div().flex_1().min_h(px(0.)).child(outer)
         };
 
+        // With the assistant open, dock it to the right of the whole workspace via
+        // a resizable split (same shape as the inspector dock, one level up). Width
+        // is app-owned (`assistant_w`), so it survives close/reopen.
+        let body = if self.assistant.is_some() {
+            let start = view.clone();
+            let resize = view.clone();
+            let end = view.clone();
+            let panel = self.render_assistant(cx);
+            div().flex_1().min_h(px(0.)).child(
+                SplitPane::new("shell-split-assistant", Axis::Horizontal)
+                    .sized(SplitSide::Trailing)
+                    .size(self.assistant_w)
+                    .gutter(px(1.))
+                    .drag(self.assistant_drag)
+                    .min_first(px(320.))
+                    .max_first(px(760.))
+                    .on_drag_start(move |anchor, _, cx| {
+                        start
+                            .update(cx, |this, cx| {
+                                this.assistant_drag = Some(anchor);
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+                    .on_resize(move |size, _, cx| {
+                        resize
+                            .update(cx, |this, cx| {
+                                this.assistant_w = size;
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+                    .on_drag_end(move |_, cx| {
+                        end.update(cx, |this, cx| {
+                            this.assistant_drag = None;
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .first(body)
+                    .second(panel),
+            )
+        } else {
+            body
+        };
+
         // --- status bar: endpoint · db · read-only | rows · cols · UTF-8 · SQL ·
         // engine — the design's information-dense bottom strip ---
         let counts = active.active_result().and_then(|g| g.status_counts());
@@ -292,6 +338,31 @@ impl AppState {
             ))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)));
 
+        // Assistant toggle, pinned to the far-right of the status bar (mirrors the
+        // schema sidebar toggle on the left). Accent-tinted while the panel is open.
+        let assistant_open = self.assistant.is_some();
+        let assistant_toggle = div()
+            .id("toggle-assistant")
+            .ml_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(20.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .tooltip(Tooltip::text("Toggle assistant  ⌘L"))
+            .hover(|s| s.bg(theme.bg_elevated))
+            .child(crate::icons::icon(
+                "sparkles",
+                theme.scale(14.),
+                if assistant_open {
+                    theme.red
+                } else {
+                    theme.text_muted
+                },
+            ))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_assistant(cx)));
+
         let statusbar = div()
             .flex_shrink_0()
             .h(px(25.))
@@ -312,7 +383,13 @@ impl AppState {
                     .child(sidebar_toggle)
                     .child(status_left),
             )
-            .child(status_right);
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(status_right)
+                    .child(assistant_toggle),
+            );
 
         div()
             .size_full()

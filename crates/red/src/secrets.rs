@@ -141,6 +141,31 @@ pub fn delete_ssh_passphrase(id: &str) -> Result<()> {
     remove(&ssh_passphrase_account(id))
 }
 
+/// Keychain account for the AI assistant provider's API key. App-global (not
+/// per-connection), namespaced by provider so multiple providers can coexist.
+fn ai_key_account(provider: &str) -> String {
+    format!("ai-key:{provider}")
+}
+
+/// Fetch the AI provider's API key, or `None` if unset. The assistant stays off
+/// until this is present.
+pub fn get_ai_key(provider: &str) -> Result<Option<String>> {
+    read(&ai_key_account(provider))
+}
+
+/// Store (or replace) the AI provider's API key. Never written to `settings.toml`
+/// — it lives only in the OS keychain, like connection passwords.
+pub fn set_ai_key(provider: &str, key: &str) -> Result<()> {
+    write(&ai_key_account(provider), key)
+}
+
+/// Remove the AI provider's API key. Idempotent. The symmetric remove of the
+/// set/get/delete trio, kept for the settings "remove key" path.
+#[allow(dead_code)]
+pub fn delete_ai_key(provider: &str) -> Result<()> {
+    remove(&ai_key_account(provider))
+}
+
 /// Remove every secret filed under a connection id — DB password plus both SSH
 /// secrets — so deleting a connection never orphans a credential. Idempotent.
 pub fn delete_all(id: &str) -> Result<()> {
