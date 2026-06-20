@@ -571,14 +571,14 @@ pub struct AppState {
     /// restores it. Resizable via the shell split.
     pub(crate) assistant_w: Pixels,
     pub(crate) assistant_drag: Option<DragAnchor>,
-    /// Whether the assistant is usable at all (a key is configured, or the default
-    /// provider is the subscription, which needs none). Drives the panel's
-    /// setup-vs-chat view. Recomputed at launch and on settings reload.
+    /// Whether the assistant is usable at all — at least one configured agent is
+    /// ready (an ACP agent, which needs no key, or an API agent with a key). Drives
+    /// the panel's setup-vs-chat view. Recomputed at launch and on settings reload.
     pub(crate) ai_configured: bool,
-    /// Whether an Anthropic API key is available (keyring or env), independent of
-    /// the default provider. Gates offering an API-key chat alongside a
-    /// subscription one (mixed providers, M-S6). Recomputed with `ai_configured`.
-    pub(crate) ai_api_key_available: bool,
+    /// The usable agents in config order — the source for the panel's agent
+    /// selector and the per-chat default. An API agent appears only once it has a
+    /// key; an ACP agent always. Recomputed with `ai_configured`.
+    pub(crate) usable_agents: Vec<AgentInfo>,
     /// Monotonic id source for assistant conversations, so the backend keeps each
     /// panel's turn history separate.
     pub(crate) next_conversation_id: u64,
@@ -803,38 +803,45 @@ fn update_config(settings: &Settings) -> UpdateConfig {
 }
 
 /// Build the backend's AI config from `[ai]` settings + the keyring-stored API
-/// key. The key is read from the OS keychain (the same store connection passwords
-/// use); as a convenience for first-run / headless setup it falls back to the
-/// `ANTHROPIC_API_KEY` environment variable. An empty key leaves the assistant
-/// off (a turn then replies with a clear error). Used at launch and on reload.
+/// keys. Each configured agent profile (resolved from `[[ai.agents]]`, or the
+/// synthesized legacy built-ins) becomes an [`AiAgentProfile`](red_service::AiAgentProfile);
+/// for `api`-kind agents the key is read from the OS keychain under `ai-key:<id>`
+/// (the `anthropic` built-in additionally falls back to the `ANTHROPIC_API_KEY`
+/// env var for first-run/headless setup). An empty key leaves *that* agent off (a
+/// turn on it then replies with a clear error). Used at launch and on reload.
 pub(crate) fn ai_config(settings: &Settings) -> red_service::AiConfig {
-    let provider = if settings.ai.provider.is_empty() {
-        "anthropic".to_string()
-    } else {
-        settings.ai.provider.clone()
-    };
-    // `subscription` drives Claude Code over ACP (no key); anything else is the
-    // API-key path. `kind` is only the *default* for new chats now — turns carry
-    // their own provider (M-S6), so a chat can be on either backend regardless.
-    let kind = if provider.eq_ignore_ascii_case("subscription") {
-        red_service::AiProviderKind::Subscription
-    } else {
-        red_service::AiProviderKind::ApiKey
-    };
-    // Always resolve the API key, even when the default is the subscription, so an
-    // API-key chat works alongside a subscription one (mixed providers, M-S6). The
-    // key lives under the canonical `anthropic` provider name (or the env var).
-    let api_key = crate::secrets::get_ai_key("anthropic")
-        .ok()
-        .flatten()
-        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-        .unwrap_or_default();
+    let agents = settings
+        .ai
+        .resolved_agents()
+        .into_iter()
+        .map(|a| {
+            let kind = if a.kind.eq_ignore_ascii_case("acp") {
+                red_service::AiAgentKind::Acp
+            } else {
+                red_service::AiAgentKind::Api
+            };
+            // Only api agents need a key; resolve it per-id, with the env-var
+            // fallback scoped to the canonical `anthropic` built-in.
+            let api_key = if matches!(kind, red_service::AiAgentKind::Api) {
+                resolve_agent_key(&a.id)
+            } else {
+                String::new()
+            };
+            red_service::AiAgentProfile {
+                id: a.id,
+                name: a.name,
+                kind,
+                command: a.command,
+                base_url: a.base_url,
+                model: a.model,
+                api_key,
+            }
+        })
+        .collect();
     red_service::AiConfig {
-        provider: kind,
-        model: settings.ai.model.clone(),
-        api_key,
+        agents,
+        default_agent: settings.ai.resolved_default_agent(),
         show_thinking: settings.ai.show_thinking,
-        agent_command: settings.ai.agent_command.clone(),
         // The global AI access policy (M-S7); a connection's overrides layer over
         // it on the backend. The tier string parses leniently (a typo → `read`).
         enabled: settings.ai.enabled,
@@ -846,6 +853,49 @@ pub(crate) fn ai_config(settings: &Settings) -> red_service::AiConfig {
             max_tool_calls: settings.ai.limits.max_tool_calls,
         },
     }
+}
+
+/// One configured, usable agent the panel can run a chat on. `is_acp` distinguishes
+/// the two backends for UI that differs by kind (the re-auth/switch-account action,
+/// the header label) without leaking the protocol enum into the panel.
+#[derive(Debug, Clone)]
+pub(crate) struct AgentInfo {
+    pub id: String,
+    pub name: String,
+    pub is_acp: bool,
+}
+
+/// The usable agents in config order: an ACP agent is always usable (it owns its
+/// auth); an API agent only once it has a key. Drives the panel's selector and the
+/// setup-vs-chat gate. Built from [`ai_config`] so it agrees exactly with what the
+/// backend was handed.
+pub(crate) fn usable_agents(settings: &Settings) -> Vec<AgentInfo> {
+    ai_config(settings)
+        .agents
+        .into_iter()
+        .filter(|a| matches!(a.kind, red_service::AiAgentKind::Acp) || !a.api_key.is_empty())
+        .map(|a| AgentInfo {
+            is_acp: matches!(a.kind, red_service::AiAgentKind::Acp),
+            id: a.id,
+            name: a.name,
+        })
+        .collect()
+}
+
+/// The API key for an `api`-kind agent profile, read from the OS keychain under
+/// `ai-key:<id>`. The canonical `anthropic` built-in additionally falls back to
+/// the `ANTHROPIC_API_KEY` env var (first-run / headless convenience); other
+/// agents do not, so a local/proxy agent never silently picks up that key.
+pub(crate) fn resolve_agent_key(id: &str) -> String {
+    crate::secrets::get_ai_key(id)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            (id == crate::settings::BUILTIN_API_AGENT)
+                .then(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .flatten()
+        })
+        .unwrap_or_default()
 }
 
 impl AppState {
@@ -1207,11 +1257,8 @@ impl AppState {
             focus_rename: false,
             assistant_w: px(380.),
             assistant_drag: None,
-            ai_configured: {
-                let cfg = ai_config(&settings);
-                cfg.provider == red_service::AiProviderKind::Subscription || !cfg.api_key.is_empty()
-            },
-            ai_api_key_available: !ai_config(&settings).api_key.is_empty(),
+            usable_agents: usable_agents(&settings),
+            ai_configured: !usable_agents(&settings).is_empty(),
             next_conversation_id: 0,
             filter_bar: None,
             cell_menu: None,
@@ -1570,6 +1617,14 @@ impl AppState {
                 conversation_id,
                 sql,
             } => self.on_ai_open_query(conversation_id, sql, cx),
+            Event::AiCommandsAvailable {
+                conversation_id,
+                commands,
+            } => self.on_ai_commands_available(conversation_id, commands, cx),
+            Event::AiConfigOptionsAvailable {
+                conversation_id,
+                options,
+            } => self.on_ai_config_options_available(conversation_id, options, cx),
 
             // The streaming `Query`/`FetchMore` path stays in the protocol for
             // headless use + tests; the UI now drives results via `OpenResult`.

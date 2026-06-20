@@ -330,11 +330,28 @@ pub struct AiSettings {
     /// Model id, e.g. `claude-opus-4-8`. Empty falls back to the Opus default.
     /// (API-key path only; the subscription agent picks its own model.)
     pub model: String,
+    /// Default subscription-agent model selector, as the agent's opaque value id
+    /// (set from the composer's dropdown). Applied to each new chat's session; empty
+    /// lets the agent keep its own default. Last choice wins — changing the dropdown
+    /// rewrites this, but never retroactively changes already-open chats.
+    pub subscription_model: String,
+    /// Default subscription-agent reasoning-level selector (opaque value id), same
+    /// semantics as `subscription_model`.
+    pub subscription_reasoning: String,
     /// Surface a summarized "thinking…" affordance while the model reasons.
     pub show_thinking: bool,
     /// Advanced: override the subscription agent's launch command. Empty falls
     /// back to the default `npx -y @agentclientprotocol/claude-agent-acp`.
+    /// Legacy: superseded by the matching built-in's `command` once `agents` is set.
     pub agent_command: String,
+    /// User-defined agent profiles (`[[ai.agents]]`). When empty, profiles are
+    /// synthesized from the legacy `provider`/`model`/`agent_command` keys (see
+    /// [`AiSettings::resolved_agents`]) so a config written before agent profiles
+    /// keeps working unchanged.
+    pub agents: Vec<AiAgentSettings>,
+    /// The agent id new chats start on. Empty (or naming a missing agent) resolves
+    /// to the legacy provider's built-in, else the first agent.
+    pub default_agent: String,
     /// Resource guards on the `read` tier (`[ai.limits]`, M-S7).
     pub limits: AiLimitsSettings,
 }
@@ -346,10 +363,127 @@ impl Default for AiSettings {
             provider: "anthropic".to_string(),
             tier: "read".to_string(),
             model: "claude-opus-4-8".to_string(),
+            subscription_model: String::new(),
+            subscription_reasoning: String::new(),
             show_thinking: false,
             agent_command: String::new(),
+            agents: Vec::new(),
+            default_agent: String::new(),
             limits: AiLimitsSettings::default(),
         }
+    }
+}
+
+/// The two built-in agent ids. Kept byte-stable: `"anthropic"` is the keyring
+/// account (`ai-key:anthropic`) and the binding old saved chats persist, and both
+/// are what legacy configs synthesize — renaming would orphan keys and chats.
+pub const BUILTIN_API_AGENT: &str = "anthropic";
+pub const BUILTIN_ACP_AGENT: &str = "subscription";
+
+/// One user-defined agent profile (`[[ai.agents]]`). `kind` selects the backend:
+/// `"api"` (the Messages API via `red-ai`, optionally at a custom `base_url`) or
+/// `"acp"` (an external agent over ACP via `red-acp`, launched by `command` —
+/// Claude Code, `codex acp`, a local agent). The API key never lives here; it's in
+/// the OS keyring under `ai-key:<id>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiAgentSettings {
+    /// Stable id: the keyring account (`ai-key:<id>`), the saved-chat binding, and
+    /// the per-turn selector. The built-ins use `"anthropic"`/`"subscription"`.
+    pub id: String,
+    /// Display name shown in the selector and chat header.
+    pub name: String,
+    /// `"api"` or `"acp"`.
+    pub kind: String,
+    /// ACP: launch command; empty falls back to the default Claude Code invocation.
+    pub command: String,
+    /// API: wire format. `"anthropic"` is the only value in v1.
+    pub wire: String,
+    /// API: endpoint override; empty uses the default Anthropic base URL.
+    pub base_url: String,
+    /// API: model id; empty falls back to the Opus default.
+    pub model: String,
+}
+
+impl Default for AiAgentSettings {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            kind: "api".to_string(),
+            command: String::new(),
+            wire: "anthropic".to_string(),
+            base_url: String::new(),
+            model: String::new(),
+        }
+    }
+}
+
+impl AiSettings {
+    /// The effective agent profiles. An explicit `[[ai.agents]]` list wins (blank
+    /// ids dropped, duplicate ids de-duped keeping the first). When absent, two
+    /// profiles are synthesized from the legacy `provider`/`model`/`agent_command`
+    /// keys so a config written before agent profiles keeps working unchanged.
+    pub fn resolved_agents(&self) -> Vec<AiAgentSettings> {
+        if !self.agents.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            let explicit: Vec<AiAgentSettings> = self
+                .agents
+                .iter()
+                .filter(|a| !a.id.trim().is_empty())
+                .filter(|a| seen.insert(a.id.trim().to_string()))
+                .cloned()
+                .collect();
+            if !explicit.is_empty() {
+                return explicit;
+            }
+        }
+        // Legacy synthesis: the two built-ins, ids byte-stable (see the consts).
+        vec![
+            AiAgentSettings {
+                id: BUILTIN_API_AGENT.to_string(),
+                name: "Claude (API)".to_string(),
+                kind: "api".to_string(),
+                command: String::new(),
+                wire: "anthropic".to_string(),
+                base_url: String::new(),
+                model: self.model.clone(),
+            },
+            AiAgentSettings {
+                id: BUILTIN_ACP_AGENT.to_string(),
+                name: "Claude (subscription)".to_string(),
+                kind: "acp".to_string(),
+                command: self.agent_command.clone(),
+                wire: String::new(),
+                base_url: String::new(),
+                model: String::new(),
+            },
+        ]
+    }
+
+    /// The agent id new chats start on: an explicit `default_agent` when it names a
+    /// resolved agent; else (legacy only) the old `provider` mapped to its built-in
+    /// id; else the first resolved agent (empty when none).
+    pub fn resolved_default_agent(&self) -> String {
+        let agents = self.resolved_agents();
+        let has = |id: &str| agents.iter().any(|a| a.id == id);
+        let want = self.default_agent.trim();
+        if !want.is_empty() && has(want) {
+            return want.to_string();
+        }
+        // Legacy: map the old provider string onto a built-in id (only meaningful
+        // when no explicit agents are configured, i.e. we synthesized them).
+        if self.agents.is_empty() {
+            let legacy = if self.provider.eq_ignore_ascii_case("subscription") {
+                BUILTIN_ACP_AGENT
+            } else {
+                BUILTIN_API_AGENT
+            };
+            if has(legacy) {
+                return legacy.to_string();
+            }
+        }
+        agents.first().map(|a| a.id.clone()).unwrap_or_default()
     }
 }
 
@@ -605,6 +739,104 @@ mod tests {
     fn missing_file_is_default() {
         let t = temp_store();
         assert_eq!(t.store.load_report().settings, Settings::default());
+    }
+
+    #[test]
+    fn legacy_ai_synthesizes_two_builtin_agents() {
+        // No [[ai.agents]] → synthesize the API + subscription built-ins with
+        // byte-stable ids, carrying the legacy model/command through.
+        let ai = AiSettings {
+            model: "claude-x".into(),
+            agent_command: "my-agent".into(),
+            ..AiSettings::default()
+        };
+        let agents = ai.resolved_agents();
+        let ids: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, [BUILTIN_API_AGENT, BUILTIN_ACP_AGENT]);
+        assert_eq!(agents[0].kind, "api");
+        assert_eq!(agents[0].model, "claude-x");
+        assert_eq!(agents[1].kind, "acp");
+        assert_eq!(agents[1].command, "my-agent");
+    }
+
+    #[test]
+    fn legacy_provider_drives_default_agent() {
+        let api = AiSettings {
+            provider: "anthropic".into(),
+            ..AiSettings::default()
+        };
+        assert_eq!(api.resolved_default_agent(), BUILTIN_API_AGENT);
+        let sub = AiSettings {
+            provider: "subscription".into(),
+            ..AiSettings::default()
+        };
+        assert_eq!(sub.resolved_default_agent(), BUILTIN_ACP_AGENT);
+    }
+
+    #[test]
+    fn explicit_agents_win_over_legacy() {
+        let toml = r#"
+            provider = "anthropic"
+            default_agent = "codex"
+            [[agents]]
+            id = "codex"
+            name = "Codex"
+            kind = "acp"
+            command = "codex acp"
+            [[agents]]
+            id = "local"
+            name = "Local"
+            kind = "api"
+            base_url = "http://127.0.0.1:8080"
+            model = "llama"
+        "#;
+        let ai: AiSettings = toml::from_str(toml).expect("ai settings");
+        let agents = ai.resolved_agents();
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].id, "codex");
+        assert_eq!(agents[1].base_url, "http://127.0.0.1:8080");
+        // The explicit, valid default_agent is honored.
+        assert_eq!(ai.resolved_default_agent(), "codex");
+    }
+
+    #[test]
+    fn blank_and_duplicate_ids_are_dropped() {
+        let toml = r#"
+            [[agents]]
+            id = "  "
+            name = "Blank"
+            [[agents]]
+            id = "dup"
+            name = "First"
+            kind = "acp"
+            [[agents]]
+            id = "dup"
+            name = "Second"
+            kind = "api"
+        "#;
+        let ai: AiSettings = toml::from_str(toml).expect("ai settings");
+        let agents = ai.resolved_agents();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].id, "dup");
+        // First wins on a duplicate id.
+        assert_eq!(agents[0].name, "First");
+    }
+
+    #[test]
+    fn default_agent_at_missing_id_falls_back_to_first() {
+        let toml = r#"
+            default_agent = "ghost"
+            [[agents]]
+            id = "a"
+            name = "A"
+            kind = "acp"
+            [[agents]]
+            id = "b"
+            name = "B"
+            kind = "acp"
+        "#;
+        let ai: AiSettings = toml::from_str(toml).expect("ai settings");
+        assert_eq!(ai.resolved_default_agent(), "a");
     }
 
     #[test]

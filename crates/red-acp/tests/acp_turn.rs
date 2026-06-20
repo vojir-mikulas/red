@@ -15,6 +15,8 @@ fn fake_agent_config() -> AcpConfig {
         // The fake agent titles its permission tool `run_select`; auto-allow it.
         allow_tools: vec!["run_select".to_string()],
         permissions: None,
+        commands: None,
+        config: None,
     }
 }
 

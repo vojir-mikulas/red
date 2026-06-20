@@ -17,14 +17,17 @@ use agent_client_protocol::schema::{
     FileSystemCapabilities, HttpHeader, Implementation, InitializeRequest, McpServer,
     McpServerHttp, NewSessionRequest, PermissionOption, PermissionOptionId, PermissionOptionKind,
     PromptRequest, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionNotification,
-    SessionUpdate, StopReason, TextContent, ToolCallStatus, ToolCallUpdate, ToolKind,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOptions, SessionId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, StopReason, TextContent, ToolCallStatus,
+    ToolCallUpdate, ToolKind,
 };
 use agent_client_protocol::{AcpAgent, Agent, ConnectionTo};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::types::{
-    AcpConfig, AcpDelta, AcpError, AcpPermission, AcpStop, AcpTurnResult, AcpUsage, McpGrounding,
+    AcpCommand, AcpConfig, AcpConfigCategory, AcpConfigChoice, AcpConfigOption, AcpDelta, AcpError,
+    AcpPermission, AcpStop, AcpTurnResult, AcpUsage, McpGrounding,
 };
 
 /// The active turn's delta sink, swapped in before each prompt and cleared after.
@@ -38,6 +41,10 @@ type TurnReply = oneshot::Sender<Result<AcpTurnResult, AcpError>>;
 /// A take-once readiness signal fired when the session is up (or fails to start).
 type ReadyCell = Arc<Mutex<Option<oneshot::Sender<Result<(), AcpError>>>>>;
 
+/// A reply channel for a `session/set_config_option` request: the refreshed option
+/// set on success.
+type ConfigReply = oneshot::Sender<Result<Vec<AcpConfigOption>, AcpError>>;
+
 /// A command sent into the live connection.
 enum Cmd {
     Prompt {
@@ -46,6 +53,12 @@ enum Cmd {
         done: TurnReply,
     },
     Cancel,
+    /// Change a session config selector (model / reasoning) between turns.
+    SetConfig {
+        config_id: String,
+        value: String,
+        done: ConfigReply,
+    },
 }
 
 /// A handle to a live ACP conversation. Cheap to clone; the agent stays up while
@@ -91,6 +104,27 @@ impl AcpConversation {
         let _ = self.cmd_tx.send(Cmd::Cancel);
     }
 
+    /// Change a session config selector (model / reasoning) by `config_id`/`value`
+    /// (maps to `session/set_config_option`). The returned receiver resolves with the
+    /// refreshed option set, or an error.
+    pub fn set_config(
+        &self,
+        config_id: String,
+        value: String,
+    ) -> oneshot::Receiver<Result<Vec<AcpConfigOption>, AcpError>> {
+        let (done, done_rx) = oneshot::channel();
+        if let Err(mpsc::error::SendError(Cmd::SetConfig { done, .. })) =
+            self.cmd_tx.send(Cmd::SetConfig {
+                config_id,
+                value,
+                done,
+            })
+        {
+            let _ = done.send(Err(AcpError::Closed));
+        }
+        done_rx
+    }
+
     /// Whether the connection task is still running. A closed command channel
     /// means the connection ended — the agent exited or crashed — so the next
     /// prompt would only ever return [`AcpError::Closed`]. The service checks
@@ -123,6 +157,13 @@ async fn run_connection(
 
     let sink_handler = active_sink.clone();
     let usage_handler = usage_cell.clone();
+    // The agent's advertised slash commands go out of band (connection-lifetime),
+    // not through the active turn's sink — they arrive right after the session opens.
+    let commands_handler = config.commands.clone();
+    // Session config selectors (model / reasoning): one clone updates the notification
+    // handler on `ConfigOptionUpdate`, the other ships the initial set from `session/new`.
+    let config_handler = config.config.clone();
+    let config_initial = config.config.clone();
     let ready_closure = ready.clone();
     let cwd = config.cwd.clone();
     let mcp = config.mcp.clone();
@@ -137,7 +178,13 @@ async fn run_connection(
         // Stream updates onto the active turn's sink.
         .on_receive_notification(
             async move |notification: SessionNotification, _cx| {
-                handle_update(&notification.update, &sink_handler, &usage_handler);
+                handle_update(
+                    &notification.update,
+                    &sink_handler,
+                    &usage_handler,
+                    &commands_handler,
+                    &config_handler,
+                );
                 Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
@@ -157,8 +204,15 @@ async fn run_connection(
         )
         .connect_with(agent, move |conn: ConnectionTo<Agent>| async move {
             let session_id = match start_session(&conn, &cwd, mcp.as_ref()).await {
-                Ok(id) => {
+                Ok((id, options)) => {
                     signal(&ready_closure, Ok(()));
+                    // Ship the session's initial config selectors (model / reasoning),
+                    // advertised in the `session/new` response.
+                    if let Some(tx) = &config_initial {
+                        if !options.is_empty() {
+                            let _ = tx.send(options);
+                        }
+                    }
                     id
                 }
                 Err(e) => {
@@ -179,12 +233,13 @@ async fn run_connection(
 }
 
 /// `initialize` (restricted caps) → auth (if required) → `session/new` with the
-/// MCP grounding server. Returns the session id.
+/// MCP grounding server. Returns the session id and the session's initial config
+/// selectors (model / reasoning), if the agent advertises any.
 async fn start_session(
     conn: &ConnectionTo<Agent>,
     cwd: &std::path::Path,
     mcp: Option<&McpGrounding>,
-) -> Result<SessionId, agent_client_protocol::Error> {
+) -> Result<(SessionId, Vec<AcpConfigOption>), agent_client_protocol::Error> {
     let init = conn
         .send_request(
             InitializeRequest::new(ProtocolVersion::V1)
@@ -212,7 +267,32 @@ async fn start_session(
         request = request.mcp_servers(vec![McpServer::Http(server)]);
     }
     let session = conn.send_request(request).block_task().await?;
-    Ok(session.session_id)
+    let options = session
+        .config_options
+        .as_deref()
+        .map(map_config_options)
+        .unwrap_or_default();
+    tracing::debug!(
+        config_options = options.len(),
+        "acp: session opened (initial config options)"
+    );
+    Ok((session.session_id, options))
+}
+
+/// A static name for a session update variant, for diagnostic logging.
+fn update_kind(update: &SessionUpdate) -> &'static str {
+    match update {
+        SessionUpdate::AgentMessageChunk(_) => "agent_message_chunk",
+        SessionUpdate::AgentThoughtChunk(_) => "agent_thought_chunk",
+        SessionUpdate::ToolCall(_) => "tool_call",
+        SessionUpdate::ToolCallUpdate(_) => "tool_call_update",
+        SessionUpdate::UsageUpdate(_) => "usage_update",
+        SessionUpdate::AvailableCommandsUpdate(_) => "available_commands_update",
+        SessionUpdate::ConfigOptionUpdate(_) => "config_option_update",
+        SessionUpdate::CurrentModeUpdate(_) => "current_mode_update",
+        SessionUpdate::Plan(_) => "plan",
+        _ => "other",
+    }
 }
 
 /// Pull prompts off the command channel and drive one ACP turn at a time. Streamed
@@ -225,9 +305,30 @@ async fn run_turns(
     usage_cell: &UsageCell,
 ) {
     while let Some(cmd) = cmd_rx.recv().await {
-        let Cmd::Prompt { text, sink, done } = cmd else {
+        let (text, sink, done) = match cmd {
+            Cmd::Prompt { text, sink, done } => (text, sink, done),
             // A Cancel with no active turn — nothing to do.
-            continue;
+            Cmd::Cancel => continue,
+            // Config changes (model / reasoning) happen between turns: issue the
+            // request and reply with the refreshed option set.
+            Cmd::SetConfig {
+                config_id,
+                value,
+                done,
+            } => {
+                let reply = conn
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session_id.clone(),
+                        config_id,
+                        value.as_str(),
+                    ))
+                    .block_task()
+                    .await
+                    .map(|resp| map_config_options(&resp.config_options))
+                    .map_err(|e| AcpError::Protocol(e.to_string()));
+                let _ = done.send(reply);
+                continue;
+            }
         };
         *active_sink.lock().unwrap() = Some(sink);
         *usage_cell.lock().unwrap() = AcpUsage::default();
@@ -256,6 +357,13 @@ async fn run_turns(
                             "a turn is already in progress".into(),
                         )));
                     }
+                    // The UI disables the selectors mid-turn, but reject defensively
+                    // rather than mutate config while a prompt is streaming.
+                    Some(Cmd::SetConfig { done, .. }) => {
+                        let _ = done.send(Err(AcpError::Protocol(
+                            "a turn is already in progress".into(),
+                        )));
+                    }
                 },
             }
         };
@@ -273,9 +381,52 @@ async fn run_turns(
     }
 }
 
-/// Map one streamed update onto an [`AcpDelta`] (and record usage). Returns
-/// without sending for updates we don't surface (plans, command lists, modes).
-fn handle_update(update: &SessionUpdate, active_sink: &SinkCell, usage_cell: &UsageCell) {
+/// Map one streamed update onto an [`AcpDelta`] (and record usage), and forward the
+/// agent's advertised slash commands out of band. Returns without sending for
+/// updates we don't surface (plans, modes).
+fn handle_update(
+    update: &SessionUpdate,
+    active_sink: &SinkCell,
+    usage_cell: &UsageCell,
+    commands: &Option<mpsc::UnboundedSender<Vec<AcpCommand>>>,
+    config: &Option<mpsc::UnboundedSender<Vec<AcpConfigOption>>>,
+) {
+    // Diagnostic: name every non-streaming update the agent sends, so we can tell
+    // whether it advertises slash commands / config selectors at all.
+    if !matches!(
+        update,
+        SessionUpdate::AgentMessageChunk(_) | SessionUpdate::AgentThoughtChunk(_)
+    ) {
+        tracing::debug!(kind = update_kind(update), "acp session update");
+    }
+    // Slash commands arrive out of band (no active turn), so they go on their own
+    // channel rather than the turn sink.
+    if let SessionUpdate::AvailableCommandsUpdate(update) = update {
+        tracing::debug!(
+            count = update.available_commands.len(),
+            "acp: commands update"
+        );
+        if let Some(tx) = commands {
+            let list = update
+                .available_commands
+                .iter()
+                .map(|c| AcpCommand {
+                    name: c.name.clone(),
+                    description: c.description.clone(),
+                })
+                .collect();
+            let _ = tx.send(list);
+        }
+        return;
+    }
+    // Config selectors (model / reasoning) likewise update out of band.
+    if let SessionUpdate::ConfigOptionUpdate(update) = update {
+        tracing::debug!(count = update.config_options.len(), "acp: config update");
+        if let Some(tx) = config {
+            let _ = tx.send(map_config_options(&update.config_options));
+        }
+        return;
+    }
     let delta = match update {
         SessionUpdate::AgentMessageChunk(chunk) => Some(AcpDelta::Text(text_of(&chunk.content))),
         SessionUpdate::AgentThoughtChunk(chunk) => {
@@ -318,6 +469,53 @@ fn tool_name(update: &ToolCallUpdate) -> String {
         .title
         .clone()
         .unwrap_or_else(|| "tool".to_string())
+}
+
+/// Map ACP `config_options` to Red's [`AcpConfigOption`], keeping only single-select
+/// selectors (the only kind on the stable build) and flattening grouped choices.
+fn map_config_options(options: &[SessionConfigOption]) -> Vec<AcpConfigOption> {
+    options.iter().filter_map(map_config_option).collect()
+}
+
+fn map_config_option(option: &SessionConfigOption) -> Option<AcpConfigOption> {
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return None;
+    };
+    let choices = match &select.options {
+        SessionConfigSelectOptions::Ungrouped(opts) => opts.iter().map(map_choice).collect(),
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|g| g.options.iter())
+            .map(map_choice)
+            .collect(),
+        _ => Vec::new(),
+    };
+    Some(AcpConfigOption {
+        id: option.id.0.to_string(),
+        name: option.name.clone(),
+        category: map_category(option.category.as_ref()),
+        current_value: select.current_value.0.to_string(),
+        choices,
+    })
+}
+
+fn map_choice(
+    option: &agent_client_protocol::schema::SessionConfigSelectOption,
+) -> AcpConfigChoice {
+    AcpConfigChoice {
+        value: option.value.0.to_string(),
+        name: option.name.clone(),
+        description: option.description.clone(),
+    }
+}
+
+fn map_category(category: Option<&SessionConfigOptionCategory>) -> AcpConfigCategory {
+    match category {
+        Some(SessionConfigOptionCategory::Model) => AcpConfigCategory::Model,
+        Some(SessionConfigOptionCategory::ThoughtLevel) => AcpConfigCategory::Reasoning,
+        Some(SessionConfigOptionCategory::Mode) => AcpConfigCategory::Mode,
+        _ => AcpConfigCategory::Other,
+    }
 }
 
 fn text_of(block: &ContentBlock) -> String {
@@ -374,10 +572,23 @@ fn is_auto_allowed(tool_call: &ToolCallUpdate, allow_tools: &[String]) -> bool {
     ) {
         return false;
     }
-    let title = tool_title(tool_call).to_ascii_lowercase();
+    let title = tool_title(tool_call);
     allow_tools
         .iter()
-        .any(|name| title.contains(&name.to_ascii_lowercase()))
+        .any(|name| title_names_tool(&title, name))
+}
+
+/// Whether `title` names `tool` as a whole token, not merely as a substring. The
+/// agent's MCP title carries the tool name, sometimes prefixed (e.g.
+/// `"red-db: run_select"`), so we tokenize on non-identifier characters and match
+/// a full token: `run_select` matches `"red-db: run_select"` but NOT a look-alike
+/// like `"run_select_then_drop"`, which a loose `contains` would wrongly auto-allow.
+fn title_names_tool(title: &str, tool: &str) -> bool {
+    let tool = tool.to_ascii_lowercase();
+    title
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|token| token == tool)
 }
 
 /// The agent's human-readable title for a tool call (used for both matching and
@@ -477,6 +688,18 @@ mod tests {
             &call("red-db: describe_table", None),
             &tools
         ));
+    }
+
+    #[test]
+    fn auto_allow_requires_a_whole_token_not_a_substring() {
+        let tools = db_tools();
+        // A look-alike that merely *contains* a known tool name is NOT auto-allowed —
+        // a loose substring match would wrongly wave these through.
+        assert!(!is_auto_allowed(
+            &call("run_select_then_drop", None),
+            &tools
+        ));
+        assert!(!is_auto_allowed(&call("describe_table_evil", None), &tools));
     }
 
     #[test]

@@ -639,7 +639,7 @@ pub(crate) async fn run_tool(
                     (out, true)
                 }
                 Err(RedError::Timeout) => (
-                    "error: the query exceeded the assistant's statement timeout — it was \
+                    "error: the query exceeded the agent's statement timeout — it was \
                     cancelled. Narrow it (add WHERE/LIMIT) or inspect the plan with explain."
                         .into(),
                     false,
@@ -675,7 +675,7 @@ pub(crate) async fn run_tool(
             let html = wrap_report_html(title, body);
             let path = std::env::temp_dir()
                 .join(format!("red-report-{}.html", uuid::Uuid::new_v4().simple()));
-            match std::fs::write(&path, html) {
+            match write_report_file(&path, &html) {
                 Ok(()) => {
                     // Hand the path to the UI so it opens the file in the browser.
                     report.announce(&path);
@@ -1007,6 +1007,23 @@ const REPORT_STYLE: &str = concat!(
     "</style>",
 );
 
+/// Write a finished report to `path`, owner-readable only (`0600` on Unix). A
+/// report can carry real query data, and on a shared temp dir (Linux `/tmp`) a
+/// world-readable file would let another local user read it — so restrict it at
+/// creation rather than writing world-readable and tightening after.
+fn write_report_file(path: &Path, html: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(html.as_bytes())
+}
+
 /// Wrap an AI-authored report body in a sandboxed, themed HTML document (Feature C).
 /// The safety boundary is a strict Content-Security-Policy: `default-src 'none'`
 /// blocks ALL scripts (inline and remote), remote fetches, and remote
@@ -1100,7 +1117,7 @@ pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
         }
     };
     let mut s = format!(
-        "You are Red's database assistant, embedded in a native SQL explorer. You help the user \
+        "You are Red's database agent, embedded in a native SQL explorer. You help the user \
          explore and understand the database they are connected to.\n\n\
          {tools_line}\n\n\
          When you write SQL for the user, put it in a fenced ```sql block so they can run it. Be \

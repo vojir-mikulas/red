@@ -181,9 +181,14 @@ async fn dispatch(
         "ping" => Ok(json!({})),
         "tools/list" => {
             // The tier filters the catalog (M-S7) — the agent never even sees a
-            // tool above its access tier.
+            // tool above its access tier. The subscription/MCP path additionally
+            // withholds *write* tools: a write executes only on the API-key path,
+            // where per-statement approval is enforced in-process *before* the tool
+            // runs. The MCP server can't verify the external agent actually prompted
+            // the user, so it never offers (or runs) a mutating tool — reads only.
             let tools: Vec<Json> = tool_catalog(&policy)
                 .into_iter()
+                .filter(|t| !crate::ai::is_write_tool(&t.name))
                 .map(|t| {
                     json!({
                         "name": t.name,
@@ -198,6 +203,18 @@ async fn dispatch(
             let name = params.get("name").and_then(Json::as_str).unwrap_or("");
             if name.is_empty() {
                 return Err((-32602, "missing tool name".into()));
+            }
+            // Writes never run over the subscription/MCP path (see tools/list): only
+            // the in-process-gated API-key path may mutate. Refused in-band so the
+            // model can recover (and before charging the budget).
+            if crate::ai::is_write_tool(name) {
+                return Ok(json!({
+                    "content": [ { "type": "text", "text":
+                        "error: this agent cannot modify data. Hand the user the SQL with \
+                        open_query so they can run it themselves, or tell them to use the \
+                        API-key agent, which gates each write behind explicit approval." } ],
+                    "isError": true,
+                }));
             }
             // Charge the agent's cumulative tool-call budget before running anything
             // (M-S7). Over budget → a tool error the model can recover from, not a
@@ -228,11 +245,32 @@ async fn dispatch(
     }
 }
 
+/// Whether the request carries the exact bearer nonce. The comparison is
+/// constant-time so response timing can't leak the token byte by byte to a local
+/// process probing the port (loopback + a 256-bit nonce already make that
+/// impractical; this closes the gap regardless).
 fn authorized(headers: &hyper::HeaderMap, token: &str) -> bool {
-    headers
+    let Some(value) = headers
         .get(hyper::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v == format!("Bearer {token}"))
+    else {
+        return false;
+    };
+    ct_eq(value.as_bytes(), format!("Bearer {token}").as_bytes())
+}
+
+/// Constant-time byte-slice equality: always compares every byte, so timing
+/// doesn't reveal how long a common prefix matched. The length check
+/// short-circuits, but the nonce's length is fixed and not itself a secret.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn rpc_error(id: Json, code: i64, message: &str) -> Json {
@@ -444,6 +482,69 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("budget"));
+    }
+
+    #[tokio::test]
+    async fn write_tier_is_read_only_over_mcp() {
+        // Even at the Write tier on a writable connection, the subscription/MCP path
+        // never exposes or runs a write tool — writes are the API-key path's alone.
+        let path = std::env::temp_dir().join(format!("red-mcp-w-{}.db", Uuid::new_v4()));
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT);
+                 INSERT INTO t (id, n) VALUES (1, 'before');",
+            )
+            .unwrap();
+        }
+        let driver: Arc<dyn DatabaseDriver> = Arc::new(SqliteDriver::new(path, false));
+        let server = McpServer::start(
+            driver,
+            AiPolicy {
+                tier: red_core::AiTier::Write,
+                ..AiPolicy::default()
+            },
+            ReportSink::disabled(),
+        )
+        .await
+        .unwrap();
+        let client = reqwest::Client::new();
+
+        // tools/list withholds the write tool.
+        let list = call(
+            &server,
+            &client,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        )
+        .await;
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"propose_write"), "got: {names:?}");
+
+        // And calling it anyway is refused in-band (the row stays untouched).
+        let reply = call(
+            &server,
+            &client,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "propose_write",
+                    "arguments": { "sql": "UPDATE t SET n = 'after' WHERE id = 1" },
+                },
+            }),
+        )
+        .await;
+        assert_eq!(reply["result"]["isError"], json!(true));
+        assert!(reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("cannot modify data"));
     }
 
     #[tokio::test]

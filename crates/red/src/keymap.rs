@@ -259,7 +259,7 @@ const DEFAULTS: &[ActionDef] = &[
     def(
         "cmd-l",
         "ToggleAssistant",
-        "Toggle AI assistant",
+        "Toggle AI agent",
         Some("RedRoot"),
     ),
     // Result filter bar. ⌘⇧F to keep plain ⌘F as schema search.

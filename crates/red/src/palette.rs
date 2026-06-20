@@ -73,8 +73,6 @@ pub(crate) enum Cmd {
     AssistantHistory,
     /// Start a fresh assistant chat, saving the current one (M-S5).
     AssistantNewChat,
-    /// Delete the open assistant conversation's saved file (M-S5).
-    AssistantDeleteConversation,
     /// Reveal the conversations directory in the OS file manager (M-S5).
     RevealConversationStorage,
 }
@@ -251,7 +249,6 @@ impl AppState {
             Cmd::AddRow => self.add_draft_row(cx),
             Cmd::AssistantHistory => self.open_history_sidebar(cx),
             Cmd::AssistantNewChat => self.new_chat(cx),
-            Cmd::AssistantDeleteConversation => self.delete_current_conversation(cx),
             Cmd::RevealConversationStorage => self.reveal_conversation_storage(cx),
         }
     }
@@ -409,21 +406,15 @@ impl AppState {
                 // Assistant conversation history (M-S5) — only with the panel open.
                 if self.assistant.is_some() {
                     out.push((
-                        PaletteItem::new("cmd:ai-new-chat", "assistant: new chat"),
+                        PaletteItem::new("cmd:ai-new-chat", "agent: new chat"),
                         Cmd::AssistantNewChat,
                     ));
                     out.push((
-                        PaletteItem::new("cmd:ai-history", "assistant: conversation history…"),
+                        PaletteItem::new("cmd:ai-history", "agent: conversation history…"),
                         Cmd::AssistantHistory,
                     ));
-                    if self.assistant_has_saved_chat() {
-                        out.push((
-                            PaletteItem::new("cmd:ai-delete", "assistant: delete conversation"),
-                            Cmd::AssistantDeleteConversation,
-                        ));
-                    }
                     out.push((
-                        PaletteItem::new("cmd:ai-storage", "assistant: open conversation storage"),
+                        PaletteItem::new("cmd:ai-storage", "agent: open conversation storage"),
                         Cmd::RevealConversationStorage,
                     ));
                 }

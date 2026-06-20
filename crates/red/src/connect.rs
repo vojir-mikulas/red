@@ -1004,7 +1004,7 @@ impl AppState {
             return None;
         }
         Some(
-            labeled_field("AI assistant", theme).child(
+            labeled_field("AI agent", theme).child(
                 div()
                     .flex()
                     .items_center()
@@ -1022,7 +1022,7 @@ impl AppState {
                             .text_size(theme.scale(11.5))
                             .text_color(theme.text_muted)
                             .child(
-                                "The assistant may propose INSERT/UPDATE/DELETE — each needs your \
+                                "The agent may propose INSERT/UPDATE/DELETE — each needs your \
                                  approval; DDL and unqualified changes are always blocked.",
                             ),
                     ),

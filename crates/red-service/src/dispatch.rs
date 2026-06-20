@@ -123,6 +123,21 @@ struct OpenSpec {
 /// bounds/total after the fact and read specs without round-tripping commands).
 type ResultMap = Arc<Mutex<HashMap<u64, OpenSpec>>>;
 
+/// One configured AI agent in the dispatch registry, built once per `ConfigureAi`
+/// from an [`AiAgentProfile`](crate::protocol::AiAgentProfile). An `Api` agent
+/// holds its pre-built provider (`None` when it has no key — a turn then reports
+/// "not configured") and resolved model; an `Acp` agent holds its resolved launch
+/// command. A turn names an id, the loop looks it up here and routes accordingly.
+enum AiProfileRuntime {
+    Api {
+        provider: Option<Arc<dyn red_ai::AiProvider>>,
+        model: String,
+    },
+    Acp {
+        command: String,
+    },
+}
+
 /// The cancellable work in flight for one open result. Each detached fetch carries
 /// an [`AbortSignal`]; when a newer one supersedes it (a flung scrollbar, a new
 /// page, a closed tab) the old signal is [`abort`](AbortSignal::abort)ed so the
@@ -416,16 +431,15 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
         tx
     };
 
-    // The AI assistant's shared config (built from `ConfigureAi`): the API-key
-    // provider (`None` until a key is configured), the agent launch command, the
-    // resolved model, and the thinking-display flag. These are the resources both
-    // backends draw on; *which* backend a turn uses is decided per-turn by
-    // `AiTurn.provider` (M-S6), so several conversations on different backends run
-    // concurrently. A turn runs as a spawned task off this loop (like exports),
-    // sharing `ai_state` for its conversation history and cancel registry.
-    let mut ai_provider: Option<Arc<dyn red_ai::AiProvider>> = None;
-    let mut ai_agent_command = String::new();
-    let mut ai_model: String = red_ai::MODEL_OPUS.to_string();
+    // The AI assistant's configured agents (built from `ConfigureAi.agents`), keyed
+    // by id — an API agent carries its pre-built provider (None until a key is set)
+    // and model; an ACP agent carries its resolved launch command. *Which* agent a
+    // turn uses is decided per-turn by `AiTurn.agent` (M-S6), so several
+    // conversations on different agents run concurrently. A turn runs as a spawned
+    // task off this loop (like exports), sharing `ai_state` for its conversation
+    // history and cancel registry.
+    let mut ai_agents: HashMap<String, AiProfileRuntime> = HashMap::new();
+    let mut ai_default_agent = String::new();
     let mut ai_show_thinking = false;
     // The global AI access policy (M-S7): master switch, access tier, and resource
     // guards, set by `ConfigureAi`. A turn layers the session's per-connection
@@ -523,12 +537,6 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::ConfigureAi(cfg) => {
-                ai_agent_command = cfg.agent_command;
-                ai_model = if cfg.model.is_empty() {
-                    red_ai::MODEL_OPUS.to_string()
-                } else {
-                    cfg.model
-                };
                 ai_show_thinking = cfg.show_thinking;
                 ai_policy = red_core::AiPolicy {
                     enabled: cfg.enabled,
@@ -538,20 +546,51 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     // this with the connection's authoritative read-only flag.
                     read_only: false,
                 };
-                // An empty key leaves the API-key path off — a turn then replies
-                // with a clear AiError rather than a failed network call. The
-                // subscription path needs no key (the agent owns its auth).
-                ai_provider = if cfg.api_key.is_empty() {
-                    None
-                } else {
-                    Some(Arc::new(red_ai::AnthropicProvider::new(cfg.api_key))
-                        as Arc<dyn red_ai::AiProvider>)
-                };
+                ai_default_agent = cfg.default_agent;
+                // Build each configured agent's runtime. An API agent with an empty
+                // key gets a `None` provider — a turn on it replies with a clear
+                // AiError rather than a failed network call; an ACP agent needs no
+                // key (it owns its own auth). A custom `base_url` retargets the
+                // Anthropic-wire provider (e.g. a local endpoint).
+                ai_agents = cfg
+                    .agents
+                    .into_iter()
+                    .map(|a| {
+                        let runtime = match a.kind {
+                            crate::protocol::AiAgentKind::Api => {
+                                let model = if a.model.is_empty() {
+                                    red_ai::MODEL_OPUS.to_string()
+                                } else {
+                                    a.model
+                                };
+                                let provider = if a.api_key.is_empty() {
+                                    None
+                                } else {
+                                    let mut p = red_ai::AnthropicProvider::new(a.api_key);
+                                    if !a.base_url.is_empty() {
+                                        p = p.with_base_url(a.base_url);
+                                    }
+                                    Some(Arc::new(p) as Arc<dyn red_ai::AiProvider>)
+                                };
+                                AiProfileRuntime::Api { provider, model }
+                            }
+                            crate::protocol::AiAgentKind::Acp => {
+                                let command = if a.command.is_empty() {
+                                    crate::DEFAULT_AGENT_COMMAND.to_string()
+                                } else {
+                                    a.command
+                                };
+                                AiProfileRuntime::Acp { command }
+                            }
+                        };
+                        (a.id, runtime)
+                    })
+                    .collect();
             }
 
             Command::AiTurn {
                 conversation_id,
-                provider,
+                agent,
                 message,
                 context,
             } => {
@@ -593,26 +632,52 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         session_id,
                         Event::AiError {
                             conversation_id,
-                            message: "the AI assistant is disabled for this connection".into(),
+                            message: "the AI agent is disabled for this connection".into(),
                         },
                     );
                     continue;
                 }
 
-                match provider {
-                    crate::protocol::AiProviderKind::ApiKey => {
-                        let Some(provider) = ai_provider.clone() else {
+                // Resolve which agent this turn runs on: the named id, or the default
+                // when empty. An id that names no configured agent — e.g. a saved
+                // chat bound to a profile the user has since deleted — fails with a
+                // clear error rather than silently running a different backend.
+                let agent_id = if agent.trim().is_empty() {
+                    ai_default_agent.clone()
+                } else {
+                    agent
+                };
+                let Some(runtime) = ai_agents.get(&agent_id) else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::AiError {
+                            conversation_id,
+                            message: format!(
+                                "AI agent '{agent_id}' is not configured — pick another in the \
+                                 panel, or add it in Settings."
+                            ),
+                        },
+                    );
+                    continue;
+                };
+
+                match runtime {
+                    AiProfileRuntime::Api { provider, model } => {
+                        let Some(provider) = provider.clone() else {
                             emit(
                                 &events,
                                 session_id,
                                 Event::AiError {
                                     conversation_id,
-                                    message: "AI assistant is not configured — add an API key in Settings."
-                                        .into(),
+                                    message:
+                                        "AI agent is not configured — add an API key in Settings."
+                                            .into(),
                                 },
                             );
                             continue;
                         };
+                        let model = model.clone();
                         let cancel = red_ai::CancelToken::new();
                         lock(&ai_state).register(conversation_id, cancel.clone());
                         tokio::spawn(crate::ai::run_turn(
@@ -622,7 +687,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             ai_state.clone(),
                             session_id,
                             conversation_id,
-                            ai_model.clone(),
+                            model,
                             ai_show_thinking,
                             effective,
                             message,
@@ -630,12 +695,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             cancel,
                         ));
                     }
-                    crate::protocol::AiProviderKind::Subscription => {
-                        let command = if ai_agent_command.is_empty() {
-                            crate::DEFAULT_AGENT_COMMAND.to_string()
-                        } else {
-                            ai_agent_command.clone()
-                        };
+                    AiProfileRuntime::Acp { command } => {
+                        let command = command.clone();
                         // The agent loads its own config (and login) from cwd; use
                         // the process working directory.
                         let cwd = std::env::current_dir()
@@ -687,6 +748,23 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // the other ACP calls.
                 let manager = ai_acp.clone();
                 tokio::spawn(async move { manager.lock().await.reauthenticate(conversation_id) });
+            }
+
+            Command::AiSetConfigOption {
+                conversation_id,
+                config_id,
+                value,
+            } => {
+                // Change a model / reasoning selector on the subscription path. Off
+                // the loop — it awaits the agent's reply, then emits the refreshed set.
+                tokio::spawn(crate::acp::set_config_option(
+                    ai_acp.clone(),
+                    events.clone(),
+                    session_id,
+                    conversation_id,
+                    config_id,
+                    value,
+                ));
             }
 
             Command::TestConnection(config) => {

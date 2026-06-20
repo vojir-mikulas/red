@@ -11,7 +11,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use red_acp::{AcpConfig, AcpConversation, AcpDelta, AcpPermission, AcpStop, McpGrounding};
+use red_acp::{
+    AcpCommand, AcpConfig, AcpConfigCategory, AcpConfigOption, AcpConversation, AcpDelta,
+    AcpPermission, AcpStop, McpGrounding,
+};
 use red_core::AiPolicy;
 use red_driver::DatabaseDriver;
 use tokio::sync::{mpsc, oneshot};
@@ -19,7 +22,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::ai::{system_prompt, tool_catalog, user_turn, ReportSink};
 use crate::dispatch::{emit, Events};
 use crate::mcp::McpServer;
-use crate::protocol::{AiContext, AiDelta, AiUsage};
+use crate::protocol::{
+    AiCommand, AiConfigCategory, AiConfigChoice, AiConfigOption, AiContext, AiDelta, AiUsage,
+};
 use crate::{Event, SessionId};
 
 /// The MCP server name the agent sees for Red's DB tools.
@@ -80,6 +85,15 @@ impl AcpManager {
         if let Some(c) = self.conversations.get(&conversation_id) {
             c.agent.cancel();
         }
+    }
+
+    /// The live agent handle for a conversation, if it's been started. Cloned so the
+    /// caller can issue a request (e.g. a config change) without holding the manager
+    /// lock across the await.
+    pub(crate) fn conversation_agent(&self, conversation_id: u64) -> Option<AcpConversation> {
+        self.conversations
+            .get(&conversation_id)
+            .map(|c| c.agent.clone())
     }
 
     /// Park a permission decision sink and return the request id to surface, or
@@ -294,7 +308,7 @@ pub(crate) async fn run_turn(
             session,
             Event::AiError {
                 conversation_id,
-                message: "the assistant connection ended".into(),
+                message: "the agent connection ended".into(),
             },
         ),
     }
@@ -348,6 +362,25 @@ async fn ensure_conversation(
         // user via the relay task below. The agent is also capability-restricted
         // (no fs/terminal) in `red-acp`.
         let (perm_tx, perm_rx) = mpsc::unbounded_channel::<AcpPermission>();
+        // Slash commands the agent advertises (connection-lifetime): relayed to the
+        // UI as `AiCommandsAvailable`. Spawned before `events` moves into the
+        // permission relay below.
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Vec<AcpCommand>>();
+        tokio::spawn(commands_relay(
+            events.clone(),
+            session,
+            conversation_id,
+            cmd_rx,
+        ));
+        // Session config selectors (model / reasoning): relayed as
+        // `AiConfigOptionsAvailable`. Also spawned before `events` moves below.
+        let (cfg_tx, cfg_rx) = mpsc::unbounded_channel::<Vec<AcpConfigOption>>();
+        tokio::spawn(config_relay(
+            events.clone(),
+            session,
+            conversation_id,
+            cfg_rx,
+        ));
         tokio::spawn(permission_relay(
             manager.clone(),
             events,
@@ -368,6 +401,8 @@ async fn ensure_conversation(
                 .filter(|n| !crate::ai::is_write_tool(n))
                 .collect(),
             permissions: Some(perm_tx),
+            commands: Some(cmd_tx),
+            config: Some(cfg_tx),
         };
         let agent = AcpConversation::start(config)
             .await
@@ -430,6 +465,121 @@ async fn permission_relay(
                 detail,
             },
         );
+    }
+}
+
+/// Relay the agent's advertised slash commands from one conversation to the UI as
+/// `AiCommandsAvailable`. Connection-lifetime: ends when the conversation is torn
+/// down (the agent drops its sender, closing `cmd_rx`).
+async fn commands_relay(
+    events: Events,
+    session: Option<SessionId>,
+    conversation_id: u64,
+    mut cmd_rx: mpsc::UnboundedReceiver<Vec<AcpCommand>>,
+) {
+    while let Some(commands) = cmd_rx.recv().await {
+        let commands = commands
+            .into_iter()
+            .map(|c| AiCommand {
+                name: c.name,
+                description: c.description,
+            })
+            .collect();
+        emit(
+            &events,
+            session,
+            Event::AiCommandsAvailable {
+                conversation_id,
+                commands,
+            },
+        );
+    }
+}
+
+/// Relay the agent's session config selectors (model / reasoning) from one
+/// conversation to the UI as `AiConfigOptionsAvailable`. Connection-lifetime, like
+/// `commands_relay`.
+async fn config_relay(
+    events: Events,
+    session: Option<SessionId>,
+    conversation_id: u64,
+    mut cfg_rx: mpsc::UnboundedReceiver<Vec<AcpConfigOption>>,
+) {
+    while let Some(options) = cfg_rx.recv().await {
+        emit(
+            &events,
+            session,
+            Event::AiConfigOptionsAvailable {
+                conversation_id,
+                options: options.iter().map(map_config_option).collect(),
+            },
+        );
+    }
+}
+
+/// Apply a model / reasoning change on a conversation (`Command::AiSetConfigOption`):
+/// issue the ACP `session/set_config_option` and emit the refreshed selector set so
+/// the UI reconciles. A request for an unknown/dead conversation, or a failure, is
+/// surfaced as an `AiError` on that conversation. A no-op if the conversation isn't
+/// live yet (its agent starts on the first turn).
+pub(crate) async fn set_config_option(
+    manager: Arc<tokio::sync::Mutex<AcpManager>>,
+    events: Events,
+    session: Option<SessionId>,
+    conversation_id: u64,
+    config_id: String,
+    value: String,
+) {
+    let agent = {
+        let guard = manager.lock().await;
+        guard.conversation_agent(conversation_id)
+    };
+    let Some(agent) = agent else {
+        return;
+    };
+    match agent.set_config(config_id, value).await {
+        Ok(Ok(options)) => emit(
+            &events,
+            session,
+            Event::AiConfigOptionsAvailable {
+                conversation_id,
+                options: options.iter().map(map_config_option).collect(),
+            },
+        ),
+        Ok(Err(e)) => emit(
+            &events,
+            session,
+            Event::AiError {
+                conversation_id,
+                message: e.to_string(),
+            },
+        ),
+        // The agent connection ended before answering — leave the dropdown as-is.
+        Err(_) => {}
+    }
+}
+
+/// Map a `red-acp` config option to its UI-facing twin.
+fn map_config_option(option: &AcpConfigOption) -> AiConfigOption {
+    AiConfigOption {
+        id: option.id.clone(),
+        name: option.name.clone(),
+        category: match option.category {
+            AcpConfigCategory::Model => AiConfigCategory::Model,
+            AcpConfigCategory::Reasoning => AiConfigCategory::Reasoning,
+            AcpConfigCategory::Mode => AiConfigCategory::Mode,
+            AcpConfigCategory::Other => AiConfigCategory::Other,
+        },
+        current_value: option.current_value.clone(),
+        choices: option
+            .choices
+            .iter()
+            .map(|c| AiConfigChoice {
+                value: c.value.clone(),
+                name: c.name.clone(),
+                description: c.description.clone(),
+            })
+            .collect(),
     }
 }
 

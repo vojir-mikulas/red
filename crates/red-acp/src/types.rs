@@ -24,6 +24,47 @@ pub enum AcpDelta {
     ToolFinished { name: String, ok: bool },
 }
 
+/// One slash command the agent advertises (ACP `AvailableCommandsUpdate`) — e.g.
+/// `login` / "Sign in to your account". The `name` carries no leading slash; the
+/// composer adds it. Surfaced so the UI can offer a `/`-triggered command picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpCommand {
+    pub name: String,
+    pub description: String,
+}
+
+/// One session configuration selector the agent advertises (ACP `config_options`),
+/// e.g. a model picker or a reasoning-level picker. Only single-select (`Select`)
+/// options are surfaced; the UI renders each as a dropdown. The `id`/`value` strings
+/// are opaque agent identifiers round-tripped back via [`AcpConversation::set_config`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpConfigOption {
+    pub id: String,
+    pub name: String,
+    pub category: AcpConfigCategory,
+    /// The currently-selected choice's `value`.
+    pub current_value: String,
+    pub choices: Vec<AcpConfigChoice>,
+}
+
+/// One choice within an [`AcpConfigOption`]'s dropdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpConfigChoice {
+    pub value: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// What an [`AcpConfigOption`] controls, mapped from ACP's category. Drives where the
+/// UI places the dropdown; `Other` covers categories Red doesn't surface yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpConfigCategory {
+    Model,
+    Reasoning,
+    Mode,
+    Other,
+}
+
 /// Token / cost accounting for a turn, taken from the latest `UsageUpdate`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AcpUsage {
@@ -91,6 +132,15 @@ pub struct AcpConfig {
     /// Where non-auto-allowed permission requests go for a user decision. `None`
     /// means deny-by-default (no UI wired) — the safe choice.
     pub permissions: Option<mpsc::UnboundedSender<AcpPermission>>,
+    /// Where the agent's advertised slash commands are forwarded as they arrive
+    /// (`AvailableCommandsUpdate`), for the `/`-command picker. Connection-lifetime,
+    /// not per-turn: commands typically land right after the session opens. `None`
+    /// drops them.
+    pub commands: Option<mpsc::UnboundedSender<Vec<AcpCommand>>>,
+    /// Where the agent's session config selectors (model / reasoning) are forwarded:
+    /// the initial set from `session/new` and any later `ConfigOptionUpdate`.
+    /// Connection-lifetime, like `commands`. `None` drops them.
+    pub config: Option<mpsc::UnboundedSender<Vec<AcpConfigOption>>>,
 }
 
 /// Errors the ACP backend can raise. Kept coarse — the service maps them to an
@@ -104,6 +154,6 @@ pub enum AcpError {
     #[error("agent error: {0}")]
     Protocol(String),
     /// The conversation's connection has ended (agent exited / was torn down).
-    #[error("the assistant connection has ended")]
+    #[error("the agent connection has ended")]
     Closed,
 }

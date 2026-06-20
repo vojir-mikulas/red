@@ -17,6 +17,8 @@
 //! background chats keep streaming (events route by `conversation_id` to whichever
 //! chat owns them) and a switcher lists them all.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use flint::prelude::*;
@@ -114,10 +116,12 @@ pub(crate) struct ChatSession {
     /// The most recent finished turn's token/cost accounting (M-S4), shown as a
     /// compact footer. `None` until the first turn completes.
     pub(crate) last_usage: Option<red_service::AiUsage>,
-    /// Which backend this chat runs on (`"subscription"`, `"anthropic"`, …). Chosen
-    /// at creation (defaulting from `[ai] provider`) and persisted as the
-    /// conversation's provider binding (M-S5); turns carry it so the right backend
-    /// handles them (M-S6). Locked once the first message is sent.
+    /// Which agent this chat runs on — the agent profile's id (`"subscription"`,
+    /// `"anthropic"`, `"codex"`, …). Chosen at creation (defaulting to the resolved
+    /// default agent) and persisted as the conversation's binding (M-S5); turns carry
+    /// it so the right backend handles them (M-S6). Locked once the first message is
+    /// sent. (Field name kept as `provider` — it's the serialized key saved chats
+    /// already use.)
     pub(crate) provider: String,
     /// The chat's title, derived from its first user message; the saved file's
     /// display name. `None` until the first turn is sent.
@@ -143,6 +147,24 @@ pub(crate) struct ChatSession {
     /// Whether a reveal ticker is currently scheduled for this chat (so deltas don't
     /// spawn a second one). See `ensure_reveal_ticker`.
     pub(crate) revealing: bool,
+    /// Whether a background chat finished a turn the user hasn't looked at yet —
+    /// drives the history sidebar's unread dot. Set when a turn finishes on a chat
+    /// that isn't the active one, cleared the moment it's switched to. In-memory
+    /// only; a fresh session starts everything read.
+    pub(crate) unread: bool,
+    /// The agent's advertised slash commands (subscription path only), driving the
+    /// composer's `/`-command picker. Populated by `AiCommandsAvailable` once the
+    /// agent's session opens — so empty until this chat sends its first turn, and
+    /// always empty on the API-key path. In-memory only.
+    pub(crate) commands: Vec<red_service::AiCommand>,
+    /// The agent's model / reasoning selectors (subscription path only), driving the
+    /// composer dropdowns. Populated by `AiConfigOptionsAvailable` once the session
+    /// opens. In-memory only.
+    pub(crate) config_options: Vec<red_service::AiConfigOption>,
+    /// Whether this chat already applied the central default model/reasoning to its
+    /// fresh session (so a later `ConfigOptionUpdate` doesn't re-apply it and stomp a
+    /// mid-chat choice). In-memory only.
+    pub(crate) config_defaults_applied: bool,
 }
 
 impl ChatSession {
@@ -165,6 +187,10 @@ impl ChatSession {
             draft: String::new(),
             revealed: 0,
             revealing: false,
+            unread: false,
+            commands: Vec::new(),
+            config_options: Vec::new(),
+            config_defaults_applied: false,
         }
     }
 
@@ -179,29 +205,6 @@ impl ChatSession {
     /// Whether this chat has nothing sent yet — the panel's single editable draft.
     fn is_draft(&self) -> bool {
         self.messages.is_empty()
-    }
-
-    /// Whether this chat runs on the Claude subscription (ACP) path.
-    fn is_subscription(&self) -> bool {
-        self.provider.eq_ignore_ascii_case("subscription")
-    }
-
-    /// The backend this chat's turns route to (M-S6).
-    fn provider_kind(&self) -> red_service::AiProviderKind {
-        if self.is_subscription() {
-            red_service::AiProviderKind::Subscription
-        } else {
-            red_service::AiProviderKind::ApiKey
-        }
-    }
-
-    /// A short backend label for the per-chat indicator.
-    fn provider_label(&self) -> &'static str {
-        if self.is_subscription() {
-            "Subscription"
-        } else {
-            "API key"
-        }
     }
 
     /// Whether this chat needs the user's attention while it isn't shown — a parked
@@ -241,6 +244,20 @@ pub(crate) struct Rename {
     sub: gpui::Subscription,
 }
 
+/// The lifecycle state a history row reflects through its leading dot — replacing
+/// the provider glyph (which now lives in the subtitle text). See [`status_dot`].
+#[derive(Clone, Copy, PartialEq)]
+enum RowStatus {
+    /// The single never-sent chat — a hollow circle.
+    Draft,
+    /// A turn is streaming right now — a pulsing dot.
+    Streaming,
+    /// A background turn finished that the user hasn't switched to — a filled dot.
+    Unread,
+    /// Nothing pending — a quiet muted dot.
+    Idle,
+}
+
 /// One flattened row of the merged history sidebar — an open chat (the draft, or a
 /// sent one) or a saved-but-closed conversation. Built fresh each render.
 struct HistoryRow {
@@ -251,16 +268,11 @@ struct HistoryRow {
     saved_index: Option<usize>,
     title: String,
     subtitle: String,
-    subscription: bool,
+    status: RowStatus,
     active: bool,
     attention: bool,
     /// The single editable draft — no rename/delete affordances; named live.
     draft: bool,
-}
-
-/// Whether a saved conversation's recorded provider is the subscription path.
-fn provider_is_subscription(provider: &str) -> bool {
-    provider.eq_ignore_ascii_case("subscription")
 }
 
 /// All the assistant panel's state. Present iff the panel is open.
@@ -289,6 +301,13 @@ pub(crate) struct AssistantState {
     pub(crate) show_list: bool,
     /// An in-progress inline title rename, if any.
     pub(crate) renaming: Option<Rename>,
+    /// The active chat's slash commands, mirrored here so the composer's completion
+    /// provider (a plain closure with no access to `AppState`) can read them. Kept
+    /// in sync with the active chat by [`AppState::sync_command_completions`].
+    pub(crate) completion_commands: Rc<RefCell<Vec<red_service::AiCommand>>>,
+    /// Which config selector's dropdown is currently open (its `config_id`), if any.
+    /// `flint::Select` is stateless, so the open state lives here.
+    pub(crate) open_config: Option<String>,
 }
 
 impl AssistantState {
@@ -338,6 +357,28 @@ impl AppState {
         }
     }
 
+    /// Whether the agent `id` runs over ACP (an external agent that owns its own
+    /// auth — Claude subscription, Codex, a local agent). Resolved against the
+    /// configured agents; an id no longer configured (a saved chat bound to a since-
+    /// removed agent) falls back to the legacy `"subscription"` built-in convention.
+    pub(crate) fn agent_is_acp(&self, id: &str) -> bool {
+        self.usable_agents
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.is_acp)
+            .unwrap_or_else(|| id.eq_ignore_ascii_case(crate::settings::BUILTIN_ACP_AGENT))
+    }
+
+    /// The display name for the agent `id` (the selector/header label). Falls back
+    /// to the id itself when the agent is no longer configured.
+    pub(crate) fn agent_name(&self, id: &str) -> SharedString {
+        self.usable_agents
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| SharedString::from(a.name.clone()))
+            .unwrap_or_else(|| SharedString::from(id.to_string()))
+    }
+
     /// Open or close the assistant panel (⌘L). Only meaningful while connected and
     /// while the assistant is enabled for this connection (M-S7).
     pub(crate) fn toggle_assistant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -353,19 +394,41 @@ impl AppState {
         } else {
             let conversation_id = self.next_conversation_id;
             self.next_conversation_id += 1;
+            // Shared mirror of the active chat's slash commands, read by the
+            // composer's completion provider (a closure with no access to state).
+            let completion_commands: Rc<RefCell<Vec<red_service::AiCommand>>> =
+                Rc::new(RefCell::new(Vec::new()));
             // A multiline composer: no gutter, Enter sends, Shift+Enter newlines.
-            let input = cx.new(|cx| {
-                CodeEditor::new(cx)
-                    .gutter(false)
-                    .submit_on_enter(true)
-                    // The composer card draws the border; the editor stays borderless
-                    // so it reads as one surface (Zed-style).
-                    .resting_border(false)
-                    // Prose composer: wrap long lines to the width instead of
-                    // scrolling horizontally.
-                    .soft_wrap(true)
-                    .a11y_label("Assistant prompt")
-                    .placeholder("Message Claude Agent — / for commands")
+            let input = cx.new({
+                let commands = completion_commands.clone();
+                let detail = completion_commands.clone();
+                move |cx| {
+                    CodeEditor::new(cx)
+                        .gutter(false)
+                        .submit_on_enter(true)
+                        // The composer card draws the border; the editor stays
+                        // borderless so it reads as one surface (Zed-style).
+                        .resting_border(false)
+                        // Prose composer: wrap long lines to the width instead of
+                        // scrolling horizontally.
+                        .soft_wrap(true)
+                        .a11y_label("Agent prompt")
+                        .placeholder("Message Claude Agent — / for commands")
+                        // `/`-command picker: offer the agent's commands when the
+                        // word under the cursor is a slash command (see
+                        // `slash_candidates`); the popup shows each command's name
+                        // and a dim description.
+                        .completions(move |text, cursor| {
+                            slash_candidates(&commands.borrow(), text, cursor)
+                        })
+                        .completion_detail(move |name| {
+                            detail
+                                .borrow()
+                                .iter()
+                                .find(|c| c.name == name)
+                                .map(|c| SharedString::from(c.description.clone()))
+                        })
+                }
             });
             let sub = cx.subscribe(&input, |this, _, e: &CodeEditorEvent, cx| match e {
                 // Enter (or ⌘↵) sends; Esc stops an in-flight turn from the keyboard
@@ -407,19 +470,26 @@ impl AppState {
                 active: 0,
                 show_list: false,
                 renaming: None,
+                completion_commands,
+                open_config: None,
             });
             self.focus_assistant = true;
         }
         cx.notify();
     }
 
-    /// The default backend for a new chat: `[ai] provider`, or `anthropic`.
+    /// The agent id a new chat starts on — the resolved default agent, falling back
+    /// to the first usable agent when the default isn't usable (e.g. an API default
+    /// with no key while an ACP agent is ready).
     fn default_ai_provider(&self) -> String {
-        if self.settings.ai.provider.is_empty() {
-            "anthropic".to_string()
-        } else {
-            self.settings.ai.provider.clone()
+        let default = self.settings.ai.resolved_default_agent();
+        if self.usable_agents.iter().any(|a| a.id == default) {
+            return default;
         }
+        self.usable_agents
+            .first()
+            .map(|a| a.id.clone())
+            .unwrap_or(default)
     }
 
     /// Send the prompt box's contents as one turn on the active chat.
@@ -460,18 +530,18 @@ impl AppState {
             return;
         };
         let conversation_id = state.active().conversation_id;
-        let provider = state.active().provider_kind();
-        self.dispatch_turn(conversation_id, provider, message, cx);
+        let agent = state.active().provider.clone();
+        self.dispatch_turn(conversation_id, agent, message, cx);
     }
 
     /// The shared turn-dispatch core: record the user message on whichever chat owns
     /// `conversation_id` (sidebar *or* agent tab), then send `Command::AiTurn`. The
-    /// chat's own provider binding (M-S6) decides which backend runs it, so
-    /// concurrent chats on different backends each route correctly.
+    /// chat's own agent binding (M-S6) decides which backend runs it, so concurrent
+    /// chats on different agents each route correctly.
     fn dispatch_turn(
         &mut self,
         conversation_id: u64,
-        provider: red_service::AiProviderKind,
+        agent: String,
         message: String,
         cx: &mut Context<Self>,
     ) {
@@ -520,7 +590,7 @@ impl AppState {
             session,
             red_service::Command::AiTurn {
                 conversation_id,
-                provider,
+                agent,
                 message,
                 context,
             },
@@ -560,7 +630,7 @@ impl AppState {
         if let Some(state) = self.assistant.as_mut() {
             let chat = state.active_mut();
             chat.error = None;
-            chat.status = Some("Restarting the assistant — sign in if the browser opens.".into());
+            chat.status = Some("Restarting the agent — sign in if the browser opens.".into());
         }
         cx.notify();
     }
@@ -627,6 +697,7 @@ impl AppState {
         if created {
             self.next_conversation_id += 1;
         }
+        self.sync_command_completions();
         self.focus_assistant = true;
         cx.notify();
     }
@@ -642,10 +713,12 @@ impl AppState {
             state.active = index;
             state.show_list = false;
             state.renaming = None;
+            state.chats[index].unread = false;
             state.chats[index].draft.clone()
         } else {
             return;
         };
+        self.sync_command_completions();
         self.load_composer(text, cx);
         self.focus_assistant = true;
         cx.notify();
@@ -713,6 +786,7 @@ impl AppState {
                 state.active -= 1;
             }
         }
+        self.sync_command_completions();
         cx.notify();
     }
 
@@ -779,6 +853,7 @@ impl AppState {
             state.renaming = None;
         }
         // A restored chat is sent, so the composer starts empty.
+        self.sync_command_completions();
         self.load_composer(String::new(), cx);
         self.focus_assistant = true;
         cx.notify();
@@ -884,36 +959,6 @@ impl AppState {
         cx.notify();
     }
 
-    /// Delete the active chat's saved file (the panel's Delete action) and close
-    /// that chat. A never-saved chat just closes. The file is also user-deletable by
-    /// hand — the next history open simply won't list it.
-    pub(crate) fn delete_current_conversation(&mut self, cx: &mut Context<Self>) {
-        let (conversation_id, stem) = match self.assistant.as_ref() {
-            Some(state) => {
-                let chat = state.active();
-                (chat.conversation_id, chat.file_stem.clone())
-            }
-            None => return,
-        };
-        if let Some(stem) = stem {
-            if let Some(dir) = crate::conversations::conversations_dir() {
-                let path = dir.join(format!("{stem}.json"));
-                if let Err(e) = crate::conversations::delete(&path) {
-                    tracing::warn!("failed to delete conversation: {e}");
-                }
-            }
-        }
-        // Drop the chat without re-persisting the just-deleted file. Reuse
-        // `close_chat`'s bookkeeping, but clear the stem first so it isn't re-saved.
-        if let Some(state) = self.assistant.as_mut() {
-            if let Some(chat) = state.find_mut(conversation_id) {
-                chat.file_stem = None;
-                chat.messages.clear();
-            }
-        }
-        self.close_chat(conversation_id, cx);
-    }
-
     /// Reveal the conversations directory in the OS file manager (the "Open
     /// conversation storage" affordance). Files there are plain JSON — readable,
     /// hand-editable, deletable. Mirrors the saved-queries / settings reveal.
@@ -931,13 +976,6 @@ impl AppState {
             tracing::warn!("failed to create conversations directory: {e}");
         }
         self.reveal_path(&dir, cx);
-    }
-
-    /// Whether the active chat has been saved (gates the Delete affordance).
-    pub(crate) fn assistant_has_saved_chat(&self) -> bool {
-        self.assistant
-            .as_ref()
-            .is_some_and(|s| s.active().file_stem.is_some())
     }
 
     /// Save the API key from the setup view to the OS keyring and (re)configure
@@ -958,8 +996,10 @@ impl AppState {
         if let Some(state) = self.assistant.as_ref() {
             state.key_input.update(cx, |i, cx| i.set_content("", cx));
         }
-        self.ai_configured = true;
-        self.ai_api_key_available = true;
+        // Recompute the usable-agent list now the `anthropic` built-in has a key,
+        // then re-push the config so the backend builds its provider.
+        self.usable_agents = crate::app::usable_agents(&self.settings);
+        self.ai_configured = !self.usable_agents.is_empty();
         self.service
             .send_global(red_service::Command::ConfigureAi(crate::app::ai_config(
                 &self.settings,
@@ -1025,6 +1065,137 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         self.open_query_in_tab(sql, cx);
+    }
+
+    /// Store the agent's advertised slash commands on their chat (M-S4). Refreshes
+    /// the composer's command mirror if it's the active chat, so `/` offers them.
+    pub(crate) fn on_ai_commands_available(
+        &mut self,
+        conversation_id: u64,
+        commands: Vec<red_service::AiCommand>,
+        cx: &mut Context<Self>,
+    ) {
+        let updated = self
+            .with_chat_mut(conversation_id, |chat| chat.commands = commands)
+            .is_some();
+        if updated {
+            self.sync_command_completions();
+            cx.notify();
+        }
+    }
+
+    /// Store the agent's model / reasoning selectors on their chat, then apply the
+    /// central default (settings) once per fresh session — so a new chat opens on the
+    /// user's last-chosen model/reasoning without retroactively touching other chats.
+    pub(crate) fn on_ai_config_options_available(
+        &mut self,
+        conversation_id: u64,
+        options: Vec<red_service::AiConfigOption>,
+        cx: &mut Context<Self>,
+    ) {
+        let updated = self
+            .with_chat_mut(conversation_id, |chat| chat.config_options = options)
+            .is_some();
+        if !updated {
+            return;
+        }
+        self.apply_default_config(conversation_id, cx);
+        cx.notify();
+    }
+
+    /// Apply the central default model/reasoning (from settings) to a chat's fresh
+    /// session, once. For each defaulted selector whose stored value is advertised and
+    /// differs from the agent's current pick, send a set so the new chat lands on the
+    /// user's last choice. Guarded by `config_defaults_applied` so a later
+    /// `ConfigOptionUpdate` doesn't re-apply over a mid-chat manual change.
+    fn apply_default_config(&mut self, conversation_id: u64, cx: &mut Context<Self>) {
+        let model = self.settings.ai.subscription_model.clone();
+        let reasoning = self.settings.ai.subscription_reasoning.clone();
+        let Some(chat) = self
+            .assistant
+            .as_mut()
+            .and_then(|s| s.find_mut(conversation_id))
+        else {
+            return;
+        };
+        if chat.config_defaults_applied {
+            return;
+        }
+        chat.config_defaults_applied = true;
+        let to_apply = default_config_changes(&chat.config_options, &model, &reasoning);
+        for (config_id, value) in to_apply {
+            self.send_set_config_option(conversation_id, config_id, value, cx);
+        }
+    }
+
+    /// The composer dropdown changed a selector: optimistically reflect it on the
+    /// chat, persist it as the central default for future chats (last choice wins;
+    /// existing chats untouched), and tell the backend to apply it to this session.
+    pub(crate) fn change_config_option(
+        &mut self,
+        config_id: String,
+        value: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.assistant.as_mut() else {
+            return;
+        };
+        state.open_config = None;
+        let conversation_id = state.active().conversation_id;
+        let chat = state.active_mut();
+        // Optimistic local update + remember the category for the settings write.
+        let mut category = None;
+        for opt in &mut chat.config_options {
+            if opt.id == config_id {
+                opt.current_value = value.clone();
+                category = Some(opt.category);
+            }
+        }
+        // Persist as the central default for new chats (not retroactive).
+        match category {
+            Some(red_service::AiConfigCategory::Model) => {
+                self.settings.ai.subscription_model = value.clone();
+                self.save_settings();
+            }
+            Some(red_service::AiConfigCategory::Reasoning) => {
+                self.settings.ai.subscription_reasoning = value.clone();
+                self.save_settings();
+            }
+            _ => {}
+        }
+        self.send_set_config_option(conversation_id, config_id, value, cx);
+        cx.notify();
+    }
+
+    /// Send the backend a config change for one conversation (no settings write — the
+    /// callers decide whether this is a user choice or a default being applied).
+    fn send_set_config_option(
+        &mut self,
+        conversation_id: u64,
+        config_id: String,
+        value: String,
+        _cx: &mut Context<Self>,
+    ) {
+        if let Phase::Connected(active) = &self.phase {
+            self.service.send_to(
+                active.session,
+                red_service::Command::AiSetConfigOption {
+                    conversation_id,
+                    config_id,
+                    value,
+                },
+            );
+        }
+    }
+
+    /// Mirror the active chat's slash commands into the shared cell the composer's
+    /// completion provider reads. Called whenever the active chat changes or its
+    /// commands arrive. Cheap; a no-op when the panel is closed.
+    pub(crate) fn sync_command_completions(&self) {
+        let Some(state) = self.assistant.as_ref() else {
+            return;
+        };
+        *state.completion_commands.borrow_mut() = state.active().commands.clone();
     }
 
     // --- event sinks (driven from `on_event`) --------------------------------
@@ -1149,11 +1320,18 @@ impl AppState {
         usage: red_service::AiUsage,
         cx: &mut Context<Self>,
     ) {
+        // A turn finishing on a chat the user isn't looking at is "unread" until
+        // they switch to it (drives the history dot). The active chat is, by
+        // definition, already in view.
+        let active_id = self.assistant.as_ref().map(|s| s.active().conversation_id);
         let finished = self
             .with_chat_mut(conversation_id, |chat| {
                 chat.streaming = false;
                 chat.status = None;
                 chat.pending_permission = None;
+                if active_id != Some(chat.conversation_id) {
+                    chat.unread = true;
+                }
                 // Keep a non-empty reading; a turn that reports nothing (some
                 // refusals / cancels) leaves the prior footer in place.
                 if usage != red_service::AiUsage::default() {
@@ -1324,6 +1502,79 @@ impl AppState {
         }
     }
 
+    /// The composer's model + reasoning dropdowns (subscription path), to the left of
+    /// Send. One `flint::Select` per advertised Model/Reasoning selector; empty (so
+    /// Send sits alone) on the API-key path or before the agent's session opens.
+    /// Dimmed and non-interactive while a turn streams.
+    fn render_config_selectors(
+        &self,
+        state: &AssistantState,
+        chat: &ChatSession,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let streaming = chat.streaming;
+        let open = state.open_config.clone();
+        let mut row = div().flex().items_center().gap_1p5().min_w(px(0.));
+        let mut any = false;
+        for cat in [
+            red_service::AiConfigCategory::Model,
+            red_service::AiConfigCategory::Reasoning,
+        ] {
+            let Some(opt) = chat
+                .config_options
+                .iter()
+                .find(|o| o.category == cat && !o.choices.is_empty())
+            else {
+                continue;
+            };
+            any = true;
+            let selected = opt
+                .choices
+                .iter()
+                .position(|c| c.value == opt.current_value)
+                .unwrap_or(usize::MAX);
+            let is_open = !streaming && open.as_deref() == Some(opt.id.as_str());
+            let mut select = Select::new(SharedString::from(format!("ai-config-{}", opt.id)))
+                .selected(selected)
+                .open(is_open)
+                .placeholder("Default");
+            for choice in &opt.choices {
+                select = select.option(SharedString::from(choice.name.clone()));
+            }
+            if !streaming {
+                let view = cx.entity();
+                let id_toggle = opt.id.clone();
+                select = select.on_toggle(move |_, cx| {
+                    view.update(cx, |this, cx| {
+                        if let Some(s) = this.assistant.as_mut() {
+                            s.open_config = if s.open_config.as_deref() == Some(id_toggle.as_str())
+                            {
+                                None
+                            } else {
+                                Some(id_toggle.clone())
+                            };
+                            cx.notify();
+                        }
+                    });
+                });
+                let view = cx.entity();
+                let id_select = opt.id.clone();
+                let values: Vec<String> = opt.choices.iter().map(|c| c.value.clone()).collect();
+                select = select.on_select(move |ix, _, cx| {
+                    if let Some(value) = values.get(ix).cloned() {
+                        let id = id_select.clone();
+                        view.update(cx, |this, cx| this.change_config_option(id, value, cx));
+                    }
+                });
+            }
+            row = row.child(div().when(streaming, |d| d.opacity(0.5)).child(select));
+        }
+        if !any {
+            return div().into_any_element();
+        }
+        row.into_any_element()
+    }
+
     /// The assistant panel body, docked right of the workspace by the shell.
     pub(crate) fn render_assistant(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
@@ -1331,13 +1582,13 @@ impl AppState {
             return div().into_any_element();
         };
         let chat = state.active();
-        // Subscription mode (Claude Code over ACP) needs no API key and bills the
-        // user's Pro/Max plan; the header reflects the active chat's backend.
-        let is_subscription = chat.is_subscription();
+        // An ACP agent (Claude subscription, Codex, a local agent) owns its own auth
+        // and bills its own way; the body hint reflects the active chat's backend.
+        let is_subscription = self.agent_is_acp(&chat.provider);
 
         let header = self.render_assistant_header(state, &theme, cx);
 
-        // Setup view: no provider usable yet (no key, default isn't subscription).
+        // Setup view: no agent usable yet (no API key, and no ACP agent configured).
         if !self.ai_configured {
             return self.render_assistant_setup(state, header, &theme, cx);
         }
@@ -1365,7 +1616,7 @@ impl AppState {
                  subscription (Claude Code) — the first message starts the agent, which reads \
                  the schema and runs capped, read-only SELECTs through Red's tools."
             } else {
-                "Ask a question about the connected database. The assistant can read the \
+                "Ask a question about the connected database. The agent can read the \
                  schema and run capped, read-only SELECTs to answer."
             };
             body = body.child(
@@ -1374,9 +1625,9 @@ impl AppState {
                     .text_color(theme.text_muted)
                     .child(hint),
             );
-            // Before the first message, the chat's backend can still be switched —
-            // offer the picker when more than one provider is available (M-S6).
-            if let Some(picker) = self.render_provider_picker(chat, &theme, cx) {
+            // Before the first message, the chat's agent can still be switched —
+            // offer the picker when more than one agent is usable (M-S6).
+            if let Some(picker) = self.render_agent_picker(chat, &theme, cx) {
                 body = body.child(picker);
             }
         }
@@ -1444,7 +1695,8 @@ impl AppState {
         };
 
         // A bordered, rounded composer card (Zed-style): the multiline input on top,
-        // a slim toolbar row below with a commands hint and the send/stop button.
+        // a slim toolbar row below with the model/reasoning selectors on the left and
+        // the send/stop button on the right.
         let composer = div()
             .flex_shrink_0()
             .m_2()
@@ -1467,15 +1719,11 @@ impl AppState {
                     .flex()
                     .items_center()
                     .justify_between()
+                    .gap_2()
                     .px_2()
                     .pt_2()
                     .pb_1p5()
-                    .child(
-                        div()
-                            .text_size(theme.scale(10.5))
-                            .text_color(theme.text_faint)
-                            .child("/ for commands"),
-                    )
+                    .child(self.render_config_selectors(state, chat, cx))
                     .child(action),
             );
 
@@ -1509,7 +1757,8 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let chat = state.active();
-        let is_subscription = chat.is_subscription();
+        let is_subscription = self.agent_is_acp(&chat.provider);
+        let agent_name = self.agent_name(&chat.provider);
 
         let icon_btn = |id: &'static str, glyph: &'static str, tip: &'static str| {
             div()
@@ -1585,19 +1834,16 @@ impl AppState {
             icon_btn("assistant-new-chat", "plus", "New chat")
                 .on_click(cx.listener(|this, _, _, cx| this.new_chat(cx)))
         });
-        let delete = (self.ai_configured && self.assistant_has_saved_chat()).then(|| {
-            icon_btn("assistant-delete", "trash", "Delete this conversation")
-                .on_click(cx.listener(|this, _, _, cx| this.delete_current_conversation(cx)))
-        });
 
+        // Deletion lives only in the history sidebar (each row's trash) — the chat
+        // view never deletes the conversation it's showing.
         let header_actions = div()
             .flex()
             .items_center()
             .gap_1()
             .when_some(reauth, |row, r| row.child(r))
             .when_some(list_btn, |row, l| row.child(l))
-            .when_some(new_chat, |row, n| row.child(n))
-            .when_some(delete, |row, d| row.child(d));
+            .when_some(new_chat, |row, n| row.child(n));
 
         div()
             .flex_shrink_0()
@@ -1621,11 +1867,7 @@ impl AppState {
                         theme.scale(14.),
                         theme.accent,
                     ))
-                    .child(if is_subscription {
-                        "Claude Agent Subscription"
-                    } else {
-                        "Assistant"
-                    })
+                    .child(agent_name)
                     // A "writes" badge when this connection opted into the write tier
                     // (Feature B), so the user knows the agent can propose data changes
                     // (each one still gated by per-statement approval).
@@ -1644,7 +1886,7 @@ impl AppState {
                                 .child(crate::icons::icon("edit", theme.scale(10.), theme.yellow))
                                 .child("writes")
                                 .tooltip(flint::Tooltip::text(
-                                    "This connection allows the assistant to propose writes — \
+                                    "This connection allows the agent to propose writes — \
                                          each one needs your approval.",
                                 )),
                         )
@@ -1696,7 +1938,7 @@ impl AppState {
                         div()
                             .text_size(theme.scale(12.5))
                             .text_color(theme.text)
-                            .child("Add an Anthropic API key to use the assistant."),
+                            .child("Add an Anthropic API key to use the agent."),
                     )
                     .child(
                         div()
@@ -1747,7 +1989,7 @@ impl AppState {
                     saved_index: None,
                     title,
                     subtitle: "Draft".to_string(),
-                    subscription: c.is_subscription(),
+                    status: RowStatus::Draft,
                     active: i == state.active,
                     attention: false,
                     draft: true,
@@ -1770,17 +2012,24 @@ impl AppState {
                 .iter()
                 .filter(|m| m.role == ChatRole::User)
                 .count();
-            let mut subtitle = format!("{} · {turns} turns", c.provider_label());
+            let mut subtitle = format!("{} · {turns} turns", self.agent_name(&c.provider));
             if c.streaming {
                 subtitle.push_str(" · streaming");
             }
+            let status = if c.streaming {
+                RowStatus::Streaming
+            } else if c.unread {
+                RowStatus::Unread
+            } else {
+                RowStatus::Idle
+            };
             rows.push(HistoryRow {
                 key: RowKey::Open(c.conversation_id),
                 open_index: Some(i),
                 saved_index: None,
                 title,
                 subtitle,
-                subscription: c.is_subscription(),
+                status,
                 active: i == state.active,
                 attention: c.needs_attention(),
                 draft: false,
@@ -1791,18 +2040,14 @@ impl AppState {
                 continue;
             }
             let turns = conv.messages.iter().filter(|m| m.role == "user").count();
-            let label = if provider_is_subscription(&conv.provider) {
-                "Subscription"
-            } else {
-                "API key"
-            };
+            let label = self.agent_name(&conv.provider);
             rows.push(HistoryRow {
                 key: RowKey::Saved(conv.stem.clone()),
                 open_index: None,
                 saved_index: Some(j),
                 title: conv.title.clone(),
                 subtitle: format!("{label} · {turns} turns"),
-                subscription: provider_is_subscription(&conv.provider),
+                status: RowStatus::Idle,
                 active: false,
                 attention: false,
                 draft: false,
@@ -1930,16 +2175,10 @@ impl AppState {
             .when(row.active, |r| r.bg(theme.bg_elevated))
             .hover(|s| s.bg(theme.bg_elevated));
 
-        // Provider glyph: sparkles for subscription, a key for API-key.
-        el = el.child(crate::icons::icon(
-            if row.subscription {
-                "sparkles"
-            } else {
-                "key-round"
-            },
-            theme.scale(13.),
-            theme.text_muted,
-        ));
+        // Leading status dot (replaces the old provider glyph; the provider now
+        // reads in the subtitle): draft is hollow, streaming pulses, an unseen
+        // background reply is filled-accent, everything else is a quiet dot.
+        el = el.child(status_dot(row.status, theme, cx.reduce_motion()));
 
         if let Some(rename) = renaming_here {
             // Inline rename: the title becomes an edit field (Enter commits).
@@ -2011,6 +2250,9 @@ impl AppState {
             el = el.child(
                 small_btn(format!("history-rename-{id_key}"), "edit", "Rename").on_click(
                     cx.listener(move |this, _, _, cx| {
+                        // Don't let the click fall through to the row body (which
+                        // would open the chat instead of starting the rename).
+                        cx.stop_propagation();
                         this.begin_rename(key_rename.clone(), title.clone(), cx)
                     }),
                 ),
@@ -2019,6 +2261,7 @@ impl AppState {
             el = el.child(
                 small_btn(format!("history-delete-{id_key}"), "trash", "Delete").on_click(
                     cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
                         this.delete_conversation_row(key_delete.clone(), cx)
                     }),
                 ),
@@ -2028,43 +2271,45 @@ impl AppState {
         el.into_any_element()
     }
 
-    /// The empty-chat provider picker (M-S6): two pills to bind a new chat to a
-    /// backend before its first message. Shown only when both backends are usable
-    /// (an API key is present *and* the subscription is an option) — otherwise the
-    /// chat's single available provider needs no choice.
-    fn render_provider_picker(
+    /// The empty-chat agent picker (M-S6): one selectable chip per usable agent, to
+    /// bind a new chat to an agent before its first message. Shown only when more
+    /// than one agent is usable — a single agent needs no choice. The chips wrap, so
+    /// a handful of agents lay out cleanly.
+    fn render_agent_picker(
         &self,
         chat: &ChatSession,
         theme: &flint::Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        // Only offer a choice when there's actually more than one provider.
-        if !self.ai_api_key_available {
+        if self.usable_agents.len() <= 1 {
             return None;
         }
-        let pill = |id: &'static str, label: &'static str, provider: &'static str, on: bool| {
-            div()
-                .id(id)
-                .px_2()
-                .h(px(24.))
-                .flex()
-                .items_center()
-                .rounded(px(5.))
-                .border_1()
-                .text_size(theme.scale(11.))
-                .cursor_pointer()
-                .when(on, |s| {
-                    s.border_color(theme.accent).text_color(theme.accent)
-                })
-                .when(!on, |s| {
-                    s.border_color(theme.border).text_color(theme.text_muted)
-                })
-                .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_active_chat_provider(provider.to_string(), cx)
-                }))
-        };
-        let sub = chat.is_subscription();
+        let current = chat.provider.clone();
+        let chips =
+            self.usable_agents.iter().map(|agent| {
+                let on = agent.id == current;
+                let id = agent.id.clone();
+                div()
+                    .id(SharedString::from(format!("ai-pick-{}", agent.id)))
+                    .px_2()
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(5.))
+                    .border_1()
+                    .text_size(theme.scale(11.))
+                    .cursor_pointer()
+                    .when(on, |s| {
+                        s.border_color(theme.accent).text_color(theme.accent)
+                    })
+                    .when(!on, |s| {
+                        s.border_color(theme.border).text_color(theme.text_muted)
+                    })
+                    .child(SharedString::from(agent.name.clone()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_active_chat_provider(id.clone(), cx)
+                    }))
+            });
         Some(
             div()
                 .flex()
@@ -2074,20 +2319,15 @@ impl AppState {
                     div()
                         .text_size(theme.scale(10.5))
                         .text_color(theme.text_muted)
-                        .child("Backend for this chat:"),
+                        .child("Agent for this chat:"),
                 )
                 .child(
                     div()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .gap_1p5()
-                        .child(pill("ai-pick-apikey", "API key", "anthropic", !sub))
-                        .child(pill(
-                            "ai-pick-subscription",
-                            "Claude subscription",
-                            "subscription",
-                            sub,
-                        )),
+                        .children(chips),
                 )
                 .into_any_element(),
         )
@@ -2209,7 +2449,7 @@ impl AppState {
                     .text_size(theme.scale(12.))
                     .text_color(theme.text)
                     .child(crate::icons::icon("lock", theme.scale(13.), theme.accent))
-                    .child(format!("Allow the assistant to run {}?", pending.title)),
+                    .child(format!("Allow the agent to run {}?", pending.title)),
             );
         if let Some(detail) = &pending.detail {
             card = card.child(
@@ -2255,7 +2495,7 @@ impl AppState {
         };
         let (label, label_color) = match msg.role {
             ChatRole::User => ("You", theme.text_muted),
-            ChatRole::Assistant => ("Assistant", theme.accent),
+            ChatRole::Assistant => ("Agent", theme.accent),
         };
 
         // Label row: the author, plus a copy-to-clipboard affordance for the
@@ -2402,6 +2642,70 @@ fn follow_if_at_bottom(chat: &ChatSession) {
     }
 }
 
+/// Candidate slash-command names for the composer's completion popup, or empty when
+/// the word under the cursor isn't a slash command. A slash command is a `/` at the
+/// start of the input (or after whitespace) followed by the in-progress name; the
+/// returned candidate is the bare name (the editor keeps the typed `/`). The word
+/// boundary matches the editor's own (alphanumeric + `_`), so the accepted candidate
+/// replaces exactly the typed name.
+fn slash_candidates(
+    commands: &[red_service::AiCommand],
+    text: &str,
+    cursor: usize,
+) -> Vec<SharedString> {
+    if commands.is_empty() {
+        return Vec::new();
+    }
+    let bytes = text.as_bytes();
+    let cursor = cursor.min(bytes.len());
+    // Walk back over the in-progress command name.
+    let mut start = cursor;
+    while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+        start -= 1;
+    }
+    // The char before the name must be `/`, and that `/` must open the input or
+    // follow whitespace — so "and/or" or a file path never triggers the picker.
+    if start == 0 || bytes[start - 1] != b'/' {
+        return Vec::new();
+    }
+    let slash = start - 1;
+    if slash > 0 && !bytes[slash - 1].is_ascii_whitespace() {
+        return Vec::new();
+    }
+    let prefix = text[start..cursor].to_ascii_lowercase();
+    commands
+        .iter()
+        .filter(|c| c.name.to_ascii_lowercase().starts_with(&prefix))
+        .map(|c| SharedString::from(c.name.clone()))
+        .collect()
+}
+
+/// Which config selectors a fresh session should switch to honor the central
+/// defaults: for each Model/Reasoning option whose stored default is non-empty, an
+/// advertised choice, and not already current, the `(config_id, value)` to apply.
+/// Options without a stored default (or already on it) are left as the agent set them.
+fn default_config_changes(
+    options: &[red_service::AiConfigOption],
+    model_default: &str,
+    reasoning_default: &str,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for opt in options {
+        let default = match opt.category {
+            red_service::AiConfigCategory::Model => model_default,
+            red_service::AiConfigCategory::Reasoning => reasoning_default,
+            _ => continue,
+        };
+        if default.is_empty() || default == opt.current_value {
+            continue;
+        }
+        if opt.choices.iter().any(|c| c.value == default) {
+            out.push((opt.id.clone(), default.to_string()));
+        }
+    }
+    out
+}
+
 /// The first `n` characters of `s` (a byte-safe prefix), or all of it when shorter.
 /// Drives the streaming reveal — slicing on a char boundary so multibyte text never
 /// panics mid-codepoint.
@@ -2410,6 +2714,38 @@ fn take_chars(s: &str, n: usize) -> &str {
         Some((i, _)) => &s[..i],
         None => s,
     }
+}
+
+/// A history row's leading status dot, sized to the old provider glyph's footprint
+/// so the list never reflows as a chat changes state. A draft is a hollow ring; a
+/// streaming chat pulses (resting solid under reduced motion); an unseen background
+/// reply is a filled accent dot; an idle chat is a quiet muted dot.
+fn status_dot(status: RowStatus, theme: &flint::Theme, reduce_motion: bool) -> AnyElement {
+    let slot = div().flex().items_center().justify_center().size(px(13.));
+    let dot = div().size(px(7.)).rounded_full();
+    let inner = match status {
+        RowStatus::Draft => dot.border_1().border_color(theme.text_muted),
+        RowStatus::Idle => dot.bg(theme.text_muted),
+        RowStatus::Unread => dot.bg(theme.accent),
+        RowStatus::Streaming => {
+            let dot = dot.bg(theme.accent);
+            if reduce_motion {
+                dot
+            } else {
+                return slot
+                    .child(dot.with_animation(
+                        "ai-history-streaming-dot",
+                        Animation::new(Duration::from_millis(1100)).repeat(),
+                        |dot, delta| {
+                            let o = 0.2 + 0.8 * (0.5 + 0.5 * (delta * std::f32::consts::TAU).cos());
+                            dot.opacity(o)
+                        },
+                    ))
+                    .into_any_element();
+            }
+        }
+    };
+    slot.child(inner).into_any_element()
 }
 
 /// The streaming caret: a small block trailing the typed-out answer. It pulses
@@ -2597,7 +2933,7 @@ fn render_transcript(messages: &[crate::conversations::StoredMessage]) -> Option
             continue;
         }
         let who = if m.role == "assistant" {
-            "Assistant"
+            "Agent"
         } else {
             "You"
         };
@@ -2678,6 +3014,83 @@ mod tests {
     use super::*;
 
     #[test]
+    fn central_defaults_apply_only_when_valid_and_different() {
+        let choice = |v: &str| red_service::AiConfigChoice {
+            value: v.into(),
+            name: v.into(),
+            description: None,
+        };
+        let model = red_service::AiConfigOption {
+            id: "model".into(),
+            name: "Model".into(),
+            category: red_service::AiConfigCategory::Model,
+            current_value: "auto".into(),
+            choices: vec![choice("auto"), choice("opus"), choice("haiku")],
+        };
+        let reasoning = red_service::AiConfigOption {
+            id: "reasoning".into(),
+            name: "Reasoning".into(),
+            category: red_service::AiConfigCategory::Reasoning,
+            current_value: "default".into(),
+            choices: vec![choice("default"), choice("hard")],
+        };
+        let opts = vec![model, reasoning];
+
+        // A valid, different model default applies; an empty reasoning default is left.
+        assert_eq!(
+            default_config_changes(&opts, "opus", ""),
+            vec![("model".to_string(), "opus".to_string())]
+        );
+        // Both apply when both differ.
+        assert_eq!(
+            default_config_changes(&opts, "haiku", "hard"),
+            vec![
+                ("model".to_string(), "haiku".to_string()),
+                ("reasoning".to_string(), "hard".to_string()),
+            ]
+        );
+        // A default equal to the current pick is a no-op; an unknown value is ignored.
+        assert!(default_config_changes(&opts, "auto", "nonexistent").is_empty());
+        // No stored defaults → nothing to apply.
+        assert!(default_config_changes(&opts, "", "").is_empty());
+    }
+
+    #[test]
+    fn slash_picker_triggers_only_in_command_position() {
+        let cmds = vec![
+            red_service::AiCommand {
+                name: "login".into(),
+                description: "Sign in".into(),
+            },
+            red_service::AiCommand {
+                name: "logout".into(),
+                description: "Sign out".into(),
+            },
+            red_service::AiCommand {
+                name: "clear".into(),
+                description: "Reset".into(),
+            },
+        ];
+        let names = |t: &str, c: usize| -> Vec<String> {
+            slash_candidates(&cmds, t, c)
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect()
+        };
+        // A bare `/` offers everything; the prefix filters.
+        assert_eq!(names("/", 1), vec!["login", "logout", "clear"]);
+        assert_eq!(names("/lo", 3), vec!["login", "logout"]);
+        assert_eq!(names("/cle", 4), vec!["clear"]);
+        // After whitespace mid-message still counts as command position.
+        assert_eq!(names("hi /lo", 6), vec!["login", "logout"]);
+        // A slash glued to a preceding word (path, and/or) does not trigger.
+        assert!(names("and/lo", 6).is_empty());
+        // No match, and no commands → empty.
+        assert!(names("/xyz", 4).is_empty());
+        assert!(slash_candidates(&[], "/lo", 3).is_empty());
+    }
+
+    #[test]
     fn extracts_first_sql_fence() {
         let md = "Here you go:\n```sql\nSELECT 1;\n```\nDone.";
         assert_eq!(extract_sql(md).as_deref(), Some("SELECT 1;"));
@@ -2731,7 +3144,7 @@ mod tests {
         ];
         let seed = render_transcript(&msgs).expect("non-empty");
         assert!(seed.contains("You: hi"));
-        assert!(seed.contains("Assistant: hello"));
+        assert!(seed.contains("Agent: hello"));
         // Empty-text turns are skipped; thinking isn't seeded.
         assert!(!seed.contains("ignored"));
         // An all-empty transcript yields nothing to seed.
@@ -2744,20 +3157,12 @@ mod tests {
     }
 
     #[test]
-    fn provider_kind_maps_from_binding() {
-        let api = ChatSession::new(0, "anthropic".to_string());
-        assert_eq!(api.provider_kind(), red_service::AiProviderKind::ApiKey);
-        assert!(!api.is_subscription());
-        let sub = ChatSession::new(1, "subscription".to_string());
-        assert_eq!(
-            sub.provider_kind(),
-            red_service::AiProviderKind::Subscription
-        );
-        assert!(sub.is_subscription());
-        // Case-insensitive, and an unknown name falls back to the API-key path.
-        let weird = ChatSession::new(2, "SUBSCRIPTION".to_string());
-        assert!(weird.is_subscription());
-        let other = ChatSession::new(3, "openai".to_string());
-        assert_eq!(other.provider_kind(), red_service::AiProviderKind::ApiKey);
+    fn chat_carries_its_agent_binding() {
+        // The chat stores the agent id verbatim; a turn carries it to the backend,
+        // which resolves the kind (the panel no longer maps it). Any id round-trips.
+        for id in ["anthropic", "subscription", "codex", "local"] {
+            let chat = ChatSession::new(0, id.to_string());
+            assert_eq!(chat.provider, id);
+        }
     }
 }

@@ -336,7 +336,7 @@ fn inline(text: &str, theme: &Theme) -> AnyElement {
             Span::Code => font(theme.mono_family.clone()),
         };
         let color = if span == Span::Code {
-            theme.red
+            theme.accent
         } else {
             theme.text
         };
@@ -344,7 +344,10 @@ fn inline(text: &str, theme: &Theme) -> AnyElement {
             len: seg.len(),
             font: f,
             color,
-            background_color: (span == Span::Code).then_some(theme.bg_elevated),
+            // A faint tint of the accent, not a solid surface — reads as a subtle
+            // chip in every theme rather than a stark white/black box (the old
+            // `bg_elevated` was pure white in Ayu Light).
+            background_color: (span == Span::Code).then(|| theme.accent.opacity(0.12)),
             underline: None,
             strikethrough: None,
         });

@@ -85,7 +85,7 @@ statement_timeout = 0
 restore_last_session = false
 
 [ai]
-# The master switch for the grounded chat assistant (⌘L). false is a true kill
+# The master switch for the grounded chat agent (⌘L). false is a true kill
 # switch — no panel entry point, no local MCP server, no agent process. A
 # connection can override it in connections.toml (ai_enabled).
 enabled = true
@@ -95,8 +95,8 @@ enabled = true
 #   "subscription" — Claude Code over ACP, billed to a Pro/Max subscription.
 provider = "anthropic"
 
-# How much the assistant's tools can see (the capability boundary):
-#   "off"    — no database tools; the assistant chats without DB grounding.
+# How much the agent's tools can see (the capability boundary):
+#   "off"    — no database tools; the agent chats without DB grounding.
 #   "schema" — structure only (tables, columns, types) — never row data.
 #   "read"   — the full read catalog: capped SELECTs + EXPLAIN. A tool above the
 #              tier is never offered to the model.
@@ -118,6 +118,42 @@ show_thinking = false
 # Advanced: override the subscription agent's launch command. Empty uses the
 # default (npx -y @agentclientprotocol/claude-agent-acp).
 agent_command = ""
+
+# Multiple agents. Define named profiles and pick which a new chat starts on with
+# the selector in the panel (and manage them in Settings → AI). When NO [[ai.agents]]
+# are defined, two are synthesized from the keys above ("anthropic" API + "subscription"
+# ACP) so this section is optional. Each profile's API key lives in the OS keyring
+# under `ai-key:<id>`, never here. `kind` is "api" (Messages API via red-ai, optional
+# base_url) or "acp" (an external agent over ACP — Claude Code, codex, a local agent).
+#
+# default_agent = "claude-sub"
+#
+# [[ai.agents]]
+# id = "claude-sub"
+# name = "Claude (subscription)"
+# kind = "acp"
+# command = ""              # empty = default Claude Code invocation
+#
+# [[ai.agents]]
+# id = "codex"
+# name = "Codex"
+# kind = "acp"
+# command = "codex acp"
+#
+# [[ai.agents]]
+# id = "claude-api"
+# name = "Claude (API)"
+# kind = "api"
+# wire = "anthropic"
+# model = "claude-opus-4-8"
+#
+# [[ai.agents]]
+# id = "local"
+# name = "Local"
+# kind = "api"
+# wire = "anthropic"        # an Anthropic-wire-compatible endpoint
+# base_url = "http://127.0.0.1:8080"
+# model = "..."
 
 [ai.limits]
 # Defense-in-depth caps the read-tier tools run under. Each can be disabled with 0

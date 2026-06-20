@@ -59,7 +59,7 @@ impl SettingsTab {
             SettingsTab::Query => "Query",
             SettingsTab::Keymap => "Keymap",
             SettingsTab::Behavior => "Behavior",
-            SettingsTab::Ai => "AI assistant",
+            SettingsTab::Ai => "AI agent",
             SettingsTab::About => "About",
         }
     }
@@ -1205,12 +1205,12 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
         .on_change(cx.listener(|this, on: &bool, _, cx| this.set_ai_show_thinking(*on, cx)));
 
     settings_page_scaffold(
-        "AI assistant",
+        "AI agent",
         div()
             .flex()
             .flex_col()
             .child(setting_row(
-                "Enable assistant",
+                "Enable agent",
                 "The grounded chat sidepanel (⌘L). Off is a true kill switch — it \
                  removes the panel, runs no agent, and starts no local server.",
                 switch,
@@ -1219,7 +1219,7 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             .child(settings_header("Database access", &theme))
             .child(setting_row(
                 "Access tier",
-                "How much the assistant's tools can see. Off: no database tools at \
+                "How much the agent's tools can see. Off: no database tools at \
                  all. Schema: structure only (tables, columns, types — never row \
                  data). Read: the full read catalog (run capped SELECTs and EXPLAIN). \
                  A tool above the tier is never offered to the model.",
@@ -1233,12 +1233,13 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                     .text_size(theme.scale(12.))
                     .text_color(theme.text_muted)
                     .child(
-                        "A connection can override the tier in connections.toml \
-                         (ai_tier / ai_enabled). Write access is per-connection only — \
-                         set ai_tier = \"write\" on a specific connection to let the \
-                         assistant propose INSERT/UPDATE/DELETE. Every write still needs \
-                         your explicit per-statement approval, is blocked on a read-only \
-                         connection, and never runs DDL or an unqualified UPDATE/DELETE.",
+                        "Write access is per-connection, never a global default: edit a \
+                         writable connection and turn on “AI assistant → Allow writes” to \
+                         let the assistant propose INSERT/UPDATE/DELETE there. Every write \
+                         still needs your explicit per-statement approval, is blocked on a \
+                         read-only connection, and never runs DDL or an unqualified \
+                         UPDATE/DELETE. A connection can also override enabled/tier in \
+                         connections.toml (ai_enabled / ai_tier).",
                     ),
             )
             .child(settings_header("Read-tier resource guards", &theme))
@@ -1276,19 +1277,120 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 show_thinking,
                 &theme,
             ))
-            .child(
-                div()
-                    .pt_4()
-                    .text_size(theme.scale(12.))
-                    .text_color(theme.text_faint)
-                    .child(
-                        "Provider, model, and the subscription agent command live in \
-                         the settings file ([ai] provider / model / agent_command).",
-                    ),
-            ),
+            .child(settings_header("Agents", &theme))
+            .child(ai_agents_section(state, &theme, cx)),
         &theme,
     )
     .into_any_element()
+}
+
+/// The Agents list (Phase 5): every configured agent — the synthesized legacy
+/// built-ins, or an explicit `[[ai.agents]]` set. Click a row to make it the
+/// default new chats start on; the filled dot marks the current default. An API
+/// agent shows whether its key is set (the keyring), an ACP agent is always ready.
+/// Add/remove agents and edit their fields (command / base_url / model / API keys)
+/// in the settings file — the "Edit in settings file" button opens it.
+fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>) -> AnyElement {
+    let view = cx.entity();
+    let agents = state.settings.ai.resolved_agents();
+    let default_id = state.settings.ai.resolved_default_agent();
+    let usable: std::collections::HashSet<&str> =
+        state.usable_agents.iter().map(|a| a.id.as_str()).collect();
+
+    let mut list = div().flex().flex_col().gap_1();
+    for a in &agents {
+        let is_default = a.id == default_id;
+        let is_acp = a.kind.eq_ignore_ascii_case("acp");
+        // Status: an ACP agent owns its own auth (always ready); an API agent is
+        // ready only once its key is in the keyring (i.e. it made the usable list).
+        let (status, status_color) = if is_acp {
+            ("ready", theme.text_muted)
+        } else if usable.contains(a.id.as_str()) {
+            ("key set", theme.accent)
+        } else {
+            ("no key", theme.text_faint)
+        };
+        let id = a.id.clone();
+        let row_view = view.clone();
+        let dot = div()
+            .size(px(8.))
+            .rounded_full()
+            .flex_none()
+            .when(is_default, |d| d.bg(theme.accent))
+            .when(!is_default, |d| d.border_1().border_color(theme.border));
+        let kind_badge = div()
+            .px_1p5()
+            .rounded(px(4.))
+            .bg(theme.bg_elevated)
+            .text_size(theme.scale(10.))
+            .text_color(theme.text_muted)
+            .child(if is_acp { "ACP" } else { "API" });
+        list = list.child(
+            div()
+                .id(SharedString::from(format!("agent-row-{}", a.id)))
+                .role(gpui::Role::Button)
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .h(px(32.))
+                .rounded(theme.radius)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.bg_elevated))
+                .child(dot)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_size(theme.scale(12.5))
+                        .text_color(theme.text)
+                        .child(SharedString::from(a.name.clone())),
+                )
+                .child(kind_badge)
+                .child(
+                    div()
+                        .text_size(theme.scale(10.5))
+                        .text_color(status_color)
+                        .child(status),
+                )
+                .when(is_default, |row| {
+                    row.child(
+                        div()
+                            .text_size(theme.scale(10.5))
+                            .text_color(theme.text_muted)
+                            .child("· default"),
+                    )
+                })
+                .on_click(move |_, _, cx| {
+                    let id = id.clone();
+                    row_view.update(cx, |this, cx| this.set_default_agent(&id, cx));
+                }),
+        );
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .text_size(theme.scale(12.))
+                .text_color(theme.text_muted)
+                .child(
+                    "Pick the agent new chats start on (click a row). Switch a chat's \
+                     agent before its first message from the panel. Add or remove agents \
+                     and edit their command / endpoint / model / API key in the settings \
+                     file — keys are stored in the OS keyring, never in the file.",
+                ),
+        )
+        .child(list)
+        .child(
+            Button::new("ai-edit-agents-file", "Edit in settings file")
+                .variant(ButtonVariant::Secondary)
+                .size(ButtonSize::Sm)
+                .on_click(cx.listener(|this, _, _, cx| this.open_settings_file(cx))),
+        )
+        .into_any_element()
 }
 
 fn about_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {

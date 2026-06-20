@@ -135,13 +135,11 @@ impl AppState {
         // backend only re-polls if the cadence actually moved.
         self.service
             .send_global(Command::ConfigureUpdates(update_config(&self.settings)));
-        // Re-push the AI config in case `[ai]` (model / provider / thinking) changed.
+        // Re-push the AI config in case `[ai]` (agents / tier / thinking) changed,
+        // and recompute the usable-agent list the panel selector draws from.
         let ai = crate::app::ai_config(&self.settings);
-        // Subscription mode needs no key (the agent owns its login); the API-key
-        // path is "ready" only once a key is present.
-        self.ai_configured =
-            ai.provider == red_service::AiProviderKind::Subscription || !ai.api_key.is_empty();
-        self.ai_api_key_available = !ai.api_key.is_empty();
+        self.usable_agents = crate::app::usable_agents(&self.settings);
+        self.ai_configured = !self.usable_agents.is_empty();
         self.service.send_global(Command::ConfigureAi(ai));
         // If the reload (or a per-connection override) just flipped the master
         // switch off (M-S7), close any open panel so the kill switch is immediate.
@@ -754,6 +752,21 @@ impl AppState {
     pub(crate) fn set_ai_tier(&mut self, tier: &str, cx: &mut Context<Self>) {
         self.settings.ai.tier = tier.to_string();
         self.save_settings();
+        self.push_ai_config();
+        cx.notify();
+    }
+
+    /// Set the agent new chats start on (`[ai] default_agent`). If the settings
+    /// still rely on the synthesized legacy built-ins (no explicit `[[ai.agents]]`),
+    /// materialize that list first so the choice has somewhere to persist. Re-pushed
+    /// so the panel's selector default updates immediately.
+    pub(crate) fn set_default_agent(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.settings.ai.agents.is_empty() {
+            self.settings.ai.agents = self.settings.ai.resolved_agents();
+        }
+        self.settings.ai.default_agent = id.to_string();
+        self.save_settings();
+        self.usable_agents = crate::app::usable_agents(&self.settings);
         self.push_ai_config();
         cx.notify();
     }

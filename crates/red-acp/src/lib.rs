@@ -16,6 +16,6 @@ mod types;
 
 pub use conversation::AcpConversation;
 pub use types::{
-    AcpConfig, AcpDelta, AcpError, AcpPermission, AcpStop, AcpTurnResult, AcpUsage, McpGrounding,
-    DEFAULT_AGENT_COMMAND,
+    AcpCommand, AcpConfig, AcpConfigCategory, AcpConfigChoice, AcpConfigOption, AcpDelta, AcpError,
+    AcpPermission, AcpStop, AcpTurnResult, AcpUsage, McpGrounding, DEFAULT_AGENT_COMMAND,
 };
