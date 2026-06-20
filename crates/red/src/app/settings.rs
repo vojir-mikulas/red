@@ -799,7 +799,11 @@ impl AppState {
         }
         if let Err(e) = crate::secrets::set_ai_key(&id, &key) {
             tracing::warn!("failed to store AI key in keychain: {e}");
-            self.notify(ToastVariant::Error, "Couldn't store the key in the keychain", cx);
+            self.notify(
+                ToastVariant::Error,
+                "Couldn't store the key in the keychain",
+                cx,
+            );
             return;
         }
         self.ai_key_input.update(cx, |i, cx| i.set_content("", cx));

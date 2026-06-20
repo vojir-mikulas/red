@@ -1454,7 +1454,12 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                     .gap_2()
                     .px_2()
                     .pb_1()
-                    .child(div().flex_1().min_w(px(0.)).child(state.ai_key_input.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(state.ai_key_input.clone()),
+                    )
                     .child(
                         Button::new("ai-key-save", "Save")
                             .variant(ButtonVariant::Primary)

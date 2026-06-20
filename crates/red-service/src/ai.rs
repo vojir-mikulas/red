@@ -523,13 +523,24 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
                 styling; a base stylesheet (light/dark) is already applied. Scripts and remote/\
                 external resources (other domains, <script>, remote <img>/CSS) are stripped or \
                 blocked for safety, so keep everything self-contained (data URIs for images). \
+                For INTERACTIVE charts (hover tooltips, legends), pass `charts` — an array of \
+                Chart.js v4 config objects — and reference each one from the body with an empty \
+                <div data-red-chart=\"INDEX\"></div> placeholder (INDEX is the chart's position \
+                in the array). The charts are rendered by a trusted built-in Chart.js; you supply \
+                DATA only (no JavaScript/function callbacks — they are ignored). Prefer charts \
+                over inline <svg> when the user wants something interactive. \
                 Use this when the user asks for a report."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "html": { "type": "string", "description": "The report BODY as self-contained HTML (no <html>/<head>/<body> wrapper — that's added)." },
+                    "html": { "type": "string", "description": "The report BODY as self-contained HTML (no <html>/<head>/<body> wrapper — that's added). Reference any charts with <div data-red-chart=\"INDEX\"></div> placeholders." },
                     "title": { "type": "string", "description": "Report title (browser tab + heading)." },
+                    "charts": {
+                        "type": "array",
+                        "description": "Optional interactive charts. Each item is a Chart.js v4 config object, e.g. {\"type\":\"bar\",\"data\":{\"labels\":[…],\"datasets\":[{\"label\":\"Revenue\",\"data\":[…]}]},\"options\":{…}}. type is one of bar, line, pie, doughnut, radar, polarArea, scatter, bubble. Provide data only — no functions/callbacks. Place a <div data-red-chart=\"INDEX\"></div> in the html body for each.",
+                        "items": { "type": "object" },
+                    },
                 },
                 "required": ["html"],
                 "additionalProperties": false,
@@ -690,9 +701,19 @@ pub(crate) async fn run_tool(
                 );
             }
             let title = input.get("title").and_then(Json::as_str);
-            // Wrap the model's HTML in a sandboxed, themed shell (strict CSP: no
-            // scripts, no remote loads) and open it in the browser.
-            let html = wrap_report_html(title, body);
+            // Optional interactive charts: keep only well-formed Chart.js spec
+            // objects. They are embedded as inert data and rendered by the trusted
+            // bundle (see `wrap_report_html`); anything that isn't an object is
+            // dropped rather than smuggled into the document.
+            let charts: Vec<Json> = input
+                .get("charts")
+                .and_then(Json::as_array)
+                .map(|items| items.iter().filter(|c| c.is_object()).cloned().collect())
+                .unwrap_or_default();
+            // Wrap the model's HTML in a sandboxed, themed shell (strict CSP) and
+            // open it in the browser. With charts, the shell adds a nonce-gated
+            // Chart.js bundle and a `connect-src 'none'` (no-egress) policy.
+            let html = wrap_report_html(title, body, &charts);
             let path = std::env::temp_dir()
                 .join(format!("red-report-{}.html", uuid::Uuid::new_v4().simple()));
             match write_report_file(&path, &html) {
@@ -1060,6 +1081,13 @@ fn write_report_file(path: &Path, html: &str) -> std::io::Result<()> {
     file.write_all(html.as_bytes())
 }
 
+/// The trusted in-report chart bundle: Chart.js v4 (UMD, minified) + our renderer
+/// (`assets/report-renderer.js`). This is the ONLY code allowed to run in a report
+/// — it is injected behind a per-report CSP nonce, so the model's HTML and the
+/// chart specs (which never carry the nonce) cannot execute. See `assets/README.md`
+/// to regenerate after a Chart.js bump.
+const REPORT_CHARTS_JS: &str = include_str!("../assets/report-charts.js");
+
 /// Wrap an AI-authored report body in a sandboxed, themed HTML document (Feature C).
 /// The safety boundary is a strict Content-Security-Policy: `default-src 'none'`
 /// blocks ALL scripts (inline and remote), remote fetches, and remote
@@ -1068,19 +1096,48 @@ fn write_report_file(path: &Path, html: &str) -> std::io::Result<()> {
 /// body (or a value injected from the data) smuggles a `<script>` or a remote URL,
 /// the browser neither runs nor loads it. `<script>` blocks are also stripped
 /// defensively, belt-and-suspenders.
-fn wrap_report_html(title: Option<&str>, body: &str) -> String {
+///
+/// When the model supplies `charts`, the report gains interactivity (Chart.js):
+/// the specs are embedded as inert `application/json` DATA the model authors, and
+/// our trusted bundle (the only thing carrying the CSP `nonce`) renders them. The
+/// CSP keeps the hole tight: scripts run only with the nonce (so the model cannot
+/// inject runnable code), and `connect-src 'none'` denies all network egress (so
+/// even the trusted bundle cannot exfiltrate the data it charts). The specs are
+/// pure data fed to Chart.js, which never evals them.
+fn wrap_report_html(title: Option<&str>, body: &str, charts: &[Json]) -> String {
     let title = title
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .unwrap_or("Red — report");
     let t = red_driver::html_escape(title);
     let safe_body = strip_scripts(body);
+
+    if charts.is_empty() {
+        return format!(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+             <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+             <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; \
+             style-src 'unsafe-inline'; img-src data:\">\
+             <title>{t}</title>{REPORT_STYLE}</head><body>{safe_body}</body></html>\n"
+        );
+    }
+
+    // Unguessable per-report nonce — only our bundle carries it, so a `<script>`
+    // smuggled through the body or a spec value has no valid nonce and won't run.
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let data = json!({ "charts": charts }).to_string();
+    // Neutralize `</script>` breakout from the inert data block; `<` parses
+    // back to `<` under JSON.parse, so the data round-trips intact.
+    let data = data.replace('<', "\\u003c");
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; \
-         style-src 'unsafe-inline'; img-src data:\">\
-         <title>{t}</title>{REPORT_STYLE}</head><body>{safe_body}</body></html>\n"
+         script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; img-src data:; \
+         connect-src 'none'\">\
+         <title>{t}</title>{REPORT_STYLE}</head><body>{safe_body}\
+         <script id=\"red-report-data\" type=\"application/json\">{data}</script>\
+         <script nonce=\"{nonce}\">{REPORT_CHARTS_JS}</script></body></html>\n"
     )
 }
 
@@ -1128,8 +1185,9 @@ pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
             "You have read-only tools: list_schema, describe_table, run_select (capped SELECTs), \
              explain, open_query (open a SQL query in a new editor tab in the user's workspace — a \
              read-only SELECT runs automatically), and generate_report (you author an HTML report \
-             from data you've read, and it opens in the user's browser — use it when the user asks \
-             for a report). Use them to ground every answer in the live database rather than \
+             from data you've read — with optional interactive Chart.js charts — and it opens in \
+             the user's browser; use it when the user asks for a report). Use them to ground every \
+             answer in the live database rather than \
              guessing — discover objects with list_schema, inspect structure with describe_table, \
              and read data with run_select. Use open_query to hand the user a query to explore in \
              the grid. Prefer small, targeted queries with explicit columns and LIMIT."
@@ -1463,6 +1521,61 @@ mod tests {
         assert!(!ok);
         // Nothing announced: the channel is empty but still open (Err), not an item.
         assert!(rx.try_recv().is_err(), "a refused report must not announce");
+    }
+
+    #[tokio::test]
+    async fn generate_report_with_charts_is_nonce_gated_and_egress_free() {
+        use futures::StreamExt;
+
+        let db = std::env::temp_dir().join(format!("red-grc-{}.db", uuid::Uuid::new_v4().simple()));
+        let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let sink = ReportSink::new(tx, None, 11);
+
+        let (content, ok) = run_tool(
+            &driver,
+            "generate_report",
+            &json!({
+                "title": "Sales",
+                "html": "<h1>Sales</h1><div data-red-chart=\"0\"></div>",
+                "charts": [
+                    {
+                        "type": "bar",
+                        // A label that tries to break out of the data block.
+                        "data": { "labels": ["</script><script>alert(1)</script>"],
+                                  "datasets": [{ "label": "Q1", "data": [3] }] },
+                    },
+                    // Non-object entries are dropped, not embedded.
+                    "not-a-chart",
+                ],
+            }),
+            &AiPolicy::default(),
+            &CancelToken::new(),
+            &sink,
+        )
+        .await;
+        assert!(ok, "expected success, got: {content}");
+
+        let (_session, event) = rx.next().await.expect("an AiReportReady event");
+        let Event::AiReportReady { path, .. } = event else {
+            panic!("expected AiReportReady");
+        };
+        let html = std::fs::read_to_string(&path).unwrap();
+
+        // The chart hole is tight: scripts run only with the nonce, and there is
+        // zero network egress so the bundle cannot leak the data it charts.
+        assert!(html.contains("script-src 'nonce-"));
+        assert!(html.contains("connect-src 'none'"));
+        // The trusted bundle is injected behind the nonce; the inert data block is not.
+        assert!(html.contains("<script nonce="));
+        assert!(html.contains("Chart.js v4"));
+        assert!(html.contains("id=\"red-report-data\" type=\"application/json\""));
+        // The breakout attempt is neutralized: no stray executable <script> from
+        // the data, and the `<` is escaped to its JSON unicode form.
+        assert!(!html.contains("<script>alert(1)</script>"));
+        assert!(html.contains("\\u003c/script>"));
+        // Non-object chart entries are filtered out of the embedded payload.
+        assert!(!html.contains("not-a-chart"));
     }
 
     #[test]

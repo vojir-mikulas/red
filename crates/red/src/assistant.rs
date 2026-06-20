@@ -622,8 +622,11 @@ impl AppState {
                 if chat.title.is_none() {
                     chat.title = Some(derive_title(&message));
                 }
-                chat.messages
-                    .push(ChatMessage::new(ChatRole::User, message.clone(), String::new()));
+                chat.messages.push(ChatMessage::new(
+                    ChatRole::User,
+                    message.clone(),
+                    String::new(),
+                ));
                 chat.error = None;
                 chat.status = None;
                 chat.streaming = true;
@@ -2962,8 +2965,10 @@ fn expand_slash_report(message: &str) -> Option<String> {
     };
     Some(format!(
         "{ask}\n\nRead the data you need with run_select, then call the generate_report tool with \
-         the report written as HTML — a heading, a short summary, and the relevant table(s) or an \
-         inline chart. Open it for me."
+         the report written as HTML — a heading, a short summary, and the relevant table(s). Where \
+         a visual helps, add interactive charts via the tool's `charts` argument (Chart.js config \
+         objects) and reference them with <div data-red-chart=\"INDEX\"></div> placeholders. Open \
+         it for me."
     ))
 }
 
