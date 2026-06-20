@@ -158,6 +158,20 @@ impl AiState {
         }
     }
 
+    /// Drop all per-conversation state — history, cancel token, cumulative tool tally
+    /// — when the UI closes/deletes the conversation, so these maps stay bounded by
+    /// what's open rather than every conversation ever touched this session. Cancels
+    /// any in-flight turn first so its task winds down. (A turn still racing to its
+    /// final history write can re-insert one entry; that's bounded, unlike the prior
+    /// unconditional growth.)
+    pub(crate) fn forget(&mut self, conversation_id: u64) {
+        if let Some(tok) = self.cancels.remove(&conversation_id) {
+            tok.cancel();
+        }
+        self.histories.remove(&conversation_id);
+        self.tool_calls.remove(&conversation_id);
+    }
+
     /// Charge one tool call against the conversation's cumulative budget. Returns
     /// `false` once the budget (`max`, `0` = unlimited) is exhausted, so the loop
     /// can stop a runaway agent instead of letting it spin tools forever.
@@ -626,11 +640,17 @@ pub(crate) async fn run_tool(
                 .map(|n| n as usize);
             let limit = requested.unwrap_or(max_rows).clamp(1, max_rows);
             let abort = AbortSignal::new();
-            let fetch = driver.fetch_page(sql, 0, limit, PageCap::Display { key: None }, &abort);
+            // Fetch one extra row so a result that's exactly `limit` long (complete)
+            // is told apart from one that genuinely has more rows (truncated). The
+            // probe row is dropped before the page is shown to the model.
+            let probe = limit.saturating_add(1);
+            let fetch = driver.fetch_page(sql, 0, probe, PageCap::Display { key: None }, &abort);
             match guard_timeout(limits.statement_timeout_ms, &abort, fetch).await {
-                Ok(page) => {
+                Ok(mut page) => {
+                    let truncated = page.rows.len() > limit;
+                    page.rows.truncate(limit);
                     let mut out = format_page(&page);
-                    if page.rows.len() >= limit {
+                    if truncated {
                         out.push_str(&format!(
                             "\n(truncated to {limit} rows — the result may have more; add LIMIT or \
                             a WHERE clause to narrow it)"
@@ -806,10 +826,26 @@ fn is_read_only_select(sql: &str) -> bool {
     lower.starts_with("select") || lower.starts_with("with")
 }
 
+/// The tools that never mutate data and so may run on any backend without the
+/// per-call write gate. This is an allowlist on purpose: anything *not* named here
+/// is treated as a write, so a future tool fails *closed* (gated, withheld from the
+/// MCP/ACP path) until it's explicitly vetted and added — rather than slipping
+/// through a denylist someone forgot to extend.
+pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
+    "list_schema",
+    "describe_table",
+    "run_select",
+    "explain",
+    "generate_report",
+    // Hands the user a SQL query to open in a tab — no DB mutation of its own.
+    "open_query",
+];
+
 /// Whether `name` is a mutating tool — it never auto-runs and never auto-allows;
-/// it rides the per-call approval gate on both backends (Feature B).
+/// it rides the per-call approval gate on both backends (Feature B). Defined as the
+/// complement of [`READ_ONLY_TOOLS`] so a new, unlisted tool is treated as a write.
 pub(crate) fn is_write_tool(name: &str) -> bool {
-    name == "propose_write"
+    !READ_ONLY_TOOLS.contains(&name)
 }
 
 /// The outcome of vetting a `propose_write` call before it runs (Feature B). The
@@ -1037,7 +1073,7 @@ fn wrap_report_html(title: Option<&str>, body: &str) -> String {
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .unwrap_or("Red — report");
-    let t = escape_html_text(title);
+    let t = red_driver::html_escape(title);
     let safe_body = strip_scripts(body);
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
@@ -1070,14 +1106,6 @@ fn strip_scripts(html: &str) -> String {
         i += ch.len_utf8();
     }
     out
-}
-
-/// Escape the HTML-significant characters in plain text (used for the report
-/// `<title>`); local to the service since the driver's escaper isn't reachable here.
-fn escape_html_text(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 /// The stable grounding instruction, tailored to the access tier (M-S7). Shared

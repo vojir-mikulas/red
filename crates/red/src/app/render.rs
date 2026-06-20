@@ -205,6 +205,12 @@ impl Render for AppState {
             }
         }
 
+        // A Settings agent key row just opened; focus its field.
+        if self.focus_ai_key {
+            self.focus_ai_key = false;
+            window.focus(&self.ai_key_input.focus_handle(cx), cx);
+        }
+
         // An inline cell edit just opened in the inspector (Track B5) — focus its
         // field so the user types the new value immediately.
         if self.focus_inspector_edit {

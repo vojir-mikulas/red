@@ -218,9 +218,18 @@ async fn dispatch(
             }
             // Charge the agent's cumulative tool-call budget before running anything
             // (M-S7). Over budget → a tool error the model can recover from, not a
-            // transport failure.
+            // transport failure. Reserve a slot with a compare-update (not a plain
+            // `fetch_add`) so a rejected over-budget call doesn't keep inflating the
+            // counter — matching the API path's check-then-increment in
+            // `AiState::charge_tool_call`.
             let max = policy.limits.max_tool_calls;
-            if max != 0 && calls.fetch_add(1, Ordering::Relaxed) >= max {
+            let over_budget = max != 0
+                && calls
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                        (n < max).then_some(n + 1)
+                    })
+                    .is_err();
+            if over_budget {
                 return Ok(json!({
                     "content": [ { "type": "text", "text":
                         "error: this conversation's tool-call budget is exhausted; answer with \

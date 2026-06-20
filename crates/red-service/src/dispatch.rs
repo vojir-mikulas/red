@@ -568,7 +568,19 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                 } else {
                                     let mut p = red_ai::AnthropicProvider::new(a.api_key);
                                     if !a.base_url.is_empty() {
-                                        p = p.with_base_url(a.base_url);
+                                        // A custom endpoint is fine, but never send the
+                                        // API key to an arbitrary cleartext host — only
+                                        // HTTPS (or loopback http). Reject and keep the
+                                        // default rather than exfiltrate the credential.
+                                        if red_ai::is_safe_base_url(&a.base_url) {
+                                            p = p.with_base_url(a.base_url);
+                                        } else {
+                                            tracing::warn!(
+                                                "ignoring AI agent base_url {:?}: only https \
+                                                 (or localhost http) may receive the API key",
+                                                a.base_url
+                                            );
+                                        }
                                     }
                                     Some(Arc::new(p) as Arc<dyn red_ai::AiProvider>)
                                 };
@@ -723,6 +735,15 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 tokio::spawn(async move { manager.lock().await.cancel(conversation_id) });
             }
 
+            Command::AiForget { conversation_id } => {
+                // The conversation was closed/deleted in the UI — drop its backend
+                // state on both paths so the maps stay bounded. The API-key forget is
+                // a quick sync lock; the ACP one awaits, so it runs off the loop.
+                lock(&ai_state).forget(conversation_id);
+                let manager = ai_acp.clone();
+                tokio::spawn(async move { manager.lock().await.forget(conversation_id) });
+            }
+
             Command::AiPermission {
                 conversation_id: _,
                 request_id,
@@ -741,13 +762,20 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 );
             }
 
-            Command::AiReauthenticate { conversation_id } => {
-                // Tear down the conversation's agent (M-S4) so the next turn
-                // re-spawns it and re-runs the ACP handshake — which pops the
-                // agent's own login when it isn't authenticated. Off the loop like
-                // the other ACP calls.
-                let manager = ai_acp.clone();
-                tokio::spawn(async move { manager.lock().await.reauthenticate(conversation_id) });
+            Command::AiReauthenticateAgent { agent_id } => {
+                // Re-auth from Settings (M-S4): only meaningful for an ACP agent.
+                // Spawn it for a fresh handshake — which pops the agent's own login
+                // when it isn't signed in — then force idle conversations to
+                // re-handshake. Off the loop like the other ACP calls.
+                if let Some(AiProfileRuntime::Acp { command }) = ai_agents.get(&agent_id) {
+                    let command = command.clone();
+                    // The agent loads its own config (and login) from cwd; use the
+                    // process working directory, matching the turn path.
+                    let cwd =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+                    let manager = ai_acp.clone();
+                    tokio::spawn(crate::acp::reauthenticate_agent(manager, command, cwd));
+                }
             }
 
             Command::AiSetConfigOption {

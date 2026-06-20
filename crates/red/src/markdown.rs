@@ -10,15 +10,27 @@ use gpui::{div, font, prelude::*, px, AnyElement, SharedString, StyledText, Text
 
 /// Render Markdown `src` as a column of block elements.
 pub(crate) fn render(src: &str, theme: &Theme) -> AnyElement {
+    render_blocks(&parse(src), theme)
+}
+
+/// Parse Markdown `src` into its blocks. Exposed (with [`render_blocks`]) so a
+/// caller can cache the parse for a *settled* message and rebuild only the elements
+/// each frame, instead of re-parsing the whole transcript on every repaint.
+pub(crate) fn parse(src: &str) -> Vec<Block> {
+    parse_blocks(src)
+}
+
+/// Render already-parsed `blocks` as a column of block elements.
+pub(crate) fn render_blocks(blocks: &[Block], theme: &Theme) -> AnyElement {
     let mut col = div().flex().flex_col().gap_1p5();
-    for block in parse_blocks(src) {
-        col = col.child(render_block(&block, theme));
+    for block in blocks {
+        col = col.child(render_block(block, theme));
     }
     col.into_any_element()
 }
 
 /// A parsed top-level block.
-enum Block {
+pub(crate) enum Block {
     Paragraph(String),
     Heading(u8, String),
     Code(String),

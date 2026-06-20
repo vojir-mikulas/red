@@ -17,6 +17,22 @@ use crate::{AiProvider, CancelToken};
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 
+/// Whether `base_url` is safe to send the API key to. Every request carries the
+/// key in the `x-api-key` header, so a `base_url` override (a config field) must
+/// not be allowed to retarget that credential to an arbitrary host over cleartext.
+/// HTTPS is allowed anywhere; plain HTTP only to loopback (a local proxy / test).
+pub fn is_safe_base_url(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    match url.scheme() {
+        "https" => true,
+        // url strips the brackets from an IPv6 host, so match the bare form too.
+        "http" => matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1")),
+        _ => false,
+    }
+}
+
 /// Claude provider. Holds a reused `reqwest::Client` and the API key (never
 /// logged). `base_url` is overridable so a test or a proxy can point elsewhere.
 pub struct AnthropicProvider {
@@ -123,7 +139,11 @@ impl AiProvider for AnthropicProvider {
         }
 
         let mut acc = TurnAccumulator::default();
-        let mut buf = String::new();
+        // Accumulate raw bytes, not a String: a multibyte UTF-8 codepoint can be
+        // split across two network chunks, so decoding each chunk on its own would
+        // turn the boundary bytes into U+FFFD. We only decode whole SSE lines,
+        // which always end on a codepoint boundary (the `\n`).
+        let mut buf: Vec<u8> = Vec::new();
         let mut stream = resp.bytes_stream();
 
         while let Some(chunk) = stream.next().await {
@@ -131,12 +151,13 @@ impl AiProvider for AnthropicProvider {
                 return Err(AiError::Cancelled);
             }
             let chunk = chunk.map_err(|e| AiError::Network(e.to_string()))?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            buf.extend_from_slice(&chunk);
 
             // SSE events are newline-delimited; keep the trailing partial line.
-            while let Some(nl) = buf.find('\n') {
-                let line = buf[..nl].trim_end_matches('\r').to_string();
-                buf.drain(..=nl);
+            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
+                let line = String::from_utf8_lossy(&line_bytes);
+                let line = line.trim_end_matches('\n').trim_end_matches('\r');
                 let Some(data) = line.strip_prefix("data:") else {
                     continue; // skip `event:` lines and blanks; data carries `type`
                 };

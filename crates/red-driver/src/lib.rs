@@ -26,6 +26,7 @@ mod pg_text;
 mod plan;
 mod postgres;
 mod sqlite;
+pub use format::html_escape;
 pub use mysql::MysqlDriver;
 pub use postgres::PostgresDriver;
 pub use sqlite::SqliteDriver;

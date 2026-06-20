@@ -148,8 +148,8 @@ pub enum AiTier {
     /// Read **plus** the gated write tool (`propose_write`): a single
     /// INSERT/UPDATE/DELETE that requires explicit, per-statement user approval and
     /// is blocked on a read-only connection and for destructive shapes (DDL,
-    /// unqualified UPDATE/DELETE). Off unless a connection opts in
-    /// (`ai_tier = "write"`); never the global default.
+    /// unqualified UPDATE/DELETE). Opt-in only — set globally (`[ai] tier = "write"`)
+    /// or per-connection (`ai_tier = "write"`); never a default.
     Write,
 }
 
@@ -185,9 +185,9 @@ impl AiTier {
     }
 
     /// Parse a settings string leniently: an unrecognized value resolves to the
-    /// safe default rather than failing, so a typo never wedges the AI off. Note
-    /// `write` is accepted (for a per-connection `ai_tier`) but is never the global
-    /// default.
+    /// safe default rather than failing, so a typo never wedges the AI off. `write`
+    /// is accepted both globally (`[ai] tier`) and per-connection (`ai_tier`); it
+    /// only ever grants the write tool on a writable connection, gated by approval.
     pub fn parse(s: &str) -> AiTier {
         match s.trim().to_ascii_lowercase().as_str() {
             "off" => AiTier::Off,

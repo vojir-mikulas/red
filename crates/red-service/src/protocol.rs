@@ -217,6 +217,14 @@ pub enum Command {
     AiCancel {
         conversation_id: u64,
     },
+    /// Forget all per-conversation backend state when the UI closes or deletes a
+    /// conversation: the API-key path's running history/cancel/tool tally and the
+    /// subscription path's live agent. Without it those maps grow for the whole
+    /// session (a reopened conversation comes back under a fresh id, re-seeded), so
+    /// this keeps the backend's memory bounded by what's actually open.
+    AiForget {
+        conversation_id: u64,
+    },
     /// Answer a pending agent tool-permission prompt (M-S2, subscription path).
     /// `allow` runs the tool; otherwise it's denied. Routed to the parked request
     /// by `request_id` so a stale answer for a superseded prompt is dropped.
@@ -225,13 +233,14 @@ pub enum Command {
         request_id: u64,
         allow: bool,
     },
-    /// Re-authenticate / switch account on the subscription path (M-S4). The agent
-    /// owns `/login`, so Red can't drive it directly — instead it tears down this
-    /// conversation's agent so the next turn re-spawns it and re-runs the ACP
-    /// handshake, which pops the agent's browser login when it isn't authenticated.
-    /// A no-op on the API-key path. Red never touches the subscription tokens.
-    AiReauthenticate {
-        conversation_id: u64,
+    /// Re-authenticate / switch account for an ACP agent, driven from Settings
+    /// (M-S4). The agent owns `/login`, so Red can't drive it directly — instead it
+    /// spawns the agent and runs a fresh ACP handshake, which pops the agent's own
+    /// browser login when it isn't signed in, then drops the probe and forces idle
+    /// conversations to re-handshake so they pick up the new account. A no-op for an
+    /// API agent. Red never touches the subscription tokens.
+    AiReauthenticateAgent {
+        agent_id: String,
     },
     /// Change a session config selector (model / reasoning) on the subscription path.
     /// `config_id`/`value` are the opaque agent identifiers from the advertised

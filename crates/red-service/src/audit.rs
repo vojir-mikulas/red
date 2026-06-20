@@ -37,7 +37,18 @@ pub(crate) fn record_write(sql: &str, affected: u64) {
     // Flatten newlines/tabs so one write is one line with stable columns.
     let flat = sql.replace(['\n', '\r', '\t'], " ");
     let line = format!("{now}\t{affected}\t{flat}\n");
-    match OpenOptions::new().create(true).append(true).open(&path) {
+    // Owner-readable only (`0600` on Unix): the log carries executed SQL, which
+    // routinely embeds real literal values, so on a shared host a world-readable
+    // file would leak them to other local users. Restrict at creation, matching the
+    // report file (`write_report_file`).
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(&path) {
         Ok(mut file) => {
             if let Err(e) = file.write_all(line.as_bytes()) {
                 tracing::warn!("failed to append to AI write-audit log: {e}");

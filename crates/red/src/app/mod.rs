@@ -579,6 +579,15 @@ pub struct AppState {
     /// selector and the per-chat default. An API agent appears only once it has a
     /// key; an ACP agent always. Recomputed with `ai_configured`.
     pub(crate) usable_agents: Vec<AgentInfo>,
+    /// Shared obscured field for entering an API agent's key in Settings → AI agent
+    /// → Agents. One input reused across rows; `ai_key_editing` says which agent it's
+    /// bound to (`None` = no row is editing). The key is written to the OS keyring
+    /// under the agent's id, never to settings.toml.
+    pub(crate) ai_key_input: Entity<TextInput>,
+    /// The id of the API agent whose key row is currently open for editing, if any.
+    pub(crate) ai_key_editing: Option<String>,
+    /// Set when an agent key row just opened: the next render focuses `ai_key_input`.
+    pub(crate) focus_ai_key: bool,
     /// Monotonic id source for assistant conversations, so the backend keeps each
     /// panel's turn history separate.
     pub(crate) next_conversation_id: u64,
@@ -1124,6 +1133,19 @@ impl AppState {
         )
         .detach();
 
+        // Shared obscured field for the Settings → AI agents key rows. Enter saves
+        // the key for the row currently being edited; Esc closes the row.
+        let ai_key_input = cx.new(|cx| TextInput::new(cx).obscured().with_placeholder("sk-ant-…"));
+        cx.subscribe(
+            &ai_key_input,
+            |this, _, event: &TextInputEvent, cx| match event {
+                TextInputEvent::Submit => this.save_agent_key(cx),
+                TextInputEvent::Cancel => this.cancel_agent_key(cx),
+                _ => {}
+            },
+        )
+        .detach();
+
         // The connection switcher (⌘P). Seed its sections off the just-loaded
         // connections; `rebuild_switcher` refreshes them on every connect/disconnect.
         let switcher = cx.new(|cx| {
@@ -1259,6 +1281,9 @@ impl AppState {
             assistant_drag: None,
             usable_agents: usable_agents(&settings),
             ai_configured: !usable_agents(&settings).is_empty(),
+            ai_key_input,
+            ai_key_editing: None,
+            focus_ai_key: false,
             next_conversation_id: 0,
             filter_bar: None,
             cell_menu: None,

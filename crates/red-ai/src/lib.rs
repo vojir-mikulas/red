@@ -18,7 +18,7 @@ use tokio::sync::mpsc::UnboundedSender;
 mod anthropic;
 mod types;
 
-pub use anthropic::AnthropicProvider;
+pub use anthropic::{is_safe_base_url, AnthropicProvider};
 pub use types::{
     AiError, ContentBlock, Delta, Message, Result, Role, StopReason, ToolDef, TurnOutcome,
     TurnRequest, Usage,

@@ -154,15 +154,25 @@ impl AcpManager {
         }
     }
 
-    /// Re-authenticate / switch account (M-S4): drop this conversation's agent so
-    /// the next turn re-spawns it and re-runs the ACP handshake. When the agent
-    /// isn't logged in (e.g. the user signed out of Claude Code elsewhere, or the
-    /// subscription token expired) that handshake advertises an auth method and the
-    /// agent pops its own browser login — Red never sees the tokens. A conversation
-    /// that was never started is a no-op (the first turn starts it fresh anyway).
-    pub(crate) fn reauthenticate(&mut self, conversation_id: u64) {
+    /// Drop every conversation not mid-turn so its next prompt re-spawns the agent
+    /// and re-runs the ACP handshake (M-S4) — used after a Settings re-auth so live
+    /// chats pick up the newly signed-in account. A conversation with a turn in
+    /// flight is left alone, the same way the idle sweep skips it.
+    pub(crate) fn drop_idle(&mut self) {
+        let before = self.conversations.len();
+        self.conversations.retain(|_, c| c.active);
+        let dropped = before - self.conversations.len();
+        if dropped > 0 {
+            tracing::debug!("dropped {dropped} idle ACP conversation(s) after re-auth");
+        }
+    }
+
+    /// Tear down a conversation the UI has closed or deleted (M-S5), freeing its
+    /// agent subprocess and MCP port now rather than waiting for the idle sweep.
+    /// Dropping the `Conversation` unwinds the same way as [`Self::evict_session`].
+    pub(crate) fn forget(&mut self, conversation_id: u64) {
         if self.conversations.remove(&conversation_id).is_some() {
-            tracing::debug!("re-authenticating ACP conversation {conversation_id} — agent restart");
+            tracing::debug!("forgetting closed ACP conversation {conversation_id}");
         }
     }
 
@@ -311,6 +321,40 @@ pub(crate) async fn run_turn(
                 message: "the agent connection ended".into(),
             },
         ),
+    }
+}
+
+/// Re-authenticate / switch account for an ACP agent from Settings (M-S4), with no
+/// active conversation needed. Spawns the agent and runs a fresh handshake
+/// (`initialize`, then — if the agent advertises an auth method, i.e. it isn't
+/// signed in — its own `/login`, which pops the agent's browser; Red never sees the
+/// tokens), opens a throwaway session with no grounding, then drops the probe.
+/// Existing idle conversations are then torn down so their next turn re-handshakes
+/// and picks up the new account; an in-flight turn is left running.
+pub(crate) async fn reauthenticate_agent(
+    manager: Arc<tokio::sync::Mutex<AcpManager>>,
+    command: String,
+    cwd: PathBuf,
+) {
+    let config = AcpConfig {
+        command,
+        cwd,
+        // No DB grounding and no relays — this probe only drives the handshake.
+        mcp: None,
+        allow_tools: Vec::new(),
+        permissions: None,
+        commands: None,
+        config: None,
+    };
+    match AcpConversation::start(config).await {
+        Ok(_probe) => {
+            // Handshake done (login popped if it was needed). The `_probe` handle
+            // drops here, tearing the agent down; then force idle conversations to
+            // re-handshake so they adopt the account on their next turn.
+            manager.lock().await.drop_idle();
+            tracing::debug!("ACP re-auth handshake completed");
+        }
+        Err(e) => tracing::warn!("ACP re-auth handshake failed: {e}"),
     }
 }
 

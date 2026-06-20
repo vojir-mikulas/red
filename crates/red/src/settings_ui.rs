@@ -1110,22 +1110,25 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
 
     // Database access tier — the capability boundary. Out-of-tier tools are never
     // even offered to the model (M-S7), so this is the real "how much can it see".
-    // The global selector tops out at Read; the write tier is per-connection only
-    // (connections.toml `ai_tier = "write"`), so it's never a one-click global
-    // default. A hand-set global `write` shows as Read here.
+    // Write adds the gated `propose_write` tool on top of the read catalog; every
+    // write still needs per-statement approval and is blocked on a read-only
+    // connection. A connection can narrow or widen this in connections.toml
+    // (`ai_tier`).
     let tier_sel = match red_core::AiTier::parse(&ai.tier) {
         red_core::AiTier::Off => 0,
         red_core::AiTier::Schema => 1,
-        red_core::AiTier::Read | red_core::AiTier::Write => 2,
+        red_core::AiTier::Read => 2,
+        red_core::AiTier::Write => 3,
     };
     let tier_view = view.clone();
     let tier = Segmented::new("set-ai-tier")
         .segment("Off")
         .segment("Schema")
         .segment("Read")
+        .segment("Write")
         .selected(tier_sel)
         .on_select(move |ix, _, cx| {
-            let t = ["off", "schema", "read"][ix.min(2)];
+            let t = ["off", "schema", "read", "write"][ix.min(3)];
             tier_view.update(cx, |this, cx| this.set_ai_tier(t, cx));
         });
 
@@ -1222,7 +1225,8 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 "How much the agent's tools can see. Off: no database tools at \
                  all. Schema: structure only (tables, columns, types — never row \
                  data). Read: the full read catalog (run capped SELECTs and EXPLAIN). \
-                 A tool above the tier is never offered to the model.",
+                 Write: adds INSERT/UPDATE/DELETE, each needing your per-statement \
+                 approval. A tool above the tier is never offered to the model.",
                 tier,
                 &theme,
             ))
@@ -1233,13 +1237,14 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                     .text_size(theme.scale(12.))
                     .text_color(theme.text_muted)
                     .child(
-                        "Write access is per-connection, never a global default: edit a \
-                         writable connection and turn on “AI assistant → Allow writes” to \
-                         let the assistant propose INSERT/UPDATE/DELETE there. Every write \
-                         still needs your explicit per-statement approval, is blocked on a \
-                         read-only connection, and never runs DDL or an unqualified \
-                         UPDATE/DELETE. A connection can also override enabled/tier in \
-                         connections.toml (ai_enabled / ai_tier).",
+                        "At the Write tier the assistant may propose INSERT/UPDATE/DELETE: \
+                         every write still needs your explicit per-statement approval, is \
+                         blocked on a read-only connection, and never runs DDL or an \
+                         unqualified UPDATE/DELETE. A connection can override enabled/tier \
+                         in connections.toml (ai_enabled / ai_tier) — e.g. grant Write on \
+                         one trusted connection while the global default stays Read, or \
+                         flip it on per writable connection via “AI assistant → Allow \
+                         writes” in the connection form.",
                     ),
             )
             .child(settings_header("Read-tier resource guards", &theme))
@@ -1325,6 +1330,74 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
             .text_size(theme.scale(10.))
             .text_color(theme.text_muted)
             .child(if is_acp { "ACP" } else { "API" });
+        // Re-auth / switch account (M-S4) lives here, not in the chat panel: an ACP
+        // agent owns its own `/login`, so this asks the backend to spawn it for a
+        // fresh handshake (it pops its own browser when signed out). API agents
+        // carry a key, not a login, so they get no button.
+        let signin = is_acp.then(|| {
+            let signin_id = a.id.clone();
+            let signin_view = view.clone();
+            div()
+                .id(SharedString::from(format!("agent-signin-{}", a.id)))
+                .role(gpui::Role::Button)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(22.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .tooltip(flint::Tooltip::text("Sign in / switch account"))
+                .hover(|s| s.bg(theme.border))
+                .child(crate::icons::icon(
+                    "key-round",
+                    theme.scale(12.),
+                    theme.text_muted,
+                ))
+                .on_click(move |_, _, cx| {
+                    // Don't let the click fall through to the row (which would set
+                    // this agent as the default).
+                    cx.stop_propagation();
+                    let id = signin_id.clone();
+                    signin_view.update(cx, |this, cx| this.reauthenticate_agent(&id, cx));
+                })
+        });
+        // API agents authenticate with a key (kept in the OS keyring, never the
+        // settings file). This toggles an inline editor row below; the label tracks
+        // whether a key is already stored and whether this row is open.
+        let editing = state.ai_key_editing.as_deref() == Some(a.id.as_str());
+        let has_key = !is_acp && usable.contains(a.id.as_str());
+        let key_btn = (!is_acp).then(|| {
+            let key_id = a.id.clone();
+            let key_view = view.clone();
+            let label = if editing {
+                "Cancel"
+            } else if has_key {
+                "Change key"
+            } else {
+                "Add key"
+            };
+            div()
+                .id(SharedString::from(format!("agent-key-{}", a.id)))
+                .role(gpui::Role::Button)
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(22.))
+                .px_2()
+                .rounded(px(4.))
+                .border_1()
+                .border_color(theme.border)
+                .text_size(theme.scale(10.5))
+                .text_color(theme.text_muted)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.bg_elevated))
+                .child(label)
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    let id = key_id.clone();
+                    key_view.update(cx, |this, cx| this.edit_agent_key(&id, cx));
+                })
+        });
         list = list.child(
             div()
                 .id(SharedString::from(format!("agent-row-{}", a.id)))
@@ -1361,11 +1434,45 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                             .child("· default"),
                     )
                 })
+                .when_some(key_btn, |row, b| row.child(b))
+                .when_some(signin, |row, b| row.child(b))
                 .on_click(move |_, _, cx| {
                     let id = id.clone();
                     row_view.update(cx, |this, cx| this.set_default_agent(&id, cx));
                 }),
         );
+
+        // The inline key editor, shown under the row while this API agent is open.
+        // Enter (or Save) stores the key; Esc (or Cancel) closes it; Remove clears a
+        // stored key. The field is the shared `ai_key_input` — only one row at a time.
+        if editing {
+            let id_remove = a.id.clone();
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .pb_1()
+                    .child(div().flex_1().min_w(px(0.)).child(state.ai_key_input.clone()))
+                    .child(
+                        Button::new("ai-key-save", "Save")
+                            .variant(ButtonVariant::Primary)
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(|this, _, _, cx| this.save_agent_key(cx))),
+                    )
+                    .when(has_key, |row| {
+                        row.child(
+                            Button::new("ai-key-remove", "Remove")
+                                .variant(ButtonVariant::Danger)
+                                .size(ButtonSize::Sm)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.clear_agent_key(&id_remove, cx)
+                                })),
+                        )
+                    }),
+            );
+        }
     }
 
     div()
@@ -1378,9 +1485,11 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                 .text_color(theme.text_muted)
                 .child(
                     "Pick the agent new chats start on (click a row). Switch a chat's \
-                     agent before its first message from the panel. Add or remove agents \
-                     and edit their command / endpoint / model / API key in the settings \
-                     file — keys are stored in the OS keyring, never in the file.",
+                     agent before its first message from the panel. An API agent needs a \
+                     key — use “Add key” (stored in the OS keyring, never in the file). An \
+                     ACP agent owns its own login — use the key button to sign in or switch \
+                     account. Add or remove agents and edit their command / endpoint / \
+                     model in the settings file.",
                 ),
         )
         .child(list)

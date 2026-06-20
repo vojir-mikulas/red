@@ -578,17 +578,32 @@ fn is_auto_allowed(tool_call: &ToolCallUpdate, allow_tools: &[String]) -> bool {
         .any(|name| title_names_tool(&title, name))
 }
 
-/// Whether `title` names `tool` as a whole token, not merely as a substring. The
-/// agent's MCP title carries the tool name, sometimes prefixed (e.g.
-/// `"red-db: run_select"`), so we tokenize on non-identifier characters and match
-/// a full token: `run_select` matches `"red-db: run_select"` but NOT a look-alike
-/// like `"run_select_then_drop"`, which a loose `contains` would wrongly auto-allow.
+/// Whether `title` *is* the tool `tool`, not merely mentions it. ACP doesn't carry
+/// the structured MCP tool name into the permission request, so we fall back to the
+/// call's title — but the MCP convention is that the title IS the tool name,
+/// optionally server-qualified: `run_select`, `red-db: run_select`, or
+/// `mcp__red-db__run_select`. We reduce the title to that trailing identifier and
+/// require it to equal the tool name exactly. That keeps the legitimate forms while
+/// refusing to auto-allow a tool whose title merely *contains* our name inside a
+/// longer human sentence (e.g. an unrelated `"fetch run_select docs"` Read tool) —
+/// a bare-token match would wrongly green-light it. (Residual: a malicious agent
+/// can still title its own tool exactly `run_select`; the non-write `ToolKind`
+/// guard in `is_auto_allowed` and deny-default elsewhere are the backstop.)
 fn title_names_tool(title: &str, tool: &str) -> bool {
     let tool = tool.to_ascii_lowercase();
-    title
-        .to_ascii_lowercase()
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .any(|token| token == tool)
+    let lower = title.to_ascii_lowercase();
+    // Strip a `server:`/path qualifier, then an `mcp__server__` prefix, leaving the
+    // bare tool identifier — which must match the tool name in full.
+    let ident = lower
+        .rsplit([':', '/'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .rsplit("__")
+        .next()
+        .unwrap_or_default()
+        .trim();
+    ident == tool
 }
 
 /// The agent's human-readable title for a tool call (used for both matching and
@@ -700,6 +715,27 @@ mod tests {
             &tools
         ));
         assert!(!is_auto_allowed(&call("describe_table_evil", None), &tools));
+    }
+
+    #[test]
+    fn auto_allow_requires_the_title_to_be_the_tool_not_to_mention_it() {
+        let tools = db_tools();
+        // A non-DB tool whose title merely *mentions* our tool name inside a longer
+        // human sentence must NOT auto-allow — only the bare (optionally
+        // server-qualified) identifier counts.
+        assert!(!is_auto_allowed(
+            &call("fetch run_select docs from the web", Some(ToolKind::Read)),
+            &tools
+        ));
+        assert!(!is_auto_allowed(
+            &call("read file run_select.sql", Some(ToolKind::Read)),
+            &tools
+        ));
+        // The fully MCP-qualified form is still recognised.
+        assert!(is_auto_allowed(
+            &call("mcp__red-db__run_select", Some(ToolKind::Read)),
+            &tools
+        ));
     }
 
     #[test]

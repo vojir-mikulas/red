@@ -771,6 +771,90 @@ impl AppState {
         cx.notify();
     }
 
+    /// Open the inline key editor for an API agent's row (Settings → AI agents).
+    /// Binds the shared `ai_key_input` to this agent id, clears it, and focuses it so
+    /// the user types the key at once. A second click on the same row closes it.
+    pub(crate) fn edit_agent_key(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.ai_key_editing.as_deref() == Some(id) {
+            self.cancel_agent_key(cx);
+            return;
+        }
+        self.ai_key_editing = Some(id.to_string());
+        self.ai_key_input.update(cx, |i, cx| i.set_content("", cx));
+        self.focus_ai_key = true;
+        cx.notify();
+    }
+
+    /// Save the key in the open agent-key row to the OS keyring (under the agent's
+    /// id), then recompute the usable-agent list and re-push the config so the
+    /// backend builds that agent's provider. A blank key is treated as Cancel.
+    pub(crate) fn save_agent_key(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.ai_key_editing.clone() else {
+            return;
+        };
+        let key = self.ai_key_input.read(cx).content().trim().to_string();
+        if key.is_empty() {
+            self.cancel_agent_key(cx);
+            return;
+        }
+        if let Err(e) = crate::secrets::set_ai_key(&id, &key) {
+            tracing::warn!("failed to store AI key in keychain: {e}");
+            self.notify(ToastVariant::Error, "Couldn't store the key in the keychain", cx);
+            return;
+        }
+        self.ai_key_input.update(cx, |i, cx| i.set_content("", cx));
+        self.ai_key_editing = None;
+        self.refresh_ai_agents();
+        self.notify(ToastVariant::Success, "API key saved", cx);
+        cx.notify();
+    }
+
+    /// Close the inline key editor without saving.
+    pub(crate) fn cancel_agent_key(&mut self, cx: &mut Context<Self>) {
+        self.ai_key_editing = None;
+        self.ai_key_input.update(cx, |i, cx| i.set_content("", cx));
+        cx.notify();
+    }
+
+    /// Remove an API agent's stored key from the keyring, then refresh the usable
+    /// list so the agent drops back to "no key".
+    pub(crate) fn clear_agent_key(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Err(e) = crate::secrets::delete_ai_key(id) {
+            tracing::warn!("failed to remove AI key from keychain: {e}");
+        }
+        if self.ai_key_editing.as_deref() == Some(id) {
+            self.cancel_agent_key(cx);
+        }
+        self.refresh_ai_agents();
+        self.notify(ToastVariant::Info, "API key removed", cx);
+        cx.notify();
+    }
+
+    /// Recompute the usable-agent list and re-push the AI config after a key change,
+    /// so the panel selector and backend providers reflect it immediately.
+    fn refresh_ai_agents(&mut self) {
+        self.usable_agents = crate::app::usable_agents(&self.settings);
+        self.ai_configured = !self.usable_agents.is_empty();
+        self.service
+            .send_global(Command::ConfigureAi(crate::app::ai_config(&self.settings)));
+    }
+
+    /// Re-authenticate / switch account for an ACP agent from Settings (M-S4). The
+    /// agent owns `/login`, so Red asks the backend to spawn it for a fresh
+    /// handshake — which pops the agent's own browser login when it isn't signed in.
+    /// Session-less: re-auth doesn't need a connected database. A no-op for an API
+    /// agent (those carry their key, not a login).
+    pub(crate) fn reauthenticate_agent(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.service.send_global(Command::AiReauthenticateAgent {
+            agent_id: id.to_string(),
+        });
+        self.notify(
+            ToastVariant::Info,
+            "Signing in — complete it in the browser if it opens.",
+            cx,
+        );
+    }
+
     pub(crate) fn set_ai_max_rows(&mut self, n: usize, cx: &mut Context<Self>) {
         self.settings.ai.limits.max_rows = n;
         self.save_settings();

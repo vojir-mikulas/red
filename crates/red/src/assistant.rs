@@ -82,6 +82,62 @@ pub(crate) struct ChatMessage {
     pub(crate) role: ChatRole,
     pub(crate) text: String,
     pub(crate) thinking: String,
+    /// Frame-stable render artifacts (parsed Markdown + first SQL block), filled
+    /// lazily and reused while `text` is unchanged — see [`ChatMessage::markdown`].
+    cache: RefCell<MessageCache>,
+}
+
+/// Cached, frame-stable derivations of a bubble's `text`. A transcript repaint (e.g.
+/// every reveal tick while *another* turn streams, or any `cx.notify`) rebuilds the
+/// whole element tree; without this, every settled bubble would re-parse its
+/// Markdown and re-scan for SQL each frame. Keyed by `len` so streaming growth
+/// invalidates it (the text only ever appends, then freezes when the turn settles).
+#[derive(Default)]
+struct MessageCache {
+    len: usize,
+    blocks: Option<Rc<Vec<crate::markdown::Block>>>,
+    sql: Option<SharedString>,
+}
+
+impl ChatMessage {
+    fn new(role: ChatRole, text: String, thinking: String) -> Self {
+        Self {
+            role,
+            text,
+            thinking,
+            cache: RefCell::new(MessageCache::default()),
+        }
+    }
+
+    /// Reparse/rescan only when `text` changed since the last fill. `blocks` being
+    /// `Some` doubles as the "computed" flag (so a `None` SQL result still counts).
+    fn refresh_cache(&self) {
+        let fresh = {
+            let c = self.cache.borrow();
+            c.blocks.is_some() && c.len == self.text.len()
+        };
+        if fresh {
+            return;
+        }
+        let blocks = Rc::new(crate::markdown::parse(&self.text));
+        let sql = extract_sql(&self.text).map(SharedString::from);
+        let mut c = self.cache.borrow_mut();
+        c.len = self.text.len();
+        c.blocks = Some(blocks);
+        c.sql = sql;
+    }
+
+    /// The parsed Markdown for this (settled) bubble, cached across frames.
+    fn markdown(&self) -> Rc<Vec<crate::markdown::Block>> {
+        self.refresh_cache();
+        self.cache.borrow().blocks.clone().expect("just refreshed")
+    }
+
+    /// The first fenced SQL block in this (settled) bubble, cached across frames.
+    fn sql_block(&self) -> Option<SharedString> {
+        self.refresh_cache();
+        self.cache.borrow().sql.clone()
+    }
 }
 
 /// A pending agent tool-permission prompt (M-S2, subscription path): the agent
@@ -216,11 +272,11 @@ impl ChatSession {
     /// Ensure the trailing bubble is an assistant bubble (deltas append to it).
     fn assistant_bubble(&mut self) -> &mut ChatMessage {
         if !matches!(self.messages.last(), Some(m) if m.role == ChatRole::Assistant) {
-            self.messages.push(ChatMessage {
-                role: ChatRole::Assistant,
-                text: String::new(),
-                thinking: String::new(),
-            });
+            self.messages.push(ChatMessage::new(
+                ChatRole::Assistant,
+                String::new(),
+                String::new(),
+            ));
         }
         self.messages.last_mut().expect("just ensured")
     }
@@ -566,11 +622,8 @@ impl AppState {
                 if chat.title.is_none() {
                     chat.title = Some(derive_title(&message));
                 }
-                chat.messages.push(ChatMessage {
-                    role: ChatRole::User,
-                    text: message.clone(),
-                    thinking: String::new(),
-                });
+                chat.messages
+                    .push(ChatMessage::new(ChatRole::User, message.clone(), String::new()));
                 chat.error = None;
                 chat.status = None;
                 chat.streaming = true;
@@ -610,29 +663,6 @@ impl AppState {
             .as_mut()
             .and_then(|state| state.find_mut(conversation_id))
             .map(f)
-    }
-
-    /// Re-authenticate / switch the subscription account (M-S4). The agent owns
-    /// `/login`, so Red asks the backend to restart the conversation's agent; the
-    /// next turn re-runs the handshake and the agent pops its own browser login
-    /// when it isn't signed in. A no-op on the API-key path.
-    pub(crate) fn reauthenticate_assistant(&mut self, cx: &mut Context<Self>) {
-        let Some(state) = self.assistant.as_ref() else {
-            return;
-        };
-        let conversation_id = state.active().conversation_id;
-        if let Phase::Connected(active) = &self.phase {
-            self.service.send_to(
-                active.session,
-                red_service::Command::AiReauthenticate { conversation_id },
-            );
-        }
-        if let Some(state) = self.assistant.as_mut() {
-            let chat = state.active_mut();
-            chat.error = None;
-            chat.status = Some("Restarting the agent — sign in if the browser opens.".into());
-        }
-        cx.notify();
     }
 
     // --- conversation history (M-S5) ---------------------------------------
@@ -761,6 +791,11 @@ impl AppState {
     /// from history. If it was the last chat, a fresh empty one takes its place so
     /// the panel always has an active conversation.
     pub(crate) fn close_chat(&mut self, conversation_id: u64, cx: &mut Context<Self>) {
+        // Tell the backend to drop this conversation's history/agent (M-S5) so its
+        // state doesn't linger for the whole session. Session-less: it's keyed by
+        // conversation_id on the shared AI state, and works even while disconnected.
+        self.service
+            .send_global(red_service::Command::AiForget { conversation_id });
         // Mint a replacement id up front to avoid borrowing `self` twice.
         let replacement_id = self.next_conversation_id;
         let replacement_provider = self.default_ai_provider();
@@ -833,14 +868,13 @@ impl AppState {
             chat.messages = conv
                 .messages
                 .iter()
-                .map(|m| ChatMessage {
-                    role: if m.role == "assistant" {
+                .map(|m| {
+                    let role = if m.role == "assistant" {
                         ChatRole::Assistant
                     } else {
                         ChatRole::User
-                    },
-                    text: m.text.clone(),
-                    thinking: m.thinking.clone(),
+                    };
+                    ChatMessage::new(role, m.text.clone(), m.thinking.clone())
                 })
                 .collect();
             chat.title = Some(conv.title.clone());
@@ -1324,25 +1358,28 @@ impl AppState {
         // they switch to it (drives the history dot). The active chat is, by
         // definition, already in view.
         let active_id = self.assistant.as_ref().map(|s| s.active().conversation_id);
-        let finished = self
-            .with_chat_mut(conversation_id, |chat| {
-                chat.streaming = false;
-                chat.status = None;
-                chat.pending_permission = None;
-                if active_id != Some(chat.conversation_id) {
-                    chat.unread = true;
-                }
-                // Keep a non-empty reading; a turn that reports nothing (some
-                // refusals / cancels) leaves the prior footer in place.
-                if usage != red_service::AiUsage::default() {
-                    chat.last_usage = Some(usage);
-                }
-                // Persist the now-complete exchange so it survives a restart (M-S5).
-                persist_chat(chat);
-                follow_if_at_bottom(chat);
-            })
-            .is_some();
-        if finished {
+        let finished = self.with_chat_mut(conversation_id, |chat| {
+            chat.streaming = false;
+            chat.status = None;
+            // A prompt can't outlive its turn; deny any still-open one on the backend.
+            let stranded = chat.pending_permission.take().map(|p| p.request_id);
+            if active_id != Some(chat.conversation_id) {
+                chat.unread = true;
+            }
+            // Keep a non-empty reading; a turn that reports nothing (some
+            // refusals / cancels) leaves the prior footer in place.
+            if usage != red_service::AiUsage::default() {
+                chat.last_usage = Some(usage);
+            }
+            // Persist the now-complete exchange so it survives a restart (M-S5).
+            persist_chat(chat);
+            follow_if_at_bottom(chat);
+            stranded
+        });
+        if let Some(stranded) = finished {
+            if let Some(request_id) = stranded {
+                self.deny_stranded_permission(conversation_id, request_id);
+            }
             cx.notify();
             // Drain any still-hidden tail now that no more text is coming.
             self.ensure_reveal_ticker(conversation_id, cx);
@@ -1355,16 +1392,18 @@ impl AppState {
         message: String,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .with_chat_mut(conversation_id, |chat| {
-                chat.streaming = false;
-                chat.status = None;
-                chat.error = Some(message.into());
-                // A prompt can't outlive its turn — drop any unanswered one.
-                chat.pending_permission = None;
-            })
-            .is_some()
-        {
+        let stranded = self.with_chat_mut(conversation_id, |chat| {
+            chat.streaming = false;
+            chat.status = None;
+            chat.error = Some(message.into());
+            // A prompt can't outlive its turn — drop any unanswered one, and deny it
+            // on the backend so a parked agent decision sink isn't left blocking.
+            chat.pending_permission.take().map(|p| p.request_id)
+        });
+        if let Some(stranded) = stranded {
+            if let Some(request_id) = stranded {
+                self.deny_stranded_permission(conversation_id, request_id);
+            }
             cx.notify();
         }
     }
@@ -1432,20 +1471,46 @@ impl AppState {
             return;
         };
         let conversation_id = state.active().conversation_id;
+        // Only consume the prompt once we know we can deliver the answer. If the
+        // connection dropped while the buttons were on screen, the agent (and its
+        // parked decision sink) is already gone — just clear the stale prompt rather
+        // than `take()`-ing it and silently losing the click with nothing sent.
+        let Phase::Connected(active) = &self.phase else {
+            state.active_mut().pending_permission = None;
+            cx.notify();
+            return;
+        };
+        let session = active.session;
         let Some(pending) = state.active_mut().pending_permission.take() else {
             return;
         };
+        self.service.send_to(
+            session,
+            red_service::Command::AiPermission {
+                conversation_id,
+                request_id: pending.request_id,
+                allow,
+            },
+        );
+        cx.notify();
+    }
+
+    /// Deny a permission prompt that's being torn down because its turn errored or
+    /// finished while it was still on screen, so the backend resolves the parked
+    /// agent decision sink instead of leaving the agent blocked on it. A no-op once
+    /// disconnected (the sink is dropped → denied on teardown) or if the id was
+    /// already resolved (the backend treats an unknown id as a no-op).
+    fn deny_stranded_permission(&self, conversation_id: u64, request_id: u64) {
         if let Phase::Connected(active) = &self.phase {
             self.service.send_to(
                 active.session,
                 red_service::Command::AiPermission {
                     conversation_id,
-                    request_id: pending.request_id,
-                    allow,
+                    request_id,
+                    allow: false,
                 },
             );
         }
-        cx.notify();
     }
 
     /// Assemble the on-screen grounding for a turn (the UI knows the screen; the
@@ -1757,7 +1822,6 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let chat = state.active();
-        let is_subscription = self.agent_is_acp(&chat.provider);
         let agent_name = self.agent_name(&chat.provider);
 
         let icon_btn = |id: &'static str, glyph: &'static str, tip: &'static str| {
@@ -1777,13 +1841,6 @@ impl AppState {
                     theme.text_muted,
                 ))
         };
-
-        // The agent owns `/login`, so "Switch account" restarts it (M-S4); only
-        // meaningful on the subscription path.
-        let reauth = is_subscription.then(|| {
-            icon_btn("assistant-reauth", "key-round", "Sign in / switch account")
-                .on_click(cx.listener(|this, _, _, cx| this.reauthenticate_assistant(cx)))
-        });
 
         // The chat switcher (M-S6): toggles a list of all open chats. A red dot
         // flags a background chat that needs attention (a parked permission).
@@ -1841,7 +1898,6 @@ impl AppState {
             .flex()
             .items_center()
             .gap_1()
-            .when_some(reauth, |row, r| row.child(r))
             .when_some(list_btn, |row, l| row.child(l))
             .when_some(new_chat, |row, n| row.child(n));
 
@@ -2549,7 +2605,15 @@ impl AppState {
         // prefix while typing); user turns are plain.
         if msg.role == ChatRole::Assistant {
             if !shown.is_empty() {
-                bubble = bubble.child(crate::markdown::render(shown, theme));
+                // A settled bubble renders from its cached parse (frame-stable); the
+                // live one still parses its revealed prefix fresh each tick — but
+                // that's a single message, not the whole transcript.
+                let md = if live {
+                    crate::markdown::render(shown, theme)
+                } else {
+                    crate::markdown::render_blocks(&msg.markdown(), theme)
+                };
+                bubble = bubble.child(md);
             }
             // A blinking caret trails the revealed text while the model is typing
             // (and signals "still working" through tool calls / token gaps).
@@ -2569,7 +2633,8 @@ impl AppState {
         // turn (suppressed while still typing): insert it into the active editor, or
         // open it in a fresh query tab (a read-only SELECT runs there automatically).
         if !live && msg.role == ChatRole::Assistant {
-            if let Some(sql) = extract_sql(&msg.text) {
+            if let Some(sql) = msg.sql_block() {
+                let sql = sql.to_string();
                 let key = bubble_key(msg);
                 let chip = |id: SharedString, glyph: &'static str, label: &'static str| {
                     div()

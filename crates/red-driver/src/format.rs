@@ -230,8 +230,9 @@ pub(crate) fn html_cell(value: &Value) -> String {
 }
 
 /// Escape the five HTML-significant characters so cell text can't break the markup
-/// (or inject it).
-pub(crate) fn html_escape(s: &str) -> String {
+/// (or inject it). Shared with the AI report path (`red-service`) so both HTML
+/// emitters escape identically.
+pub fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
