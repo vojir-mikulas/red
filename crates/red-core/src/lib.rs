@@ -162,7 +162,12 @@ impl AiTier {
             AiTier::Schema => matches!(tool, "list_schema" | "describe_table"),
             AiTier::Read => matches!(
                 tool,
-                "list_schema" | "describe_table" | "run_select" | "explain" | "generate_report"
+                "list_schema"
+                    | "describe_table"
+                    | "run_select"
+                    | "explain"
+                    | "generate_report"
+                    | "open_query"
             ),
             // Write inherits the full read catalog and adds the gated write tool.
             AiTier::Write => tool == "propose_write" || AiTier::Read.allows_tool(tool),
@@ -1522,6 +1527,7 @@ mod ai_policy_tests {
         assert!(AiTier::Read.allows_tool("run_select"));
         assert!(AiTier::Read.allows_tool("explain"));
         assert!(AiTier::Read.allows_tool("generate_report"));
+        assert!(AiTier::Read.allows_tool("open_query"));
         // The write tool is gated to the Write tier — and Write inherits the read
         // catalog on top of it.
         assert!(!AiTier::Read.allows_tool("propose_write"));

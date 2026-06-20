@@ -257,12 +257,15 @@ impl AppState {
                             })),
                     )
                     .child(
-                        // Themed standalone HTML report, opened in the browser
-                        // (Feature C) — a view, not a save-to-disk export.
-                        Button::new("result-report", "Report")
+                        // Save the table as a themed standalone HTML file (a plain
+                        // export format alongside CSV/JSON). AI-authored *reports* are
+                        // a separate, on-demand thing the assistant generates.
+                        Button::new("result-html", "HTML")
                             .variant(ButtonVariant::Ghost)
                             .size(ButtonSize::Sm)
-                            .on_click(cx.listener(|this, _, _, cx| this.export_html_report(cx))),
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.export_result(ExportFormat::Html, cx)
+                            })),
                     ),
             );
 

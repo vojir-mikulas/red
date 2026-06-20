@@ -26,7 +26,7 @@ use gpui::{
     ScrollHandle, SharedString, WeakEntity, Window,
 };
 
-use crate::app::{ActiveConn, AppState, Phase, QueryTab};
+use crate::app::{ActiveConn, AppState, Phase};
 
 /// Cap on schema objects folded into the grounding summary, so a database with
 /// thousands of tables doesn't blow the context window. The model pulls full
@@ -56,9 +56,6 @@ pub(crate) enum ChatRole {
 pub(crate) enum QuickAction {
     /// Explain the last query error and how to fix it (shown when one exists).
     ExplainError,
-    /// Review the editor's SQL for correctness and performance (shown when the
-    /// editor holds a statement).
-    OptimizeQuery,
 }
 
 impl QuickAction {
@@ -66,10 +63,6 @@ impl QuickAction {
     fn prompt(self) -> &'static str {
         match self {
             QuickAction::ExplainError => "Explain the error from my last query and how to fix it.",
-            QuickAction::OptimizeQuery => {
-                "Review the SQL in my editor for correctness and performance, and \
-                 suggest an improved version."
-            }
         }
     }
 
@@ -77,7 +70,6 @@ impl QuickAction {
     fn label(self) -> &'static str {
         match self {
             QuickAction::ExplainError => "Explain error",
-            QuickAction::OptimizeQuery => "Optimize query",
         }
     }
 }
@@ -231,47 +223,6 @@ impl ChatSession {
     }
 }
 
-/// An **AI agent tab**'s state (Feature A): a full conversation rehomed into a
-/// query-tab peer. It carries the same [`ChatSession`] the sidebar uses — so the
-/// shipped streaming, provider binding, permission gate, and usage footer all work
-/// unchanged, and events route by `conversation_id` to whichever chat owns them,
-/// sidebar or tab. The tab additionally owns its own composer; the inline result
-/// grid lives in the host [`QueryTab::result`], so all the windowed-cursor paging
-/// plumbing applies for free.
-pub(crate) struct AgentSession {
-    /// The conversation: transcript, streaming state, provider binding, usage.
-    pub(crate) chat: ChatSession,
-    /// This tab's prompt composer — a multiline box; Enter sends, Shift+Enter
-    /// newlines (mirrors the sidebar composer).
-    pub(crate) input: Entity<CodeEditor>,
-    /// Kept alive so closing the tab drops the composer's submit listener.
-    #[allow(dead_code)]
-    sub: gpui::Subscription,
-}
-
-impl AgentSession {
-    /// Build a fresh agent session bound to `conversation_id` on `provider`, wiring
-    /// the composer's Enter/Esc to the active agent tab's send/cancel.
-    fn new(conversation_id: u64, provider: String, cx: &mut Context<AppState>) -> Self {
-        let input = cx.new(|cx| {
-            CodeEditor::new(cx)
-                .gutter(false)
-                .submit_on_enter(true)
-                .a11y_label("AI agent prompt")
-                .placeholder("Ask for data in plain language…")
-        });
-        let sub = cx.subscribe(&input, |this, _, e: &CodeEditorEvent, cx| match e {
-            CodeEditorEvent::Submit | CodeEditorEvent::Run => this.submit_agent_tab(cx),
-            CodeEditorEvent::Escape => this.cancel_agent_tab(cx),
-        });
-        AgentSession {
-            chat: ChatSession::new(conversation_id, provider),
-            input,
-            sub,
-        }
-    }
-}
-
 /// Which conversation a history-sidebar row refers to — an open chat (by its
 /// stable id) or a saved-but-closed conversation (by its file stem). Used to
 /// target rename/delete without threading indices around.
@@ -407,8 +358,14 @@ impl AppState {
                 CodeEditor::new(cx)
                     .gutter(false)
                     .submit_on_enter(true)
+                    // The composer card draws the border; the editor stays borderless
+                    // so it reads as one surface (Zed-style).
+                    .resting_border(false)
+                    // Prose composer: wrap long lines to the width instead of
+                    // scrolling horizontally.
+                    .soft_wrap(true)
                     .a11y_label("Assistant prompt")
-                    .placeholder("Ask about this database…")
+                    .placeholder("Message Claude Agent — / for commands")
             });
             let sub = cx.subscribe(&input, |this, _, e: &CodeEditorEvent, cx| match e {
                 // Enter (or ⌘↵) sends; Esc stops an in-flight turn from the keyboard
@@ -456,17 +413,6 @@ impl AppState {
         cx.notify();
     }
 
-    /// Close the assistant panel (no-op when shut).
-    pub(crate) fn close_assistant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.assistant.is_some() {
-            self.assistant = None;
-            // Return focus to the root so keyboard actions keep routing (see
-            // `toggle_assistant`).
-            window.focus(&self.root_focus, cx);
-            cx.notify();
-        }
-    }
-
     /// The default backend for a new chat: `[ai] provider`, or `anthropic`.
     fn default_ai_provider(&self) -> String {
         if self.settings.ai.provider.is_empty() {
@@ -490,6 +436,10 @@ impl AppState {
         }
         // Clear the box; `send_turn` records the exchange and dispatches.
         state.input.update(cx, |i, cx| i.set_content("", cx));
+        // `/report …` is a shortcut: expand it into a clear instruction so the agent
+        // builds and opens an HTML report (it reads the data, then calls
+        // generate_report). Plain English ("make me a report about …") works too.
+        let message = expand_slash_report(&message).unwrap_or(message);
         self.send_turn(message, cx);
     }
 
@@ -558,6 +508,8 @@ impl AppState {
                 chat.revealed = 0;
                 // It's no longer a draft — drop any preserved prompt text.
                 chat.draft.clear();
+                // Sending is explicit — always jump to the new message + the reply.
+                chat.scroll.scroll_to_bottom();
                 true
             })
             .unwrap_or(false);
@@ -573,206 +525,21 @@ impl AppState {
                 context,
             },
         );
-        // Keep an agent tab's strip label in step with its now-titled chat.
-        self.sync_agent_tab_title();
         cx.notify();
     }
 
-    /// Run `f` against whichever [`ChatSession`] owns `conversation_id` — the
-    /// sidebar's chats first, then any open agent tab. Returns `f`'s result, or
-    /// `None` if no chat matches. The closure returns an owned value so no borrow
-    /// of `self` escapes (sidesteps the two-field borrow pitfall).
+    /// Run `f` against the [`ChatSession`] that owns `conversation_id` (events route
+    /// here, not just to the active chat). Returns `f`'s result, or `None` if no
+    /// chat matches.
     fn with_chat_mut<R>(
         &mut self,
         conversation_id: u64,
         f: impl FnOnce(&mut ChatSession) -> R,
     ) -> Option<R> {
-        if let Some(state) = self.assistant.as_mut() {
-            if let Some(chat) = state.find_mut(conversation_id) {
-                return Some(f(chat));
-            }
-        }
-        if let Phase::Connected(active) = &mut self.phase {
-            for tab in &mut active.tabs {
-                if let Some(agent) = &mut tab.agent {
-                    if agent.chat.conversation_id == conversation_id {
-                        return Some(f(&mut agent.chat));
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    // --- AI agent tabs (Feature A) ------------------------------------------
-
-    /// Open a fresh AI agent tab — a worksheet peer of a query tab where the agent
-    /// writes + runs read-only SQL and shows its work. Gated on the assistant being
-    /// enabled for this connection (M-S7); the backend tier still bounds what it can
-    /// do. Focuses the new tab's composer.
-    pub(crate) fn new_agent_tab(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.phase, Phase::Connected(_)) || !self.ai_enabled() {
-            return;
-        }
-        let conversation_id = self.next_conversation_id;
-        self.next_conversation_id += 1;
-        let provider = self.default_ai_provider();
-        let seq = if let Phase::Connected(active) = &mut self.phase {
-            active.agent_seq += 1;
-            active.agent_seq
-        } else {
-            return;
-        };
-        let mut tab = QueryTab::new(format!("Agent {seq}"), cx);
-        tab.agent = Some(AgentSession::new(conversation_id, provider, cx));
-        self.push_tab(tab, cx);
-        self.focus_agent_input = true;
-        cx.notify();
-    }
-
-    /// Send the active agent tab's composer text as one turn.
-    pub(crate) fn submit_agent_tab(&mut self, cx: &mut Context<Self>) {
-        let (conversation_id, provider, message, input) = {
-            let Phase::Connected(active) = &self.phase else {
-                return;
-            };
-            let Some(agent) = active.active().and_then(|t| t.agent.as_ref()) else {
-                return;
-            };
-            if agent.chat.streaming {
-                return;
-            }
-            (
-                agent.chat.conversation_id,
-                agent.chat.provider_kind(),
-                agent.input.read(cx).content().trim().to_string(),
-                agent.input.clone(),
-            )
-        };
-        if message.is_empty() {
-            return;
-        }
-        input.update(cx, |i, cx| i.set_content("", cx));
-        self.dispatch_turn(conversation_id, provider, message, cx);
-    }
-
-    /// Stop the active agent tab's in-flight turn (its Stop button / Esc).
-    pub(crate) fn cancel_agent_tab(&mut self, cx: &mut Context<Self>) {
-        let conversation_id = match &self.phase {
-            Phase::Connected(active) => match active.active().and_then(|t| t.agent.as_ref()) {
-                Some(agent) if agent.chat.streaming => agent.chat.conversation_id,
-                _ => return,
-            },
-            _ => return,
-        };
-        if let Phase::Connected(active) = &self.phase {
-            self.service.send_to(
-                active.session,
-                red_service::Command::AiCancel { conversation_id },
-            );
-        }
-        cx.notify();
-    }
-
-    /// Answer the active agent tab's pending tool-permission prompt (its Allow/Deny).
-    pub(crate) fn answer_agent_permission(&mut self, allow: bool, cx: &mut Context<Self>) {
-        let (conversation_id, request_id) = {
-            let Phase::Connected(active) = &self.phase else {
-                return;
-            };
-            let Some(agent) = active.active().and_then(|t| t.agent.as_ref()) else {
-                return;
-            };
-            match &agent.chat.pending_permission {
-                Some(p) => (agent.chat.conversation_id, p.request_id),
-                None => return,
-            }
-        };
-        self.with_chat_mut(conversation_id, |chat| chat.pending_permission = None);
-        if let Phase::Connected(active) = &self.phase {
-            self.service.send_to(
-                active.session,
-                red_service::Command::AiPermission {
-                    conversation_id,
-                    request_id,
-                    allow,
-                },
-            );
-        }
-        cx.notify();
-    }
-
-    /// Open the agent-proposed `sql` in the active agent tab's *inline* grid (the
-    /// host tab's `result`) and return the new result's epoch. Read-only by design —
-    /// the worksheet shows the same rows the model reasoned over; a write belongs in
-    /// a real query tab. Returns `None` (after a toast) if it isn't a single SELECT.
-    fn agent_open_select(&mut self, sql: String, cx: &mut Context<Self>) -> Option<u64> {
-        let sql = sql.trim().to_string();
-        if sql.is_empty() {
-            return None;
-        }
-        if !matches!(crate::sql::classify(&sql), crate::sql::StatementKind::Query) {
-            self.notify(
-                flint::ToastVariant::Error,
-                "The agent worksheet runs read-only SELECTs — use “Open in a query tab” to run writes.",
-                cx,
-            );
-            return None;
-        }
-        if crate::sql::statement_count(&sql) > 1 {
-            self.notify(
-                flint::ToastVariant::Error,
-                "Select a single statement to run.",
-                cx,
-            );
-            return None;
-        }
-        let sql = crate::sql::auto_limit(&sql, self.settings.query.auto_limit).unwrap_or(sql);
-        self.open_result("agent", sql, None, cx);
-        match &self.phase {
-            Phase::Connected(active) => active.active_result().map(|g| g.epoch),
-            _ => None,
-        }
-    }
-
-    /// Run the agent-proposed `sql` inline in the active agent tab.
-    pub(crate) fn agent_run_sql(&mut self, sql: String, cx: &mut Context<Self>) {
-        let _ = self.agent_open_select(sql, cx);
-    }
-
-    /// Run the agent-proposed `sql` inline and, once its rows land, render them to a
-    /// themed HTML report and open it in the browser (Feature C) — the one-click
-    /// "generate a report" payoff.
-    pub(crate) fn agent_report_sql(&mut self, sql: String, cx: &mut Context<Self>) {
-        if let Some(epoch) = self.agent_open_select(sql, cx) {
-            self.report_after_epoch = Some(epoch);
-        }
-    }
-
-    /// Open the agent-proposed `sql` in a fresh query tab and run it — the
-    /// "promote to a worksheet I own" affordance.
-    pub(crate) fn open_sql_in_query_tab(&mut self, sql: String, cx: &mut Context<Self>) {
-        self.new_query(cx);
-        if let Phase::Connected(active) = &self.phase {
-            if let Some(tab) = active.active() {
-                tab.editor
-                    .update(cx, |e, cx| e.set_content(sql.clone(), cx));
-            }
-        }
-        self.run_editor_query(cx);
-    }
-
-    /// Mirror the active agent tab's chat title onto its strip label, once the chat
-    /// derives one from the first message.
-    fn sync_agent_tab_title(&mut self) {
-        if let Phase::Connected(active) = &mut self.phase {
-            if let Some(tab) = active.tabs.get_mut(active.active_tab) {
-                let title = tab.agent.as_ref().and_then(|a| a.chat.title.clone());
-                if let Some(title) = title {
-                    tab.title = title;
-                }
-            }
-        }
+        self.assistant
+            .as_mut()
+            .and_then(|state| state.find_mut(conversation_id))
+            .map(f)
     }
 
     /// Re-authenticate / switch the subscription account (M-S4). The agent owns
@@ -1229,6 +996,37 @@ impl AppState {
         cx.notify();
     }
 
+    /// Open `sql` in a fresh query tab in the workspace. A read-only SELECT runs
+    /// automatically (the data lands in the grid); anything else is loaded for the
+    /// user to run, so the editor's own write-confirm path still applies. Shared by
+    /// the assistant's "Open in a query tab" chip and the agent's open_query tool.
+    pub(crate) fn open_query_in_tab(&mut self, sql: String, cx: &mut Context<Self>) {
+        if !matches!(self.phase, Phase::Connected(_)) {
+            return;
+        }
+        self.new_query(cx);
+        if let Phase::Connected(active) = &self.phase {
+            if let Some(tab) = active.active() {
+                tab.editor
+                    .update(cx, |e, cx| e.set_content(sql.clone(), cx));
+            }
+        }
+        if matches!(crate::sql::classify(&sql), crate::sql::StatementKind::Query) {
+            self.run_editor_query(cx);
+        }
+        cx.notify();
+    }
+
+    /// The agent's `open_query` tool fired: open the SQL in a new query tab.
+    pub(crate) fn on_ai_open_query(
+        &mut self,
+        _conversation_id: u64,
+        sql: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_query_in_tab(sql, cx);
+    }
+
     // --- event sinks (driven from `on_event`) --------------------------------
 
     pub(crate) fn on_ai_delta(
@@ -1270,6 +1068,8 @@ impl AppState {
             if grew && reduce_motion {
                 chat.revealed = chat.streaming_text_chars();
             }
+            // Keep following the newest text if the user is at the bottom.
+            follow_if_at_bottom(chat);
             grew
         });
         let Some(grew_text) = grew_text else {
@@ -1332,6 +1132,8 @@ impl AppState {
                 if caught_up {
                     chat.revealing = false;
                 }
+                // Follow the growing text while the user is at the bottom.
+                follow_if_at_bottom(chat);
                 (true, !caught_up)
             })
             .unwrap_or((false, false));
@@ -1359,14 +1161,13 @@ impl AppState {
                 }
                 // Persist the now-complete exchange so it survives a restart (M-S5).
                 persist_chat(chat);
+                follow_if_at_bottom(chat);
             })
             .is_some();
         if finished {
             cx.notify();
             // Drain any still-hidden tail now that no more text is coming.
             self.ensure_reveal_ticker(conversation_id, cx);
-            // An agent tab's first reply may have just titled the chat.
-            self.sync_agent_tab_title();
         }
     }
 
@@ -1483,8 +1284,33 @@ impl AppState {
             .and_then(|t| t.result.as_ref())
             .and_then(|r| r.error())
             .map(str::to_string);
+        // What the user is looking at, so they can refer to "this tab" / "these
+        // results". The tab name goes at any tier; the result's shape (counts +
+        // column names) reflects query output, so it's withheld below `read`.
+        let reads_allowed = matches!(
+            self.ai_tier_effective(),
+            red_core::AiTier::Read | red_core::AiTier::Write
+        );
+        let current_tab = active.active().map(|t| {
+            let mut s = format!("\"{}\"", t.title);
+            if reads_allowed {
+                if let Some(grid) = t.result.as_ref() {
+                    if let Some((rows, cols)) = grid.status_counts() {
+                        let names: Vec<String> = (0..cols)
+                            .filter_map(|c| grid.column_meta(c).map(|(name, _)| name))
+                            .collect();
+                        s.push_str(&format!(
+                            " — showing a result of {rows} row(s) × {cols} column(s): {}",
+                            names.join(", ")
+                        ));
+                    }
+                }
+            }
+            s
+        });
         red_service::AiContext {
             schema_summary: summarize_schema(&active.schema.schemas),
+            current_tab,
             editor_sql,
             last_error,
             selection: None,
@@ -1561,7 +1387,7 @@ impl AppState {
             let live =
                 i == last && msg.role == ChatRole::Assistant && (chat.streaming || chat.revealing);
             let reveal = live.then_some(chat.revealed);
-            body = body.child(self.render_bubble(msg, reveal, false, &theme, cx));
+            body = body.child(self.render_bubble(msg, reveal, &theme, cx));
         }
         if let Some(status) = &chat.status {
             body = body.child(
@@ -1606,7 +1432,7 @@ impl AppState {
                 .items_center()
                 .justify_center()
                 .rounded(px(6.))
-                .bg(theme.red)
+                .bg(theme.accent)
                 .cursor_pointer()
                 .tooltip(flint::Tooltip::text(
                     "Send (Enter · Shift+Enter for a new line)",
@@ -1617,22 +1443,41 @@ impl AppState {
                 .into_any_element()
         };
 
+        // A bordered, rounded composer card (Zed-style): the multiline input on top,
+        // a slim toolbar row below with a commands hint and the send/stop button.
         let composer = div()
             .flex_shrink_0()
+            .m_2()
             .flex()
-            .items_end()
-            .gap_2()
-            .p_2()
-            .border_t_1()
+            .flex_col()
+            .rounded(theme.radius)
+            .border_1()
             .border_color(theme.border)
+            .bg(theme.bg_input)
             .child(
                 div()
-                    .flex_1()
                     .min_w(px(0.))
                     .h(px(64.))
+                    .px_2p5()
+                    .pt_1p5()
                     .child(state.input.clone()),
             )
-            .child(action);
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .pt_2()
+                    .pb_1p5()
+                    .child(
+                        div()
+                            .text_size(theme.scale(10.5))
+                            .text_color(theme.text_faint)
+                            .child("/ for commands"),
+                    )
+                    .child(action),
+            );
 
         div()
             .size_full()
@@ -1644,7 +1489,7 @@ impl AppState {
             .child(header)
             .child(body)
             .when_some(chat.pending_permission.as_ref(), |col, pending| {
-                col.child(self.render_permission(pending, false, &theme, cx))
+                col.child(self.render_permission(pending, &theme, cx))
             })
             .when_some(self.render_quick_actions(chat, &theme, cx), |col, chips| {
                 col.child(chips)
@@ -1684,9 +1529,6 @@ impl AppState {
                 ))
         };
 
-        let close = icon_btn("assistant-close", "x", "Close assistant")
-            .on_click(cx.listener(|this, _, window, cx| this.close_assistant(window, cx)));
-
         // The agent owns `/login`, so "Switch account" restarts it (M-S4); only
         // meaningful on the subscription path.
         let reauth = is_subscription.then(|| {
@@ -1721,11 +1563,7 @@ impl AppState {
                 .tooltip(flint::Tooltip::text(list_tip))
                 .hover(|s| s.bg(theme.bg_elevated))
                 .child(crate::icons::icon(
-                    if state.show_list {
-                        "panel-left-close"
-                    } else {
-                        "panel-left-open"
-                    },
+                    "history",
                     theme.scale(13.),
                     theme.text_muted,
                 ))
@@ -1759,8 +1597,7 @@ impl AppState {
             .when_some(reauth, |row, r| row.child(r))
             .when_some(list_btn, |row, l| row.child(l))
             .when_some(new_chat, |row, n| row.child(n))
-            .when_some(delete, |row, d| row.child(d))
-            .child(close);
+            .when_some(delete, |row, d| row.child(d));
 
         div()
             .flex_shrink_0()
@@ -1779,15 +1616,15 @@ impl AppState {
                     .gap_1p5()
                     .text_size(theme.scale(12.))
                     .text_color(theme.text)
-                    .child(crate::icons::icon("sparkles", theme.scale(14.), theme.red))
-                    .child("Assistant")
-                    .when(is_subscription, |row| {
-                        row.child(
-                            div()
-                                .text_size(theme.scale(10.5))
-                                .text_color(theme.text_muted)
-                                .child("· Subscription"),
-                        )
+                    .child(crate::icons::icon(
+                        "sparkles",
+                        theme.scale(14.),
+                        theme.accent,
+                    ))
+                    .child(if is_subscription {
+                        "Claude Agent Subscription"
+                    } else {
+                        "Assistant"
                     })
                     // A "writes" badge when this connection opted into the write tier
                     // (Feature B), so the user knows the agent can propose data changes
@@ -1833,7 +1670,7 @@ impl AppState {
             .flex()
             .items_center()
             .rounded(px(6.))
-            .bg(theme.red)
+            .bg(theme.accent)
             .text_size(theme.scale(12.))
             .text_color(theme.bg_app)
             .cursor_pointer()
@@ -2036,7 +1873,7 @@ impl AppState {
             .text_size(theme.scale(11.5))
             .text_color(theme.text_muted)
             .cursor_pointer()
-            .hover(|s| s.border_color(theme.red).text_color(theme.red))
+            .hover(|s| s.border_color(theme.accent).text_color(theme.accent))
             .child(crate::icons::icon(
                 "plus",
                 theme.scale(11.),
@@ -2216,7 +2053,9 @@ impl AppState {
                 .border_1()
                 .text_size(theme.scale(11.))
                 .cursor_pointer()
-                .when(on, |s| s.border_color(theme.red).text_color(theme.red))
+                .when(on, |s| {
+                    s.border_color(theme.accent).text_color(theme.accent)
+                })
                 .when(!on, |s| {
                     s.border_color(theme.border).text_color(theme.text_muted)
                 })
@@ -2270,18 +2109,14 @@ impl AppState {
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
-        let tab = active.active();
-        let has_error = tab
+        let has_error = active
+            .active()
             .and_then(|t| t.result.as_ref())
             .is_some_and(|r| r.error().is_some());
-        let has_sql = tab.is_some_and(|t| !t.editor.read(cx).content().trim().is_empty());
 
         let mut actions = Vec::new();
         if has_error {
             actions.push(QuickAction::ExplainError);
-        }
-        if has_sql {
-            actions.push(QuickAction::OptimizeQuery);
         }
         if actions.is_empty() {
             return None;
@@ -2310,7 +2145,7 @@ impl AppState {
                     .text_size(theme.scale(11.))
                     .text_color(theme.text_muted)
                     .cursor_pointer()
-                    .hover(|s| s.border_color(theme.red).text_color(theme.red))
+                    .hover(|s| s.border_color(theme.accent).text_color(theme.accent))
                     .child(crate::icons::icon(
                         "sparkles",
                         theme.scale(11.),
@@ -2331,7 +2166,6 @@ impl AppState {
     fn render_permission(
         &self,
         pending: &PendingPermission,
-        agent_tab: bool,
         theme: &flint::Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2347,7 +2181,7 @@ impl AppState {
                 .cursor_pointer()
                 .child(label);
             if accent {
-                base.bg(theme.red)
+                base.bg(theme.accent)
                     .text_color(theme.bg_app)
                     .hover(|s| s.opacity(0.9))
             } else {
@@ -2374,7 +2208,7 @@ impl AppState {
                     .gap_1p5()
                     .text_size(theme.scale(12.))
                     .text_color(theme.text)
-                    .child(crate::icons::icon("lock", theme.scale(13.), theme.red))
+                    .child(crate::icons::icon("lock", theme.scale(13.), theme.accent))
                     .child(format!("Allow the assistant to run {}?", pending.title)),
             );
         if let Some(detail) = &pending.detail {
@@ -2386,35 +2220,18 @@ impl AppState {
                     .child(detail.clone()),
             );
         }
-        // Route the answer to the surface the prompt is shown on: an agent tab's
-        // own chat, or the active sidebar chat. `agent_tab` is Copy, so each
-        // listener captures its own copy.
         card.child(
             div()
                 .flex()
                 .items_center()
                 .gap_2()
                 .child(
-                    button("ai-permission-deny", "Deny", false).on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            if agent_tab {
-                                this.answer_agent_permission(false, cx);
-                            } else {
-                                this.answer_permission(false, cx);
-                            }
-                        },
-                    )),
+                    button("ai-permission-deny", "Deny", false)
+                        .on_click(cx.listener(|this, _, _, cx| this.answer_permission(false, cx))),
                 )
                 .child(
-                    button("ai-permission-allow", "Allow", true).on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            if agent_tab {
-                                this.answer_agent_permission(true, cx);
-                            } else {
-                                this.answer_permission(true, cx);
-                            }
-                        },
-                    )),
+                    button("ai-permission-allow", "Allow", true)
+                        .on_click(cx.listener(|this, _, _, cx| this.answer_permission(true, cx))),
                 ),
         )
         .into_any_element()
@@ -2427,7 +2244,6 @@ impl AppState {
         &self,
         msg: &ChatMessage,
         reveal: Option<usize>,
-        in_agent_tab: bool,
         theme: &flint::Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2439,7 +2255,7 @@ impl AppState {
         };
         let (label, label_color) = match msg.role {
             ChatRole::User => ("You", theme.text_muted),
-            ChatRole::Assistant => ("Assistant", theme.red),
+            ChatRole::Assistant => ("Assistant", theme.accent),
         };
 
         // Label row: the author, plus a copy-to-clipboard affordance for the
@@ -2510,9 +2326,8 @@ impl AppState {
         }
 
         // SQL affordances for the first fenced SQL block in a *settled* assistant
-        // turn (suppressed while still typing). In an agent tab the worksheet runs
-        // it inline or promotes it to a query tab; in the sidebar it's inserted into
-        // the active editor.
+        // turn (suppressed while still typing): insert it into the active editor, or
+        // open it in a fresh query tab (a read-only SELECT runs there automatically).
         if !live && msg.role == ChatRole::Assistant {
             if let Some(sql) = extract_sql(&msg.text) {
                 let key = bubble_key(msg);
@@ -2530,7 +2345,7 @@ impl AppState {
                         .text_size(theme.scale(11.))
                         .text_color(theme.text_muted)
                         .cursor_pointer()
-                        .hover(|s| s.border_color(theme.red).text_color(theme.red))
+                        .hover(|s| s.border_color(theme.accent).text_color(theme.accent))
                         .child(crate::icons::icon(
                             glyph,
                             theme.scale(11.),
@@ -2538,228 +2353,52 @@ impl AppState {
                         ))
                         .child(label)
                 };
-                if in_agent_tab {
-                    let run_sql = sql.clone();
-                    let report_sql = sql.clone();
-                    let open_sql = sql.clone();
-                    bubble = bubble.child(
-                        div()
-                            .mt_1()
-                            .flex()
-                            .flex_wrap()
-                            .gap_1p5()
-                            .child(
-                                chip(
-                                    SharedString::from(format!("ai-run-{key}")),
-                                    "play",
-                                    "Run here",
-                                )
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| this.agent_run_sql(run_sql.clone(), cx),
-                                )),
-                            )
-                            .child(
-                                chip(
-                                    SharedString::from(format!("ai-report-{key}")),
-                                    "sparkles",
-                                    "Report",
-                                )
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.agent_report_sql(report_sql.clone(), cx)
-                                    },
-                                )),
-                            )
-                            .child(
-                                chip(
-                                    SharedString::from(format!("ai-open-{key}")),
-                                    "table",
-                                    "Open in a query tab",
-                                )
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.open_sql_in_query_tab(open_sql.clone(), cx)
-                                    },
-                                )),
-                            ),
-                    );
-                } else {
-                    bubble = bubble.child(
-                        chip(
-                            SharedString::from(format!("ai-insert-{key}")),
-                            "corner-down-left",
-                            "Insert into editor",
-                        )
+                let insert_sql = sql.clone();
+                bubble = bubble.child(
+                    div()
                         .mt_1()
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.ai_insert_sql(sql.clone(), cx)),
+                        .flex()
+                        .flex_wrap()
+                        .gap_1p5()
+                        .child(
+                            chip(
+                                SharedString::from(format!("ai-insert-{key}")),
+                                "corner-down-left",
+                                "Insert into editor",
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| this.ai_insert_sql(insert_sql.clone(), cx),
+                            )),
+                        )
+                        .child(
+                            chip(
+                                SharedString::from(format!("ai-open-{key}")),
+                                "table",
+                                "Open in a query tab",
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| this.open_query_in_tab(sql.clone(), cx),
+                            )),
                         ),
-                    );
-                }
+                );
             }
         }
 
         bubble.into_any_element()
     }
-
-    /// An AI agent tab's body (Feature A): the conversation transcript, the
-    /// composer, any pending tool-permission prompt, and the usage footer. The tab
-    /// strip is the header (drawn by `render_editor`); the inline result grid is the
-    /// host tab's `result`, drawn in the pane below by the shell.
-    pub(crate) fn render_agent_tab(
-        &self,
-        agent: &AgentSession,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let theme = cx.theme().clone();
-        let chat = &agent.chat;
-
-        // Not configured yet: point the user at setup rather than a dead composer.
-        if !self.ai_configured {
-            return div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .p_4()
-                .bg(theme.bg_app)
-                .child(
-                    div()
-                        .text_size(theme.scale(13.))
-                        .text_color(theme.text)
-                        .child("Add an Anthropic API key to use the agent."),
-                )
-                .child(
-                    div()
-                        .text_size(theme.scale(11.5))
-                        .text_color(theme.text_muted)
-                        .child(
-                            "Open the assistant panel (⌘L) to add a key, or set the \
-                             ANTHROPIC_API_KEY environment variable. The key is stored in \
-                             your OS keychain.",
-                        ),
-                )
-                .into_any_element();
-        }
-
-        // Transcript.
-        let mut body = div()
-            .id("agent-body")
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .track_scroll(&chat.scroll)
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_3();
-
-        if chat.messages.is_empty() {
-            body = body.child(
-                div()
-                    .text_size(theme.scale(12.5))
-                    .text_color(theme.text_muted)
-                    .child(
-                        "Describe the data you want in plain language. The agent reads the \
-                         schema, writes and runs read-only SQL, checks the result, and shows \
-                         its work — run any SQL it proposes here, or open it in a query tab.",
-                    ),
-            );
-            if let Some(picker) = self.render_provider_picker(chat, &theme, cx) {
-                body = body.child(picker);
-            }
-        }
-        let last = chat.messages.len().saturating_sub(1);
-        for (i, msg) in chat.messages.iter().enumerate() {
-            let live =
-                i == last && msg.role == ChatRole::Assistant && (chat.streaming || chat.revealing);
-            let reveal = live.then_some(chat.revealed);
-            body = body.child(self.render_bubble(msg, reveal, true, &theme, cx));
-        }
-        if let Some(status) = &chat.status {
-            body = body.child(
-                div()
-                    .text_size(theme.scale(11.))
-                    .text_color(theme.text_muted)
-                    .child(status.clone()),
-            );
-        }
-        if let Some(err) = &chat.error {
-            body = body.child(
-                div()
-                    .text_size(theme.scale(11.5))
-                    .text_color(theme.red)
-                    .child(err.clone()),
-            );
-        }
-
-        // Composer: a multiline prompt box with a send (or stop) icon button.
-        let action: AnyElement = if chat.streaming {
-            div()
-                .id("agent-stop")
-                .size(px(30.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(6.))
-                .border_1()
-                .border_color(theme.border)
-                .cursor_pointer()
-                .tooltip(flint::Tooltip::text("Stop (Esc)"))
-                .hover(|s| s.border_color(theme.red))
-                .child(crate::icons::icon("x", theme.scale(14.), theme.text_muted))
-                .on_click(cx.listener(|this, _, _, cx| this.cancel_agent_tab(cx)))
-                .into_any_element()
-        } else {
-            div()
-                .id("agent-send")
-                .size(px(30.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(6.))
-                .bg(theme.red)
-                .cursor_pointer()
-                .tooltip(flint::Tooltip::text(
-                    "Send (Enter · Shift+Enter for a new line)",
-                ))
-                .hover(|s| s.opacity(0.9))
-                .child(crate::icons::icon("send", theme.scale(15.), theme.bg_app))
-                .on_click(cx.listener(|this, _, _, cx| this.submit_agent_tab(cx)))
-                .into_any_element()
-        };
-
-        let composer = div()
-            .flex_shrink_0()
-            .flex()
-            .items_end()
-            .gap_2()
-            .p_2()
-            .border_t_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .h(px(64.))
-                    .child(agent.input.clone()),
-            )
-            .child(action);
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(theme.bg_app)
-            .child(body)
-            .when_some(chat.pending_permission.as_ref(), |col, pending| {
-                col.child(self.render_permission(pending, true, &theme, cx))
-            })
-            .child(composer)
-            .when_some(chat.last_usage, |col, usage| {
-                col.child(render_usage(&usage, &theme))
-            })
-            .into_any_element()
+}
+/// Keep the transcript pinned to the newest message *only while the user is already
+/// at (or within a line of) the bottom* — so streaming text follows the view, but a
+/// user who scrolled up to read history isn't yanked down. The offset/max are from
+/// the last paint (the user's current position); `scroll_to_bottom` applies on the
+/// next paint, after the new content has grown the transcript.
+fn follow_if_at_bottom(chat: &ChatSession) {
+    let offset = chat.scroll.offset().y;
+    let max = chat.scroll.max_offset().y;
+    // `offset` is ≤ 0 (0 at top, more negative further down); `max` ≥ 0 is the
+    // bottom extent. Nothing to scroll yet (`max == 0`) counts as "at bottom".
+    if max <= px(0.) || offset <= px(24.) - max {
+        chat.scroll.scroll_to_bottom();
     }
 }
 
@@ -2904,6 +2543,28 @@ const TITLE_CAP: usize = 60;
 /// turn (M-S5), so resuming a long conversation doesn't blow the context window.
 /// Keeps the most recent turns (the tail), which is what a follow-up references.
 const SEED_CAP: usize = 6_000;
+
+/// Expand a `/report …` composer shortcut into an explicit instruction so the agent
+/// reads the data and calls `generate_report`. Returns `None` for a non-`/report`
+/// message (sent verbatim). A bare `/report` still asks for a report of whatever's
+/// in context; `/reporting` (no separator) is not matched.
+fn expand_slash_report(message: &str) -> Option<String> {
+    let rest = message.strip_prefix("/report")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let topic = rest.trim();
+    let ask = if topic.is_empty() {
+        "Create an HTML report for me.".to_string()
+    } else {
+        format!("Create an HTML report about: {topic}")
+    };
+    Some(format!(
+        "{ask}\n\nRead the data you need with run_select, then call the generate_report tool with \
+         the report written as HTML — a heading, a short summary, and the relevant table(s) or an \
+         inline chart. Open it for me."
+    ))
+}
 
 /// A one-line title from a chat's first user message: the first non-empty line,
 /// whitespace-collapsed and capped. Used as the saved file's display name.
@@ -3078,12 +2739,8 @@ mod tests {
     }
 
     #[test]
-    fn quick_action_prompts_are_distinct_and_nonempty() {
-        let explain = QuickAction::ExplainError.prompt();
-        let optimize = QuickAction::OptimizeQuery.prompt();
-        assert!(!explain.trim().is_empty());
-        assert!(!optimize.trim().is_empty());
-        assert_ne!(explain, optimize);
+    fn quick_action_prompt_is_nonempty() {
+        assert!(!QuickAction::ExplainError.prompt().trim().is_empty());
     }
 
     #[test]

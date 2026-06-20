@@ -433,6 +433,14 @@ pub enum Event {
         conversation_id: u64,
         path: String,
     },
+    /// The agent asked to open `sql` in a new query tab (so the user has it in the
+    /// editor/grid). The UI opens a fresh tab with the SQL loaded and runs it if it's
+    /// a read-only SELECT; anything else is left for the user to run (so the write
+    /// path's own confirmation still applies).
+    AiOpenQuery {
+        conversation_id: u64,
+        sql: String,
+    },
     Error(String),
 }
 
@@ -483,6 +491,11 @@ pub struct AiContext {
     /// pulls full detail on demand via the `describe_table` tool, so this stays
     /// small even for large databases.
     pub schema_summary: String,
+    /// The currently-viewed tab, so the user can refer to it ("this tab", "the
+    /// current query/result"): its name and — at `read` tier — a one-line shape of
+    /// the result on screen (row/column counts + column names). The SQL itself rides
+    /// in `editor_sql`.
+    pub current_tab: Option<String>,
     /// The SQL currently in the editor, if any.
     pub editor_sql: Option<String>,
     /// The last query/result error shown, if any ("Explain this error").

@@ -701,6 +701,7 @@ impl AppState {
                     .child(self.render_connection_fields(form, is_file, &errors, theme))
                     .children(self.render_ssh_section(form, is_file, &errors, theme, cx))
                     .child(self.render_label_access_row(form, theme, cx))
+                    .children(self.render_ai_write_row(form, theme, cx))
                     .children(self.render_form_status(form, cx)),
             )
     }
@@ -986,6 +987,47 @@ impl AppState {
                 .on_click(cx.listener(move |this, _, _, cx| this.set_form_kind(kind, cx)))
         });
         div().flex().gap_1p5().children(cells)
+    }
+
+    /// The AI write opt-in (Feature B): lets the assistant propose INSERT/UPDATE/
+    /// DELETE on this connection, each gated by per-statement approval. Shown only
+    /// when the assistant is enabled and the connection is *writable* — write access
+    /// is meaningless (and blocked) on a read-only connection, so unticking
+    /// "Read-only" is the prerequisite. `None` hides the row otherwise.
+    fn render_ai_write_row(
+        &self,
+        form: &FormState,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        if !self.ai_enabled() || form.read_only {
+            return None;
+        }
+        Some(
+            labeled_field("AI assistant", theme).child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(32.))
+                    .child(
+                        Toggle::new("ai-allow-writes", form.ai_allow_writes)
+                            .label("Allow writes")
+                            .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                this.set_form_ai_allow_writes(*checked, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme.scale(11.5))
+                            .text_color(theme.text_muted)
+                            .child(
+                                "The assistant may propose INSERT/UPDATE/DELETE — each needs your \
+                                 approval; DDL and unqualified changes are always blocked.",
+                            ),
+                    ),
+            ),
+        )
     }
 
     /// The label-color swatches + the read-only access toggle, sharing one row.

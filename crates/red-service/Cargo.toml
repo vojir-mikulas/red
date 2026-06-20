@@ -27,6 +27,8 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
 uuid.workspace = true
+# Resolve the user config dir for the AI write-audit log (Feature B).
+dirs.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time", "net", "io-util"] }
@@ -34,3 +36,5 @@ tokio = { workspace = true, features = ["rt", "sync", "macros", "time", "net", "
 rusqlite.workspace = true
 # The MCP server test drives the localhost endpoint with a real HTTP client.
 reqwest.workspace = true
+# A scripted fake AiProvider for the write-approval round-trip test.
+async-trait.workspace = true

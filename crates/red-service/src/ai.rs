@@ -12,14 +12,13 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use red_ai::{
     AiProvider, CancelToken, ContentBlock, Message, Role, StopReason, ToolDef, TurnRequest,
 };
-use red_core::{AiPolicy, AiTier, ExportFormat, RedError, Value};
+use red_core::{AiPolicy, AiTier, RedError, Value};
 use red_driver::{AbortSignal, DatabaseDriver, PageCap};
 use serde_json::{json, Value as Json};
 use tokio::sync::oneshot;
@@ -28,12 +27,11 @@ use crate::dispatch::{emit, Events};
 use crate::protocol::{AiContext, AiDelta, AiUsage};
 use crate::{Event, SessionId};
 
-/// Where a `generate_report` tool's output file is delivered so the UI can open it
-/// (Feature C, agent-initiated reports). The tool layer stays UI-agnostic — it just
-/// announces "I wrote a report to `<path>`"; the caller turns that into the
-/// `AiReportReady` event the UI handles. Both backends construct one from the
-/// `events`/`session`/`conversation_id` they hold; a `disabled()` sink (no channel)
-/// drops the announcement and is used by tests.
+/// A small, UI-agnostic announcer the `generate_report` tool uses to hand a
+/// freshly-written report file to the UI to open in the browser. The tool stays
+/// UI-free — it just announces a path; the caller turns it into an `AiReportReady`
+/// event. Both backends construct one from the `events`/`session`/`conversation_id`
+/// they hold; a `disabled()` sink (no channel) drops announcements (tests).
 #[derive(Clone)]
 pub(crate) struct ReportSink {
     events: Option<Events>,
@@ -69,6 +67,20 @@ impl ReportSink {
                 Event::AiReportReady {
                     conversation_id: self.conversation_id,
                     path: path.display().to_string(),
+                },
+            );
+        }
+    }
+
+    /// Ask the UI to open `sql` in a new query tab (the agent's open_query tool).
+    fn announce_open_query(&self, sql: &str) {
+        if let Some(events) = &self.events {
+            emit(
+                events,
+                self.session,
+                Event::AiOpenQuery {
+                    conversation_id: self.conversation_id,
+                    sql: sql.to_string(),
                 },
             );
         }
@@ -490,18 +502,36 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "generate_report".into(),
-            description: format!(
-                "Render a read-only SELECT (or WITH ... SELECT) to a themed, standalone HTML \
-                report and open it in the user's browser. Use this when the user asks for a \
-                report or a shareable view of some data. The result is capped at {max_rows} rows \
-                (like run_select) — write a focused query (aggregate / top-N / explicit columns). \
-                Returns once the file is written and opened."
-            ),
+            description: "Write a custom HTML report for the user and open it in their browser. \
+                YOU author the report: first read the data with run_select, then call this with \
+                `html` set to the report's body — headings, prose/summary, one or more <table>s, \
+                even an inline <svg> chart. Use semantic HTML and inline `style=\"…\"` for any \
+                styling; a base stylesheet (light/dark) is already applied. Scripts and remote/\
+                external resources (other domains, <script>, remote <img>/CSS) are stripped or \
+                blocked for safety, so keep everything self-contained (data URIs for images). \
+                Use this when the user asks for a report."
+                .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "sql": { "type": "string", "description": "A single read-only SELECT/WITH query." },
-                    "title": { "type": "string", "description": "Optional human title for the report." },
+                    "html": { "type": "string", "description": "The report BODY as self-contained HTML (no <html>/<head>/<body> wrapper — that's added)." },
+                    "title": { "type": "string", "description": "Report title (browser tab + heading)." },
+                },
+                "required": ["html"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "open_query".into(),
+            description: "Open a SQL query in a new editor tab in the user's workspace so they have \
+                it in the grid. A read-only SELECT runs automatically; anything else is just loaded \
+                for the user to run themselves. Use this to hand the user a query to explore or \
+                build on — it does NOT return rows to you (use run_select for that)."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "sql": { "type": "string", "description": "The SQL to open in a new query tab." },
                 },
                 "required": ["sql"],
                 "additionalProperties": false,
@@ -628,66 +658,55 @@ pub(crate) async fn run_tool(
             }
         }
         "generate_report" => {
-            let sql = input.get("sql").and_then(Json::as_str).unwrap_or("").trim();
-            if !is_read_only_select(sql) {
+            let body = input
+                .get("html")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .trim();
+            if body.is_empty() {
                 return (
-                    "error: generate_report needs a single read-only SELECT or WITH...SELECT query"
-                        .into(),
+                    "error: generate_report needs `html` — the report body you authored".into(),
                     false,
                 );
             }
-            // Cap the report like run_select: wrap as a subquery with the row ceiling
-            // (the paging wrap shape) so a report can't stream unbounded rows to disk.
-            let max_rows = limits.max_rows.max(1);
-            let inner = sql.trim_end_matches(';').trim();
-            let capped = format!("SELECT * FROM ({inner}) AS _red LIMIT {max_rows}");
+            let title = input.get("title").and_then(Json::as_str);
+            // Wrap the model's HTML in a sandboxed, themed shell (strict CSP: no
+            // scripts, no remote loads) and open it in the browser.
+            let html = wrap_report_html(title, body);
             let path = std::env::temp_dir()
                 .join(format!("red-report-{}.html", uuid::Uuid::new_v4().simple()));
-            // Time-box the render: a watchdog flips the export's cancel flag after the
-            // statement timeout (the row cap bounds size; this bounds a slow query).
-            let cancel = Arc::new(AtomicBool::new(false));
-            let watchdog = (limits.statement_timeout_ms != 0).then(|| {
-                let c = cancel.clone();
-                let ms = limits.statement_timeout_ms;
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(ms)).await;
-                    c.store(true, Ordering::Relaxed);
-                })
-            });
-            // A throwaway progress channel — a one-shot report has no progress UI.
-            let (progress, _rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
-            let result = driver
-                .export(&capped, &path, ExportFormat::Html, cancel, progress)
-                .await;
-            if let Some(w) = watchdog {
-                w.abort();
-            }
-            match result {
-                Ok(rows) => {
+            match std::fs::write(&path, html) {
+                Ok(()) => {
                     // Hand the path to the UI so it opens the file in the browser.
                     report.announce(&path);
-                    let label = input
-                        .get("title")
-                        .and_then(Json::as_str)
-                        .filter(|t| !t.trim().is_empty())
-                        .map(|t| format!(" “{}”", t.trim()))
+                    let label = title
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .map(|t| format!(" “{t}”"))
                         .unwrap_or_default();
                     (
-                        format!(
-                            "Generated report{label} with {rows} row(s) and opened it in the \
-                            user's browser."
-                        ),
+                        format!("Generated the report{label} and opened it in the user's browser."),
                         true,
                     )
                 }
-                Err(RedError::Interrupted) => (
-                    "error: the report query exceeded the assistant's statement timeout — narrow \
-                    it (aggregate / add WHERE / LIMIT)."
-                        .into(),
+                Err(e) => (
+                    format!("error: could not write the report file: {e}"),
                     false,
                 ),
-                Err(e) => (format!("error: could not generate the report: {e}"), false),
             }
+        }
+        "open_query" => {
+            let sql = input.get("sql").and_then(Json::as_str).unwrap_or("").trim();
+            if sql.is_empty() {
+                return ("error: open_query needs `sql`".into(), false);
+            }
+            // Hand the SQL to the UI, which opens a new query tab (and runs it if it's
+            // a read-only SELECT). Nothing executes here.
+            report.announce_open_query(sql);
+            (
+                "Opened the query in a new editor tab in the user's workspace.".into(),
+                true,
+            )
         }
         "propose_write" => {
             // Re-vet at execution (defense in depth): tier, read-only, and the
@@ -696,13 +715,17 @@ pub(crate) async fn run_tool(
             // (run_turn / the ACP permission flow); we only *run* an allowed shape.
             match assess_write(name, input, policy) {
                 WriteAssessment::NeedsApproval { sql } => match driver.execute(&sql).await {
-                    Ok(affected) => (
-                        format!(
-                            "Executed the write — {affected} row(s) affected. Verify with a \
-                             SELECT if it matters."
-                        ),
-                        true,
-                    ),
+                    Ok(affected) => {
+                        // Durable record of what the agent actually changed (Feature B).
+                        crate::audit::record_write(&sql, affected);
+                        (
+                            format!(
+                                "Executed the write — {affected} row(s) affected. Verify with a \
+                                 SELECT if it matters."
+                            ),
+                            true,
+                        )
+                    }
                     Err(e) => (format!("error: the write failed: {e}"), false),
                 },
                 WriteAssessment::Reject(why) => (format!("error: {why}"), false),
@@ -849,13 +872,19 @@ enum WriteShape {
 /// statement — are the cases per-call approval alone shouldn't be trusted to catch
 /// (a rubber-stamped `DELETE` with no WHERE is catastrophic). False negatives are
 /// fine: the user can always run those by hand in a query tab.
+///
+/// Classification runs on a **noise-stripped** copy (string literals, quoted
+/// identifiers, and comments blanked) so a keyword or `;` *inside a literal* can't
+/// fool the gate — e.g. `UPDATE t SET note = 'see where'` (no real WHERE) is still
+/// blocked, and a `;` inside a string isn't read as statement chaining.
 fn write_shape(sql: &str) -> WriteShape {
-    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let stripped = strip_sql_noise(sql);
+    let trimmed = stripped.trim().trim_end_matches(';').trim();
     if trimmed.is_empty() {
         return WriteShape::Blocked("the statement is empty");
     }
-    // No embedded terminator — a `;` mid-string could chain a second statement past
-    // the keyword check (and past the user's eyes).
+    // No embedded terminator — a real `;` chains a second statement past the keyword
+    // check (and past the user's eyes).
     if trimmed.contains(';') {
         return WriteShape::Blocked("multiple statements are not allowed — submit one at a time");
     }
@@ -865,8 +894,9 @@ fn write_shape(sql: &str) -> WriteShape {
         "select" | "with" => WriteShape::NotWrite,
         "insert" => WriteShape::Ok,
         "update" | "delete" => {
-            // Require a WHERE clause so a whole-table mutation can't slip through.
-            if lower.contains(" where ") || lower.contains("\nwhere ") {
+            // Require a real WHERE keyword (a word token, not a substring) so a
+            // whole-table mutation can't slip through.
+            if has_word(&lower, "where") {
                 WriteShape::Ok
             } else {
                 WriteShape::Blocked(
@@ -882,6 +912,155 @@ fn write_shape(sql: &str) -> WriteShape {
              manually in a query tab",
         ),
     }
+}
+
+/// Blank out the parts of `sql` that aren't structure — single-quoted strings
+/// (with `''` escapes), double-quoted / backtick-quoted identifiers, and `--` line
+/// and `/* */` block comments — replacing each run with spaces so positions and the
+/// surrounding keywords are preserved. Used so the write classifier reasons about
+/// real SQL keywords, never text that merely *looks* like one inside a literal.
+fn strip_sql_noise(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // String literal / quoted identifier — consume to the matching close,
+            // honoring the doubled-quote escape (`''`, `""`).
+            '\'' | '"' | '`' => {
+                out.push(' ');
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if n == c {
+                        // A doubled quote is an escape, not a close.
+                        if chars.peek() == Some(&c) {
+                            chars.next();
+                            out.push(' ');
+                            out.push(' ');
+                            continue;
+                        }
+                        break;
+                    }
+                    out.push(' ');
+                }
+                out.push(' ');
+            }
+            // Line comment `-- …` to end of line.
+            '-' if chars.peek() == Some(&'-') => {
+                out.push(' ');
+                while let Some(&n) = chars.peek() {
+                    if n == '\n' {
+                        break;
+                    }
+                    chars.next();
+                    out.push(' ');
+                }
+            }
+            // Block comment `/* … */`.
+            '/' if chars.peek() == Some(&'*') => {
+                out.push(' ');
+                chars.next();
+                out.push(' ');
+                while let Some(n) = chars.next() {
+                    out.push(' ');
+                    if n == '*' && chars.peek() == Some(&'/') {
+                        chars.next();
+                        out.push(' ');
+                        break;
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Whether `word` appears in `haystack` as a whole word (delimited by non-word
+/// chars), not merely as a substring. `haystack` is assumed already lowercased.
+fn has_word(haystack: &str, word: &str) -> bool {
+    haystack
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|tok| tok == word)
+}
+
+/// The report shell's inline stylesheet — a neutral, light/dark base the model's
+/// `style="…"` can build on. No external fonts/assets (the CSP forbids them).
+const REPORT_STYLE: &str = concat!(
+    "<style>",
+    ":root{color-scheme:light dark}",
+    "*{box-sizing:border-box}",
+    "body{margin:0;padding:32px 24px;max-width:1100px;margin-inline:auto;",
+    "font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;",
+    "background:#fff;color:#1a1a1a}",
+    "h1{font-size:22px}h2{font-size:17px;margin-top:1.6em}",
+    "table{border-collapse:collapse;width:100%;margin:12px 0;font-variant-numeric:tabular-nums}",
+    "th,td{padding:7px 12px;text-align:left;border-bottom:1px solid #e5e7eb}",
+    "th{background:#f6f7f9;font-weight:600}",
+    "tbody tr:nth-child(even){background:#fafbfc}",
+    "code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#f3f4f6;border-radius:4px}",
+    "code{padding:1px 5px}pre{padding:12px;overflow:auto}",
+    "@media(prefers-color-scheme:dark){",
+    "body{background:#0f1115;color:#e6e6e6}",
+    "th,td{border-bottom-color:#262a31}th{background:#161a20}",
+    "tbody tr:nth-child(even){background:#13161b}",
+    "code,pre{background:#1b2028}}",
+    "</style>",
+);
+
+/// Wrap an AI-authored report body in a sandboxed, themed HTML document (Feature C).
+/// The safety boundary is a strict Content-Security-Policy: `default-src 'none'`
+/// blocks ALL scripts (inline and remote), remote fetches, and remote
+/// images/CSS/fonts/frames; `style-src 'unsafe-inline'` allows the model's inline
+/// styling; `img-src data:` allows inline (data-URI) images and SVG. So even if the
+/// body (or a value injected from the data) smuggles a `<script>` or a remote URL,
+/// the browser neither runs nor loads it. `<script>` blocks are also stripped
+/// defensively, belt-and-suspenders.
+fn wrap_report_html(title: Option<&str>, body: &str) -> String {
+    let title = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or("Red — report");
+    let t = escape_html_text(title);
+    let safe_body = strip_scripts(body);
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; \
+         style-src 'unsafe-inline'; img-src data:\">\
+         <title>{t}</title>{REPORT_STYLE}</head><body>{safe_body}</body></html>\n"
+    )
+}
+
+/// Remove `<script>…</script>` blocks (case-insensitive) from `html`. Defensive
+/// only — the report's CSP already forbids script execution; this just keeps the
+/// rendered document clean. An unterminated `<script` drops the remainder.
+fn strip_scripts(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0;
+    while i < html.len() {
+        if lower[i..].starts_with("<script") {
+            match lower[i..].find("</script>") {
+                Some(rel) => {
+                    i += rel + "</script>".len();
+                    continue;
+                }
+                None => break,
+            }
+        }
+        let ch = html[i..].chars().next().expect("char at boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Escape the HTML-significant characters in plain text (used for the report
+/// `<title>`); local to the service since the driver's escaper isn't reachable here.
+fn escape_html_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// The stable grounding instruction, tailored to the access tier (M-S7). Shared
@@ -902,14 +1081,16 @@ pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
         }
         AiTier::Read => {
             "You have read-only tools: list_schema, describe_table, run_select (capped SELECTs), \
-             explain, and generate_report (render a capped SELECT to an HTML report opened in the \
-             user's browser — use it when the user asks for a report). Use them to ground every \
-             answer in the live database rather than guessing — discover objects with list_schema, \
-             inspect structure with describe_table, and read data with run_select. Prefer small, \
-             targeted queries with explicit columns and LIMIT."
+             explain, open_query (open a SQL query in a new editor tab in the user's workspace — a \
+             read-only SELECT runs automatically), and generate_report (you author an HTML report \
+             from data you've read, and it opens in the user's browser — use it when the user asks \
+             for a report). Use them to ground every answer in the live database rather than \
+             guessing — discover objects with list_schema, inspect structure with describe_table, \
+             and read data with run_select. Use open_query to hand the user a query to explore in \
+             the grid. Prefer small, targeted queries with explicit columns and LIMIT."
         }
         AiTier::Write => {
-            "You have the read tools (list_schema, describe_table, run_select, explain, \
+            "You have the read tools (list_schema, describe_table, run_select, explain, open_query, \
              generate_report) AND a gated write tool, propose_write, for a SINGLE \
              INSERT/UPDATE/DELETE. Every propose_write call requires the user's explicit Allow on \
              the exact SQL — assume it may be denied, and never batch or chain statements. \
@@ -953,6 +1134,13 @@ pub(crate) fn user_turn(message: &str, ctx: &AiContext) -> String {
         s.push_str("Earlier in this conversation (for context):\n");
         s.push_str(prior.trim());
         s.push_str("\n\n---\n\n");
+    }
+    if let Some(tab) = ctx.current_tab.as_deref().filter(|s| !s.trim().is_empty()) {
+        s.push_str("The user is currently viewing tab ");
+        s.push_str(tab.trim());
+        s.push_str(
+            ". When they say \"this\"/\"the current tab/query/result\", they mean this.\n\n",
+        );
     }
     if let Some(sql) = ctx.editor_sql.as_deref().filter(|s| !s.trim().is_empty()) {
         s.push_str("Current editor SQL:\n```sql\n");
@@ -1118,7 +1306,8 @@ mod tests {
                 "describe_table",
                 "run_select",
                 "explain",
-                "generate_report"
+                "generate_report",
+                "open_query"
             ]
         );
     }
@@ -1164,25 +1353,19 @@ mod tests {
                 "describe_table",
                 "run_select",
                 "explain",
-                "generate_report"
+                "generate_report",
+                "open_query"
             ]
         );
     }
 
     #[tokio::test]
-    async fn generate_report_writes_an_html_file_and_announces_it() {
+    async fn generate_report_wraps_ai_html_and_announces_it() {
         use futures::StreamExt;
 
-        // A tiny fixture DB.
+        // generate_report renders model-authored HTML — no DB call. A no-op driver is
+        // enough (the tool never touches it).
         let db = std::env::temp_dir().join(format!("red-gr-{}.db", uuid::Uuid::new_v4().simple()));
-        {
-            let conn = rusqlite::Connection::open(&db).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE t (id INTEGER, name TEXT);
-                 INSERT INTO t VALUES (1, 'alpha'), (2, 'beta');",
-            )
-            .unwrap();
-        }
         let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let sink = ReportSink::new(tx, None, 7);
@@ -1190,16 +1373,19 @@ mod tests {
         let (content, ok) = run_tool(
             &driver,
             "generate_report",
-            &json!({ "sql": "SELECT id, name FROM t ORDER BY id", "title": "Widgets" }),
+            &json!({
+                "title": "Widgets",
+                "html": "<h1>Top widgets</h1><p>alpha leads beta.</p>\
+                         <script>fetch('http://evil')</script>",
+            }),
             &AiPolicy::default(),
             &CancelToken::new(),
             &sink,
         )
         .await;
         assert!(ok, "expected success, got: {content}");
-        assert!(content.contains("Generated report"));
+        assert!(content.contains("Generated the report"));
 
-        // The announced path is a real, well-formed HTML file with the data.
         let (_session, event) = rx.next().await.expect("an AiReportReady event");
         let Event::AiReportReady {
             conversation_id,
@@ -1211,13 +1397,19 @@ mod tests {
         assert_eq!(conversation_id, 7);
         let html = std::fs::read_to_string(&path).unwrap();
         assert!(html.starts_with("<!doctype html>"));
-        assert!(html.contains("alpha") && html.contains("beta"));
+        // The model's body is present and the title is carried through.
+        assert!(html.contains("<h1>Top widgets</h1>"));
+        assert!(html.contains("Widgets"));
+        // Sandboxed: a strict CSP is set and the smuggled <script> is stripped.
+        assert!(html.contains("Content-Security-Policy"));
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("evil"));
 
-        // A non-SELECT is refused, and nothing is announced.
+        // An empty body is refused, and nothing is announced.
         let (_content, ok) = run_tool(
             &driver,
             "generate_report",
-            &json!({ "sql": "DELETE FROM t" }),
+            &json!({ "html": "   " }),
             &AiPolicy::default(),
             &CancelToken::new(),
             &sink,
@@ -1253,6 +1445,13 @@ mod tests {
         assert!(rejected("UPDATE t SET a=1 WHERE id=1; DROP TABLE t"));
         // A read query isn't a write.
         assert!(rejected("SELECT * FROM t"));
+        // A `where` inside a string literal or comment is NOT a real WHERE — the
+        // statement is still an unqualified mutation and must be blocked.
+        assert!(rejected("UPDATE t SET note = 'see where you go'"));
+        assert!(rejected("DELETE FROM t -- delete where id = 1"));
+        // Conversely, a real WHERE with a `;` inside a string literal is a single,
+        // qualified statement — allowed (the `;` isn't statement chaining).
+        assert!(allowed("UPDATE t SET note = 'a;b' WHERE id = 1"));
     }
 
     #[test]
@@ -1320,6 +1519,147 @@ mod tests {
         // Resolving a stale/unknown id is a harmless no-op.
         st.resolve_permission(id, false);
         st.resolve_permission(424242, false);
+    }
+
+    /// A scripted `AiProvider`: the first turn requests `propose_write` with `sql`,
+    /// the second ends the turn. Lets the test drive the API-key write round-trip
+    /// without a network or a real model.
+    struct ScriptedWrite {
+        calls: std::sync::atomic::AtomicUsize,
+        sql: String,
+    }
+
+    #[async_trait::async_trait]
+    impl red_ai::AiProvider for ScriptedWrite {
+        async fn stream_turn(
+            &self,
+            _req: &red_ai::TurnRequest,
+            _tx: &tokio::sync::mpsc::UnboundedSender<red_ai::Delta>,
+            _cancel: &CancelToken,
+        ) -> red_ai::Result<red_ai::TurnOutcome> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (content, stop_reason) = if n == 0 {
+                (
+                    vec![ContentBlock::ToolUse {
+                        id: "w1".into(),
+                        name: "propose_write".into(),
+                        input: json!({ "sql": self.sql }),
+                    }],
+                    StopReason::ToolUse,
+                )
+            } else {
+                (
+                    vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                    StopReason::EndTurn,
+                )
+            };
+            Ok(red_ai::TurnOutcome {
+                message: Message {
+                    role: Role::Assistant,
+                    content,
+                },
+                stop_reason,
+                usage: red_ai::Usage::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn api_key_write_is_gated_by_approval_then_executes() {
+        use futures::StreamExt;
+
+        let db = std::env::temp_dir().join(format!("red-bw-{}.db", uuid::Uuid::new_v4().simple()));
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO t VALUES (1, 'before');",
+            )
+            .unwrap();
+        }
+        // Writable connection at the Write tier.
+        let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, false));
+        let provider: Arc<dyn red_ai::AiProvider> = Arc::new(ScriptedWrite {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            sql: "UPDATE t SET name = 'after' WHERE id = 1".into(),
+        });
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let state = Arc::new(Mutex::new(AiState::default()));
+        let policy = AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        };
+
+        // Read the current `name` through the driver (a fresh windowed fetch).
+        let name_now = |driver: Arc<dyn DatabaseDriver>| async move {
+            let abort = AbortSignal::new();
+            let page = driver
+                .fetch_page(
+                    "SELECT name FROM t WHERE id = 1",
+                    0,
+                    1,
+                    PageCap::Display { key: None },
+                    &abort,
+                )
+                .await
+                .unwrap();
+            page.rows[0][0].to_string()
+        };
+
+        let turn = tokio::spawn(run_turn(
+            provider,
+            driver.clone(),
+            tx,
+            state.clone(),
+            None,
+            1,
+            "m".into(),
+            false,
+            policy,
+            "change it".into(),
+            AiContext::default(),
+            CancelToken::new(),
+        ));
+
+        // The first thing the user sees is the write-approval prompt, carrying the
+        // exact SQL — the write has NOT run yet.
+        let request_id = tokio::time::timeout(Duration::from_secs(5), async {
+            // The very first event must be the approval prompt — nothing runs first.
+            match rx.next().await.expect("an event").1 {
+                Event::AiPermissionRequest {
+                    request_id, detail, ..
+                } => {
+                    assert!(detail
+                        .unwrap_or_default()
+                        .contains("UPDATE t SET name = 'after'"));
+                    request_id
+                }
+                _ => panic!("the write must prompt before doing anything"),
+            }
+        })
+        .await
+        .expect("a permission prompt arrives");
+        assert!(name_now(driver.clone()).await.contains("before"));
+
+        // Approve → the write runs and the turn completes.
+        lock(&state).resolve_permission(request_id, true);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    rx.next().await.expect("an event").1,
+                    Event::AiTurnFinished { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the turn finishes after approval");
+        turn.await.unwrap();
+
+        assert!(name_now(driver).await.contains("after"));
     }
 
     #[test]

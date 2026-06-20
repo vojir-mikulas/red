@@ -683,12 +683,6 @@ impl AppState {
                 grid.on_ready(columns, total, key);
             }
         }
-        // A one-click report queued against this result (Feature C): now that the
-        // rows have landed, stream them to a themed HTML file and open it.
-        if self.report_after_epoch == Some(epoch) {
-            self.report_after_epoch = None;
-            self.start_html_report_export(epoch, cx);
-        }
         cx.notify();
     }
 
@@ -1104,54 +1098,6 @@ impl AppState {
         );
     }
 
-    /// Export the active result as a themed HTML report to a temp file and open it
-    /// in the browser (Feature C) — the "generate a report and view it" flow,
-    /// distinct from the save-to-disk CSV/JSON exports. No-op without a result.
-    pub(crate) fn export_html_report(&mut self, cx: &mut Context<Self>) {
-        let epoch = match &self.phase {
-            Phase::Connected(a) => a.active_result().map(|g| g.epoch),
-            _ => None,
-        };
-        if let Some(epoch) = epoch {
-            self.start_html_report_export(epoch, cx);
-        }
-    }
-
-    /// Begin a temp-file HTML report export for `epoch` and remember to open it in
-    /// the browser once `ExportFinished` lands. Shared by the grid affordance and
-    /// the agent tab's one-click report.
-    pub(crate) fn start_html_report_export(&mut self, epoch: u64, cx: &mut Context<Self>) {
-        let total = match &self.phase {
-            Phase::Connected(a) => a
-                .active_result()
-                .filter(|g| g.epoch == epoch)
-                .map(|g| g.total_rows())
-                .unwrap_or(0),
-            _ => 0,
-        };
-        let id = self.next_export_id;
-        self.next_export_id += 1;
-        let path = std::env::temp_dir().join(format!("red-report-{id}.html"));
-        self.report_export_ids.push(id);
-        self.send_active(Command::Export {
-            format: ExportFormat::Html,
-            path,
-            epoch,
-            id,
-        });
-        self.push_notification(
-            Notification {
-                id: 0,
-                variant: ToastVariant::Info,
-                message: "Generating report… 0%".into(),
-                auto_dismiss: None,
-                export: Some(ExportProgress { id, rows: 0, total }),
-            },
-            cx,
-        );
-        cx.notify();
-    }
-
     // --- export progress events ---
 
     /// The notification id of the export toast carrying `export_id`, if it's still
@@ -1194,27 +1140,6 @@ impl AppState {
         if let Some(nid) = self.export_notification_id(id) {
             self.dismiss(nid, cx);
         }
-        // An HTML *report* opens in the browser rather than just toasting a path.
-        if let Some(pos) = self.report_export_ids.iter().position(|&x| x == id) {
-            self.report_export_ids.remove(pos);
-            match crate::app::open_in_os(std::path::Path::new(&path)) {
-                Ok(()) => {
-                    self.notify(
-                        ToastVariant::Success,
-                        format!("Opened report ({rows} row(s))"),
-                        cx,
-                    );
-                }
-                Err(e) => {
-                    self.notify(
-                        ToastVariant::Error,
-                        format!("Report saved to {path}, but couldn't open it: {e}"),
-                        cx,
-                    );
-                }
-            }
-            return;
-        }
         self.notify(
             ToastVariant::Success,
             format!("Exported {rows} row(s) to {path}"),
@@ -1224,7 +1149,6 @@ impl AppState {
 
     /// `ExportCancelled`: drop the progress toast, leave an auto-dismissing notice.
     pub(crate) fn on_export_cancelled(&mut self, id: u64, cx: &mut Context<Self>) {
-        self.report_export_ids.retain(|&x| x != id);
         if let Some(nid) = self.export_notification_id(id) {
             self.dismiss(nid, cx);
         }

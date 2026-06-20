@@ -17,6 +17,7 @@
 
 mod acp;
 mod ai;
+mod audit;
 mod dispatch;
 mod mcp;
 mod protocol;

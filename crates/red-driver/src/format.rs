@@ -79,12 +79,10 @@ impl<W: Write> ExportWriter<W> {
             }
             ExportFormat::Json => write!(out, "[")?,
             ExportFormat::Html => {
-                write!(out, "{HTML_HEAD}")?;
-                write!(out, "<thead><tr>")?;
-                for name in &names {
-                    write!(out, "<th>{}</th>", html_escape(name))?;
-                }
-                writeln!(out, "</tr></thead><tbody>")?;
+                // A streamed grid export carries no model-supplied title; the
+                // generate_report tool renders titled reports via `render_html_report`.
+                write!(out, "{}", html_head(None))?;
+                write!(out, "{}", html_thead(&names))?;
             }
         }
         Ok(Self {
@@ -139,14 +137,7 @@ impl<W: Write> ExportWriter<W> {
     pub(crate) fn finish(mut self) -> io::Result<u64> {
         match self.format {
             ExportFormat::Json => write!(self.out, "\n]\n")?,
-            ExportFormat::Html => {
-                let plural = if self.written == 1 { "" } else { "s" };
-                writeln!(
-                    self.out,
-                    "</tbody></table><p class=\"meta\">{} row{plural}</p></main></body></html>",
-                    self.written
-                )?;
-            }
+            ExportFormat::Html => write!(self.out, "{}", html_foot(self.written))?,
             ExportFormat::Csv => {}
         }
         self.out.flush()?;
@@ -159,13 +150,11 @@ impl<W: Write> ExportWriter<W> {
     }
 }
 
-/// The HTML report's document head: a self-contained, themed shell (inline CSS,
-/// light/dark via `prefers-color-scheme`, sticky header, zebra rows) up to the
-/// opening `<table>`. No external assets, so the file opens anywhere offline.
-const HTML_HEAD: &str = concat!(
-    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
-    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
-    "<title>Red — query report</title><style>",
+/// The HTML report's inline stylesheet: a self-contained, themed shell (light/dark
+/// via `prefers-color-scheme`, sticky header, zebra rows). No external assets, so a
+/// report opens anywhere offline.
+const HTML_STYLE: &str = concat!(
+    "<style>",
     ":root{color-scheme:light dark}",
     "*{box-sizing:border-box}",
     "body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;",
@@ -188,9 +177,44 @@ const HTML_HEAD: &str = concat!(
     "th{background:#161a20;border-bottom-color:#262a31}",
     "tbody tr:nth-child(even){background:#13161b}",
     "tbody tr:hover{background:#1b2130}.null{color:#6b7280}}",
-    "</style></head><body><main><h1>Red — query report</h1>",
-    "<div class=\"table-wrap\"><table>",
+    "</style>",
 );
+
+/// The default report heading when the caller (or model) supplies no title.
+const DEFAULT_REPORT_TITLE: &str = "Red — query report";
+
+/// The HTML report's document head up to the opening `<table>`: the doctype, the
+/// inline style, and the `<h1>` heading. `title` sets both the browser `<title>` and
+/// the visible heading (escaped); `None` uses [`DEFAULT_REPORT_TITLE`].
+fn html_head(title: Option<&str>) -> String {
+    let title = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or(DEFAULT_REPORT_TITLE);
+    let t = html_escape(title);
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>{t}</title>{HTML_STYLE}</head><body><main><h1>{t}</h1>\
+         <div class=\"table-wrap\"><table>"
+    )
+}
+
+/// The `<thead>` row for the report's columns (escaped names).
+fn html_thead(names: &[String]) -> String {
+    let mut s = String::from("<thead><tr>");
+    for name in names {
+        s.push_str(&format!("<th>{}</th>", html_escape(name)));
+    }
+    s.push_str("</tr></thead><tbody>\n");
+    s
+}
+
+/// The report's closing: the row-count footer and the document close.
+fn html_foot(rows: u64) -> String {
+    let plural = if rows == 1 { "" } else { "s" };
+    format!("</tbody></table><p class=\"meta\">{rows} row{plural}</p></main></body></html>\n")
+}
 
 /// One HTML cell's inner content: NULL renders as a dim italic marker, blobs as a
 /// length marker, everything else HTML-escaped text.

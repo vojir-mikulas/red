@@ -6283,7 +6283,9 @@ dependencies = [
 name = "red-service"
 version = "0.7.0"
 dependencies = [
+ "async-trait",
  "bytes",
+ "dirs 5.0.1",
  "futures",
  "http-body-util",
  "hyper",

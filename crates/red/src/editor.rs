@@ -427,26 +427,6 @@ impl AppState {
                     .ok();
             })
             .children(tabs);
-        // A "✨" opens an AI agent tab — a natural-language worksheet peer of a
-        // query tab (Feature A). Offered only while the assistant is enabled for
-        // this connection (M-S7); pinned left of the "＋".
-        let agent_btn = self.ai_enabled().then(|| {
-            div()
-                .id("sql-new-agent")
-                .flex_shrink_0()
-                .w(px(34.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .border_l_1()
-                .border_color(border)
-                .cursor_pointer()
-                .tooltip(Tooltip::text("New AI agent tab"))
-                .text_color(faint)
-                .hover(|s| s.bg(bg_elevated).text_color(text))
-                .on_click(cx.listener(|this, _, _, cx| this.new_agent_tab(cx)))
-                .child(crate::icons::icon("sparkles", theme.scale(13.), faint))
-        });
         // The "＋" stays pinned right of the scrolling tabs, always reachable.
         let tabstrip = div()
             .flex_shrink_0()
@@ -457,7 +437,6 @@ impl AppState {
             .border_b_1()
             .border_color(border)
             .child(tab_viewport)
-            .children(agent_btn)
             .child(
                 div()
                     .id("sql-new")
@@ -497,21 +476,6 @@ impl AppState {
                 .child(tabstrip)
                 .child(empty);
         };
-
-        // An AI agent tab (Feature A) renders the conversation in place of the SQL
-        // editor + run bar; its inline result grid is the host tab's `result`, drawn
-        // in the pane below by the shell. The tab strip stays the header.
-        if let Some(agent) = tab.agent.as_ref() {
-            let body = self.render_agent_tab(agent, cx);
-            return div()
-                .relative()
-                .size_full()
-                .flex()
-                .flex_col()
-                .bg(bg_app)
-                .child(tabstrip)
-                .child(body);
-        }
 
         // --- breadcrumb: connection › query ---
         let breadcrumb = div()

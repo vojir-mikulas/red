@@ -327,7 +327,8 @@ mod tests {
                 "describe_table",
                 "run_select",
                 "explain",
-                "generate_report"
+                "generate_report",
+                "open_query"
             ]
         );
     }

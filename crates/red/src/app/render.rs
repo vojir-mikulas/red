@@ -197,20 +197,6 @@ impl Render for AppState {
             }
         }
 
-        // An AI agent tab just opened / became active; focus its composer.
-        if self.focus_agent_input {
-            self.focus_agent_input = false;
-            if let Phase::Connected(active) = &self.phase {
-                if let Some(handle) = active
-                    .active()
-                    .and_then(|t| t.agent.as_ref())
-                    .map(|a| a.input.focus_handle(cx))
-                {
-                    window.focus(&handle, cx);
-                }
-            }
-        }
-
         // An inline conversation rename just began; focus its edit field.
         if self.focus_rename {
             self.focus_rename = false;
