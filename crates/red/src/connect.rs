@@ -161,9 +161,9 @@ impl AppState {
 
         let theme = cx.theme();
 
-        // The brand lockup: the square mark beside the wordmark, centered. Both take
-        // the accent so they re-tint with the active theme (`red.svg` renders as an
-        // accent-masked square).
+        // The brand lockup: the square mark beside the wordmark, centered. The mark
+        // is pinned to the brand red (`red.svg` renders as a masked square) so it
+        // reads as "Red" regardless of the active theme's accent.
         let header = div()
             .flex()
             .items_center()
@@ -174,7 +174,7 @@ impl AppState {
                     .path("red.svg")
                     .size(theme.scale(40.))
                     .flex_none()
-                    .text_color(theme.accent),
+                    .text_color(gpui::rgb(0xdc2626)),
             )
             .child(
                 // The wordmark sits in the primary text color (white on the dark

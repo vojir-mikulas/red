@@ -222,6 +222,15 @@ fn numbered_item(line: &str) -> Option<&str> {
         .map(str::trim)
 }
 
+/// Max source lines rendered for one code block — one element is built per line, so
+/// an unbounded block (a model dumping a huge file) would build thousands of nodes
+/// every repaint. Past this a summary row stands in.
+const MAX_CODE_LINES: usize = 400;
+
+/// Max body rows rendered for one Markdown table. The result grid is the place for
+/// large result sets; a chat table is a summary, so cap it and note the remainder.
+const MAX_TABLE_ROWS: usize = 200;
+
 fn render_block(block: &Block, theme: &Theme) -> AnyElement {
     match block {
         Block::Paragraph(text) => div()
@@ -249,9 +258,17 @@ fn render_block(block: &Block, theme: &Theme) -> AnyElement {
                 .font_family(theme.mono_family.clone())
                 .text_size(theme.scale(11.5))
                 .text_color(theme.text);
-            for line in code.lines() {
+            for line in code.lines().take(MAX_CODE_LINES) {
                 // A non-breaking-ish line: render each source line as its own row.
                 block = block.child(div().child(line.to_string()));
+            }
+            let total = code.lines().count();
+            if total > MAX_CODE_LINES {
+                block = block.child(
+                    div()
+                        .text_color(theme.text_muted)
+                        .child(format!("… {} more lines", total - MAX_CODE_LINES)),
+                );
             }
             block.into_any_element()
         }
@@ -297,8 +314,24 @@ fn render_block(block: &Block, theme: &Theme) -> AnyElement {
                 .overflow_hidden()
                 .text_size(theme.scale(11.5));
             table = table.child(table_row(headers, theme, true));
-            for row in rows {
-                table = table.child(table_row(row, theme, false));
+            // Normalize every body row to the header's column count so a ragged row
+            // (more/fewer cells than the header) can't skew the grid, and cap the
+            // number of rows rendered.
+            let cols = headers.len();
+            for row in rows.iter().take(MAX_TABLE_ROWS) {
+                let cells: Vec<String> = (0..cols)
+                    .map(|i| row.get(i).cloned().unwrap_or_default())
+                    .collect();
+                table = table.child(table_row(&cells, theme, false));
+            }
+            if rows.len() > MAX_TABLE_ROWS {
+                table = table.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_color(theme.text_muted)
+                        .child(format!("… {} more rows", rows.len() - MAX_TABLE_ROWS)),
+                );
             }
             table.into_any_element()
         }

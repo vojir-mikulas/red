@@ -73,12 +73,33 @@ pub(crate) struct AcpManager {
     pending: HashMap<u64, oneshot::Sender<bool>>,
     /// Monotonic id handed to each surfaced permission prompt.
     next_request_id: u64,
+    /// Crash-restart bookkeeping per conversation, so a reliably-crashing agent
+    /// can't be re-spawned on every turn (see [`AcpManager::allow_restart`]). Kept
+    /// after the `Conversation` itself is dropped — that's the point: it has to
+    /// outlive the dead agent to bound how often it comes back.
+    restarts: HashMap<u64, RestartTracker>,
 }
 
 /// Cap on outstanding (un-answered) permission prompts. The UI serializes one
 /// prompt at a time; a higher number means an agent is spamming requests — deny
 /// the overflow rather than let the map grow without bound.
 const MAX_PENDING_PERMISSIONS: usize = 32;
+
+/// How many crash-restarts a single conversation may take within
+/// [`RESTART_WINDOW`] before further restarts are refused until the window rolls
+/// over. Starting an agent spawns a subprocess and binds a fresh MCP port, so a
+/// crash-on-every-prompt agent would otherwise thrash both on each turn.
+const RESTART_MAX: u32 = 5;
+
+/// The rolling window over which [`RESTART_MAX`] is counted. Long enough to catch a
+/// crash loop, short enough that a transient failure clears on its own.
+const RESTART_WINDOW: Duration = Duration::from_secs(60);
+
+/// Per-conversation crash-restart counter over a rolling [`RESTART_WINDOW`].
+struct RestartTracker {
+    count: u32,
+    window_start: Instant,
+}
 
 impl AcpManager {
     /// Cancel the in-flight turn for a conversation, if it exists.
@@ -107,6 +128,28 @@ impl AcpManager {
         self.next_request_id += 1;
         self.pending.insert(id, decide);
         Some(id)
+    }
+
+    /// Record a crash-restart for `conversation_id` and report whether another is
+    /// within budget ([`RESTART_MAX`] per [`RESTART_WINDOW`]). Past the budget the
+    /// caller refuses the turn instead of re-spawning, so a crash-on-every-prompt
+    /// agent can't thrash a subprocess + MCP bind on each send; the window rolls
+    /// over on its own, so a later genuine retry isn't blocked forever.
+    fn allow_restart(&mut self, conversation_id: u64) -> bool {
+        let now = Instant::now();
+        let tracker = self
+            .restarts
+            .entry(conversation_id)
+            .or_insert(RestartTracker {
+                count: 0,
+                window_start: now,
+            });
+        if now.duration_since(tracker.window_start) > RESTART_WINDOW {
+            tracker.count = 0;
+            tracker.window_start = now;
+        }
+        tracker.count += 1;
+        tracker.count <= RESTART_MAX
     }
 
     /// Answer a parked permission prompt (the panel's Allow/Deny). A stale id (the
@@ -172,6 +215,7 @@ impl AcpManager {
     /// agent subprocess and MCP port now rather than waiting for the idle sweep.
     /// Dropping the `Conversation` unwinds the same way as [`Self::evict_session`].
     pub(crate) fn forget(&mut self, conversation_id: u64) {
+        self.restarts.remove(&conversation_id);
         if self.conversations.remove(&conversation_id).is_some() {
             tracing::debug!("forgetting closed ACP conversation {conversation_id}");
         }
@@ -191,6 +235,7 @@ impl AcpManager {
             );
             self.conversations.clear();
         }
+        self.restarts.clear();
     }
 }
 
@@ -380,10 +425,22 @@ async fn ensure_conversation(
     // Restart on crash (M-S3): a conversation whose connection task has ended
     // (agent exited / crashed) can't serve another turn, so drop it and fall
     // through to a fresh start — a new agent session, so grounding re-folds.
-    if let Some(c) = guard.conversations.get(&conversation_id) {
-        if !c.agent.is_alive() {
-            tracing::debug!("ACP conversation {conversation_id} died — restarting");
-            guard.conversations.remove(&conversation_id);
+    if guard
+        .conversations
+        .get(&conversation_id)
+        .is_some_and(|c| !c.agent.is_alive())
+    {
+        tracing::debug!("ACP conversation {conversation_id} died — restarting");
+        guard.conversations.remove(&conversation_id);
+        // Bound crash-restarts: a reliably-crashing agent would otherwise re-spawn a
+        // subprocess + MCP bind on every prompt. Past the budget, refuse this turn.
+        if !guard.allow_restart(conversation_id) {
+            return Err(format!(
+                "the assistant agent has crashed repeatedly ({RESTART_MAX} times within \
+                 {}s) and won't be restarted again right now. Check the agent command in \
+                 Settings, then try again shortly.",
+                RESTART_WINDOW.as_secs()
+            ));
         }
     }
     if !guard.conversations.contains_key(&conversation_id) {

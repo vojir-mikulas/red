@@ -120,7 +120,19 @@ pub(crate) fn save(stem: &str, conv: &Conversation) -> Result<PathBuf> {
 
     let contents = serde_json::to_string_pretty(conv).context("serializing the conversation")?;
     let tmp = dest.with_extension(format!("json.tmp.{}", std::process::id()));
-    let mut file = std::fs::File::create(&tmp).context("creating the conversation temp file")?;
+    // Owner-only (0o600) on Unix: a transcript can quote query results the user
+    // asked about, so it's confidential even though no credentials land here — the
+    // same posture as the AI report/audit files. `rename` preserves the mode.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(&tmp)
+        .context("creating the conversation temp file")?;
     file.write_all(contents.as_bytes())?;
     file.sync_all()?;
     drop(file);

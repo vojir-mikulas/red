@@ -140,6 +140,14 @@ const AI_REQUEST_BASE: u64 = 1 << 48;
 /// past it, deny rather than grow the map. Mirrors the ACP manager's cap.
 const MAX_PENDING_PERMS: usize = 32;
 
+/// Cap on the report payload a `generate_report` call may embed (body HTML plus the
+/// serialized charts/data/filters). The model assembles `data` from already-capped
+/// query results, but nothing else bounds what it can echo — and the renderer
+/// builds one DOM node per row with no virtualization, so an oversized payload makes
+/// a multi-MB document that's slow (or hostile) to open in the browser. Past this we
+/// refuse and tell the model to narrow the report rather than write the file.
+const MAX_REPORT_BYTES: usize = 4 * 1024 * 1024;
+
 impl AiState {
     /// Record an in-flight turn's cancel token so `AiCancel` can reach it.
     pub(crate) fn register(&mut self, conversation_id: u64, token: CancelToken) {
@@ -726,8 +734,26 @@ pub(crate) async fn run_tool(
             if sql.is_empty() {
                 return ("error: `sql` is required".into(), false);
             }
-            match driver.explain(sql, false).await {
+            // Bound the wait like run_select. `explain(analyze=false)` only *plans*
+            // (it never executes the statement), and the trait gives it no abort
+            // seam, so on timeout we hand the model a clean error while the engine's
+            // plan call winds down on its own — it's plan-only, so it can't run away
+            // with data, only take a moment on a pathological statement.
+            let explain = driver.explain(sql, false);
+            let result = match limits.statement_timeout_ms {
+                0 => explain.await,
+                ms => tokio::time::timeout(Duration::from_millis(ms), explain)
+                    .await
+                    .unwrap_or(Err(RedError::Timeout)),
+            };
+            match result {
                 Ok(plan) => (format_plan(&plan), true),
+                Err(RedError::Timeout) => (
+                    "error: the EXPLAIN exceeded the agent's statement timeout — \
+                     simplify the statement."
+                        .into(),
+                    false,
+                ),
                 Err(e) => (format!("error: {e}"), false),
             }
         }
@@ -765,6 +791,23 @@ pub(crate) async fn run_tool(
                 .and_then(Json::as_array)
                 .map(|items| items.iter().filter(|c| c.is_object()).cloned().collect())
                 .unwrap_or_default();
+            // Refuse an oversized report before building the file: the renderer has
+            // no row virtualization, so a giant payload yields a sluggish document.
+            let payload_bytes = body.len()
+                + charts.iter().map(|c| c.to_string().len()).sum::<usize>()
+                + data.map_or(0, |d| d.to_string().len())
+                + filters.iter().map(|f| f.to_string().len()).sum::<usize>();
+            if payload_bytes > MAX_REPORT_BYTES {
+                return (
+                    format!(
+                        "error: the report is too large ({} KiB; the cap is {} KiB). Summarize or \
+                         aggregate the data, or narrow it with a tighter query, then try again.",
+                        payload_bytes / 1024,
+                        MAX_REPORT_BYTES / 1024,
+                    ),
+                    false,
+                );
+            }
             // Wrap the model's HTML in a sandboxed, themed shell (strict CSP) and
             // open it in the browser. With charts/data, the shell adds a nonce-gated
             // bundle and a `connect-src 'none'` (no-egress) policy. The active app
@@ -888,19 +931,47 @@ fn cap_result_bytes(mut content: String, max: usize) -> String {
 }
 
 /// A conservative read-only gate: the statement must be a single SELECT or a CTE
-/// that resolves to a SELECT, with no statement separator that could smuggle a
-/// write past the prefix check.
+/// that resolves to a SELECT, with no statement separator and no embedded write.
+///
+/// `run_select` runs on the *user's* connection, which is writable unless the
+/// connection itself was opened read-only — so this gate, not the engine, is what
+/// keeps a read-tier agent from mutating data. A naive "starts with SELECT/WITH"
+/// check is not enough: Postgres executes **data-modifying CTEs**
+/// (`WITH x AS (DELETE … RETURNING …) SELECT * FROM x`), and `SELECT … INTO` /
+/// `INTO OUTFILE` and sequence-advancing functions also write while leading with
+/// SELECT. So, like [`write_shape`], we reason about a **noise-stripped** copy
+/// (literals/quoted-identifiers/comments blanked) and reject any surviving write
+/// keyword — sharing `strip_sql_noise`/`has_word` so the read and write gates can't
+/// drift. False positives (a rejected legitimate read) are acceptable: the user can
+/// always run such a query by hand in a query tab. (Defense in depth: opening the
+/// AI's reads on an engine-level read-only connection would make this belt-and-
+/// suspenders — a worthwhile follow-up, but it needs a per-call driver seam.)
 fn is_read_only_select(sql: &str) -> bool {
-    let trimmed = sql.trim().trim_end_matches(';');
+    let stripped = strip_sql_noise(sql);
+    let trimmed = stripped.trim().trim_end_matches(';').trim();
     if trimmed.is_empty() {
         return false;
     }
-    // No embedded statement terminator (a `;` mid-string could chain a write).
+    // No embedded statement terminator (a `;` could chain a write past the prefix).
     if trimmed.contains(';') {
         return false;
     }
     let lower = trimmed.to_ascii_lowercase();
-    lower.starts_with("select") || lower.starts_with("with")
+    if !(lower.starts_with("select") || lower.starts_with("with")) {
+        return false;
+    }
+    // A statement that *starts* SELECT/WITH can still write. Reject if any write
+    // keyword survives noise-stripping as a whole-word token: the data-modifying
+    // CTE verbs (Postgres runs these), `INTO` (`SELECT … INTO new_table` /
+    // `INTO OUTFILE`/`DUMPFILE`), and the sequence-advancing functions. These verbs
+    // are reserved words, so they can't be bare column names in a real read; a
+    // column legitimately named one of them would be quoted, and quoting blanks it
+    // out before this check. (`FOR UPDATE` locking reads trip `update` and are
+    // rejected too — fine, the assistant browses, it doesn't lock.)
+    const WRITE_TOKENS: &[&str] = &[
+        "insert", "update", "delete", "merge", "into", "nextval", "setval",
+    ];
+    !WRITE_TOKENS.iter().any(|w| has_word(&lower, w))
 }
 
 /// The tools that never mutate data and so may run on any backend without the
@@ -1516,6 +1587,33 @@ mod tests {
         assert!(!is_read_only_select("DELETE FROM t"));
         assert!(!is_read_only_select("select 1; drop table t"));
         assert!(!is_read_only_select(""));
+    }
+
+    #[test]
+    fn read_only_gate_rejects_data_modifying_ctes_and_select_into() {
+        // A data-modifying CTE leads with WITH but Postgres executes the DELETE.
+        assert!(!is_read_only_select(
+            "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x"
+        ));
+        assert!(!is_read_only_select(
+            "with g as (update t set a=1 returning id) select * from g"
+        ));
+        assert!(!is_read_only_select(
+            "WITH n AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM n"
+        ));
+        // SELECT … INTO (Postgres creates a table) / INTO OUTFILE (MySQL writes a file).
+        assert!(!is_read_only_select("SELECT * INTO new_t FROM t"));
+        assert!(!is_read_only_select(
+            "SELECT * FROM t INTO OUTFILE '/tmp/x'"
+        ));
+        // Sequence-advancing functions write.
+        assert!(!is_read_only_select("SELECT nextval('s')"));
+        assert!(!is_read_only_select("select setval('s', 1)"));
+        // A write keyword merely *inside a literal or quoted identifier* is harmless
+        // and must NOT block a real read (noise is stripped before the check).
+        assert!(is_read_only_select("SELECT 'delete me' AS note FROM t"));
+        assert!(is_read_only_select(r#"SELECT "update" FROM t"#));
+        assert!(is_read_only_select("SELECT id FROM t WHERE c = 'a;b'"));
     }
 
     #[test]
