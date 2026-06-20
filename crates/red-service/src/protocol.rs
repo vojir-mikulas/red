@@ -567,6 +567,44 @@ pub struct AiContext {
     /// Whether this connection forbids writes — folded into the prompt so the
     /// model doesn't propose edits it can't run.
     pub read_only: bool,
+    /// The active Red/Flint theme's colors, so an AI-generated report can match
+    /// the app's look (Ayu Dark, GitHub Dark, …) instead of a generic light/dark
+    /// document. `None` falls back to the report's built-in light/dark (which
+    /// follows the OS). The UI fills it from the live `Theme`; only the
+    /// `generate_report` path reads it. Boxed so `AiContext` (which rides in the
+    /// `Command::AiTurn` variant) stays small.
+    pub theme: Option<Box<ReportTheme>>,
+}
+
+/// A snapshot of the active theme's colors as CSS color strings, handed to the
+/// report generator so the standalone HTML report (page, tables, charts, filter
+/// controls) is painted in Red's current palette. UI-agnostic on this side — the
+/// UI converts its `Hsla` tokens to CSS; the report shell + chart/table renderer
+/// just substitute them.
+#[derive(Debug, Clone)]
+pub struct ReportTheme {
+    /// Dark vs light, so the renderer picks matching shadows / `color-scheme`.
+    pub is_dark: bool,
+    /// Page background (the app's main surface).
+    pub bg: String,
+    /// Card / elevated surface (chart cards, table header, filter bar).
+    pub surface: String,
+    /// Primary text.
+    pub fg: String,
+    /// Secondary / muted text (axis ticks, counts, labels).
+    pub muted: String,
+    /// Hairline borders.
+    pub border: String,
+    /// Faint grid lines.
+    pub grid: String,
+    /// Hover / zebra background.
+    pub hover: String,
+    /// Brand accent (primary series, focus rings, links).
+    pub accent: String,
+    /// Translucent accent for focus-ring glow.
+    pub ring: String,
+    /// Categorical chart palette pulled from the theme's semantic colors.
+    pub palette: Vec<String>,
 }
 
 /// One streamed increment of an assistant turn (the `Event::AiDelta` payload).

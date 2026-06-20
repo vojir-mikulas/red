@@ -338,6 +338,10 @@ pub struct AiSettings {
     /// Default subscription-agent reasoning-level selector (opaque value id), same
     /// semantics as `subscription_model`.
     pub subscription_reasoning: String,
+    /// Default subscription-agent permission-mode selector (opaque value id) — the
+    /// agent's accept policy (default / accept edits / auto / bypass). Same
+    /// last-choice-wins semantics as `subscription_model`.
+    pub subscription_mode: String,
     /// Surface a summarized "thinking…" affordance while the model reasons.
     pub show_thinking: bool,
     /// Advanced: override the subscription agent's launch command. Empty falls
@@ -365,6 +369,7 @@ impl Default for AiSettings {
             model: "claude-opus-4-8".to_string(),
             subscription_model: String::new(),
             subscription_reasoning: String::new(),
+            subscription_mode: String::new(),
             show_thinking: false,
             agent_command: String::new(),
             agents: Vec::new(),

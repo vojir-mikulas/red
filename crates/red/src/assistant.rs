@@ -364,6 +364,13 @@ pub(crate) struct AssistantState {
     /// Which config selector's dropdown is currently open (its `config_id`), if any.
     /// `flint::Select` is stateless, so the open state lives here.
     pub(crate) open_config: Option<String>,
+    /// The most recent subscription session's advertised selectors (model / reasoning
+    /// / mode). An agent only advertises these once its session opens (on the first
+    /// turn), so a brand-new chat has none yet; the composer renders this cache as a
+    /// provisional set so the dropdowns show *before* the chat sends its first turn.
+    /// Replaced by the chat's own live options once its session opens. Empty until the
+    /// first subscription session of the process has run.
+    pub(crate) last_config_options: Vec<red_service::AiConfigOption>,
 }
 
 impl AssistantState {
@@ -528,6 +535,7 @@ impl AppState {
                 renaming: None,
                 completion_commands,
                 open_config: None,
+                last_config_options: Vec::new(),
             });
             self.focus_assistant = true;
         }
@@ -1130,6 +1138,11 @@ impl AppState {
         options: Vec<red_service::AiConfigOption>,
         cx: &mut Context<Self>,
     ) {
+        // Cache the live set so the next brand-new chat can render these selectors
+        // before it has opened its own session (see `last_config_options`).
+        if let Some(state) = self.assistant.as_mut() {
+            state.last_config_options = options.clone();
+        }
         let updated = self
             .with_chat_mut(conversation_id, |chat| chat.config_options = options)
             .is_some();
@@ -1148,6 +1161,7 @@ impl AppState {
     fn apply_default_config(&mut self, conversation_id: u64, cx: &mut Context<Self>) {
         let model = self.settings.ai.subscription_model.clone();
         let reasoning = self.settings.ai.subscription_reasoning.clone();
+        let mode = self.settings.ai.subscription_mode.clone();
         let Some(chat) = self
             .assistant
             .as_mut()
@@ -1159,7 +1173,7 @@ impl AppState {
             return;
         }
         chat.config_defaults_applied = true;
-        let to_apply = default_config_changes(&chat.config_options, &model, &reasoning);
+        let to_apply = default_config_changes(&chat.config_options, &model, &reasoning, &mode);
         for (config_id, value) in to_apply {
             self.send_set_config_option(conversation_id, config_id, value, cx);
         }
@@ -1188,6 +1202,15 @@ impl AppState {
                 category = Some(opt.category);
             }
         }
+        // Mirror the pick into the pre-session cache too, so a pick made before this
+        // chat opens its session (rendered from the cache) shows immediately and the
+        // category is still found when the chat has no live options yet.
+        for opt in &mut state.last_config_options {
+            if opt.id == config_id {
+                opt.current_value = value.clone();
+                category = category.or(Some(opt.category));
+            }
+        }
         // Persist as the central default for new chats (not retroactive).
         match category {
             Some(red_service::AiConfigCategory::Model) => {
@@ -1196,6 +1219,10 @@ impl AppState {
             }
             Some(red_service::AiConfigCategory::Reasoning) => {
                 self.settings.ai.subscription_reasoning = value.clone();
+                self.save_settings();
+            }
+            Some(red_service::AiConfigCategory::Mode) => {
+                self.settings.ai.subscription_mode = value.clone();
                 self.save_settings();
             }
             _ => {}
@@ -1567,6 +1594,8 @@ impl AppState {
                 active.config.kind, active.config.database
             ),
             read_only: active.config.read_only,
+            // Paint AI-generated reports in Red's active theme (Ayu, GitHub Dark, …).
+            theme: Some(Box::new(report_theme(cx.theme()))),
         }
     }
 
@@ -1582,14 +1611,24 @@ impl AppState {
     ) -> AnyElement {
         let streaming = chat.streaming;
         let open = state.open_config.clone();
+        // Before this chat opens its own session it has no advertised selectors yet;
+        // fall back to the last subscription session's set so the dropdowns still
+        // show. A pre-session pick persists via settings and applies on session open.
+        let options = if chat.config_options.is_empty() && self.agent_is_acp(&chat.provider) {
+            &state.last_config_options
+        } else {
+            &chat.config_options
+        };
         let mut row = div().flex().items_center().gap_1p5().min_w(px(0.));
         let mut any = false;
         for cat in [
             red_service::AiConfigCategory::Model,
             red_service::AiConfigCategory::Reasoning,
+            // The agent's permission mode (default / accept edits / auto / bypass),
+            // advertised as a `Mode` selector — round-trips like the others.
+            red_service::AiConfigCategory::Mode,
         ] {
-            let Some(opt) = chat
-                .config_options
+            let Some(opt) = options
                 .iter()
                 .find(|o| o.category == cat && !o.choices.is_empty())
             else {
@@ -1605,6 +1644,9 @@ impl AppState {
             let mut select = Select::new(SharedString::from(format!("ai-config-{}", opt.id)))
                 .selected(selected)
                 .open(is_open)
+                // Neutral, not accent-colored: these toolbar dropdowns shouldn't
+                // compete with the Send button for emphasis.
+                .accent(false)
                 .placeholder("Default");
             for choice in &opt.choices {
                 select = select.option(SharedString::from(choice.name.clone()));
@@ -1635,7 +1677,14 @@ impl AppState {
                     }
                 });
             }
-            row = row.child(div().when(streaming, |d| d.opacity(0.5)).child(select));
+            row = row.child(
+                div()
+                    // Each dropdown may shrink below its label width so all of them
+                    // (plus Send) fit the narrowest sidebar; the label truncates.
+                    .min_w(px(0.))
+                    .when(streaming, |d| d.opacity(0.5))
+                    .child(select),
+            );
         }
         if !any {
             return div().into_any_element();
@@ -1730,7 +1779,9 @@ impl AppState {
         let action: AnyElement = if chat.streaming {
             div()
                 .id("assistant-stop")
-                .size(px(30.))
+                .size(px(24.))
+                // Hold a square 1:1 regardless of how the toolbar row compresses.
+                .flex_shrink_0()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1740,13 +1791,15 @@ impl AppState {
                 .cursor_pointer()
                 .tooltip(flint::Tooltip::text("Stop (Esc)"))
                 .hover(|s| s.border_color(theme.red))
-                .child(crate::icons::icon("x", theme.scale(14.), theme.text_muted))
+                .child(crate::icons::icon("x", theme.scale(13.), theme.text_muted))
                 .on_click(cx.listener(|this, _, _, cx| this.cancel_assistant(cx)))
                 .into_any_element()
         } else {
             div()
                 .id("assistant-send")
-                .size(px(30.))
+                .size(px(24.))
+                // Hold a square 1:1 regardless of how the toolbar row compresses.
+                .flex_shrink_0()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1757,7 +1810,7 @@ impl AppState {
                     "Send (Enter · Shift+Enter for a new line)",
                 ))
                 .hover(|s| s.opacity(0.9))
-                .child(crate::icons::icon("send", theme.scale(15.), theme.bg_app))
+                .child(crate::icons::icon("send", theme.scale(13.), theme.bg_app))
                 .on_click(cx.listener(|this, _, _, cx| this.submit_assistant(cx)))
                 .into_any_element()
         };
@@ -2756,12 +2809,14 @@ fn default_config_changes(
     options: &[red_service::AiConfigOption],
     model_default: &str,
     reasoning_default: &str,
+    mode_default: &str,
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for opt in options {
         let default = match opt.category {
             red_service::AiConfigCategory::Model => model_default,
             red_service::AiConfigCategory::Reasoning => reasoning_default,
+            red_service::AiConfigCategory::Mode => mode_default,
             _ => continue,
         };
         if default.is_empty() || default == opt.current_value {
@@ -2948,6 +3003,45 @@ const TITLE_CAP: usize = 60;
 /// Keeps the most recent turns (the tail), which is what a follow-up references.
 const SEED_CAP: usize = 6_000;
 
+/// An `Hsla` as a CSS color string (`hsl(h s% l%)`, with `/ a` when translucent),
+/// so the active theme's tokens can be dropped straight into a report's CSS.
+fn css_color(c: gpui::Hsla) -> String {
+    let (h, s, l) = (c.h * 360.0, c.s * 100.0, c.l * 100.0);
+    if c.a >= 0.999 {
+        format!("hsl({h:.1} {s:.1}% {l:.1}%)")
+    } else {
+        format!("hsl({h:.1} {s:.1}% {l:.1}% / {:.3})", c.a)
+    }
+}
+
+/// Snapshot the active Flint theme into a [`red_service::ReportTheme`] so an
+/// AI-generated report is painted in Red's current palette (page, tables, chart
+/// cards, filter bar) instead of a generic light/dark document. The categorical
+/// chart palette is pulled from the theme's semantic colors, led by the accent.
+fn report_theme(t: &flint::Theme) -> red_service::ReportTheme {
+    red_service::ReportTheme {
+        is_dark: t.bg_app.l < 0.5,
+        bg: css_color(t.bg_app),
+        surface: css_color(t.bg_elevated),
+        fg: css_color(t.text),
+        muted: css_color(t.text_muted),
+        border: css_color(t.border),
+        grid: css_color(t.border_soft),
+        hover: css_color(t.bg_hover),
+        accent: css_color(t.accent),
+        ring: css_color(t.accent_ghost),
+        palette: vec![
+            css_color(t.accent),
+            css_color(t.blue),
+            css_color(t.green),
+            css_color(t.orange),
+            css_color(t.purple),
+            css_color(t.cyan),
+            css_color(t.yellow),
+        ],
+    }
+}
+
 /// Expand a `/report …` composer shortcut into an explicit instruction so the agent
 /// reads the data and calls `generate_report`. Returns `None` for a non-`/report`
 /// message (sent verbatim). A bare `/report` still asks for a report of whatever's
@@ -2965,10 +3059,12 @@ fn expand_slash_report(message: &str) -> Option<String> {
     };
     Some(format!(
         "{ask}\n\nRead the data you need with run_select, then call the generate_report tool with \
-         the report written as HTML — a heading, a short summary, and the relevant table(s). Where \
-         a visual helps, add interactive charts via the tool's `charts` argument (Chart.js config \
-         objects) and reference them with <div data-red-chart=\"INDEX\"></div> placeholders. Open \
-         it for me."
+         the report written as HTML — a heading and a short summary. Where a visual helps, add \
+         interactive charts via the `charts` argument and reference them with \
+         <div data-red-chart=\"INDEX\"></div> placeholders. If the user would benefit from \
+         exploring the rows, put the data in the `data` argument as a named dataset and drop a \
+         <div data-red-table=\"NAME\"></div> placeholder for a searchable/sortable table (and bind \
+         charts to that dataset so filters update them). Open it for me."
     ))
 }
 
@@ -3104,25 +3200,33 @@ mod tests {
             current_value: "default".into(),
             choices: vec![choice("default"), choice("hard")],
         };
-        let opts = vec![model, reasoning];
+        let mode = red_service::AiConfigOption {
+            id: "mode".into(),
+            name: "Mode".into(),
+            category: red_service::AiConfigCategory::Mode,
+            current_value: "default".into(),
+            choices: vec![choice("default"), choice("acceptEdits"), choice("bypass")],
+        };
+        let opts = vec![model, reasoning, mode];
 
-        // A valid, different model default applies; an empty reasoning default is left.
+        // A valid, different model default applies; empty reasoning/mode defaults are left.
         assert_eq!(
-            default_config_changes(&opts, "opus", ""),
+            default_config_changes(&opts, "opus", "", ""),
             vec![("model".to_string(), "opus".to_string())]
         );
-        // Both apply when both differ.
+        // All three apply when each differs.
         assert_eq!(
-            default_config_changes(&opts, "haiku", "hard"),
+            default_config_changes(&opts, "haiku", "hard", "acceptEdits"),
             vec![
                 ("model".to_string(), "haiku".to_string()),
                 ("reasoning".to_string(), "hard".to_string()),
+                ("mode".to_string(), "acceptEdits".to_string()),
             ]
         );
         // A default equal to the current pick is a no-op; an unknown value is ignored.
-        assert!(default_config_changes(&opts, "auto", "nonexistent").is_empty());
+        assert!(default_config_changes(&opts, "auto", "nonexistent", "default").is_empty());
         // No stored defaults → nothing to apply.
-        assert!(default_config_changes(&opts, "", "").is_empty());
+        assert!(default_config_changes(&opts, "", "", "").is_empty());
     }
 
     #[test]

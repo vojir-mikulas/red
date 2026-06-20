@@ -24,7 +24,7 @@ use serde_json::{json, Value as Json};
 use tokio::sync::oneshot;
 
 use crate::dispatch::{emit, Events};
-use crate::protocol::{AiContext, AiDelta, AiUsage};
+use crate::protocol::{AiContext, AiDelta, AiUsage, ReportTheme};
 use crate::{Event, SessionId};
 
 /// A small, UI-agnostic announcer the `generate_report` tool uses to hand a
@@ -37,14 +37,24 @@ pub(crate) struct ReportSink {
     events: Option<Events>,
     session: Option<SessionId>,
     conversation_id: u64,
+    /// The active app theme, so `generate_report` can paint the report in Red's
+    /// colors. Captured when the sink is built (per turn on the API-key path; at
+    /// conversation start on the subscription path).
+    theme: Option<ReportTheme>,
 }
 
 impl ReportSink {
-    pub(crate) fn new(events: Events, session: Option<SessionId>, conversation_id: u64) -> Self {
+    pub(crate) fn new(
+        events: Events,
+        session: Option<SessionId>,
+        conversation_id: u64,
+        theme: Option<ReportTheme>,
+    ) -> Self {
         Self {
             events: Some(events),
             session,
             conversation_id,
+            theme,
         }
     }
 
@@ -55,7 +65,13 @@ impl ReportSink {
             events: None,
             session: None,
             conversation_id: 0,
+            theme: None,
         }
+    }
+
+    /// The theme to paint the report with, if the UI supplied one.
+    fn theme(&self) -> Option<&ReportTheme> {
+        self.theme.as_ref()
     }
 
     /// Announce a freshly-written report so the UI opens it.
@@ -211,8 +227,14 @@ pub(crate) async fn run_turn(
     // The tier decides which tools the model is even offered (M-S7): `off` grounds
     // nothing, `schema` withholds row data, `read` is the full catalog.
     let tools = tool_catalog(&policy);
-    // Where `generate_report` delivers its file so the UI opens it (Feature C).
-    let report = ReportSink::new(events.clone(), session, conversation_id);
+    // Where `generate_report` delivers its file so the UI opens it (Feature C);
+    // carries the active theme so the report matches Red's colors.
+    let report = ReportSink::new(
+        events.clone(),
+        session,
+        conversation_id,
+        context.theme.as_deref().cloned(),
+    );
 
     // Seed the conversation with the grounded user message and pull the running
     // history so a follow-up keeps prior context.
@@ -527,18 +549,39 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
                 Chart.js v4 config objects — and reference each one from the body with an empty \
                 <div data-red-chart=\"INDEX\"></div> placeholder (INDEX is the chart's position \
                 in the array). The charts are rendered by a trusted built-in Chart.js; you supply \
-                DATA only (no JavaScript/function callbacks — they are ignored). Prefer charts \
-                over inline <svg> when the user wants something interactive. \
+                DATA only (no JavaScript/function callbacks — they are ignored). \
+                For INTERACTIVE TABLES the user can search/sort/filter, pass `data` — named \
+                datasets of {columns, rows} — and drop a <div data-red-table=\"NAME\"></div> \
+                placeholder; the user gets a live filter box, click-to-sort headers, and per-column \
+                filters. A chart can BIND to a dataset instead of carrying inline data — give it \
+                {\"dataset\":\"NAME\",\"type\":\"bar\",\"x\":\"colName\",\"y\":[\"colA\"]} — and it \
+                re-draws automatically when the user filters that dataset's table. \
+                For DASHBOARD-style controls (like Grafana variables) that drive EVERY table and \
+                bound chart at once, pass `filters` — e.g. a multi-select to show only chosen \
+                regions: {\"column\":\"Region\",\"type\":\"multiselect\"}. They render as a control \
+                bar at the top of the report. Prefer this (data + bound charts + a table + \
+                filters) when the user wants to explore/slice the data; prefer inline-data charts \
+                for a fixed visual. \
                 Use this when the user asks for a report."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "html": { "type": "string", "description": "The report BODY as self-contained HTML (no <html>/<head>/<body> wrapper — that's added). Reference any charts with <div data-red-chart=\"INDEX\"></div> placeholders." },
+                    "html": { "type": "string", "description": "The report BODY as self-contained HTML (no <html>/<head>/<body> wrapper — that's added). Reference charts with <div data-red-chart=\"INDEX\"></div> and interactive tables with <div data-red-table=\"NAME\"></div> placeholders." },
                     "title": { "type": "string", "description": "Report title (browser tab + heading)." },
                     "charts": {
                         "type": "array",
-                        "description": "Optional interactive charts. Each item is a Chart.js v4 config object, e.g. {\"type\":\"bar\",\"data\":{\"labels\":[…],\"datasets\":[{\"label\":\"Revenue\",\"data\":[…]}]},\"options\":{…}}. type is one of bar, line, pie, doughnut, radar, polarArea, scatter, bubble. Provide data only — no functions/callbacks. Place a <div data-red-chart=\"INDEX\"></div> in the html body for each.",
+                        "description": "Optional interactive charts. Each item is EITHER a full Chart.js v4 config with inline data, e.g. {\"type\":\"bar\",\"data\":{\"labels\":[…],\"datasets\":[{\"label\":\"Revenue\",\"data\":[…]}]},\"options\":{…}}, OR a dataset binding {\"dataset\":\"NAME\",\"type\":\"bar\",\"x\":\"colName\",\"y\":[\"col1\",\"col2\"],\"aggregate\":\"sum\",\"options\":{…}} that derives its data from a named `data` dataset and follows that table's filters. type is one of bar, line, pie, doughnut, radar, polarArea, scatter, bubble. aggregate (sum/avg/min/max/count/none, default none) groups rows sharing an x value. Data only — no functions/callbacks. Place a <div data-red-chart=\"INDEX\"></div> in the body for each.",
+                        "items": { "type": "object" },
+                    },
+                    "data": {
+                        "type": "object",
+                        "description": "Optional named datasets for interactive tables and filter-linked charts, e.g. {\"sales\":{\"columns\":[\"Month\",\"Region\",\"Revenue\"],\"rows\":[[\"Jan\",\"NA\",120],[\"Feb\",\"EU\",90]]}}. Each value is {columns:[string], rows:[[cell,…]]} (cells are strings/numbers/null). Reference a dataset with <div data-red-table=\"sales\"></div> for a searchable/sortable table, and/or bind charts to it via {\"dataset\":\"sales\",…}.",
+                        "additionalProperties": { "type": "object" },
+                    },
+                    "filters": {
+                        "type": "array",
+                        "description": "Optional report-wide filter controls (Grafana-style variables) that filter EVERY table and bound chart. Each is {\"column\":\"Region\",\"type\":\"multiselect\",\"label\":\"Region\",\"dataset\":\"sales\",\"default\":[…]}. type: multiselect (checkbox dropdown — pick which values to show; this is the 'show only selected regions' control), select (single value), range (numeric min/max), or search (substring). column must exist in the dataset(s); omit `dataset` to apply to all datasets that have that column. `default` pre-selects values (multiselect/select). They appear in a bar at the top; no body placeholder needed (optionally place <div data-red-filters></div> to position it).",
                         "items": { "type": "object" },
                     },
                 },
@@ -710,10 +753,23 @@ pub(crate) async fn run_tool(
                 .and_then(Json::as_array)
                 .map(|items| items.iter().filter(|c| c.is_object()).cloned().collect())
                 .unwrap_or_default();
+            // Optional named datasets for interactive (filterable/sortable) tables
+            // and filter-linked charts. Kept only if it's an object map; embedded as
+            // inert data and rendered client-side by the trusted bundle.
+            let data = input.get("data").filter(|v| v.is_object());
+            // Optional report-wide filter controls (Grafana-style variables): a bar
+            // of multiselect/select/range/search controls bound to dataset columns
+            // that drive every table and bound chart at once. Objects only.
+            let filters: Vec<Json> = input
+                .get("filters")
+                .and_then(Json::as_array)
+                .map(|items| items.iter().filter(|c| c.is_object()).cloned().collect())
+                .unwrap_or_default();
             // Wrap the model's HTML in a sandboxed, themed shell (strict CSP) and
-            // open it in the browser. With charts, the shell adds a nonce-gated
-            // Chart.js bundle and a `connect-src 'none'` (no-egress) policy.
-            let html = wrap_report_html(title, body, &charts);
+            // open it in the browser. With charts/data, the shell adds a nonce-gated
+            // bundle and a `connect-src 'none'` (no-egress) policy. The active app
+            // theme (if any) paints the report in Red's palette.
+            let html = wrap_report_html(title, body, &charts, data, &filters, report.theme());
             let path = std::env::temp_dir()
                 .join(format!("red-report-{}.html", uuid::Uuid::new_v4().simple()));
             match write_report_file(&path, &html) {
@@ -1064,6 +1120,57 @@ const REPORT_STYLE: &str = concat!(
     "</style>",
 );
 
+/// The report's base document style. With a `theme` (the active Red palette) the
+/// page, tables and code blocks are painted in Red's colors and pinned to its
+/// light/dark; without one, fall back to [`REPORT_STYLE`] (built-in, OS-driven).
+fn report_style(theme: Option<&ReportTheme>) -> String {
+    let Some(th) = theme else {
+        return REPORT_STYLE.to_string();
+    };
+    let scheme = if th.is_dark { "dark" } else { "light" };
+    format!(
+        "<style>:root{{color-scheme:{scheme}}}*{{box-sizing:border-box}}\
+         body{{margin:0;padding:32px 24px;max-width:1100px;margin-inline:auto;\
+         font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;\
+         background:{bg};color:{fg}}}\
+         h1{{font-size:22px}}h2{{font-size:17px;margin-top:1.6em}}a{{color:{accent}}}\
+         table{{border-collapse:collapse;width:100%;margin:12px 0;font-variant-numeric:tabular-nums}}\
+         th,td{{padding:7px 12px;text-align:left;border-bottom:1px solid {border}}}\
+         th{{background:{surface};font-weight:600}}\
+         tbody tr:nth-child(even){{background:{hover}}}\
+         code,pre{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:{surface};border-radius:4px}}\
+         code{{padding:1px 5px}}pre{{padding:12px;overflow:auto}}</style>",
+        bg = th.bg,
+        fg = th.fg,
+        accent = th.accent,
+        border = th.border,
+        surface = th.surface,
+        hover = th.hover,
+    )
+}
+
+/// Serialize the theme into the report's inert data payload so the chart/table/
+/// filter renderer paints in the same colors. Built by hand (rather than deriving
+/// `Serialize`) to keep `ReportTheme` a plain data type and the key names explicit.
+fn report_theme_json(theme: Option<&ReportTheme>) -> Json {
+    match theme {
+        None => Json::Null,
+        Some(th) => json!({
+            "is_dark": th.is_dark,
+            "bg": th.bg,
+            "surface": th.surface,
+            "fg": th.fg,
+            "muted": th.muted,
+            "border": th.border,
+            "grid": th.grid,
+            "hover": th.hover,
+            "accent": th.accent,
+            "ring": th.ring,
+            "palette": th.palette,
+        }),
+    }
+}
+
 /// Write a finished report to `path`, owner-readable only (`0600` on Unix). A
 /// report can carry real query data, and on a shared temp dir (Linux `/tmp`) a
 /// world-readable file would let another local user read it — so restrict it at
@@ -1097,45 +1204,68 @@ const REPORT_CHARTS_JS: &str = include_str!("../assets/report-charts.js");
 /// the browser neither runs nor loads it. `<script>` blocks are also stripped
 /// defensively, belt-and-suspenders.
 ///
-/// When the model supplies `charts`, the report gains interactivity (Chart.js):
-/// the specs are embedded as inert `application/json` DATA the model authors, and
-/// our trusted bundle (the only thing carrying the CSP `nonce`) renders them. The
-/// CSP keeps the hole tight: scripts run only with the nonce (so the model cannot
-/// inject runnable code), and `connect-src 'none'` denies all network egress (so
-/// even the trusted bundle cannot exfiltrate the data it charts). The specs are
-/// pure data fed to Chart.js, which never evals them.
-fn wrap_report_html(title: Option<&str>, body: &str, charts: &[Json]) -> String {
+/// When the model supplies `charts` or `data`, the report gains interactivity:
+/// the specs/datasets/filters are embedded as inert `application/json` DATA the
+/// model authors, and our trusted bundle (the only thing carrying the CSP `nonce`)
+/// renders interactive charts (Chart.js), filterable/sortable tables over the
+/// embedded `data`, and a report-wide filter bar (`filters`) that slices every
+/// table and bound chart at once. The CSP keeps the hole tight: scripts run only with the nonce
+/// (so the model cannot inject runnable code), and `connect-src 'none'` denies all
+/// network egress (so even the trusted bundle cannot exfiltrate the data, and all
+/// filtering happens client-side over what's already embedded — never a callback
+/// to the database). The payload is pure data; the bundle never evals it and
+/// writes every table cell via `textContent`.
+fn wrap_report_html(
+    title: Option<&str>,
+    body: &str,
+    charts: &[Json],
+    data: Option<&Json>,
+    filters: &[Json],
+    theme: Option<&ReportTheme>,
+) -> String {
     let title = title
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .unwrap_or("Red — report");
     let t = red_driver::html_escape(title);
     let safe_body = strip_scripts(body);
+    // The base document style — Red's active theme if the UI supplied one, else
+    // the built-in light/dark (follows the OS).
+    let style = report_style(theme);
 
-    if charts.is_empty() {
+    let has_data = data
+        .and_then(Json::as_object)
+        .is_some_and(|o| !o.is_empty());
+    if charts.is_empty() && !has_data {
         return format!(
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
              <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
              <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; \
              style-src 'unsafe-inline'; img-src data:\">\
-             <title>{t}</title>{REPORT_STYLE}</head><body>{safe_body}</body></html>\n"
+             <title>{t}</title>{style}</head><body>{safe_body}</body></html>\n"
         );
     }
 
     // Unguessable per-report nonce — only our bundle carries it, so a `<script>`
     // smuggled through the body or a spec value has no valid nonce and won't run.
     let nonce = uuid::Uuid::new_v4().simple().to_string();
-    let data = json!({ "charts": charts }).to_string();
+    let payload = json!({
+        "charts": charts,
+        "data": data.cloned().unwrap_or(Json::Null),
+        "filters": filters,
+        "theme": report_theme_json(theme),
+    })
+    .to_string();
     // Neutralize `</script>` breakout from the inert data block; `<` parses
     // back to `<` under JSON.parse, so the data round-trips intact.
-    let data = data.replace('<', "\\u003c");
+    let data = payload.replace('<', "\\u003c");
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; \
          script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; img-src data:; \
          connect-src 'none'\">\
-         <title>{t}</title>{REPORT_STYLE}</head><body>{safe_body}\
+         <title>{t}</title>{style}</head><body>{safe_body}\
          <script id=\"red-report-data\" type=\"application/json\">{data}</script>\
          <script nonce=\"{nonce}\">{REPORT_CHARTS_JS}</script></body></html>\n"
     )
@@ -1471,7 +1601,7 @@ mod tests {
         let db = std::env::temp_dir().join(format!("red-gr-{}.db", uuid::Uuid::new_v4().simple()));
         let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let sink = ReportSink::new(tx, None, 7);
+        let sink = ReportSink::new(tx, None, 7, None);
 
         let (content, ok) = run_tool(
             &driver,
@@ -1530,7 +1660,7 @@ mod tests {
         let db = std::env::temp_dir().join(format!("red-grc-{}.db", uuid::Uuid::new_v4().simple()));
         let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let sink = ReportSink::new(tx, None, 11);
+        let sink = ReportSink::new(tx, None, 11, None);
 
         let (content, ok) = run_tool(
             &driver,
@@ -1576,6 +1706,96 @@ mod tests {
         assert!(html.contains("\\u003c/script>"));
         // Non-object chart entries are filtered out of the embedded payload.
         assert!(!html.contains("not-a-chart"));
+    }
+
+    #[tokio::test]
+    async fn generate_report_with_data_embeds_datasets_for_interactive_tables() {
+        use futures::StreamExt;
+
+        let db = std::env::temp_dir().join(format!("red-grd-{}.db", uuid::Uuid::new_v4().simple()));
+        let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let sink = ReportSink::new(tx, None, 13, None);
+
+        let (content, ok) = run_tool(
+            &driver,
+            "generate_report",
+            &json!({
+                "title": "Sales",
+                "html": "<h1>Sales</h1><div data-red-table=\"sales\"></div>",
+                "data": {
+                    "sales": {
+                        "columns": ["Month", "Region", "Revenue"],
+                        "rows": [["Jan", "NA", 120], ["Feb", "EU", 90]],
+                    },
+                },
+            }),
+            &AiPolicy::default(),
+            &CancelToken::new(),
+            &sink,
+        )
+        .await;
+        assert!(ok, "expected success, got: {content}");
+
+        let (_session, event) = rx.next().await.expect("an AiReportReady event");
+        let Event::AiReportReady { path, .. } = event else {
+            panic!("expected AiReportReady");
+        };
+        let html = std::fs::read_to_string(&path).unwrap();
+
+        // `data` alone (no charts) still triggers the interactive, no-egress shell.
+        assert!(html.contains("script-src 'nonce-"));
+        assert!(html.contains("connect-src 'none'"));
+        assert!(html.contains("<script nonce="));
+        // The dataset is embedded as inert data for client-side filtering.
+        assert!(html.contains("id=\"red-report-data\" type=\"application/json\""));
+        assert!(html.contains("\"sales\""));
+        assert!(html.contains("Revenue"));
+    }
+
+    #[tokio::test]
+    async fn generate_report_embeds_report_wide_filters() {
+        use futures::StreamExt;
+
+        let db = std::env::temp_dir().join(format!("red-grf-{}.db", uuid::Uuid::new_v4().simple()));
+        let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let sink = ReportSink::new(tx, None, 17, None);
+
+        let (content, ok) = run_tool(
+            &driver,
+            "generate_report",
+            &json!({
+                "title": "Sales",
+                "html": "<h1>Sales</h1><div data-red-table=\"sales\"></div>",
+                "data": {
+                    "sales": {
+                        "columns": ["Month", "Region", "Revenue"],
+                        "rows": [["Jan", "NA", 120], ["Feb", "EU", 90]],
+                    },
+                },
+                "filters": [
+                    { "column": "Region", "type": "multiselect" },
+                    "not-an-object",
+                ],
+            }),
+            &AiPolicy::default(),
+            &CancelToken::new(),
+            &sink,
+        )
+        .await;
+        assert!(ok, "expected success, got: {content}");
+
+        let (_session, event) = rx.next().await.expect("an AiReportReady event");
+        let Event::AiReportReady { path, .. } = event else {
+            panic!("expected AiReportReady");
+        };
+        let html = std::fs::read_to_string(&path).unwrap();
+        // The filter definition rides in the inert payload (non-object dropped).
+        assert!(html.contains("\"filters\""));
+        assert!(html.contains("multiselect"));
+        assert!(!html.contains("not-an-object"));
+        assert!(html.contains("connect-src 'none'"));
     }
 
     #[test]
