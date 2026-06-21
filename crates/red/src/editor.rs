@@ -448,7 +448,7 @@ impl AppState {
                     .border_l_1()
                     .border_color(border)
                     .cursor_pointer()
-                    .tooltip(Tooltip::text("New tab  ⌘T"))
+                    .tooltip(Tooltip::text(crate::keymap::localize_hint("New tab  ⌘T")))
                     .text_color(faint)
                     .hover(|s| s.bg(bg_elevated).text_color(text))
                     .on_click(cx.listener(|this, _, _, cx| this.new_query(cx)))
@@ -539,7 +539,7 @@ impl AppState {
             .border_t_1()
             .border_color(border)
             .child(
-                Button::new("sql-run", "Run  ⌘↵")
+                Button::new("sql-run", crate::keymap::localize_hint("Run  ⌘↵"))
                     .variant(ButtonVariant::Primary)
                     .size(ButtonSize::Sm)
                     .icon(crate::icons::icon("play", theme.scale(11.), on_accent))

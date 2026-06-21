@@ -303,7 +303,10 @@ pub(crate) struct Notification {
 
 /// The default editor text a fresh query tab opens with. A tab still holding
 /// exactly this (and no result) is "pristine" — closing it needs no confirmation.
+#[cfg(target_os = "macos")]
 pub(crate) const EMPTY_QUERY: &str = "-- Write SQL, ⌘↵ to run\n";
+#[cfg(not(target_os = "macos"))]
+pub(crate) const EMPTY_QUERY: &str = "-- Write SQL, Ctrl+Enter to run\n";
 
 /// One query tab: its own SQL editor and result grid. A connection holds several
 /// of these; the schema sidebar, split sizes, and query history are shared.

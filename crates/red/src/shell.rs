@@ -71,7 +71,7 @@ impl AppState {
             crate::icons::icon("settings", theme.scale(16.), theme.text_muted),
         )
         .size(IconButtonSize::Sm)
-        .tooltip("Settings  ⌘,")
+        .tooltip(crate::keymap::localize_hint("Settings  ⌘,"))
         .a11y_label("Settings")
         .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
 
@@ -329,7 +329,9 @@ impl AppState {
             .size(px(20.))
             .rounded(px(4.))
             .cursor_pointer()
-            .tooltip(Tooltip::text("Toggle sidebar  ⌘B"))
+            .tooltip(Tooltip::text(crate::keymap::localize_hint(
+                "Toggle sidebar  ⌘B",
+            )))
             .hover(|s| s.bg(theme.bg_elevated))
             .child(crate::icons::icon(
                 if active.sidebar_collapsed {
@@ -357,7 +359,7 @@ impl AppState {
             .size(px(20.))
             .rounded(px(4.))
             .cursor_pointer()
-            .tooltip(Tooltip::text("Toggle agent  ⌘L"))
+            .tooltip(Tooltip::text(crate::keymap::localize_hint("Toggle agent  ⌘L")))
             .hover(|s| s.bg(theme.bg_elevated))
             .child(crate::icons::icon(
                 "sparkles",

@@ -460,6 +460,15 @@ impl AppState {
             PaletteItem::new("cmd:keymap-file", "keymap: customize keybindings"),
             Cmd::OpenKeymapFile,
         ));
+
+        // The hints above are written as macOS glyphs; localize them to the host
+        // platform (a no-op on macOS) so Windows/Linux show `Ctrl+…`, matching the
+        // keys that actually fire. Harmless on non-shortcut hints (left untouched).
+        for (item, _) in &mut out {
+            if let Some(hint) = item.hint.take() {
+                item.hint = Some(crate::keymap::localize_hint(&hint).into());
+            }
+        }
         out
     }
 

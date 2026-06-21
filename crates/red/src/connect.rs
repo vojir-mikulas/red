@@ -131,7 +131,7 @@ impl AppState {
             crate::icons::icon("settings", cx.theme().scale(16.), cx.theme().text_muted),
         )
         .size(IconButtonSize::Sm)
-        .tooltip("Settings  ⌘,")
+        .tooltip(crate::keymap::localize_hint("Settings  ⌘,"))
         .a11y_label("Settings")
         .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
 
@@ -454,7 +454,7 @@ impl AppState {
                     .border_1()
                     .border_color(theme.border)
                     .font_family(theme.mono_family.clone())
-                    .child("⌘N"),
+                    .child(crate::keymap::localize_hint("⌘N")),
             )
             .on_click(cx.listener(|this, _, _, cx| this.open_new_form(cx)))
     }

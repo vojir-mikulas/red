@@ -828,7 +828,7 @@ impl AppState {
         let mut menu = ContextMenu::new("result-cell-menu")
             .item(
                 ContextMenuItem::new("cell-inspect", "Inspect")
-                    .shortcut("⌘I")
+                    .shortcut(crate::keymap::localize_hint("⌘I"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.cell_menu = None;
                         this.open_inspector(cx);
@@ -837,7 +837,7 @@ impl AppState {
             )
             .item(
                 ContextMenuItem::new("cell-copy", "Copy")
-                    .shortcut("⌘C")
+                    .shortcut(crate::keymap::localize_hint("⌘C"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.cell_menu = None;
                         this.copy_result_selection(cx);
@@ -857,7 +857,7 @@ impl AppState {
                 )
                 .item(
                     ContextMenuItem::new("cell-null", "Set NULL")
-                        .shortcut("⌥⌘0")
+                        .shortcut(crate::keymap::localize_hint("⌥⌘0"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.cell_menu = None;
                             this.set_cell_null(cx);
@@ -868,7 +868,7 @@ impl AppState {
         if editable_browse {
             menu = menu.item(
                 ContextMenuItem::new("row-delete", "Toggle row deletion")
-                    .shortcut("⌘⌫")
+                    .shortcut(crate::keymap::localize_hint("⌘⌫"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.cell_menu = None;
                         this.toggle_delete_rows(cx);

@@ -745,7 +745,7 @@ impl AppState {
                                 .font_family(theme.mono_family.clone())
                                 .text_size(theme.scale(11.5))
                                 .text_color(theme.text)
-                                .child(keys),
+                                .child(crate::keymap::localize_hint(keys)),
                         ),
                 );
             }

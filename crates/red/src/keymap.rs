@@ -16,8 +16,9 @@
 //! - `RedRoot` — app-chrome actions (tabs, sidebar, copy) that should fire from
 //!   any focus *within* the app, since `RedRoot` is an ancestor of every pane.
 //!
-//! The bindings use `cmd-*` unconditionally, matching the rest of the app's
-//! macOS-first chrome; per-platform `ctrl-*` splitting is a follow-up.
+//! The table is written in canonical `cmd-*` form, but [`platform_chord`] rewrites
+//! the `cmd` modifier to GPUI's `secondary` at bind time, so each key fires as Cmd
+//! on macOS and Ctrl on Windows/Linux. Hints follow suit via [`localize_hint`].
 //!
 //! **Re-applying.** [`apply`] is total: it `clear_key_bindings`, re-installs the
 //! Flint component keymaps, the defaults, and the overrides, every time. That is
@@ -198,6 +199,86 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
             ],
         ),
     ]
+}
+
+/// Rewrite RED's canonical `cmd-*` chords onto the key GPUI actually matches per
+/// platform. `cmd` is the primary modifier (the Cmd key) only on macOS; on
+/// Windows/Linux a bare `cmd` token binds the Win/Super key, which the OS owns —
+/// so every default would be dead there. GPUI's `secondary` token resolves to
+/// Cmd on macOS and Ctrl elsewhere, so swapping the `cmd` component for it makes
+/// the bindings fire as the user expects on every platform. `ctrl`, `alt`,
+/// `shift` and literal-`ctrl` chords (`ctrl-tab`, `ctrl-g`) are left alone — they
+/// mean the same physical key everywhere. Applied at the single bind chokepoint
+/// ([`bind_named`]) so defaults *and* `keymap.toml` overrides get the same
+/// treatment; the canonical `cmd-*` form is what the editor and file still use.
+fn platform_chord(chord: &str) -> String {
+    chord
+        .split(' ')
+        .map(|step| {
+            step.split('-')
+                .map(|part| {
+                    if part.eq_ignore_ascii_case("cmd") {
+                        "secondary"
+                    } else {
+                        part
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("-")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Localize a pre-rendered macOS-glyph shortcut hint (`⌘⇧F`, `⌥⌘1`, `⌃Tab`) to
+/// the host platform. A no-op on macOS; on Windows/Linux it spells the modifier
+/// glyphs (`Ctrl`/`Alt`/`Shift`, with the `⌘` primary folded onto `Ctrl` to match
+/// what [`platform_chord`] binds) and `+`-joins them, e.g. `⌘⇧F` → `Ctrl+Shift+F`.
+/// Non-modifier glyphs (arrows, `↵`) and plain text pass through unchanged, so it
+/// is safe to run over any hint string — including ones with no shortcut at all.
+pub(crate) fn localize_hint(hint: &str) -> String {
+    if cfg!(target_os = "macos") {
+        return hint.to_string();
+    }
+    hint.split(' ')
+        .map(localize_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Localize one whitespace-delimited token of a hint: peel any leading modifier
+/// glyphs, then spell + `+`-join them ahead of the remaining key text. A token
+/// with no leading modifier (a separator, an arrow, plain text) is returned as is.
+fn localize_token(token: &str) -> String {
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut rest = token;
+    loop {
+        let mut chars = rest.chars();
+        match chars.next() {
+            // `⌘` (primary) and `⌃` (literal ctrl) both render as Ctrl off macOS.
+            Some('⌘') | Some('⌃') => ctrl = true,
+            Some('⌥') => alt = true,
+            Some('⇧') => shift = true,
+            _ => break,
+        }
+        rest = chars.as_str();
+    }
+    if !(ctrl || alt || shift) {
+        return token.to_string();
+    }
+    // A stable, conventional order regardless of how the source glyphs were written.
+    let mods = [(ctrl, "Ctrl"), (alt, "Alt"), (shift, "Shift")]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect::<Vec<_>>()
+        .join("+");
+    if rest.is_empty() {
+        mods
+    } else {
+        format!("{mods}+{rest}")
+    }
 }
 
 /// One default binding and the metadata the keymap editor needs to present it.
@@ -529,7 +610,11 @@ pub(crate) fn apply(cx: &mut App, overrides: &[KeymapBlock]) -> Vec<String> {
     // Dev-only perf HUD toggle (⌥⌘P). Re-bound here so a keymap reload's clear
     // doesn't drop it; the action itself is declared in `main` under the feature.
     #[cfg(feature = "dev-stats")]
-    cx.bind_keys([KeyBinding::new("cmd-alt-p", crate::ToggleDevStats, None)]);
+    cx.bind_keys([KeyBinding::new(
+        &platform_chord("cmd-alt-p"),
+        crate::ToggleDevStats,
+        None,
+    )]);
 
     let mut warnings = Vec::new();
     let user = user_bindings(overrides, &mut warnings);
@@ -618,6 +703,10 @@ fn make_binding(
 /// new` panics on a bad keystroke/context, so callers binding user input must
 /// validate those first (see [`make_binding`]); [`DEFAULTS`] is known-good.
 fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<KeyBinding, String> {
+    // Bind the platform-resolved chord (`cmd` → `secondary`), not the canonical
+    // form, so the key fires as Cmd on macOS and Ctrl on Windows/Linux.
+    let keystroke = platform_chord(keystroke);
+    let keystroke = keystroke.as_str();
     macro_rules! kb {
         ($action:expr) => {
             KeyBinding::new(keystroke, $action, context)
@@ -674,6 +763,49 @@ mod tests {
     #[test]
     fn all_defaults_resolve() {
         assert_eq!(default_bindings().len(), DEFAULTS.len());
+    }
+
+    #[test]
+    fn platform_chord_rewrites_only_cmd() {
+        // `cmd` becomes GPUI's platform-resolving `secondary`; other modifiers and
+        // literal-`ctrl` chords are untouched.
+        assert_eq!(platform_chord("cmd-k"), "secondary-k");
+        assert_eq!(platform_chord("cmd-shift-f"), "secondary-shift-f");
+        assert_eq!(platform_chord("cmd-alt-1"), "secondary-alt-1");
+        assert_eq!(platform_chord("cmd-,"), "secondary-,");
+        assert_eq!(platform_chord("ctrl-tab"), "ctrl-tab");
+        assert_eq!(platform_chord("ctrl-shift-tab"), "ctrl-shift-tab");
+        assert_eq!(platform_chord("f2"), "f2");
+    }
+
+    #[test]
+    fn platform_chord_every_default_parses() {
+        // The rewritten form must still be a keystroke GPUI accepts, on any host.
+        for d in DEFAULTS {
+            for token in platform_chord(d.keystroke).split_whitespace() {
+                assert!(
+                    Keystroke::parse(token).is_ok(),
+                    "rewritten default {:?} → {:?} is unparseable",
+                    d.keystroke,
+                    token
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn localize_token_spells_modifiers() {
+        // `localize_token` is the off-macOS path: glyph runs become `+`-joined words
+        // in a stable Ctrl/Alt/Shift order, key glyphs pass through, `⌘`/`⌃` fold.
+        assert_eq!(localize_token("⌘⇧F"), "Ctrl+Shift+F");
+        assert_eq!(localize_token("⌥⌘1"), "Ctrl+Alt+1");
+        assert_eq!(localize_token("⇧⌘E"), "Ctrl+Shift+E");
+        assert_eq!(localize_token("⌃Tab"), "Ctrl+Tab");
+        assert_eq!(localize_token("⌘↵"), "Ctrl+↵");
+        // No leading modifier — plain text and arrows are returned verbatim.
+        assert_eq!(localize_token("Settings"), "Settings");
+        assert_eq!(localize_token("→"), "→");
+        assert_eq!(localize_token("/"), "/");
     }
 
     #[test]

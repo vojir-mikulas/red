@@ -1035,20 +1035,23 @@ fn shortcut_chip(keystroke: &str, theme: &Theme) -> impl IntoElement {
 }
 
 /// Render a `keymap.toml` keystroke string as readable glyphs. Space-separated
-/// chords (a sequence) are kept space-separated; within a chord the modifier
-/// glyphs run together (`⌘⇧F`).
+/// chords (a sequence) are kept space-separated. On macOS the modifier glyphs run
+/// together (`⌘⇧F`); on Windows/Linux the modifiers are spelled and `+`-joined
+/// (`Ctrl+Shift+F`), with `cmd` folded onto Ctrl to match what actually binds
+/// there (see [`crate::keymap`]).
 fn keystroke_glyphs(keystroke: &str) -> String {
+    let mac = cfg!(target_os = "macos");
     keystroke
         .split(' ')
         .map(|chord| {
-            chord
+            let parts = chord
                 .split('-')
                 .map(|part| match part {
-                    "cmd" => "⌘".to_string(),
-                    "shift" => "⇧".to_string(),
-                    "alt" => "⌥".to_string(),
-                    "ctrl" => "⌃".to_string(),
-                    "fn" => "fn".to_string(),
+                    "cmd" => if mac { "⌘" } else { "Ctrl" }.to_string(),
+                    "shift" => if mac { "⇧" } else { "Shift" }.to_string(),
+                    "alt" => if mac { "⌥" } else { "Alt" }.to_string(),
+                    "ctrl" => if mac { "⌃" } else { "Ctrl" }.to_string(),
+                    "fn" => if mac { "fn" } else { "Fn" }.to_string(),
                     "enter" => "↵".to_string(),
                     "escape" => "Esc".to_string(),
                     "backspace" => "⌫".to_string(),
@@ -1061,7 +1064,13 @@ fn keystroke_glyphs(keystroke: &str) -> String {
                     "right" => "→".to_string(),
                     other => other.to_uppercase(),
                 })
-                .collect::<String>()
+                .collect::<Vec<_>>();
+            // Mac glyphs read as a run; spelled-out modifiers need a separator.
+            if mac {
+                parts.concat()
+            } else {
+                parts.join("+")
+            }
         })
         .collect::<Vec<_>>()
         .join(" ")
