@@ -63,6 +63,20 @@ bundle-universal:
 sign identity="Developer ID Application: Mikulas Vojir (ZGT84Z73N9)":
     SIGN_IDENTITY="{{identity}}" SKIP_NOTARIZE=1 ./scripts/sign-mac.sh
 
+# --- Linux / Windows packaging (see docs/plans/future/cross-platform.md) ---
+
+# Build a Linux AppImage into build/ (run on Linux; needs librsvg + appimagetool).
+bundle-linux:
+    ./scripts/bundle-linux.sh
+
+# Build a Windows portable zip into build\ (run on Windows).
+bundle-windows:
+    pwsh scripts/bundle-windows.ps1
+
+# Compile-check the Linux build from any host via Docker (verifies portability).
+check-linux:
+    ./scripts/check-linux.sh check
+
 # --- versioning / release ---
 
 # Bump the workspace version (every crate inherits it via `version.workspace`).

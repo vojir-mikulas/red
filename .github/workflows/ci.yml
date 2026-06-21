@@ -90,6 +90,40 @@ jobs:
       - name: Test (red-driver · red-service, live engines)
         run: cargo test -p red-driver -p red-service -- --nocapture
 
+  cross:
+    name: cross-platform build (${{ matrix.os }})
+    # The full app builds + tests on macOS above; this guards that the Linux and
+    # Windows GPUI backends keep compiling (e.g. a macOS-only API or a missing
+    # cfg arm). Compile only — behaviour is verified on the macOS runner.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux GPUI deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang cmake protobuf-compiler \
+            libfontconfig-dev libfreetype-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcb-shm0-dev \
+            libasound2-dev libssl-dev libvulkan-dev libgbm-dev
+
+      - name: Build (red app)
+        run: cargo build -p red
+
   deny:
     name: cargo-deny (supply chain)
     # No compile needed — cargo-deny reads the dependency graph — so the cheap

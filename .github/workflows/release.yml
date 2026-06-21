@@ -85,3 +85,59 @@ jobs:
           files: build/Red-*.dmg
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+  linux:
+    # Built on the oldest supported runner so the AppImage links against an older
+    # glibc and runs on a wider range of desktops. No self-update yet (manual
+    # download) — see docs/plans/future/cross-platform.md.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build + packaging deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang cmake protobuf-compiler \
+            libfontconfig-dev libfreetype-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcb-shm0-dev \
+            libasound2-dev libssl-dev libvulkan-dev libgbm-dev \
+            librsvg2-bin libfuse2
+
+      - name: Build AppImage
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ./scripts/bundle-linux.sh "$VERSION"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/Red-*.AppImage
+          fail_on_unmatched_files: true
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build portable zip
+        shell: pwsh
+        run: |
+          $version = "${env:GITHUB_REF_NAME}" -replace '^v',''
+          ./scripts/bundle-windows.ps1 -Version $version
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/Red-*-windows.zip
+          fail_on_unmatched_files: true

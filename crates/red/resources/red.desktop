@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Red
+GenericName=Database Explorer
+Comment=Roughly Enough Data — a fast, native database explorer
+Exec=Red
+Icon=red
+Terminal=false
+Categories=Development;Database;Utility;
+Keywords=database;sql;sqlite;postgres;mysql;explorer;
+StartupNotify=true
+StartupWMClass=Red
