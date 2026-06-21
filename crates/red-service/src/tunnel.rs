@@ -202,9 +202,19 @@ async fn authenticate_agent(
     handle: &mut russh::client::Handle<Handler>,
     user: &str,
 ) -> Result<bool> {
+    // ssh-agent transport is platform-specific: a Unix socket via `$SSH_AUTH_SOCK`
+    // on Unix, the OpenSSH named pipe on Windows. Only the connect differs — the
+    // identity walk below is generic over the agent's stream type.
+    #[cfg(unix)]
     let mut agent = russh::keys::agent::client::AgentClient::connect_env()
         .await
         .map_err(|e| RedError::Auth(format!("no SSH agent available: {e}")))?;
+    #[cfg(windows)]
+    let mut agent = russh::keys::agent::client::AgentClient::connect_named_pipe(
+        r"\\.\pipe\openssh-ssh-agent",
+    )
+    .await
+    .map_err(|e| RedError::Auth(format!("no SSH agent available: {e}")))?;
     let identities = agent
         .request_identities()
         .await
