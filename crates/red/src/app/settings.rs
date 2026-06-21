@@ -202,7 +202,22 @@ impl AppState {
         std::process::exit(0);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    /// Linux (AppImage): the new image was renamed over `$APPIMAGE`, so relaunch
+    /// that path and exit, leaving only the new version. Falls back to the current
+    /// exe if `$APPIMAGE` is somehow unset (it always is under the AppImage runtime
+    /// that the updater requires before staging).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn restart_for_update(&mut self, _cx: &mut Context<Self>) {
+        let target = std::env::var_os("APPIMAGE")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_exe().ok());
+        if let Some(target) = target {
+            let _ = std::process::Command::new(target).spawn();
+        }
+        std::process::exit(0);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     pub(crate) fn restart_for_update(&mut self, _cx: &mut Context<Self>) {}
 
     /// Store the updater's latest state and, when a build has finished staging,

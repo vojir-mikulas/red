@@ -1,7 +1,15 @@
-//! The macOS self-updater (Phase 3 of docs/plans/self-update.md): poll GitHub
-//! Releases, download a newer notarized `.dmg`, swap it over the installed
-//! `/Applications/Red.app`, and report `ReadyToRestart`. The relaunch itself is a
-//! UI concern (spawn the swapped bundle + exit).
+//! The self-updater (Phase 3 of docs/plans/self-update.md): poll GitHub Releases,
+//! download a newer build, swap it over the installed app, and report
+//! `ReadyToRestart`. The relaunch itself is a UI concern (spawn the new build +
+//! exit). The check loop, API fetch, semver comparison, and download-host pinning
+//! are platform-agnostic; only asset selection, the install-root probe, the swap,
+//! and the relaunch differ per OS.
+//!
+//! **macOS** swaps a notarized `.dmg` over `/Applications/Red.app`. **Linux** is
+//! AppImage-only: it replaces the running `$APPIMAGE` in place (see the Linux
+//! `download_and_swap`). Other platforms (Windows) report `Unsupported` and fall
+//! back to a manual download. Integrity on macOS rests on notarization; on Linux,
+//! which has no equivalent, on a `.sha256` sidecar published with the release.
 //!
 //! Network and bundle operations shell out to the platform tools the release
 //! pipeline already relies on — `curl`, `hdiutil`, `rsync` — so the backend takes
@@ -149,7 +157,7 @@ async fn check(events: &Events, cfg: &UpdateConfig) {
             )
         }
     };
-    let dmg_url = match release.dmg_url {
+    let asset_url = match release.asset_url {
         Some(url) => url,
         None => {
             return emit(
@@ -161,6 +169,7 @@ async fn check(events: &Events, cfg: &UpdateConfig) {
             )
         }
     };
+    let checksum_url = release.checksum_url;
 
     emit(
         events,
@@ -172,7 +181,11 @@ async fn check(events: &Events, cfg: &UpdateConfig) {
 
     let version = release.version;
     let app = app_root.to_string_lossy().into_owned();
-    match tokio::task::spawn_blocking(move || download_and_swap(&dmg_url, Path::new(&app))).await {
+    match tokio::task::spawn_blocking(move || {
+        download_and_swap(&asset_url, checksum_url.as_deref(), Path::new(&app))
+    })
+    .await
+    {
         Ok(Ok(())) => emit(events, UpdateState::ReadyToRestart { version }),
         Ok(Err(reason)) => emit(events, UpdateState::Failed { reason }),
         Err(_) => emit(
@@ -184,14 +197,29 @@ async fn check(events: &Events, cfg: &UpdateConfig) {
     }
 }
 
+/// The release-asset filename suffix this platform self-installs from: the macOS
+/// `.dmg` or the Linux `.AppImage`. On platforms with no in-place updater
+/// (Windows) `installed_app_root()` returns `None` first, so this is never used —
+/// it just needs a value so the shared `fetch_latest_release` compiles.
+#[cfg(target_os = "macos")]
+const ASSET_SUFFIX: &str = ".dmg";
+#[cfg(target_os = "linux")]
+const ASSET_SUFFIX: &str = ".AppImage";
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const ASSET_SUFFIX: &str = ".dmg";
+
 /// The release fields the updater needs from the GitHub API.
 struct Release {
     /// The tag, e.g. `v0.2.0`.
     version: String,
     /// The release's GitHub page, for the manual-download fallback.
     html_url: String,
-    /// The universal `.dmg` asset's download URL, if present.
-    dmg_url: Option<String>,
+    /// The self-install asset's download URL for this platform (`.dmg` /
+    /// `.AppImage`), if present and served from a GitHub host.
+    asset_url: Option<String>,
+    /// The asset's `.sha256` sidecar URL, if the release publishes one. Used for
+    /// integrity where there's no OS-level notarization (Linux).
+    checksum_url: Option<String>,
 }
 
 /// GET the repo's latest *non-prerelease* release and pull out the dmg asset.
@@ -232,25 +260,50 @@ fn fetch_latest_release(repo: &str) -> Result<Release, String> {
         .ok_or_else(|| "GitHub release has no tag_name".to_string())?
         .to_string();
     let html_url = json["html_url"].as_str().unwrap_or_default().to_string();
-    // Only accept a dmg whose download URL points at a GitHub asset host — the
-    // bytes are fed straight to `curl`, so a release that named some other host
-    // (a compromised API response) is treated as "no installable asset" and the
-    // UI falls back to the manual-download link.
-    let dmg_url = json["assets"].as_array().and_then(|assets| {
-        assets.iter().find_map(|asset| {
-            let name = asset["name"].as_str()?;
-            let url = name
-                .ends_with(".dmg")
-                .then(|| asset["browser_download_url"].as_str())
-                .flatten()?;
-            is_allowed_download_url(url).then(|| url.to_string())
-        })
-    });
+
+    // Pick this platform's self-install asset by filename suffix, plus its optional
+    // `.sha256` sidecar. Only accept a URL pointing at a GitHub asset host — the
+    // bytes are fed straight to `curl`, so a release that named some other host (a
+    // compromised API response) is treated as "no installable asset" and the UI
+    // falls back to the manual-download link.
+    let assets = json["assets"].as_array();
+    let mut asset_url = None;
+    let mut asset_name = None;
+    if let Some(assets) = assets {
+        for asset in assets {
+            let Some(name) = asset["name"].as_str() else {
+                continue;
+            };
+            if !name.ends_with(ASSET_SUFFIX) {
+                continue;
+            }
+            if let Some(url) = asset["browser_download_url"].as_str() {
+                if is_allowed_download_url(url) {
+                    asset_url = Some(url.to_string());
+                    asset_name = Some(name.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    let checksum_url = match (asset_name, assets) {
+        (Some(name), Some(assets)) => {
+            let want = format!("{name}.sha256");
+            assets.iter().find_map(|asset| {
+                let url = (asset["name"].as_str()? == want)
+                    .then(|| asset["browser_download_url"].as_str())
+                    .flatten()?;
+                is_allowed_download_url(url).then(|| url.to_string())
+            })
+        }
+        _ => None,
+    };
 
     Ok(Release {
         version,
         html_url,
-        dmg_url,
+        asset_url,
+        checksum_url,
     })
 }
 
@@ -346,7 +399,25 @@ fn installed_app_root() -> Option<std::path::PathBuf> {
     (is_bundle && writable).then(|| app.to_path_buf())
 }
 
-#[cfg(not(target_os = "macos"))]
+/// The installed AppImage path *if* we're allowed to replace it. Self-update only
+/// applies to an AppImage install: its runtime exports `$APPIMAGE` = the absolute
+/// path of the running `.AppImage`. A distro/Flatpak package or a `cargo run` dev
+/// build has no `$APPIMAGE` (→ `Unsupported` + manual-download link, per the plan's
+/// "don't fight the package manager"). The file and its directory must be writable
+/// so we can stage a sibling temp and atomically rename it into place.
+#[cfg(target_os = "linux")]
+fn installed_app_root() -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(std::env::var_os("APPIMAGE")?);
+    let writable = |p: &Path| {
+        std::fs::metadata(p)
+            .map(|m| !m.permissions().readonly())
+            .unwrap_or(false)
+    };
+    let ok = path.is_file() && writable(&path) && path.parent().map(writable).unwrap_or(false);
+    ok.then_some(path)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn installed_app_root() -> Option<std::path::PathBuf> {
     None
 }
@@ -356,7 +427,14 @@ fn installed_app_root() -> Option<std::path::PathBuf> {
 /// swap it over the installed bundle with atomic renames. The mount is always
 /// detached and the temp dir cleaned, even on a failed swap.
 #[cfg(target_os = "macos")]
-fn download_and_swap(dmg_url: &str, app_root: &Path) -> Result<(), String> {
+fn download_and_swap(
+    dmg_url: &str,
+    _checksum_url: Option<&str>,
+    app_root: &Path,
+) -> Result<(), String> {
+    // macOS integrity rests on notarization (validated on mount), not the sidecar
+    // checksum, so `_checksum_url` is unused here.
+    //
     // Defence in depth: the URL was already screened when the release was parsed,
     // but re-check here so this entry point can't be handed an arbitrary host.
     if !is_allowed_download_url(dmg_url) {
@@ -525,7 +603,7 @@ fn staged_swap(staged: &Path, app_root: &Path) -> Result<(), String> {
 /// A short, hard-to-guess suffix for the temp dir name, derived from the wall
 /// clock's nanoseconds. Not a security boundary on its own (the 0700 dir +
 /// `create_dir`-fails-if-exists are) — just makes the path unpredictable.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn unique_suffix() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -533,14 +611,150 @@ fn unique_suffix() -> u128 {
         .unwrap_or(0)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn download_and_swap(_dmg_url: &str, _app_root: &Path) -> Result<(), String> {
-    Err("self-update is only supported on macOS".into())
+/// Linux AppImage self-update: download the new `.AppImage` beside the running one,
+/// verify it against the release's `.sha256` sidecar (Linux builds aren't
+/// OS-notarized, so integrity rests on that checksum — fetched over TLS from a
+/// pinned GitHub host), mark it executable, then atomically rename it over the
+/// running `$APPIMAGE`. Replacing an open file is safe on Linux: the live process
+/// keeps its mapped inode and the next launch picks up the new file. Without a
+/// sidecar we refuse to install rather than run unverified bytes.
+#[cfg(target_os = "linux")]
+fn download_and_swap(
+    asset_url: &str,
+    checksum_url: Option<&str>,
+    target: &Path,
+) -> Result<(), String> {
+    // Defence in depth: both URLs were screened when the release was parsed.
+    if !is_allowed_download_url(asset_url) {
+        return Err("refusing to download from a non-GitHub host".into());
+    }
+    let checksum_url =
+        checksum_url.ok_or("release has no .sha256 sidecar — refusing to self-update")?;
+    if !is_allowed_download_url(checksum_url) {
+        return Err("refusing to fetch checksum from a non-GitHub host".into());
+    }
+
+    let parent = target.parent().ok_or("AppImage has no parent dir")?;
+    // Stage in the SAME directory as the target so the final rename is atomic (one
+    // filesystem). A hidden pid+nanosecond name avoids colliding with a parallel
+    // update and stays out of the user's way if we crash mid-download.
+    let tmp = parent.join(format!(
+        ".red-update-{}-{}.AppImage",
+        std::process::id(),
+        unique_suffix()
+    ));
+
+    let result = (|| -> Result<(), String> {
+        let tmp_path = tmp.to_str().ok_or("non-UTF-8 temp path")?;
+        run_cmd(
+            "curl",
+            &[
+                "-sSL",
+                "--fail",
+                "--proto",
+                "=https",
+                "--connect-timeout",
+                "30",
+                "--max-time",
+                "600",
+                "--max-redirs",
+                "5",
+                "-o",
+                tmp_path,
+                asset_url,
+            ],
+        )?;
+
+        let expected = fetch_checksum(checksum_url)?;
+        let actual = sha256_file(tmp_path)?;
+        if !actual.eq_ignore_ascii_case(&expected) {
+            return Err(format!(
+                "downloaded AppImage failed checksum (expected {expected}, got {actual})"
+            ));
+        }
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("setting executable bit: {e}"))?;
+
+        std::fs::rename(&tmp, target).map_err(|e| format!("installing new AppImage: {e}"))?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Fetch the `.sha256` sidecar and return its digest (the leading token of a
+/// `sha256sum`-style `<hex>  <name>` line).
+#[cfg(target_os = "linux")]
+fn fetch_checksum(url: &str) -> Result<String, String> {
+    let out = std::process::Command::new("curl")
+        .args([
+            "-sSL",
+            "--fail",
+            "--proto",
+            "=https",
+            "--connect-timeout",
+            "30",
+            "--max-time",
+            "60",
+            "--max-redirs",
+            "5",
+            url,
+        ])
+        .output()
+        .map_err(|e| format!("launching curl: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "fetching checksum: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    parse_sha256_hex(&String::from_utf8_lossy(&out.stdout))
+        .ok_or_else(|| "checksum sidecar is not a SHA-256 digest".into())
+}
+
+/// SHA-256 of a file via coreutils `sha256sum` (universally present on Linux),
+/// keeping the updater free of a hashing dependency.
+#[cfg(target_os = "linux")]
+fn sha256_file(path: &str) -> Result<String, String> {
+    let out = std::process::Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .map_err(|e| format!("launching sha256sum: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "sha256sum failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    parse_sha256_hex(&String::from_utf8_lossy(&out.stdout))
+        .ok_or_else(|| "sha256sum produced no digest".into())
+}
+
+/// The leading SHA-256 hex token of a `sha256sum`-style line, validated to be 64
+/// hex chars. `None` for anything else.
+#[cfg(any(target_os = "linux", test))]
+fn parse_sha256_hex(s: &str) -> Option<String> {
+    let tok = s.split_whitespace().next()?;
+    (tok.len() == 64 && tok.bytes().all(|b| b.is_ascii_hexdigit())).then(|| tok.to_string())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn download_and_swap(
+    _asset_url: &str,
+    _checksum_url: Option<&str>,
+    _target: &Path,
+) -> Result<(), String> {
+    Err("self-update is not supported on this platform".into())
 }
 
 /// Run a helper process, mapping a non-zero exit (or a launch failure) to a
 /// human-readable error carrying its stderr.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run_cmd(program: &str, args: &[&str]) -> Result<(), String> {
     let out = std::process::Command::new(program)
         .args(args)
@@ -599,6 +813,21 @@ mod tests {
         assert!(!is_newer("v0.2.0-rc1", "v0.2.0-rc2"));
         // A higher core beats any prerelease regardless of suffix.
         assert!(is_newer("v0.3.0-rc1", "v0.2.0"));
+    }
+
+    #[test]
+    fn sha256_hex_is_validated() {
+        let valid = "a".repeat(64);
+        // The leading token of a `sha256sum` line, or a bare digest, parses.
+        assert_eq!(
+            parse_sha256_hex(&format!("{valid}  Red-1.0.0-x86_64.AppImage")),
+            Some(valid.clone())
+        );
+        assert_eq!(parse_sha256_hex(&valid), Some(valid));
+        // Wrong length or non-hex is rejected, so a garbage sidecar can't pass.
+        assert_eq!(parse_sha256_hex("deadbeef  short"), None);
+        assert_eq!(parse_sha256_hex(&format!("{}  x", "g".repeat(64))), None);
+        assert_eq!(parse_sha256_hex(""), None);
     }
 
     #[test]

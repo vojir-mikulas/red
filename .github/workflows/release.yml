@@ -118,7 +118,10 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: build/Red-*.AppImage
+          # The .sha256 sidecar backs the Linux self-updater's integrity check.
+          files: |
+            build/Red-*.AppImage
+            build/Red-*.AppImage.sha256
           fail_on_unmatched_files: true
 
   windows:

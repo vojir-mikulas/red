@@ -68,4 +68,9 @@ echo "▸ packaging $OUT"
 # (CI containers), so it works without /dev/fuse.
 ARCH="$ARCH" "$TOOL" --no-appstream "$APPDIR" "$OUT" \
   || ARCH="$ARCH" "$TOOL" --appimage-extract-and-run --no-appstream "$APPDIR" "$OUT"
-echo "▸ done: $OUT"
+
+# Sidecar checksum: the Linux self-updater verifies the downloaded AppImage against
+# this (AppImages aren't OS-notarized). Written with a bare filename so the digest
+# is the first token, which the updater parses. Keep it next to the artifact.
+( cd "$BUILD" && sha256sum "$(basename "$OUT")" > "$(basename "$OUT").sha256" )
+echo "▸ done: $OUT (+ .sha256)"
