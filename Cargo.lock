@@ -6213,7 +6213,7 @@ dependencies = [
 
 [[package]]
 name = "red"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -6236,7 +6236,7 @@ dependencies = [
 
 [[package]]
 name = "red-acp"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "agent-client-protocol",
  "serde_json",
@@ -6247,7 +6247,7 @@ dependencies = [
 
 [[package]]
 name = "red-ai"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -6261,7 +6261,7 @@ dependencies = [
 
 [[package]]
 name = "red-core"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -6269,7 +6269,7 @@ dependencies = [
 
 [[package]]
 name = "red-driver"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -6285,7 +6285,7 @@ dependencies = [
 
 [[package]]
 name = "red-service"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "async-trait",
  "bytes",
