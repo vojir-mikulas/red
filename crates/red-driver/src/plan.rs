@@ -106,6 +106,43 @@ pub(crate) fn from_text_tree(raw: &str, analyzed: bool) -> QueryPlan {
     }
 }
 
+/// Parse an indentation-nested text plan with **no node markers** — ClickHouse's
+/// `EXPLAIN`, where each step is a line whose nesting is purely its leading-space
+/// indent (no `->` prefix like Postgres/MySQL). Every non-empty line is a node at
+/// its indentation; a deeper-indented line nests under the previous shallower one.
+/// Trailing `(key=value …)` groups fold into metrics, like the marker parser.
+/// ClickHouse has no `EXPLAIN ANALYZE` actuals, so `analyzed` is always false.
+pub(crate) fn from_indent_tree(raw: &str) -> QueryPlan {
+    let mut stack: Vec<(usize, PlanNode)> = Vec::new();
+    let mut roots: Vec<PlanNode> = Vec::new();
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let (label, metrics) = split_paren_metrics(line.trim_start());
+        push_node(
+            &mut stack,
+            &mut roots,
+            indent,
+            PlanNode {
+                label,
+                detail: None,
+                metrics,
+                children: Vec::new(),
+            },
+        );
+    }
+    while let Some((_, finished)) = stack.pop() {
+        attach(&mut stack, &mut roots, finished);
+    }
+    QueryPlan {
+        nodes: roots,
+        raw: raw.trim_end().to_string(),
+        analyzed: false,
+    }
+}
+
 /// Build a flat plan from a tabular `EXPLAIN` (older MySQL / MariaDB, which lack
 /// `FORMAT=TREE`): one node per row, its non-empty columns folded into metrics,
 /// labelled by the `table` column when present. Not nested — honestly flat — but
@@ -348,6 +385,27 @@ mod tests {
         assert_eq!(plan.nodes.len(), 1);
         assert_eq!(plan.nodes[0].label, "Nested loop inner join");
         assert_eq!(plan.nodes[0].children.len(), 2);
+    }
+
+    #[test]
+    fn clickhouse_indent_nests_without_markers() {
+        // ClickHouse `EXPLAIN` indents by spaces with no `->` markers: the
+        // `ReadFromMergeTree` step nests under `Expression`.
+        let raw = "Expression ((Project names + Projection))\n  \
+                   Expression\n    \
+                   ReadFromMergeTree (default.events)";
+        let plan = from_indent_tree(raw);
+        assert_eq!(plan.nodes.len(), 1, "single root");
+        let root = &plan.nodes[0];
+        assert_eq!(root.label, "Expression ((Project names + Projection))");
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.children[0].children.len(), 1);
+        assert_eq!(
+            root.children[0].children[0].label,
+            "ReadFromMergeTree (default.events)"
+        );
+        assert!(!plan.analyzed);
+        assert!(plan.raw.contains("default.events"));
     }
 
     #[test]

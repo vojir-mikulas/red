@@ -13,6 +13,10 @@ pub enum DbKind {
     #[default]
     Sqlite,
     Mysql,
+    /// ClickHouse — the OLAP engine, reached over its HTTP interface. Read-only in
+    /// v1 (no in-grid editing — `UPDATE`/`DELETE` are async `ALTER … UPDATE`
+    /// mutations with no transaction/rollback), so its driver refuses `apply_edits`.
+    Clickhouse,
 }
 
 impl DbKind {
@@ -20,7 +24,12 @@ impl DbKind {
     /// means adding a variant here and an arm to each accessor below — the form is
     /// data-driven off these, not a hand-maintained list.
     pub const fn all() -> &'static [DbKind] {
-        &[DbKind::Postgres, DbKind::Sqlite, DbKind::Mysql]
+        &[
+            DbKind::Postgres,
+            DbKind::Sqlite,
+            DbKind::Mysql,
+            DbKind::Clickhouse,
+        ]
     }
 
     /// File-based engines (SQLite) take a single path, not host/port/user/pass.
@@ -28,11 +37,13 @@ impl DbKind {
         matches!(self, DbKind::Sqlite)
     }
 
-    /// The conventional default port, or `None` for file engines.
+    /// The conventional default port, or `None` for file engines. ClickHouse's
+    /// default is its HTTP interface port (`8123`), which the driver speaks.
     pub const fn default_port(self) -> Option<u16> {
         match self {
             DbKind::Postgres => Some(5432),
             DbKind::Mysql => Some(3306),
+            DbKind::Clickhouse => Some(8123),
             DbKind::Sqlite => None,
         }
     }
@@ -43,6 +54,7 @@ impl DbKind {
             DbKind::Postgres => "postgres",
             DbKind::Mysql => "mysql",
             DbKind::Sqlite => "sqlite",
+            DbKind::Clickhouse => "clickhouse",
         }
     }
 
@@ -53,6 +65,7 @@ impl DbKind {
             "postgres" | "postgresql" => Some(DbKind::Postgres),
             "mysql" | "mariadb" => Some(DbKind::Mysql),
             "sqlite" | "sqlite3" | "file" => Some(DbKind::Sqlite),
+            "clickhouse" | "clickhouse-http" | "ch" => Some(DbKind::Clickhouse),
             _ => None,
         }
     }
@@ -64,6 +77,7 @@ impl fmt::Display for DbKind {
             DbKind::Sqlite => write!(f, "SQLite"),
             DbKind::Postgres => write!(f, "PostgreSQL"),
             DbKind::Mysql => write!(f, "MySQL/MariaDB"),
+            DbKind::Clickhouse => write!(f, "ClickHouse"),
         }
     }
 }

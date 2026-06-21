@@ -373,6 +373,7 @@ impl DatabaseDriver for MysqlDriver {
             |c| format!("CAST({c} AS CHAR)"),
             "LIKE",
             true,
+            true,
         )
     }
 

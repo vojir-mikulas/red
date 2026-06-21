@@ -17,6 +17,12 @@ rusqlite.workspace = true
 tokio-postgres.workspace = true
 mysql_async.workspace = true
 futures-util.workspace = true
+# ClickHouse driver — its HTTP interface (no heavy native-protocol client). reqwest
+# (rustls) and serde_json are already in the tree via red-ai; uuid (already pulled
+# by the ACP crate's subtree) gives each query a stable id for `KILL QUERY`.
+reqwest.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }

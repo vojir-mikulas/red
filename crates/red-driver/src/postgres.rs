@@ -391,6 +391,7 @@ impl DatabaseDriver for PostgresDriver {
             |c| format!("({c})::text"),
             "ILIKE",
             false,
+            true,
         )
     }
 

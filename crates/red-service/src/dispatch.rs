@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use futures::channel::mpsc::UnboundedSender;
 use red_core::{AiTier, ConnectionConfig, DbKind, KeyKind, KeySpec, RedError, ResultFilter, Value};
 use red_driver::{
-    AbortSignal, CancelToken, DatabaseDriver, MysqlDriver, PageCap, PostgresDriver, QueryCursor,
-    SqliteDriver,
+    AbortSignal, CancelToken, ClickhouseDriver, DatabaseDriver, MysqlDriver, PageCap,
+    PostgresDriver, QueryCursor, SqliteDriver,
 };
 use tokio::sync::mpsc::UnboundedReceiver as CmdReceiver;
 use tokio::sync::Semaphore;
@@ -2021,6 +2021,16 @@ async fn connect(
             // schema tree to the chosen one when the connection names a database.
             Arc::new(
                 MysqlDriver::connect(&dsn, config.read_only)
+                    .await?
+                    .with_scope(Some(config.database.clone())),
+            )
+        }
+        DbKind::Clickhouse => {
+            // Like MySQL, a ClickHouse connection can see every database; scope the
+            // tree to the chosen one. Read-only first (the driver refuses in-grid
+            // edits regardless — ClickHouse is OLAP).
+            Arc::new(
+                ClickhouseDriver::connect(&dsn, config.read_only)
                     .await?
                     .with_scope(Some(config.database.clone())),
             )

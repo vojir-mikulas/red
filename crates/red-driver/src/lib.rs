@@ -20,12 +20,14 @@ use tokio::sync::mpsc::UnboundedSender;
 
 #[cfg(test)]
 mod conformance;
+mod clickhouse;
 mod format;
 mod mysql;
 mod pg_text;
 mod plan;
 mod postgres;
 mod sqlite;
+pub use clickhouse::ClickhouseDriver;
 pub use format::html_escape;
 pub use mysql::MysqlDriver;
 pub use postgres::PostgresDriver;
@@ -279,11 +281,18 @@ pub(crate) fn edit_count_err(op: &EditOp, affected: u64) -> RedError {
 /// is the case-insensitive match keyword (`ILIKE` on Postgres, `LIKE` elsewhere —
 /// SQLite/MySQL `LIKE` is ASCII-case-insensitive by default).
 /// `backslash_escapes` must be `true` for engines that treat `\` as a string-
-/// literal escape (MySQL/MariaDB in the default mode), `false` where `\` is a
-/// plain literal byte (SQLite, and Postgres with `standard_conforming_strings`).
-/// It controls a second escaping layer so the backslashes the `LIKE` pattern uses
-/// survive the engine's *string-literal* parser intact — without it, a search for
-/// a literal `%`, `_`, or `\` silently misbehaves on MySQL.
+/// literal escape (MySQL/MariaDB in the default mode, and ClickHouse), `false`
+/// where `\` is a plain literal byte (SQLite, and Postgres with
+/// `standard_conforming_strings`). It controls a second escaping layer so the
+/// backslashes the `LIKE` pattern uses survive the engine's *string-literal*
+/// parser intact — without it, a search for a literal `%`, `_`, or `\` silently
+/// misbehaves on MySQL.
+///
+/// `escape_clause` controls the trailing `ESCAPE '…'`: the SQL-standard engines
+/// (Postgres/MySQL/SQLite) accept it and rely on it to name `\` as the pattern's
+/// escape char, but ClickHouse's `LIKE`/`ILIKE` has no `ESCAPE` clause (its escape
+/// char is always `\`), so it passes `false` to omit it — the `\`-escaped pattern
+/// still matches literally against ClickHouse's built-in backslash escaping.
 pub(crate) fn contains_clause(
     columns: &[ColumnMeta],
     term: &str,
@@ -291,24 +300,22 @@ pub(crate) fn contains_clause(
     as_text: impl Fn(&str) -> String,
     like_op: &str,
     backslash_escapes: bool,
+    escape_clause: bool,
 ) -> Option<String> {
     let pattern = like_pattern(term, backslash_escapes);
     // The escape char inside the literal is one backslash; on a backslash-escaping
     // engine that backslash must itself be doubled in the literal to reach `LIKE`.
-    let escape_clause = if backslash_escapes {
-        r"ESCAPE '\\'"
+    let escape = if !escape_clause {
+        String::new()
+    } else if backslash_escapes {
+        r" ESCAPE '\\'".to_string()
     } else {
-        r"ESCAPE '\'"
+        r" ESCAPE '\'".to_string()
     };
     let preds: Vec<String> = columns
         .iter()
         .filter(|c| !c.type_name.as_deref().is_some_and(is_blob_type))
-        .map(|c| {
-            format!(
-                "{} {like_op} {pattern} {escape_clause}",
-                as_text(&quote(&c.name))
-            )
-        })
+        .map(|c| format!("{} {like_op} {pattern}{escape}", as_text(&quote(&c.name))))
         .collect();
     (!preds.is_empty()).then(|| format!("({})", preds.join(" OR ")))
 }
@@ -696,6 +703,7 @@ mod tests {
             |c| format!("CAST({c} AS TEXT)"),
             "LIKE",
             false,
+            true,
         )
         .expect("text/int columns are searchable");
         assert_eq!(
@@ -710,8 +718,10 @@ mod tests {
     fn contains_clause_is_none_when_nothing_searchable() {
         // All-blob and empty column sets yield no predicate (→ no filter applied).
         let blobs = [col("a", Some("blob")), col("b", Some("bytea"))];
-        assert!(contains_clause(&blobs, "x", |c| c.into(), |c| c.into(), "LIKE", false).is_none());
-        assert!(contains_clause(&[], "x", |c| c.into(), |c| c.into(), "LIKE", false).is_none());
+        assert!(
+            contains_clause(&blobs, "x", |c| c.into(), |c| c.into(), "LIKE", false, true).is_none()
+        );
+        assert!(contains_clause(&[], "x", |c| c.into(), |c| c.into(), "LIKE", false, true).is_none());
     }
 
     #[test]
@@ -719,7 +729,8 @@ mod tests {
         // A computed/untyped column (`type_name: None`) is searched, not skipped.
         let columns = [col("expr", None)];
         assert!(
-            contains_clause(&columns, "x", |c| c.into(), |c| c.into(), "LIKE", false).is_some()
+            contains_clause(&columns, "x", |c| c.into(), |c| c.into(), "LIKE", false, true)
+                .is_some()
         );
     }
 }

@@ -33,6 +33,7 @@ fn engine_tint(kind: DbKind, theme: &Theme) -> Hsla {
         DbKind::Postgres => theme.blue,
         DbKind::Sqlite => theme.cyan,
         DbKind::Mysql => theme.orange,
+        DbKind::Clickhouse => theme.yellow,
     }
 }
 
@@ -474,6 +475,7 @@ impl AppState {
             DbKind::Sqlite => (BadgeVariant::Info, "SQLite"),
             DbKind::Postgres => (BadgeVariant::Special, "Postgres"),
             DbKind::Mysql => (BadgeVariant::Warning, "MySQL"),
+            DbKind::Clickhouse => (BadgeVariant::Accent, "ClickHouse"),
         };
         let group = SharedString::from(format!("connect-card-{orig_ix}"));
         // Accessible name: the connection's name, engine, and read-only state —

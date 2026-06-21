@@ -139,6 +139,7 @@ impl DatabaseDriver for SqliteDriver {
             |c| format!("CAST({c} AS TEXT)"),
             "LIKE",
             false,
+            true,
         )
     }
 
