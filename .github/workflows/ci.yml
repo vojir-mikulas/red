@@ -119,7 +119,7 @@ jobs:
             libwayland-dev wayland-protocols libxkbcommon-dev libxkbcommon-x11-dev \
             libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libxcb-shm0-dev \
-            libasound2-dev libssl-dev libvulkan-dev libgbm-dev
+            libasound2-dev libssl-dev libvulkan-dev libgbm-dev libdbus-1-dev
 
       - name: Build (red app)
         run: cargo build -p red

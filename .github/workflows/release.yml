@@ -107,7 +107,7 @@ jobs:
             libwayland-dev wayland-protocols libxkbcommon-dev libxkbcommon-x11-dev \
             libx11-dev libx11-xcb-dev libxcb1-dev libxcb-render0-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libxcb-shm0-dev \
-            libasound2-dev libssl-dev libvulkan-dev libgbm-dev \
+            libasound2-dev libssl-dev libvulkan-dev libgbm-dev libdbus-1-dev \
             librsvg2-bin libfuse2
 
       - name: Build AppImage
@@ -142,5 +142,10 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: build/Red-*-windows.zip
+          # The bare .exe + .sha256 are the self-update payload; the .zip is the
+          # first-time portable install.
+          files: |
+            build/Red-*-windows.zip
+            build/Red-*-windows.exe
+            build/Red-*-windows.exe.sha256
           fail_on_unmatched_files: true

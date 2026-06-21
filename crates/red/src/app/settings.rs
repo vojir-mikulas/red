@@ -217,7 +217,18 @@ impl AppState {
         std::process::exit(0);
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    /// Windows (portable): the new exe was moved into the running exe's path (the
+    /// old one renamed to `<exe>.old`, reaped on next launch). Relaunch and exit so
+    /// only the new version remains.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn restart_for_update(&mut self, _cx: &mut Context<Self>) {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe).spawn();
+        }
+        std::process::exit(0);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     pub(crate) fn restart_for_update(&mut self, _cx: &mut Context<Self>) {}
 
     /// Store the updater's latest state and, when a build has finished staging,

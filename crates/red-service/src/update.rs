@@ -205,7 +205,9 @@ async fn check(events: &Events, cfg: &UpdateConfig) {
 const ASSET_SUFFIX: &str = ".dmg";
 #[cfg(target_os = "linux")]
 const ASSET_SUFFIX: &str = ".AppImage";
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
+const ASSET_SUFFIX: &str = ".exe";
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 const ASSET_SUFFIX: &str = ".dmg";
 
 /// The release fields the updater needs from the GitHub API.
@@ -226,26 +228,29 @@ struct Release {
 /// `/releases/latest` already excludes drafts and prereleases server-side.
 fn fetch_latest_release(repo: &str) -> Result<Release, String> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let out = std::process::Command::new("curl")
-        .args([
-            "-sSL",
-            "--fail",
-            "--proto",
-            "=https",
-            "--connect-timeout",
-            "30",
-            "--max-time",
-            "60",
-            "--max-redirs",
-            "5",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            "User-Agent: red-updater",
-            &url,
-        ])
-        .output()
-        .map_err(|e| format!("launching curl: {e}"))?;
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args([
+        "-sSL",
+        "--fail",
+        "--proto",
+        "=https",
+        "--connect-timeout",
+        "30",
+        "--max-time",
+        "60",
+        "--max-redirs",
+        "5",
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        "User-Agent: red-updater",
+        &url,
+    ]);
+    // GUI-subsystem Windows builds would flash a console for each child process —
+    // including these background checks — so spawn curl headless.
+    #[cfg(target_os = "windows")]
+    no_window(&mut cmd);
+    let out = cmd.output().map_err(|e| format!("launching curl: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "GitHub API request failed: {}",
@@ -417,7 +422,28 @@ fn installed_app_root() -> Option<std::path::PathBuf> {
     ok.then_some(path)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// The installed `Red.exe` path *if* we're allowed to replace it. Self-update only
+/// applies to a **portable** install: the distributed zip drops a `.red-portable`
+/// marker next to the exe, so a `cargo run` dev build or any loose exe (no marker)
+/// is never silently overwritten. The exe and its directory must be writable so we
+/// can stage a sibling temp and rename it into place (a Program Files install would
+/// need elevation → the rename fails → `Failed`, not a silent no-op).
+#[cfg(target_os = "windows")]
+fn installed_app_root() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    if !dir.join(".red-portable").is_file() {
+        return None;
+    }
+    let writable = |p: &Path| {
+        std::fs::metadata(p)
+            .map(|m| !m.permissions().readonly())
+            .unwrap_or(false)
+    };
+    (writable(&exe) && writable(dir)).then_some(exe)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn installed_app_root() -> Option<std::path::PathBuf> {
     None
 }
@@ -603,7 +629,7 @@ fn staged_swap(staged: &Path, app_root: &Path) -> Result<(), String> {
 /// A short, hard-to-guess suffix for the temp dir name, derived from the wall
 /// clock's nanoseconds. Not a security boundary on its own (the 0700 dir +
 /// `create_dir`-fails-if-exists are) — just makes the path unpredictable.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn unique_suffix() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -689,24 +715,25 @@ fn download_and_swap(
 
 /// Fetch the `.sha256` sidecar and return its digest (the leading token of a
 /// `sha256sum`-style `<hex>  <name>` line).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn fetch_checksum(url: &str) -> Result<String, String> {
-    let out = std::process::Command::new("curl")
-        .args([
-            "-sSL",
-            "--fail",
-            "--proto",
-            "=https",
-            "--connect-timeout",
-            "30",
-            "--max-time",
-            "60",
-            "--max-redirs",
-            "5",
-            url,
-        ])
-        .output()
-        .map_err(|e| format!("launching curl: {e}"))?;
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args([
+        "-sSL",
+        "--fail",
+        "--proto",
+        "=https",
+        "--connect-timeout",
+        "30",
+        "--max-time",
+        "60",
+        "--max-redirs",
+        "5",
+        url,
+    ]);
+    #[cfg(target_os = "windows")]
+    no_window(&mut cmd);
+    let out = cmd.output().map_err(|e| format!("launching curl: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "fetching checksum: {}",
@@ -735,15 +762,144 @@ fn sha256_file(path: &str) -> Result<String, String> {
         .ok_or_else(|| "sha256sum produced no digest".into())
 }
 
+/// SHA-256 of a file via PowerShell's `Get-FileHash` (present on every supported
+/// Windows), keeping the updater free of a hashing dependency. `.Hash` is clean
+/// uppercase hex; the comparison is case-insensitive.
+#[cfg(target_os = "windows")]
+fn sha256_file(path: &str) -> Result<String, String> {
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &format!(
+            "(Get-FileHash -Algorithm SHA256 -LiteralPath {}).Hash",
+            ps_quote(path)
+        ),
+    ]);
+    no_window(&mut cmd);
+    let out = cmd
+        .output()
+        .map_err(|e| format!("launching powershell: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "Get-FileHash failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    parse_sha256_hex(&String::from_utf8_lossy(&out.stdout))
+        .ok_or_else(|| "Get-FileHash produced no digest".into())
+}
+
+/// Quote a path as a PowerShell single-quoted literal (backslashes are literal
+/// inside single quotes; an embedded quote is escaped by doubling), so a path with
+/// spaces or metacharacters can't break out of the `-Command` string.
+#[cfg(target_os = "windows")]
+fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Windows: spawn helper processes without flashing a console window — the release
+/// build is a GUI-subsystem app, so a child console would pop up on every check.
+#[cfg(target_os = "windows")]
+fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW)
+}
+
 /// The leading SHA-256 hex token of a `sha256sum`-style line, validated to be 64
 /// hex chars. `None` for anything else.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 fn parse_sha256_hex(s: &str) -> Option<String> {
     let tok = s.split_whitespace().next()?;
     (tok.len() == 64 && tok.bytes().all(|b| b.is_ascii_hexdigit())).then(|| tok.to_string())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Windows portable self-update: download the new `Red.exe` beside the running one,
+/// verify it against the release's `.sha256` sidecar (no Authenticode check yet —
+/// integrity rests on the checksum, fetched over TLS from a pinned GitHub host),
+/// then replace-on-restart. A running `.exe` can't be deleted, but it *can* be
+/// renamed: move the live exe to `Red.exe.old`, move the new one into place
+/// (rolling back on failure), and reap the `.old` on next launch. Without a sidecar
+/// we refuse rather than run unverified bytes.
+#[cfg(target_os = "windows")]
+fn download_and_swap(
+    asset_url: &str,
+    checksum_url: Option<&str>,
+    target: &Path,
+) -> Result<(), String> {
+    if !is_allowed_download_url(asset_url) {
+        return Err("refusing to download from a non-GitHub host".into());
+    }
+    let checksum_url =
+        checksum_url.ok_or("release has no .sha256 sidecar — refusing to self-update")?;
+    if !is_allowed_download_url(checksum_url) {
+        return Err("refusing to fetch checksum from a non-GitHub host".into());
+    }
+
+    let parent = target.parent().ok_or("exe has no parent dir")?;
+    let name = target
+        .file_name()
+        .and_then(|f| f.to_str())
+        .ok_or("exe has no file name")?;
+    // Stage in the SAME directory as the target so the final rename is atomic (one
+    // volume). Unique pid+nanosecond name avoids colliding with a parallel update.
+    let tmp = parent.join(format!(
+        "red-update-{}-{}.exe",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let old = parent.join(format!("{name}.old"));
+
+    let result = (|| -> Result<(), String> {
+        let tmp_path = tmp.to_str().ok_or("non-UTF-8 temp path")?;
+        run_cmd(
+            "curl",
+            &[
+                "-sSL",
+                "--fail",
+                "--proto",
+                "=https",
+                "--connect-timeout",
+                "30",
+                "--max-time",
+                "600",
+                "--max-redirs",
+                "5",
+                "-o",
+                tmp_path,
+                asset_url,
+            ],
+        )?;
+
+        let expected = fetch_checksum(checksum_url)?;
+        let actual = sha256_file(tmp_path)?;
+        if !actual.eq_ignore_ascii_case(&expected) {
+            return Err(format!(
+                "downloaded exe failed checksum (expected {expected}, got {actual})"
+            ));
+        }
+
+        // Clear any leftover `.old` from a prior update, then rename the live exe
+        // aside and the new one into place. Roll back if the second rename fails so
+        // we never end up with no exe at the install path.
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(target, &old).map_err(|e| format!("moving current exe aside: {e}"))?;
+        if let Err(e) = std::fs::rename(&tmp, target) {
+            let _ = std::fs::rename(&old, target);
+            return Err(format!("installing new exe: {e}"));
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn download_and_swap(
     _asset_url: &str,
     _checksum_url: Option<&str>,
@@ -754,10 +910,13 @@ fn download_and_swap(
 
 /// Run a helper process, mapping a non-zero exit (or a launch failure) to a
 /// human-readable error carrying its stderr.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn run_cmd(program: &str, args: &[&str]) -> Result<(), String> {
-    let out = std::process::Command::new(program)
-        .args(args)
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    #[cfg(target_os = "windows")]
+    no_window(&mut cmd);
+    let out = cmd
         .output()
         .map_err(|e| format!("launching {program}: {e}"))?;
     if out.status.success() {

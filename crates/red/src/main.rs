@@ -56,6 +56,16 @@ gpui::actions!(red, [ToggleDevStats]);
 fn main() {
     init_tracing();
 
+    // Windows self-update can't delete the running exe, so it leaves the previous
+    // binary as `<exe>.old` and relies on the next launch to reap it. Best-effort:
+    // a still-locked or absent file just means there's nothing to clean up.
+    #[cfg(target_os = "windows")]
+    if let Ok(exe) = std::env::current_exe() {
+        if let (Some(dir), Some(name)) = (exe.parent(), exe.file_name().and_then(|n| n.to_str())) {
+            let _ = std::fs::remove_file(dir.join(format!("{name}.old")));
+        }
+    }
+
     application().with_assets(Assets).run(|cx: &mut App| {
         cx.set_global(crate::theme::one_dark());
         if let Err(err) = Assets::load_fonts(cx) {
