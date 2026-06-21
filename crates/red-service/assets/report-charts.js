@@ -47,6 +47,20 @@
   // container — see resizeAllCharts).
   var CHARTS = [];
 
+  // Hard cap on DOM rows we materialize for a table's filtered view. The grid is
+  // not virtualized, so an unbounded <tbody> rebuild on every keystroke can lock
+  // up the page on large result sets; we render the first N and footer the rest.
+  var TABLE_RENDER_CAP = 500;
+
+  // Trailing debounce — coalesces rapid filter keystrokes into one re-render.
+  function debounce(fn, ms) {
+    var h = null;
+    return function () {
+      if (h) clearTimeout(h);
+      h = setTimeout(function () { h = null; fn(); }, ms);
+    };
+  }
+
   var LIGHT = {
     fg: "#18181b",
     muted: "#71717a",
@@ -327,6 +341,11 @@
         // column index → {type:'set'|'range'|'text', …}); sort: per-table.
         state: { search: "", colFilters: {}, facets: {}, sort: { col: -1, dir: 0 } },
         subs: [],
+        // Each report-wide filter control bound to this dataset registers a
+        // resetter here, so a table's "Clear filters" can also reset the
+        // shared facet controls back to their default (all rows) and re-sync
+        // their UI — see renderTable's clear handler and the make* controls.
+        facetResets: [],
       };
       ds.notify = function () {
         for (var k = 0; k < ds.subs.length; k++) ds.subs[k]();
@@ -336,11 +355,14 @@
     return reg;
   }
 
+  // Returns a FINITE number or null. NaN/Infinity are treated as null so they
+  // can't poison range-slider domains, aggregates, or chart axis scaling
+  // (callers already skip nulls). A raw NaN/Infinity number cell counts as null.
   function toNum(v) {
-    if (typeof v === "number") return v;
+    if (typeof v === "number") return Number.isFinite(v) ? v : null;
     if (typeof v === "string" && v.trim() !== "") {
       var n = Number(v);
-      return isNaN(n) ? null : n;
+      return Number.isFinite(n) ? n : null;
     }
     return null;
   }
@@ -460,9 +482,10 @@
       inp.type = "text";
       inp.className = "red-colfilter";
       inp.placeholder = "—";
+      var notifyCol = debounce(function () { ds.notify(); }, 120);
       inp.addEventListener("input", function () {
         ds.state.colFilters[ci] = inp.value;
-        ds.notify();
+        notifyCol();
       });
       fth.appendChild(inp);
       ftr.appendChild(fth);
@@ -486,9 +509,10 @@
       }
     }
 
+    var notifySearch = debounce(function () { ds.notify(); }, 120);
     search.addEventListener("input", function () {
       ds.state.search = search.value;
-      ds.notify();
+      notifySearch();
     });
     clear.addEventListener("click", function () {
       ds.state.search = "";
@@ -496,6 +520,10 @@
       search.value = "";
       var inputs = ftr.querySelectorAll("input");
       for (var i = 0; i < inputs.length; i++) inputs[i].value = "";
+      // Also drop report-wide facet selections and refresh each shared filter
+      // control's UI, so the table truly resets to "no filters applied".
+      ds.state.facets = {};
+      for (var f = 0; f < ds.facetResets.length; f++) ds.facetResets[f]();
       ds.notify();
     });
 
@@ -503,7 +531,10 @@
       var rows = viewRows(ds);
       tbody.textContent = "";
       var frag = document.createDocumentFragment();
-      for (var r = 0; r < rows.length; r++) {
+      // No virtualization: cap how many rows we materialize per render so a large
+      // filtered view can't lock up the page (small tables are unaffected).
+      var shown = rows.length > TABLE_RENDER_CAP ? TABLE_RENDER_CAP : rows.length;
+      for (var r = 0; r < shown; r++) {
         var tr = document.createElement("tr");
         for (var c = 0; c < ds.columns.length; c++) {
           var td = document.createElement("td");
@@ -513,6 +544,18 @@
           tr.appendChild(td);
         }
         frag.appendChild(tr);
+      }
+      if (rows.length > shown) {
+        var ftrTr = document.createElement("tr");
+        var ftrTd = document.createElement("td");
+        ftrTd.colSpan = ds.columns.length || 1;
+        ftrTd.className = "red-count";
+        ftrTd.style.textAlign = "center";
+        ftrTd.style.padding = "8px";
+        ftrTd.textContent =
+          "… showing first " + shown + " of " + rows.length + " rows";
+        ftrTr.appendChild(ftrTd);
+        frag.appendChild(ftrTr);
       }
       tbody.appendChild(frag);
       count.textContent =
@@ -536,10 +579,12 @@
     switch (how) {
       case "avg":
         return vals.reduce(function (a, b) { return a + b; }, 0) / vals.length;
+      // reduce (not Math.min/max.apply) so a very large group can't blow the
+      // argument-count limit and throw a RangeError.
       case "min":
-        return Math.min.apply(null, vals);
+        return vals.reduce(function (a, b) { return b < a ? b : a; }, vals[0]);
       case "max":
-        return Math.max.apply(null, vals);
+        return vals.reduce(function (a, b) { return b > a ? b : a; }, vals[0]);
       default:
         return vals.reduce(function (a, b) { return a + b; }, 0);
     }
@@ -558,15 +603,28 @@
       .filter(function (i) { return i >= 0; });
   }
 
+  // Thrown when a chart names a dataset column that doesn't resolve, so the
+  // caller can show the "Could not render this chart." fallback (with which
+  // column was bad) instead of an empty axes-only canvas.
+  function badColumn(name) {
+    var e = new Error("unknown column");
+    e.redBadColumn = name == null ? "(unnamed)" : String(name);
+    return e;
+  }
+
   function buildConfig(ds, spec) {
     var rows = viewRows(ds);
     var type = spec.type || "bar";
     var xi = colIndex(ds, spec.x);
     var opts = spec.options || {};
+    // An explicit x that doesn't resolve is a hard error (don't silently fall
+    // back to row-index labels). A null/omitted x keeps its index behavior.
+    if (spec.x != null && xi === -1) throw badColumn(spec.x);
 
     if (type === "scatter" || type === "bubble") {
       var yi = colIndex(ds, Array.isArray(spec.y) ? spec.y[0] : spec.y);
       var ri = colIndex(ds, spec.r);
+      if (yi === -1) throw badColumn(Array.isArray(spec.y) ? spec.y[0] : spec.y);
       var pts = rows.map(function (r) {
         var p = { x: toNum(r[xi]), y: toNum(r[yi]) };
         if (type === "bubble") p.r = ri >= 0 ? toNum(r[ri]) || 4 : 4;
@@ -580,6 +638,9 @@
     }
 
     var ycols = resolveY(ds, spec, xi);
+    // An explicit y that resolves to no valid column → bad column name.
+    if (spec.y != null && !ycols.length)
+      throw badColumn(Array.isArray(spec.y) ? spec.y.join(", ") : spec.y);
     var how = spec.aggregate || "none";
     var labels, series;
     if (how === "none") {
@@ -640,7 +701,10 @@
         CHARTS.push(new Chart(canvas, spec));
       }
     } catch (e) {
-      slot.textContent = "Could not render this chart.";
+      slot.textContent =
+        e && e.redBadColumn
+          ? "Could not render this chart. Unknown column: " + e.redBadColumn
+          : "Could not render this chart.";
     }
   }
 
@@ -688,11 +752,17 @@
       }
     });
     var allNum = out.length > 0 && out.every(function (s) {
-      return s !== "" && !isNaN(Number(s));
+      return s !== "" && Number.isFinite(Number(s));
     });
     out.sort(
       allNum
-        ? function (a, b) { return Number(a) - Number(b); }
+        // Guard non-finite (NaN/Infinity) so the comparator never returns NaN.
+        ? function (a, b) {
+            var na = Number(a), nb = Number(b);
+            if (!Number.isFinite(na) || !Number.isFinite(nb))
+              return String(a).localeCompare(String(b));
+            return na - nb;
+          }
         : function (a, b) { return a.localeCompare(b); }
     );
     return out;
@@ -750,8 +820,13 @@
     }
     function apply() {
       var set = selSet();
+      // An empty selection means "no filter applied" (show all rows), not
+      // "match nothing". This also covers a `def.default` that matches none of
+      // the column's distinct values — without it, such a default would hide
+      // every row. passesFacets skips a set facet whose `set` is null.
+      var facetSet = set.size ? set : null;
       targets.forEach(function (tg) {
-        tg.ds.state.facets[tg.ci] = { type: "set", set: set };
+        tg.ds.state.facets[tg.ci] = { type: "set", set: facetSet };
         tg.ds.notify();
       });
       var on = values.filter(function (v) { return selected[v]; }).length;
@@ -800,6 +875,20 @@
       panel.style.display = open ? "none" : "block";
     });
 
+    // Reset to defaults + re-sync the checkbox UI (used by a table's
+    // "Clear filters"); does not re-apply, since the caller resets facets.
+    function reset() {
+      for (var i = 0; i < values.length; i++) selected[values[i]] = false;
+      for (var j = 0; j < defaults.length; j++)
+        if (defaults[j] in selected) selected[defaults[j]] = true;
+      checks.forEach(function (ch) { ch.input.checked = !!selected[ch.v]; });
+      all.input.checked = values.every(function (x) { return selected[x]; });
+      var on = values.filter(function (v) { return selected[v]; }).length;
+      btn.textContent =
+        on === values.length ? "All" : on === 0 ? "None" : on + " selected";
+    }
+    targets.forEach(function (tg) { tg.ds.facetResets.push(reset); });
+
     wrap.appendChild(label);
     wrap.appendChild(btn);
     wrap.appendChild(panel);
@@ -838,6 +927,13 @@
       });
     }
     sel.addEventListener("change", apply);
+    // Reset to default (or "All") + re-sync the UI for "Clear filters".
+    targets.forEach(function (tg) {
+      tg.ds.facetResets.push(function () {
+        sel.value =
+          def.default != null && def.default !== "" ? String(def.default) : ALL;
+      });
+    });
     wrap.appendChild(label);
     wrap.appendChild(sel);
     apply();
@@ -860,12 +956,20 @@
         if (n !== null) vals.push(n);
       });
     });
-    var dmin = vals.length ? Math.min.apply(null, vals) : 0;
-    var dmax = vals.length ? Math.max.apply(null, vals) : 100;
+    // reduce (not Math.min/max.apply) — a huge column can't throw RangeError.
+    // vals are already finite (toNum drops NaN/Infinity), so the domain is sane.
+    var dmin = vals.length
+      ? vals.reduce(function (a, b) { return b < a ? b : a; }, vals[0])
+      : 0;
+    var dmax = vals.length
+      ? vals.reduce(function (a, b) { return b > a ? b : a; }, vals[0])
+      : 100;
     if (dmin === dmax) dmax = dmin + 1;
     var span = dmax - dmin;
     var intish = vals.length > 0 && vals.every(function (v) { return Number.isInteger(v); });
-    var step = intish ? 1 : span / 100;
+    // Float step: ~1/1000 of the span so a large domain isn't dragged in coarse
+    // span/100 jumps, with a tiny floor to avoid a zero/degenerate step.
+    var step = intish ? 1 : Math.max(span / 1000, 1e-9);
 
     var box = document.createElement("div");
     box.className = "red-rangewrap";
@@ -943,6 +1047,22 @@
       }
     });
 
+    // Reset both handles to the full domain for "Clear filters" (curLo/curHi at
+    // the edges make apply() emit null min/max → no filter). Caller resets the
+    // facet itself, so we only re-sync the visible controls here.
+    targets.forEach(function (tg) {
+      tg.ds.facetResets.push(function () {
+        curLo = dmin;
+        curHi = dmax;
+        loR.value = String(dmin);
+        hiR.value = String(dmax);
+        loNum.value = fmtNum(dmin);
+        hiNum.value = fmtNum(dmax);
+        fill.style.left = "0%";
+        fill.style.width = "100%";
+      });
+    });
+
     box.appendChild(loNum);
     box.appendChild(slider);
     box.appendChild(hiNum);
@@ -967,6 +1087,10 @@
         tg.ds.state.facets[tg.ci] = { type: "text", text: inp.value };
         tg.ds.notify();
       });
+    });
+    // Clear the box for "Clear filters" (caller resets the facet itself).
+    targets.forEach(function (tg) {
+      tg.ds.facetResets.push(function () { inp.value = ""; });
     });
     wrap.appendChild(label);
     wrap.appendChild(inp);

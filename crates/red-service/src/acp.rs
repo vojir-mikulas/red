@@ -152,6 +152,16 @@ impl AcpManager {
         tracker.count <= RESTART_MAX
     }
 
+    /// Drop restart trackers whose conversation no longer exists, so the map can't
+    /// outgrow the live conversation set. Eviction is a clean teardown (idle sweep,
+    /// session close, re-auth), not a crash, so resetting the budget for a
+    /// reclaimed conversation is correct — a rapidly-crashing one stays recent and
+    /// is retained, keeping its budget intact.
+    fn prune_restarts(&mut self) {
+        let conversations = &self.conversations;
+        self.restarts.retain(|id, _| conversations.contains_key(id));
+    }
+
     /// Answer a parked permission prompt (the panel's Allow/Deny). A stale id (the
     /// prompt was already resolved or the agent went away) is a no-op.
     pub(crate) fn resolve_permission(&mut self, request_id: u64, allow: bool) {
@@ -181,6 +191,7 @@ impl AcpManager {
         if dropped > 0 {
             tracing::debug!("tore down {dropped} ACP conversation(s) for a closed session");
         }
+        self.prune_restarts();
     }
 
     /// Reclaim conversations idle past [`IDLE_TEARDOWN`] (M-S3), skipping any with
@@ -196,6 +207,7 @@ impl AcpManager {
         if dropped > 0 {
             tracing::debug!("evicted {dropped} idle ACP conversation(s)");
         }
+        self.prune_restarts();
     }
 
     /// Drop every conversation not mid-turn so its next prompt re-spawns the agent
@@ -209,6 +221,7 @@ impl AcpManager {
         if dropped > 0 {
             tracing::debug!("dropped {dropped} idle ACP conversation(s) after re-auth");
         }
+        self.prune_restarts();
     }
 
     /// Tear down a conversation the UI has closed or deleted (M-S5), freeing its

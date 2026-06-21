@@ -791,28 +791,28 @@ pub(crate) async fn run_tool(
                 .and_then(Json::as_array)
                 .map(|items| items.iter().filter(|c| c.is_object()).cloned().collect())
                 .unwrap_or_default();
-            // Refuse an oversized report before building the file: the renderer has
-            // no row virtualization, so a giant payload yields a sluggish document.
-            let payload_bytes = body.len()
-                + charts.iter().map(|c| c.to_string().len()).sum::<usize>()
-                + data.map_or(0, |d| d.to_string().len())
-                + filters.iter().map(|f| f.to_string().len()).sum::<usize>();
-            if payload_bytes > MAX_REPORT_BYTES {
-                return (
-                    format!(
-                        "error: the report is too large ({} KiB; the cap is {} KiB). Summarize or \
-                         aggregate the data, or narrow it with a tighter query, then try again.",
-                        payload_bytes / 1024,
-                        MAX_REPORT_BYTES / 1024,
-                    ),
-                    false,
-                );
-            }
             // Wrap the model's HTML in a sandboxed, themed shell (strict CSP) and
             // open it in the browser. With charts/data, the shell adds a nonce-gated
             // bundle and a `connect-src 'none'` (no-egress) policy. The active app
             // theme (if any) paints the report in Red's palette.
             let html = wrap_report_html(title, body, &charts, data, &filters, report.theme());
+            // Refuse an oversized report by measuring the FINAL document (body + the
+            // re-serialized data + styles) rather than the raw inputs, so the cap
+            // reflects what the (non-virtualizing) renderer actually has to open. The
+            // chart bundle is a fixed ~250 KiB; discount it so the cap measures the
+            // model's contribution, not our constant overhead.
+            let report_bytes = html.len().saturating_sub(REPORT_CHARTS_JS.len());
+            if report_bytes > MAX_REPORT_BYTES {
+                return (
+                    format!(
+                        "error: the report is too large ({} KiB; the cap is {} KiB). Summarize or \
+                         aggregate the data, or narrow it with a tighter query, then try again.",
+                        report_bytes / 1024,
+                        MAX_REPORT_BYTES / 1024,
+                    ),
+                    false,
+                );
+            }
             let path = std::env::temp_dir()
                 .join(format!("red-report-{}.html", uuid::Uuid::new_v4().simple()));
             match write_report_file(&path, &html) {
@@ -971,7 +971,35 @@ fn is_read_only_select(sql: &str) -> bool {
     const WRITE_TOKENS: &[&str] = &[
         "insert", "update", "delete", "merge", "into", "nextval", "setval",
     ];
-    !WRITE_TOKENS.iter().any(|w| has_word(&lower, w))
+    // Server-side functions callable from inside a SELECT that write/read files,
+    // manipulate large objects, execute remote SQL, or emit WAL — all beyond a read
+    // tier's intent (e.g. `SELECT lo_import('/etc/passwd')`, `SELECT load_file(…)`,
+    // `SELECT dblink_exec('…','DELETE …')`). This is a denylist of the well-known
+    // dangerous ones; the *complete* guarantee is engine-level read-only (see the
+    // doc comment). The names are underscore-qualified identifiers, not plausible
+    // bare column names, so blocking them won't trip a real browse query.
+    const DANGEROUS_FNS: &[&str] = &[
+        // Postgres: file read/write, large objects, remote exec, WAL, admin file ops.
+        "lo_import",
+        "lo_export",
+        "pg_read_file",
+        "pg_read_binary_file",
+        "pg_ls_dir",
+        "pg_stat_file",
+        "pg_logical_emit_message",
+        "dblink_exec",
+        "pg_file_write",
+        "pg_file_unlink",
+        "pg_file_rename",
+        // MySQL: file read and UDF command execution.
+        "load_file",
+        "sys_exec",
+        "sys_eval",
+    ];
+    !WRITE_TOKENS
+        .iter()
+        .chain(DANGEROUS_FNS)
+        .any(|w| has_word(&lower, w))
 }
 
 /// The tools that never mutate data and so may run on any backend without the
@@ -1609,6 +1637,13 @@ mod tests {
         // Sequence-advancing functions write.
         assert!(!is_read_only_select("SELECT nextval('s')"));
         assert!(!is_read_only_select("select setval('s', 1)"));
+        // Server-side functions that read/write files or run remote SQL are refused.
+        assert!(!is_read_only_select("SELECT lo_import('/etc/passwd')"));
+        assert!(!is_read_only_select("SELECT pg_read_file('/etc/passwd')"));
+        assert!(!is_read_only_select(
+            "SELECT dblink_exec('dbname=x', 'DELETE FROM t')"
+        ));
+        assert!(!is_read_only_select("select load_file('/etc/passwd')"));
         // A write keyword merely *inside a literal or quoted identifier* is harmless
         // and must NOT block a real read (noise is stripped before the check).
         assert!(is_read_only_select("SELECT 'delete me' AS note FROM t"));

@@ -360,6 +360,19 @@ pub struct AiSettings {
     pub limits: AiLimitsSettings,
 }
 
+impl AiSettings {
+    /// A fail-closed variant: the assistant off, everything else at defaults. Used
+    /// when the `[ai]` section (or the whole settings file) can't be parsed, so a
+    /// malformed hand-edit disables AI rather than silently reverting to the
+    /// permissive default (`enabled = true`, read tier).
+    pub(crate) fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for AiSettings {
     fn default() -> Self {
         Self {
@@ -437,7 +450,13 @@ impl AiSettings {
                 .iter()
                 .filter(|a| !a.id.trim().is_empty())
                 .filter(|a| seen.insert(a.id.trim().to_string()))
-                .cloned()
+                // Store the trimmed id, not just dedup on it: the id is the keychain
+                // account key and the built-in env-var match, so a stray-whitespace
+                // id (`" anthropic"`) must resolve to the same identity downstream.
+                .map(|a| AiAgentSettings {
+                    id: a.id.trim().to_string(),
+                    ..a.clone()
+                })
                 .collect();
             if !explicit.is_empty() {
                 return explicit;
@@ -570,10 +589,17 @@ impl FileSettingsStore {
         let value: toml::Value = match contents.parse() {
             Ok(v) => v,
             Err(e) => {
+                // Fail closed: if we can't read the user's file at all, don't assume
+                // they wanted the assistant on — disable it rather than reverting to
+                // the permissive `AiSettings::default()`.
                 return LoadReport {
-                    settings: Settings::default(),
+                    settings: Settings {
+                        ai: AiSettings::disabled(),
+                        ..Settings::default()
+                    },
                     warnings: vec![format!(
-                        "settings.toml isn't valid TOML ({e}) — using defaults"
+                        "settings.toml isn't valid TOML ({e}) — using defaults; the assistant is \
+                         disabled until it's fixed"
                     )],
                     migrated: false,
                 };
@@ -588,7 +614,7 @@ impl FileSettingsStore {
             query: section(&value, "query", &mut warnings),
             behavior: section(&value, "behavior", &mut warnings),
             update: section(&value, "update", &mut warnings),
-            ai: section(&value, "ai", &mut warnings),
+            ai: ai_section(&value, &mut warnings),
         };
         let migrated = apply_legacy(&mut settings, &value);
 
@@ -681,6 +707,28 @@ fn section<T: Default + DeserializeOwned>(
                     "settings.toml: couldn't read [{key}] ({e}) — keeping defaults for that section"
                 ));
                 T::default()
+            }
+        },
+    }
+}
+
+/// Like [`section`] but **fails closed** for the security-sensitive `[ai]` table.
+/// A malformed section disables the assistant ([`AiSettings::disabled`]) instead of
+/// reverting to the permissive default (`enabled = true`, read tier), so a stray
+/// hand-edit — a typo'd key, a wrong-typed value — can't silently re-enable AI
+/// access against the user's intent. A missing section still uses the normal
+/// default (the shipped behavior).
+fn ai_section(value: &toml::Value, warnings: &mut Vec<String>) -> AiSettings {
+    match value.get("ai") {
+        None => AiSettings::default(),
+        Some(v) => match v.clone().try_into() {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                warnings.push(format!(
+                    "settings.toml: couldn't read [ai] ({e}) — the assistant is disabled until \
+                     it's fixed"
+                ));
+                AiSettings::disabled()
             }
         },
     }
@@ -861,8 +909,36 @@ mod tests {
         let t = temp_store();
         write(&t.store, "this is = not valid toml ][");
         let report = t.store.load_report();
-        assert_eq!(report.settings, Settings::default());
+        // Everything but AI falls back to defaults; AI fails CLOSED (disabled) since
+        // we couldn't read the user's intent for a security-sensitive control.
+        assert_eq!(
+            report.settings,
+            Settings {
+                ai: AiSettings::disabled(),
+                ..Settings::default()
+            }
+        );
+        assert!(!report.settings.ai.enabled);
         assert_eq!(report.warnings.len(), 1);
+    }
+
+    #[test]
+    fn malformed_ai_section_fails_closed() {
+        // A wrong-typed key in [ai] (here a string for the bool `show_thinking`)
+        // fails the whole section. It must disable the assistant rather than revert
+        // to the permissive default — even though `enabled = true` is set here, a
+        // parse failure must not leave AI on.
+        let t = temp_store();
+        write(
+            &t.store,
+            "[ai]\nenabled = true\ntier = \"read\"\nshow_thinking = \"yes\"\n",
+        );
+        let loaded = t.store.load_report();
+        assert!(
+            !loaded.settings.ai.enabled,
+            "AI must fail closed, not stay enabled"
+        );
+        assert_eq!(loaded.warnings.len(), 1);
     }
 
     #[test]

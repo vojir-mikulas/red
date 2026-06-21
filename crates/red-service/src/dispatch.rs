@@ -334,6 +334,7 @@ fn apply_connect_outcome(
     sessions: &mut HashMap<SessionId, SessionState>,
     connect_gen: &HashMap<SessionId, u64>,
     events: &Events,
+    ai_acp: &Arc<tokio::sync::Mutex<crate::acp::AcpManager>>,
 ) {
     match outcome {
         ConnectOutcome::Session {
@@ -355,6 +356,14 @@ fn apply_connect_outcome(
                         id,
                         SessionState::new(driver, tunnel, ai_override, read_only),
                     );
+                    // Evict any ACP conversation still bound to this id: it grounds in
+                    // the prior connection's driver. The reconnect already fired an
+                    // eviction, but an AI turn spawned just before the reconnect could
+                    // insert its conversation *after* that eviction ran (the dial has
+                    // since completed, so it has — closing that orphan-on-reconnect
+                    // race). A first connect has no such conversation, so this no-ops.
+                    let manager = ai_acp.clone();
+                    tokio::spawn(async move { manager.lock().await.evict_session(Some(id)) });
                     emit(events, Some(id), Event::Connected { version });
                 }
                 Err(ConnectFail {
@@ -470,7 +479,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // The sender is held for the loop's lifetime, so `recv` only
                 // resolves with a real outcome (never `None`).
                 if let Some(outcome) = outcome {
-                    apply_connect_outcome(outcome, &mut sessions, &connect_gen, &events);
+                    apply_connect_outcome(outcome, &mut sessions, &connect_gen, &events, &ai_acp);
                 }
                 continue;
             }

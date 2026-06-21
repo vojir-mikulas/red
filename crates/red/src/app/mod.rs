@@ -1794,7 +1794,10 @@ impl AppState {
 }
 
 /// Open `path` with the OS's default handler — the file-first "open in editor"
-/// seam. Platform shell-out lives at the app edge; the UI never blocks on it.
+/// seam. Platform shell-out lives at the app edge. Uses `spawn` (fire-and-forget),
+/// never `status`: callers run on the GPUI main thread, and waiting on the OS
+/// opener to exit (a slow `xdg-open`/`cmd start` handler) would freeze the window.
+/// `Ok` means the opener was launched, not that the file was successfully shown.
 pub(crate) fn open_in_os(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     let mut cmd = {
@@ -1816,5 +1819,6 @@ pub(crate) fn open_in_os(path: &std::path::Path) -> std::io::Result<()> {
         c.arg(path);
         c
     };
-    cmd.status().map(|_| ())
+    // Fire-and-forget: spawn the opener and return without waiting for it to exit.
+    cmd.spawn().map(|_| ())
 }

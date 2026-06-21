@@ -184,16 +184,19 @@ impl AiTier {
         }
     }
 
-    /// Parse a settings string leniently: an unrecognized value resolves to the
-    /// safe default rather than failing, so a typo never wedges the AI off. `write`
-    /// is accepted both globally (`[ai] tier`) and per-connection (`ai_tier`); it
-    /// only ever grants the write tool on a writable connection, gated by approval.
+    /// Parse a settings string. Recognized tiers map directly; an **unrecognized**
+    /// value fails **closed** to [`AiTier::Off`] rather than to a permissive tier —
+    /// a typo like `"readonly"` or `"scema"` when locking the assistant down must
+    /// not silently grant row-data (`read`) access. `write` is accepted both
+    /// globally (`[ai] tier`) and per-connection (`ai_tier`); it only ever grants
+    /// the write tool on a writable connection, gated by approval.
     pub fn parse(s: &str) -> AiTier {
         match s.trim().to_ascii_lowercase().as_str() {
             "off" => AiTier::Off,
             "schema" => AiTier::Schema,
+            "read" => AiTier::Read,
             "write" => AiTier::Write,
-            _ => AiTier::Read,
+            _ => AiTier::Off,
         }
     }
 }
@@ -1539,14 +1542,16 @@ mod ai_policy_tests {
     }
 
     #[test]
-    fn tier_parse_is_lenient() {
+    fn tier_parse_recognizes_known_tiers_and_fails_closed() {
         assert_eq!(AiTier::parse("off"), AiTier::Off);
         assert_eq!(AiTier::parse(" Schema "), AiTier::Schema);
         assert_eq!(AiTier::parse("READ"), AiTier::Read);
         assert_eq!(AiTier::parse("write"), AiTier::Write);
-        // A typo or empty string falls back to the safe default rather than erroring.
-        assert_eq!(AiTier::parse("nonsense"), AiTier::Read);
-        assert_eq!(AiTier::parse(""), AiTier::Read);
+        // A typo or empty string fails CLOSED (Off), never to a permissive tier —
+        // locking the assistant down must not silently grant read access.
+        assert_eq!(AiTier::parse("nonsense"), AiTier::Off);
+        assert_eq!(AiTier::parse("readonly"), AiTier::Off);
+        assert_eq!(AiTier::parse(""), AiTier::Off);
     }
 
     #[test]
