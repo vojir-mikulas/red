@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use red_core::{ConnectionConfig, DbKind, SshAuth, SshConfig};
+use red_core::{AiTier, ConnectionConfig, DbKind, SshAuth, SshConfig};
 use serde::{Deserialize, Serialize};
 
 /// A saved connection plus a recency stamp for "recent" ordering. The in-memory
@@ -64,6 +64,14 @@ struct RawConnection {
     color: u8,
     #[serde(default)]
     read_only: bool,
+    /// Optional per-connection AI master-switch override (M-S7). Absent inherits
+    /// the global `[ai] enabled`.
+    #[serde(default)]
+    ai_enabled: Option<bool>,
+    /// Optional per-connection AI access-tier override (M-S7): `off`/`schema`/
+    /// `read`. Absent inherits the global `[ai] tier`.
+    #[serde(default)]
+    ai_tier: Option<AiTier>,
     #[serde(default)]
     last_accessed: Option<u64>,
     /// Optional SSH jump host. Absent in pre-SSH configs; secrets are never here.
@@ -126,6 +134,8 @@ impl RawConnection {
             database: self.database,
             color: self.color,
             read_only: self.read_only,
+            ai_enabled: self.ai_enabled,
+            ai_tier: self.ai_tier,
             ssh: self.ssh.and_then(RawSsh::into_config),
         };
         // Legacy migration: an old `dsn` with no structured fields populated. For a
@@ -174,6 +184,13 @@ struct WriteConnection {
     database: String,
     color: u8,
     read_only: bool,
+    /// Per-connection AI overrides (M-S7); omitted when unset so they inherit the
+    /// global `[ai]` policy and pre-M-S7 files round-trip unchanged. Scalar keys,
+    /// so they stay ahead of the `ssh` sub-table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ai_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ai_tier: Option<AiTier>,
     last_accessed: Option<u64>,
     /// Optional `[connection.ssh]` sub-table. Must stay the **last** field: TOML
     /// requires a table-valued key to follow all of a struct's scalar keys.
@@ -223,6 +240,8 @@ impl From<&StoredConnection> for WriteConnection {
             database: c.database.clone(),
             color: c.color,
             read_only: c.read_only,
+            ai_enabled: c.ai_enabled,
+            ai_tier: c.ai_tier,
             last_accessed: s.last_accessed,
             ssh: c.ssh.as_ref().map(WriteSsh::from_config),
         }
@@ -394,6 +413,10 @@ mod tests {
                     database: "analytics".into(),
                     color: 3,
                     read_only: false,
+                    // Per-connection AI overrides (M-S7) must round-trip; conn-a
+                    // leaves them unset to confirm they're omitted and inherited.
+                    ai_enabled: Some(false),
+                    ai_tier: Some(AiTier::Schema),
                     ssh: None,
                 },
                 last_accessed: None,
@@ -427,6 +450,11 @@ mod tests {
         // Password is not persisted; it comes back empty.
         assert_eq!(back[1].config.password, "");
         assert_eq!(back[1].last_accessed, None);
+        // Per-connection AI overrides round-trip; an unset one stays inherited.
+        assert_eq!(back[0].config.ai_enabled, None);
+        assert_eq!(back[0].config.ai_tier, None);
+        assert_eq!(back[1].config.ai_enabled, Some(false));
+        assert_eq!(back[1].config.ai_tier, Some(AiTier::Schema));
     }
 
     #[test]

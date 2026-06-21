@@ -71,12 +71,18 @@ actions!(
         Settings,
         /// Open the settings panel on its About tab (RED → About RED in the menu).
         About,
+        /// Open the GitHub issue tracker in the browser (Help → Report a Bug…).
+        /// Menu-only, like `About` — no default shortcut, so it's absent from
+        /// `DEFAULTS`/the keymap editor.
+        ReportBug,
         /// Open the connection switcher popover (⌘P).
         SwitchConnection,
         /// Open or close the cell detail inspector (⌘I).
         ToggleInspector,
         /// Close the cell detail inspector (Esc) — a no-op when it's shut.
         CloseInspector,
+        /// Open or close the AI assistant chat panel (⌘L).
+        ToggleAssistant,
         /// Open or close the result filter bar (⌘⇧F) — Track B2.
         ToggleFilter,
         /// Save the active tab's query as a named snippet (⇧⌘S) — Track B3.
@@ -245,6 +251,15 @@ const DEFAULTS: &[ActionDef] = &[
         "escape",
         "CloseInspector",
         "Close cell inspector",
+        Some("RedRoot"),
+    ),
+    // ⌘L toggles the AI assistant panel. `RedRoot`-scoped like the inspector so a
+    // focused editor / field keeps its own ⌘L; it fires from the grid, schema, or
+    // root. The panel has a close button for when its own input has focus.
+    def(
+        "cmd-l",
+        "ToggleAssistant",
+        "Toggle AI agent",
         Some("RedRoot"),
     ),
     // Result filter bar. ⌘⇧F to keep plain ⌘F as schema search.
@@ -619,6 +634,7 @@ fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<Ke
         "CopyResult" => kb!(CopyResult),
         "ToggleInspector" => kb!(ToggleInspector),
         "CloseInspector" => kb!(CloseInspector),
+        "ToggleAssistant" => kb!(ToggleAssistant),
         "ToggleFilter" => kb!(ToggleFilter),
         "SaveQuery" => kb!(SaveQuery),
         "OpenSavedQueries" => kb!(OpenSavedQueries),
@@ -877,7 +893,7 @@ mod tests {
             Some(row_of("NewTab", Some("RedRoot")))
         );
         // A free key collides with nothing.
-        assert_eq!(conflict_for(&slots, filter, "cmd-l"), None);
+        assert_eq!(conflict_for(&slots, filter, "cmd-d"), None);
         // The same key in a *different* context (Table vs RedRoot) is not a conflict.
         let begin = DEFAULTS
             .iter()

@@ -86,6 +86,7 @@ impl AppState {
             test: TestState::Idle,
             ssh_enabled: false,
             ssh_auth: SshAuthMode::Agent,
+            ai_allow_writes: false,
         });
         self.focus_name_field = true;
         cx.notify();
@@ -151,6 +152,7 @@ impl AppState {
             test: TestState::Idle,
             ssh_enabled: config.ssh.is_some(),
             ssh_auth: ssh_auth.unwrap_or(SshAuthMode::Agent),
+            ai_allow_writes: config.ai_tier == Some(red_core::AiTier::Write),
         });
         self.focus_name_field = true;
         cx.notify();
@@ -187,6 +189,24 @@ impl AppState {
                 passphrase: self.ssh_passphrase_input.read(cx).content().to_string(),
             }
         });
+        // Per-connection AI overrides (M-S7). `ai_enabled` and a stricter
+        // `off`/`schema` tier are still hand-set in connections.toml; carry the
+        // editing connection's values through so a save doesn't drop them. The
+        // **write** opt-in (Feature B) IS surfaced — the form checkbox sets
+        // `ai_tier = "write"`, and clearing it reverts to inherit (unless a hand-set
+        // off/schema is present, which is preserved).
+        let prior = form
+            .editing
+            .and_then(|i| self.connections.get(i))
+            .map(|c| (c.config.ai_enabled, c.config.ai_tier))
+            .unwrap_or((None, None));
+        let ai_enabled = prior.0;
+        let ai_tier = if form.ai_allow_writes {
+            Some(red_core::AiTier::Write)
+        } else {
+            // Unchecked: keep a hand-set off/schema, but drop a prior write opt-in.
+            prior.1.filter(|t| *t != red_core::AiTier::Write)
+        };
         Some(ConnectionConfig {
             name: read(&self.name_input),
             kind: form.kind,
@@ -198,6 +218,8 @@ impl AppState {
             database: read(&self.database_input),
             color: form.color,
             read_only: form.read_only,
+            ai_enabled,
+            ai_tier,
             ssh,
         })
     }
@@ -475,6 +497,13 @@ impl AppState {
     pub(crate) fn set_form_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
         if let Some(form) = &mut self.form {
             form.read_only = read_only;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn set_form_ai_allow_writes(&mut self, on: bool, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.form {
+            form.ai_allow_writes = on;
         }
         cx.notify();
     }

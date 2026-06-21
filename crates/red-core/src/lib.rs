@@ -123,6 +123,158 @@ impl fmt::Debug for SshConfig {
     }
 }
 
+/// How much of the connected database the AI assistant's tools may reach. The
+/// tier is enforced where the MCP tool catalog is *constructed* — a tool above
+/// the tier simply isn't offered, so the model (on either the API-key or the
+/// subscription/ACP backend) can't call something the tier withholds. It is a
+/// least-privilege ladder: each rung adds to the one below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "lowercase")
+)]
+pub enum AiTier {
+    /// No DB tools at all — the assistant chats without database grounding.
+    Off,
+    /// Structure only: `list_schema` + `describe_table`. The model sees tables,
+    /// columns, types, and keys but never reads a row of data.
+    Schema,
+    /// The full read catalog: adds `run_select` and `explain`, subject to the
+    /// resource guards in [`AiLimits`]. Honors a connection's `read_only` posture.
+    /// The shipped default.
+    #[default]
+    Read,
+    /// Read **plus** the gated write tool (`propose_write`): a single
+    /// INSERT/UPDATE/DELETE that requires explicit, per-statement user approval and
+    /// is blocked on a read-only connection and for destructive shapes (DDL,
+    /// unqualified UPDATE/DELETE). Opt-in only — set globally (`[ai] tier = "write"`)
+    /// or per-connection (`ai_tier = "write"`); never a default.
+    Write,
+}
+
+impl AiTier {
+    /// Whether the named tool is exposed at this tier. The single source of truth
+    /// for catalog membership, so both backends gate identically.
+    pub fn allows_tool(self, tool: &str) -> bool {
+        match self {
+            AiTier::Off => false,
+            AiTier::Schema => matches!(tool, "list_schema" | "describe_table"),
+            AiTier::Read => matches!(
+                tool,
+                "list_schema"
+                    | "describe_table"
+                    | "run_select"
+                    | "explain"
+                    | "generate_report"
+                    | "open_query"
+            ),
+            // Write inherits the full read catalog and adds the gated write tool.
+            AiTier::Write => tool == "propose_write" || AiTier::Read.allows_tool(tool),
+        }
+    }
+
+    /// A short label for status lines and logs.
+    pub fn label(self) -> &'static str {
+        match self {
+            AiTier::Off => "off",
+            AiTier::Schema => "schema",
+            AiTier::Read => "read",
+            AiTier::Write => "write",
+        }
+    }
+
+    /// Parse a settings string. Recognized tiers map directly; an **unrecognized**
+    /// value fails **closed** to [`AiTier::Off`] rather than to a permissive tier —
+    /// a typo like `"readonly"` or `"scema"` when locking the assistant down must
+    /// not silently grant row-data (`read`) access. `write` is accepted both
+    /// globally (`[ai] tier`) and per-connection (`ai_tier`); it only ever grants
+    /// the write tool on a writable connection, gated by approval.
+    pub fn parse(s: &str) -> AiTier {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => AiTier::Off,
+            "schema" => AiTier::Schema,
+            "read" => AiTier::Read,
+            "write" => AiTier::Write,
+            _ => AiTier::Off,
+        }
+    }
+}
+
+/// Resource guards on the `read` tier — defense in depth so neither backend can
+/// make the assistant read 1M rows by accident or hang the session thread. They
+/// are enforced server-side in the tool layer, mirroring the windowed-cursor and
+/// fat-cell caps the human-facing paths already carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiLimits {
+    /// Hard ceiling on rows one `run_select` may return; a larger requested
+    /// `LIMIT` is clamped and the truncation reported back to the model.
+    pub max_rows: usize,
+    /// Per-tool-call statement timeout. `0` disables it.
+    pub statement_timeout_ms: u64,
+    /// Cap on the size of one tool result handed back to the model; a larger
+    /// result is truncated (and the truncation noted) so context can't balloon.
+    pub max_result_bytes: usize,
+    /// Cap on tool calls per conversation, bounding a runaway agent loop. `0`
+    /// disables the cap.
+    pub max_tool_calls: usize,
+}
+
+impl Default for AiLimits {
+    fn default() -> Self {
+        Self {
+            max_rows: 1000,
+            statement_timeout_ms: 15_000,
+            max_result_bytes: 256 * 1024,
+            max_tool_calls: 100,
+        }
+    }
+}
+
+/// The resolved AI access policy for one turn: the master switch, the access
+/// tier, and the resource guards. Built by layering a connection's optional
+/// overrides over the global `[ai]` settings (see [`Self::with_overrides`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiPolicy {
+    /// The master switch. When `false` the assistant is a true no-op: no panel
+    /// entry, no tools, and — critically — no MCP server or agent process.
+    pub enabled: bool,
+    pub tier: AiTier,
+    pub limits: AiLimits,
+    /// The connection's read-only posture, carried into the tool layer so the write
+    /// tool is withheld (and rejected, defense in depth) on a read-only connection —
+    /// the same guard the human write path is held to. Authoritative (set from the
+    /// session), not the UI-supplied `AiContext.read_only`.
+    pub read_only: bool,
+}
+
+impl Default for AiPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tier: AiTier::Read,
+            limits: AiLimits::default(),
+            read_only: false,
+        }
+    }
+}
+
+impl AiPolicy {
+    /// Layer a connection's optional overrides over this (global) policy. A set
+    /// override tightens (or loosens) the field for that connection; an unset one
+    /// inherits the global value — so an unconfigured connection gets the global
+    /// default, and a sensitive one can be pinned `off`/`schema` without touching
+    /// the global setting.
+    pub fn with_overrides(self, enabled: Option<bool>, tier: Option<AiTier>) -> AiPolicy {
+        AiPolicy {
+            enabled: enabled.unwrap_or(self.enabled),
+            tier: tier.unwrap_or(self.tier),
+            limits: self.limits,
+            read_only: self.read_only,
+        }
+    }
+}
+
 /// A saved connection target. Stored as structured fields rather than one opaque
 /// DSN so the form can offer both entry modes and so engines stay swappable; the
 /// driver-facing connection string is composed on demand by [`Self::dsn`]. For a
@@ -153,6 +305,15 @@ pub struct ConnectionConfig {
     /// every write path is refused up front.
     #[cfg_attr(feature = "serde", serde(default))]
     pub read_only: bool,
+    /// Per-connection AI master-switch override. `None` inherits the global
+    /// `[ai] enabled`; `Some(false)` is a true kill switch for *this* connection
+    /// (no panel, no tools, no agent), e.g. a production database.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ai_enabled: Option<bool>,
+    /// Per-connection AI access-tier override. `None` inherits the global
+    /// `[ai] tier`; set it to pin a sensitive connection to `off`/`schema`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ai_tier: Option<AiTier>,
     /// Optional SSH jump host. When set, the service tunnels the connection
     /// through it (see [`SshConfig`]); `None` connects directly.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -185,6 +346,8 @@ impl fmt::Debug for ConnectionConfig {
             .field("database", &self.database)
             .field("color", &self.color)
             .field("read_only", &self.read_only)
+            .field("ai_enabled", &self.ai_enabled)
+            .field("ai_tier", &self.ai_tier)
             .field("ssh", &self.ssh)
             .finish()
     }
@@ -961,6 +1124,10 @@ pub struct ResultPage {
 pub enum ExportFormat {
     Csv,
     Json,
+    /// A themed, self-contained HTML report — a standalone document (inline CSS,
+    /// light/dark via `prefers-color-scheme`) opened in the system browser, not a
+    /// data interchange file. Streamed row-by-row like the others.
+    Html,
 }
 
 /// Per-query knobs carried UI → service → driver.
@@ -1345,5 +1512,63 @@ mod edit_tests {
         assert_eq!(coerce_edit_value("x", None), Ok(Value::Text("x".into())));
         // A non-numeric value on an integer column is a coercion error (no preview).
         assert!(coerce_edit_value("abc", Some("int")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod ai_policy_tests {
+    use super::*;
+
+    #[test]
+    fn tier_ladder_gates_tools() {
+        // off → nothing; schema → structure only; read → the full catalog.
+        assert!(!AiTier::Off.allows_tool("list_schema"));
+        assert!(AiTier::Schema.allows_tool("list_schema"));
+        assert!(AiTier::Schema.allows_tool("describe_table"));
+        assert!(!AiTier::Schema.allows_tool("run_select"));
+        assert!(!AiTier::Schema.allows_tool("explain"));
+        assert!(AiTier::Read.allows_tool("run_select"));
+        assert!(AiTier::Read.allows_tool("explain"));
+        assert!(AiTier::Read.allows_tool("generate_report"));
+        assert!(AiTier::Read.allows_tool("open_query"));
+        // The write tool is gated to the Write tier — and Write inherits the read
+        // catalog on top of it.
+        assert!(!AiTier::Read.allows_tool("propose_write"));
+        assert!(AiTier::Write.allows_tool("propose_write"));
+        assert!(AiTier::Write.allows_tool("run_select"));
+        // Unknown tools are never allowed at any tier.
+        assert!(!AiTier::Read.allows_tool("frobnicate"));
+        assert!(!AiTier::Write.allows_tool("frobnicate"));
+    }
+
+    #[test]
+    fn tier_parse_recognizes_known_tiers_and_fails_closed() {
+        assert_eq!(AiTier::parse("off"), AiTier::Off);
+        assert_eq!(AiTier::parse(" Schema "), AiTier::Schema);
+        assert_eq!(AiTier::parse("READ"), AiTier::Read);
+        assert_eq!(AiTier::parse("write"), AiTier::Write);
+        // A typo or empty string fails CLOSED (Off), never to a permissive tier —
+        // locking the assistant down must not silently grant read access.
+        assert_eq!(AiTier::parse("nonsense"), AiTier::Off);
+        assert_eq!(AiTier::parse("readonly"), AiTier::Off);
+        assert_eq!(AiTier::parse(""), AiTier::Off);
+    }
+
+    #[test]
+    fn overrides_layer_over_global() {
+        let global = AiPolicy {
+            enabled: true,
+            tier: AiTier::Read,
+            limits: AiLimits::default(),
+            read_only: false,
+        };
+        // Unset overrides inherit the global policy verbatim.
+        assert_eq!(global.with_overrides(None, None), global);
+        // A connection can tighten the tier and flip the master switch without
+        // touching the global policy; limits stay global.
+        let tightened = global.with_overrides(Some(false), Some(AiTier::Schema));
+        assert!(!tightened.enabled);
+        assert_eq!(tightened.tier, AiTier::Schema);
+        assert_eq!(tightened.limits, global.limits);
     }
 }

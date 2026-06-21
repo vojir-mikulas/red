@@ -191,6 +191,10 @@ pub(crate) struct FormState {
     /// Which SSH auth method the form has selected. The key path and the secrets
     /// live in the shared SSH inputs; this only tracks the choice.
     pub ssh_auth: SshAuthMode,
+    /// Opt this connection into the AI **write** tier (Feature B): the assistant may
+    /// propose INSERT/UPDATE/DELETE, each gated by per-statement approval. Off by
+    /// default; ignored on a read-only connection. Maps to `ai_tier = "write"`.
+    pub ai_allow_writes: bool,
 }
 
 /// The SSH authentication method picked in the form. Mirrors `red_core::SshAuth`
@@ -335,6 +339,9 @@ impl QueryTab {
                     this.pending_focus = Some(Pane::Grid);
                     cx.notify();
                 }
+                // The query editor never sends (it's not a `submit_on_enter`
+                // composer); Enter inserts a line here.
+                CodeEditorEvent::Submit => {}
             },
         )
         .detach();
@@ -552,6 +559,38 @@ pub struct AppState {
     /// The cell detail inspector, when open (Track B1). Owns its scroll position
     /// and any on-demand full value fetched for a capped/evicted cell.
     pub(crate) inspector: Option<crate::inspector::InspectorState>,
+    /// The AI assistant chat panel, when open (right-docked). Owns its input,
+    /// transcript, and streaming state. Single panel across the workspace.
+    pub(crate) assistant: Option<crate::assistant::AssistantState>,
+    /// Set when the assistant panel just opened: the next render focuses its input.
+    pub(crate) focus_assistant: bool,
+    /// Set when an inline conversation rename just began: the next render focuses
+    /// its edit field so the user types the new title at once.
+    pub(crate) focus_rename: bool,
+    /// Docked width of the assistant panel, retained while it's closed so reopening
+    /// restores it. Resizable via the shell split.
+    pub(crate) assistant_w: Pixels,
+    pub(crate) assistant_drag: Option<DragAnchor>,
+    /// Whether the assistant is usable at all — at least one configured agent is
+    /// ready (an ACP agent, which needs no key, or an API agent with a key). Drives
+    /// the panel's setup-vs-chat view. Recomputed at launch and on settings reload.
+    pub(crate) ai_configured: bool,
+    /// The usable agents in config order — the source for the panel's agent
+    /// selector and the per-chat default. An API agent appears only once it has a
+    /// key; an ACP agent always. Recomputed with `ai_configured`.
+    pub(crate) usable_agents: Vec<AgentInfo>,
+    /// Shared obscured field for entering an API agent's key in Settings → AI agent
+    /// → Agents. One input reused across rows; `ai_key_editing` says which agent it's
+    /// bound to (`None` = no row is editing). The key is written to the OS keyring
+    /// under the agent's id, never to settings.toml.
+    pub(crate) ai_key_input: Entity<TextInput>,
+    /// The id of the API agent whose key row is currently open for editing, if any.
+    pub(crate) ai_key_editing: Option<String>,
+    /// Set when an agent key row just opened: the next render focuses `ai_key_input`.
+    pub(crate) focus_ai_key: bool,
+    /// Monotonic id source for assistant conversations, so the backend keeps each
+    /// panel's turn history separate.
+    pub(crate) next_conversation_id: u64,
     /// The result filter bar, when open (Track B2). The transient editing UI; the
     /// *applied* filter lives on the grid (`ResultGrid::filter`).
     pub(crate) filter_bar: Option<crate::filter::FilterBarState>,
@@ -684,6 +723,9 @@ pub struct AppState {
     /// The saved queries shown by the open picker, held only while it's open so an
     /// activation can resolve its index. Loaded on demand — never at startup.
     pub(crate) saved_queries: Vec<crate::queries::SavedQuery>,
+    /// The saved conversations shown by the open history picker (M-S5), held only
+    /// while it's open so an activation can resolve its index. Loaded on demand.
+    pub(crate) loaded_conversations: Vec<crate::conversations::Conversation>,
     /// The connection switcher (⌘P): an always-mounted topbar trigger that opens a
     /// searchable, sectioned popover of the active + recent connections. Its
     /// sections are rebuilt from `connections` + `phase` via [`Self::rebuild_switcher`].
@@ -753,6 +795,11 @@ pub struct AppState {
 /// The GitHub `owner/repo` the self-updater polls (see docs/plans/self-update.md).
 pub(crate) const UPDATE_REPO: &str = "vojir-mikulas/red";
 
+/// Where the "report a bug" links point — the project's GitHub issue tracker.
+/// Shared by the welcome-screen footer, the About tab, and the Help menu so the
+/// three never drift.
+pub(crate) const ISSUES_URL: &str = "https://github.com/vojir-mikulas/red/issues";
+
 /// Build the backend's updater config from the persisted settings + this build's
 /// version. Used at launch and on each settings reload.
 fn update_config(settings: &Settings) -> UpdateConfig {
@@ -762,6 +809,102 @@ fn update_config(settings: &Settings) -> UpdateConfig {
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         interval: settings.update.interval(),
     }
+}
+
+/// Build the backend's AI config from `[ai]` settings + the keyring-stored API
+/// keys. Each configured agent profile (resolved from `[[ai.agents]]`, or the
+/// synthesized legacy built-ins) becomes an [`AiAgentProfile`](red_service::AiAgentProfile);
+/// for `api`-kind agents the key is read from the OS keychain under `ai-key:<id>`
+/// (the `anthropic` built-in additionally falls back to the `ANTHROPIC_API_KEY`
+/// env var for first-run/headless setup). An empty key leaves *that* agent off (a
+/// turn on it then replies with a clear error). Used at launch and on reload.
+pub(crate) fn ai_config(settings: &Settings) -> red_service::AiConfig {
+    let agents = settings
+        .ai
+        .resolved_agents()
+        .into_iter()
+        .map(|a| {
+            let kind = if a.kind.eq_ignore_ascii_case("acp") {
+                red_service::AiAgentKind::Acp
+            } else {
+                red_service::AiAgentKind::Api
+            };
+            // Only api agents need a key; resolve it per-id, with the env-var
+            // fallback scoped to the canonical `anthropic` built-in.
+            let api_key = if matches!(kind, red_service::AiAgentKind::Api) {
+                resolve_agent_key(&a.id)
+            } else {
+                String::new()
+            };
+            red_service::AiAgentProfile {
+                id: a.id,
+                name: a.name,
+                kind,
+                command: a.command,
+                base_url: a.base_url,
+                model: a.model,
+                api_key,
+            }
+        })
+        .collect();
+    red_service::AiConfig {
+        agents,
+        default_agent: settings.ai.resolved_default_agent(),
+        show_thinking: settings.ai.show_thinking,
+        // The global AI access policy (M-S7); a connection's overrides layer over
+        // it on the backend. The tier string parses leniently (a typo → `read`).
+        enabled: settings.ai.enabled,
+        tier: red_service::AiTier::parse(&settings.ai.tier),
+        limits: red_service::AiLimits {
+            max_rows: settings.ai.limits.max_rows,
+            statement_timeout_ms: settings.ai.limits.statement_timeout_ms,
+            max_result_bytes: settings.ai.limits.max_result_bytes,
+            max_tool_calls: settings.ai.limits.max_tool_calls,
+        },
+    }
+}
+
+/// One configured, usable agent the panel can run a chat on. `is_acp` distinguishes
+/// the two backends for UI that differs by kind (the re-auth/switch-account action,
+/// the header label) without leaking the protocol enum into the panel.
+#[derive(Debug, Clone)]
+pub(crate) struct AgentInfo {
+    pub id: String,
+    pub name: String,
+    pub is_acp: bool,
+}
+
+/// The usable agents in config order: an ACP agent is always usable (it owns its
+/// auth); an API agent only once it has a key. Drives the panel's selector and the
+/// setup-vs-chat gate. Built from [`ai_config`] so it agrees exactly with what the
+/// backend was handed.
+pub(crate) fn usable_agents(settings: &Settings) -> Vec<AgentInfo> {
+    ai_config(settings)
+        .agents
+        .into_iter()
+        .filter(|a| matches!(a.kind, red_service::AiAgentKind::Acp) || !a.api_key.is_empty())
+        .map(|a| AgentInfo {
+            is_acp: matches!(a.kind, red_service::AiAgentKind::Acp),
+            id: a.id,
+            name: a.name,
+        })
+        .collect()
+}
+
+/// The API key for an `api`-kind agent profile, read from the OS keychain under
+/// `ai-key:<id>`. The canonical `anthropic` built-in additionally falls back to
+/// the `ANTHROPIC_API_KEY` env var (first-run / headless convenience); other
+/// agents do not, so a local/proxy agent never silently picks up that key.
+pub(crate) fn resolve_agent_key(id: &str) -> String {
+    crate::secrets::get_ai_key(id)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            (id == crate::settings::BUILTIN_API_AGENT)
+                .then(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .flatten()
+        })
+        .unwrap_or_default()
 }
 
 impl AppState {
@@ -805,6 +948,9 @@ impl AppState {
         // setters and `reload_settings` re-push them when they change.
         service.send_global(Command::SetStatementTimeout(settings.query.timeout()));
         service.send_global(Command::SetDisplayCellCap(settings.grid.max_cell_chars));
+        // Configure the AI assistant provider (key from the keyring / env). An
+        // empty key leaves it off until one is set.
+        service.send_global(Command::ConfigureAi(ai_config(&settings)));
         // Arm the self-updater (Phase 3): an initial check at launch, then on the
         // configured cadence — unless `auto_update = false`, which sends a disabled
         // config so the backend keeps the timer (and network) parked.
@@ -987,6 +1133,19 @@ impl AppState {
         )
         .detach();
 
+        // Shared obscured field for the Settings → AI agents key rows. Enter saves
+        // the key for the row currently being edited; Esc closes the row.
+        let ai_key_input = cx.new(|cx| TextInput::new(cx).obscured().with_placeholder("sk-ant-…"));
+        cx.subscribe(
+            &ai_key_input,
+            |this, _, event: &TextInputEvent, cx| match event {
+                TextInputEvent::Submit => this.save_agent_key(cx),
+                TextInputEvent::Cancel => this.cancel_agent_key(cx),
+                _ => {}
+            },
+        )
+        .detach();
+
         // The connection switcher (⌘P). Seed its sections off the just-loaded
         // connections; `rebuild_switcher` refreshes them on every connect/disconnect.
         let switcher = cx.new(|cx| {
@@ -1115,6 +1274,17 @@ impl AppState {
             next_copy_id: 0,
             pending_copy: None,
             inspector: None,
+            assistant: None,
+            focus_assistant: false,
+            focus_rename: false,
+            assistant_w: px(380.),
+            assistant_drag: None,
+            usable_agents: usable_agents(&settings),
+            ai_configured: !usable_agents(&settings).is_empty(),
+            ai_key_input,
+            ai_key_editing: None,
+            focus_ai_key: false,
+            next_conversation_id: 0,
             filter_bar: None,
             cell_menu: None,
             confirm_exec: None,
@@ -1160,6 +1330,7 @@ impl AppState {
             palette_cmds: Vec::new(),
             palette_prompt: PromptKind::GoToRow,
             saved_queries: Vec::new(),
+            loaded_conversations: Vec::new(),
             switcher,
             parked: HashMap::new(),
             foreground_session: None,
@@ -1444,6 +1615,42 @@ impl AppState {
             // --- self-update (Phases 3–4) ---
             Event::UpdateState(state) => self.on_update_state(state, cx),
 
+            // --- AI assistant ---
+            Event::AiDelta {
+                conversation_id,
+                delta,
+            } => self.on_ai_delta(conversation_id, delta, cx),
+            Event::AiTurnFinished {
+                conversation_id,
+                usage,
+            } => self.on_ai_finished(conversation_id, usage, cx),
+            Event::AiError {
+                conversation_id,
+                message,
+            } => self.on_ai_error(conversation_id, message, cx),
+            Event::AiPermissionRequest {
+                conversation_id,
+                request_id,
+                title,
+                detail,
+            } => self.on_ai_permission_request(conversation_id, request_id, title, detail, cx),
+            Event::AiReportReady {
+                conversation_id,
+                path,
+            } => self.on_ai_report_ready(conversation_id, path, cx),
+            Event::AiOpenQuery {
+                conversation_id,
+                sql,
+            } => self.on_ai_open_query(conversation_id, sql, cx),
+            Event::AiCommandsAvailable {
+                conversation_id,
+                commands,
+            } => self.on_ai_commands_available(conversation_id, commands, cx),
+            Event::AiConfigOptionsAvailable {
+                conversation_id,
+                options,
+            } => self.on_ai_config_options_available(conversation_id, options, cx),
+
             // The streaming `Query`/`FetchMore` path stays in the protocol for
             // headless use + tests; the UI now drives results via `OpenResult`.
             Event::QueryStarted { .. }
@@ -1587,8 +1794,11 @@ impl AppState {
 }
 
 /// Open `path` with the OS's default handler — the file-first "open in editor"
-/// seam. Platform shell-out lives at the app edge; the UI never blocks on it.
-fn open_in_os(path: &std::path::Path) -> std::io::Result<()> {
+/// seam. Platform shell-out lives at the app edge. Uses `spawn` (fire-and-forget),
+/// never `status`: callers run on the GPUI main thread, and waiting on the OS
+/// opener to exit (a slow `xdg-open`/`cmd start` handler) would freeze the window.
+/// `Ok` means the opener was launched, not that the file was successfully shown.
+pub(crate) fn open_in_os(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     let mut cmd = {
         let mut c = std::process::Command::new("open");
@@ -1609,5 +1819,6 @@ fn open_in_os(path: &std::path::Path) -> std::io::Result<()> {
         c.arg(path);
         c
     };
-    cmd.status().map(|_| ())
+    // Fire-and-forget: spawn the opener and return without waiting for it to exit.
+    cmd.spawn().map(|_| ())
 }

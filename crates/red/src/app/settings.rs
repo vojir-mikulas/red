@@ -135,6 +135,17 @@ impl AppState {
         // backend only re-polls if the cadence actually moved.
         self.service
             .send_global(Command::ConfigureUpdates(update_config(&self.settings)));
+        // Re-push the AI config in case `[ai]` (agents / tier / thinking) changed,
+        // and recompute the usable-agent list the panel selector draws from.
+        let ai = crate::app::ai_config(&self.settings);
+        self.usable_agents = crate::app::usable_agents(&self.settings);
+        self.ai_configured = !self.usable_agents.is_empty();
+        self.service.send_global(Command::ConfigureAi(ai));
+        // If the reload (or a per-connection override) just flipped the master
+        // switch off (M-S7), close any open panel so the kill switch is immediate.
+        if self.assistant.is_some() && !self.ai_enabled() {
+            self.assistant = None;
+        }
         self.apply_theme(cx);
         cx.notify();
     }
@@ -710,6 +721,176 @@ impl AppState {
     pub(crate) fn set_restore_last_session(&mut self, on: bool, cx: &mut Context<Self>) {
         self.settings.behavior.restore_last_session = on;
         self.save_settings();
+        cx.notify();
+    }
+
+    // --- settings: AI assistant ---
+
+    /// Re-push the full AI config to the backend so a knob change (tier, limits,
+    /// thinking) applies to the next turn for both backends.
+    fn push_ai_config(&mut self) {
+        self.service
+            .send_global(Command::ConfigureAi(crate::app::ai_config(&self.settings)));
+    }
+
+    /// Flip the master switch. Off is a true kill switch (M-S7): persist it, push
+    /// it to the backend (which stops spawning agents/MCP servers), and close any
+    /// open panel so the effect is immediate. Honors per-connection overrides via
+    /// [`Self::ai_enabled`].
+    pub(crate) fn set_ai_enabled(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.ai.enabled = on;
+        self.save_settings();
+        self.push_ai_config();
+        if self.assistant.is_some() && !self.ai_enabled() {
+            self.assistant = None;
+        }
+        cx.notify();
+    }
+
+    /// Set the default database-access tier (`off` / `schema` / `read`). Re-pushed
+    /// so the catalog the model sees changes on the next turn.
+    pub(crate) fn set_ai_tier(&mut self, tier: &str, cx: &mut Context<Self>) {
+        self.settings.ai.tier = tier.to_string();
+        self.save_settings();
+        self.push_ai_config();
+        cx.notify();
+    }
+
+    /// Set the agent new chats start on (`[ai] default_agent`). If the settings
+    /// still rely on the synthesized legacy built-ins (no explicit `[[ai.agents]]`),
+    /// materialize that list first so the choice has somewhere to persist. Re-pushed
+    /// so the panel's selector default updates immediately.
+    pub(crate) fn set_default_agent(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.settings.ai.agents.is_empty() {
+            self.settings.ai.agents = self.settings.ai.resolved_agents();
+        }
+        self.settings.ai.default_agent = id.to_string();
+        self.save_settings();
+        self.usable_agents = crate::app::usable_agents(&self.settings);
+        self.push_ai_config();
+        cx.notify();
+    }
+
+    /// Open the inline key editor for an API agent's row (Settings → AI agents).
+    /// Binds the shared `ai_key_input` to this agent id, clears it, and focuses it so
+    /// the user types the key at once. A second click on the same row closes it.
+    pub(crate) fn edit_agent_key(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.ai_key_editing.as_deref() == Some(id) {
+            self.cancel_agent_key(cx);
+            return;
+        }
+        self.ai_key_editing = Some(id.to_string());
+        self.ai_key_input.update(cx, |i, cx| i.set_content("", cx));
+        self.focus_ai_key = true;
+        cx.notify();
+    }
+
+    /// Save the key in the open agent-key row to the OS keyring (under the agent's
+    /// id), then recompute the usable-agent list and re-push the config so the
+    /// backend builds that agent's provider. A blank key is treated as Cancel.
+    pub(crate) fn save_agent_key(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.ai_key_editing.clone() else {
+            return;
+        };
+        let key = self.ai_key_input.read(cx).content().trim().to_string();
+        if key.is_empty() {
+            self.cancel_agent_key(cx);
+            return;
+        }
+        if let Err(e) = crate::secrets::set_ai_key(&id, &key) {
+            tracing::warn!("failed to store AI key in keychain: {e}");
+            self.notify(
+                ToastVariant::Error,
+                "Couldn't store the key in the keychain",
+                cx,
+            );
+            return;
+        }
+        self.ai_key_input.update(cx, |i, cx| i.set_content("", cx));
+        self.ai_key_editing = None;
+        self.refresh_ai_agents();
+        self.notify(ToastVariant::Success, "API key saved", cx);
+        cx.notify();
+    }
+
+    /// Close the inline key editor without saving.
+    pub(crate) fn cancel_agent_key(&mut self, cx: &mut Context<Self>) {
+        self.ai_key_editing = None;
+        self.ai_key_input.update(cx, |i, cx| i.set_content("", cx));
+        cx.notify();
+    }
+
+    /// Remove an API agent's stored key from the keyring, then refresh the usable
+    /// list so the agent drops back to "no key".
+    pub(crate) fn clear_agent_key(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Err(e) = crate::secrets::delete_ai_key(id) {
+            tracing::warn!("failed to remove AI key from keychain: {e}");
+        }
+        if self.ai_key_editing.as_deref() == Some(id) {
+            self.cancel_agent_key(cx);
+        }
+        self.refresh_ai_agents();
+        self.notify(ToastVariant::Info, "API key removed", cx);
+        cx.notify();
+    }
+
+    /// Recompute the usable-agent list and re-push the AI config after a key change,
+    /// so the panel selector and backend providers reflect it immediately.
+    fn refresh_ai_agents(&mut self) {
+        self.usable_agents = crate::app::usable_agents(&self.settings);
+        self.ai_configured = !self.usable_agents.is_empty();
+        self.service
+            .send_global(Command::ConfigureAi(crate::app::ai_config(&self.settings)));
+    }
+
+    /// Re-authenticate / switch account for an ACP agent from Settings (M-S4). The
+    /// agent owns `/login`, so Red asks the backend to spawn it for a fresh
+    /// handshake — which pops the agent's own browser login when it isn't signed in.
+    /// Session-less: re-auth doesn't need a connected database. A no-op for an API
+    /// agent (those carry their key, not a login).
+    pub(crate) fn reauthenticate_agent(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.service.send_global(Command::AiReauthenticateAgent {
+            agent_id: id.to_string(),
+        });
+        self.notify(
+            ToastVariant::Info,
+            "Signing in — complete it in the browser if it opens.",
+            cx,
+        );
+    }
+
+    pub(crate) fn set_ai_max_rows(&mut self, n: usize, cx: &mut Context<Self>) {
+        self.settings.ai.limits.max_rows = n;
+        self.save_settings();
+        self.push_ai_config();
+        cx.notify();
+    }
+
+    pub(crate) fn set_ai_timeout(&mut self, ms: u64, cx: &mut Context<Self>) {
+        self.settings.ai.limits.statement_timeout_ms = ms;
+        self.save_settings();
+        self.push_ai_config();
+        cx.notify();
+    }
+
+    pub(crate) fn set_ai_max_bytes(&mut self, bytes: usize, cx: &mut Context<Self>) {
+        self.settings.ai.limits.max_result_bytes = bytes;
+        self.save_settings();
+        self.push_ai_config();
+        cx.notify();
+    }
+
+    pub(crate) fn set_ai_max_calls(&mut self, n: usize, cx: &mut Context<Self>) {
+        self.settings.ai.limits.max_tool_calls = n;
+        self.save_settings();
+        self.push_ai_config();
+        cx.notify();
+    }
+
+    pub(crate) fn set_ai_show_thinking(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.ai.show_thinking = on;
+        self.save_settings();
+        self.push_ai_config();
         cx.notify();
     }
 

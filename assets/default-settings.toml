@@ -83,3 +83,90 @@ statement_timeout = 0
 # Reconnect to the most recently used connection on launch (credentials come from
 # the OS keychain). Off shows the connection picker.
 restore_last_session = false
+
+[ai]
+# The master switch for the grounded chat agent (⌘L). false is a true kill
+# switch — no panel entry point, no local MCP server, no agent process. A
+# connection can override it in connections.toml (ai_enabled).
+enabled = true
+
+# Which backend handles turns:
+#   "anthropic"    — the Claude Messages API, billed to an API key (keychain/env).
+#   "subscription" — Claude Code over ACP, billed to a Pro/Max subscription.
+provider = "anthropic"
+
+# How much the agent's tools can see (the capability boundary):
+#   "off"    — no database tools; the agent chats without DB grounding.
+#   "schema" — structure only (tables, columns, types) — never row data.
+#   "read"   — the full read catalog: capped SELECTs + EXPLAIN. A tool above the
+#              tier is never offered to the model.
+#   "write"  — adds the gated propose_write tool (a single INSERT/UPDATE/DELETE that
+#              needs your explicit per-statement approval, is blocked on read-only
+#              connections, and never runs DDL or an unqualified UPDATE/DELETE).
+# A connection can override this in connections.toml (ai_tier) — e.g. keep the
+# global default at "read" and grant "write" only on a specific trusted connection,
+# or flip it on per writable connection via the connection form's "Allow writes".
+tier = "read"
+
+# Model id for the API-key path. Empty falls back to the Opus default. The
+# subscription agent picks its own model.
+model = "claude-opus-4-8"
+
+# Surface a summarized "thinking…" affordance while the model reasons.
+show_thinking = false
+
+# Advanced: override the subscription agent's launch command. Empty uses the
+# default (npx -y @agentclientprotocol/claude-agent-acp).
+agent_command = ""
+
+# Multiple agents. Define named profiles and pick which a new chat starts on with
+# the selector in the panel (and manage them in Settings → AI). When NO [[ai.agents]]
+# are defined, two are synthesized from the keys above ("anthropic" API + "subscription"
+# ACP) so this section is optional. Each profile's API key lives in the OS keyring
+# under `ai-key:<id>`, never here. `kind` is "api" (Messages API via red-ai, optional
+# base_url) or "acp" (an external agent over ACP — Claude Code, codex, a local agent).
+#
+# default_agent = "claude-sub"
+#
+# [[ai.agents]]
+# id = "claude-sub"
+# name = "Claude (subscription)"
+# kind = "acp"
+# command = ""              # empty = default Claude Code invocation
+#
+# [[ai.agents]]
+# id = "codex"
+# name = "Codex"
+# kind = "acp"
+# command = "codex acp"
+#
+# [[ai.agents]]
+# id = "claude-api"
+# name = "Claude (API)"
+# kind = "api"
+# wire = "anthropic"
+# model = "claude-opus-4-8"
+#
+# [[ai.agents]]
+# id = "local"
+# name = "Local"
+# kind = "api"
+# wire = "anthropic"        # an Anthropic-wire-compatible endpoint
+# base_url = "http://127.0.0.1:8080"
+# model = "..."
+
+[ai.limits]
+# Defense-in-depth caps the read-tier tools run under. Each can be disabled with 0
+# (where noted), but the defaults are sane ceilings.
+
+# Hard row ceiling on one tool SELECT; a larger LIMIT is clamped down to this.
+max_rows = 1000
+
+# Per-tool-call statement timeout in milliseconds. 0 disables it.
+statement_timeout_ms = 15000
+
+# Trim a tool result larger than this (bytes) before it reaches the model. 0 off.
+max_result_bytes = 262144
+
+# Cumulative tool-call budget per conversation, bounding a runaway loop. 0 off.
+max_tool_calls = 100

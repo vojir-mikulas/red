@@ -70,13 +70,20 @@ pub(crate) struct ExportWriter<W: Write> {
 }
 
 impl<W: Write> ExportWriter<W> {
-    /// Begin an export: write the CSV header row, or the opening JSON `[`.
+    /// Begin an export: write the CSV header row, the opening JSON `[`, or the HTML
+    /// document head + table header.
     pub(crate) fn begin(mut out: W, format: ExportFormat, names: Vec<String>) -> io::Result<Self> {
         match format {
             ExportFormat::Csv => {
                 writeln!(out, "{}", csv_record(names.iter().map(String::as_str)))?;
             }
             ExportFormat::Json => write!(out, "[")?,
+            ExportFormat::Html => {
+                // A streamed grid export carries no model-supplied title; the
+                // generate_report tool renders titled reports via `render_html_report`.
+                write!(out, "{}", html_head(None))?;
+                write!(out, "{}", html_thead(&names))?;
+            }
         }
         Ok(Self {
             out,
@@ -113,16 +120,25 @@ impl<W: Write> ExportWriter<W> {
                 }
                 write!(self.out, "}}")?;
             }
+            ExportFormat::Html => {
+                write!(self.out, "<tr>")?;
+                for value in cells {
+                    write!(self.out, "<td>{}</td>", html_cell(value))?;
+                }
+                writeln!(self.out, "</tr>")?;
+            }
         }
         self.written += 1;
         Ok(())
     }
 
-    /// Close the export (JSON gets its trailing `]`; CSV needs no footer), flush,
-    /// and return the row count written.
+    /// Close the export: JSON gets its trailing `]`, HTML closes the table + a row-
+    /// count footer + the document; CSV needs no footer. Flush, return the count.
     pub(crate) fn finish(mut self) -> io::Result<u64> {
-        if let ExportFormat::Json = self.format {
-            write!(self.out, "\n]\n")?;
+        match self.format {
+            ExportFormat::Json => write!(self.out, "\n]\n")?,
+            ExportFormat::Html => write!(self.out, "{}", html_foot(self.written))?,
+            ExportFormat::Csv => {}
         }
         self.out.flush()?;
         Ok(self.written)
@@ -132,6 +148,103 @@ impl<W: Write> ExportWriter<W> {
     pub(crate) fn written(&self) -> u64 {
         self.written
     }
+}
+
+/// The HTML report's inline stylesheet: a self-contained, themed shell (light/dark
+/// via `prefers-color-scheme`, sticky header, zebra rows). No external assets, so a
+/// report opens anywhere offline.
+const HTML_STYLE: &str = concat!(
+    "<style>",
+    ":root{color-scheme:light dark}",
+    "*{box-sizing:border-box}",
+    "body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;",
+    "background:#fff;color:#1a1a1a}",
+    "main{max-width:1200px;margin:0 auto;padding:32px 24px}",
+    "h1{font-size:20px;font-weight:600;margin:0 0 16px}",
+    ".meta{margin:12px 2px;color:#6b7280;font-size:12px}",
+    ".table-wrap{overflow:auto;border:1px solid #e5e7eb;border-radius:8px}",
+    "table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}",
+    "th,td{padding:7px 12px;text-align:left;border-bottom:1px solid #eceef1;",
+    "white-space:nowrap;max-width:480px;overflow:hidden;text-overflow:ellipsis}",
+    "th{position:sticky;top:0;background:#f6f7f9;font-weight:600;border-bottom:1px solid #e5e7eb}",
+    "tbody tr:nth-child(even){background:#fafbfc}",
+    "tbody tr:hover{background:#f0f4ff}",
+    ".null{color:#9aa3af;font-style:italic}",
+    "@media(prefers-color-scheme:dark){",
+    "body{background:#0f1115;color:#e6e6e6}",
+    ".meta{color:#8b93a1}.table-wrap{border-color:#262a31}",
+    "th,td{border-bottom-color:#1c2128}",
+    "th{background:#161a20;border-bottom-color:#262a31}",
+    "tbody tr:nth-child(even){background:#13161b}",
+    "tbody tr:hover{background:#1b2130}.null{color:#6b7280}}",
+    "</style>",
+);
+
+/// The default report heading when the caller (or model) supplies no title.
+const DEFAULT_REPORT_TITLE: &str = "Red — query report";
+
+/// The HTML report's document head up to the opening `<table>`: the doctype, the
+/// inline style, and the `<h1>` heading. `title` sets both the browser `<title>` and
+/// the visible heading (escaped); `None` uses [`DEFAULT_REPORT_TITLE`].
+fn html_head(title: Option<&str>) -> String {
+    let title = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or(DEFAULT_REPORT_TITLE);
+    let t = html_escape(title);
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>{t}</title>{HTML_STYLE}</head><body><main><h1>{t}</h1>\
+         <div class=\"table-wrap\"><table>"
+    )
+}
+
+/// The `<thead>` row for the report's columns (escaped names).
+fn html_thead(names: &[String]) -> String {
+    let mut s = String::from("<thead><tr>");
+    for name in names {
+        s.push_str(&format!("<th>{}</th>", html_escape(name)));
+    }
+    s.push_str("</tr></thead><tbody>\n");
+    s
+}
+
+/// The report's closing: the row-count footer and the document close.
+fn html_foot(rows: u64) -> String {
+    let plural = if rows == 1 { "" } else { "s" };
+    format!("</tbody></table><p class=\"meta\">{rows} row{plural}</p></main></body></html>\n")
+}
+
+/// One HTML cell's inner content: NULL renders as a dim italic marker, blobs as a
+/// length marker, everything else HTML-escaped text.
+pub(crate) fn html_cell(value: &Value) -> String {
+    match value {
+        Value::Null => "<span class=\"null\">NULL</span>".to_string(),
+        Value::Integer(n) => n.to_string(),
+        Value::Real(x) => x.to_string(),
+        Value::Text(s) => html_escape(s),
+        Value::Blob(b) => format!("&lt;{} bytes&gt;", b.len()),
+        Value::Capped(_) => html_escape(&value.to_string()),
+    }
+}
+
+/// Escape the five HTML-significant characters so cell text can't break the markup
+/// (or inject it). Shared with the AI report path (`red-service`) so both HTML
+/// emitters escape identically.
+pub fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 pub(crate) fn csv_record<'a>(fields: impl Iterator<Item = &'a str>) -> String {
@@ -185,4 +298,46 @@ pub(crate) fn json_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The HTML report is a self-contained document: a head, a typed table header,
+    /// one escaped `<tr>` per row, a NULL marker, and a row-count footer — and a
+    /// cell that smuggles markup is escaped, not interpreted.
+    #[test]
+    fn html_report_is_well_formed_and_escaped() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut w = ExportWriter::begin(
+            &mut buf,
+            ExportFormat::Html,
+            vec!["name".to_string(), "note".to_string()],
+        )
+        .unwrap();
+        w.write_row(&[Value::Text("<script>".to_string()), Value::Null])
+            .unwrap();
+        w.write_row(&[Value::Text("a & b".to_string()), Value::Integer(7)])
+            .unwrap();
+        let rows = w.finish().unwrap();
+        assert_eq!(rows, 2);
+
+        let html = String::from_utf8(buf).unwrap();
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.contains("<th>name</th><th>note</th>"));
+        // The injected tag is escaped, and the raw form never appears.
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("a &amp; b"));
+        assert!(html.contains("class=\"null\">NULL"));
+        assert!(html.trim_end().ends_with("</html>"));
+        assert!(html.contains("2 rows"));
+    }
+
+    /// Blobs report as a length marker (escaped), never raw bytes.
+    #[test]
+    fn html_report_blob_is_a_length_marker() {
+        assert_eq!(html_cell(&Value::Blob(vec![0u8; 5])), "&lt;5 bytes&gt;");
+    }
 }

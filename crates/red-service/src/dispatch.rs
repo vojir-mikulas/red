@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::UnboundedSender;
-use red_core::{ConnectionConfig, DbKind, KeyKind, KeySpec, RedError, ResultFilter, Value};
+use red_core::{AiTier, ConnectionConfig, DbKind, KeyKind, KeySpec, RedError, ResultFilter, Value};
 use red_driver::{
     AbortSignal, CancelToken, DatabaseDriver, MysqlDriver, PageCap, PostgresDriver, QueryCursor,
     SqliteDriver,
@@ -22,7 +22,7 @@ use crate::{Command, Envelope, Event, RunFetch, SessionId};
 
 /// The event sender carries each event tagged with the session it belongs to
 /// (`None` for the session-less probe replies).
-type Events = UnboundedSender<(Option<SessionId>, Event)>;
+pub(crate) type Events = UnboundedSender<(Option<SessionId>, Event)>;
 
 /// Cap on page fetches running at once. The grid can request a burst of pages
 /// (several tabs, or a viewport spanning page boundaries); without a cap a flung
@@ -123,6 +123,21 @@ struct OpenSpec {
 /// bounds/total after the fact and read specs without round-tripping commands).
 type ResultMap = Arc<Mutex<HashMap<u64, OpenSpec>>>;
 
+/// One configured AI agent in the dispatch registry, built once per `ConfigureAi`
+/// from an [`AiAgentProfile`](crate::protocol::AiAgentProfile). An `Api` agent
+/// holds its pre-built provider (`None` when it has no key — a turn then reports
+/// "not configured") and resolved model; an `Acp` agent holds its resolved launch
+/// command. A turn names an id, the loop looks it up here and routes accordingly.
+enum AiProfileRuntime {
+    Api {
+        provider: Option<Arc<dyn red_ai::AiProvider>>,
+        model: String,
+    },
+    Acp {
+        command: String,
+    },
+}
+
 /// The cancellable work in flight for one open result. Each detached fetch carries
 /// an [`AbortSignal`]; when a newer one supersedes it (a flung scrollbar, a new
 /// page, a closed tab) the old signal is [`abort`](AbortSignal::abort)ed so the
@@ -182,6 +197,15 @@ struct ActiveQuery {
 /// switching between connections is instant — no reconnect, no schema reload.
 struct SessionState {
     driver: Arc<dyn DatabaseDriver>,
+    /// This connection's optional AI policy overrides (M-S7), captured at connect
+    /// from its [`ConnectionConfig`]. Layered over the global `[ai]` policy when a
+    /// turn runs on this session, so a sensitive connection can disable the
+    /// assistant or pin its tier without touching the global setting.
+    ai_override: AiOverride,
+    /// The connection's read-only posture, captured at connect. Carried into the AI
+    /// policy so the write tool (`AiTier::Write`) is withheld on a read-only
+    /// connection — the same guard the human write path is held to.
+    read_only: bool,
     /// The SSH tunnel this connection rides, if any. Held only to keep it alive
     /// for the session's lifetime: dropping it (on teardown/eviction) closes the
     /// forward and the SSH session. `None` for a direct connection.
@@ -196,10 +220,26 @@ struct SessionState {
     last_used: Instant,
 }
 
+/// A connection's optional AI policy overrides (M-S7), carried from its
+/// [`ConnectionConfig`] to the session so a turn can resolve the effective policy.
+/// `None` fields inherit the global `[ai]` policy.
+#[derive(Clone, Copy, Default)]
+struct AiOverride {
+    enabled: Option<bool>,
+    tier: Option<AiTier>,
+}
+
 impl SessionState {
-    fn new(driver: Arc<dyn DatabaseDriver>, tunnel: Option<Tunnel>) -> Self {
+    fn new(
+        driver: Arc<dyn DatabaseDriver>,
+        tunnel: Option<Tunnel>,
+        ai_override: AiOverride,
+        read_only: bool,
+    ) -> Self {
         Self {
             driver,
+            ai_override,
+            read_only,
             _tunnel: tunnel,
             active: None,
             results: Arc::new(Mutex::new(HashMap::new())),
@@ -256,6 +296,11 @@ enum ConnectOutcome {
     Session {
         id: SessionId,
         generation: u64,
+        /// The connection's AI policy overrides (M-S7), captured at connect so the
+        /// resulting session carries them.
+        ai_override: AiOverride,
+        /// The connection's read-only posture, captured at connect for the AI policy.
+        read_only: bool,
         result: Result<(Arc<dyn DatabaseDriver>, Option<Tunnel>), ConnectFail>,
     },
     /// A session-less `TestConnection` finished — carries the server version on
@@ -289,11 +334,14 @@ fn apply_connect_outcome(
     sessions: &mut HashMap<SessionId, SessionState>,
     connect_gen: &HashMap<SessionId, u64>,
     events: &Events,
+    ai_acp: &Arc<tokio::sync::Mutex<crate::acp::AcpManager>>,
 ) {
     match outcome {
         ConnectOutcome::Session {
             id,
             generation,
+            ai_override,
+            read_only,
             result,
         } => {
             // A newer `Connect` on this id superseded the one that produced this
@@ -304,7 +352,18 @@ fn apply_connect_outcome(
             match result {
                 Ok((driver, tunnel)) => {
                     let version = driver.server_version();
-                    sessions.insert(id, SessionState::new(driver, tunnel));
+                    sessions.insert(
+                        id,
+                        SessionState::new(driver, tunnel, ai_override, read_only),
+                    );
+                    // Evict any ACP conversation still bound to this id: it grounds in
+                    // the prior connection's driver. The reconnect already fired an
+                    // eviction, but an AI turn spawned just before the reconnect could
+                    // insert its conversation *after* that eviction ran (the dial has
+                    // since completed, so it has — closing that orphan-on-reconnect
+                    // race). A first connect has no such conversation, so this no-ops.
+                    let manager = ai_acp.clone();
+                    tokio::spawn(async move { manager.lock().await.evict_session(Some(id)) });
                     emit(events, Some(id), Event::Connected { version });
                 }
                 Err(ConnectFail {
@@ -381,6 +440,26 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
         tx
     };
 
+    // The AI assistant's configured agents (built from `ConfigureAi.agents`), keyed
+    // by id — an API agent carries its pre-built provider (None until a key is set)
+    // and model; an ACP agent carries its resolved launch command. *Which* agent a
+    // turn uses is decided per-turn by `AiTurn.agent` (M-S6), so several
+    // conversations on different agents run concurrently. A turn runs as a spawned
+    // task off this loop (like exports), sharing `ai_state` for its conversation
+    // history and cancel registry.
+    let mut ai_agents: HashMap<String, AiProfileRuntime> = HashMap::new();
+    let mut ai_default_agent = String::new();
+    let mut ai_show_thinking = false;
+    // The global AI access policy (M-S7): master switch, access tier, and resource
+    // guards, set by `ConfigureAi`. A turn layers the session's per-connection
+    // overrides over this and enforces the result in the shared tool layer, so it
+    // covers both backends and the agent can't bypass it.
+    let mut ai_policy = red_core::AiPolicy::default();
+    let ai_state = Arc::new(Mutex::new(crate::ai::AiState::default()));
+    // The subscription (ACP) path keeps one live agent conversation per
+    // `conversation_id`; the tokio Mutex lets a slow agent start await off-loop.
+    let ai_acp = Arc::new(tokio::sync::Mutex::new(crate::acp::AcpManager::default()));
+
     loop {
         let (session_id, command) = tokio::select! {
             maybe = commands.recv() => match maybe {
@@ -389,13 +468,18 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             },
             _ = sweep.tick() => {
                 evict_idle(&mut sessions, foreground, &events);
+                // Reclaim long-idle subscription agents too (M-S3). Off the loop,
+                // like the other ACP calls, since the manager is behind a tokio
+                // Mutex a slow start may be holding.
+                let manager = ai_acp.clone();
+                tokio::spawn(async move { manager.lock().await.evict_idle() });
                 continue;
             }
             outcome = connect_rx.recv() => {
                 // The sender is held for the loop's lifetime, so `recv` only
                 // resolves with a real outcome (never `None`).
                 if let Some(outcome) = outcome {
-                    apply_connect_outcome(outcome, &mut sessions, &connect_gen, &events);
+                    apply_connect_outcome(outcome, &mut sessions, &connect_gen, &events, &ai_acp);
                 }
                 continue;
             }
@@ -413,6 +497,11 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // session) tears down whatever was there first.
                 if let Some(mut old) = sessions.remove(&id) {
                     old.teardown();
+                    // The new driver replaces the old one, so any subscription
+                    // agent bound to the old session must go too (M-S3) — the next
+                    // turn lazily rebinds a fresh agent to the new driver.
+                    let manager = ai_acp.clone();
+                    tokio::spawn(async move { manager.lock().await.evict_session(Some(id)) });
                 }
                 // Dial off the loop so a hung connect doesn't wedge dispatch; the
                 // result comes back over `connect_rx`. Bump the generation so a
@@ -420,12 +509,23 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 let generation = connect_gen.entry(id).or_default();
                 *generation += 1;
                 let generation = *generation;
+                // Capture the connection's AI overrides before `config` moves into
+                // the dial task, so the resulting session carries them (M-S7).
+                let ai_override = AiOverride {
+                    enabled: config.ai_enabled,
+                    tier: config.ai_tier,
+                };
+                // The connection's read-only posture, captured before `config` moves
+                // into the dial task, so the session can gate the AI write tool.
+                let read_only = config.read_only;
                 let tx = connect_tx.clone();
                 tokio::spawn(async move {
                     let result = attempt_connect(&config).await;
                     let _ = tx.send(ConnectOutcome::Session {
                         id,
                         generation,
+                        ai_override,
+                        read_only,
                         result,
                     });
                 });
@@ -443,6 +543,265 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
 
             Command::CheckForUpdate => {
                 let _ = updater.send(crate::update::UpdateControl::CheckNow);
+            }
+
+            Command::ConfigureAi(cfg) => {
+                ai_show_thinking = cfg.show_thinking;
+                ai_policy = red_core::AiPolicy {
+                    enabled: cfg.enabled,
+                    tier: cfg.tier,
+                    limits: cfg.limits,
+                    // The global default is writable-posture; each turn overrides
+                    // this with the connection's authoritative read-only flag.
+                    read_only: false,
+                };
+                ai_default_agent = cfg.default_agent;
+                // Build each configured agent's runtime. An API agent with an empty
+                // key gets a `None` provider — a turn on it replies with a clear
+                // AiError rather than a failed network call; an ACP agent needs no
+                // key (it owns its own auth). A custom `base_url` retargets the
+                // Anthropic-wire provider (e.g. a local endpoint).
+                ai_agents = cfg
+                    .agents
+                    .into_iter()
+                    .map(|a| {
+                        let runtime = match a.kind {
+                            crate::protocol::AiAgentKind::Api => {
+                                let model = if a.model.is_empty() {
+                                    red_ai::MODEL_OPUS.to_string()
+                                } else {
+                                    a.model
+                                };
+                                let provider = if a.api_key.is_empty() {
+                                    None
+                                } else {
+                                    let mut p = red_ai::AnthropicProvider::new(a.api_key);
+                                    if !a.base_url.is_empty() {
+                                        // A custom endpoint is fine, but never send the
+                                        // API key to an arbitrary cleartext host — only
+                                        // HTTPS (or loopback http). Reject and keep the
+                                        // default rather than exfiltrate the credential.
+                                        if red_ai::is_safe_base_url(&a.base_url) {
+                                            p = p.with_base_url(a.base_url);
+                                        } else {
+                                            tracing::warn!(
+                                                "ignoring AI agent base_url {:?}: only https \
+                                                 (or localhost http) may receive the API key",
+                                                a.base_url
+                                            );
+                                        }
+                                    }
+                                    Some(Arc::new(p) as Arc<dyn red_ai::AiProvider>)
+                                };
+                                AiProfileRuntime::Api { provider, model }
+                            }
+                            crate::protocol::AiAgentKind::Acp => {
+                                let command = if a.command.is_empty() {
+                                    crate::DEFAULT_AGENT_COMMAND.to_string()
+                                } else {
+                                    a.command
+                                };
+                                AiProfileRuntime::Acp { command }
+                            }
+                        };
+                        (a.id, runtime)
+                    })
+                    .collect();
+            }
+
+            Command::AiTurn {
+                conversation_id,
+                agent,
+                message,
+                context,
+            } => {
+                // Both backends ground in the connected session's driver.
+                let driver = session_id
+                    .and_then(|id| sessions.get(&id))
+                    .map(|s| s.driver.clone());
+                let Some(driver) = driver else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::AiError {
+                            conversation_id,
+                            message: "not connected".into(),
+                        },
+                    );
+                    continue;
+                };
+
+                // Resolve the effective AI policy (M-S7): the session's per-connection
+                // overrides layered over the global one. The master switch is checked
+                // here, before anything spawns — a disabled assistant starts no MCP
+                // server and no agent process, it just reports the refusal.
+                let ai_override = session_id
+                    .and_then(|id| sessions.get(&id))
+                    .map(|s| s.ai_override)
+                    .unwrap_or_default();
+                // The connection's authoritative read-only posture gates the write
+                // tool (defense in depth alongside the driver's own rejection).
+                let read_only = session_id
+                    .and_then(|id| sessions.get(&id))
+                    .map(|s| s.read_only)
+                    .unwrap_or(false);
+                let mut effective = ai_policy.with_overrides(ai_override.enabled, ai_override.tier);
+                effective.read_only = read_only;
+                if !effective.enabled {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::AiError {
+                            conversation_id,
+                            message: "the AI agent is disabled for this connection".into(),
+                        },
+                    );
+                    continue;
+                }
+
+                // Resolve which agent this turn runs on: the named id, or the default
+                // when empty. An id that names no configured agent — e.g. a saved
+                // chat bound to a profile the user has since deleted — fails with a
+                // clear error rather than silently running a different backend.
+                let agent_id = if agent.trim().is_empty() {
+                    ai_default_agent.clone()
+                } else {
+                    agent
+                };
+                let Some(runtime) = ai_agents.get(&agent_id) else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::AiError {
+                            conversation_id,
+                            message: format!(
+                                "AI agent '{agent_id}' is not configured — pick another in the \
+                                 panel, or add it in Settings."
+                            ),
+                        },
+                    );
+                    continue;
+                };
+
+                match runtime {
+                    AiProfileRuntime::Api { provider, model } => {
+                        let Some(provider) = provider.clone() else {
+                            emit(
+                                &events,
+                                session_id,
+                                Event::AiError {
+                                    conversation_id,
+                                    message:
+                                        "AI agent is not configured — add an API key in Settings."
+                                            .into(),
+                                },
+                            );
+                            continue;
+                        };
+                        let model = model.clone();
+                        let cancel = red_ai::CancelToken::new();
+                        lock(&ai_state).register(conversation_id, cancel.clone());
+                        tokio::spawn(crate::ai::run_turn(
+                            provider,
+                            driver,
+                            events.clone(),
+                            ai_state.clone(),
+                            session_id,
+                            conversation_id,
+                            model,
+                            ai_show_thinking,
+                            effective,
+                            message,
+                            context,
+                            cancel,
+                        ));
+                    }
+                    AiProfileRuntime::Acp { command } => {
+                        let command = command.clone();
+                        // The agent loads its own config (and login) from cwd; use
+                        // the process working directory.
+                        let cwd = std::env::current_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("/"));
+                        tokio::spawn(crate::acp::run_turn(
+                            ai_acp.clone(),
+                            driver,
+                            command,
+                            cwd,
+                            events.clone(),
+                            session_id,
+                            conversation_id,
+                            effective,
+                            message,
+                            context,
+                        ));
+                    }
+                }
+            }
+
+            Command::AiCancel { conversation_id } => {
+                lock(&ai_state).cancel(conversation_id);
+                let manager = ai_acp.clone();
+                tokio::spawn(async move { manager.lock().await.cancel(conversation_id) });
+            }
+
+            Command::AiForget { conversation_id } => {
+                // The conversation was closed/deleted in the UI — drop its backend
+                // state on both paths so the maps stay bounded. The API-key forget is
+                // a quick sync lock; the ACP one awaits, so it runs off the loop.
+                lock(&ai_state).forget(conversation_id);
+                let manager = ai_acp.clone();
+                tokio::spawn(async move { manager.lock().await.forget(conversation_id) });
+            }
+
+            Command::AiPermission {
+                conversation_id: _,
+                request_id,
+                allow,
+            } => {
+                // Answer a parked permission prompt. It belongs to exactly one
+                // backend: the subscription path's ACP manager (M-S2 tool prompts) or
+                // the API-key path's AiState (Feature B write prompts). Their request-
+                // id spaces are disjoint (AiState offsets its ids), so resolving both
+                // is safe — only the owning side has the id. The API-key resolve is a
+                // quick sync lock; the ACP one awaits, so it runs off the loop.
+                lock(&ai_state).resolve_permission(request_id, allow);
+                let manager = ai_acp.clone();
+                tokio::spawn(
+                    async move { manager.lock().await.resolve_permission(request_id, allow) },
+                );
+            }
+
+            Command::AiReauthenticateAgent { agent_id } => {
+                // Re-auth from Settings (M-S4): only meaningful for an ACP agent.
+                // Spawn it for a fresh handshake — which pops the agent's own login
+                // when it isn't signed in — then force idle conversations to
+                // re-handshake. Off the loop like the other ACP calls.
+                if let Some(AiProfileRuntime::Acp { command }) = ai_agents.get(&agent_id) {
+                    let command = command.clone();
+                    // The agent loads its own config (and login) from cwd; use the
+                    // process working directory, matching the turn path.
+                    let cwd =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+                    let manager = ai_acp.clone();
+                    tokio::spawn(crate::acp::reauthenticate_agent(manager, command, cwd));
+                }
+            }
+
+            Command::AiSetConfigOption {
+                conversation_id,
+                config_id,
+                value,
+            } => {
+                // Change a model / reasoning selector on the subscription path. Off
+                // the loop — it awaits the agent's reply, then emits the refreshed set.
+                tokio::spawn(crate::acp::set_config_option(
+                    ai_acp.clone(),
+                    events.clone(),
+                    session_id,
+                    conversation_id,
+                    config_id,
+                    value,
+                ));
             }
 
             Command::TestConnection(config) => {
@@ -479,6 +838,10 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 if let Some(mut state) = sessions.remove(&id) {
                     state.teardown();
                 }
+                // Tear down any subscription agent grounded in this session — its
+                // MCP server holds a now-dead driver clone (M-S3).
+                let manager = ai_acp.clone();
+                tokio::spawn(async move { manager.lock().await.evict_session(Some(id)) });
                 // Invalidate any in-flight connect for this id so its late outcome
                 // can't resurrect the session the user just closed.
                 if let Some(g) = connect_gen.get_mut(&id) {
@@ -1189,6 +1552,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             Command::Shutdown => break,
         }
     }
+
+    // The window closed or the service is shutting down. Explicitly tear down any
+    // live subscription agents (M-S3): the permission-relay tasks hold `Arc` clones
+    // of the manager, so dropping the loop's own `Arc` alone would leave a
+    // reference cycle and orphan the agent subprocesses. Clearing the map drops
+    // their command channels, which unwinds the cycle and reaps the processes.
+    ai_acp.lock().await.clear();
 }
 
 /// Drop every session that's been idle past [`IDLE_EVICT`] and isn't the
@@ -1663,7 +2033,7 @@ async fn connect(
 /// The UI may have dropped its receiver (window closed) — a failed send is the
 /// expected shutdown path, not an error. `session` tags the event so the UI
 /// routes it to the right workspace (`None` for the session-less probe replies).
-fn emit(events: &Events, session: Option<SessionId>, event: Event) {
+pub(crate) fn emit(events: &Events, session: Option<SessionId>, event: Event) {
     let _ = events.unbounded_send((session, event));
 }
 
@@ -1780,7 +2150,7 @@ mod checkpoint_tests {
     #[test]
     fn reap_excess_results_caps_to_the_lowest_epochs() {
         let (path, driver) = driver_with(1, "reap");
-        let mut state = SessionState::new(driver, None);
+        let mut state = SessionState::new(driver, None, AiOverride::default(), false);
 
         // Open one more than the cap, epochs 1..=MAX+1. Every epoch also has an
         // in-flight handle, so we can assert those are reaped in lockstep.

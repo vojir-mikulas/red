@@ -7,7 +7,17 @@ yanked = "deny"
 # tree drags in a few transitively that we can't fix and that are not
 # vulnerabilities. A vulnerability anywhere still fails the build.
 unmaintained = "workspace"
-ignore = []
+ignore = [
+    # RUSTSEC-2023-0071 — Marvin timing sidechannel in the `rsa` crate. Pulled in
+    # transitively by `russh` (our pure-Rust SSH client for jump-host tunnels), via
+    # `ssh-key` for RSA host/auth key handling. There is no patched release yet
+    # ("No safe upgrade is available"), and the attack requires an adversary
+    # observing the timing of RSA private-key operations over the network — RED
+    # only exercises rsa during the handshake of an outbound SSH tunnel the user
+    # explicitly configures to their own jump host. Revisit when rsa ships a
+    # constant-time fix (https://github.com/RustCrypto/RSA/issues/626).
+    "RUSTSEC-2023-0071",
+]
 
 [licenses]
 # RED is licensed GPL-3.0-or-later (see LICENSE / NOTICE): GPUI's tree pulls in

@@ -37,16 +37,18 @@ pub(crate) enum SettingsTab {
     Query,
     Keymap,
     Behavior,
+    Ai,
     About,
 }
 
 impl SettingsTab {
-    pub(crate) const ALL: [SettingsTab; 6] = [
+    pub(crate) const ALL: [SettingsTab; 7] = [
         SettingsTab::Appearance,
         SettingsTab::Grid,
         SettingsTab::Query,
         SettingsTab::Keymap,
         SettingsTab::Behavior,
+        SettingsTab::Ai,
         SettingsTab::About,
     ];
 
@@ -57,6 +59,7 @@ impl SettingsTab {
             SettingsTab::Query => "Query",
             SettingsTab::Keymap => "Keymap",
             SettingsTab::Behavior => "Behavior",
+            SettingsTab::Ai => "AI agent",
             SettingsTab::About => "About",
         }
     }
@@ -289,6 +292,7 @@ fn settings_page(tab: SettingsTab, state: &AppState, cx: &mut Context<AppState>)
         SettingsTab::Query => query_page(state, cx),
         SettingsTab::Keymap => keymap_page(state, cx),
         SettingsTab::Behavior => behavior_page(state, cx),
+        SettingsTab::Ai => ai_page(state, cx),
         SettingsTab::About => about_page(state, cx),
     }
 }
@@ -1086,6 +1090,423 @@ fn behavior_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     .into_any_element()
 }
 
+/// The AI tab: the master kill switch, the database-access tier (how much the
+/// assistant's tools can see), and the resource guards those tools run under.
+/// Everything here writes `[ai]` in `settings.toml` and is re-pushed to the
+/// backend live, so a tier change applies to the next turn and flipping the
+/// switch off removes the sidepanel immediately (see [`AppState::set_ai_enabled`]).
+/// Provider, model, and the agent command stay in the file — the convenience
+/// surface holds the safety knobs, the file holds the plumbing.
+fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
+    let theme = cx.theme().clone();
+    let view = cx.entity();
+    let ai = &state.settings.ai;
+    let enabled = ai.enabled;
+
+    // The master switch. Off is a true kill switch — no panel, no MCP server, no
+    // agent process. Flipping it off also closes any open panel.
+    let switch = Toggle::new("set-ai-enabled", enabled)
+        .on_change(cx.listener(|this, on: &bool, _, cx| this.set_ai_enabled(*on, cx)));
+
+    // Database access tier — the capability boundary. Out-of-tier tools are never
+    // even offered to the model (M-S7), so this is the real "how much can it see".
+    // Write adds the gated `propose_write` tool on top of the read catalog; every
+    // write still needs per-statement approval and is blocked on a read-only
+    // connection. A connection can narrow or widen this in connections.toml
+    // (`ai_tier`).
+    let tier_sel = match red_core::AiTier::parse(&ai.tier) {
+        red_core::AiTier::Off => 0,
+        red_core::AiTier::Schema => 1,
+        red_core::AiTier::Read => 2,
+        red_core::AiTier::Write => 3,
+    };
+    let tier_view = view.clone();
+    let tier = Segmented::new("set-ai-tier")
+        .segment("Off")
+        .segment("Schema")
+        .segment("Read")
+        .segment("Write")
+        .selected(tier_sel)
+        .on_select(move |ix, _, cx| {
+            let t = ["off", "schema", "read", "write"][ix.min(3)];
+            tier_view.update(cx, |this, cx| this.set_ai_tier(t, cx));
+        });
+
+    // Resource guards on the `read` tier. Each is a preset segmented; a hand-edited
+    // off-preset value shows no selection (usize::MAX) rather than snapping.
+    const ROW_PRESETS: [usize; 4] = [100, 500, 1000, 5000];
+    let rows_sel = ROW_PRESETS
+        .iter()
+        .position(|&n| n == ai.limits.max_rows)
+        .unwrap_or(usize::MAX);
+    let rows_view = view.clone();
+    let max_rows = Segmented::new("set-ai-max-rows")
+        .segment("100")
+        .segment("500")
+        .segment("1000")
+        .segment("5000")
+        .selected(rows_sel)
+        .on_select(move |ix, _, cx| {
+            let n = ROW_PRESETS[ix.min(ROW_PRESETS.len() - 1)];
+            rows_view.update(cx, |this, cx| this.set_ai_max_rows(n, cx));
+        });
+
+    // Statement timeout, in milliseconds (0 = off).
+    const TIMEOUT_PRESETS: [u64; 4] = [0, 5_000, 15_000, 30_000];
+    let timeout_sel = TIMEOUT_PRESETS
+        .iter()
+        .position(|&n| n == ai.limits.statement_timeout_ms)
+        .unwrap_or(usize::MAX);
+    let timeout_view = view.clone();
+    let timeout = Segmented::new("set-ai-timeout")
+        .segment("Off")
+        .segment("5s")
+        .segment("15s")
+        .segment("30s")
+        .selected(timeout_sel)
+        .on_select(move |ix, _, cx| {
+            let n = TIMEOUT_PRESETS[ix.min(TIMEOUT_PRESETS.len() - 1)];
+            timeout_view.update(cx, |this, cx| this.set_ai_timeout(n, cx));
+        });
+
+    // Result byte cap (0 = off).
+    const BYTE_PRESETS: [usize; 3] = [64 * 1024, 256 * 1024, 1024 * 1024];
+    let bytes_sel = BYTE_PRESETS
+        .iter()
+        .position(|&n| n == ai.limits.max_result_bytes)
+        .unwrap_or(usize::MAX);
+    let bytes_view = view.clone();
+    let max_bytes = Segmented::new("set-ai-max-bytes")
+        .segment("64 KB")
+        .segment("256 KB")
+        .segment("1 MB")
+        .selected(bytes_sel)
+        .on_select(move |ix, _, cx| {
+            let n = BYTE_PRESETS[ix.min(BYTE_PRESETS.len() - 1)];
+            bytes_view.update(cx, |this, cx| this.set_ai_max_bytes(n, cx));
+        });
+
+    // Tool-call budget per conversation (0 = off).
+    const CALL_PRESETS: [usize; 4] = [25, 50, 100, 200];
+    let calls_sel = CALL_PRESETS
+        .iter()
+        .position(|&n| n == ai.limits.max_tool_calls)
+        .unwrap_or(usize::MAX);
+    let calls_view = view.clone();
+    let max_calls = Segmented::new("set-ai-max-calls")
+        .segment("25")
+        .segment("50")
+        .segment("100")
+        .segment("200")
+        .selected(calls_sel)
+        .on_select(move |ix, _, cx| {
+            let n = CALL_PRESETS[ix.min(CALL_PRESETS.len() - 1)];
+            calls_view.update(cx, |this, cx| this.set_ai_max_calls(n, cx));
+        });
+
+    let show_thinking = Toggle::new("set-ai-thinking", ai.show_thinking)
+        .on_change(cx.listener(|this, on: &bool, _, cx| this.set_ai_show_thinking(*on, cx)));
+
+    settings_page_scaffold(
+        "AI agent",
+        div()
+            .flex()
+            .flex_col()
+            .child(setting_row(
+                "Enable agent",
+                "The grounded chat sidepanel (⌘L). Off is a true kill switch — it \
+                 removes the panel, runs no agent, and starts no local server.",
+                switch,
+                &theme,
+            ))
+            .child(settings_header("Database access", &theme))
+            .child(setting_row(
+                "Access tier",
+                "How much the agent's tools can see. Off: no database tools at \
+                 all. Schema: structure only (tables, columns, types — never row \
+                 data). Read: the full read catalog (run capped SELECTs and EXPLAIN). \
+                 Write: adds INSERT/UPDATE/DELETE, each needing your per-statement \
+                 approval. A tool above the tier is never offered to the model.",
+                tier,
+                &theme,
+            ))
+            .child(
+                div()
+                    .pt_2()
+                    .pb_1()
+                    .text_size(theme.scale(12.))
+                    .text_color(theme.text_muted)
+                    .child(
+                        "At the Write tier the assistant may propose INSERT/UPDATE/DELETE: \
+                         every write still needs your explicit per-statement approval, is \
+                         blocked on a read-only connection, and never runs DDL or an \
+                         unqualified UPDATE/DELETE. A connection can override enabled/tier \
+                         in connections.toml (ai_enabled / ai_tier) — e.g. grant Write on \
+                         one trusted connection while the global default stays Read, or \
+                         flip it on per writable connection via “AI assistant → Allow \
+                         writes” in the connection form.",
+                    ),
+            )
+            .child(settings_header("Read-tier resource guards", &theme))
+            .child(setting_row(
+                "Max rows per query",
+                "Hard ceiling on rows one tool SELECT returns; a larger LIMIT is \
+                 clamped down to this.",
+                max_rows,
+                &theme,
+            ))
+            .child(setting_row(
+                "Statement timeout",
+                "Abort a single tool query that runs longer than this.",
+                timeout,
+                &theme,
+            ))
+            .child(setting_row(
+                "Result size cap",
+                "Trim a tool result larger than this before it's handed back to the \
+                 model, so a wide row set can't blow up the context.",
+                max_bytes,
+                &theme,
+            ))
+            .child(setting_row(
+                "Tool calls per chat",
+                "Bound a runaway agent loop — the cumulative tool-call budget for one \
+                 conversation.",
+                max_calls,
+                &theme,
+            ))
+            .child(settings_header("Display", &theme))
+            .child(setting_row(
+                "Show thinking",
+                "Surface a summarized “thinking…” affordance while the model reasons.",
+                show_thinking,
+                &theme,
+            ))
+            .child(settings_header("Agents", &theme))
+            .child(ai_agents_section(state, &theme, cx)),
+        &theme,
+    )
+    .into_any_element()
+}
+
+/// The Agents list (Phase 5): every configured agent — the synthesized legacy
+/// built-ins, or an explicit `[[ai.agents]]` set. Click a row to make it the
+/// default new chats start on; the filled dot marks the current default. An API
+/// agent shows whether its key is set (the keyring), an ACP agent is always ready.
+/// Add/remove agents and edit their fields (command / base_url / model / API keys)
+/// in the settings file — the "Edit in settings file" button opens it.
+fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>) -> AnyElement {
+    let view = cx.entity();
+    let agents = state.settings.ai.resolved_agents();
+    let default_id = state.settings.ai.resolved_default_agent();
+    let usable: std::collections::HashSet<&str> =
+        state.usable_agents.iter().map(|a| a.id.as_str()).collect();
+
+    let mut list = div().flex().flex_col().gap_1();
+    for a in &agents {
+        let is_default = a.id == default_id;
+        let is_acp = a.kind.eq_ignore_ascii_case("acp");
+        // Status: an ACP agent owns its own auth (always ready); an API agent is
+        // ready only once its key is in the keyring (i.e. it made the usable list).
+        let (status, status_color) = if is_acp {
+            ("ready", theme.text_muted)
+        } else if usable.contains(a.id.as_str()) {
+            ("key set", theme.accent)
+        } else {
+            ("no key", theme.text_faint)
+        };
+        let id = a.id.clone();
+        let row_view = view.clone();
+        let dot = div()
+            .size(px(8.))
+            .rounded_full()
+            .flex_none()
+            .when(is_default, |d| d.bg(theme.accent))
+            .when(!is_default, |d| d.border_1().border_color(theme.border));
+        let kind_badge = div()
+            .px_1p5()
+            .rounded(px(4.))
+            .bg(theme.bg_elevated)
+            .text_size(theme.scale(10.))
+            .text_color(theme.text_muted)
+            .child(if is_acp { "ACP" } else { "API" });
+        // Re-auth / switch account (M-S4) lives here, not in the chat panel: an ACP
+        // agent owns its own `/login`, so this asks the backend to spawn it for a
+        // fresh handshake (it pops its own browser when signed out). API agents
+        // carry a key, not a login, so they get no button.
+        let signin = is_acp.then(|| {
+            let signin_id = a.id.clone();
+            let signin_view = view.clone();
+            div()
+                .id(SharedString::from(format!("agent-signin-{}", a.id)))
+                .role(gpui::Role::Button)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(22.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .tooltip(flint::Tooltip::text("Sign in / switch account"))
+                .hover(|s| s.bg(theme.border))
+                .child(crate::icons::icon(
+                    "key-round",
+                    theme.scale(12.),
+                    theme.text_muted,
+                ))
+                .on_click(move |_, _, cx| {
+                    // Don't let the click fall through to the row (which would set
+                    // this agent as the default).
+                    cx.stop_propagation();
+                    let id = signin_id.clone();
+                    signin_view.update(cx, |this, cx| this.reauthenticate_agent(&id, cx));
+                })
+        });
+        // API agents authenticate with a key (kept in the OS keyring, never the
+        // settings file). This toggles an inline editor row below; the label tracks
+        // whether a key is already stored and whether this row is open.
+        let editing = state.ai_key_editing.as_deref() == Some(a.id.as_str());
+        let has_key = !is_acp && usable.contains(a.id.as_str());
+        let key_btn = (!is_acp).then(|| {
+            let key_id = a.id.clone();
+            let key_view = view.clone();
+            let label = if editing {
+                "Cancel"
+            } else if has_key {
+                "Change key"
+            } else {
+                "Add key"
+            };
+            div()
+                .id(SharedString::from(format!("agent-key-{}", a.id)))
+                .role(gpui::Role::Button)
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(22.))
+                .px_2()
+                .rounded(px(4.))
+                .border_1()
+                .border_color(theme.border)
+                .text_size(theme.scale(10.5))
+                .text_color(theme.text_muted)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.bg_elevated))
+                .child(label)
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    let id = key_id.clone();
+                    key_view.update(cx, |this, cx| this.edit_agent_key(&id, cx));
+                })
+        });
+        list = list.child(
+            div()
+                .id(SharedString::from(format!("agent-row-{}", a.id)))
+                .role(gpui::Role::Button)
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .h(px(32.))
+                .rounded(theme.radius)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.bg_elevated))
+                .child(dot)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_size(theme.scale(12.5))
+                        .text_color(theme.text)
+                        .child(SharedString::from(a.name.clone())),
+                )
+                .child(kind_badge)
+                .child(
+                    div()
+                        .text_size(theme.scale(10.5))
+                        .text_color(status_color)
+                        .child(status),
+                )
+                .when(is_default, |row| {
+                    row.child(
+                        div()
+                            .text_size(theme.scale(10.5))
+                            .text_color(theme.text_muted)
+                            .child("· default"),
+                    )
+                })
+                .when_some(key_btn, |row, b| row.child(b))
+                .when_some(signin, |row, b| row.child(b))
+                .on_click(move |_, _, cx| {
+                    let id = id.clone();
+                    row_view.update(cx, |this, cx| this.set_default_agent(&id, cx));
+                }),
+        );
+
+        // The inline key editor, shown under the row while this API agent is open.
+        // Enter (or Save) stores the key; Esc (or Cancel) closes it; Remove clears a
+        // stored key. The field is the shared `ai_key_input` — only one row at a time.
+        if editing {
+            let id_remove = a.id.clone();
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .pb_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(state.ai_key_input.clone()),
+                    )
+                    .child(
+                        Button::new("ai-key-save", "Save")
+                            .variant(ButtonVariant::Primary)
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(|this, _, _, cx| this.save_agent_key(cx))),
+                    )
+                    .when(has_key, |row| {
+                        row.child(
+                            Button::new("ai-key-remove", "Remove")
+                                .variant(ButtonVariant::Danger)
+                                .size(ButtonSize::Sm)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.clear_agent_key(&id_remove, cx)
+                                })),
+                        )
+                    }),
+            );
+        }
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .text_size(theme.scale(12.))
+                .text_color(theme.text_muted)
+                .child(
+                    "Pick the agent new chats start on (click a row). Switch a chat's \
+                     agent before its first message from the panel. An API agent needs a \
+                     key — use “Add key” (stored in the OS keyring, never in the file). An \
+                     ACP agent owns its own login — use the key button to sign in or switch \
+                     account. Add or remove agents and edit their command / endpoint / \
+                     model in the settings file.",
+                ),
+        )
+        .child(list)
+        .child(
+            Button::new("ai-edit-agents-file", "Edit in settings file")
+                .variant(ButtonVariant::Secondary)
+                .size(ButtonSize::Sm)
+                .on_click(cx.listener(|this, _, _, cx| this.open_settings_file(cx))),
+        )
+        .into_any_element()
+}
+
 fn about_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     let theme = cx.theme().clone();
 
@@ -1129,7 +1550,22 @@ fn about_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 auto_update,
                 &theme,
             ))
-            .child(update_status_row(state, &theme, cx)),
+            .child(update_status_row(state, &theme, cx))
+            .child(settings_header("Feedback", &theme))
+            .child(setting_row(
+                "Report a bug",
+                "Red is in early development. Found something wrong? Open an \
+                 issue on GitHub.",
+                Button::new("report-bug", "Report a bug…")
+                    .variant(ButtonVariant::Secondary)
+                    .size(ButtonSize::Sm)
+                    .on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.open_external(crate::app::ISSUES_URL, cx)
+                        }),
+                    ),
+                &theme,
+            )),
         &theme,
     )
     .into_any_element()

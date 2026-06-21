@@ -46,6 +46,11 @@ use crate::{
 pub struct MysqlDriver {
     pool: Pool,
     version: String,
+    /// Read-only posture. Every write transaction is opened with `START
+    /// TRANSACTION READ ONLY` (not a bare `BEGIN`) so the engine rejects writes
+    /// per-transaction — the session-level `SET SESSION TRANSACTION READ ONLY`
+    /// from `init` does not survive a pooled connection being reset on reclaim.
+    read_only: bool,
     /// When set, the schema tree is restricted to this one database — the
     /// connection's chosen `database`. `None` lists every non-system database on
     /// the server (a MySQL connection can see them all). See [`Self::with_scope`].
@@ -79,8 +84,21 @@ impl MysqlDriver {
         Ok(Self {
             pool,
             version: version.unwrap_or_default(),
+            read_only,
             scope: None,
         })
+    }
+
+    /// The statement that opens a write transaction. On a read-only connection it
+    /// is `START TRANSACTION READ ONLY` so the engine rejects any write in the
+    /// batch per-transaction — robust even when a pooled connection's session-level
+    /// read-only posture was wiped by a reset on reclaim. See the `read_only` field.
+    fn begin_stmt(&self) -> &'static str {
+        if self.read_only {
+            "START TRANSACTION READ ONLY"
+        } else {
+            "BEGIN"
+        }
     }
 
     /// Restrict the schema tree to a single database. An empty name clears the
@@ -477,7 +495,9 @@ impl DatabaseDriver for MysqlDriver {
 
     async fn execute(&self, sql: &str) -> Result<u64> {
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
-        conn.query_drop("BEGIN").await.map_err(map_my_err)?;
+        conn.query_drop(self.begin_stmt())
+            .await
+            .map_err(map_my_err)?;
         match conn.query_drop(sql).await {
             Ok(()) => {
                 let affected = conn.affected_rows();
@@ -496,7 +516,9 @@ impl DatabaseDriver for MysqlDriver {
             return Ok(0);
         }
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
-        conn.query_drop("BEGIN").await.map_err(map_my_err)?;
+        conn.query_drop(self.begin_stmt())
+            .await
+            .map_err(map_my_err)?;
         let mut total = 0u64;
         for op in ops {
             let (sql, params) = crate::edit_sql(

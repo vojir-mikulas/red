@@ -204,7 +204,10 @@ impl AppState {
         active: &ActiveConn,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = cx.theme();
+        // Owned (not borrowed from `cx`) so the agent-tab branch below can call a
+        // `&mut cx` render method without clashing with the theme tokens this fn
+        // snapshots throughout.
+        let theme = cx.theme().clone();
         let (bg_app, bg_panel, bg_elevated, bg_hover) = (
             theme.bg_app,
             theme.bg_panel,

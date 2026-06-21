@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use red_core::{
-    Column, ConnectionConfig, EditOp, ExportFormat, KeySpec, QueryOptions, QueryPlan, ResultFilter,
-    RowWindow, SchemaMeta, TableDetail, UpdateState, Value,
+    AiLimits, AiTier, Column, ConnectionConfig, EditOp, ExportFormat, KeySpec, QueryOptions,
+    QueryPlan, ResultFilter, RowWindow, SchemaMeta, TableDetail, UpdateState, Value,
 };
 
 /// Identifies one keep-alive backend session. Minted UI-side at connect start so
@@ -192,6 +192,65 @@ pub enum Command {
     /// Force an immediate update check ("Check for updates" in the About tab).
     /// Global.
     CheckForUpdate,
+    /// (Re)configure the AI assistant provider. Global — sent at launch and on
+    /// each settings reload, like the other tuning knobs. An empty `api_key`
+    /// leaves the assistant unconfigured (a turn then replies with `AiError`).
+    /// The key never touches `settings.toml`; the UI reads it from the OS keyring
+    /// and hands it across here.
+    ConfigureAi(AiConfig),
+    /// Run one assistant turn on the envelope's session. The backend drives the
+    /// model → tool → model loop (read-only schema/`SELECT` tools, auto-run and
+    /// row-capped) and streams `AiDelta` events, ending with `AiTurnFinished` or
+    /// `AiError`. `conversation_id` lets the UI route deltas to the right thread
+    /// and cancel a specific turn. `agent` is the id of the agent profile *this*
+    /// conversation is bound to (M-S6) — turns carry it so several chats on
+    /// different agents (API-key, subscription, Codex, local) can run concurrently,
+    /// rather than every turn following one global provider. An empty or unknown id
+    /// resolves to the default agent / a clear `AiError`.
+    AiTurn {
+        conversation_id: u64,
+        agent: String,
+        message: String,
+        context: AiContext,
+    },
+    /// Abort an in-flight assistant turn by `conversation_id` (the panel's Stop).
+    AiCancel {
+        conversation_id: u64,
+    },
+    /// Forget all per-conversation backend state when the UI closes or deletes a
+    /// conversation: the API-key path's running history/cancel/tool tally and the
+    /// subscription path's live agent. Without it those maps grow for the whole
+    /// session (a reopened conversation comes back under a fresh id, re-seeded), so
+    /// this keeps the backend's memory bounded by what's actually open.
+    AiForget {
+        conversation_id: u64,
+    },
+    /// Answer a pending agent tool-permission prompt (M-S2, subscription path).
+    /// `allow` runs the tool; otherwise it's denied. Routed to the parked request
+    /// by `request_id` so a stale answer for a superseded prompt is dropped.
+    AiPermission {
+        conversation_id: u64,
+        request_id: u64,
+        allow: bool,
+    },
+    /// Re-authenticate / switch account for an ACP agent, driven from Settings
+    /// (M-S4). The agent owns `/login`, so Red can't drive it directly — instead it
+    /// spawns the agent and runs a fresh ACP handshake, which pops the agent's own
+    /// browser login when it isn't signed in, then drops the probe and forces idle
+    /// conversations to re-handshake so they pick up the new account. A no-op for an
+    /// API agent. Red never touches the subscription tokens.
+    AiReauthenticateAgent {
+        agent_id: String,
+    },
+    /// Change a session config selector (model / reasoning) on the subscription path.
+    /// `config_id`/`value` are the opaque agent identifiers from the advertised
+    /// `AiConfigOptionsAvailable`. The agent re-advertises the refreshed set, which
+    /// comes back as another `AiConfigOptionsAvailable`. A no-op on the API-key path.
+    AiSetConfigOption {
+        conversation_id: u64,
+        config_id: String,
+        value: String,
+    },
     Shutdown,
 }
 
@@ -358,7 +417,262 @@ pub enum Event {
     /// The self-updater's state changed (Phases 3–4). Global (`None` session) —
     /// the UI stores it and renders the titlebar pill + About-tab status from it.
     UpdateState(UpdateState),
+    /// A streamed increment of an assistant turn. Echoes `conversation_id` so the
+    /// panel appends it to the right thread.
+    AiDelta {
+        conversation_id: u64,
+        delta: AiDelta,
+    },
+    /// An assistant turn completed normally; `usage` is its token accounting.
+    AiTurnFinished {
+        conversation_id: u64,
+        usage: AiUsage,
+    },
+    /// An assistant turn failed (no provider, auth, network, refusal, cancel).
+    /// Scoped to its conversation so the panel shows it inline, not as a global
+    /// toast.
+    AiError {
+        conversation_id: u64,
+        message: String,
+    },
+    /// The subscription agent wants to run a tool Red didn't auto-allow (M-S2):
+    /// the panel shows a confirm prompt and answers with `Command::AiPermission`.
+    /// `title` is what the agent intends to do; `detail` is a compact rendering of
+    /// the tool's input, if any. Scoped to its conversation, shown inline.
+    AiPermissionRequest {
+        conversation_id: u64,
+        request_id: u64,
+        title: String,
+        detail: Option<String>,
+    },
+    /// A `generate_report` tool produced a standalone HTML report at `path`; the UI
+    /// opens it in the system browser. Scoped to its conversation so the originating
+    /// chat (sidebar or agent tab) could also note it.
+    AiReportReady {
+        conversation_id: u64,
+        path: String,
+    },
+    /// The agent asked to open `sql` in a new query tab (so the user has it in the
+    /// editor/grid). The UI opens a fresh tab with the SQL loaded and runs it if it's
+    /// a read-only SELECT; anything else is left for the user to run (so the write
+    /// path's own confirmation still applies).
+    AiOpenQuery {
+        conversation_id: u64,
+        sql: String,
+    },
+    /// The subscription agent advertised its slash commands (after its session
+    /// opened). Scoped to the conversation; the panel stores them so the composer's
+    /// `/`-command picker can offer them. May arrive more than once (the agent can
+    /// re-advertise); the latest list replaces the previous.
+    AiCommandsAvailable {
+        conversation_id: u64,
+        commands: Vec<AiCommand>,
+    },
+    /// The subscription agent advertised (or updated) its session config selectors —
+    /// model / reasoning dropdowns. Scoped to the conversation; the panel renders
+    /// them next to the Send button. The latest list replaces the previous.
+    AiConfigOptionsAvailable {
+        conversation_id: u64,
+        options: Vec<AiConfigOption>,
+    },
     Error(String),
+}
+
+/// Which backend executes an agent profile's turns. `Api` is the Claude Messages
+/// API path (`red-ai`, optionally at a custom base URL); `Acp` drives an external
+/// agent over ACP (`red-acp`) — Claude Code on a subscription, Codex, a local agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AiAgentKind {
+    #[default]
+    Api,
+    Acp,
+}
+
+/// One configured agent the user can run turns on, resolved UI-side from
+/// `settings.toml` (`[[ai.agents]]`, or the synthesized legacy built-ins) plus the
+/// per-agent API key read from the OS keyring. The service keys its provider
+/// registry by [`id`](Self::id); a turn names that id.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiAgentProfile {
+    /// Stable id — the per-turn selector and keyring account (`ai-key:<id>`).
+    pub id: String,
+    /// Display name (echoed back to the UI for the selector/header; not used by the
+    /// service itself).
+    pub name: String,
+    /// Which backend runs it.
+    pub kind: AiAgentKind,
+    /// `Acp`: the agent launch command; empty falls back to the default invocation.
+    pub command: String,
+    /// `Api`: endpoint override; empty uses the default Anthropic base URL.
+    pub base_url: String,
+    /// `Api`: model id; empty falls back to the Opus default.
+    pub model: String,
+    /// `Api`: the API key from the keyring. Empty leaves *this* agent unconfigured
+    /// (a turn on it replies with `AiError`). Unused for `Acp` (the agent owns its
+    /// own auth).
+    pub api_key: String,
+}
+
+/// How the AI assistant is configured, carried by `ConfigureAi`. Built UI-side
+/// from `settings.toml` (`[ai]`) plus per-agent API keys read from the OS keyring.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiConfig {
+    /// The configured agents (always at least one — the legacy built-ins are
+    /// synthesized when none are defined). Keyed by id in the service registry.
+    pub agents: Vec<AiAgentProfile>,
+    /// The id a turn falls back to when it names an empty/unknown agent.
+    pub default_agent: String,
+    /// Surface a summarized "thinking…" affordance (adaptive thinking).
+    pub show_thinking: bool,
+    /// The global AI master switch (`[ai] enabled`, M-S7). When `false`, the
+    /// service refuses turns and never starts an MCP server or agent — a true kill
+    /// switch. A connection's `ai_enabled` override can flip it per session.
+    pub enabled: bool,
+    /// The global access tier (`[ai] tier`, M-S7) deciding which DB tools the model
+    /// is offered. A connection's `ai_tier` override can tighten it per session.
+    pub tier: AiTier,
+    /// The global resource guards (`[ai.limits]`, M-S7): row cap, statement
+    /// timeout, result byte cap, and per-conversation tool-call budget.
+    pub limits: AiLimits,
+}
+
+/// What's on screen when the user sends a turn, assembled by the UI (it knows the
+/// screen; the service knows the model). The service folds this into the system
+/// prompt / first user message so the model is grounded in *this* database.
+#[derive(Debug, Clone, Default)]
+pub struct AiContext {
+    /// A compact `table(col type, …)` summary of the connected schema. The model
+    /// pulls full detail on demand via the `describe_table` tool, so this stays
+    /// small even for large databases.
+    pub schema_summary: String,
+    /// The currently-viewed tab, so the user can refer to it ("this tab", "the
+    /// current query/result"): its name and — at `read` tier — a one-line shape of
+    /// the result on screen (row/column counts + column names). The SQL itself rides
+    /// in `editor_sql`.
+    pub current_tab: Option<String>,
+    /// The SQL currently in the editor, if any.
+    pub editor_sql: Option<String>,
+    /// The last query/result error shown, if any ("Explain this error").
+    pub last_error: Option<String>,
+    /// A textual snapshot of the selected rows, if any.
+    pub selection: Option<String>,
+    /// A rendered digest of an earlier, persisted conversation (M-S5), set only on
+    /// the first turn after a saved chat is reopened. The backend starts a fresh
+    /// session (the agent/history isn't restored), so this folds the prior exchange
+    /// back into the prompt as context — the conversation continues coherently
+    /// across app restarts on both the API-key and subscription paths.
+    pub prior_transcript: Option<String>,
+    /// `kind` + database name, for the system prompt's grounding line.
+    pub connection: String,
+    /// Whether this connection forbids writes — folded into the prompt so the
+    /// model doesn't propose edits it can't run.
+    pub read_only: bool,
+    /// The active Red/Flint theme's colors, so an AI-generated report can match
+    /// the app's look (Ayu Dark, GitHub Dark, …) instead of a generic light/dark
+    /// document. `None` falls back to the report's built-in light/dark (which
+    /// follows the OS). The UI fills it from the live `Theme`; only the
+    /// `generate_report` path reads it. Boxed so `AiContext` (which rides in the
+    /// `Command::AiTurn` variant) stays small.
+    pub theme: Option<Box<ReportTheme>>,
+}
+
+/// A snapshot of the active theme's colors as CSS color strings, handed to the
+/// report generator so the standalone HTML report (page, tables, charts, filter
+/// controls) is painted in Red's current palette. UI-agnostic on this side — the
+/// UI converts its `Hsla` tokens to CSS; the report shell + chart/table renderer
+/// just substitute them.
+#[derive(Debug, Clone)]
+pub struct ReportTheme {
+    /// Dark vs light, so the renderer picks matching shadows / `color-scheme`.
+    pub is_dark: bool,
+    /// Page background (the app's main surface).
+    pub bg: String,
+    /// Card / elevated surface (chart cards, table header, filter bar).
+    pub surface: String,
+    /// Primary text.
+    pub fg: String,
+    /// Secondary / muted text (axis ticks, counts, labels).
+    pub muted: String,
+    /// Hairline borders.
+    pub border: String,
+    /// Faint grid lines.
+    pub grid: String,
+    /// Hover / zebra background.
+    pub hover: String,
+    /// Brand accent (primary series, focus rings, links).
+    pub accent: String,
+    /// Translucent accent for focus-ring glow.
+    pub ring: String,
+    /// Categorical chart palette pulled from the theme's semantic colors.
+    pub palette: Vec<String>,
+}
+
+/// One streamed increment of an assistant turn (the `Event::AiDelta` payload).
+#[derive(Debug, Clone)]
+pub enum AiDelta {
+    /// A chunk of summarized thinking text.
+    Thinking(String),
+    /// A chunk of visible answer text.
+    Text(String),
+    /// The model began running a read-only tool (shown as a transient status).
+    ToolStarted { name: String },
+    /// A tool finished; `ok` is false when it errored.
+    ToolFinished { name: String, ok: bool },
+}
+
+/// One slash command the assistant backend advertises (the `AiCommandsAvailable`
+/// payload). Subscription (ACP) only — the agent lists them after its session opens;
+/// the composer offers them through a `/`-triggered picker. `name` carries no
+/// leading slash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiCommand {
+    pub name: String,
+    pub description: String,
+}
+
+/// One session config selector the subscription agent advertises (the
+/// `AiConfigOptionsAvailable` payload) — a model or reasoning-level dropdown. The
+/// `id`/`value` strings are opaque agent identifiers round-tripped via
+/// `Command::AiSetConfigOption`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiConfigOption {
+    pub id: String,
+    pub name: String,
+    pub category: AiConfigCategory,
+    /// The currently-selected choice's `value`.
+    pub current_value: String,
+    pub choices: Vec<AiConfigChoice>,
+}
+
+/// One choice within an [`AiConfigOption`] dropdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiConfigChoice {
+    pub value: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// What an [`AiConfigOption`] controls — drives where the composer places it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiConfigCategory {
+    Model,
+    Reasoning,
+    Mode,
+    Other,
+}
+
+/// Token accounting for one assistant turn (the `AiTurnFinished` payload). The
+/// subscription (ACP) path reports cumulative session figures and, when the agent
+/// provides it, a running `cost_usd`; the API-key path reports per-turn tokens and
+/// no cost. The panel renders whichever fields are non-zero/present.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AiUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    /// Running session cost in USD, when the backend reports it (subscription
+    /// path). `None` on the API-key path, which prices nothing.
+    pub cost_usd: Option<f64>,
 }
 
 /// How the self-updater should behave, carried by `ConfigureUpdates`. Built

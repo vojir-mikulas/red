@@ -1,0 +1,22 @@
+[package]
+name = "red-acp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The Agent Client Protocol SDK — drives an external coding agent (Claude Code in
+# ACP mode) as a subprocess and speaks JSON-RPC over its stdio. `unstable` matches
+# the rev Zed pins, and unlocks auth methods, MCP-over-ACP, and end-of-turn token
+# usage. Independent of the gpui pin, so the cross-repo gpui contract is untouched.
+agent-client-protocol = { workspace = true, features = ["unstable"] }
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+serde_json.workspace = true

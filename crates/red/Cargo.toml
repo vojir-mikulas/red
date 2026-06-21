@@ -41,6 +41,7 @@ red-core = { workspace = true, features = ["serde"] }
 red-service.workspace = true
 futures.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 dirs.workspace = true
 notify.workspace = true

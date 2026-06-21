@@ -162,9 +162,13 @@ impl AppState {
 
         // When collapsed, the schema pane (and its resize split) drop out entirely
         // and the editor/results fill the width; the status-bar toggle brings it
-        // back, restoring the retained `sidebar_w`.
-        let body = if active.sidebar_collapsed {
-            div().flex_1().min_h(px(0.)).child(inner)
+        // back, restoring the retained `sidebar_w`. `workspace` is the bare,
+        // self-sizing (`size_full`) split — the `flex_1` fill wrapper is applied
+        // below, *after* deciding whether the assistant dock wraps it. (Wrapping a
+        // `flex_1` element inside the dock's non-flex pane would collapse it — the
+        // dock pane stretches a `size_full` child but doesn't grow a `flex_1` one.)
+        let workspace = if active.sidebar_collapsed {
+            inner.into_any_element()
         } else {
             let schema_pane = self.render_schema(active, window, cx);
             let start = view.clone();
@@ -207,7 +211,53 @@ impl AppState {
                 })
                 .first(schema_pane)
                 .second(inner);
-            div().flex_1().min_h(px(0.)).child(outer)
+            outer.into_any_element()
+        };
+
+        // With the assistant open, dock it to the right of the whole workspace via
+        // a resizable split (same shape as the inspector dock, one level up). Width
+        // is app-owned (`assistant_w`), so it survives close/reopen.
+        let body = if self.assistant.is_some() {
+            let start = view.clone();
+            let resize = view.clone();
+            let end = view.clone();
+            let panel = self.render_assistant(cx);
+            div().flex_1().min_h(px(0.)).child(
+                SplitPane::new("shell-split-assistant", Axis::Horizontal)
+                    .sized(SplitSide::Trailing)
+                    .size(self.assistant_w)
+                    .gutter(px(1.))
+                    .drag(self.assistant_drag)
+                    .min_first(px(320.))
+                    .max_first(px(760.))
+                    .on_drag_start(move |anchor, _, cx| {
+                        start
+                            .update(cx, |this, cx| {
+                                this.assistant_drag = Some(anchor);
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+                    .on_resize(move |size, _, cx| {
+                        resize
+                            .update(cx, |this, cx| {
+                                this.assistant_w = size;
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+                    .on_drag_end(move |_, cx| {
+                        end.update(cx, |this, cx| {
+                            this.assistant_drag = None;
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .first(workspace)
+                    .second(panel),
+            )
+        } else {
+            div().flex_1().min_h(px(0.)).child(workspace)
         };
 
         // --- status bar: endpoint · db · read-only | rows · cols · UTF-8 · SQL ·
@@ -292,6 +342,34 @@ impl AppState {
             ))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)));
 
+        // Assistant toggle, pinned to the far-right of the status bar (mirrors the
+        // schema sidebar toggle on the left). Accent-tinted while the panel is open.
+        // Hidden entirely when the assistant is disabled for this connection (the
+        // M-S7 kill switch) — no entry point, not just a no-op button.
+        let assistant_enabled = self.ai_enabled();
+        let assistant_open = self.assistant.is_some();
+        let assistant_toggle = div()
+            .id("toggle-assistant")
+            .ml_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(20.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .tooltip(Tooltip::text("Toggle agent  ⌘L"))
+            .hover(|s| s.bg(theme.bg_elevated))
+            .child(crate::icons::icon(
+                "sparkles",
+                theme.scale(14.),
+                if assistant_open {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                },
+            ))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_assistant(window, cx)));
+
         let statusbar = div()
             .flex_shrink_0()
             .h(px(25.))
@@ -312,7 +390,13 @@ impl AppState {
                     .child(sidebar_toggle)
                     .child(status_left),
             )
-            .child(status_right);
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(status_right)
+                    .children(assistant_enabled.then_some(assistant_toggle)),
+            );
 
         div()
             .size_full()

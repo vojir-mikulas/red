@@ -33,6 +33,7 @@ pub struct Settings {
     pub query: QuerySettings,
     pub behavior: BehaviorSettings,
     pub update: UpdateSettings,
+    pub ai: AiSettings,
 }
 
 // --- appearance --------------------------------------------------------------
@@ -304,6 +305,241 @@ impl UpdateSettings {
     }
 }
 
+// --- ai ----------------------------------------------------------------------
+
+/// AI assistant configuration (the right-docked chat sidebar). The API key does
+/// **not** live here — it routes through the OS keyring (see `crate::secrets`),
+/// the same secret store connection passwords use. Only the non-secret knobs
+/// (provider, model, the thinking-display toggle) are persisted in `settings.toml`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiSettings {
+    /// The master switch. `false` is a true kill switch — no panel entry point,
+    /// no MCP server, no agent process (M-S7). A connection can override it.
+    pub enabled: bool,
+    /// Which backend handles turns:
+    /// - `"anthropic"` (default) — the Claude Messages API, billed to an API key.
+    /// - `"subscription"` — Claude Code over ACP, billed to the user's Pro/Max
+    ///   subscription (the agent owns its own login; no key needed).
+    pub provider: String,
+    /// Database access tier the assistant's tools run at (M-S7): `"off"` (no DB
+    /// tools), `"schema"` (structure only, no row data), or `"read"` (the full
+    /// read catalog). A connection can override it; unknown values resolve to
+    /// `"read"`.
+    pub tier: String,
+    /// Model id, e.g. `claude-opus-4-8`. Empty falls back to the Opus default.
+    /// (API-key path only; the subscription agent picks its own model.)
+    pub model: String,
+    /// Default subscription-agent model selector, as the agent's opaque value id
+    /// (set from the composer's dropdown). Applied to each new chat's session; empty
+    /// lets the agent keep its own default. Last choice wins — changing the dropdown
+    /// rewrites this, but never retroactively changes already-open chats.
+    pub subscription_model: String,
+    /// Default subscription-agent reasoning-level selector (opaque value id), same
+    /// semantics as `subscription_model`.
+    pub subscription_reasoning: String,
+    /// Default subscription-agent permission-mode selector (opaque value id) — the
+    /// agent's accept policy (default / accept edits / auto / bypass). Same
+    /// last-choice-wins semantics as `subscription_model`.
+    pub subscription_mode: String,
+    /// Surface a summarized "thinking…" affordance while the model reasons.
+    pub show_thinking: bool,
+    /// Advanced: override the subscription agent's launch command. Empty falls
+    /// back to the default `npx -y @agentclientprotocol/claude-agent-acp`.
+    /// Legacy: superseded by the matching built-in's `command` once `agents` is set.
+    pub agent_command: String,
+    /// User-defined agent profiles (`[[ai.agents]]`). When empty, profiles are
+    /// synthesized from the legacy `provider`/`model`/`agent_command` keys (see
+    /// [`AiSettings::resolved_agents`]) so a config written before agent profiles
+    /// keeps working unchanged.
+    pub agents: Vec<AiAgentSettings>,
+    /// The agent id new chats start on. Empty (or naming a missing agent) resolves
+    /// to the legacy provider's built-in, else the first agent.
+    pub default_agent: String,
+    /// Resource guards on the `read` tier (`[ai.limits]`, M-S7).
+    pub limits: AiLimitsSettings,
+}
+
+impl AiSettings {
+    /// A fail-closed variant: the assistant off, everything else at defaults. Used
+    /// when the `[ai]` section (or the whole settings file) can't be parsed, so a
+    /// malformed hand-edit disables AI rather than silently reverting to the
+    /// permissive default (`enabled = true`, read tier).
+    pub(crate) fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: "anthropic".to_string(),
+            tier: "read".to_string(),
+            model: "claude-opus-4-8".to_string(),
+            subscription_model: String::new(),
+            subscription_reasoning: String::new(),
+            subscription_mode: String::new(),
+            show_thinking: false,
+            agent_command: String::new(),
+            agents: Vec::new(),
+            default_agent: String::new(),
+            limits: AiLimitsSettings::default(),
+        }
+    }
+}
+
+/// The two built-in agent ids. Kept byte-stable: `"anthropic"` is the keyring
+/// account (`ai-key:anthropic`) and the binding old saved chats persist, and both
+/// are what legacy configs synthesize — renaming would orphan keys and chats.
+pub const BUILTIN_API_AGENT: &str = "anthropic";
+pub const BUILTIN_ACP_AGENT: &str = "subscription";
+
+/// One user-defined agent profile (`[[ai.agents]]`). `kind` selects the backend:
+/// `"api"` (the Messages API via `red-ai`, optionally at a custom `base_url`) or
+/// `"acp"` (an external agent over ACP via `red-acp`, launched by `command` —
+/// Claude Code, `codex acp`, a local agent). The API key never lives here; it's in
+/// the OS keyring under `ai-key:<id>`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiAgentSettings {
+    /// Stable id: the keyring account (`ai-key:<id>`), the saved-chat binding, and
+    /// the per-turn selector. The built-ins use `"anthropic"`/`"subscription"`.
+    pub id: String,
+    /// Display name shown in the selector and chat header.
+    pub name: String,
+    /// `"api"` or `"acp"`.
+    pub kind: String,
+    /// ACP: launch command; empty falls back to the default Claude Code invocation.
+    pub command: String,
+    /// API: wire format. `"anthropic"` is the only value in v1.
+    pub wire: String,
+    /// API: endpoint override; empty uses the default Anthropic base URL.
+    pub base_url: String,
+    /// API: model id; empty falls back to the Opus default.
+    pub model: String,
+}
+
+impl Default for AiAgentSettings {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            kind: "api".to_string(),
+            command: String::new(),
+            wire: "anthropic".to_string(),
+            base_url: String::new(),
+            model: String::new(),
+        }
+    }
+}
+
+impl AiSettings {
+    /// The effective agent profiles. An explicit `[[ai.agents]]` list wins (blank
+    /// ids dropped, duplicate ids de-duped keeping the first). When absent, two
+    /// profiles are synthesized from the legacy `provider`/`model`/`agent_command`
+    /// keys so a config written before agent profiles keeps working unchanged.
+    pub fn resolved_agents(&self) -> Vec<AiAgentSettings> {
+        if !self.agents.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            let explicit: Vec<AiAgentSettings> = self
+                .agents
+                .iter()
+                .filter(|a| !a.id.trim().is_empty())
+                .filter(|a| seen.insert(a.id.trim().to_string()))
+                // Store the trimmed id, not just dedup on it: the id is the keychain
+                // account key and the built-in env-var match, so a stray-whitespace
+                // id (`" anthropic"`) must resolve to the same identity downstream.
+                .map(|a| AiAgentSettings {
+                    id: a.id.trim().to_string(),
+                    ..a.clone()
+                })
+                .collect();
+            if !explicit.is_empty() {
+                return explicit;
+            }
+        }
+        // Legacy synthesis: the two built-ins, ids byte-stable (see the consts).
+        vec![
+            AiAgentSettings {
+                id: BUILTIN_API_AGENT.to_string(),
+                name: "Claude (API)".to_string(),
+                kind: "api".to_string(),
+                command: String::new(),
+                wire: "anthropic".to_string(),
+                base_url: String::new(),
+                model: self.model.clone(),
+            },
+            AiAgentSettings {
+                id: BUILTIN_ACP_AGENT.to_string(),
+                name: "Claude (subscription)".to_string(),
+                kind: "acp".to_string(),
+                command: self.agent_command.clone(),
+                wire: String::new(),
+                base_url: String::new(),
+                model: String::new(),
+            },
+        ]
+    }
+
+    /// The agent id new chats start on: an explicit `default_agent` when it names a
+    /// resolved agent; else (legacy only) the old `provider` mapped to its built-in
+    /// id; else the first resolved agent (empty when none).
+    pub fn resolved_default_agent(&self) -> String {
+        let agents = self.resolved_agents();
+        let has = |id: &str| agents.iter().any(|a| a.id == id);
+        let want = self.default_agent.trim();
+        if !want.is_empty() && has(want) {
+            return want.to_string();
+        }
+        // Legacy: map the old provider string onto a built-in id (only meaningful
+        // when no explicit agents are configured, i.e. we synthesized them).
+        if self.agents.is_empty() {
+            let legacy = if self.provider.eq_ignore_ascii_case("subscription") {
+                BUILTIN_ACP_AGENT
+            } else {
+                BUILTIN_API_AGENT
+            };
+            if has(legacy) {
+                return legacy.to_string();
+            }
+        }
+        agents.first().map(|a| a.id.clone()).unwrap_or_default()
+    }
+}
+
+/// The `[ai.limits]` block: defense-in-depth caps the assistant's tools run
+/// under, mirroring [`red_core::AiLimits`]. Defaults to the same sane ceilings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiLimitsSettings {
+    /// Hard row ceiling on one `run_select`; a larger LIMIT is clamped.
+    pub max_rows: usize,
+    /// Per-tool-call statement timeout in milliseconds. `0` disables it.
+    pub statement_timeout_ms: u64,
+    /// Cap on the bytes of one tool result handed back to the model. `0` disables.
+    pub max_result_bytes: usize,
+    /// Cap on tool calls per conversation, bounding a runaway loop. `0` disables.
+    pub max_tool_calls: usize,
+}
+
+impl Default for AiLimitsSettings {
+    fn default() -> Self {
+        // Mirror `red_core::AiLimits::default()` so the wired default matches the
+        // backend's own fallback.
+        let d = red_core::AiLimits::default();
+        Self {
+            max_rows: d.max_rows,
+            statement_timeout_ms: d.statement_timeout_ms,
+            max_result_bytes: d.max_result_bytes,
+            max_tool_calls: d.max_tool_calls,
+        }
+    }
+}
+
 // --- store -------------------------------------------------------------------
 
 /// The outcome of a load: the resolved settings, plus any non-fatal warnings to
@@ -353,10 +589,17 @@ impl FileSettingsStore {
         let value: toml::Value = match contents.parse() {
             Ok(v) => v,
             Err(e) => {
+                // Fail closed: if we can't read the user's file at all, don't assume
+                // they wanted the assistant on — disable it rather than reverting to
+                // the permissive `AiSettings::default()`.
                 return LoadReport {
-                    settings: Settings::default(),
+                    settings: Settings {
+                        ai: AiSettings::disabled(),
+                        ..Settings::default()
+                    },
                     warnings: vec![format!(
-                        "settings.toml isn't valid TOML ({e}) — using defaults"
+                        "settings.toml isn't valid TOML ({e}) — using defaults; the assistant is \
+                         disabled until it's fixed"
                     )],
                     migrated: false,
                 };
@@ -371,6 +614,7 @@ impl FileSettingsStore {
             query: section(&value, "query", &mut warnings),
             behavior: section(&value, "behavior", &mut warnings),
             update: section(&value, "update", &mut warnings),
+            ai: ai_section(&value, &mut warnings),
         };
         let migrated = apply_legacy(&mut settings, &value);
 
@@ -468,6 +712,28 @@ fn section<T: Default + DeserializeOwned>(
     }
 }
 
+/// Like [`section`] but **fails closed** for the security-sensitive `[ai]` table.
+/// A malformed section disables the assistant ([`AiSettings::disabled`]) instead of
+/// reverting to the permissive default (`enabled = true`, read tier), so a stray
+/// hand-edit — a typo'd key, a wrong-typed value — can't silently re-enable AI
+/// access against the user's intent. A missing section still uses the normal
+/// default (the shipped behavior).
+fn ai_section(value: &toml::Value, warnings: &mut Vec<String>) -> AiSettings {
+    match value.get("ai") {
+        None => AiSettings::default(),
+        Some(v) => match v.clone().try_into() {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                warnings.push(format!(
+                    "settings.toml: couldn't read [ai] ({e}) — the assistant is disabled until \
+                     it's fixed"
+                ));
+                AiSettings::disabled()
+            }
+        },
+    }
+}
+
 /// Lift the legacy flat keys (`theme` / `density` / `confirm_destructive`) into
 /// the new sections once, so an old file upgrades cleanly. Returns `true` when
 /// anything was migrated (the caller re-saves in the new shape). These keys only
@@ -529,6 +795,104 @@ mod tests {
     }
 
     #[test]
+    fn legacy_ai_synthesizes_two_builtin_agents() {
+        // No [[ai.agents]] → synthesize the API + subscription built-ins with
+        // byte-stable ids, carrying the legacy model/command through.
+        let ai = AiSettings {
+            model: "claude-x".into(),
+            agent_command: "my-agent".into(),
+            ..AiSettings::default()
+        };
+        let agents = ai.resolved_agents();
+        let ids: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, [BUILTIN_API_AGENT, BUILTIN_ACP_AGENT]);
+        assert_eq!(agents[0].kind, "api");
+        assert_eq!(agents[0].model, "claude-x");
+        assert_eq!(agents[1].kind, "acp");
+        assert_eq!(agents[1].command, "my-agent");
+    }
+
+    #[test]
+    fn legacy_provider_drives_default_agent() {
+        let api = AiSettings {
+            provider: "anthropic".into(),
+            ..AiSettings::default()
+        };
+        assert_eq!(api.resolved_default_agent(), BUILTIN_API_AGENT);
+        let sub = AiSettings {
+            provider: "subscription".into(),
+            ..AiSettings::default()
+        };
+        assert_eq!(sub.resolved_default_agent(), BUILTIN_ACP_AGENT);
+    }
+
+    #[test]
+    fn explicit_agents_win_over_legacy() {
+        let toml = r#"
+            provider = "anthropic"
+            default_agent = "codex"
+            [[agents]]
+            id = "codex"
+            name = "Codex"
+            kind = "acp"
+            command = "codex acp"
+            [[agents]]
+            id = "local"
+            name = "Local"
+            kind = "api"
+            base_url = "http://127.0.0.1:8080"
+            model = "llama"
+        "#;
+        let ai: AiSettings = toml::from_str(toml).expect("ai settings");
+        let agents = ai.resolved_agents();
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].id, "codex");
+        assert_eq!(agents[1].base_url, "http://127.0.0.1:8080");
+        // The explicit, valid default_agent is honored.
+        assert_eq!(ai.resolved_default_agent(), "codex");
+    }
+
+    #[test]
+    fn blank_and_duplicate_ids_are_dropped() {
+        let toml = r#"
+            [[agents]]
+            id = "  "
+            name = "Blank"
+            [[agents]]
+            id = "dup"
+            name = "First"
+            kind = "acp"
+            [[agents]]
+            id = "dup"
+            name = "Second"
+            kind = "api"
+        "#;
+        let ai: AiSettings = toml::from_str(toml).expect("ai settings");
+        let agents = ai.resolved_agents();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].id, "dup");
+        // First wins on a duplicate id.
+        assert_eq!(agents[0].name, "First");
+    }
+
+    #[test]
+    fn default_agent_at_missing_id_falls_back_to_first() {
+        let toml = r#"
+            default_agent = "ghost"
+            [[agents]]
+            id = "a"
+            name = "A"
+            kind = "acp"
+            [[agents]]
+            id = "b"
+            name = "B"
+            kind = "acp"
+        "#;
+        let ai: AiSettings = toml::from_str(toml).expect("ai settings");
+        assert_eq!(ai.resolved_default_agent(), "a");
+    }
+
+    #[test]
     fn round_trip() {
         let t = temp_store();
         let mut settings = Settings::default();
@@ -545,8 +909,36 @@ mod tests {
         let t = temp_store();
         write(&t.store, "this is = not valid toml ][");
         let report = t.store.load_report();
-        assert_eq!(report.settings, Settings::default());
+        // Everything but AI falls back to defaults; AI fails CLOSED (disabled) since
+        // we couldn't read the user's intent for a security-sensitive control.
+        assert_eq!(
+            report.settings,
+            Settings {
+                ai: AiSettings::disabled(),
+                ..Settings::default()
+            }
+        );
+        assert!(!report.settings.ai.enabled);
         assert_eq!(report.warnings.len(), 1);
+    }
+
+    #[test]
+    fn malformed_ai_section_fails_closed() {
+        // A wrong-typed key in [ai] (here a string for the bool `show_thinking`)
+        // fails the whole section. It must disable the assistant rather than revert
+        // to the permissive default — even though `enabled = true` is set here, a
+        // parse failure must not leave AI on.
+        let t = temp_store();
+        write(
+            &t.store,
+            "[ai]\nenabled = true\ntier = \"read\"\nshow_thinking = \"yes\"\n",
+        );
+        let loaded = t.store.load_report();
+        assert!(
+            !loaded.settings.ai.enabled,
+            "AI must fail closed, not stay enabled"
+        );
+        assert_eq!(loaded.warnings.len(), 1);
     }
 
     #[test]

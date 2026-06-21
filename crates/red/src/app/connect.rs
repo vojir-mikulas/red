@@ -4,6 +4,7 @@
 //! delete actions. Split out of `mod.rs` to keep the root state machine lean.
 
 use super::*;
+use red_core::SshAuth;
 
 impl AppState {
     // --- sessions (keep-alive workspaces) ---
@@ -215,6 +216,31 @@ impl AppState {
                 Ok(Some(pw)) => config.password = pw,
                 Ok(None) => {}
                 Err(e) => tracing::warn!("failed to read credential from keychain: {e}"),
+            }
+        }
+        // SSH secrets live in the keychain too (the saved config carries them empty),
+        // so hydrate the tunnel's secret for the active auth mode before dialing —
+        // otherwise a saved connection authenticates with a blank password/passphrase
+        // and fails, even though the Test probe (which reads the form) succeeded.
+        if let Some(ssh) = config.ssh.as_mut() {
+            match &ssh.auth {
+                SshAuth::Password if ssh.password.is_empty() => {
+                    match crate::secrets::get_ssh_password(&id) {
+                        Ok(Some(pw)) => ssh.password = pw,
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!("failed to read SSH password from keychain: {e}"),
+                    }
+                }
+                SshAuth::Key { .. } if ssh.passphrase.is_empty() => {
+                    match crate::secrets::get_ssh_passphrase(&id) {
+                        Ok(Some(pp)) => ssh.passphrase = pp,
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!("failed to read SSH passphrase from keychain: {e}")
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         self.start_connect(id, config, cx);

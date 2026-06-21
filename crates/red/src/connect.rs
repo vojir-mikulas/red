@@ -134,11 +134,36 @@ impl AppState {
         .a11y_label("Settings")
         .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
 
+        // Quiet footer: Red is pre-1.0, so invite bug reports straight from the
+        // first screen. The link reuses the shared `open_external` seam.
+        let footer_theme = cx.theme().clone();
+        let footer =
+            div()
+                .pt(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .text_size(footer_theme.scale(12.))
+                .text_color(footer_theme.text_faint)
+                .child("Red is in early development — found a bug?")
+                .child(
+                    div()
+                        .id("connect-report-bug")
+                        .cursor_pointer()
+                        .text_color(footer_theme.accent)
+                        .hover(|s| s.underline())
+                        .child("Report it")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.open_external(crate::app::ISSUES_URL, cx)
+                        })),
+                );
+
         let theme = cx.theme();
 
-        // The brand lockup: the square mark beside the wordmark, centered. Both take
-        // the accent so they re-tint with the active theme (`red.svg` renders as an
-        // accent-masked square).
+        // The brand lockup: the square mark beside the wordmark, centered. The mark
+        // is pinned to the brand red (`red.svg` renders as a masked square) so it
+        // reads as "Red" regardless of the active theme's accent.
         let header = div()
             .flex()
             .items_center()
@@ -149,7 +174,7 @@ impl AppState {
                     .path("red.svg")
                     .size(theme.scale(40.))
                     .flex_none()
-                    .text_color(theme.accent),
+                    .text_color(gpui::rgb(0xdc2626)),
             )
             .child(
                 // The wordmark sits in the primary text color (white on the dark
@@ -192,7 +217,8 @@ impl AppState {
             .child(connections_header)
             .children(toolbar)
             .child(saved)
-            .child(new_button);
+            .child(new_button)
+            .child(footer);
 
         let screen = div()
             .id("connect-screen")
@@ -675,6 +701,7 @@ impl AppState {
                     .child(self.render_connection_fields(form, is_file, &errors, theme))
                     .children(self.render_ssh_section(form, is_file, &errors, theme, cx))
                     .child(self.render_label_access_row(form, theme, cx))
+                    .children(self.render_ai_write_row(form, theme, cx))
                     .children(self.render_form_status(form, cx)),
             )
     }
@@ -960,6 +987,47 @@ impl AppState {
                 .on_click(cx.listener(move |this, _, _, cx| this.set_form_kind(kind, cx)))
         });
         div().flex().gap_1p5().children(cells)
+    }
+
+    /// The AI write opt-in (Feature B): lets the assistant propose INSERT/UPDATE/
+    /// DELETE on this connection, each gated by per-statement approval. Shown only
+    /// when the assistant is enabled and the connection is *writable* — write access
+    /// is meaningless (and blocked) on a read-only connection, so unticking
+    /// "Read-only" is the prerequisite. `None` hides the row otherwise.
+    fn render_ai_write_row(
+        &self,
+        form: &FormState,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        if !self.ai_enabled() || form.read_only {
+            return None;
+        }
+        Some(
+            labeled_field("AI agent", theme).child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(32.))
+                    .child(
+                        Toggle::new("ai-allow-writes", form.ai_allow_writes)
+                            .label("Allow writes")
+                            .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                this.set_form_ai_allow_writes(*checked, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme.scale(11.5))
+                            .text_color(theme.text_muted)
+                            .child(
+                                "The agent may propose INSERT/UPDATE/DELETE — each needs your \
+                                 approval; DDL and unqualified changes are always blocked.",
+                            ),
+                    ),
+            ),
+        )
     }
 
     /// The label-color swatches + the read-only access toggle, sharing one row.

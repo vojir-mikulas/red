@@ -12,14 +12,29 @@ authors.workspace = true
 [dependencies]
 red-core.workspace = true
 red-driver.workspace = true
+red-ai.workspace = true
+red-acp.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time", "net", "io-util"] }
 futures.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
 # SSH tunnels (jump-host connections) — pure-Rust client, no system libssh.
 russh.workspace = true
+# Localhost HTTP MCP server that grounds the subscription (ACP) assistant in the
+# live database. hyper/hyper-util/http-body-util/bytes ride reqwest's existing tree.
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+uuid.workspace = true
+# Resolve the user config dir for the AI write-audit log (Feature B).
+dirs.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time", "net", "io-util"] }
 # Used only by tests to populate a fixture DB the service then introspects.
 rusqlite.workspace = true
+# The MCP server test drives the localhost endpoint with a real HTTP client.
+reqwest.workspace = true
+# A scripted fake AiProvider for the write-approval round-trip test.
+async-trait.workspace = true

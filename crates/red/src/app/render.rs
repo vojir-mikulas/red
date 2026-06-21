@@ -9,8 +9,9 @@ use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::keymap::{
     About, AddRow, BeginEdit, CloseInspector, CloseTab, CycleFocusNext, CycleFocusPrev, DeleteRow,
     Explain, FocusEditor, FocusGrid, FocusSchema, NewConnection, NewTab, NextTab, OpenSavedQueries,
-    PrevTab, RefreshSchema, RevertChanges, RunQuery, SaveQuery, SearchSchema, SetNull, Settings,
-    ShowShortcuts, SubmitChanges, SwitchConnection, ToggleFilter, ToggleInspector, ToggleSidebar,
+    PrevTab, RefreshSchema, ReportBug, RevertChanges, RunQuery, SaveQuery, SearchSchema, SetNull,
+    Settings, ShowShortcuts, SubmitChanges, SwitchConnection, ToggleAssistant, ToggleFilter,
+    ToggleInspector, ToggleSidebar,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
@@ -188,6 +189,28 @@ impl Render for AppState {
             }
         }
 
+        // ⌘L — the assistant panel just opened; focus its prompt box.
+        if self.focus_assistant {
+            self.focus_assistant = false;
+            if let Some(panel) = &self.assistant {
+                window.focus(&panel.input.focus_handle(cx), cx);
+            }
+        }
+
+        // An inline conversation rename just began; focus its edit field.
+        if self.focus_rename {
+            self.focus_rename = false;
+            if let Some(rename) = self.assistant.as_ref().and_then(|p| p.renaming.as_ref()) {
+                window.focus(&rename.input.focus_handle(cx), cx);
+            }
+        }
+
+        // A Settings agent key row just opened; focus its field.
+        if self.focus_ai_key {
+            self.focus_ai_key = false;
+            window.focus(&self.ai_key_input.focus_handle(cx), cx);
+        }
+
         // An inline cell edit just opened in the inspector (Track B5) — focus its
         // field so the user types the new value immediately.
         if self.focus_inspector_edit {
@@ -336,6 +359,9 @@ impl Render for AppState {
             // ⌘I toggles the cell detail inspector; Esc closes it (no-op when shut).
             .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| this.toggle_inspector(cx)))
             .on_action(cx.listener(|this, _: &CloseInspector, _, cx| this.close_inspector(cx)))
+            .on_action(cx.listener(|this, _: &ToggleAssistant, window, cx| {
+                this.toggle_assistant(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ToggleFilter, _, cx| this.toggle_filter_bar(cx)))
             // Saved queries (B3): ⇧⌘S opens the name prompt; ⇧⌘O the picker.
             .on_action(cx.listener(|this, _: &SaveQuery, _, cx| this.open_save_prompt(cx)))
@@ -374,6 +400,10 @@ impl Render for AppState {
             // Settings panel: ⌘, and the RED → Settings… / About RED menu items.
             .on_action(cx.listener(|this, _: &Settings, _, cx| this.open_settings(cx)))
             .on_action(cx.listener(|this, _: &About, _, cx| this.open_about(cx)))
+            // Help → Report a Bug…: open the issue tracker in the browser.
+            .on_action(cx.listener(|this, _: &ReportBug, _, cx| {
+                this.open_external(crate::app::ISSUES_URL, cx)
+            }))
             // --- staged grid editing (Track B6) ---
             .on_action(cx.listener(|this, _: &BeginEdit, _, cx| this.begin_grid_edit(cx)))
             // ⌘↵ in the grid submits staged changes; with nothing staged it falls

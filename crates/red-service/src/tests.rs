@@ -1005,6 +1005,89 @@ fn panic_message_recovers_common_payloads() {
     assert_eq!(panic_message(from_other.as_ref()), "unknown panic");
 }
 
+/// The agent registry resolves a turn's `agent` id: an unknown id (e.g. a saved
+/// chat bound to a since-removed agent) fails with a clear error naming it, and a
+/// configured API agent with no key reports "add an API key" — both *before*
+/// anything spawns, so neither launches an agent process.
+#[tokio::test]
+async fn ai_turn_resolves_agent_id_with_clear_errors() {
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(&handle, Command::Connect(sqlite(":memory:", true)));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    // One ACP agent (needs no key) and one keyless API agent.
+    send(
+        &handle,
+        Command::ConfigureAi(AiConfig {
+            agents: vec![
+                AiAgentProfile {
+                    id: "sub".into(),
+                    name: "Sub".into(),
+                    kind: AiAgentKind::Acp,
+                    command: "true".into(),
+                    base_url: String::new(),
+                    model: String::new(),
+                    api_key: String::new(),
+                },
+                AiAgentProfile {
+                    id: "api".into(),
+                    name: "API".into(),
+                    kind: AiAgentKind::Api,
+                    command: String::new(),
+                    base_url: String::new(),
+                    model: String::new(),
+                    api_key: String::new(),
+                },
+            ],
+            default_agent: "sub".into(),
+            show_thinking: false,
+            enabled: true,
+            tier: AiTier::Read,
+            limits: AiLimits::default(),
+        }),
+    );
+
+    // Unknown id → a clear error that names the missing agent.
+    send(
+        &handle,
+        Command::AiTurn {
+            conversation_id: 1,
+            agent: "ghost".into(),
+            message: "hi".into(),
+            context: AiContext::default(),
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::AiError { message, .. }) => {
+            assert!(message.contains("ghost"), "got: {message}")
+        }
+        other => panic!("expected AiError, got {other:?}"),
+    }
+
+    // Keyless API agent → "add an API key", never a failed network call.
+    send(
+        &handle,
+        Command::AiTurn {
+            conversation_id: 2,
+            agent: "api".into(),
+            message: "hi".into(),
+            context: AiContext::default(),
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::AiError { message, .. }) => {
+            assert!(message.contains("add an API key"), "got: {message}")
+        }
+        other => panic!("expected AiError, got {other:?}"),
+    }
+
+    send(&handle, Command::Shutdown);
+}
+
 #[test]
 fn lock_recovers_from_a_poisoned_mutex() {
     use crate::dispatch::lock;

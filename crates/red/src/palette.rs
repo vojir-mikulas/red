@@ -69,6 +69,12 @@ pub(crate) enum Cmd {
     RevertChanges,
     /// Append a new draft (insert) row to the result (Track B6).
     AddRow,
+    /// Open the assistant's conversation-history picker (M-S5).
+    AssistantHistory,
+    /// Start a fresh assistant chat, saving the current one (M-S5).
+    AssistantNewChat,
+    /// Reveal the conversations directory in the OS file manager (M-S5).
+    RevealConversationStorage,
 }
 
 /// Which free-text prompt the single palette slot is currently serving, so a
@@ -241,6 +247,9 @@ impl AppState {
             Cmd::SubmitChanges => self.submit_changes(cx),
             Cmd::RevertChanges => self.revert_changes(cx),
             Cmd::AddRow => self.add_draft_row(cx),
+            Cmd::AssistantHistory => self.open_history_sidebar(cx),
+            Cmd::AssistantNewChat => self.new_chat(cx),
+            Cmd::RevealConversationStorage => self.reveal_conversation_storage(cx),
         }
     }
 
@@ -394,6 +403,21 @@ impl AppState {
                     PaletteItem::new("cmd:disconnect", "connection: disconnect"),
                     Cmd::Disconnect,
                 ));
+                // Assistant conversation history (M-S5) — only with the panel open.
+                if self.assistant.is_some() {
+                    out.push((
+                        PaletteItem::new("cmd:ai-new-chat", "agent: new chat"),
+                        Cmd::AssistantNewChat,
+                    ));
+                    out.push((
+                        PaletteItem::new("cmd:ai-history", "agent: conversation history…"),
+                        Cmd::AssistantHistory,
+                    ));
+                    out.push((
+                        PaletteItem::new("cmd:ai-storage", "agent: open conversation storage"),
+                        Cmd::RevealConversationStorage,
+                    ));
+                }
             }
             Phase::Disconnected => {
                 for (index, conn) in self.connections.iter().enumerate() {

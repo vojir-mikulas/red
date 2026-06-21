@@ -30,8 +30,8 @@ use flint::components::text_input::{
 
 use crate::keymap::{
     About, CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusSchema,
-    NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, RunQuery, SearchSchema, Settings,
-    ShowShortcuts, SwitchConnection, ToggleSidebar,
+    NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, ReportBug, RunQuery, SearchSchema,
+    Settings, ShowShortcuts, SwitchConnection, ToggleSidebar,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 use crate::Quit;
@@ -101,6 +101,10 @@ pub(crate) fn build_menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Close Tab", CloseTab),
         ]),
-        Menu::new("Help").items([MenuItem::action("Keyboard Shortcuts", ShowShortcuts)]),
+        Menu::new("Help").items([
+            MenuItem::action("Keyboard Shortcuts", ShowShortcuts),
+            MenuItem::separator(),
+            MenuItem::action("Report a Bug…", ReportBug),
+        ]),
     ]
 }
