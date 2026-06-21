@@ -495,7 +495,9 @@ impl DatabaseDriver for MysqlDriver {
 
     async fn execute(&self, sql: &str) -> Result<u64> {
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
-        conn.query_drop(self.begin_stmt()).await.map_err(map_my_err)?;
+        conn.query_drop(self.begin_stmt())
+            .await
+            .map_err(map_my_err)?;
         match conn.query_drop(sql).await {
             Ok(()) => {
                 let affected = conn.affected_rows();
@@ -514,7 +516,9 @@ impl DatabaseDriver for MysqlDriver {
             return Ok(0);
         }
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
-        conn.query_drop(self.begin_stmt()).await.map_err(map_my_err)?;
+        conn.query_drop(self.begin_stmt())
+            .await
+            .map_err(map_my_err)?;
         let mut total = 0u64;
         for op in ops {
             let (sql, params) = crate::edit_sql(
