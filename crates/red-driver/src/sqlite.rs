@@ -358,7 +358,7 @@ fn execute_blocking(path: &Path, read_only: bool, sql: &str) -> Result<u64> {
             Ok(affected as u64)
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
+            crate::warn_rollback(conn.execute_batch("ROLLBACK"), "execute");
             Err(map_step_err(e))
         }
     }
@@ -382,13 +382,13 @@ fn apply_edits_blocking(path: &Path, read_only: bool, ops: &[EditOp]) -> Result<
             Ok(affected) => {
                 let affected = affected as u64;
                 if affected != 1 {
-                    let _ = conn.execute_batch("ROLLBACK");
+                    crate::warn_rollback(conn.execute_batch("ROLLBACK"), "apply_edits");
                     return Err(crate::edit_count_err(op, affected));
                 }
                 total += affected;
             }
             Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
+                crate::warn_rollback(conn.execute_batch("ROLLBACK"), "apply_edits");
                 return Err(map_step_err(e));
             }
         }

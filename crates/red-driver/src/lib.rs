@@ -263,6 +263,24 @@ pub(crate) fn edit_count_err(op: &EditOp, affected: u64) -> RedError {
     ))
 }
 
+/// Note a failed `ROLLBACK` after an edit/exec error. The original statement
+/// error is the primary cause and is still returned by the caller; this only
+/// surfaces the rare case where the rollback *itself* failed, which leaves the
+/// transaction state ambiguous and is worth a log line. `context` names the call
+/// site (e.g. `"execute"`, `"apply_edits"`).
+pub(crate) fn warn_rollback<E: std::fmt::Display>(
+    result: std::result::Result<(), E>,
+    context: &str,
+) {
+    if let Err(e) = result {
+        tracing::warn!(
+            context,
+            error = %e,
+            "rollback failed; transaction state may be inconsistent"
+        );
+    }
+}
+
 /// Build a portable "any text-representable column contains `term`" predicate for
 /// the result-search filter ([`red_core::ResultFilter::Contains`]): an OR-chain of
 /// `<col-as-text> <like> '<escaped %term%>' ESCAPE '\'` over every non-blob column.

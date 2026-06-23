@@ -12,6 +12,7 @@ authors.workspace = true
 [dependencies]
 red-core.workspace = true
 async-trait.workspace = true
+tracing.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }
 rusqlite.workspace = true
 tokio-postgres.workspace = true

@@ -506,7 +506,7 @@ impl DatabaseDriver for MysqlDriver {
                 Ok(affected)
             }
             Err(e) => {
-                let _ = conn.query_drop("ROLLBACK").await;
+                crate::warn_rollback(conn.query_drop("ROLLBACK").await, "execute");
                 Err(map_my_err(e))
             }
         }
@@ -541,13 +541,13 @@ impl DatabaseDriver for MysqlDriver {
                 Ok(()) => {
                     let affected = conn.affected_rows();
                     if affected != 1 {
-                        let _ = conn.query_drop("ROLLBACK").await;
+                        crate::warn_rollback(conn.query_drop("ROLLBACK").await, "apply_edits");
                         return Err(crate::edit_count_err(op, affected));
                     }
                     total += affected;
                 }
                 Err(e) => {
-                    let _ = conn.query_drop("ROLLBACK").await;
+                    crate::warn_rollback(conn.query_drop("ROLLBACK").await, "apply_edits");
                     return Err(map_my_err(e));
                 }
             }

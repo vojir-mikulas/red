@@ -10,7 +10,7 @@
 //! the command sender, which ends the turn loop and tears the agent down.
 
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use agent_client_protocol::schema::{
     AuthenticateRequest, CancelNotification, ClientCapabilities, ContentBlock,
@@ -33,6 +33,15 @@ use crate::types::{
 /// The active turn's delta sink, swapped in before each prompt and cleared after.
 /// Shared between the connection's notification handler and the turn loop.
 type SinkCell = Arc<Mutex<Option<mpsc::UnboundedSender<AcpDelta>>>>;
+
+/// Lock a cell, recovering from poisoning instead of panicking. These cells hold
+/// a turn's sink and running usage; the streaming notification handler and the
+/// turn loop share them, so a panic on one side must not cascade into a poisoned
+/// `unwrap()` that takes down the whole turn task — the inner value is always a
+/// valid (if stale) snapshot to keep working from.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 /// The latest usage seen this turn, returned in the turn result.
 type UsageCell = Arc<Mutex<AcpUsage>>;
 
@@ -330,8 +339,8 @@ async fn run_turns(
                 continue;
             }
         };
-        *active_sink.lock().unwrap() = Some(sink);
-        *usage_cell.lock().unwrap() = AcpUsage::default();
+        *lock(active_sink) = Some(sink);
+        *lock(usage_cell) = AcpUsage::default();
 
         let prompt = conn
             .send_request(PromptRequest::new(
@@ -368,8 +377,8 @@ async fn run_turns(
             }
         };
 
-        *active_sink.lock().unwrap() = None;
-        let usage = *usage_cell.lock().unwrap();
+        *lock(active_sink) = None;
+        let usage = *lock(usage_cell);
         let reply = match outcome {
             Ok(response) => Ok(AcpTurnResult {
                 usage,
@@ -447,7 +456,7 @@ fn handle_update(
             _ => None,
         },
         SessionUpdate::UsageUpdate(usage) => {
-            *usage_cell.lock().unwrap() = AcpUsage {
+            *lock(usage_cell) = AcpUsage {
                 used_tokens: usage.used,
                 context_tokens: usage.size,
                 cost_usd: usage.cost.as_ref().map(|c| c.amount),
@@ -457,7 +466,7 @@ fn handle_update(
         _ => None,
     };
     if let Some(delta) = delta {
-        if let Some(tx) = active_sink.lock().unwrap().as_ref() {
+        if let Some(tx) = lock(active_sink).as_ref() {
             let _ = tx.send(delta);
         }
     }
@@ -667,7 +676,7 @@ fn map_stop(stop: StopReason) -> AcpStop {
 
 /// Fire the take-once readiness signal (idempotent; later calls are no-ops).
 fn signal(ready: &ReadyCell, result: Result<(), AcpError>) {
-    if let Some(tx) = ready.lock().unwrap().take() {
+    if let Some(tx) = lock(ready).take() {
         let _ = tx.send(result);
     }
 }

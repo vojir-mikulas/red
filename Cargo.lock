@@ -6280,6 +6280,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-postgres",
+ "tracing",
  "uuid",
 ]
 

@@ -264,22 +264,36 @@ impl AppState {
         // engine — the design's information-dense bottom strip ---
         let counts = active.active_result().and_then(|g| g.status_counts());
 
+        // Endpoint + connection name can be arbitrarily long (a deep SQLite path,
+        // a verbose `user@host:port/database`). They sit in a `flex_1 min_w_0`
+        // group and truncate with an ellipsis so the window can shrink without
+        // shoving the right-hand status / assistant button off-screen. The dot and
+        // the read-only badge stay `flex_shrink_0` — only the text gives way.
         let status_left = div()
             .flex()
             .items_center()
+            .min_w_0()
             .child(
                 div()
                     .flex()
                     .items_center()
+                    .min_w_0()
                     .gap_1p5()
                     .px_2()
-                    .child(div().size(px(6.)).rounded_full().bg(theme.green))
-                    .child(config.display_target()),
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .size(px(6.))
+                            .rounded_full()
+                            .bg(theme.green),
+                    )
+                    .child(div().min_w_0().truncate().child(config.display_target())),
             )
-            .child(div().px_2().child(config.name.clone()))
+            .child(div().min_w_0().truncate().px_2().child(config.name.clone()))
             .child(
                 div()
                     .flex()
+                    .flex_shrink_0()
                     .items_center()
                     .gap_1()
                     .px_2()
@@ -323,6 +337,7 @@ impl AppState {
         let sidebar_toggle = div()
             .id("toggle-sidebar")
             .mr_1()
+            .flex_shrink_0()
             .flex()
             .items_center()
             .justify_center()
@@ -388,15 +403,22 @@ impl AppState {
             .text_size(theme.scale(11.))
             .text_color(theme.text_muted)
             .child(
+                // The left group flexes and clips; its children truncate so the
+                // right group is never pushed past the window edge.
                 div()
                     .flex()
+                    .flex_1()
+                    .min_w_0()
                     .items_center()
+                    .overflow_hidden()
                     .child(sidebar_toggle)
                     .child(status_left),
             )
             .child(
+                // Counts + assistant toggle stay fixed-width and always visible.
                 div()
                     .flex()
+                    .flex_shrink_0()
                     .items_center()
                     .child(status_right)
                     .children(assistant_enabled.then_some(assistant_toggle)),

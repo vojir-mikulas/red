@@ -540,7 +540,7 @@ impl DatabaseDriver for PostgresDriver {
                     Ok(affected)
                 }
                 Err(e) => {
-                    let _ = client.batch_execute("ROLLBACK").await;
+                    crate::warn_rollback(client.batch_execute("ROLLBACK").await, "execute");
                     Err(map_pg_err(e))
                 }
             }
@@ -575,13 +575,16 @@ impl DatabaseDriver for PostgresDriver {
                 match client.execute(&sql, &refs).await {
                     Ok(affected) => {
                         if affected != 1 {
-                            let _ = client.batch_execute("ROLLBACK").await;
+                            crate::warn_rollback(
+                                client.batch_execute("ROLLBACK").await,
+                                "apply_edits",
+                            );
                             return Err(crate::edit_count_err(op, affected));
                         }
                         total += affected;
                     }
                     Err(e) => {
-                        let _ = client.batch_execute("ROLLBACK").await;
+                        crate::warn_rollback(client.batch_execute("ROLLBACK").await, "apply_edits");
                         return Err(map_pg_err(e));
                     }
                 }
