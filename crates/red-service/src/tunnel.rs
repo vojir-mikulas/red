@@ -210,11 +210,10 @@ async fn authenticate_agent(
         .await
         .map_err(|e| RedError::Auth(format!("no SSH agent available: {e}")))?;
     #[cfg(windows)]
-    let mut agent = russh::keys::agent::client::AgentClient::connect_named_pipe(
-        r"\\.\pipe\openssh-ssh-agent",
-    )
-    .await
-    .map_err(|e| RedError::Auth(format!("no SSH agent available: {e}")))?;
+    let mut agent =
+        russh::keys::agent::client::AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent")
+            .await
+            .map_err(|e| RedError::Auth(format!("no SSH agent available: {e}")))?;
     let identities = agent
         .request_identities()
         .await

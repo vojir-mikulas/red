@@ -31,7 +31,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use red_core::{
     Column, ColumnMeta, ConnectionConfig, EditOp, ExportFormat, KeySpec, ObjectKind, ObjectMeta,
-    QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail, Value,
+    QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail,
+    Value,
 };
 use serde_json::Value as Json;
 use tokio::sync::mpsc::UnboundedSender;
@@ -132,7 +133,11 @@ impl ClickhouseDriver {
     async fn fetch_version(&self) -> Result<String> {
         let qid = new_query_id();
         let resp = self
-            .build_query("SELECT version() FORMAT JSONCompactEachRow".to_string(), &qid, &[])
+            .build_query(
+                "SELECT version() FORMAT JSONCompactEachRow".to_string(),
+                &qid,
+                &[],
+            )
             .send()
             .await
             .map_err(|e| RedError::Connect(e.to_string()))?;
@@ -252,7 +257,11 @@ impl ClickhouseDriver {
                 driver_err(e)
             }
         };
-        let resp = self.build_query(sql, qid, params).send().await.map_err(to_err)?;
+        let resp = self
+            .build_query(sql, qid, params)
+            .send()
+            .await
+            .map_err(to_err)?;
         let status = resp.status();
         let body = resp.bytes().await.map_err(to_err)?;
         if abort.is_aborted() {
@@ -266,12 +275,9 @@ impl ClickhouseDriver {
 
     /// Introspection convenience: a collected fetch with no cancellation handle
     /// (`list_objects`/`describe_table` carry no `AbortSignal` in the trait).
-    async fn run_simple(
-        &self,
-        base_sql: String,
-        params: &[(String, String)],
-    ) -> Result<RowBlock> {
-        self.run_collect(base_sql, params, &AbortSignal::new()).await
+    async fn run_simple(&self, base_sql: String, params: &[(String, String)]) -> Result<RowBlock> {
+        self.run_collect(base_sql, params, &AbortSignal::new())
+            .await
     }
 
     /// Open a streaming SELECT and read its two header lines (names, then types),
@@ -279,11 +285,7 @@ impl ClickhouseDriver {
     /// Shared by the cursor and `export`. A query that fails *before* streaming
     /// (syntax/permission) surfaces here as a non-success status with the error in
     /// the body — the validation the trait expects at open time.
-    async fn open_stream(
-        &self,
-        base_sql: &str,
-        query_id: &str,
-    ) -> Result<OpenedStream> {
+    async fn open_stream(&self, base_sql: &str, query_id: &str) -> Result<OpenedStream> {
         let sql = format!("{base_sql} FORMAT {ROW_FORMAT}");
         let resp = self
             .build_query(sql, query_id, &[])
@@ -324,7 +326,9 @@ impl ClickhouseDriver {
 #[async_trait]
 impl DatabaseDriver for ClickhouseDriver {
     async fn ping(&self) -> Result<()> {
-        self.run_simple("SELECT 1".to_string(), &[]).await.map(|_| ())
+        self.run_simple("SELECT 1".to_string(), &[])
+            .await
+            .map(|_| ())
     }
 
     fn server_version(&self) -> String {
@@ -367,8 +371,16 @@ impl DatabaseDriver for ClickhouseDriver {
 
         let mut schemas: Vec<SchemaMeta> = Vec::new();
         for row in &rows {
-            let db = row.first().and_then(Json::as_str).unwrap_or_default().to_string();
-            let name = row.get(1).and_then(Json::as_str).unwrap_or_default().to_string();
+            let db = row
+                .first()
+                .and_then(Json::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let name = row
+                .get(1)
+                .and_then(Json::as_str)
+                .unwrap_or_default()
+                .to_string();
             let engine = row.get(2).and_then(Json::as_str).unwrap_or_default();
             let kind = if engine.ends_with("View") {
                 ObjectKind::View
@@ -403,8 +415,16 @@ impl DatabaseDriver for ClickhouseDriver {
         let columns = rows
             .iter()
             .map(|row| {
-                let name = row.first().and_then(Json::as_str).unwrap_or_default().to_string();
-                let type_name = row.get(1).and_then(Json::as_str).unwrap_or_default().to_string();
+                let name = row
+                    .first()
+                    .and_then(Json::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let type_name = row
+                    .get(1)
+                    .and_then(Json::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 let in_pk = row.get(2).and_then(json_to_i64).unwrap_or(0) == 1;
                 ColumnMeta {
                     not_null: !type_name.starts_with("Nullable("),
@@ -478,7 +498,10 @@ impl DatabaseDriver for ClickhouseDriver {
         abort: &AbortSignal,
     ) -> Result<ResultPage> {
         let bound = bound.unwrap_or(&[]);
-        let types = bound.iter().map(ch_param_type).collect::<Result<Vec<_>>>()?;
+        let types = bound
+            .iter()
+            .map(ch_param_type)
+            .collect::<Result<Vec<_>>>()?;
         // Typed placeholders `{p0:Int64}` keep the bound a real parameter (bound via
         // `param_p0` URL params), never string-interpolated into the SQL.
         let (where_clause, order_by) =
@@ -538,7 +561,10 @@ impl DatabaseDriver for ClickhouseDriver {
         );
         let (_, _, rows) = self.run_collect(base, &[], abort).await?;
         Ok(rows.first().and_then(|r| {
-            match (r.first().and_then(json_to_i64), r.get(1).and_then(json_to_i64)) {
+            match (
+                r.first().and_then(json_to_i64),
+                r.get(1).and_then(json_to_i64),
+            ) {
                 (Some(lo), Some(hi)) => Some((lo, hi)),
                 _ => None,
             }
@@ -647,7 +673,9 @@ impl DatabaseDriver for ClickhouseDriver {
                 }
                 bail_if_cancelled!();
                 let raw: Vec<Json> = serde_json::from_slice(&line).map_err(driver_err)?;
-                writer.write_row(&ch_row(&raw, &types, None)).map_err(driver_err)?;
+                writer
+                    .write_row(&ch_row(&raw, &types, None))
+                    .map_err(driver_err)?;
                 throttle.tick(writer.written());
             }
             if exhausted {
@@ -663,7 +691,9 @@ impl DatabaseDriver for ClickhouseDriver {
                     if !buf.iter().all(u8::is_ascii_whitespace) {
                         bail_if_cancelled!();
                         let raw: Vec<Json> = serde_json::from_slice(&buf).map_err(driver_err)?;
-                        writer.write_row(&ch_row(&raw, &types, None)).map_err(driver_err)?;
+                        writer
+                            .write_row(&ch_row(&raw, &types, None))
+                            .map_err(driver_err)?;
                         buf.clear();
                     }
                 }
@@ -826,12 +856,11 @@ fn parse_block(body: &[u8]) -> Result<RowBlock> {
             .ok_or_else(|| RedError::Driver("empty ClickHouse response".to_string()))?,
     )
     .map_err(driver_err)?;
-    let types: Vec<String> = serde_json::from_slice(
-        lines
-            .next()
-            .ok_or_else(|| RedError::Driver("ClickHouse response missing type header".to_string()))?,
-    )
-    .map_err(driver_err)?;
+    let types: Vec<String> =
+        serde_json::from_slice(lines.next().ok_or_else(|| {
+            RedError::Driver("ClickHouse response missing type header".to_string())
+        })?)
+        .map_err(driver_err)?;
     let columns = names
         .iter()
         .zip(types.iter())
@@ -918,7 +947,10 @@ fn text_value(s: &str, max: Option<usize>) -> Value {
 fn ch_base_type(ty: &str) -> &str {
     let mut t = ty.trim();
     loop {
-        if let Some(inner) = t.strip_prefix("Nullable(").and_then(|s| s.strip_suffix(')')) {
+        if let Some(inner) = t
+            .strip_prefix("Nullable(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
             t = inner.trim();
         } else if let Some(inner) = t
             .strip_prefix("LowCardinality(")
@@ -952,7 +984,9 @@ fn ch_param_type(v: &Value) -> Result<&'static str> {
         Value::Real(_) => "Float64",
         Value::Text(_) => "String",
         Value::Blob(_) | Value::Null | Value::Capped(_) => {
-            return Err(RedError::Query("unsupported ClickHouse seek bound".to_string()))
+            return Err(RedError::Query(
+                "unsupported ClickHouse seek bound".to_string(),
+            ))
         }
     })
 }
@@ -1167,8 +1201,11 @@ mod tests {
             .iter()
             .find(|s| s.name == db)
             .unwrap_or_else(|| panic!("database {db} present in the tree"));
-        let objects: Vec<(&str, ObjectKind)> =
-            ns.objects.iter().map(|o| (o.name.as_str(), o.kind)).collect();
+        let objects: Vec<(&str, ObjectKind)> = ns
+            .objects
+            .iter()
+            .map(|o| (o.name.as_str(), o.kind))
+            .collect();
         assert!(objects.contains(&(books.as_str(), ObjectKind::Table)));
         assert!(objects.contains(&(recent.as_str(), ObjectKind::View)));
 
@@ -1180,13 +1217,22 @@ mod tests {
                 .find(|c| c.name == n)
                 .unwrap_or_else(|| panic!("column {n} present on {books}"))
         };
-        assert!(col("id").primary_key, "id is in the (MergeTree) primary key");
+        assert!(
+            col("id").primary_key,
+            "id is in the (MergeTree) primary key"
+        );
         assert!(col("title").not_null, "a non-Nullable column is NOT NULL");
         assert!(detail.foreign_keys.is_empty(), "OLAP — no foreign keys");
         assert!(detail.indexes.is_empty(), "OLAP — no secondary indexes");
 
-        driver.execute(&format!("DROP TABLE {recent}")).await.unwrap();
-        driver.execute(&format!("DROP TABLE {books}")).await.unwrap();
+        driver
+            .execute(&format!("DROP TABLE {recent}"))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!("DROP TABLE {books}"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1226,15 +1272,27 @@ mod tests {
         let d = &driver;
         let abort = &abort;
         let count = |sql: String| async move { d.count(&sql, abort).await.unwrap() };
-        assert_eq!(count(filtered("apple")).await, 2, "matches across text columns");
+        assert_eq!(
+            count(filtered("apple")).await,
+            2,
+            "matches across text columns"
+        );
         assert_eq!(count(filtered("APPLE")).await, 2, "case-insensitive");
         assert_eq!(
             count(filtered("%")).await,
             1,
             "LIKE metacharacters match literally"
         );
-        assert_eq!(count(filtered("O'Brien")).await, 1, "embedded quote is escaped");
-        assert_eq!(count(filtered("zzznope")).await, 0, "no match → empty result");
+        assert_eq!(
+            count(filtered("O'Brien")).await,
+            1,
+            "embedded quote is escaped"
+        );
+        assert_eq!(
+            count(filtered("zzznope")).await,
+            0,
+            "no match → empty result"
+        );
 
         driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
     }
@@ -1259,8 +1317,12 @@ mod tests {
             .unwrap();
 
         let key = KeySpec::single("id", KeyKind::Int);
-        battery::seeks_forward_backward_and_reads_bounds(&driver, &format!("SELECT * FROM {t}"), &key)
-            .await;
+        battery::seeks_forward_backward_and_reads_bounds(
+            &driver,
+            &format!("SELECT * FROM {t}"),
+            &key,
+        )
+        .await;
 
         // Composite `(grp, id)` seek over a non-unique sort column.
         let g = tag("seekcomposite");
@@ -1286,8 +1348,14 @@ mod tests {
             descending: true,
             ..key_asc.clone()
         };
-        battery::seeks_composite_sorted(&driver, &format!("SELECT * FROM {g}"), &key_asc, &key_desc, 30)
-            .await;
+        battery::seeks_composite_sorted(
+            &driver,
+            &format!("SELECT * FROM {g}"),
+            &key_asc,
+            &key_desc,
+            30,
+        )
+        .await;
         driver.execute(&format!("DROP TABLE {g}")).await.unwrap();
         driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
     }
@@ -1367,7 +1435,14 @@ mod tests {
         let key = KeySpec::single("id", KeyKind::Int);
         let abort = AbortSignal::new();
         let page = driver
-            .fetch_seek(&format!("SELECT id, t FROM {t}"), &key, None, false, 5, &abort)
+            .fetch_seek(
+                &format!("SELECT id, t FROM {t}"),
+                &key,
+                None,
+                false,
+                5,
+                &abort,
+            )
             .await
             .unwrap();
         assert_eq!(page.rows.len(), 1, "fixture has exactly one row");
@@ -1389,7 +1464,13 @@ mod tests {
 
         // A Full page keeps the whole cell (the clipboard re-fetch).
         let full = driver
-            .fetch_page(&format!("SELECT id, t FROM {t}"), 0, 5, PageCap::Full, &abort)
+            .fetch_page(
+                &format!("SELECT id, t FROM {t}"),
+                0,
+                5,
+                PageCap::Full,
+                &abort,
+            )
             .await
             .unwrap();
         match &full.rows[0][1] {
@@ -1438,6 +1519,10 @@ mod tests {
             },
         };
         assert!(driver.apply_edit(&op).await.is_err(), "edits are refused");
-        assert_eq!(driver.apply_edits(&[]).await.unwrap(), 0, "empty batch is a no-op");
+        assert_eq!(
+            driver.apply_edits(&[]).await.unwrap(),
+            0,
+            "empty batch is a no-op"
+        );
     }
 }

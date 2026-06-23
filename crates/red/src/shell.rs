@@ -359,7 +359,9 @@ impl AppState {
             .size(px(20.))
             .rounded(px(4.))
             .cursor_pointer()
-            .tooltip(Tooltip::text(crate::keymap::localize_hint("Toggle agent  ⌘L")))
+            .tooltip(Tooltip::text(crate::keymap::localize_hint(
+                "Toggle agent  ⌘L",
+            )))
             .hover(|s| s.bg(theme.bg_elevated))
             .child(crate::icons::icon(
                 "sparkles",

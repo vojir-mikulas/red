@@ -87,18 +87,38 @@ pub const KEYWORDS: &[&str] = &[
 /// SQL functions offered in completion as `(name, signature, guide)`. The
 /// signature shows beside the candidate; the guide fills the doc panel.
 pub const FUNCTIONS: &[(&str, &str, &str)] = &[
-    ("count", "count(expr) → bigint", "Counts rows, or non-null values."),
+    (
+        "count",
+        "count(expr) → bigint",
+        "Counts rows, or non-null values.",
+    ),
     ("sum", "sum(expr) → numeric", "Sum of a numeric expression."),
-    ("avg", "avg(expr) → numeric", "Mean of a numeric expression."),
+    (
+        "avg",
+        "avg(expr) → numeric",
+        "Mean of a numeric expression.",
+    ),
     ("min", "min(expr)", "Smallest value in the group."),
     ("max", "max(expr)", "Largest value in the group."),
     ("coalesce", "coalesce(a, b, …)", "First non-null argument."),
-    ("now", "now() → timestamptz", "Current transaction timestamp."),
-    ("length", "length(text) → int", "Character length of a string."),
+    (
+        "now",
+        "now() → timestamptz",
+        "Current transaction timestamp.",
+    ),
+    (
+        "length",
+        "length(text) → int",
+        "Character length of a string.",
+    ),
     ("lower", "lower(text) → text", "Lower-case a string."),
     ("upper", "upper(text) → text", "Upper-case a string."),
     ("round", "round(num, digits)", "Round to N decimal places."),
-    ("date_trunc", "date_trunc(unit, ts)", "Truncate a timestamp to a unit."),
+    (
+        "date_trunc",
+        "date_trunc(unit, ts)",
+        "Truncate a timestamp to a unit.",
+    ),
 ];
 
 /// A one-line guide for a (lower-cased) SQL keyword, shown in the completion doc

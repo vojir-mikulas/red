@@ -18,9 +18,9 @@ use red_core::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 
+mod clickhouse;
 #[cfg(test)]
 mod conformance;
-mod clickhouse;
 mod format;
 mod mysql;
 mod pg_text;
@@ -721,16 +721,24 @@ mod tests {
         assert!(
             contains_clause(&blobs, "x", |c| c.into(), |c| c.into(), "LIKE", false, true).is_none()
         );
-        assert!(contains_clause(&[], "x", |c| c.into(), |c| c.into(), "LIKE", false, true).is_none());
+        assert!(
+            contains_clause(&[], "x", |c| c.into(), |c| c.into(), "LIKE", false, true).is_none()
+        );
     }
 
     #[test]
     fn contains_clause_searches_untyped_columns() {
         // A computed/untyped column (`type_name: None`) is searched, not skipped.
         let columns = [col("expr", None)];
-        assert!(
-            contains_clause(&columns, "x", |c| c.into(), |c| c.into(), "LIKE", false, true)
-                .is_some()
-        );
+        assert!(contains_clause(
+            &columns,
+            "x",
+            |c| c.into(),
+            |c| c.into(),
+            "LIKE",
+            false,
+            true
+        )
+        .is_some());
     }
 }
