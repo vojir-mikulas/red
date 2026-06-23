@@ -84,6 +84,77 @@ pub const KEYWORDS: &[&str] = &[
     "false",
 ];
 
+/// SQL functions offered in completion as `(name, signature, guide)`. The
+/// signature shows beside the candidate; the guide fills the doc panel.
+pub const FUNCTIONS: &[(&str, &str, &str)] = &[
+    ("count", "count(expr) → bigint", "Counts rows, or non-null values."),
+    ("sum", "sum(expr) → numeric", "Sum of a numeric expression."),
+    ("avg", "avg(expr) → numeric", "Mean of a numeric expression."),
+    ("min", "min(expr)", "Smallest value in the group."),
+    ("max", "max(expr)", "Largest value in the group."),
+    ("coalesce", "coalesce(a, b, …)", "First non-null argument."),
+    ("now", "now() → timestamptz", "Current transaction timestamp."),
+    ("length", "length(text) → int", "Character length of a string."),
+    ("lower", "lower(text) → text", "Lower-case a string."),
+    ("upper", "upper(text) → text", "Upper-case a string."),
+    ("round", "round(num, digits)", "Round to N decimal places."),
+    ("date_trunc", "date_trunc(unit, ts)", "Truncate a timestamp to a unit."),
+];
+
+/// A one-line guide for a (lower-cased) SQL keyword, shown in the completion doc
+/// panel. `None` for keywords without a note — they still complete, just bare.
+pub fn keyword_doc(kw: &str) -> Option<&'static str> {
+    Some(match kw {
+        "select" => "Columns or expressions to return.",
+        "from" => "Source table, view, or subquery.",
+        "where" => "Filter rows by a boolean predicate.",
+        "group" => "GROUP BY — collapse rows into groups.",
+        "order" => "ORDER BY — sort the result set.",
+        "by" => "Pairs with GROUP / ORDER.",
+        "having" => "Filter groups after aggregation.",
+        "limit" => "Cap the number of returned rows.",
+        "offset" => "Skip N rows before returning.",
+        "join" => "Combine rows from another table.",
+        "left" => "LEFT JOIN — keep unmatched left rows.",
+        "right" => "RIGHT JOIN — keep unmatched right rows.",
+        "inner" => "INNER JOIN — only matched rows.",
+        "outer" | "full" | "cross" => "Outer / cross join variant.",
+        "on" => "Join predicate.",
+        "using" => "Join on shared column names.",
+        "as" => "Alias a column or table.",
+        "and" => "Logical conjunction.",
+        "or" => "Logical disjunction.",
+        "not" => "Logical negation.",
+        "in" => "Match against a value list.",
+        "like" | "ilike" => "Pattern match on text.",
+        "between" => "Range test: x BETWEEN a AND b.",
+        "is" => "Null / boolean identity test.",
+        "null" => "Absence of a value.",
+        "distinct" => "Remove duplicate rows.",
+        "case" => "Conditional expression.",
+        "when" => "CASE branch condition.",
+        "then" => "CASE branch result.",
+        "else" => "CASE fallback.",
+        "end" => "Close a CASE expression.",
+        "union" | "intersect" | "except" => "Combine two result sets.",
+        "all" => "Keep duplicates (e.g. UNION ALL).",
+        "with" => "Common table expression (CTE).",
+        "asc" => "Ascending sort order.",
+        "desc" => "Descending sort order.",
+        "exists" => "True if a subquery returns rows.",
+        "cast" => "Convert a value's type.",
+        "insert" => "Insert new rows.",
+        "into" => "Target table for INSERT.",
+        "values" => "Row literals for INSERT.",
+        "update" => "Modify existing rows.",
+        "set" => "Assign columns in UPDATE.",
+        "delete" => "Remove rows.",
+        "returning" => "Return the affected rows.",
+        "create" | "alter" | "drop" => "Schema definition (DDL).",
+        _ => return None,
+    })
+}
+
 fn is_ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_'
 }

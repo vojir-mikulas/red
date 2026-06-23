@@ -9,6 +9,7 @@ use std::rc::Rc;
 
 use flint::prelude::*;
 use gpui::{div, prelude::*, px, Context, Hsla, Pixels, Point, SharedString, Window};
+use red_core::ObjectKind;
 use red_service::Command;
 
 use crate::app::{ActiveConn, AppState, Phase};
@@ -58,44 +59,67 @@ impl Render for TabDragPreview {
     }
 }
 
+/// A schema column candidate: its `name` and declared `type` (empty when the
+/// driver reports none), used to label and document column completions.
+#[derive(Clone)]
+struct ColumnCand {
+    name: SharedString,
+    ty: SharedString,
+}
+
+/// A schema object candidate: its `name` and whether it's a view (vs a table),
+/// which picks the completion's detail/guide text.
+#[derive(Clone)]
+struct TableCand {
+    name: SharedString,
+    is_view: bool,
+}
+
 /// The completion candidates derived from the loaded schema, grouped so the
 /// provider can rank them by the cursor's context. Rebuilt as the schema grows.
 struct CompletionIndex {
-    /// Every object (table/view) name, sorted + deduped.
-    tables: Vec<SharedString>,
+    /// Every object (table/view), sorted + deduped by name.
+    tables: Vec<TableCand>,
     /// Columns keyed by lower-cased table name, for `table.`/`alias.` completion.
-    columns_by_table: HashMap<String, Vec<SharedString>>,
-    /// Every column name across the schema, sorted + deduped.
-    all_columns: Vec<SharedString>,
+    columns_by_table: HashMap<String, Vec<ColumnCand>>,
+    /// Every column across the schema, sorted + deduped by name.
+    all_columns: Vec<ColumnCand>,
     /// The upper-cased SQL keywords.
     keywords: Vec<SharedString>,
 }
 
 fn build_index(schema: &SchemaState) -> CompletionIndex {
-    let mut tables: Vec<SharedString> = Vec::new();
+    let mut tables: Vec<TableCand> = Vec::new();
     for sc in &schema.schemas {
         for obj in &sc.objects {
-            tables.push(obj.name.clone().into());
+            tables.push(TableCand {
+                name: obj.name.clone().into(),
+                is_view: matches!(obj.kind, ObjectKind::View),
+            });
         }
     }
 
-    let mut columns_by_table: HashMap<String, Vec<SharedString>> = HashMap::new();
-    let mut all_columns: Vec<SharedString> = Vec::new();
+    let mut columns_by_table: HashMap<String, Vec<ColumnCand>> = HashMap::new();
+    let mut all_columns: Vec<ColumnCand> = Vec::new();
     for ((_, table), detail) in &schema.details {
         let entry = columns_by_table.entry(table.to_lowercase()).or_default();
         for col in &detail.columns {
-            entry.push(col.name.clone().into());
-            all_columns.push(col.name.clone().into());
+            let cand = ColumnCand {
+                name: col.name.clone().into(),
+                ty: col.type_name.clone().unwrap_or_default().into(),
+            };
+            entry.push(cand.clone());
+            all_columns.push(cand);
         }
     }
 
-    tables.sort();
-    tables.dedup();
-    all_columns.sort();
-    all_columns.dedup();
+    tables.sort_by(|a, b| a.name.cmp(&b.name));
+    tables.dedup_by(|a, b| a.name == b.name);
+    all_columns.sort_by(|a, b| a.name.cmp(&b.name));
+    all_columns.dedup_by(|a, b| a.name == b.name);
     for cols in columns_by_table.values_mut() {
-        cols.sort();
-        cols.dedup();
+        cols.sort_by(|a, b| a.name.cmp(&b.name));
+        cols.dedup_by(|a, b| a.name == b.name);
     }
 
     let keywords = crate::sql::KEYWORDS
@@ -111,12 +135,51 @@ fn build_index(schema: &SchemaState) -> CompletionIndex {
     }
 }
 
+/// Build a column completion: a `Field` badge, the type as detail, a short guide.
+fn column_item(col: &ColumnCand) -> CompletionItem {
+    let item = CompletionItem::new(col.name.clone(), CompletionKind::Field);
+    if col.ty.is_empty() {
+        item.documentation("column")
+    } else {
+        item.detail(col.ty.clone())
+            .documentation(SharedString::from(format!("{} column", col.ty)))
+    }
+}
+
+/// Build a table/view completion: an `Object` badge plus table-vs-view text.
+fn table_item(t: &TableCand) -> CompletionItem {
+    let (detail, doc) = if t.is_view {
+        ("view", "Database view.")
+    } else {
+        ("table", "Database table.")
+    };
+    CompletionItem::new(t.name.clone(), CompletionKind::Object)
+        .detail(detail)
+        .documentation(doc)
+}
+
+/// Build a keyword completion: a `Keyword` badge plus any one-line guide.
+fn keyword_item(kw: &SharedString) -> CompletionItem {
+    let item = CompletionItem::new(kw.clone(), CompletionKind::Keyword).detail("keyword");
+    match crate::sql::keyword_doc(&kw.to_lowercase()) {
+        Some(doc) => item.documentation(doc),
+        None => item,
+    }
+}
+
+/// Build a function completion: a `Function` badge, its signature, and a guide.
+fn function_item(name: &str, sig: &str, doc: &str) -> CompletionItem {
+    CompletionItem::new(SharedString::from(name), CompletionKind::Function)
+        .detail(SharedString::from(sig))
+        .documentation(SharedString::from(doc))
+}
+
 /// The provider closure handed to the editor's completion seam. It reads the
 /// cursor's context (member access, a table position, a column expression, or a
 /// statement start) and offers the matching candidates, most-relevant first.
 fn completion_provider(
     index: Rc<CompletionIndex>,
-) -> impl Fn(&str, usize) -> Vec<SharedString> + 'static {
+) -> impl Fn(&str, usize) -> Vec<CompletionItem> + 'static {
     move |content, cursor| {
         let prefix = crate::sql::word_prefix(content, cursor).to_lowercase();
         let context = crate::sql::analyze(content, cursor);
@@ -127,8 +190,9 @@ fn completion_provider(
             return Vec::new();
         }
 
-        // Candidate sources in priority order — earlier groups win ties.
-        let mut ordered: Vec<SharedString> = Vec::new();
+        // Candidate sources in priority order — earlier groups win ties. Each
+        // carries a kind badge, a detail (type/signature), and a doc-panel guide.
+        let mut ordered: Vec<CompletionItem> = Vec::new();
         match &context {
             CompletionContext::Dot { qualifier } => {
                 let q = qualifier.to_lowercase();
@@ -140,29 +204,34 @@ fn completion_provider(
                         index
                             .tables
                             .iter()
-                            .find(|t| t.to_lowercase() == q)
-                            .map(|t| t.to_lowercase())
+                            .find(|t| t.name.to_lowercase() == q)
+                            .map(|t| t.name.to_lowercase())
                     });
                 if let Some(cols) = real.and_then(|r| index.columns_by_table.get(&r)) {
-                    ordered.extend(cols.iter().cloned());
+                    ordered.extend(cols.iter().map(column_item));
                 }
             }
-            CompletionContext::Table => ordered.extend(index.tables.iter().cloned()),
+            CompletionContext::Table => ordered.extend(index.tables.iter().map(table_item)),
             CompletionContext::Column => {
                 // Columns of the tables this statement actually references rank
-                // first, then the rest of the schema, then tables and keywords.
+                // first, then the rest of the schema, then functions, tables, keywords.
                 for (_, table) in crate::sql::referenced_tables_at(content, cursor) {
                     if let Some(cols) = index.columns_by_table.get(&table.to_lowercase()) {
-                        ordered.extend(cols.iter().cloned());
+                        ordered.extend(cols.iter().map(column_item));
                     }
                 }
-                ordered.extend(index.all_columns.iter().cloned());
-                ordered.extend(index.tables.iter().cloned());
-                ordered.extend(index.keywords.iter().cloned());
+                ordered.extend(index.all_columns.iter().map(column_item));
+                ordered.extend(
+                    crate::sql::FUNCTIONS
+                        .iter()
+                        .map(|(n, sig, doc)| function_item(n, sig, doc)),
+                );
+                ordered.extend(index.tables.iter().map(table_item));
+                ordered.extend(index.keywords.iter().map(keyword_item));
             }
             CompletionContext::Keyword => {
-                ordered.extend(index.keywords.iter().cloned());
-                ordered.extend(index.tables.iter().cloned());
+                ordered.extend(index.keywords.iter().map(keyword_item));
+                ordered.extend(index.tables.iter().map(table_item));
             }
         }
 
@@ -170,7 +239,7 @@ fn completion_provider(
         ordered
             .into_iter()
             .filter(|c| {
-                let cl = c.to_lowercase();
+                let cl = c.label.to_lowercase();
                 if !cl.starts_with(&prefix) || (!prefix.is_empty() && cl == prefix) {
                     return false;
                 }
@@ -846,7 +915,7 @@ impl AppState {
         for editor in editors {
             let index = index.clone();
             editor.update(cx, |editor, cx| {
-                editor.set_completions(completion_provider(index), cx)
+                editor.set_rich_completions(completion_provider(index), cx)
             });
         }
     }
