@@ -550,6 +550,36 @@ impl GridBuffer {
         row.values[col] = value;
     }
 
+    /// Resident cells whose display text contains `term` (already lower-cased),
+    /// as `(absolute ordinal, data column)`, sorted row-major. Scans only the
+    /// rows held resident — find-in-result is deliberately a loaded-rows feature
+    /// (the whole-set search is the filter bar, which pushes a SQL predicate).
+    pub(super) fn find_matches(&self, term: &str) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut scan = |ord: usize, row: &Row| {
+            for (c, cell) in row.display.iter().enumerate() {
+                if cell.text.to_lowercase().contains(term) {
+                    out.push((ord, c));
+                }
+            }
+        };
+        match &self.mode {
+            BufferMode::Offset(pages) => {
+                let mut ords: Vec<usize> = pages.rows.keys().copied().collect();
+                ords.sort_unstable();
+                for ord in ords {
+                    scan(ord, &pages.rows[&ord]);
+                }
+            }
+            BufferMode::Keyed(run) => {
+                for (i, row) in run.rows.iter().enumerate() {
+                    scan(run.anchor + i, row);
+                }
+            }
+        }
+        out
+    }
+
     /// Whether the resident rows' ordinals are interpolation estimates.
     pub(super) fn is_estimated(&self) -> bool {
         match &self.mode {

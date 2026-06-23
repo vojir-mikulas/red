@@ -378,6 +378,21 @@ impl ResultGrid {
         }
     }
 
+    /// Find-in-result (Track B2, Tier 1): resident cells whose display text
+    /// contains `term_lower` (already lower-cased), as `(ordinal, data column)`.
+    /// Scans only loaded rows — see [`buffer::GridBuffer::find_matches`].
+    pub(crate) fn find_matches(&self, term_lower: &str) -> Vec<(usize, usize)> {
+        self.buffer.borrow().find_matches(term_lower)
+    }
+
+    /// Select `(ordinal, table_col)` and scroll it into view — the find bar's
+    /// "reveal this match", so the grid's selection highlight marks the current
+    /// match. `table_col` is in table-column space (gutter included).
+    pub(crate) fn reveal_cell(&mut self, ordinal: usize, table_col: usize, row_height: f32) {
+        self.selection = Some(CellRange::single(ordinal, table_col));
+        self.go_to_row(ordinal, row_height);
+    }
+
     /// How many whole rows the on-screen viewport shows — the PageUp/PageDown
     /// step. Reads the list's last measured viewport height (0 before first paint).
     pub(in crate::result) fn viewport_rows(&self, row_height: f32) -> usize {

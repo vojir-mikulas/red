@@ -330,6 +330,16 @@ impl AppState {
         let dirty_tint = Hsla { a: 0.22, ..num };
         let delete_tint = Hsla { a: 0.16, ..red };
         let (overlay_cells, overlay_bg) = (overlay.clone(), overlay.clone());
+        // Find-in-result highlight (Track B2, Tier 1): the resident cells matching
+        // the open find bar's term get a soft accent tint via the same `cell_bg`
+        // hook. The focused match is *also* the grid selection, so the selection
+        // highlight marks "current" on top of this. Keyed by `(ordinal, data col)`.
+        let find_hits: std::collections::HashSet<(usize, usize)> = self
+            .find_bar
+            .as_ref()
+            .map(|b| b.grid_matches.iter().copied().collect())
+            .unwrap_or_default();
+        let find_tint = Hsla { a: 0.20, ..accent };
         // The open inline editor's target cell (existing rows only; draft rows host
         // their own editor in the bottom zone), so the renderer swaps in its field.
         let inline: Option<(usize, usize, Entity<TextInput>)> =
@@ -396,6 +406,9 @@ impl AppState {
                 if table_col >= gutter && overlay_bg.cells.contains_key(&(abs, table_col - gutter))
                 {
                     return Some(dirty_tint);
+                }
+                if table_col >= gutter && find_hits.contains(&(abs, table_col - gutter)) {
+                    return Some(find_tint);
                 }
                 None
             })
@@ -588,6 +601,11 @@ impl AppState {
             // The filter bar (Track B2) sits between the toolbar and the grid when
             // open; narrowing re-opens the result so the grid below just repaints.
             .when_some(self.render_filter_bar(cx), |c, bar| c.child(bar))
+            // The find bar (Track B2, Tier 1) sits alongside the filter bar; it
+            // only highlights loaded rows, so the grid below just repaints.
+            .when_some(self.render_find_bar(crate::find::FindTarget::Grid, cx), |c, bar| {
+                c.child(bar)
+            })
             .child(
                 div()
                     .flex_1()

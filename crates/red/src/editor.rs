@@ -708,6 +708,13 @@ impl AppState {
             .bg(bg_app)
             .child(tabstrip)
             .child(breadcrumb)
+            // The find bar (Track B2, Tier 1) sits above the editor when ⌘F opened
+            // it against the query; it selects matches in place, so the editor just
+            // repaints.
+            .when_some(
+                self.render_find_bar(crate::find::FindTarget::Editor, cx),
+                |c, bar| c.child(bar),
+            )
             .child(surface)
             .child(run_bar)
             .children(history)

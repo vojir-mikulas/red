@@ -14,6 +14,7 @@ mod conversations;
 mod dev_stats;
 mod editor;
 mod filter;
+mod find;
 mod icons;
 mod inspector;
 mod keymap;

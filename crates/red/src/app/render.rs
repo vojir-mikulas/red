@@ -8,7 +8,8 @@ use gpui::{div, prelude::*, px, Focusable, KeyDownEvent, Render, Window};
 use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::keymap::{
     About, AddRow, BeginEdit, CloseInspector, CloseTab, CycleFocusNext, CycleFocusPrev, DeleteRow,
-    Explain, FocusEditor, FocusGrid, FocusSchema, NewConnection, NewTab, NextTab, OpenSavedQueries,
+    Explain, FindInResult, FocusEditor, FocusGrid, FocusSchema, NewConnection, NewTab, NextTab,
+    OpenSavedQueries,
     PrevTab, RefreshSchema, ReportBug, RevertChanges, RunQuery, SaveQuery, SearchSchema, SetNull,
     Settings, ShowShortcuts, SubmitChanges, SwitchConnection, ToggleAssistant, ToggleFilter,
     ToggleInspector, ToggleSidebar,
@@ -189,6 +190,14 @@ impl Render for AppState {
             }
         }
 
+        // ⌘F (grid) — the find bar just opened; focus its input to type at once.
+        if self.focus_find {
+            self.focus_find = false;
+            if let Some(bar) = &self.find_bar {
+                window.focus(&bar.input.focus_handle(cx), cx);
+            }
+        }
+
         // ⌘L — the assistant panel just opened; focus its prompt box.
         if self.focus_assistant {
             self.focus_assistant = false;
@@ -363,6 +372,9 @@ impl Render for AppState {
                 this.toggle_assistant(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleFilter, _, cx| this.toggle_filter_bar(cx)))
+            .on_action(cx.listener(|this, _: &FindInResult, window, cx| {
+                this.toggle_find_bar(window, cx)
+            }))
             // Saved queries (B3): ⇧⌘S opens the name prompt; ⇧⌘O the picker.
             .on_action(cx.listener(|this, _: &SaveQuery, _, cx| this.open_save_prompt(cx)))
             .on_action(cx.listener(|this, _: &OpenSavedQueries, _, cx| this.open_saved_picker(cx)))

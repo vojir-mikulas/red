@@ -86,6 +86,9 @@ actions!(
         ToggleAssistant,
         /// Open or close the result filter bar (⌘⇧F) — Track B2.
         ToggleFilter,
+        /// Open or close the find-in-result bar (⌘F when the grid is focused) —
+        /// Track B2, Tier 1.
+        FindInResult,
         /// Save the active tab's query as a named snippet (⇧⌘S) — Track B3.
         SaveQuery,
         /// Open the saved-query picker (⇧⌘O) — Track B3.
@@ -139,6 +142,7 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
                 ("⌘W", "Close tab"),
                 ("⌃Tab / ⌃⇧Tab", "Next / previous tab"),
                 ("⌘↵", "Run query"),
+                ("⌘F", "Find in query…"),
                 ("⇧⌘E", "Explain query (plan)"),
                 ("⇧⌘S", "Save query"),
                 ("⇧⌘O", "Open saved query…"),
@@ -156,6 +160,7 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
                 ("⌃G", "Go to row…"),
                 ("⌘C", "Copy selection"),
                 ("⌘I", "Inspect cell"),
+                ("⌘F", "Find in loaded rows…"),
                 ("⌘⇧F", "Filter rows…"),
             ],
         ),
@@ -448,6 +453,13 @@ const DEFAULTS: &[ActionDef] = &[
     ),
     def("cmd-alt-n", "AddRow", "Add row", Some("Table")),
     def("cmd-alt-0", "SetNull", "Set cell to NULL", Some("Table")),
+    // ⌘F finds within the focused pane: loaded rows in the grid, text in the SQL
+    // editor. Bound in `Table` and `CodeEditor` (both below `RedRoot`), so it wins
+    // over `RedRoot`'s `SearchSchema` only while one of those is focused —
+    // elsewhere ⌘F still focuses the schema filter. The single `FindInResult`
+    // handler picks the target from which pane holds focus.
+    def("cmd-f", "FindInResult", "Find", Some("Table")),
+    def("cmd-f", "FindInResult", "Find", Some("CodeEditor")),
 ];
 
 /// A `const fn` shorthand so [`DEFAULTS`] reads as a compact table rather than a
@@ -725,6 +737,7 @@ fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<Ke
         "CloseInspector" => kb!(CloseInspector),
         "ToggleAssistant" => kb!(ToggleAssistant),
         "ToggleFilter" => kb!(ToggleFilter),
+        "FindInResult" => kb!(FindInResult),
         "SaveQuery" => kb!(SaveQuery),
         "OpenSavedQueries" => kb!(OpenSavedQueries),
         "Explain" => kb!(Explain),

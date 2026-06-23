@@ -597,6 +597,9 @@ pub struct AppState {
     /// The result filter bar, when open (Track B2). The transient editing UI; the
     /// *applied* filter lives on the grid (`ResultGrid::filter`).
     pub(crate) filter_bar: Option<crate::filter::FilterBarState>,
+    /// The find-in-result bar, when open (Track B2, Tier 1). Transient UI; it
+    /// scans loaded rows and holds the matches + focused index in its own state.
+    pub(crate) find_bar: Option<crate::find::FindBarState>,
     /// Window-coordinate anchor for the result cell's right-click context menu,
     /// when open. The right-click selects the cell first, so the menu's Inspect/
     /// Copy act on it; `None` keeps the menu closed.
@@ -779,6 +782,9 @@ pub struct AppState {
     /// Set when the result filter bar just opened: the next render focuses its
     /// input so the user can type immediately.
     pub(crate) focus_filter: bool,
+    /// Set when the find bar just opened: the next render focuses its input so the
+    /// user can type immediately.
+    pub(crate) focus_find: bool,
     /// Set when an inline cell edit just opened in the inspector (Track B5): the
     /// next render focuses its field so the user types into it at once.
     pub(crate) focus_inspector_edit: bool,
@@ -1289,6 +1295,7 @@ impl AppState {
             focus_ai_key: false,
             next_conversation_id: 0,
             filter_bar: None,
+            find_bar: None,
             cell_menu: None,
             confirm_exec: None,
             grid_edit: None,
@@ -1353,6 +1360,7 @@ impl AppState {
             focus_history: false,
             focus_search: false,
             focus_filter: false,
+            focus_find: false,
             focus_inspector_edit: false,
             open_switcher: false,
             update: UpdateState::Unknown,
