@@ -35,8 +35,13 @@ const STATUS_TIMEOUT: Duration = Duration::from_secs(45);
 /// How long to wait for `auth login` to print its authorize URL before giving up.
 const LOGIN_URL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long to wait, after the code is submitted, for the CLI to exchange it and
-/// exit. A wrong/expired code makes the CLI fail fast; this only bounds a hang.
+/// How long to wait for the user to finish authorizing in the browser before
+/// giving up (the common path completes on its own via the browser callback — no
+/// code paste needed). Long enough to find a password / pass 2FA.
+const LOGIN_COMPLETE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long to wait, after a code is pasted, for the CLI to exchange it and exit.
+/// A wrong/expired code makes the CLI fail fast; this only bounds a hang.
 const LOGIN_FINISH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Cap on captured stderr used to explain a failed sign-in, so a chatty agent
@@ -195,23 +200,58 @@ async fn run_login_inner(
     // Keep draining stdout so the pipe never stalls while the user authorizes.
     let drain = tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
 
-    // Phase 2: wait for the pasted code (or cancellation via a dropped sender).
-    let code = code.await.map_err(|_| "sign-in cancelled".to_string())?;
-    stdin
-        .write_all(format!("{}\n", code.trim()).as_bytes())
-        .await
-        .map_err(|e| format!("could not submit the code: {e}"))?;
-    stdin.flush().await.ok();
-    // Close stdin so the CLI stops waiting for more input and proceeds to exchange.
-    drop(stdin);
+    // Phase 2: the sign-in completes one of two ways, whichever happens first:
+    //  - the **common** path: the user authorizes in the browser and the CLI's own
+    //    callback finishes it, so the process just exits — no code paste needed;
+    //  - the **fallback** path: the CLI shows a code and waits on stdin for it, which
+    //    the user pastes (relayed over `code`).
+    // Cancellation drops the `code` sender, which resolves it with an error.
+    let mut pasted_code: Option<String> = None;
+    let mut cancelled = false;
+    let exited = tokio::select! {
+        biased;
+        // The CLI finished on its own (browser callback) — or timed out waiting.
+        res = timeout(LOGIN_COMPLETE_TIMEOUT, child.wait()) => Some(res),
+        // The user pasted a code (or cancelled). Touch `child` only after the select.
+        pasted = code => {
+            match pasted {
+                Ok(code) => pasted_code = Some(code),
+                Err(_) => cancelled = true,
+            }
+            None
+        }
+    };
 
-    // Phase 3: wait for the exchange to finish.
-    let status = match timeout(LOGIN_FINISH_TIMEOUT, child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => return Err(format!("sign-in process error: {e}")),
-        Err(_) => {
+    let status = match exited {
+        // Completed via the browser callback — the usual, paste-free path.
+        Some(Ok(Ok(status))) => status,
+        Some(Ok(Err(e))) => return Err(format!("sign-in process error: {e}")),
+        Some(Err(_)) => {
             let _ = child.start_kill();
-            return Err("sign-in timed out".into());
+            return Err("sign-in timed out — no response from the browser".into());
+        }
+        None if cancelled => {
+            let _ = child.start_kill();
+            return Err("sign-in cancelled".into());
+        }
+        // Fallback: feed the pasted code, then wait for the CLI to exchange it.
+        None => {
+            let code = pasted_code.expect("a code or cancellation");
+            stdin
+                .write_all(format!("{}\n", code.trim()).as_bytes())
+                .await
+                .map_err(|e| format!("could not submit the code: {e}"))?;
+            stdin.flush().await.ok();
+            // Close stdin so the CLI proceeds to the exchange instead of waiting.
+            drop(stdin);
+            match timeout(LOGIN_FINISH_TIMEOUT, child.wait()).await {
+                Ok(Ok(status)) => status,
+                Ok(Err(e)) => return Err(format!("sign-in process error: {e}")),
+                Err(_) => {
+                    let _ = child.start_kill();
+                    return Err("sign-in timed out".into());
+                }
+            }
         }
     };
     let _ = drain.await;

@@ -1341,6 +1341,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
             .when(is_default, |d| d.bg(theme.accent))
             .when(!is_default, |d| d.border_1().border_color(theme.border));
         let kind_badge = div()
+            .flex_none()
             .px_1p5()
             .rounded(px(4.))
             .bg(theme.bg_elevated)
@@ -1357,6 +1358,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
             div()
                 .id(SharedString::from(format!("agent-signin-{}", a.id)))
                 .role(gpui::Role::Button)
+                .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1386,10 +1388,12 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
             div()
                 .id(SharedString::from(format!("agent-signout-{}", a.id)))
                 .role(gpui::Role::Button)
+                .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
                 .h(px(22.))
+                .whitespace_nowrap()
                 .px_2()
                 .rounded(px(4.))
                 .border_1()
@@ -1424,10 +1428,12 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
             div()
                 .id(SharedString::from(format!("agent-key-{}", a.id)))
                 .role(gpui::Role::Button)
+                .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
                 .h(px(22.))
+                .whitespace_nowrap()
                 .px_2()
                 .rounded(px(4.))
                 .border_1()
@@ -1451,29 +1457,42 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                 .items_center()
                 .gap_2()
                 .px_2()
-                .h(px(32.))
+                .min_h(px(40.))
                 .rounded(theme.radius)
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.bg_elevated))
                 .child(dot)
+                // Name on top, the status/identity line beneath it — so a long
+                // sign-in identity (email · tier) never pushes the name into a wrap.
                 .child(
                     div()
                         .flex_1()
                         .min_w(px(0.))
-                        .text_size(theme.scale(12.5))
-                        .text_color(theme.text)
-                        .child(SharedString::from(a.name.clone())),
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(theme.scale(12.5))
+                                .text_color(theme.text)
+                                .child(SharedString::from(a.name.clone())),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(theme.scale(10.5))
+                                .text_color(status_color)
+                                .child(status),
+                        ),
                 )
                 .child(kind_badge)
-                .child(
-                    div()
-                        .text_size(theme.scale(10.5))
-                        .text_color(status_color)
-                        .child(status),
-                )
                 .when(is_default, |row| {
                     row.child(
                         div()
+                            .flex_none()
+                            .whitespace_nowrap()
                             .text_size(theme.scale(10.5))
                             .text_color(theme.text_muted)
                             .child("· default"),
@@ -1577,9 +1596,10 @@ fn acp_identity(status: &red_service::AiAuthStatus) -> String {
     label
 }
 
-/// The inline paste-code sign-in panel shown under an agent's row while a sign-in is
-/// in flight: a prompt, the code field + Submit/Cancel, a manual "open the page"
-/// fallback, and any error from a prior attempt.
+/// The inline sign-in panel shown under an agent's row while a sign-in is in flight.
+/// The common path completes in the browser on its own (no code needed); the code
+/// field is a fallback for when the CLI shows a code to paste. Also: the manual
+/// "open the page" link and any error from a prior attempt.
 fn login_panel(
     state: &AppState,
     flow: &crate::app::AiLoginFlow,
@@ -1605,9 +1625,29 @@ fn login_panel(
                         .text_size(theme.scale(11.5))
                         .text_color(theme.text_muted)
                         .child(
-                            "A browser opened to sign in. After authorizing, paste the code \
-                             shown there:",
+                            "A browser window opened — authorize there to finish signing in. \
+                             This closes on its own when you're done.",
                         ),
+                )
+                .child(
+                    div()
+                        .id("ai-login-open")
+                        .role(gpui::Role::Button)
+                        .cursor_pointer()
+                        .text_size(theme.scale(11.))
+                        .text_color(theme.accent)
+                        .child("Didn't open? Open the sign-in page")
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.open_external(&url_open, cx)),
+                        ),
+                )
+                // Fallback: only some flows show a code to paste back.
+                .child(
+                    div()
+                        .pt_1()
+                        .text_size(theme.scale(10.5))
+                        .text_color(theme.text_faint)
+                        .child("If the browser shows a code instead, paste it here:"),
                 )
                 .child(
                     div()
@@ -1622,7 +1662,7 @@ fn login_panel(
                         )
                         .child(
                             Button::new("ai-login-submit", "Submit")
-                                .variant(ButtonVariant::Primary)
+                                .variant(ButtonVariant::Secondary)
                                 .size(ButtonSize::Sm)
                                 .on_click(cx.listener(|this, _, _, cx| this.submit_login_code(cx))),
                         )
@@ -1631,18 +1671,6 @@ fn login_panel(
                                 .variant(ButtonVariant::Secondary)
                                 .size(ButtonSize::Sm)
                                 .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("ai-login-open")
-                        .role(gpui::Role::Button)
-                        .cursor_pointer()
-                        .text_size(theme.scale(11.))
-                        .text_color(theme.accent)
-                        .child("Didn't open? Open the sign-in page")
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.open_external(&url_open, cx)),
                         ),
                 );
             if flow.submitting {

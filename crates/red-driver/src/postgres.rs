@@ -1030,7 +1030,10 @@ mod tests {
         // because Postgres won't assignment-cast text into them.
         assert_eq!(pg_cast(&text, Some("jsonb")), "::text::\"jsonb\"");
         assert_eq!(pg_cast(&text, Some("json")), "::text::\"json\"");
-        assert_eq!(pg_cast(&text, Some("timestamptz")), "::text::\"timestamptz\"");
+        assert_eq!(
+            pg_cast(&text, Some("timestamptz")),
+            "::text::\"timestamptz\""
+        );
         assert_eq!(pg_cast(&text, Some("uuid")), "::text::\"uuid\"");
         assert_eq!(pg_cast(&text, Some("mood")), "::text::\"mood\"");
         // Plain text-family columns assign directly — no second cast.
@@ -1484,7 +1487,11 @@ mod tests {
         let row = &page.rows[0];
         // jsonb re-serializes with canonical spacing on the server.
         assert_eq!(text(&row[0]), "{\"b\": [2, 3]}", "jsonb landed");
-        assert_eq!(text(&row[1]), "2021-06-15 12:30:00+00", "timestamptz landed");
+        assert_eq!(
+            text(&row[1]),
+            "2021-06-15 12:30:00+00",
+            "timestamptz landed"
+        );
         assert_eq!(
             text(&row[2]),
             "12345678-1234-5678-1234-567812345678",

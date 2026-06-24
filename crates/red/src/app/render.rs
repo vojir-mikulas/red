@@ -329,7 +329,7 @@ impl Render for AppState {
         // Detail inspector: drop a loaded/in-flight full value once the cursor has
         // moved off the cell it belonged to, so a big inspected value never outlives
         // the cursor sitting on it (the "bytes dropped when focus moves" promise).
-        self.reconcile_inspector();
+        self.reconcile_inspector(cx);
 
         // First paint: install the OS-appearance observer and the settings
         // file-watcher (both need a live `Window`).

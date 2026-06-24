@@ -218,6 +218,55 @@ impl ResultGrid {
     /// the target cell is binary / display-clipped (no safe inline round-trip).
     /// `gutter` is the data-column table offset (see [`AppState::gutter`]).
     pub(crate) fn edit_target(&self, gutter: usize) -> Option<EditContext> {
+        let (row, col, pk_value, decl_type) = self.edit_identity(gutter)?;
+        let original = self.cell_value(row, col)?;
+        // A resident inline edit needs a safe round-trip: no binary, and no
+        // display-clipped cell (we'd only have its head). The inspector's
+        // [`edit_target_full`] lifts the clipped restriction once the full value
+        // has been loaded out-of-band.
+        if matches!(original, Value::Blob(_) | Value::Capped(_)) {
+            return None;
+        }
+        Some(EditContext {
+            epoch: self.epoch,
+            row,
+            data_col: col,
+            pk_value,
+            decl_type,
+            original,
+        })
+    }
+
+    /// Like [`edit_target`], but for a value fetched in full out-of-band (the
+    /// inspector's "Load full value"): the *resident* cell may be display-capped, so
+    /// the caller supplies `original` rather than reading the clipped buffer. This
+    /// is what makes a large `TEXT`/JSON cell editable. Binary is still refused —
+    /// there is no text round-trip for a blob.
+    pub(crate) fn edit_target_full(&self, gutter: usize, original: Value) -> Option<EditContext> {
+        if matches!(original, Value::Blob(_)) {
+            return None;
+        }
+        let (row, col, pk_value, decl_type) = self.edit_identity(gutter)?;
+        Some(EditContext {
+            epoch: self.epoch,
+            row,
+            data_col: col,
+            pk_value,
+            decl_type,
+            original,
+        })
+    }
+
+    /// The row identity + target column for an inline edit, independent of the
+    /// cell's current value — shared by [`edit_target`] (resident value) and
+    /// [`edit_target_full`] (a supplied loaded value). Returns
+    /// `(row, data_col, pk_value, decl_type)`. `None` unless this is an editable
+    /// single-table keyed browse with a usable (present, uncapped) PK and the
+    /// cursor sitting off the PK column.
+    pub(crate) fn edit_identity(
+        &self,
+        gutter: usize,
+    ) -> Option<(usize, usize, Value, Option<String>)> {
         self.table.as_ref()?; // must be a single-table browse to be editable
         let key = self.key.as_ref()?;
         // The identity column: the tiebreaker (the PK) for a sorted browse, else the
@@ -233,18 +282,7 @@ impl ResultGrid {
         if matches!(pk_value, Value::Null | Value::Capped(_)) {
             return None;
         }
-        let original = self.cell_value(row, col)?;
-        if matches!(original, Value::Blob(_) | Value::Capped(_)) {
-            return None;
-        }
-        Some(EditContext {
-            epoch: self.epoch,
-            row,
-            data_col: col,
-            pk_value,
-            decl_type: target.decl_type.clone(),
-            original,
-        })
+        Some((row, col, pk_value, target.decl_type.clone()))
     }
 
     /// Patch the resident cell at `(row, data_col)` to `value` in place, after a
