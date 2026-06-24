@@ -25,7 +25,7 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "137e677a
 # gpui to the SAME rev as above; Cargo unifies the two git deps only at a
 # matching URL+rev, so bumping Flint is coordinated with the gpui pin. For local
 # Flint+RED work, override with a `[patch]` or a path dep.
-flint = { git = "https://github.com/vojir-mikulas/flint", rev = "8188317b3b63d55b9d5f831cf567e2f09cf3c4cb" }
+flint = { git = "https://github.com/vojir-mikulas/flint", rev = "8e693d68ca171f646f85e596eeaa09f20ac2f929" }
 
 # --- Async / backend bridge (mirrors Nyx: Tokio backend ↔ GPUI over channels) ---
 tokio = { version = "1", default-features = false }
@@ -115,9 +115,3 @@ opt-level = 2
 #
 #   [patch."https://github.com/vojir-mikulas/flint"]
 #   flint = { path = "../flint" }
-
-# TEMP local-dev patch (uncommitted) — build Red against the sibling ../flint
-# checkout that carries the Toast overhaul + SelectableLabel. Remove before
-# committing; release by pushing flint and bumping the git rev above.
-[patch."https://github.com/vojir-mikulas/flint"]
-flint = { path = "../flint" }
