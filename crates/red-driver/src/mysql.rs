@@ -522,6 +522,8 @@ impl DatabaseDriver for MysqlDriver {
             .map_err(map_my_err)?;
         let mut total = 0u64;
         for op in ops {
+            // MySQL auto-coerces a bound string into a JSON column (it validates and
+            // stores), so no per-type cast is needed — `decl_type` is ignored here.
             let (sql, params) = crate::edit_sql(
                 op,
                 |id| format!("`{}`", escape_ident(id)),

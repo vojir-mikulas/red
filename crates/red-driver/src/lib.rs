@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ColumnMeta, EditOp, ExportFormat, KeySpec, QueryOptions, QueryPlan, RedError, Result,
-    ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
+    Column, ColumnMeta, ColumnValue, EditOp, ExportFormat, KeySpec, QueryOptions, QueryPlan,
+    RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -176,28 +176,30 @@ pub(crate) fn seek_clauses(
 
 /// Render an [`EditOp`] into `(sql, ordered bind values)` for one engine — the
 /// shared half of every driver's `apply_edit`, so only quoting and placeholder
-/// syntax differ. `quote` quotes one identifier; `placeholder(i, v)` renders the
-/// `i`-th (0-based) bind slot for value `v` (e.g. `?` or `$1::int8`). A
-/// [`Value::Null`] is emitted as the literal `NULL` keyword and **not** bound — so
+/// syntax differ. `quote` quotes one identifier; `placeholder(i, cv)` renders the
+/// `i`-th (0-based) bind slot for the column=value pair `cv` (e.g. `?` or
+/// `$1::int8`, or — given `cv.decl_type` — a cast back to a non-text column type).
+/// A [`Value::Null`] is emitted as the literal `NULL` keyword and **not** bound — so
 /// the per-engine value binders never see a null (and a typeless null bind, which
 /// Postgres can't infer, never arises). Identifiers are quoted, values are bound:
 /// no part of an edit is string-interpolated.
 pub(crate) fn edit_sql<'a>(
     op: &'a EditOp,
     quote: impl Fn(&str) -> String,
-    placeholder: impl Fn(usize, &Value) -> String,
+    placeholder: impl Fn(usize, &ColumnValue) -> String,
 ) -> (String, Vec<&'a Value>) {
     let qualify = |t: &TableRef| match &t.schema {
         Some(s) if !s.is_empty() => format!("{}.{}", quote(s), quote(&t.name)),
         _ => quote(&t.name),
     };
-    // Render `v` as a bound placeholder (pushing it to `params`) or the literal NULL.
-    let slot = |v: &'a Value, params: &mut Vec<&'a Value>| -> String {
-        if matches!(v, Value::Null) {
+    // Render `cv` as a bound placeholder (pushing its value to `params`) or the
+    // literal NULL. The placeholder sees the whole pair so it can cast by column type.
+    let slot = |cv: &'a ColumnValue, params: &mut Vec<&'a Value>| -> String {
+        if matches!(cv.value, Value::Null) {
             "NULL".to_string()
         } else {
-            let s = placeholder(params.len(), v);
-            params.push(v);
+            let s = placeholder(params.len(), cv);
+            params.push(&cv.value);
             s
         }
     };
@@ -207,14 +209,9 @@ pub(crate) fn edit_sql<'a>(
         EditOp::Update { table, key, set } => {
             let mut assigns = Vec::with_capacity(set.len());
             for cv in set {
-                assigns.push(format!(
-                    "{} = {}",
-                    quote(&cv.column),
-                    slot(&cv.value, &mut params)
-                ));
+                assigns.push(format!("{} = {}", quote(&cv.column), slot(cv, &mut params)));
             }
-            let where_clause =
-                format!("{} = {}", quote(&key.column), slot(&key.value, &mut params));
+            let where_clause = format!("{} = {}", quote(&key.column), slot(key, &mut params));
             format!(
                 "UPDATE {} SET {} WHERE {}",
                 qualify(table),
@@ -223,8 +220,7 @@ pub(crate) fn edit_sql<'a>(
             )
         }
         EditOp::Delete { table, key } => {
-            let where_clause =
-                format!("{} = {}", quote(&key.column), slot(&key.value, &mut params));
+            let where_clause = format!("{} = {}", quote(&key.column), slot(key, &mut params));
             format!("DELETE FROM {} WHERE {}", qualify(table), where_clause)
         }
         EditOp::Insert { table, values } => {
@@ -235,7 +231,7 @@ pub(crate) fn edit_sql<'a>(
                 .join(", ");
             let mut vals = Vec::with_capacity(values.len());
             for cv in values {
-                vals.push(slot(&cv.value, &mut params));
+                vals.push(slot(cv, &mut params));
             }
             format!(
                 "INSERT INTO {} ({}) VALUES ({})",

@@ -717,11 +717,18 @@ pub struct TableRef {
     pub name: String,
 }
 
-/// One `column = value` pair of an [`EditOp`].
+/// One `column = value` pair of an [`EditOp`]. `decl_type` is the column's declared
+/// engine type (best-effort, `None` for a key/PK or where it isn't known): the
+/// driver needs it to bind correctly into a non-text column. A value the driver
+/// decoded to [`Value::Text`] — jsonb, timestamp, uuid, numeric, an enum — must be
+/// *cast* back to that column type on write, because Postgres has no implicit
+/// (assignment) cast from `text` to those, so a bare text bind is rejected. Keys
+/// (always int/text, see `PkKey`) bind fine without it, so they carry `None`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnValue {
     pub column: String,
     pub value: Value,
+    pub decl_type: Option<String>,
 }
 
 impl EditOp {
@@ -1465,6 +1472,7 @@ mod edit_tests {
         ColumnValue {
             column: column.into(),
             value,
+            decl_type: None,
         }
     }
 

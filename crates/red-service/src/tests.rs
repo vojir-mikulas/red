@@ -329,10 +329,12 @@ async fn applies_a_data_edit() {
         key: ColumnValue {
             column: "id".into(),
             value: Value::Integer(id),
+            decl_type: None,
         },
         set: vec![ColumnValue {
             column: "name".into(),
             value: Value::Text("two".into()),
+            decl_type: None,
         }],
     };
 

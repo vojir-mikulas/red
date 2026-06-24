@@ -1516,6 +1516,7 @@ mod tests {
             key: red_core::ColumnValue {
                 column: "id".into(),
                 value: Value::Integer(1),
+                decl_type: None,
             },
         };
         assert!(driver.apply_edit(&op).await.is_err(), "edits are refused");

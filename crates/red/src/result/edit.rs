@@ -195,7 +195,19 @@ impl ResultGrid {
             schema: Some(schema.clone()),
             name: name.clone(),
         };
-        let col_name = |c: usize| self.columns.get(c).map(|col| col.name.clone());
+        // The column's `(name, declared type)` — the type rides along so the driver
+        // can bind a text-decoded value (jsonb, timestamp, …) back into its column.
+        let col_meta = |c: usize| {
+            self.columns
+                .get(c)
+                .map(|col| (col.name.clone(), col.decl_type.clone()))
+        };
+        // A key column binds fine without a type (always int/text), so it carries None.
+        let key_cv = |value: Value| ColumnValue {
+            column: pk_column.clone(),
+            value,
+            decl_type: None,
+        };
         let mut ops = Vec::new();
 
         for u in self.pending.updates.values() {
@@ -203,9 +215,10 @@ impl ResultGrid {
                 .cells
                 .iter()
                 .filter_map(|(c, v)| {
-                    col_name(*c).map(|column| ColumnValue {
+                    col_meta(*c).map(|(column, decl_type)| ColumnValue {
                         column,
                         value: v.clone(),
+                        decl_type,
                     })
                 })
                 .collect();
@@ -214,20 +227,14 @@ impl ResultGrid {
             }
             ops.push(EditOp::Update {
                 table: tref(),
-                key: ColumnValue {
-                    column: pk_column.clone(),
-                    value: u.pk_value.clone(),
-                },
+                key: key_cv(u.pk_value.clone()),
                 set,
             });
         }
         for d in self.pending.deletes.values() {
             ops.push(EditOp::Delete {
                 table: tref(),
-                key: ColumnValue {
-                    column: pk_column.clone(),
-                    value: d.pk_value.clone(),
-                },
+                key: key_cv(d.pk_value.clone()),
             });
         }
         for draft in &self.pending.inserts {
@@ -235,9 +242,10 @@ impl ResultGrid {
                 .cells
                 .iter()
                 .filter_map(|(c, v)| {
-                    col_name(*c).map(|column| ColumnValue {
+                    col_meta(*c).map(|(column, decl_type)| ColumnValue {
                         column,
                         value: v.clone(),
+                        decl_type,
                     })
                 })
                 .collect();

@@ -51,12 +51,18 @@ pub(crate) struct InspectorState {
     editing: Option<InspectorEdit>,
 }
 
-/// An in-progress inline cell edit hosted in the inspector (Track B5). The input's
-/// event `Subscription` is held here, not detached, so clearing `editing` (on
-/// move-off / Save / Cancel) drops it rather than orphaning it on `AppState`.
+/// An in-progress inline cell edit hosted in the inspector (Track B5). The editor
+/// is a multiline [`CodeEditor`] — not a single-line field — so the value is edited
+/// *as the pane shows it*: a pretty-printed JSON document stays formatted and a long
+/// text keeps its line breaks. It's seeded with `prefill` (the displayed body), and
+/// a Save whose content still equals `prefill` is treated as a no-op (so merely
+/// opening the editor on a pretty-printed value and saving never restyles the cell).
+/// The editor's event `Subscription` is held here, not detached, so clearing
+/// `editing` (on move-off / Save / Cancel) drops it rather than orphaning it.
 struct InspectorEdit {
-    input: Entity<TextInput>,
+    editor: Entity<CodeEditor>,
     ctx: EditContext,
+    prefill: String,
     #[allow(dead_code)]
     sub: gpui::Subscription,
 }
@@ -243,8 +249,9 @@ impl AppState {
     /// Begin an inline edit of the focused cell in the inspector (Track B5). No-op
     /// when the cell isn't editable (read-only / not edit-enabled connection, not a
     /// single-table keyed browse, the PK column, or a blob/clipped cell — see
-    /// [`AppState::active_edit_target`]). Prefills the field with the current value
-    /// so a small tweak is one keystroke; Enter saves, Esc cancels.
+    /// [`AppState::active_edit_target`]). The body turns into a multiline editor
+    /// seeded with the value *as it was being shown* (pretty JSON stays pretty), so
+    /// editing it is in-place and WYSIWYG; ⌘↵ saves, Esc cancels, Enter adds a line.
     pub(crate) fn begin_inspector_edit(&mut self, cx: &mut Context<Self>) {
         let Some(ctx) = self.active_edit_target() else {
             return;
@@ -252,24 +259,45 @@ impl AppState {
         if self.inspector.is_none() {
             return;
         }
+        // Seed the editor with the value *as the pane renders it* — a pretty-printed
+        // JSON document, a wrapped text — not the raw one-line `to_string`, so editing
+        // doesn't first flatten the formatting the user was just reading. A NULL opens
+        // empty (an empty save sets NULL back).
+        let view = format_value(&ctx.original);
         let prefill = match &ctx.original {
             Value::Null => String::new(),
-            other => other.to_string(),
+            _ => view.body.to_string(),
         };
-        let input = cx.new(|cx| {
-            let mut input = TextInput::new(cx);
-            input.set_content(prefill, cx);
-            input
+        // A multiline surface that inherits the pane's mono typography (set on its
+        // container at render time): no line-number gutter and no frame of its own, so
+        // it reads as the value body becoming editable in place. Prose soft-wraps;
+        // structured content (JSON) scrolls horizontally to keep its shape — mirroring
+        // how the read-only body lays each out.
+        let seed = prefill.clone();
+        let wrap = view.wrap;
+        let editor = cx.new(|cx| {
+            CodeEditor::new(cx)
+                .gutter(false)
+                .resting_border(false)
+                .corner_radius(px(0.))
+                .soft_wrap(wrap)
+                .a11y_label("Cell value editor")
+                .with_content(seed)
         });
-        // Enter in the field saves; Esc cancels — the same submit/cancel idiom the
-        // form fields use.
-        let sub = cx.subscribe(&input, |this, _, event: &TextInputEvent, cx| match event {
-            TextInputEvent::Submit => this.save_inspector_edit(cx),
-            TextInputEvent::Cancel => this.cancel_inspector_edit(cx),
-            TextInputEvent::Change => {}
+        // ⌘↵ (Run) saves and Esc cancels — Enter inserts a newline, so multi-line JSON
+        // is editable. The footer carries the same Save / Cancel as buttons.
+        let sub = cx.subscribe(&editor, |this, _, event: &CodeEditorEvent, cx| match event {
+            CodeEditorEvent::Run => this.save_inspector_edit(cx),
+            CodeEditorEvent::Escape => this.cancel_inspector_edit(cx),
+            CodeEditorEvent::Submit => {}
         });
         if let Some(insp) = &mut self.inspector {
-            insp.editing = Some(InspectorEdit { input, ctx, sub });
+            insp.editing = Some(InspectorEdit {
+                editor,
+                ctx,
+                prefill,
+                sub,
+            });
         }
         self.focus_inspector_edit = true;
         cx.notify();
@@ -289,8 +317,19 @@ impl AppState {
     pub(crate) fn save_inspector_edit(&mut self, cx: &mut Context<Self>) {
         let Some(insp) = &self.inspector else { return };
         let Some(edit) = &insp.editing else { return };
-        let text = edit.input.read(cx).content().to_string();
+        let text = edit.editor.read(cx).content();
         let ctx = edit.ctx.clone();
+        // Unchanged from what was seeded — including the case where the seed was a
+        // *reformatted* (pretty JSON) rendering of the stored value. Close without
+        // staging so opening the editor and saving never rewrites a cell with only
+        // cosmetic whitespace.
+        if text == edit.prefill {
+            if let Some(insp) = &mut self.inspector {
+                insp.editing = None;
+            }
+            cx.notify();
+            return;
+        }
         let value = match red_core::coerce_edit_value(&text, ctx.decl_type.as_deref()) {
             Ok(v) => v,
             Err(reason) => {
@@ -317,7 +356,7 @@ impl AppState {
     /// drain (see `focus_inspector_edit`).
     pub(crate) fn inspector_edit_focus(&self, cx: &Context<Self>) -> Option<FocusHandle> {
         let edit = self.inspector.as_ref()?.editing.as_ref()?;
-        Some(edit.input.focus_handle(cx))
+        Some(edit.editor.focus_handle(cx))
     }
 
     /// Resolve the cell under the cursor into something renderable: a loaded full
@@ -432,25 +471,38 @@ impl AppState {
                     .on_click(cx.listener(|this, _, _, cx| this.close_inspector(cx))),
             );
 
-        // While an inline edit is open (Track B5) the body *is* the value field and
-        // the footer offers Save / Cancel — the inspector becomes the editor.
+        // While an inline edit is open (Track B5) the body *is* the value editor and
+        // the footer offers Save / Cancel — the inspector becomes the editor. The
+        // editor inherits the body's mono typography from its container, so the value
+        // is edited in the very font/size it was just shown in.
         if let Some(edit) = self.inspector.as_ref().and_then(|i| i.editing.as_ref()) {
+            let hint = crate::keymap::localize_hint(
+                "Editing — ⌘↵ to save, Esc to cancel. Enter inserts a line; an empty value sets NULL.",
+            );
             let field = div()
                 .flex_1()
                 .min_h(px(0.))
                 .flex()
                 .flex_col()
-                .gap_2()
-                .p_3()
-                .font_family(ui_family.clone())
                 .child(
                     div()
                         .flex_shrink_0()
+                        .px_3()
+                        .py_2()
                         .text_size(s11)
                         .text_color(faint)
-                        .child("Editing — Enter to save, Esc to cancel. An empty value sets NULL."),
+                        .font_family(ui_family.clone())
+                        .child(hint),
                 )
-                .child(edit.input.clone())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .font_family(mono_family.clone())
+                        .text_size(body_size)
+                        .line_height(body_size * 1.5)
+                        .child(edit.editor.clone()),
+                )
                 .into_any_element();
             let footer = div()
                 .flex_shrink_0()

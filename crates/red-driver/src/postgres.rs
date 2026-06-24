@@ -444,7 +444,7 @@ impl DatabaseDriver for PostgresDriver {
         // would infer the column's narrower type (int4) and reject the bind.
         let (where_clause, order_by) =
             crate::seek_clauses(key, bound_len, descending, false, pg_quote, |i| {
-                format!("${}{}", i + 1, pg_cast(&bound.unwrap()[i]))
+                format!("${}{}", i + 1, pg_cast(&bound.unwrap()[i], None))
             });
         let sql = format!(
             "SELECT * FROM ({base}) AS _red {where_clause}ORDER BY {order_by} LIMIT {limit}"
@@ -479,7 +479,7 @@ impl DatabaseDriver for PostgresDriver {
         let bound_len = from.map_or(0, <[Value]>::len);
         let (where_clause, order_by) =
             crate::seek_clauses(key, bound_len, false, true, pg_quote, |i| {
-                format!("${}{}", i + 1, pg_cast(&from.unwrap()[i]))
+                format!("${}{}", i + 1, pg_cast(&from.unwrap()[i], None))
             });
         let sql = format!(
             "SELECT * FROM ({base}) AS _red {where_clause}\
@@ -564,8 +564,9 @@ impl DatabaseDriver for PostgresDriver {
                 // Typed placeholders (`$n::int8`, …) like the seek path: the value's
                 // wire type is fixed by the Rust value, the cast keeps Postgres from
                 // re-inferring.
-                let (sql, params) =
-                    crate::edit_sql(op, pg_quote, |i, v| format!("${}{}", i + 1, pg_cast(v)));
+                let (sql, params) = crate::edit_sql(op, pg_quote, |i, cv| {
+                    format!("${}{}", i + 1, pg_cast(&cv.value, cv.decl_type.as_deref()))
+                });
                 let owned: Vec<Value> = params.iter().map(|v| (*v).clone()).collect();
                 let boxed = pg_params(Some(&owned))?;
                 let refs: Vec<&(dyn ToSql + Sync)> = boxed
@@ -711,16 +712,38 @@ fn pg_quote(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
-/// The explicit cast for a seek-bound placeholder, from the bound value's wire
-/// type (see `fetch_seek`). A bound comes from the key column, never capped.
-fn pg_cast(value: &Value) -> &'static str {
+/// The explicit cast for a bound placeholder, pinning the inferred parameter type
+/// to the wire form the value's Rust type encodes (so Postgres can't re-infer it):
+/// `i64`→`int8`, `f64`→`float8`, `String`→`text`, `Vec<u8>`→`bytea`.
+///
+/// A [`Value::Text`] is special on **write**: it binds as `text` (the only form
+/// `String` encodes), but the target column may be jsonb/json/timestamp/uuid/numeric
+/// /an enum — types with no implicit (assignment) cast *from* text (the post-8.3
+/// rule), so `SET jsonb_col = $1::text` is rejected with "column is of type jsonb
+/// but expression is of type text". When `decl_type` names such a column we add a
+/// second, *explicit* cast — `$1::text::"jsonb"` — which type-checks. Plain
+/// text-family columns (and an unknown / absent type, e.g. a key bind) keep `::text`.
+fn pg_cast(value: &Value, decl_type: Option<&str>) -> String {
     match value {
-        Value::Integer(_) => "::int8",
-        Value::Real(_) => "::float8",
-        Value::Text(_) => "::text",
-        Value::Blob(_) => "::bytea",
-        Value::Null | Value::Capped(_) => "",
+        Value::Integer(_) => "::int8".to_string(),
+        Value::Real(_) => "::float8".to_string(),
+        Value::Blob(_) => "::bytea".to_string(),
+        Value::Null | Value::Capped(_) => String::new(),
+        Value::Text(_) => match decl_type {
+            Some(t) if !is_pg_text_type(t) => format!("::text::{}", pg_quote(t)),
+            _ => "::text".to_string(),
+        },
     }
+}
+
+/// Whether a Postgres column type (the `typname` we store as `decl_type`) is a
+/// text-family type a `text` bind assigns to directly — so it needs no second cast
+/// on write. Everything else (jsonb, timestamp, uuid, numeric, an enum, …) does.
+fn is_pg_text_type(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "text" | "varchar" | "bpchar" | "char" | "name" | "citext" | "unknown"
+    )
 }
 
 /// Box each seek-bound value as a typed `ToSql` parameter (one per leading key
@@ -986,6 +1009,36 @@ mod tests {
                 }
             }
         };
+    }
+
+    /// The write-side cast `pg_cast` emits per `(value, column type)`. A scalar pins
+    /// the wire type from its Rust value; a text value bound into a non-text column
+    /// (jsonb, timestamp, an enum) gets the second explicit cast that lets the
+    /// assignment type-check, while a plain text column (or an unknown / key bind)
+    /// stays a bare `::text`. No DB needed — pure string rendering.
+    #[test]
+    fn pg_cast_casts_text_into_non_text_columns() {
+        // Scalars: cast follows the Rust value, column type is irrelevant.
+        assert_eq!(pg_cast(&Value::Integer(1), Some("int4")), "::int8");
+        assert_eq!(pg_cast(&Value::Real(1.0), Some("numeric")), "::float8");
+        assert_eq!(pg_cast(&Value::Blob(vec![1]), None), "::bytea");
+        // NULL / capped never bind, so they emit no cast.
+        assert_eq!(pg_cast(&Value::Null, Some("jsonb")), "");
+
+        let text = Value::Text("{\"a\":1}".into());
+        // A jsonb / json / timestamp / uuid / enum column needs the explicit cast,
+        // because Postgres won't assignment-cast text into them.
+        assert_eq!(pg_cast(&text, Some("jsonb")), "::text::\"jsonb\"");
+        assert_eq!(pg_cast(&text, Some("json")), "::text::\"json\"");
+        assert_eq!(pg_cast(&text, Some("timestamptz")), "::text::\"timestamptz\"");
+        assert_eq!(pg_cast(&text, Some("uuid")), "::text::\"uuid\"");
+        assert_eq!(pg_cast(&text, Some("mood")), "::text::\"mood\"");
+        // Plain text-family columns assign directly — no second cast.
+        assert_eq!(pg_cast(&text, Some("text")), "::text");
+        assert_eq!(pg_cast(&text, Some("VARCHAR")), "::text");
+        assert_eq!(pg_cast(&text, Some("bpchar")), "::text");
+        // Unknown / absent type (e.g. a key bind) is best-effort `::text`.
+        assert_eq!(pg_cast(&text, None), "::text");
     }
 
     /// The connection's current schema — unqualified fixtures land here, so
@@ -1356,6 +1409,90 @@ mod tests {
 
         driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
         driver.execute(&format!("DROP TABLE {tb}")).await.unwrap();
+    }
+
+    /// Editing a column whose value decodes to [`Value::Text`] but whose real type
+    /// has no assignment cast *from* text — jsonb, timestamptz, uuid — must succeed:
+    /// the write-side `::text::"type"` cast (driven by `ColumnValue::decl_type`) lets
+    /// the bound text type-check into the column. A bare `::text` would be rejected
+    /// ("column is of type jsonb but expression is of type text"); this is the
+    /// regression test for that. The PK (int) and a plain text column ride along to
+    /// show the typed columns don't disturb the ordinary path.
+    #[tokio::test]
+    async fn edits_jsonb_timestamp_and_uuid_columns() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, false).await.unwrap();
+        let t = tag("typededit");
+        driver
+            .execute(&format!(
+                "CREATE TABLE {t} (id INT PRIMARY KEY, doc JSONB, at TIMESTAMPTZ, ref UUID, name TEXT)"
+            ))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!(
+                "INSERT INTO {t} VALUES (1, '{{\"a\":1}}', '2000-01-01 00:00:00+00', \
+                 '00000000-0000-0000-0000-000000000000', 'one')"
+            ))
+            .await
+            .unwrap();
+        let schema = current_schema(&driver).await;
+        let tref = red_core::TableRef {
+            schema: Some(schema),
+            name: t.clone(),
+        };
+        // One UPDATE setting every typed column at once — each `set` carries the
+        // column's `decl_type`, the key carries none (an int PK binds bare).
+        let set = |column: &str, value: &str, decl: &str| red_core::ColumnValue {
+            column: column.into(),
+            value: Value::Text(value.into()),
+            decl_type: Some(decl.into()),
+        };
+        let affected = driver
+            .apply_edit(&EditOp::Update {
+                table: tref,
+                key: red_core::ColumnValue {
+                    column: "id".into(),
+                    value: Value::Integer(1),
+                    decl_type: None,
+                },
+                set: vec![
+                    set("doc", "{\"b\": [2, 3]}", "jsonb"),
+                    set("at", "2021-06-15 12:30:00+00", "timestamptz"),
+                    set("ref", "12345678-1234-5678-1234-567812345678", "uuid"),
+                    set("name", "two", "text"),
+                ],
+            })
+            .await
+            .unwrap();
+        assert_eq!(affected, 1, "the typed UPDATE matched exactly its row");
+
+        let page = driver
+            .fetch_page(
+                &format!("SELECT doc, at, ref, name FROM {t} WHERE id = 1"),
+                0,
+                1,
+                PageCap::Full,
+                &AbortSignal::new(),
+            )
+            .await
+            .unwrap();
+        let text = |v: &Value| match v {
+            Value::Text(s) => s.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        let row = &page.rows[0];
+        // jsonb re-serializes with canonical spacing on the server.
+        assert_eq!(text(&row[0]), "{\"b\": [2, 3]}", "jsonb landed");
+        assert_eq!(text(&row[1]), "2021-06-15 12:30:00+00", "timestamptz landed");
+        assert_eq!(
+            text(&row[2]),
+            "12345678-1234-5678-1234-567812345678",
+            "uuid landed"
+        );
+        assert_eq!(text(&row[3]), "two", "plain text column unaffected");
+
+        driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
     }
 
     #[tokio::test]

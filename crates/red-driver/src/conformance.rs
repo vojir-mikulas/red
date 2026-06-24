@@ -582,10 +582,12 @@ pub(crate) async fn applies_edits(driver: &dyn DatabaseDriver, schema: &str, tab
     let id = |n: i64| ColumnValue {
         column: "id".into(),
         value: Value::Integer(n),
+        decl_type: None,
     };
     let name = |v: Value| ColumnValue {
         column: "name".into(),
         value: v,
+        decl_type: None,
     };
     let abort = AbortSignal::new();
     let read = |sql: String| {
@@ -681,10 +683,12 @@ pub(crate) async fn read_only_rejects_edit(driver: &dyn DatabaseDriver, schema: 
         key: ColumnValue {
             column: "id".into(),
             value: Value::Integer(1),
+            decl_type: None,
         },
         set: vec![ColumnValue {
             column: "name".into(),
             value: Value::Text("nope".into()),
+            decl_type: None,
         }],
     };
     assert!(
@@ -707,10 +711,12 @@ pub(crate) async fn applies_batch_atomic(driver: &dyn DatabaseDriver, schema: &s
     let id = |n: i64| ColumnValue {
         column: "id".into(),
         value: Value::Integer(n),
+        decl_type: None,
     };
     let name = |v: &str| ColumnValue {
         column: "name".into(),
         value: Value::Text(v.into()),
+        decl_type: None,
     };
     let abort = AbortSignal::new();
     let read = |sql: String| {
@@ -790,10 +796,12 @@ pub(crate) async fn read_only_rejects_batch(
         key: ColumnValue {
             column: "id".into(),
             value: Value::Integer(1),
+            decl_type: None,
         },
         set: vec![ColumnValue {
             column: "name".into(),
             value: Value::Text("nope".into()),
+            decl_type: None,
         }],
     }];
     assert!(
