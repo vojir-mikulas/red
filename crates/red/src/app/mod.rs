@@ -1088,7 +1088,21 @@ impl AppState {
         )
         .detach();
 
-        let connections = config::load();
+        let mut connections = config::load();
+
+        // First launch (no connections file yet): seed a read-only "Sample
+        // database" so the welcome screen has something to open immediately. We
+        // gate on the file's absence, not an empty list, so a user who has
+        // deliberately deleted every connection never gets the sample re-added.
+        let first_run = config::config_path().is_some_and(|p| !p.exists());
+        if first_run && connections.is_empty() {
+            if let Some(sample) = crate::sample::first_run_connection() {
+                connections.push(sample);
+                if let Err(e) = config::save(&connections) {
+                    tracing::warn!("could not persist the seeded sample connection: {e}");
+                }
+            }
+        }
 
         // The welcome screen's connection search box. Bare (the styled toolbar
         // wraps it) and out of the Tab ring (it's a standalone filter, not a form

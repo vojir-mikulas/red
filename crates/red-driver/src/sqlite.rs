@@ -924,6 +924,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shipped_sample_db_opens_read_only_and_introspects() {
+        // The "Sample database" preview that ships with the app (sample/sample.db,
+        // regenerated from sample/sample.sql) must open read-only through the real
+        // driver and introspect cleanly — that's the path the welcome card hits.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sample/sample.db");
+        assert!(path.exists(), "shipped sample.db is missing at {path:?}");
+
+        let driver = SqliteDriver::new(&path, true);
+
+        let customers = driver.describe_table("main", "customers").await.unwrap();
+        let col = |n: &str| customers.columns.iter().any(|c| c.name == n);
+        assert!(col("email") && col("country") && col("signup_date"));
+
+        // A foreign-key-bearing table introspects too, confirming the full schema
+        // round-trips from the on-disk file.
+        let orders = driver.describe_table("main", "orders").await.unwrap();
+        assert!(orders.columns.iter().any(|c| c.name == "total"));
+    }
+
+    #[tokio::test]
     async fn executes_in_transaction_and_exports() {
         let path = temp_db_path("exec");
         {

@@ -25,6 +25,7 @@ mod palette;
 mod plan;
 mod queries;
 mod result;
+mod sample;
 mod schema;
 mod secrets;
 mod settings;

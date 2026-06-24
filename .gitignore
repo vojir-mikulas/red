@@ -4,6 +4,8 @@
 *.db
 *.sqlite
 *.sqlite3
+# …but the shipped sample-database preview is committed (regenerate from sample/sample.sql).
+!sample/sample.db
 
 # Signing material — never commit. Lives only in your keychain / GitHub Secrets.
 *.p12
