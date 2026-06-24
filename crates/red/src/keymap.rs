@@ -619,6 +619,13 @@ pub(crate) fn apply(cx: &mut App, overrides: &[KeymapBlock]) -> Vec<String> {
     cx.clear_key_bindings();
     bind_components(cx);
     cx.bind_keys(default_bindings());
+    // Alt+F4 closes the window — the Windows and (most) Linux convention. It
+    // usually arrives from the OS / compositor, but not every Wayland compositor
+    // binds it, so wire it explicitly. Bound here rather than in `DEFAULTS` so it
+    // stays out of the rebind editor (it's an OS shortcut, not app chrome), and
+    // skipped on macOS, where ⌘Q is the convention and F4 isn't a close key.
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys([KeyBinding::new("alt-f4", crate::Quit, None)]);
     // Dev-only perf HUD toggle (⌥⌘P). Re-bound here so a keymap reload's clear
     // doesn't drop it; the action itself is declared in `main` under the feature.
     #[cfg(feature = "dev-stats")]

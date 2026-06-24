@@ -22,9 +22,19 @@ impl AppState {
     /// terminal error with "Edit connection" on a fatal failure (bad credentials,
     /// missing database), and always a Cancel button — plus "Retry now" while
     /// backing off.
-    fn render_connecting(&self, conn: &Connecting, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_connecting(
+        &self,
+        conn: &Connecting,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme();
         let name = conn.config.name.clone();
+
+        // The splash has no top bar, so float the window controls (Linux/Wayland
+        // only) in the corner; they `None` out where the OS draws its own.
+        let controls = crate::window_chrome::window_controls(window, theme)
+            .map(|c| div().absolute().top(px(14.)).right(px(16.)).child(c));
 
         let status = div().flex().flex_col().items_center().gap_2().w(px(360.));
         let status = match &conn.status {
@@ -124,6 +134,7 @@ impl AppState {
 
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .items_center()
@@ -133,6 +144,7 @@ impl AppState {
             .font_family(theme.font_family.clone())
             .child(status)
             .child(actions)
+            .children(controls)
     }
 }
 
@@ -319,8 +331,8 @@ impl Render for AppState {
         self.ensure_observers(window, cx);
 
         let screen = match &self.phase {
-            Phase::Disconnected => self.render_connect(cx).into_any_element(),
-            Phase::Connecting(conn) => self.render_connecting(conn, cx).into_any_element(),
+            Phase::Disconnected => self.render_connect(window, cx).into_any_element(),
+            Phase::Connecting(conn) => self.render_connecting(conn, window, cx).into_any_element(),
             Phase::Connected(active) => self.render_shell(active, window, cx).into_any_element(),
         };
 
@@ -352,6 +364,10 @@ impl Render for AppState {
         let shortcuts = self.shortcuts_open.then(|| self.render_shortcuts(cx));
 
         let theme = cx.theme();
+        // Copied out now (Hsla is Copy) so the client-decoration frame at the end
+        // of this fn doesn't hold `theme`'s borrow of `cx` across the dev-stats
+        // block's mutable `cx` use below.
+        let frame_border = theme.border;
         let root = div()
             .size_full()
             .relative()
@@ -533,7 +549,10 @@ impl Render for AppState {
             root.children(panel)
         };
 
-        root
+        // On a client-decorated window (Linux/Wayland) this wraps the app in its
+        // own resize border, corner rounding, and shadow; elsewhere it returns
+        // `root` untouched.
+        crate::window_chrome::frame(window, frame_border, root)
     }
 }
 

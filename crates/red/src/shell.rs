@@ -3,7 +3,7 @@
 //! result grid. The split sizes are caller-owned state on [`ActiveConn`].
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Axis, Context, Window, WindowControlArea};
+use gpui::{div, prelude::*, px, Axis, Context, Window};
 
 /// Left inset of the top bar. On macOS it clears the seamless traffic lights
 /// overlapping this strip and leaves a little breathing room between them and
@@ -83,23 +83,16 @@ impl AppState {
             .gap_2()
             .children(self.render_update_pill(cx))
             .child(disconnect)
-            .child(settings_gear);
+            .child(settings_gear)
+            // On a client-decorated window (Linux/Wayland) our own min/max/close
+            // buttons live here; `None` on macOS/Windows where the OS draws them.
+            .children(crate::window_chrome::window_controls(window, &theme));
 
         // The top bar doubles as the window drag region (seamless traffic lights
         // sit in the left inset); interactive children keep their own hitboxes.
-        let topbar = div()
-            .id("topbar")
-            .window_control_area(WindowControlArea::Drag)
-            // Double-clicking the drag region performs the native titlebar action
-            // (zoom/minimize per System Settings on macOS); other platforms zoom.
-            .on_click(|event, window, _| {
-                if event.click_count() == 2 {
-                    #[cfg(target_os = "macos")]
-                    window.titlebar_double_click();
-                    #[cfg(not(target_os = "macos"))]
-                    window.zoom_window();
-                }
-            })
+        // `draggable` wires the move grab (macOS uses the hit-test; Linux uses an
+        // explicit `start_window_move`) and the double-click zoom.
+        let topbar = crate::window_chrome::draggable(div().id("topbar"), window, view.clone())
             .flex_shrink_0()
             .h(px(38.))
             .flex()

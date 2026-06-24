@@ -6,8 +6,7 @@
 use flint::prelude::*;
 use flint::Theme;
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, Role, SharedString,
-    WindowControlArea,
+    div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, Role, SharedString, Window,
 };
 use red_core::DbKind;
 
@@ -98,7 +97,11 @@ impl AppState {
             .child(edit_file)
     }
 
-    pub(crate) fn render_connect(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_connect(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // Build the cards first — they reborrow `cx` mutably — then read the theme
         // for the surrounding chrome (it holds an immutable borrow). The form modal
         // is rendered at the root (see `render.rs`) so it works in any phase.
@@ -237,25 +240,24 @@ impl AppState {
         // mirroring the connected shell, where dragging is confined to the topbar.
         // The rest of the welcome screen stays clickable without moving the window.
         // It sits in the column's empty top padding, behind the settings gear.
-        let drag_strip = div()
-            .id("connect-drag")
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .h(px(38.))
-            .window_control_area(WindowControlArea::Drag)
-            .on_click(|event, window, _| {
-                if event.click_count() == 2 {
-                    #[cfg(target_os = "macos")]
-                    window.titlebar_double_click();
-                    #[cfg(not(target_os = "macos"))]
-                    window.zoom_window();
-                }
-            });
+        let drag_strip = crate::window_chrome::draggable(
+            div().id("connect-drag"),
+            window,
+            cx.entity().downgrade(),
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .h(px(38.));
+
+        // Built before `render_update_pill` (which reborrows `cx` mutably) so the
+        // `theme` borrow it needs is released first. `None` off Linux/Wayland.
+        let controls = crate::window_chrome::window_controls(window, theme);
 
         // Settings gear floats top-right (the disconnected screen has no top bar).
-        // The self-update pill sits to its left so it never covers the gear.
+        // The self-update pill sits to its left so it never covers the gear; the
+        // window controls (Linux/Wayland only) sit to its right.
         let gear = div()
             .absolute()
             .top(px(14.))
@@ -264,7 +266,8 @@ impl AppState {
             .items_center()
             .gap_2()
             .children(self.render_update_pill(cx))
-            .child(settings_gear);
+            .child(settings_gear)
+            .children(controls);
 
         div()
             .size_full()

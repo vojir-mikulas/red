@@ -755,6 +755,10 @@ pub struct AppState {
     /// Set when an overlay closed: the next render pulls focus back to the root
     /// so the global ⌘K keeps dispatching (see `close_palette`).
     pub(crate) refocus_root: bool,
+    /// Armed on mouse-down in the titlebar/drag strip; the first drag motion
+    /// then starts a compositor window-move (client-side decorations only — see
+    /// `window_chrome::draggable`). A plain click clears it without moving.
+    pub(crate) titlebar_drag: bool,
     /// Whether the keyboard-shortcuts reference overlay (`⌘/`) is showing.
     pub(crate) shortcuts_open: bool,
     /// Keyboard-highlighted saved-connection card on the disconnected screen.
@@ -1348,6 +1352,7 @@ impl AppState {
             next_active_seq: 0,
             // Focus the root on first paint so the very first ⌘K dispatches.
             refocus_root: true,
+            titlebar_drag: false,
             shortcuts_open: false,
             connect_sel: 0,
             connect_search,

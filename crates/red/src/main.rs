@@ -33,6 +33,7 @@ mod settings_watch;
 mod shell;
 mod sql;
 mod theme;
+mod window_chrome;
 
 use gpui::{prelude::*, App, Bounds, TitlebarOptions, WindowBounds, WindowOptions};
 use gpui_platform::application;
@@ -93,6 +94,12 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(gpui::size(gpui::px(720.), gpui::px(480.))),
                 titlebar: Some(titlebar_options()),
+                // On Linux (GNOME/Wayland in particular) the compositor draws no
+                // titlebar, so we ask for client-side decorations and paint our
+                // own controls + resize borders (see `window_chrome`). macOS and
+                // Windows keep their native frame (the default, `Server`).
+                #[cfg(target_os = "linux")]
+                window_decorations: Some(gpui::WindowDecorations::Client),
                 ..Default::default()
             },
             |_, cx| cx.new(|cx| AppState::new(cx, service, events)),
