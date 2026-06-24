@@ -11,9 +11,11 @@
 //!
 //! See `examples/spike.rs` for a standalone end-to-end run against a real agent.
 
+mod auth;
 mod conversation;
 mod types;
 
+pub use auth::{auth_status, logout, run_login, AuthStatus, LoginEvent};
 pub use conversation::AcpConversation;
 pub use types::{
     AcpCommand, AcpConfig, AcpConfigCategory, AcpConfigChoice, AcpConfigOption, AcpDelta, AcpError,

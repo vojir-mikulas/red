@@ -1051,6 +1051,30 @@ impl AppState {
         cx.notify();
     }
 
+    /// ⌘A: select the whole result — every row and every data column. Like
+    /// [`Self::result_select_column`] the selection spans the full result, so
+    /// copying it re-fetches the off-window rows in full (see
+    /// [`ResultGrid::copy_plan`]). Anchored top-left, focused bottom-right, both in
+    /// table-column space (the gutter sits at column 0). No-op until the result is
+    /// ready and has columns.
+    pub(crate) fn result_select_all(&mut self, cx: &mut Context<Self>) {
+        let gutter = self.gutter();
+        if let Phase::Connected(active) = &mut self.phase {
+            if let Some(grid) = active.active_result_mut() {
+                if !grid.ready || grid.error.is_some() || grid.columns.is_empty() {
+                    return;
+                }
+                let last = grid.total.saturating_sub(1);
+                let last_col = grid.columns.len() + gutter - 1;
+                grid.selection = Some(CellRange {
+                    anchor: (0, gutter),
+                    focus: (last, last_col),
+                });
+            }
+        }
+        cx.notify();
+    }
+
     /// Prompt for a save path, then stream the active tab's result there in `format`.
     pub(crate) fn export_result(&mut self, format: ExportFormat, cx: &mut Context<Self>) {
         let epoch = match &self.phase {
@@ -1105,9 +1129,14 @@ impl AppState {
             Notification {
                 id: 0,
                 variant: ToastVariant::Info,
-                message: "Exporting… 0%".into(),
+                message: "Exporting…".into(),
+                detail: None,
+                detail_label: None,
                 auto_dismiss: None,
                 export: Some(ExportProgress { id, rows: 0, total }),
+                expanded: false,
+                hovered: false,
+                dismiss_gen: 0,
             },
             cx,
         );

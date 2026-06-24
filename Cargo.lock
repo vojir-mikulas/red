@@ -2485,7 +2485,6 @@ dependencies = [
 [[package]]
 name = "flint"
 version = "0.1.0"
-source = "git+https://github.com/vojir-mikulas/flint?rev=8188317b3b63d55b9d5f831cf567e2f09cf3c4cb#8188317b3b63d55b9d5f831cf567e2f09cf3c4cb"
 dependencies = [
  "gpui",
  "unicode-segmentation",
@@ -6239,7 +6238,9 @@ name = "red-acp"
 version = "0.11.0"
 dependencies = [
  "agent-client-protocol",
+ "serde",
  "serde_json",
+ "shell-words",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -8117,6 +8118,7 @@ dependencies = [
  "libc",
  "mio 1.2.1",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2 0.6.4",
  "tokio-macros",
  "windows-sys 0.61.2",

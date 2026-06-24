@@ -34,7 +34,7 @@ use gpui::{
     PathPromptOptions, Pixels, ScrollHandle, SharedString, WeakEntity, Window, WindowAppearance,
 };
 use red_core::{ConnectionConfig, DbKind, EditOp, UpdateState};
-use red_service::{Command, Event, ServiceHandle, SessionId, UpdateConfig};
+use red_service::{AiAuthStatus, Command, Event, ServiceHandle, SessionId, UpdateConfig};
 
 use crate::config::{self, StoredConnection};
 use crate::palette::{Cmd, PromptKind};
@@ -293,12 +293,24 @@ pub(crate) struct ExportProgress {
 /// One notification in the bottom-right stack. The stack is newest-last (nearest
 /// the corner); `auto_dismiss` drives the per-toast timer (`None` = persists until
 /// closed); `export` is set only on the export-progress toast.
+///
+/// `message` is the title; `detail` is an optional secondary body. When `detail`
+/// is set we also build a `detail_label` — a selectable, copyable view of that
+/// text — so the user can highlight part of a long message and ⌘/Ctrl+C it.
+/// `expanded` toggles the collapse of a long body; `hovered` pauses the
+/// auto-dismiss timer while the pointer is over the toast (`dismiss_gen` makes a
+/// re-armed timer cancel any stale one).
 pub(crate) struct Notification {
     pub id: u64,
     pub variant: ToastVariant,
     pub message: SharedString,
+    pub detail: Option<SharedString>,
+    pub detail_label: Option<Entity<SelectableLabel>>,
     pub auto_dismiss: Option<Duration>,
     pub export: Option<ExportProgress>,
+    pub expanded: bool,
+    pub hovered: bool,
+    pub dismiss_gen: u64,
 }
 
 /// The default editor text a fresh query tab opens with. A tab still holding
@@ -591,6 +603,17 @@ pub struct AppState {
     pub(crate) ai_key_editing: Option<String>,
     /// Set when an agent key row just opened: the next render focuses `ai_key_input`.
     pub(crate) focus_ai_key: bool,
+    /// Last-known subscription sign-in identity per ACP agent id, shown in Settings →
+    /// AI. Filled by `AiAgentAuthStatus`; absent until the agent is first checked.
+    pub(crate) ai_auth: HashMap<String, AiAuthStatus>,
+    /// The in-flight interactive subscription sign-in (paste-code), if any — one at a
+    /// time. The pasted code lives in the shared `ai_login_code` field.
+    pub(crate) ai_login: Option<AiLoginFlow>,
+    /// Shared field for the pasted OAuth code during an ACP sign-in (mirrors
+    /// `ai_key_input`). Enter submits the code; Esc cancels the sign-in.
+    pub(crate) ai_login_code: Entity<TextInput>,
+    /// Set when a sign-in prompt just appeared: the next render focuses `ai_login_code`.
+    pub(crate) focus_login_code: bool,
     /// Monotonic id source for assistant conversations, so the backend keeps each
     /// panel's turn history separate.
     pub(crate) next_conversation_id: u64,
@@ -887,6 +910,22 @@ pub(crate) struct AgentInfo {
     pub is_acp: bool,
 }
 
+/// The state of an in-flight subscription sign-in shown inline in Settings → AI.
+/// The pasted code itself lives in the shared `ai_login_code` field; this tracks
+/// which agent the flow is for, the authorize URL once the agent CLI prints it, and
+/// whether a code has been submitted (so the field/buttons disable while it
+/// exchanges). Paste-code OAuth: the user authorizes at `url`, then pastes the code.
+#[derive(Debug, Clone)]
+pub(crate) struct AiLoginFlow {
+    pub agent_id: String,
+    /// The browser authorize URL, once known (the agent CLI also opens it itself).
+    pub url: Option<String>,
+    /// True after a code was submitted — disables the field until it resolves.
+    pub submitting: bool,
+    /// A failure from a prior submit (wrong/expired code), shown inline.
+    pub error: Option<String>,
+}
+
 /// The usable agents in config order: an ACP agent is always usable (it owns its
 /// auth); an API agent only once it has a key. Drives the panel's selector and the
 /// setup-vs-chat gate. Built from [`ai_config`] so it agrees exactly with what the
@@ -1173,6 +1212,20 @@ impl AppState {
         )
         .detach();
 
+        // Shared field for the pasted OAuth code during an ACP subscription sign-in.
+        // Enter submits the code; Esc cancels the sign-in.
+        let ai_login_code =
+            cx.new(|cx| TextInput::new(cx).with_placeholder("paste the code from your browser"));
+        cx.subscribe(
+            &ai_login_code,
+            |this, _, event: &TextInputEvent, cx| match event {
+                TextInputEvent::Submit => this.submit_login_code(cx),
+                TextInputEvent::Cancel => this.cancel_login(cx),
+                _ => {}
+            },
+        )
+        .detach();
+
         // The connection switcher (⌘P). Seed its sections off the just-loaded
         // connections; `rebuild_switcher` refreshes them on every connect/disconnect.
         let switcher = cx.new(|cx| {
@@ -1311,6 +1364,10 @@ impl AppState {
             ai_key_input,
             ai_key_editing: None,
             focus_ai_key: false,
+            ai_auth: HashMap::new(),
+            ai_login: None,
+            ai_login_code,
+            focus_login_code: false,
             next_conversation_id: 0,
             filter_bar: None,
             find_bar: None,
@@ -1454,8 +1511,45 @@ impl AppState {
                 id: 0,
                 variant,
                 message: message.into(),
+                detail: None,
+                detail_label: None,
                 auto_dismiss,
                 export: None,
+                expanded: false,
+                hovered: false,
+                dismiss_gen: 0,
+            },
+            cx,
+        )
+    }
+
+    /// Like [`notify`](Self::notify), but with a secondary `detail` body. The
+    /// detail becomes a selectable, copyable, collapsible block — use it for the
+    /// long, copy-worthy text (a query error, a driver message) while `title`
+    /// stays a short headline.
+    pub(crate) fn notify_detail(
+        &mut self,
+        variant: ToastVariant,
+        title: impl Into<SharedString>,
+        detail: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> u64 {
+        let auto_dismiss = match variant {
+            ToastVariant::Info | ToastVariant::Success => Some(TOAST_AUTO_DISMISS),
+            ToastVariant::Warning | ToastVariant::Error => None,
+        };
+        self.push_notification(
+            Notification {
+                id: 0,
+                variant,
+                message: title.into(),
+                detail: Some(detail.into()),
+                detail_label: None,
+                auto_dismiss,
+                export: None,
+                expanded: false,
+                hovered: false,
+                dismiss_gen: 0,
             },
             cx,
         )
@@ -1472,6 +1566,13 @@ impl AppState {
         let id = self.next_notification_id;
         self.next_notification_id += 1;
         notification.id = id;
+        // Build the selectable view of the detail body once, up front, so the
+        // renderer just clones the handle each frame.
+        if notification.detail_label.is_none() {
+            if let Some(detail) = notification.detail.clone() {
+                notification.detail_label = Some(cx.new(|cx| SelectableLabel::new(detail, cx)));
+            }
+        }
         let auto_dismiss = notification.auto_dismiss;
         self.notifications.push(notification);
         // Persistent (error / warning) toasts are removed only by a user click, so
@@ -1489,14 +1590,70 @@ impl AppState {
             self.notifications.remove(stale);
         }
         if let Some(delay) = auto_dismiss {
-            cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                cx.background_executor().timer(delay).await;
-                this.update(cx, |this, cx| this.dismiss(id, cx)).ok();
-            })
-            .detach();
+            self.arm_dismiss(id, delay, cx);
         }
         cx.notify();
         id
+    }
+
+    /// Arm (or re-arm) the auto-dismiss timer for a transient toast. Bumping the
+    /// notification's `dismiss_gen` invalidates any timer already in flight, so a
+    /// hover-driven re-arm can't be undone by a stale one; the timer also no-ops
+    /// if the toast is hovered when it fires (the un-hover will re-arm it).
+    fn arm_dismiss(&mut self, id: u64, delay: Duration, cx: &mut Context<Self>) {
+        let Some(notification) = self.notifications.iter_mut().find(|n| n.id == id) else {
+            return;
+        };
+        notification.dismiss_gen += 1;
+        let generation = notification.dismiss_gen;
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |this, cx| {
+                let still_armed = this
+                    .notifications
+                    .iter()
+                    .find(|n| n.id == id)
+                    .is_some_and(|n| n.dismiss_gen == generation && !n.hovered);
+                if still_armed {
+                    this.dismiss(id, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Pause/resume a transient toast's auto-dismiss as the pointer enters/leaves,
+    /// so a message can be read, selected and copied without it vanishing.
+    pub(crate) fn set_notification_hovered(
+        &mut self,
+        id: u64,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let re_arm = {
+            let Some(notification) = self.notifications.iter_mut().find(|n| n.id == id) else {
+                return;
+            };
+            if notification.hovered == hovered {
+                return;
+            }
+            notification.hovered = hovered;
+            // Leaving a transient toast restarts its full dwell timer.
+            (!hovered).then_some(notification.auto_dismiss).flatten()
+        };
+        if let Some(delay) = re_arm {
+            self.arm_dismiss(id, delay, cx);
+        }
+        cx.notify();
+    }
+
+    /// Flip the expand/collapse state of a toast with a long body.
+    pub(crate) fn toggle_notification_expanded(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(notification) = self.notifications.iter_mut().find(|n| n.id == id) {
+            notification.expanded = !notification.expanded;
+            cx.notify();
+        }
     }
 
     /// Remove the notification with `id` (its close button, or a fired timer).
@@ -1563,11 +1720,12 @@ impl AppState {
                 }
             }
             Event::Error(message) => {
-                // Log the full text to stderr (RUST_LOG) — a toast is ephemeral and
-                // can truncate, so the console keeps the complete error to inspect.
+                // Log the full text to stderr (RUST_LOG) too. The toast carries it
+                // as a selectable, expandable detail body, so a long backend error
+                // can be read in full, highlighted and copied straight from it.
                 tracing::error!(?session, "{message}");
                 self.on_result_error(session, &message);
-                self.notify(ToastVariant::Error, message, cx);
+                self.notify_detail(ToastVariant::Error, "Error", message, cx);
             }
 
             // --- schema explorer ---
@@ -1680,6 +1838,15 @@ impl AppState {
                 conversation_id,
                 options,
             } => self.on_ai_config_options_available(conversation_id, options, cx),
+            Event::AiLoginPrompt { agent_id, url } => self.on_ai_login_prompt(agent_id, url, cx),
+            Event::AiLoginFinished {
+                agent_id,
+                ok,
+                message,
+            } => self.on_ai_login_finished(agent_id, ok, message, cx),
+            Event::AiAgentAuthStatus { agent_id, status } => {
+                self.on_ai_agent_auth_status(agent_id, status, cx)
+            }
 
             // The streaming `Query`/`FetchMore` path stays in the protocol for
             // headless use + tests; the UI now drives results via `OpenResult`.

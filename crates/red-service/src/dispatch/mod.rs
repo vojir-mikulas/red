@@ -455,18 +455,56 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::AiReauthenticateAgent { agent_id } => {
-                // Re-auth from Settings (M-S4): only meaningful for an ACP agent.
-                // Spawn it for a fresh handshake — which pops the agent's own login
-                // when it isn't signed in — then force idle conversations to
-                // re-handshake. Off the loop like the other ACP calls.
+                // Start an interactive sign-in from Settings: only meaningful for an
+                // ACP agent. The relay drives the agent CLI's paste-code flow and
+                // emits `AiLoginPrompt`/`AiLoginFinished`. Off the loop like the
+                // other ACP calls. Sign-in is account-global, not cwd-dependent.
                 if let Some(AiProfileRuntime::Acp { command }) = ai_agents.get(&agent_id) {
                     let command = command.clone();
-                    // The agent loads its own config (and login) from cwd; use the
-                    // process working directory, matching the turn path.
-                    let cwd =
-                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
-                    let manager = ai_acp.clone();
-                    tokio::spawn(crate::acp::reauthenticate_agent(manager, command, cwd));
+                    tokio::spawn(crate::acp::start_login(
+                        ai_acp.clone(),
+                        command,
+                        agent_id,
+                        events.clone(),
+                    ));
+                }
+            }
+
+            Command::AiSubmitLoginCode { agent_id, code } => {
+                // Deliver the pasted OAuth code to the in-flight sign-in. Off the
+                // loop — taking the manager lock awaits.
+                let manager = ai_acp.clone();
+                tokio::spawn(
+                    async move { manager.lock().await.submit_login_code(&agent_id, code) },
+                );
+            }
+
+            Command::AiCancelLogin { agent_id } => {
+                // Abandon an in-flight sign-in (kills the CLI). Off the loop.
+                let manager = ai_acp.clone();
+                tokio::spawn(async move { manager.lock().await.cancel_login(&agent_id) });
+            }
+
+            Command::AiSignOutAgent { agent_id } => {
+                if let Some(AiProfileRuntime::Acp { command }) = ai_agents.get(&agent_id) {
+                    let command = command.clone();
+                    tokio::spawn(crate::acp::sign_out(
+                        ai_acp.clone(),
+                        command,
+                        agent_id,
+                        events.clone(),
+                    ));
+                }
+            }
+
+            Command::AiCheckAuthStatus { agent_id } => {
+                if let Some(AiProfileRuntime::Acp { command }) = ai_agents.get(&agent_id) {
+                    let command = command.clone();
+                    tokio::spawn(crate::acp::check_auth_status(
+                        command,
+                        agent_id,
+                        events.clone(),
+                    ));
                 }
             }
 

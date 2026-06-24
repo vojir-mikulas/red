@@ -3,16 +3,15 @@
 //! close-with-unsaved-work).
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Focusable, KeyDownEvent, Render, Window};
+use gpui::{div, prelude::*, px, ClipboardItem, Focusable, KeyDownEvent, Render, Window};
 
 use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::keymap::{
     About, AddRow, BeginEdit, CloseInspector, CloseTab, CycleFocusNext, CycleFocusPrev, DeleteRow,
     Explain, FindInResult, FocusEditor, FocusGrid, FocusSchema, NewConnection, NewTab, NextTab,
-    OpenSavedQueries,
-    PrevTab, RefreshSchema, ReportBug, RevertChanges, RunQuery, SaveQuery, SearchSchema, SetNull,
-    Settings, ShowShortcuts, SubmitChanges, SwitchConnection, ToggleAssistant, ToggleFilter,
-    ToggleInspector, ToggleSidebar,
+    OpenSavedQueries, PrevTab, RefreshSchema, ReportBug, RevertChanges, RunQuery, SaveQuery,
+    SearchSchema, SelectAll, SetNull, Settings, ShowShortcuts, SubmitChanges, SwitchConnection,
+    ToggleAssistant, ToggleFilter, ToggleInspector, ToggleSidebar,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
@@ -232,6 +231,12 @@ impl Render for AppState {
             window.focus(&self.ai_key_input.focus_handle(cx), cx);
         }
 
+        // A subscription sign-in prompt just appeared; focus its code field.
+        if self.focus_login_code {
+            self.focus_login_code = false;
+            window.focus(&self.ai_login_code.focus_handle(cx), cx);
+        }
+
         // An inline cell edit just opened in the inspector (Track B5) — focus its
         // field so the user types the new value immediately.
         if self.focus_inspector_edit {
@@ -388,9 +393,9 @@ impl Render for AppState {
                 this.toggle_assistant(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleFilter, _, cx| this.toggle_filter_bar(cx)))
-            .on_action(cx.listener(|this, _: &FindInResult, window, cx| {
-                this.toggle_find_bar(window, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &FindInResult, window, cx| this.toggle_find_bar(window, cx)),
+            )
             // Saved queries (B3): ⇧⌘S opens the name prompt; ⇧⌘O the picker.
             .on_action(cx.listener(|this, _: &SaveQuery, _, cx| this.open_save_prompt(cx)))
             .on_action(cx.listener(|this, _: &OpenSavedQueries, _, cx| this.open_saved_picker(cx)))
@@ -448,6 +453,7 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &DeleteRow, _, cx| this.toggle_delete_rows(cx)))
             .on_action(cx.listener(|this, _: &AddRow, _, cx| this.add_draft_row(cx)))
             .on_action(cx.listener(|this, _: &SetNull, _, cx| this.set_cell_null(cx)))
+            .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.result_select_all(cx)))
             // ⌘↵ runs the active tab's query from any pane — or tests the connection
             // while the form is open. ⌘N on the welcome screen adds a connection.
             .on_action(cx.listener(|this, _: &RunQuery, _, cx| {
@@ -634,13 +640,88 @@ impl AppState {
             );
         }
 
+        let icon_size = theme.scale(14.);
+        let action_size = theme.scale(13.);
+        let action_tone = theme.text_muted;
+
         for n in self.notifications.iter().skip(hidden) {
             let id = n.id;
+            // Variant → leading icon + tone. An in-flight export shows a download
+            // glyph regardless of its (Info) variant.
+            let (icon_name, tone) = if n.export.is_some() {
+                ("download", theme.accent)
+            } else {
+                match n.variant {
+                    ToastVariant::Error => ("alert-triangle", theme.red),
+                    ToastVariant::Warning => ("alert-triangle", theme.yellow),
+                    ToastVariant::Success => ("check", theme.green),
+                    ToastVariant::Info => ("sparkles", theme.accent),
+                }
+            };
+
+            let weak = cx.entity().downgrade();
+            // Trailing controls: a copy button (plain toasts) and a close/cancel
+            // button (always). Export progress isn't worth copying.
+            let close = IconButton::new(
+                ("toast-close", id),
+                crate::icons::icon("x", action_size, action_tone),
+            )
+            .size(IconButtonSize::Sm)
+            .on_click({
+                let weak = weak.clone();
+                move |_, _, cx| {
+                    weak.update(cx, |this, cx| this.close_notification(id, cx))
+                        .ok();
+                }
+            });
+            let mut actions = div().flex().items_center().gap_1();
+            if n.export.is_none() {
+                let copy_text = match &n.detail {
+                    Some(detail) => format!("{}\n{}", n.message, detail),
+                    None => n.message.to_string(),
+                };
+                actions = actions.child(
+                    IconButton::new(
+                        ("toast-copy", id),
+                        crate::icons::icon("copy", action_size, action_tone),
+                    )
+                    .size(IconButtonSize::Sm)
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                    }),
+                );
+            }
+            actions = actions.child(close);
+
             // The notification id doubles as the toast's a11y id, so each toast
             // becomes a (polite/assertive) live region screen readers announce.
             let mut toast = Toast::new(n.message.clone())
                 .id(("toast", id))
-                .variant(n.variant);
+                .variant(n.variant)
+                .width(px(280.))
+                .icon(crate::icons::icon(icon_name, icon_size, tone))
+                .actions(actions);
+
+            if let Some(label) = &n.detail_label {
+                toast = toast.detail_element(label.clone());
+                // Only offer the toggle for a genuinely long body, so "Show more"
+                // never reveals nothing.
+                let long = n
+                    .detail
+                    .as_ref()
+                    .is_some_and(|d| d.len() > 120 || d.contains('\n'));
+                if long {
+                    let weak = weak.clone();
+                    toast = toast
+                        .expandable(true)
+                        .expanded(n.expanded)
+                        .on_toggle(move |_, cx| {
+                            weak.update(cx, |this, cx| this.toggle_notification_expanded(id, cx))
+                                .ok();
+                        });
+                }
+            }
+
             if let Some(export) = &n.export {
                 let fraction = if export.total > 0 {
                     export.rows as f32 / export.total as f32
@@ -649,11 +730,22 @@ impl AppState {
                 };
                 toast = toast.progress(fraction);
             }
-            let weak = cx.entity().downgrade();
-            col = col.child(toast.on_close(move |_, cx| {
-                weak.update(cx, |this, cx| this.close_notification(id, cx))
-                    .ok();
-            }));
+
+            // Wrap the toast so hovering it pauses the auto-dismiss timer (so a
+            // message can be read / selected / copied without it vanishing).
+            let hover_weak = cx.entity().downgrade();
+            col = col.child(
+                div()
+                    .id(("toast-wrap", id))
+                    .on_hover(move |hovered, _, cx| {
+                        hover_weak
+                            .update(cx, |this, cx| {
+                                this.set_notification_hovered(id, *hovered, cx)
+                            })
+                            .ok();
+                    })
+                    .child(toast),
+            );
         }
 
         col

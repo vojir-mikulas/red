@@ -603,9 +603,10 @@ impl AppState {
             .when_some(self.render_filter_bar(cx), |c, bar| c.child(bar))
             // The find bar (Track B2, Tier 1) sits alongside the filter bar; it
             // only highlights loaded rows, so the grid below just repaints.
-            .when_some(self.render_find_bar(crate::find::FindTarget::Grid, cx), |c, bar| {
-                c.child(bar)
-            })
+            .when_some(
+                self.render_find_bar(crate::find::FindTarget::Grid, cx),
+                |c, bar| c.child(bar),
+            )
             .child(
                 div()
                     .flex_1()

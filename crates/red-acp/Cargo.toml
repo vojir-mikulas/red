@@ -15,8 +15,15 @@ authors.workspace = true
 agent-client-protocol = { workspace = true, features = ["unstable"] }
 thiserror.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+# `process`/`io-util`/`time` drive the agent's bundled CLI for subscription auth
+# (`--cli auth status|login|logout`): spawn it, parse its stdout, feed the pasted
+# OAuth code to its stdin, all with timeouts. `sync`/`rt`/`macros` as before.
+tokio = { workspace = true, features = ["sync", "rt", "macros", "process", "io-util", "time"] }
+# Parse the `auth status --json` payload (login state / email / subscription).
+serde = { workspace = true }
+serde_json.workspace = true
+# Split the configured agent command into argv (same rules as the ACP SDK).
+shell-words.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
-serde_json.workspace = true

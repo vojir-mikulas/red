@@ -23,8 +23,8 @@ use crate::ai::{system_prompt, tool_catalog, user_turn, ReportSink};
 use crate::dispatch::{emit, Events};
 use crate::mcp::McpServer;
 use crate::protocol::{
-    AiCommand, AiConfigCategory, AiConfigChoice, AiConfigOption, AiContext, AiDelta, AiUsage,
-    ReportTheme,
+    AiAuthStatus, AiCommand, AiConfigCategory, AiConfigChoice, AiConfigOption, AiContext, AiDelta,
+    AiUsage, ReportTheme,
 };
 use crate::{Event, SessionId};
 
@@ -78,6 +78,14 @@ pub(crate) struct AcpManager {
     /// after the `Conversation` itself is dropped — that's the point: it has to
     /// outlive the dead agent to bound how often it comes back.
     restarts: HashMap<u64, RestartTracker>,
+    /// In-flight interactive sign-ins (paste-code OAuth), keyed by agent id. The
+    /// login relay parks the CLI's code sink here; `AiSubmitLoginCode` takes it out
+    /// and fires it. Bounded by the number of agents. The `u64` token lets a login
+    /// clear only *its own* entry, so a sign-in restarted for the same agent (which
+    /// replaces and cancels the old one) can't have its successor cleared out from
+    /// under it when the cancelled predecessor finishes.
+    logins: HashMap<String, (u64, oneshot::Sender<String>)>,
+    next_login_token: u64,
 }
 
 /// Cap on outstanding (un-answered) permission prompts. The UI serializes one
@@ -170,6 +178,39 @@ impl AcpManager {
         }
     }
 
+    /// Park the code sink for an interactive sign-in, returning a token that
+    /// identifies *this* attempt. Replaces any prior sign-in for the agent (dropping
+    /// its sink, which cancels it).
+    fn park_login(&mut self, agent_id: String, code: oneshot::Sender<String>) -> u64 {
+        let token = self.next_login_token;
+        self.next_login_token += 1;
+        self.logins.insert(agent_id, (token, code));
+        token
+    }
+
+    /// Deliver the pasted OAuth code to the in-flight sign-in for `agent_id`. A
+    /// stale submit (no sign-in running, or it already finished) is a no-op.
+    pub(crate) fn submit_login_code(&mut self, agent_id: &str, code: String) {
+        if let Some((_, sink)) = self.logins.remove(agent_id) {
+            let _ = sink.send(code);
+        }
+    }
+
+    /// Cancel an in-flight sign-in for `agent_id` (drops its sink → the CLI is
+    /// killed). A no-op if none is running.
+    pub(crate) fn cancel_login(&mut self, agent_id: &str) {
+        self.logins.remove(agent_id);
+    }
+
+    /// Drop the parked sink for a finished sign-in, but only if it's still the one
+    /// this attempt parked (matching `token`) — a sign-in restarted for the same
+    /// agent installs a fresh token, so the stale predecessor's cleanup is skipped.
+    fn clear_login(&mut self, agent_id: &str, token: u64) {
+        if self.logins.get(agent_id).is_some_and(|(t, _)| *t == token) {
+            self.logins.remove(agent_id);
+        }
+    }
+
     /// Mark a turn finished: clear the in-flight guard and reset the idle clock so
     /// the conversation stays warm for [`IDLE_TEARDOWN`] after each reply.
     fn finish_turn(&mut self, conversation_id: u64) {
@@ -249,6 +290,8 @@ impl AcpManager {
             self.conversations.clear();
         }
         self.restarts.clear();
+        // Dropping the parked code sinks cancels any in-flight sign-in.
+        self.logins.clear();
     }
 }
 
@@ -384,38 +427,100 @@ pub(crate) async fn run_turn(
     }
 }
 
-/// Re-authenticate / switch account for an ACP agent from Settings (M-S4), with no
-/// active conversation needed. Spawns the agent and runs a fresh handshake
-/// (`initialize`, then — if the agent advertises an auth method, i.e. it isn't
-/// signed in — its own `/login`, which pops the agent's browser; Red never sees the
-/// tokens), opens a throwaway session with no grounding, then drops the probe.
-/// Existing idle conversations are then torn down so their next turn re-handshakes
-/// and picks up the new account; an in-flight turn is left running.
-pub(crate) async fn reauthenticate_agent(
+/// Drive an interactive subscription sign-in for an ACP agent from Settings. The
+/// agent's bundled CLI runs a paste-code OAuth flow: it opens the browser to an
+/// authorize URL (relayed as `AiLoginPrompt`), then waits for the code the user
+/// pastes. We park a code sink the UI fires via `AiSubmitLoginCode`, relay the
+/// CLI's lifecycle as `AiLoginPrompt`/`AiLoginFinished`, and on success force idle
+/// conversations to re-handshake so they adopt the (possibly switched) account.
+/// Red never sees the OAuth tokens — the CLI owns them.
+pub(crate) async fn start_login(
     manager: Arc<tokio::sync::Mutex<AcpManager>>,
     command: String,
-    cwd: PathBuf,
+    agent_id: String,
+    events: Events,
 ) {
-    let config = AcpConfig {
-        command,
-        cwd,
-        // No DB grounding and no relays — this probe only drives the handshake.
-        mcp: None,
-        allow_tools: Vec::new(),
-        permissions: None,
-        commands: None,
-        config: None,
-    };
-    match AcpConversation::start(config).await {
-        Ok(_probe) => {
-            // Handshake done (login popped if it was needed). The `_probe` handle
-            // drops here, tearing the agent down; then force idle conversations to
-            // re-handshake so they adopt the account on their next turn.
-            manager.lock().await.drop_idle();
-            tracing::debug!("ACP re-auth handshake completed");
+    let (code_tx, code_rx) = oneshot::channel::<String>();
+    // Park the code sink (replacing/cancelling any prior sign-in for this agent) and
+    // remember our token so cleanup only touches this attempt.
+    let token = manager.lock().await.park_login(agent_id.clone(), code_tx);
+
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<red_acp::LoginEvent>();
+    tokio::spawn(red_acp::run_login(command, ev_tx, code_rx));
+
+    while let Some(event) = ev_rx.recv().await {
+        match event {
+            red_acp::LoginEvent::Url(url) => emit(
+                &events,
+                None,
+                Event::AiLoginPrompt {
+                    agent_id: agent_id.clone(),
+                    url,
+                },
+            ),
+            red_acp::LoginEvent::Done(result) => {
+                let (ok, message) = match result {
+                    Ok(()) => (true, String::new()),
+                    Err(message) => (false, message),
+                };
+                {
+                    let mut guard = manager.lock().await;
+                    guard.clear_login(&agent_id, token);
+                    if ok {
+                        // Live chats re-handshake on their next turn to adopt the
+                        // newly signed-in (or switched) account.
+                        guard.drop_idle();
+                    }
+                }
+                emit(
+                    &events,
+                    None,
+                    Event::AiLoginFinished {
+                        agent_id,
+                        ok,
+                        message,
+                    },
+                );
+                break;
+            }
         }
-        Err(e) => tracing::warn!("ACP re-auth handshake failed: {e}"),
     }
+}
+
+/// Ask the agent's bundled CLI who is signed in and emit it as `AiAgentAuthStatus`.
+/// A failure (no CLI, spawn error, non-Claude agent) is logged and reported as
+/// "not signed in" rather than surfaced as an error — Settings just shows a sign-in
+/// affordance.
+pub(crate) async fn check_auth_status(command: String, agent_id: String, events: Events) {
+    let status = match red_acp::auth_status(&command).await {
+        Ok(s) => AiAuthStatus {
+            logged_in: s.logged_in,
+            email: s.email,
+            subscription: s.subscription_type,
+            method: s.auth_method,
+        },
+        Err(e) => {
+            tracing::debug!("acp auth status for {agent_id} unavailable: {e}");
+            AiAuthStatus::default()
+        }
+    };
+    emit(&events, None, Event::AiAgentAuthStatus { agent_id, status });
+}
+
+/// Sign out of an ACP agent's subscription, then re-emit its status so Settings
+/// reflects the change. On success, idle conversations are dropped so they
+/// re-handshake (and find no account) on their next turn.
+pub(crate) async fn sign_out(
+    manager: Arc<tokio::sync::Mutex<AcpManager>>,
+    command: String,
+    agent_id: String,
+    events: Events,
+) {
+    match red_acp::logout(&command).await {
+        Ok(()) => manager.lock().await.drop_idle(),
+        Err(e) => tracing::warn!("acp sign-out for {agent_id} failed: {e}"),
+    }
+    check_auth_status(command, agent_id, events).await;
 }
 
 /// Look up (or lazily start) the conversation's agent, returning a handle and

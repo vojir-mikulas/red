@@ -1315,14 +1315,22 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
     for a in &agents {
         let is_default = a.id == default_id;
         let is_acp = a.kind.eq_ignore_ascii_case("acp");
-        // Status: an ACP agent owns its own auth (always ready); an API agent is
-        // ready only once its key is in the keyring (i.e. it made the usable list).
-        let (status, status_color) = if is_acp {
-            ("ready", theme.text_muted)
+        // The subscription agent's last-known sign-in, once checked (the AI tab asks
+        // on open). API agents have no sign-in — they carry a key.
+        let acp_auth = is_acp.then(|| state.ai_auth.get(a.id.as_str())).flatten();
+        let signed_in = acp_auth.is_some_and(|s| s.logged_in);
+        // Status line: a subscription agent shows who's signed in (or that it isn't);
+        // an API agent shows whether its key is in the keyring.
+        let (status, status_color): (SharedString, gpui::Hsla) = if is_acp {
+            match acp_auth {
+                Some(s) if s.logged_in => (acp_identity(s).into(), theme.accent),
+                Some(_) => ("not signed in".into(), theme.text_faint),
+                None => ("ready".into(), theme.text_muted),
+            }
         } else if usable.contains(a.id.as_str()) {
-            ("key set", theme.accent)
+            ("key set".into(), theme.accent)
         } else {
-            ("no key", theme.text_faint)
+            ("no key".into(), theme.text_faint)
         };
         let id = a.id.clone();
         let row_view = view.clone();
@@ -1368,6 +1376,34 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                     cx.stop_propagation();
                     let id = signin_id.clone();
                     signin_view.update(cx, |this, cx| this.reauthenticate_agent(&id, cx));
+                })
+        });
+        // Sign out — shown only once we know the ACP agent is signed in. (A second
+        // sign-in switches account without signing out first.)
+        let signout = (is_acp && signed_in).then(|| {
+            let signout_id = a.id.clone();
+            let signout_view = view.clone();
+            div()
+                .id(SharedString::from(format!("agent-signout-{}", a.id)))
+                .role(gpui::Role::Button)
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(22.))
+                .px_2()
+                .rounded(px(4.))
+                .border_1()
+                .border_color(theme.border)
+                .text_size(theme.scale(10.5))
+                .text_color(theme.text_muted)
+                .cursor_pointer()
+                .tooltip(flint::Tooltip::text("Sign out of this subscription"))
+                .hover(|s| s.bg(theme.bg_elevated))
+                .child("Sign out")
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    let id = signout_id.clone();
+                    signout_view.update(cx, |this, cx| this.sign_out_agent(&id, cx));
                 })
         });
         // API agents authenticate with a key (kept in the OS keyring, never the
@@ -1444,12 +1480,18 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                     )
                 })
                 .when_some(key_btn, |row, b| row.child(b))
+                .when_some(signout, |row, b| row.child(b))
                 .when_some(signin, |row, b| row.child(b))
                 .on_click(move |_, _, cx| {
                     let id = id.clone();
                     row_view.update(cx, |this, cx| this.set_default_agent(&id, cx));
                 }),
         );
+
+        // Inline subscription sign-in (paste-code OAuth) for this agent, when active.
+        if let Some(flow) = state.ai_login.as_ref().filter(|f| f.agent_id == a.id) {
+            list = list.child(login_panel(state, flow, theme, cx));
+        }
 
         // The inline key editor, shown under the row while this API agent is open.
         // Enter (or Save) stores the key; Esc (or Cancel) closes it; Remove clears a
@@ -1500,10 +1542,11 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                 .child(
                     "Pick the agent new chats start on (click a row). Switch a chat's \
                      agent before its first message from the panel. An API agent needs a \
-                     key — use “Add key” (stored in the OS keyring, never in the file). An \
-                     ACP agent owns its own login — use the key button to sign in or switch \
-                     account. Add or remove agents and edit their command / endpoint / \
-                     model in the settings file.",
+                     key — use “Add key” (stored in the OS keyring, never in the file). A \
+                     subscription (ACP) agent signs in through your browser — use the key \
+                     button to sign in or switch account, and “Sign out” to disconnect; the \
+                     row shows who's signed in. Add or remove agents and edit their command \
+                     / endpoint / model in the settings file.",
                 ),
         )
         .child(list)
@@ -1514,6 +1557,113 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                 .on_click(cx.listener(|this, _, _, cx| this.open_settings_file(cx))),
         )
         .into_any_element()
+}
+
+/// A one-line "who's signed in" label for a subscription agent: the email, plus the
+/// subscription tier when known (e.g. `you@example.com · Max`).
+fn acp_identity(status: &red_service::AiAuthStatus) -> String {
+    let mut label = status
+        .email
+        .clone()
+        .unwrap_or_else(|| "signed in".to_string());
+    if let Some(sub) = status.subscription.as_deref().filter(|s| !s.is_empty()) {
+        label.push_str(" · ");
+        let mut chars = sub.chars();
+        if let Some(first) = chars.next() {
+            label.extend(first.to_uppercase());
+            label.push_str(chars.as_str());
+        }
+    }
+    label
+}
+
+/// The inline paste-code sign-in panel shown under an agent's row while a sign-in is
+/// in flight: a prompt, the code field + Submit/Cancel, a manual "open the page"
+/// fallback, and any error from a prior attempt.
+fn login_panel(
+    state: &AppState,
+    flow: &crate::app::AiLoginFlow,
+    theme: &Theme,
+    cx: &mut Context<AppState>,
+) -> AnyElement {
+    let mut panel = div().flex().flex_col().gap_1p5().px_2().pt_1().pb_2();
+    match &flow.url {
+        // The browser hasn't been pointed yet — the backend is starting the CLI.
+        None => {
+            panel = panel.child(
+                div()
+                    .text_size(theme.scale(11.5))
+                    .text_color(theme.text_muted)
+                    .child("Starting sign-in… a browser window will open shortly."),
+            );
+        }
+        Some(url) => {
+            let url_open = url.clone();
+            panel = panel
+                .child(
+                    div()
+                        .text_size(theme.scale(11.5))
+                        .text_color(theme.text_muted)
+                        .child(
+                            "A browser opened to sign in. After authorizing, paste the code \
+                             shown there:",
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(state.ai_login_code.clone()),
+                        )
+                        .child(
+                            Button::new("ai-login-submit", "Submit")
+                                .variant(ButtonVariant::Primary)
+                                .size(ButtonSize::Sm)
+                                .on_click(cx.listener(|this, _, _, cx| this.submit_login_code(cx))),
+                        )
+                        .child(
+                            Button::new("ai-login-cancel", "Cancel")
+                                .variant(ButtonVariant::Secondary)
+                                .size(ButtonSize::Sm)
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("ai-login-open")
+                        .role(gpui::Role::Button)
+                        .cursor_pointer()
+                        .text_size(theme.scale(11.))
+                        .text_color(theme.accent)
+                        .child("Didn't open? Open the sign-in page")
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.open_external(&url_open, cx)),
+                        ),
+                );
+            if flow.submitting {
+                panel = panel.child(
+                    div()
+                        .text_size(theme.scale(11.))
+                        .text_color(theme.text_muted)
+                        .child("Finishing sign-in…"),
+                );
+            }
+        }
+    }
+    if let Some(error) = &flow.error {
+        panel = panel.child(
+            div()
+                .text_size(theme.scale(11.))
+                .text_color(theme.red)
+                .child(error.clone()),
+        );
+    }
+    panel.into_any_element()
 }
 
 fn about_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {

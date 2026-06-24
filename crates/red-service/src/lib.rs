@@ -27,9 +27,9 @@ mod tunnel;
 mod update;
 
 pub use protocol::{
-    AiAgentKind, AiAgentProfile, AiCommand, AiConfig, AiConfigCategory, AiConfigChoice,
-    AiConfigOption, AiContext, AiDelta, AiUsage, Command, Event, ReportTheme, RunFetch, SessionId,
-    SortKey, UpdateConfig,
+    AiAgentKind, AiAgentProfile, AiAuthStatus, AiCommand, AiConfig, AiConfigCategory,
+    AiConfigChoice, AiConfigOption, AiContext, AiDelta, AiUsage, Command, Event, ReportTheme,
+    RunFetch, SessionId, SortKey, UpdateConfig,
 };
 pub use red_acp::DEFAULT_AGENT_COMMAND;
 pub use red_core::{AiLimits, AiPolicy, AiTier};

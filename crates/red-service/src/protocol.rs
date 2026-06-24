@@ -233,13 +233,38 @@ pub enum Command {
         request_id: u64,
         allow: bool,
     },
-    /// Re-authenticate / switch account for an ACP agent, driven from Settings
-    /// (M-S4). The agent owns `/login`, so Red can't drive it directly — instead it
-    /// spawns the agent and runs a fresh ACP handshake, which pops the agent's own
-    /// browser login when it isn't signed in, then drops the probe and forces idle
-    /// conversations to re-handshake so they pick up the new account. A no-op for an
-    /// API agent. Red never touches the subscription tokens.
+    /// Start an interactive subscription sign-in (or account switch) for an ACP
+    /// agent, driven from Settings. The agent's bundled CLI runs a **paste-code**
+    /// OAuth flow: it opens the browser to an authorize URL (relayed as
+    /// `AiLoginPrompt`), the user authorizes there, then submits the code the
+    /// browser shows via [`Command::AiSubmitLoginCode`]. Ends with `AiLoginFinished`.
+    /// A no-op for an API agent (those carry a key, not a login). Red never sees the
+    /// OAuth tokens — the CLI owns them.
     AiReauthenticateAgent {
+        agent_id: String,
+    },
+    /// Submit the OAuth code the user pasted from the browser, completing the sign-in
+    /// started by [`Command::AiReauthenticateAgent`]. Routed to the in-flight login
+    /// by `agent_id`; a stale/duplicate submit is dropped.
+    AiSubmitLoginCode {
+        agent_id: String,
+        code: String,
+    },
+    /// Abandon an in-flight sign-in (the user dismissed the paste prompt). Kills the
+    /// CLI; a no-op if no sign-in is running for `agent_id`.
+    AiCancelLogin {
+        agent_id: String,
+    },
+    /// Sign out of an ACP agent's subscription (clears its stored credential via the
+    /// bundled CLI), then re-checks status so Settings updates. A no-op for an API
+    /// agent.
+    AiSignOutAgent {
+        agent_id: String,
+    },
+    /// Ask who is signed in on an ACP agent — answered with `AiAgentAuthStatus`.
+    /// Sent when Settings → AI opens and after a sign-in/out. A no-op for an API
+    /// agent.
+    AiCheckAuthStatus {
         agent_id: String,
     },
     /// Change a session config selector (model / reasoning) on the subscription path.
@@ -475,6 +500,26 @@ pub enum Event {
         conversation_id: u64,
         options: Vec<AiConfigOption>,
     },
+    /// An interactive subscription sign-in opened the browser to `url` (paste-code
+    /// flow). The UI shows it so the user can open it manually if needed, then enter
+    /// the code. Scoped to the agent, not a conversation — sign-in lives in Settings.
+    AiLoginPrompt {
+        agent_id: String,
+        url: String,
+    },
+    /// An interactive sign-in finished. `ok` true means a credential was stored;
+    /// otherwise `message` explains the failure (cancelled, wrong code, timeout).
+    AiLoginFinished {
+        agent_id: String,
+        ok: bool,
+        message: String,
+    },
+    /// Who is signed in on an ACP agent, answering `Command::AiCheckAuthStatus` (and
+    /// emitted after a sign-in/out). Drives the identity line in Settings → AI.
+    AiAgentAuthStatus {
+        agent_id: String,
+        status: AiAuthStatus,
+    },
     Error(String),
 }
 
@@ -628,6 +673,20 @@ pub enum AiDelta {
 pub struct AiCommand {
     pub name: String,
     pub description: String,
+}
+
+/// Who (if anyone) is signed in on a subscription (ACP) agent — the
+/// `AiAgentAuthStatus` payload, surfaced in Settings → AI. Resolved by asking the
+/// agent's bundled CLI; Red never sees the OAuth tokens, only this summary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AiAuthStatus {
+    pub logged_in: bool,
+    /// The signed-in account's email, when known.
+    pub email: Option<String>,
+    /// The Claude subscription tier (e.g. `"max"`, `"pro"`), when on claude.ai auth.
+    pub subscription: Option<String>,
+    /// How the agent is authenticated (e.g. `"claude.ai"`, `"console"`).
+    pub method: Option<String>,
 }
 
 /// One session config selector the subscription agent advertises (the

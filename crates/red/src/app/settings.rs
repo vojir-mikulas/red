@@ -364,6 +364,11 @@ impl AppState {
         }
         // Now that the font cache is warm, fill the Appearance dropdowns.
         self.rebuild_settings_pickers(cx);
+        // If we open straight onto the AI tab (its last-used tab), learn who is
+        // signed in on each ACP agent so the rows can show identity.
+        if self.settings_tab == SettingsTab::Ai {
+            self.refresh_acp_auth(false);
+        }
         // Focus the panel so its Esc-to-close is heard and Tab walks its controls
         // (the next render focuses `modal_focus`, the panel's scrim ancestor).
         self.focus_modal = true;
@@ -435,6 +440,11 @@ impl AppState {
 
     pub(crate) fn set_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
         self.settings_tab = tab;
+        // Entering the AI tab: learn who is signed in on each ACP agent (lazy — only
+        // agents not yet checked), so the rows can show identity.
+        if tab == SettingsTab::Ai {
+            self.refresh_acp_auth(false);
+        }
         // Leaving (or re-entering) a tab ends any in-flight keymap capture, so the
         // recorder's interceptor never outlives the Keymap tab being visible.
         self.keymap_recording = None;
@@ -869,20 +879,151 @@ impl AppState {
             .send_global(Command::ConfigureAi(crate::app::ai_config(&self.settings)));
     }
 
-    /// Re-authenticate / switch account for an ACP agent from Settings (M-S4). The
-    /// agent owns `/login`, so Red asks the backend to spawn it for a fresh
-    /// handshake — which pops the agent's own browser login when it isn't signed in.
-    /// Session-less: re-auth doesn't need a connected database. A no-op for an API
-    /// agent (those carry their key, not a login).
+    /// Start an interactive subscription sign-in (or account switch) for an ACP agent
+    /// from Settings. The agent's bundled CLI runs a paste-code OAuth flow: it opens
+    /// the browser, then the user pastes the code shown there. We open the inline
+    /// prompt and ask the backend to begin; `AiLoginPrompt`/`AiLoginFinished` drive
+    /// the rest. Session-less. A no-op for an API agent (those carry a key, not a
+    /// login). Red never sees the OAuth tokens.
     pub(crate) fn reauthenticate_agent(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.ai_login_code.update(cx, |i, cx| i.set_content("", cx));
+        self.ai_login = Some(crate::app::AiLoginFlow {
+            agent_id: id.to_string(),
+            url: None,
+            submitting: false,
+            error: None,
+        });
         self.service.send_global(Command::AiReauthenticateAgent {
             agent_id: id.to_string(),
         });
         self.notify(
             ToastVariant::Info,
-            "Signing in — complete it in the browser if it opens.",
+            "Starting sign-in — a browser window will open.",
             cx,
         );
+        cx.notify();
+    }
+
+    /// Submit the OAuth code the user pasted from the browser, completing the sign-in.
+    /// Ignored when no sign-in is open or the field is empty.
+    pub(crate) fn submit_login_code(&mut self, cx: &mut Context<Self>) {
+        let Some(flow) = self.ai_login.as_mut() else {
+            return;
+        };
+        // The code can't be submitted before the browser URL is even known.
+        if flow.url.is_none() {
+            return;
+        }
+        let code = self.ai_login_code.read(cx).content().trim().to_string();
+        if code.is_empty() {
+            return;
+        }
+        let agent_id = flow.agent_id.clone();
+        flow.submitting = true;
+        flow.error = None;
+        self.service
+            .send_global(Command::AiSubmitLoginCode { agent_id, code });
+        cx.notify();
+    }
+
+    /// Abandon an in-flight sign-in (the user dismissed the prompt). Tells the backend
+    /// to kill the CLI and closes the inline panel.
+    pub(crate) fn cancel_login(&mut self, cx: &mut Context<Self>) {
+        if let Some(flow) = self.ai_login.take() {
+            self.service.send_global(Command::AiCancelLogin {
+                agent_id: flow.agent_id,
+            });
+            self.ai_login_code.update(cx, |i, cx| i.set_content("", cx));
+            cx.notify();
+        }
+    }
+
+    /// Sign out of an ACP agent's subscription. The backend clears the credential and
+    /// re-checks status, which updates the row. A no-op for an API agent.
+    pub(crate) fn sign_out_agent(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.service.send_global(Command::AiSignOutAgent {
+            agent_id: id.to_string(),
+        });
+        self.notify(ToastVariant::Info, "Signing out…", cx);
+    }
+
+    /// Ask the backend who is signed in on each usable ACP agent, so Settings → AI can
+    /// show identity. Lazy by default (skips agents already checked); `force` re-asks
+    /// (after a sign-in/out). Called when the AI tab is shown.
+    pub(crate) fn refresh_acp_auth(&mut self, force: bool) {
+        for agent in &self.usable_agents {
+            if agent.is_acp && (force || !self.ai_auth.contains_key(&agent.id)) {
+                self.service.send_global(Command::AiCheckAuthStatus {
+                    agent_id: agent.id.clone(),
+                });
+            }
+        }
+    }
+
+    /// The agent CLI opened the browser to `url` for sign-in (paste-code flow). Stash
+    /// it on the open flow so the panel can offer a manual "open" fallback, and focus
+    /// the code field.
+    pub(crate) fn on_ai_login_prompt(
+        &mut self,
+        agent_id: String,
+        url: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(flow) = self.ai_login.as_mut() {
+            if flow.agent_id == agent_id {
+                flow.url = Some(url);
+                self.focus_login_code = true;
+                cx.notify();
+            }
+        }
+    }
+
+    /// A sign-in finished. On success close the panel and refresh identity; on failure
+    /// keep the panel open with the error so the user can re-paste.
+    pub(crate) fn on_ai_login_finished(
+        &mut self,
+        agent_id: String,
+        ok: bool,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        let is_current = self
+            .ai_login
+            .as_ref()
+            .is_some_and(|f| f.agent_id == agent_id);
+        if ok {
+            if is_current {
+                self.ai_login = None;
+                self.ai_login_code.update(cx, |i, cx| i.set_content("", cx));
+            }
+            self.notify(ToastVariant::Success, "Signed in", cx);
+            // Pull the freshly signed-in identity for the row.
+            self.service
+                .send_global(Command::AiCheckAuthStatus { agent_id });
+        } else if is_current {
+            // Keep the prompt open so the user can try the code again.
+            if let Some(flow) = self.ai_login.as_mut() {
+                flow.submitting = false;
+                flow.error = Some(message.clone());
+            }
+            self.notify(
+                ToastVariant::Error,
+                format!("Sign-in failed: {message}"),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    /// Store an agent's refreshed sign-in identity for the Settings row.
+    pub(crate) fn on_ai_agent_auth_status(
+        &mut self,
+        agent_id: String,
+        status: AiAuthStatus,
+        cx: &mut Context<Self>,
+    ) {
+        self.ai_auth.insert(agent_id, status);
+        cx.notify();
     }
 
     pub(crate) fn set_ai_max_rows(&mut self, n: usize, cx: &mut Context<Self>) {

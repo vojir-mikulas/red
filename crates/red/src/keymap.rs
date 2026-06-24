@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 
-use flint::{CodeEditor, ComboBox, Modal, Palette, Switcher, TextInput};
+use flint::{CodeEditor, ComboBox, Modal, Palette, SelectableLabel, Switcher, TextInput};
 use gpui::{actions, App, KeyBinding, KeyBindingContextPredicate, Keystroke, NoAction};
 
 use crate::keymap_config::KeymapBlock;
@@ -108,6 +108,8 @@ actions!(
         AddRow,
         /// Set the focused result cell to NULL (⌘⌥0) — Track B6.
         SetNull,
+        /// Select the whole result — every row and data column (⌘A in the grid).
+        SelectAll,
     ]
 );
 
@@ -157,6 +159,7 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
                 ("⌘← / ⌘→", "Row start / end"),
                 ("⌘↑ / ⌘↓", "First / last row"),
                 ("PgUp / PgDn", "Page up / down"),
+                ("⌘A", "Select all"),
                 ("⌃G", "Go to row…"),
                 ("⌘C", "Copy selection"),
                 ("⌘I", "Inspect cell"),
@@ -453,6 +456,10 @@ const DEFAULTS: &[ActionDef] = &[
     ),
     def("cmd-alt-n", "AddRow", "Add row", Some("Table")),
     def("cmd-alt-0", "SetNull", "Set cell to NULL", Some("Table")),
+    // ⌘A selects the whole result. `Table`-scoped so it fires only with the grid
+    // focused — a focused text field / SQL editor (deeper contexts) keeps its own
+    // ⌘A (select all text).
+    def("cmd-a", "SelectAll", "Select all", Some("Table")),
     // ⌘F finds within the focused pane: loaded rows in the grid, text in the SQL
     // editor. Bound in `Table` and `CodeEditor` (both below `RedRoot`), so it wins
     // over `RedRoot`'s `SearchSchema` only while one of those is focused —
@@ -659,6 +666,7 @@ fn bind_components(cx: &mut App) {
     Modal::bind_keys(cx);
     Switcher::bind_keys(cx);
     ComboBox::bind_keys(cx);
+    SelectableLabel::bind_keys(cx);
 }
 
 /// Build the default bindings from [`DEFAULTS`]. The names are known-good, so a
@@ -770,6 +778,7 @@ fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<Ke
         "DeleteRow" => kb!(DeleteRow),
         "AddRow" => kb!(AddRow),
         "SetNull" => kb!(SetNull),
+        "SelectAll" => kb!(SelectAll),
         other => return Err(format!("unknown action “{other}” — skipping")),
     })
 }

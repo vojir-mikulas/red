@@ -72,6 +72,9 @@ mod tests {
             "embedded sample.db is not a SQLite database"
         );
         // A non-trivial database — guards against an accidentally-empty fixture.
-        assert!(SAMPLE_DB.len() > 16 * 1024, "sample.db looks suspiciously small");
+        assert!(
+            SAMPLE_DB.len() > 16 * 1024,
+            "sample.db looks suspiciously small"
+        );
     }
 }
