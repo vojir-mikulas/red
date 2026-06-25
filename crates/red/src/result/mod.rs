@@ -15,7 +15,7 @@ mod render;
 pub(crate) use edit::GridEdit;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -26,8 +26,8 @@ use gpui::{
     UniformListScrollHandle,
 };
 use red_core::{
-    Column as ResultColumn, ColumnMap, ColumnValue, ExportFormat, FkEdge, ImportFormat, KeySpec,
-    ResultFilter, TableRef, Value,
+    Column as ResultColumn, ColumnMap, ColumnStats, ColumnValue, ExportFormat, FkEdge,
+    ImportFormat, KeySpec, ResultFilter, TableRef, Value,
 };
 use red_service::{Command, CommandSender, RunFetch, SessionId, SortKey};
 
@@ -106,6 +106,30 @@ pub(crate) struct ResultGrid {
     /// Frozen wall-clock time the query took, set once it lands (ready or error).
     /// `None` while still running, so the elapsed time keeps counting up.
     query_elapsed: Option<Duration>,
+    /// The column-stats bar's current view (selected column + load state), or
+    /// `None` when no column is selected. Only populated while stats mode is on.
+    pub(in crate::result) stats: Option<ColumnStatsView>,
+    /// Per-data-column stats cache, cleared on every (re)open so re-selecting a
+    /// column is instant (the summary is correct only for this epoch's SQL).
+    stats_cache: HashMap<usize, ColumnStats>,
+}
+
+/// The column-stats bar's load state for the currently-selected column.
+#[derive(Clone)]
+pub(in crate::result) enum StatsState {
+    Loading,
+    Ready(ColumnStats),
+    Failed,
+}
+
+/// Which column the stats bar is showing, plus its load state. `numeric` is the
+/// column's number-ness (decided from its declared type), kept so the "compute
+/// distinct" re-request preserves the sum/avg aggregates.
+pub(in crate::result) struct ColumnStatsView {
+    pub(in crate::result) data_col: usize,
+    pub(in crate::result) column: String,
+    pub(in crate::result) numeric: bool,
+    pub(in crate::result) state: StatsState,
 }
 
 impl ResultGrid {
@@ -140,6 +164,8 @@ impl ResultGrid {
             epoch: next_epoch(),
             query_started: Instant::now(),
             query_elapsed: None,
+            stats: None,
+            stats_cache: HashMap::new(),
         }
     }
 
@@ -383,8 +409,11 @@ impl ResultGrid {
         self.total = total;
         self.ready = true;
         self.error = None;
-        // A fresh result set starts with a clean change-set.
+        // A fresh result set starts with a clean change-set + empty stats cache (the
+        // summary is keyed to the prior epoch's SQL).
         self.pending = edit::PendingChanges::default();
+        self.stats = None;
+        self.stats_cache.clear();
         self.stop_timer();
         self.window_base.set(0);
         let page = self.page_size;
@@ -455,6 +484,96 @@ impl ResultGrid {
         *self.buffer.borrow_mut() = GridBuffer::new(self.page_size);
         self.window_base.set(0);
         self.pending = edit::PendingChanges::default();
+        // A re-open computes a new epoch's SQL — the prior summary no longer applies.
+        self.stats = None;
+        self.stats_cache.clear();
+    }
+
+    /// Resolve the stats request for the currently-selected column (the bar's
+    /// auto-on-select trigger). Points the bar at that column: a cache hit fills it
+    /// instantly and returns `None`; a miss marks it `Loading` and returns the
+    /// `(epoch, column, numeric, distinct)` to request. `None` when no column is
+    /// selected, or the same column is already showing (loading or ready).
+    /// `distinct_max` guards the `count(distinct)`: it's auto-included only when the
+    /// result is at or below the threshold.
+    fn prepare_stats(
+        &mut self,
+        gutter: usize,
+        distinct_max: usize,
+    ) -> Option<(u64, String, bool, bool)> {
+        let dcol = self.cursor_cell(gutter).map(|(_, c)| c)?;
+        let col = self.columns.get(dcol)?;
+        let column = col.name.clone();
+        let numeric = red_core::is_numeric_type(col.decl_type.as_deref());
+        // Already showing this column and not in a (retryable) failed state.
+        if self
+            .stats
+            .as_ref()
+            .is_some_and(|v| v.data_col == dcol && !matches!(v.state, StatsState::Failed))
+        {
+            return None;
+        }
+        // Cache hit → instant, no query.
+        if let Some(stats) = self.stats_cache.get(&dcol).cloned() {
+            self.stats = Some(ColumnStatsView {
+                data_col: dcol,
+                column,
+                numeric,
+                state: StatsState::Ready(stats),
+            });
+            return None;
+        }
+        // Guard the (potentially full-scan) count-distinct on a large result.
+        let distinct = self.total <= distinct_max;
+        self.stats = Some(ColumnStatsView {
+            data_col: dcol,
+            column: column.clone(),
+            numeric,
+            state: StatsState::Loading,
+        });
+        Some((self.epoch, column, numeric, distinct))
+    }
+
+    /// Re-request the visible column's summary with `count(distinct)` forced on —
+    /// the bar's "[compute]" affordance when the guard withheld it. Returns the
+    /// `(epoch, column, numeric)` to send, or `None` when no column is shown.
+    fn force_distinct_request(&mut self) -> Option<(u64, String, bool)> {
+        let view = self.stats.as_mut()?;
+        let (column, numeric) = (view.column.clone(), view.numeric);
+        view.state = StatsState::Loading;
+        Some((self.epoch, column, numeric))
+    }
+
+    /// Apply a `ColumnStatsReady` reply: cache it (by the column's data index) and,
+    /// if the bar is still waiting on this column, show it.
+    fn apply_stats(&mut self, column: &str, stats: ColumnStats) {
+        // Prefer the visible view's known data index (handles duplicate names);
+        // otherwise resolve by name. Resolved first to avoid a borrow conflict.
+        let dcol = self
+            .stats
+            .as_ref()
+            .filter(|v| v.column == column)
+            .map(|v| v.data_col)
+            .or_else(|| self.columns.iter().position(|c| c.name == column));
+        if let Some(dcol) = dcol {
+            self.stats_cache.insert(dcol, stats.clone());
+        }
+        if let Some(view) = self.stats.as_mut() {
+            if view.column == column {
+                view.state = StatsState::Ready(stats);
+            }
+        }
+    }
+
+    /// Apply a `ColumnStatsFailed` reply: mark the bar "unavailable" if it's still
+    /// waiting on this column (a stale failure for a since-changed selection is
+    /// ignored).
+    fn fail_stats(&mut self, column: &str) {
+        if let Some(view) = self.stats.as_mut() {
+            if view.column == column && matches!(view.state, StatsState::Loading) {
+                view.state = StatsState::Failed;
+            }
+        }
     }
 
     /// Jump the grid to `ordinal` (0-based) — the explicit "go to row N". Places
@@ -1111,6 +1230,8 @@ impl AppState {
                 };
             }
         }
+        // A new cell selection — refresh the stats bar to its column.
+        self.refresh_column_stats(cx);
         cx.notify();
     }
 
@@ -1168,6 +1289,8 @@ impl AppState {
                 grid.scroll_col_into_view(new_col, gutter);
             }
         }
+        // The keyboard cursor moved — update the stats bar to the focused column.
+        self.refresh_column_stats(cx);
         cx.notify();
     }
 
@@ -1205,6 +1328,8 @@ impl AppState {
                 };
             }
         }
+        // Header ⌘/Ctrl-click selected this whole column — its natural stats target.
+        self.refresh_column_stats(cx);
         cx.notify();
     }
 
@@ -1227,6 +1352,105 @@ impl AppState {
                     anchor: (0, gutter),
                     focus: (last, last_col),
                 });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Toggle the column-stats bar (the toolbar "Stats" button). Turning it on
+    /// requests the summary for the currently-selected column; turning it off hides
+    /// the bar (the cached summaries stay, so re-toggling is instant).
+    pub(crate) fn toggle_stats_bar(&mut self, cx: &mut Context<Self>) {
+        self.stats_bar = !self.stats_bar;
+        if self.stats_bar {
+            self.refresh_column_stats(cx);
+        } else if let Phase::Connected(active) = &mut self.phase {
+            if let Some(grid) = active.active_result_mut() {
+                grid.stats = None;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Point the stats bar at the currently-selected column and request its summary
+    /// (a cache hit is instant). Called when the bar is on and the selection moves;
+    /// a no-op when the bar is off or nothing has changed.
+    pub(crate) fn refresh_column_stats(&mut self, cx: &mut Context<Self>) {
+        if !self.stats_bar {
+            return;
+        }
+        let gutter = self.gutter();
+        let distinct_max = self.settings.grid.stats_distinct_max_rows;
+        let req = match &mut self.phase {
+            Phase::Connected(active) => match active.active_result_mut() {
+                Some(grid) if grid.ready && grid.error.is_none() => {
+                    grid.prepare_stats(gutter, distinct_max)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((epoch, column, numeric, distinct)) = req {
+            self.send_active(Command::ColumnStats {
+                epoch,
+                column,
+                numeric,
+                distinct,
+            });
+        }
+        cx.notify();
+    }
+
+    /// The stats bar's "[compute]" button: re-request the shown column's summary
+    /// with `count(distinct)` forced on (the guard had withheld it on a large
+    /// result).
+    pub(crate) fn compute_column_distinct(&mut self, cx: &mut Context<Self>) {
+        let req = match &mut self.phase {
+            Phase::Connected(active) => active
+                .active_result_mut()
+                .and_then(|grid| grid.force_distinct_request()),
+            _ => None,
+        };
+        if let Some((epoch, column, numeric)) = req {
+            self.send_active(Command::ColumnStats {
+                epoch,
+                column,
+                numeric,
+                distinct: true,
+            });
+        }
+        cx.notify();
+    }
+
+    /// A `ColumnStatsReady` reply landed — cache it and update the bar.
+    pub(crate) fn on_column_stats(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: u64,
+        column: String,
+        stats: ColumnStats,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(active) = self.conn_mut(session) {
+            if let Some(grid) = active.result_by_epoch(epoch) {
+                grid.apply_stats(&column, stats);
+            }
+        }
+        cx.notify();
+    }
+
+    /// A `ColumnStatsFailed` reply landed — mark the bar "unavailable" (scoped, no
+    /// global toast).
+    pub(crate) fn on_column_stats_failed(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: u64,
+        column: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(active) = self.conn_mut(session) {
+            if let Some(grid) = active.result_by_epoch(epoch) {
+                grid.fail_stats(&column);
             }
         }
         cx.notify();
@@ -1502,7 +1726,10 @@ impl AppState {
         let mut mapping = Vec::new();
         let mut unmatched_target = Vec::new();
         for col in &peek.target_cols {
-            match lower.iter().position(|s| *s == col.name.to_ascii_lowercase()) {
+            match lower
+                .iter()
+                .position(|s| *s == col.name.to_ascii_lowercase())
+            {
                 Some(idx) => mapping.push(ColumnMap {
                     source: idx,
                     column: col.name.clone(),

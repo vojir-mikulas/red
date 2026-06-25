@@ -1168,6 +1168,73 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 lock(&state.results).remove(&epoch);
             }
 
+            Command::ColumnStats {
+                epoch,
+                column,
+                numeric,
+                distinct,
+            } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let driver = state.driver.clone();
+                // Reuse the result's stored (already-wrapped, filtered) SQL so the
+                // summary matches the visible rows. A stale epoch (tab closed /
+                // re-sorted) drops the request, like `FetchPage`.
+                let Some(sql) = lock(&state.results).get(&epoch).map(|s| s.sql.clone()) else {
+                    continue;
+                };
+                // A newer stats request for this epoch (the selection moved to
+                // another column) supersedes the last one; cancel its in-flight
+                // aggregate at the engine so a heavy `count(distinct)` doesn't linger.
+                let entry = state.inflight.entry(epoch).or_default();
+                if let Some(prev) = entry.stats.take() {
+                    prev.abort();
+                }
+                let abort = AbortSignal::new();
+                entry.stats = Some(abort.clone());
+                // Off the dispatch loop (a `count(distinct)` over a big result can be
+                // slow) and under the shared page-fetch cap so it can't fan out.
+                let events = events.clone();
+                let limit_src = page_fetch_limit.clone();
+                let timeout = statement_timeout;
+                tokio::spawn(async move {
+                    if abort.is_aborted() {
+                        return;
+                    }
+                    let _permit = limit_src.acquire_owned().await;
+                    if abort.is_aborted() {
+                        return;
+                    }
+                    let fetch = driver.column_stats(&sql, &column, numeric, distinct, &abort);
+                    match with_timeout(timeout, &abort, fetch).await {
+                        Ok(stats) => emit(
+                            &events,
+                            session_id,
+                            Event::ColumnStatsReady {
+                                epoch,
+                                column,
+                                stats,
+                            },
+                        ),
+                        // Superseded mid-flight (the selection moved) — stay silent;
+                        // the newer request delivers.
+                        Err(RedError::Interrupted) => {}
+                        // Pane-scoped failure (shown in the bar), not a global toast.
+                        Err(e) => {
+                            tracing::warn!(%epoch, %column, "column stats failed: {e}");
+                            emit(
+                                &events,
+                                session_id,
+                                Event::ColumnStatsFailed { epoch, column },
+                            );
+                        }
+                    }
+                });
+            }
+
             Command::Execute { sql } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get(&id) else {
@@ -1395,7 +1462,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     let handle = tokio::runtime::Handle::current();
                     let outcome = tokio::task::spawn_blocking(move || {
                         run_import_blocking(
-                            driver, path, format, target, mapping, chunk_size, cancel, progress_tx,
+                            driver,
+                            path,
+                            format,
+                            target,
+                            mapping,
+                            chunk_size,
+                            cancel,
+                            progress_tx,
                             handle,
                         )
                     })
@@ -1403,7 +1477,10 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     lock(&exports).remove(&id);
                     let (committed, err) = match outcome {
                         Ok(pair) => pair,
-                        Err(join) => (0, Some(RedError::Driver(format!("import task failed: {join}")))),
+                        Err(join) => (
+                            0,
+                            Some(RedError::Driver(format!("import task failed: {join}"))),
+                        ),
                     };
                     let rows = committed as usize;
                     match err {

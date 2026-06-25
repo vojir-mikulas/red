@@ -42,6 +42,38 @@ fn format_duration(d: std::time::Duration) -> String {
     }
 }
 
+/// One `min`/`max`/`sum`/`avg` value for the stats bar: a NULL aggregate shows as
+/// an em dash, anything else as its display string truncated so a long text min
+/// can't run the bar off-screen.
+fn fmt_stat_value(v: &red_core::Value) -> String {
+    let s = match v {
+        red_core::Value::Null => return "—".to_string(),
+        other => other.to_string(),
+    };
+    const MAX: usize = 40;
+    if s.chars().count() > MAX {
+        format!("{}…", s.chars().take(MAX).collect::<String>())
+    } else {
+        s
+    }
+}
+
+/// One `label value` segment of the stats bar (e.g. `count 12,345`).
+fn stat_seg(label: &str, value: String, label_color: Hsla, value_color: Hsla) -> gpui::AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(div().text_color(label_color).child(label.to_string()))
+        .child(div().text_color(value_color).child(value))
+        .into_any_element()
+}
+
+/// The faint `·` separator between stats-bar segments.
+fn stat_dot(color: Hsla) -> gpui::AnyElement {
+    div().text_color(color).child("·").into_any_element()
+}
+
 /// Colors a result cell carries, keyed by value kind (so the grid reads at a
 /// glance the way the design does: numbers orange, UUIDs dimmed, JSON cyan).
 #[derive(Clone, Copy)]
@@ -239,6 +271,18 @@ impl AppState {
                                 .on_click(cx.listener(|this, _, _, cx| this.add_draft_row(cx))),
                         )
                     })
+                    .child(
+                        // Toggle the column-stats bar. Reads as "filled" while on;
+                        // selecting a column then shows its pushed-down summary.
+                        Button::new("result-stats", "Stats")
+                            .variant(if self.stats_bar {
+                                ButtonVariant::Secondary
+                            } else {
+                                ButtonVariant::Ghost
+                            })
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_stats_bar(cx))),
+                    )
                     .child(
                         // ⌘⇧F — toggle the filter bar. Reads as "filled" while a
                         // filter is applied (Track B2).
@@ -648,6 +692,9 @@ impl AppState {
             .when_some(self.render_draft_rows(grid, cx), |c, drafts| {
                 c.child(drafts)
             })
+            // The column-stats bar (a thin summary line) sits just above the footer
+            // when the toggle is on.
+            .when(self.stats_bar, |c| c.child(self.render_stats_bar(grid, cx)))
             .child(footer)
             // The cell right-click menu floats above the pane, anchored at the
             // cursor; a full-cover backdrop dismisses it on an outside click.
@@ -713,6 +760,121 @@ impl AppState {
     /// staged `INSERT`, each cell click-to-edit, a leading ✕ to drop the draft.
     /// Shares the grid's horizontal scroll so its columns track the grid's. `None`
     /// when there are no drafts.
+    /// The column-stats bar: a thin summary line below the grid showing the
+    /// selected column's pushed-down aggregates (count · distinct · nulls · min ·
+    /// max, plus sum · avg for numerics). Shown only while the toggle is on; the
+    /// values come from the grid's per-column `stats` view (loading / ready /
+    /// failed), computed entirely by the engine.
+    fn render_stats_bar(
+        &self,
+        grid: &super::ResultGrid,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use super::StatsState;
+        let theme = cx.theme();
+        let (dim, text, faint, muted, sep) = (
+            theme.text_dim,
+            theme.text,
+            theme.text_faint,
+            theme.text_muted,
+            theme.border_soft,
+        );
+        let size_11 = theme.scale(11.);
+        let row = div()
+            .flex_shrink_0()
+            .h(px(26.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3p5()
+            .bg(theme.bg_panel)
+            .border_t_1()
+            .border_color(theme.border)
+            .font_family(theme.font_family.clone())
+            .text_size(size_11);
+
+        let Some(view) = grid.stats.as_ref() else {
+            return row
+                .child(
+                    div()
+                        .text_color(faint)
+                        .child("Select a column to summarize"),
+                )
+                .into_any_element();
+        };
+        // The column name leads, then the summary (or its loading/failed state).
+        let row = row.child(div().text_color(muted).child(view.column.clone()));
+        match &view.state {
+            StatsState::Loading => row
+                .child(stat_dot(sep))
+                .child(div().text_color(faint).child("computing…"))
+                .into_any_element(),
+            StatsState::Failed => row
+                .child(stat_dot(sep))
+                .child(div().text_color(faint).child("stats unavailable"))
+                .into_any_element(),
+            StatsState::Ready(s) => {
+                let nulls = (s.total - s.non_null).max(0);
+                let mut row = row.child(stat_dot(sep)).child(stat_seg(
+                    "count",
+                    group_digits(s.total.max(0) as usize),
+                    dim,
+                    text,
+                ));
+                // distinct: the computed count, or a `—  [compute]` affordance when
+                // the guard withheld the (potentially full-scan) count-distinct.
+                row = match s.distinct {
+                    Some(d) => row.child(stat_dot(sep)).child(stat_seg(
+                        "distinct",
+                        group_digits(d.max(0) as usize),
+                        dim,
+                        text,
+                    )),
+                    None => row.child(stat_dot(sep)).child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(div().text_color(dim).child("distinct"))
+                            .child(div().text_color(faint).child("—"))
+                            .child(
+                                Button::new("stats-distinct", "compute")
+                                    .variant(ButtonVariant::Ghost)
+                                    .size(ButtonSize::Sm)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.compute_column_distinct(cx)
+                                    })),
+                            ),
+                    ),
+                };
+                row = row
+                    .child(stat_dot(sep))
+                    .child(stat_seg("nulls", group_digits(nulls as usize), dim, text))
+                    .child(stat_dot(sep))
+                    .child(stat_seg("min", fmt_stat_value(&s.min), dim, text))
+                    .child(stat_dot(sep))
+                    .child(stat_seg("max", fmt_stat_value(&s.max), dim, text));
+                if let Some(sum) = &s.sum {
+                    row = row.child(stat_dot(sep)).child(stat_seg(
+                        "sum",
+                        fmt_stat_value(sum),
+                        dim,
+                        text,
+                    ));
+                }
+                if let Some(avg) = &s.avg {
+                    row = row.child(stat_dot(sep)).child(stat_seg(
+                        "avg",
+                        fmt_stat_value(avg),
+                        dim,
+                        text,
+                    ));
+                }
+                row.into_any_element()
+            }
+        }
+    }
+
     fn render_draft_rows(
         &self,
         grid: &super::ResultGrid,

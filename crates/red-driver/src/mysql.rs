@@ -433,6 +433,29 @@ impl DatabaseDriver for MysqlDriver {
         Ok(n.unwrap_or(0))
     }
 
+    async fn column_stats(
+        &self,
+        sql: &str,
+        column: &str,
+        numeric: bool,
+        distinct: bool,
+        abort: &AbortSignal,
+    ) -> Result<red_core::ColumnStats> {
+        let sql = crate::stats_sql(sql, column, numeric, distinct, |c| {
+            format!("`{}`", escape_ident(c))
+        });
+        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let _guard = self.arm_kill(abort, conn.id());
+        if abort.is_aborted() {
+            return Err(RedError::Interrupted);
+        }
+        let stmt = conn.prep(&sql).await.map_err(map_my_err)?;
+        let rows: Vec<Row> = conn.exec(&stmt, ()).await.map_err(map_my_err)?;
+        // One aggregate row, mapped full-fidelity then read positionally.
+        let cells = rows.first().map(|r| my_row(r, None)).unwrap_or_default();
+        Ok(crate::parse_stats(&cells, numeric, distinct))
+    }
+
     async fn fetch_page(
         &self,
         sql: &str,
@@ -1127,6 +1150,30 @@ mod tests {
         .await;
         // Track B7: the connection-wide FK graph reports the same edge.
         battery::lists_foreign_key_graph(&driver, &schema, &authors, &books).await;
+
+        // Seed rows for the column-stats summary: author_id is 1,1,2,NULL (NULLs +
+        // duplicates), narrowable by `author_id = 1`.
+        driver
+            .execute(&format!(
+                "INSERT INTO `{authors}`(id, name) VALUES (1, 'Ada'), (2, 'Grace')"
+            ))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!(
+                "INSERT INTO `{books}`(id, title, author_id) \
+                 VALUES (1, 'a', 1), (2, 'b', 1), (3, 'c', 2), (4, 'd', NULL)"
+            ))
+            .await
+            .unwrap();
+        battery::column_stats_summary(
+            &driver,
+            &format!("SELECT * FROM `{books}`"),
+            "author_id",
+            "title",
+            "author_id = 1",
+        )
+        .await;
 
         for obj in [
             format!("VIEW `{recent}`"),

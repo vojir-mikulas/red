@@ -444,6 +444,24 @@ impl DatabaseDriver for PostgresDriver {
         .await
     }
 
+    async fn column_stats(
+        &self,
+        sql: &str,
+        column: &str,
+        numeric: bool,
+        distinct: bool,
+        abort: &AbortSignal,
+    ) -> Result<red_core::ColumnStats> {
+        let sql = crate::stats_sql(sql, column, numeric, distinct, pg_quote);
+        self.with_fetch_conn(abort, |client| async move {
+            let row = client.query_one(&sql, &[]).await.map_err(map_pg_err)?;
+            // Read the one aggregate row full-fidelity, then map it positionally.
+            let cells = pg_row(&row, None);
+            Ok(crate::parse_stats(&cells, numeric, distinct))
+        })
+        .await
+    }
+
     async fn fetch_page(
         &self,
         sql: &str,
@@ -657,9 +675,10 @@ impl DatabaseDriver for PostgresDriver {
             for chunk in rows.chunks(max) {
                 // Typed placeholders (`$n::int8`, `$n::text::"uuid"`, …) like the
                 // edit path, so Postgres can't re-infer the parameter type.
-                let (sql, params) = crate::insert_sql(table, columns, chunk, pg_quote, |i, v, dt| {
-                    format!("${}{}", i + 1, pg_cast(v, dt))
-                });
+                let (sql, params) =
+                    crate::insert_sql(table, columns, chunk, pg_quote, |i, v, dt| {
+                        format!("${}{}", i + 1, pg_cast(v, dt))
+                    });
                 let owned: Vec<Value> = params.iter().map(|v| (*v).clone()).collect();
                 let boxed = pg_params(Some(&owned))?;
                 let refs: Vec<&(dyn ToSql + Sync)> = boxed
@@ -1339,6 +1358,30 @@ mod tests {
         // Track B7: the connection-wide FK graph reports the same edge.
         battery::lists_foreign_key_graph(&driver, &schema, &authors, &books).await;
 
+        // Seed a few rows so the column-stats summary has data: author_id is
+        // 1,1,2,NULL (NULLs + duplicates), narrowable by `author_id = 1`.
+        driver
+            .execute(&format!(
+                "INSERT INTO {authors}(id, name) VALUES (1, 'Ada'), (2, 'Grace')"
+            ))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!(
+                "INSERT INTO {books}(id, title, author_id) \
+                 VALUES (1, 'a', 1), (2, 'b', 1), (3, 'c', 2), (4, 'd', NULL)"
+            ))
+            .await
+            .unwrap();
+        battery::column_stats_summary(
+            &driver,
+            &format!("SELECT * FROM {books}"),
+            "author_id",
+            "title",
+            "author_id = 1",
+        )
+        .await;
+
         for obj in [
             format!("VIEW {recent}"),
             format!("TABLE {books}"),
@@ -1503,7 +1546,9 @@ mod tests {
         // Bulk insert (data import / table copy) on a fresh empty table.
         let ti = tag("insert");
         driver
-            .execute(&format!("CREATE TABLE {ti} (id INT PRIMARY KEY, name TEXT)"))
+            .execute(&format!(
+                "CREATE TABLE {ti} (id INT PRIMARY KEY, name TEXT)"
+            ))
             .await
             .unwrap();
         battery::inserts_rows(&driver, &schema, &ti).await;

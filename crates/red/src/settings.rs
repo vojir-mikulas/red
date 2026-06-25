@@ -178,6 +178,10 @@ pub struct GridSettings {
     pub max_cell_chars: usize,
     /// The streaming/keyset fetch window: how many rows a page request pulls.
     pub page_size: usize,
+    /// Row threshold above which the column-stats bar withholds the (potentially
+    /// full-scan) `count(distinct)` until the user explicitly asks for it — so
+    /// selecting a column never silently launches a heavy query on a huge result.
+    pub stats_distinct_max_rows: usize,
 }
 
 impl Default for GridSettings {
@@ -188,6 +192,7 @@ impl Default for GridSettings {
             null_display: "NULL".to_string(),
             max_cell_chars: 4096,
             page_size: 200,
+            stats_distinct_max_rows: 1_000_000,
         }
     }
 }

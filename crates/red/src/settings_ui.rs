@@ -612,6 +612,25 @@ fn grid_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             cell_view.update(cx, |this, cx| this.set_max_cell_chars(n, cx));
         });
 
+    // Column-stats distinct guard: the row threshold past which count(distinct) is
+    // withheld until clicked. "Always" computes it regardless of size.
+    const DISTINCT_PRESETS: [usize; 4] = [100_000, 1_000_000, 10_000_000, usize::MAX];
+    let distinct_sel = DISTINCT_PRESETS
+        .iter()
+        .position(|&n| n == state.settings.grid.stats_distinct_max_rows)
+        .unwrap_or(usize::MAX);
+    let distinct_view = view.clone();
+    let stats_distinct = Segmented::new("set-stats-distinct")
+        .segment("100K")
+        .segment("1M")
+        .segment("10M")
+        .segment("Always")
+        .selected(distinct_sel)
+        .on_select(move |ix, _, cx| {
+            let n = DISTINCT_PRESETS[ix.min(DISTINCT_PRESETS.len() - 1)];
+            distinct_view.update(cx, |this, cx| this.set_stats_distinct_max_rows(n, cx));
+        });
+
     settings_page_scaffold(
         "Result grid",
         div()
@@ -648,6 +667,13 @@ fn grid_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 "Bytes of a single cell kept resident — the fat-cell memory rail. \
                  Over-cap cells are clipped for display only; export stays full.",
                 max_cell,
+                &theme,
+            ))
+            .child(setting_row(
+                "Stats distinct limit",
+                "Result size past which the column-stats bar withholds count(distinct) \
+                 until you click compute, so it never scans a huge table by accident.",
+                stats_distinct,
                 &theme,
             )),
         &theme,

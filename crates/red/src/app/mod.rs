@@ -34,7 +34,8 @@ use gpui::{
     PathPromptOptions, Pixels, ScrollHandle, SharedString, WeakEntity, Window, WindowAppearance,
 };
 use red_core::{
-    Column, ColumnMap, ConnectionConfig, DbKind, EditOp, FkEdge, ImportFormat, TableRef, UpdateState,
+    Column, ColumnMap, ConnectionConfig, DbKind, EditOp, FkEdge, ImportFormat, TableRef,
+    UpdateState,
 };
 use red_service::{AiAuthStatus, Command, Event, ServiceHandle, SessionId, UpdateConfig};
 
@@ -672,6 +673,10 @@ pub struct AppState {
     /// Monotonic id source for assistant conversations, so the backend keeps each
     /// panel's turn history separate.
     pub(crate) next_conversation_id: u64,
+    /// Whether the column-stats bar is on (a session-ephemeral toggle, like the
+    /// filter bar's visibility). When on, selecting a column requests its
+    /// pushed-down aggregate summary; the per-column result lives on the grid.
+    pub(crate) stats_bar: bool,
     /// The result filter bar, when open (Track B2). The transient editing UI; the
     /// *applied* filter lives on the grid (`ResultGrid::filter`).
     pub(crate) filter_bar: Option<crate::filter::FilterBarState>,
@@ -1434,6 +1439,7 @@ impl AppState {
             ai_login_code,
             focus_login_code: false,
             next_conversation_id: 0,
+            stats_bar: false,
             filter_bar: None,
             find_bar: None,
             cell_menu: None,
@@ -1870,6 +1876,15 @@ impl AppState {
             } => self.on_result_run(session, epoch, fetch, rows, estimated, seq, cx),
             Event::ResultRunFailed { epoch, seq } => self.on_result_run_failed(session, epoch, seq),
             Event::CopyRowsLoaded { id, rows } => self.on_copy_rows(id, rows, cx),
+            // Column-stats bar (pushed-down aggregate summary).
+            Event::ColumnStatsReady {
+                epoch,
+                column,
+                stats,
+            } => self.on_column_stats(session, epoch, column, stats, cx),
+            Event::ColumnStatsFailed { epoch, column } => {
+                self.on_column_stats_failed(session, epoch, column, cx)
+            }
 
             // --- export & writes ---
             Event::Executed { affected } => {

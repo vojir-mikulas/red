@@ -241,6 +241,86 @@ pub(crate) async fn filters_eq(
     );
 }
 
+/// `column_stats` pushes correct aggregates to the engine and respects a wrapping
+/// filter — the column-stats summary (count · distinct · nulls · min · max · sum ·
+/// avg). The caller seeds a table its `base_sql` selects with `>0` rows, where
+/// `int_col` is an integer column carrying NULLs and duplicate values and
+/// `text_col` is a text column; `filter_pred` is a raw `WHERE` predicate that
+/// genuinely narrows the base. Assertions are internally consistent (no magic
+/// numbers) so every engine is checked identically.
+pub(crate) async fn column_stats_summary(
+    driver: &dyn DatabaseDriver,
+    base_sql: &str,
+    int_col: &str,
+    text_col: &str,
+    filter_pred: &str,
+) {
+    let abort = AbortSignal::new();
+
+    // Full-result numeric summary, distinct included.
+    let s = driver
+        .column_stats(base_sql, int_col, true, true, &abort)
+        .await
+        .unwrap();
+    let total = driver.count(base_sql, &abort).await.unwrap();
+    assert_eq!(s.total, total, "total matches count(*)");
+    assert!(
+        s.non_null <= s.total && s.non_null > 0,
+        "0 < non_null ({}) <= total ({})",
+        s.non_null,
+        s.total
+    );
+    let distinct = s.distinct.expect("distinct computed when requested");
+    assert!(
+        distinct > 0 && distinct <= s.non_null,
+        "0 < distinct ({distinct}) <= non_null ({})",
+        s.non_null
+    );
+    match (&s.min, &s.max) {
+        (Value::Integer(min), Value::Integer(max)) => assert!(min <= max, "min <= max"),
+        other => panic!("integer column should yield integer min/max, got {other:?}"),
+    }
+    assert!(
+        s.sum.is_some() && s.avg.is_some(),
+        "a numeric column reports sum and avg"
+    );
+
+    // A non-numeric column with distinct withheld: no distinct, no sum/avg.
+    let cheap = driver
+        .column_stats(base_sql, text_col, false, false, &abort)
+        .await
+        .unwrap();
+    assert!(cheap.distinct.is_none(), "distinct=false omits the count");
+    assert!(
+        cheap.sum.is_none() && cheap.avg.is_none(),
+        "a non-numeric column omits sum/avg"
+    );
+    assert!(
+        matches!(cheap.min, Value::Text(_) | Value::Null),
+        "text column yields a text (or null) min, got {:?}",
+        cheap.min
+    );
+
+    // The summary is computed over the *wrapped* (filtered) SQL — the same wrap
+    // `OpenResult` applies — so it narrows like the visible result does.
+    let filtered = format!("SELECT * FROM ({base_sql}) AS _red_f WHERE {filter_pred}");
+    let fs = driver
+        .column_stats(&filtered, int_col, true, false, &abort)
+        .await
+        .unwrap();
+    let fcount = driver.count(&filtered, &abort).await.unwrap();
+    assert_eq!(
+        fs.total, fcount,
+        "filtered total matches the filtered count"
+    );
+    assert!(
+        fs.total < s.total,
+        "the wrapping filter narrowed the summary ({} < {})",
+        fs.total,
+        s.total
+    );
+}
+
 /// `export` streams to CSV and JSON without materializing the result: a field
 /// containing a comma is quoted, and a SQL NULL becomes JSON `null`. `select_sql`
 /// must yield two columns `id, name` = `(1, 'a,b'), (2, NULL)` ordered by `id`.

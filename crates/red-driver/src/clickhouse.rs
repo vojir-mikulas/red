@@ -478,6 +478,26 @@ impl DatabaseDriver for ClickhouseDriver {
             .unwrap_or(0))
     }
 
+    async fn column_stats(
+        &self,
+        sql: &str,
+        column: &str,
+        numeric: bool,
+        distinct: bool,
+        abort: &AbortSignal,
+    ) -> Result<red_core::ColumnStats> {
+        // OLAP loves aggregates — a plain read, like every other ClickHouse path.
+        let base = crate::stats_sql(sql, column, numeric, distinct, ch_quote);
+        let (_, types, rows) = self.run_collect(base, &[], abort).await?;
+        // One aggregate row, decoded by the response's column types then read
+        // positionally.
+        let cells = rows
+            .first()
+            .map(|r| ch_row(r, &types, None))
+            .unwrap_or_default();
+        Ok(crate::parse_stats(&cells, numeric, distinct))
+    }
+
     async fn fetch_page(
         &self,
         sql: &str,
@@ -1406,6 +1426,36 @@ mod tests {
         assert_eq!(affected, 2, "execute reports rows written");
 
         battery::exports_csv_and_json(&driver, &format!("SELECT * FROM {t} ORDER BY id"), &t).await;
+        driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn column_stats_summary() {
+        let url = url_or_skip!();
+        let driver = ClickhouseDriver::connect(&url, false).await.unwrap();
+        let t = tag("stats");
+        driver
+            .execute(&format!(
+                "CREATE TABLE {t} (id Int32, title String, author_id Nullable(Int32)) \
+                 ENGINE = MergeTree ORDER BY id"
+            ))
+            .await
+            .unwrap();
+        // author_id is 1,1,2,NULL — NULLs + duplicates, narrowable by `author_id = 1`.
+        driver
+            .execute(&format!(
+                "INSERT INTO {t} VALUES (1, 'a', 1), (2, 'b', 1), (3, 'c', 2), (4, 'd', NULL)"
+            ))
+            .await
+            .unwrap();
+        battery::column_stats_summary(
+            &driver,
+            &format!("SELECT * FROM {t}"),
+            "author_id",
+            "title",
+            "author_id = 1",
+        )
+        .await;
         driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
     }
 

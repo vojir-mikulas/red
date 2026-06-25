@@ -660,6 +660,38 @@ pub struct Column {
     pub decl_type: Option<String>,
 }
 
+/// A one-column aggregate summary, all engine-computed by a single pushdown query
+/// (`SELECT count(*), count(col), … FROM (<the result's filtered SQL>) sub`) —
+/// never by scanning the materialized window. `min`/`max`/`sum`/`avg` ride through
+/// as typed [`Value`]s so the UI formats them like grid cells; the counts are
+/// plain integers. See `DatabaseDriver::column_stats`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnStats {
+    /// `count(*)` over the (filtered) result.
+    pub total: i64,
+    /// `count(col)` — the non-null rows. `nulls = total - non_null` (derived).
+    pub non_null: i64,
+    /// `count(distinct col)` — `None` when not computed (the count-distinct guard
+    /// withheld it on a large result, recomputable on demand).
+    pub distinct: Option<i64>,
+    /// `min(col)` — valid for text (lexicographic) and numbers.
+    pub min: Value,
+    /// `max(col)`.
+    pub max: Value,
+    /// `sum(col)` — numeric columns only (`None` otherwise, or when every row is
+    /// null).
+    pub sum: Option<Value>,
+    /// `avg(col)` — numeric columns only.
+    pub avg: Option<Value>,
+}
+
+/// Whether a declared column type is numeric (integer or floating/decimal). Drives
+/// the column-stats `sum`/`avg` aggregates, which only make sense on a number, and
+/// reuses the same base-token whitelists the key/edit-coercion paths use.
+pub fn is_numeric_type(decl_type: Option<&str>) -> bool {
+    decl_type.is_some_and(|t| is_int_type(t) || is_real_type(t))
+}
+
 /// A result-narrowing filter pushed into the query (Track B2). The service wraps
 /// the open's base SQL in `SELECT * FROM (base) WHERE <predicate>` *before* the
 /// count / key-bounds probe, so the whole result — count, keyset seek, sort,

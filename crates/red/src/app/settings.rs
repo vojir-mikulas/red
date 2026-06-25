@@ -739,6 +739,14 @@ impl AppState {
         cx.notify();
     }
 
+    /// Set the row threshold above which the column-stats bar withholds the
+    /// (potentially full-scan) `count(distinct)` until the user clicks "compute".
+    pub(crate) fn set_stats_distinct_max_rows(&mut self, rows: usize, cx: &mut Context<Self>) {
+        self.settings.grid.stats_distinct_max_rows = rows;
+        self.save_settings();
+        cx.notify();
+    }
+
     /// Toggle the leading row-number gutter. The gutter is column `0` in the grid's
     /// coordinate system, so flipping it shifts the data-column offset — clear the
     /// active selection (stored in table-column coords) so it can't point off by one.

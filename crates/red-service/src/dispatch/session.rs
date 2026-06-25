@@ -51,14 +51,21 @@ pub(crate) struct InFlight {
     pub(crate) run: Option<(u64, AbortSignal)>,
     /// The background checkpoint-index build, if one is running.
     pub(crate) build: Option<AbortSignal>,
+    /// The latest column-stats summary fetch for this epoch (column-stats bar).
+    pub(crate) stats: Option<AbortSignal>,
 }
 
 impl InFlight {
     /// Supersede every in-flight fetch for this result (tab closed / reconnected).
     pub(crate) fn abort_all(&self) {
-        for sig in [self.open.as_ref(), self.page.as_ref(), self.build.as_ref()]
-            .into_iter()
-            .flatten()
+        for sig in [
+            self.open.as_ref(),
+            self.page.as_ref(),
+            self.build.as_ref(),
+            self.stats.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
         {
             sig.abort();
         }

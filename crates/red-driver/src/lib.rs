@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ColumnMeta, ColumnValue, EditOp, ExportFormat, FkEdge, KeySpec, QueryOptions,
-    QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
+    Column, ColumnMeta, ColumnStats, ColumnValue, EditOp, ExportFormat, FkEdge, KeySpec,
+    QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail,
+    TableRef, Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -422,6 +423,88 @@ fn sql_literal(v: &Value) -> String {
     }
 }
 
+/// Build the aggregate-summary `SELECT` for [`DatabaseDriver::column_stats`]: a
+/// pushdown that wraps the result's SQL in a subquery and aggregates `column`.
+/// Shared across the engines — only the identifier `quote` differs. The select
+/// list is assembled in a **fixed order** so [`parse_stats`] reads it positionally:
+/// `count(*)`, `count(col)`, then `count(distinct col)` (iff `distinct`), then
+/// `min(col)`, `max(col)`, then `sum(col)`, `avg(col)` (iff `numeric`). The column
+/// identifier is quoted; the wrapped `sql` is the already-resolved (filtered) base,
+/// passed through [`strip_trailing`](format::strip_trailing) so a trailing `;`/
+/// whitespace doesn't break the subquery wrap.
+pub(crate) fn stats_sql(
+    sql: &str,
+    column: &str,
+    numeric: bool,
+    distinct: bool,
+    quote: impl Fn(&str) -> String,
+) -> String {
+    let col = quote(column);
+    let mut items = vec!["count(*)".to_string(), format!("count({col})")];
+    if distinct {
+        items.push(format!("count(distinct {col})"));
+    }
+    items.push(format!("min({col})"));
+    items.push(format!("max({col})"));
+    if numeric {
+        items.push(format!("sum({col})"));
+        items.push(format!("avg({col})"));
+    }
+    format!(
+        "SELECT {} FROM ({}) AS _red",
+        items.join(", "),
+        format::strip_trailing(sql)
+    )
+}
+
+/// Map the one aggregate row [`stats_sql`] produced into a [`ColumnStats`], reading
+/// the columns back in the order they were emitted. The counts are read as integers
+/// (a NULL/absent cell → 0; a count returned as a numeric string is parsed);
+/// `min`/`max`/`sum`/`avg` ride through as typed [`Value`]s so the UI formats them
+/// like grid cells. A NULL `sum`/`avg` (every row null) collapses to `None` so the
+/// bar omits it. `nulls` isn't stored — the UI derives `total - non_null`.
+pub(crate) fn parse_stats(cells: &[Value], numeric: bool, distinct: bool) -> ColumnStats {
+    let int_at = |i: usize| match cells.get(i) {
+        Some(Value::Integer(n)) => *n,
+        Some(Value::Real(x)) => *x as i64,
+        Some(Value::Text(s)) => s.trim().parse().unwrap_or(0),
+        _ => 0,
+    };
+    let mut i = 0;
+    let total = int_at(i);
+    i += 1;
+    let non_null = int_at(i);
+    i += 1;
+    let distinct = distinct.then(|| {
+        let d = int_at(i);
+        i += 1;
+        d
+    });
+    let min = cells.get(i).cloned().unwrap_or(Value::Null);
+    i += 1;
+    let max = cells.get(i).cloned().unwrap_or(Value::Null);
+    i += 1;
+    // A NULL aggregate (empty/all-null column) → None, so the bar shows no sum/avg.
+    let non_null_val = |v: Option<Value>| v.filter(|v| !matches!(v, Value::Null));
+    let (sum, avg) = if numeric {
+        (
+            non_null_val(cells.get(i).cloned()),
+            non_null_val(cells.get(i + 1).cloned()),
+        )
+    } else {
+        (None, None)
+    };
+    ColumnStats {
+        total,
+        non_null,
+        distinct,
+        min,
+        max,
+        sum,
+        avg,
+    }
+}
+
 /// One flat foreign-key *column* row from an `information_schema` scan (Postgres /
 /// MySQL), before composite keys are grouped. `constraint` + the `from` endpoint
 /// identify the edge a row belongs to; [`group_fk_edges`] folds consecutive rows of
@@ -557,6 +640,24 @@ pub trait DatabaseDriver: Send + Sync {
     /// the grid show a real scrollbar without holding every row. `abort` cancels
     /// the (potentially full-table) scan out-of-band when the result is superseded.
     async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64>;
+
+    /// An aggregate summary of `column` over `sql` (the result's already-filtered
+    /// SQL), pushed to the engine: builds `SELECT count(*), count(col),
+    /// [count(distinct col)], min(col), max(col), [sum(col), avg(col)] FROM (sql)
+    /// AS _red` and reads one row (see [`stats_sql`]/[`parse_stats`]) — never
+    /// scanning the materialized window. `numeric` toggles the `sum`/`avg`
+    /// aggregates (decided UI-side from the column's declared type), `distinct`
+    /// toggles the potentially-expensive `count(distinct col)`. Cancellable via
+    /// `abort`, exactly like [`count`](Self::count); identifier quoting is the
+    /// engine's own helper.
+    async fn column_stats(
+        &self,
+        sql: &str,
+        column: &str,
+        numeric: bool,
+        distinct: bool,
+        abort: &AbortSignal,
+    ) -> Result<ColumnStats>;
 
     /// A random-access `(offset, limit)` page of `sql`'s result. Backs the grid's
     /// load-on-scroll so memory stays flat: only the pages around the viewport are
@@ -958,5 +1059,75 @@ mod tests {
         assert_eq!(sql_literal(&Value::Blob(vec![1, 2, 3])), "NULL");
         assert_eq!(sql_literal(&Value::Integer(5)), "5");
         assert_eq!(sql_literal(&Value::Text("x".into())), "'x'");
+    }
+
+    #[test]
+    fn stats_sql_orders_aggregates_and_gates_optional_ones() {
+        let q = |c: &str| format!("\"{c}\"");
+        // Cheap (non-numeric, distinct withheld): count/count/min/max only.
+        assert_eq!(
+            stats_sql("SELECT * FROM t;", "name", false, false, q),
+            "SELECT count(*), count(\"name\"), min(\"name\"), max(\"name\") \
+             FROM (SELECT * FROM t) AS _red"
+        );
+        // Numeric + distinct: the optional columns slot into the fixed order.
+        assert_eq!(
+            stats_sql("SELECT * FROM t", "n", true, true, q),
+            "SELECT count(*), count(\"n\"), count(distinct \"n\"), min(\"n\"), max(\"n\"), \
+             sum(\"n\"), avg(\"n\") FROM (SELECT * FROM t) AS _red"
+        );
+    }
+
+    #[test]
+    fn parse_stats_reads_positional_aggregates() {
+        // Numeric + distinct: count, count, count(distinct), min, max, sum, avg.
+        let cells = vec![
+            Value::Integer(100),
+            Value::Integer(90),
+            Value::Integer(42),
+            Value::Integer(3),
+            Value::Integer(99),
+            Value::Integer(4500),
+            Value::Real(50.0),
+        ];
+        let s = parse_stats(&cells, true, true);
+        assert_eq!(s.total, 100);
+        assert_eq!(s.non_null, 90);
+        assert_eq!(s.distinct, Some(42));
+        assert_eq!(s.min, Value::Integer(3));
+        assert_eq!(s.max, Value::Integer(99));
+        assert_eq!(s.sum, Some(Value::Integer(4500)));
+        assert_eq!(s.avg, Some(Value::Real(50.0)));
+
+        // Distinct withheld + non-numeric: no distinct/sum/avg, min/max shift left.
+        let cells = vec![
+            Value::Integer(5),
+            Value::Integer(5),
+            Value::Text("a".into()),
+            Value::Text("z".into()),
+        ];
+        let s = parse_stats(&cells, false, false);
+        assert_eq!(s.distinct, None);
+        assert_eq!(s.min, Value::Text("a".into()));
+        assert_eq!(s.max, Value::Text("z".into()));
+        assert_eq!(s.sum, None);
+        assert_eq!(s.avg, None);
+
+        // A count returned as a numeric string (e.g. an engine's bigint-as-text) and
+        // an all-null numeric column: counts parse, sum/avg collapse to None.
+        let cells = vec![
+            Value::Text("12".into()),
+            Value::Integer(0),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ];
+        let s = parse_stats(&cells, true, false);
+        assert_eq!(s.total, 12);
+        assert_eq!(s.non_null, 0);
+        assert_eq!(s.min, Value::Null);
+        assert_eq!(s.sum, None);
+        assert_eq!(s.avg, None);
     }
 }

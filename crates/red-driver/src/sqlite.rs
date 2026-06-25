@@ -173,6 +173,38 @@ impl DatabaseDriver for SqliteDriver {
         .map_err(driver_err)?
     }
 
+    async fn column_stats(
+        &self,
+        sql: &str,
+        column: &str,
+        numeric: bool,
+        distinct: bool,
+        abort: &AbortSignal,
+    ) -> Result<red_core::ColumnStats> {
+        let path = self.path.clone();
+        let read_only = self.read_only;
+        let abort = abort.clone();
+        let sql = crate::stats_sql(sql, column, numeric, distinct, quote_ident);
+        tokio::task::spawn_blocking(move || {
+            let conn = SqliteDriver::open(&path, read_only)?;
+            let _guard = arm_interrupt(&conn, &abort);
+            if abort.is_aborted() {
+                return Err(RedError::Interrupted);
+            }
+            // One aggregate row, read full-fidelity (no cap — these are scalars).
+            let mut stmt = conn.prepare(&sql).map_err(driver_err)?;
+            let column_count = stmt.column_count();
+            let mut rows = stmt.query([]).map_err(driver_err)?;
+            let cells = match rows.next().map_err(map_step_err)? {
+                Some(row) => extract_row(row, column_count, None)?,
+                None => return Err(RedError::Driver("stats query returned no row".into())),
+            };
+            Ok(crate::parse_stats(&cells, numeric, distinct))
+        })
+        .await
+        .map_err(driver_err)?
+    }
+
     async fn fetch_page(
         &self,
         sql: &str,
@@ -450,8 +482,9 @@ fn insert_rows_blocking(
     let max = crate::insert_chunk_rows(columns.len(), SQLITE_PARAM_CAP);
     let mut total = 0u64;
     for chunk in rows.chunks(max) {
-        let (sql, params) =
-            crate::insert_sql(table, columns, chunk, quote_ident, |_, _, _| "?".to_string());
+        let (sql, params) = crate::insert_sql(table, columns, chunk, quote_ident, |_, _, _| {
+            "?".to_string()
+        });
         let bound: Vec<rusqlite::types::Value> = params.iter().map(|v| to_sqlite(v)).collect();
         match conn.execute(&sql, rusqlite::params_from_iter(bound)) {
             Ok(affected) => total += affected as u64,
@@ -1072,6 +1105,17 @@ mod tests {
             "author_id",
             Value::Integer(1),
             2,
+        )
+        .await;
+
+        // Column stats (pushdown summary): `author_id` is 1,1,2,NULL — total 4,
+        // non_null 3, distinct 2 — and an `author_id = 1` filter narrows it to 2.
+        battery::column_stats_summary(
+            &driver,
+            "SELECT * FROM books",
+            "author_id",
+            "title",
+            "author_id = 1",
         )
         .await;
 

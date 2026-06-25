@@ -433,6 +433,65 @@ async fn opens_and_pages_result() {
     send(&handle, Command::Shutdown);
 }
 
+/// The column-stats bar end-to-end: `ColumnStats` over an open result returns a
+/// pushed-down aggregate summary keyed to the right epoch/column.
+#[tokio::test]
+async fn computes_column_stats_for_open_result() {
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(&handle, Command::Connect(sqlite(":memory:", true)));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    // `counting_sql(1000)` yields one int column `x` = 1..=1000.
+    send(
+        &handle,
+        Command::OpenResult {
+            sql: counting_sql(1000),
+            epoch: 1,
+            table: None,
+            sort: None,
+            filter: None,
+        },
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::ResultReady { epoch: 1, .. })
+    ));
+
+    send(
+        &handle,
+        Command::ColumnStats {
+            epoch: 1,
+            column: "x".into(),
+            numeric: true,
+            distinct: true,
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::ColumnStatsReady {
+            epoch,
+            column,
+            stats,
+        }) => {
+            assert_eq!(epoch, 1);
+            assert_eq!(column, "x");
+            assert_eq!(stats.total, 1000);
+            assert_eq!(stats.non_null, 1000);
+            assert_eq!(stats.distinct, Some(1000));
+            assert_eq!(stats.min, Value::Integer(1));
+            assert_eq!(stats.max, Value::Integer(1000));
+            // sum(1..=1000) = 500500; present because the column is numeric.
+            assert_eq!(stats.sum, Some(Value::Integer(500500)));
+            assert!(stats.avg.is_some(), "numeric column reports avg");
+        }
+        other => panic!("expected ColumnStatsReady, got {other:?}"),
+    }
+    send(&handle, Command::Shutdown);
+}
+
 /// The keyset path end-to-end: a table browse resolves its PK as the seek
 /// key, contiguous runs extend from boundary keys, and a far jump lands by
 /// key-space interpolation with estimated ordinals.

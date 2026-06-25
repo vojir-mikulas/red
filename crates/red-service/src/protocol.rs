@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use red_core::{
-    AiLimits, AiTier, Column, ColumnMap, ConnectionConfig, EditOp, ExportFormat, FkEdge,
-    ImportFormat, KeySpec, QueryOptions, QueryPlan, ResultFilter, RowWindow, SchemaMeta,
+    AiLimits, AiTier, Column, ColumnMap, ColumnStats, ConnectionConfig, EditOp, ExportFormat,
+    FkEdge, ImportFormat, KeySpec, QueryOptions, QueryPlan, ResultFilter, RowWindow, SchemaMeta,
     TableDetail, TableRef, UpdateState, Value,
 };
 
@@ -142,6 +142,21 @@ pub enum Command {
     /// epoch). Unknown epochs are a no-op.
     CloseResult {
         epoch: u64,
+    },
+    /// Compute a column's aggregate summary over the open result's *filtered* SQL
+    /// (the column-stats bar): a single `count`/`distinct`/`min`/`max`(/`sum`/`avg`)
+    /// pushdown, like `count` but wider. `epoch` selects the open result (its stored,
+    /// already-wrapped SQL is reused so the summary matches the visible, filtered
+    /// rows); a stale epoch is ignored. `numeric` toggles `sum`/`avg` (decided
+    /// UI-side from the column's declared type), `distinct` toggles the potentially
+    /// expensive `count(distinct)` (guarded UI-side behind a row threshold). Replied
+    /// with `ColumnStatsReady` (or the pane-scoped `ColumnStatsFailed`); cancellable
+    /// and epoch-superseded like a page fetch.
+    ColumnStats {
+        epoch: u64,
+        column: String,
+        numeric: bool,
+        distinct: bool,
     },
     /// Run a non-row-returning statement (write/DDL) in a transaction.
     Execute {
@@ -452,6 +467,20 @@ pub enum Event {
     ResultRunFailed {
         epoch: u64,
         seq: u64,
+    },
+    /// A column's aggregate summary, in response to `ColumnStats`. Echoes `epoch`
+    /// and the `column` name so the grid routes it to the right result and column
+    /// (a re-sort/re-filter bumps the epoch and supersedes an in-flight summary).
+    ColumnStatsReady {
+        epoch: u64,
+        column: String,
+        stats: ColumnStats,
+    },
+    /// A `ColumnStats` request failed — scoped to the stats bar (shown as "stats
+    /// unavailable") rather than a global error toast, like `PlanFailed`.
+    ColumnStatsFailed {
+        epoch: u64,
+        column: String,
     },
     /// A write/DDL statement committed; `affected` rows changed.
     Executed {
