@@ -235,9 +235,14 @@ async fn run_connection(
         .await;
 
     if let Err(e) = result {
-        // If startup already fired `ready`, this is just a teardown error.
-        signal(&ready, Err(AcpError::Protocol(e.to_string())));
-        tracing::debug!("ACP connection ended: {e}");
+        // If readiness hadn't fired yet, the agent never came up — the subprocess
+        // failed to spawn (Node/Claude Code missing or unreachable) or the
+        // transport died mid-handshake. Surface the friendly "is Node.js
+        // installed?" hint, keeping the raw cause in the detail. If readiness had
+        // already fired, this is a later teardown — just trace it.
+        if !signal(&ready, Err(AcpError::Spawn(e.to_string()))) {
+            tracing::debug!("ACP connection ended: {e}");
+        }
     }
 }
 
@@ -675,9 +680,15 @@ fn map_stop(stop: StopReason) -> AcpStop {
 }
 
 /// Fire the take-once readiness signal (idempotent; later calls are no-ops).
-fn signal(ready: &ReadyCell, result: Result<(), AcpError>) {
+/// Fire the take-once readiness signal. Returns `true` if this call delivered the
+/// result (the signal was still pending — startup hadn't completed), `false` if
+/// readiness had already fired (so this is a later teardown).
+fn signal(ready: &ReadyCell, result: Result<(), AcpError>) -> bool {
     if let Some(tx) = lock(ready).take() {
         let _ = tx.send(result);
+        true
+    } else {
+        false
     }
 }
 

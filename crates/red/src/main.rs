@@ -13,6 +13,7 @@ mod conversations;
 #[cfg(feature = "dev-stats")]
 mod dev_stats;
 mod editor;
+mod env;
 mod filter;
 mod find;
 mod icons;
@@ -58,6 +59,11 @@ gpui::actions!(red, [ToggleDevStats]);
 
 fn main() {
     init_tracing();
+
+    // macOS GUI launches inherit a minimal PATH that omits Homebrew / Node, which
+    // would break spawning the ACP agent (`npx …`). Patch it before any thread or
+    // subprocess exists. No-op off macOS.
+    env::augment_path_for_gui_launch();
 
     // Windows self-update can't delete the running exe, so it leaves the previous
     // binary as `<exe>.old` and relies on the next launch to reap it. Best-effort:
