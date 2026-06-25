@@ -3,7 +3,7 @@
 //! Every statement the user runs from the editor is recorded here so it survives
 //! a restart, unlike the old in-memory `Vec<String>` that died with the session.
 //! The log is centralized on [`AppState`] (one store across all connections) but
-//! each entry carries its `conn_id`, so the run-bar popover shows only the active
+//! each entry carries its `conn_id`, so the History panel shows only the active
 //! connection's history while the file keeps everything — the groundwork for a
 //! future cross-connection history sidebar (see `docs/plans/query-history.md`).
 //!
@@ -18,8 +18,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+// `Context as _` brings anyhow's `.context()` into scope without taking the
+// `Context` name, which `gpui::Context` (used by `render_history`) needs.
+use anyhow::{Context as _, Result};
+use flint::prelude::*;
+use gpui::{div, prelude::*, px, Context, KeyDownEvent, SharedString};
 use serde::{Deserialize, Serialize};
+
+use crate::app::{ActiveConn, AppState};
 
 /// Newest entries retained per connection. Past this, the oldest for that
 /// connection are dropped on the next record/delete.
@@ -30,7 +36,7 @@ const MAX_TOTAL: usize = 1000;
 
 /// One logged statement: the SQL, which connection ran it, and when. `id` is
 /// process-monotonic (seeded past the max on load) so it stays unique across
-/// restarts and gives the popover a stable handle to delete a row by.
+/// restarts and gives the panel a stable handle to delete a row by.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct HistoryEntry {
     pub id: u64,
@@ -117,7 +123,7 @@ impl QueryHistory {
         self.persist();
     }
 
-    /// Remove one entry by id (the popover's per-row ✕). A no-op if it's gone.
+    /// Remove one entry by id (the panel's per-row ✕). A no-op if it's gone.
     pub(crate) fn delete(&mut self, id: u64) {
         let before = self.entries.len();
         self.entries.retain(|e| e.id != id);
@@ -135,7 +141,7 @@ impl QueryHistory {
         }
     }
 
-    /// One connection's entries, newest-first — what the popover renders.
+    /// One connection's entries, newest-first — what the panel renders.
     pub(crate) fn for_conn(&self, conn_id: &str) -> Vec<HistoryEntry> {
         self.entries
             .iter()
@@ -198,6 +204,221 @@ fn save(path: &PathBuf, entries: &[HistoryEntry]) -> Result<()> {
     drop(f);
     std::fs::rename(&tmp, path).context("renaming the history temp file")?;
     Ok(())
+}
+
+/// A short, human relative time ("just now", "5m ago", "3h ago", "2d ago") for a
+/// row's subline. Empty for a missing/future stamp (clock skew) — no fake time.
+fn relative_time(unix: u64) -> String {
+    let now = crate::conversations::now_unix();
+    if unix == 0 || now < unix {
+        return String::new();
+    }
+    let secs = now - unix;
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86_399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+impl AppState {
+    /// The History panel for the left dock: a header (title · clear · close) over a
+    /// scrollable list of this connection's past queries, newest first. Clicking a
+    /// row loads it into the active editor; hovering a row reveals a ✕ to delete it.
+    pub(crate) fn render_history(
+        &self,
+        active: &ActiveConn,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let view = cx.entity().downgrade();
+
+        let entries = self.query_history.for_conn(&active.conn_id);
+        let selected = active.history_sel;
+        let count = entries.len();
+
+        // Snapshot the tokens used inside the per-row map (all `Copy` or cheap
+        // clones) so the rows build without holding a borrow of `cx`.
+        let bg_panel = theme.bg_panel;
+        let border = theme.border;
+        let (text, muted, faint) = (theme.text, theme.text_muted, theme.text_faint);
+        let (bg_hover, bg_elevated) = (theme.bg_hover, theme.bg_elevated);
+        let ui_family = theme.font_family.clone();
+        let mono = theme.mono_family.clone();
+        let (size_12, size_11, size_10) = (theme.scale(12.), theme.scale(11.), theme.scale(10.));
+        let icon_x = theme.scale(11.);
+
+        // --- header: title · clear · close ---
+        let clear_btn = (count > 0).then(|| {
+            div()
+                .id("history-clear")
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(18.))
+                .rounded(px(3.))
+                .cursor_pointer()
+                .text_color(faint)
+                .hover(|s| s.bg(bg_elevated).text_color(text))
+                .tooltip(Tooltip::text("Clear history"))
+                .child(crate::icons::icon("trash", icon_x, faint))
+                .on_click(cx.listener(|this, _, _, cx| this.clear_history(cx)))
+        });
+
+        let close_btn = div()
+            .id("history-hide")
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(18.))
+            .rounded(px(3.))
+            .cursor_pointer()
+            .text_color(faint)
+            .hover(|s| s.bg(bg_elevated).text_color(text))
+            .tooltip(Tooltip::text(crate::keymap::localize_hint(
+                "Hide history  ⌘Y",
+            )))
+            .child(crate::icons::icon("x", icon_x, faint))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx)));
+
+        let header = div()
+            .flex_shrink_0()
+            .h(px(28.))
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .bg(bg_panel)
+            .border_b_1()
+            .border_color(border)
+            .font_family(ui_family)
+            .text_size(size_11)
+            .text_color(muted)
+            .child(div().flex_1().min_w_0().truncate().child("History"))
+            .children(clear_btn)
+            .child(close_btn);
+
+        // --- list (or empty state) ---
+        let list = if entries.is_empty() {
+            div()
+                .flex_1()
+                .min_h(px(0.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .px_4()
+                .text_size(size_11)
+                .text_color(faint)
+                .child("No queries yet")
+                .into_any_element()
+        } else {
+            div()
+                .id("history-list")
+                .key_context("History")
+                // The list owns the focus handle so ↑/↓ move the highlight, Enter
+                // loads the entry, and Esc returns focus to the editor.
+                .track_focus(&active.history_focus)
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _w, cx| {
+                    match event.keystroke.key.as_str() {
+                        "up" => this.history_move(-1, cx),
+                        "down" => this.history_move(1, cx),
+                        "enter" => this.history_accept(cx),
+                        "escape" => {
+                            this.pending_focus = Some(crate::app::Pane::Editor);
+                            cx.notify();
+                        }
+                        _ => return,
+                    }
+                    cx.stop_propagation();
+                }))
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .children(entries.into_iter().enumerate().map(|(i, entry)| {
+                    let load_view = view.clone();
+                    let del_view = view.clone();
+                    let sql = entry.sql.clone();
+                    let id = entry.id;
+                    let is_sel = i == selected;
+                    let group = SharedString::from(format!("hrow-{i}"));
+                    let label = crate::editor::history_label(&entry.sql);
+                    let when = relative_time(entry.ran_unix);
+                    let mono = mono.clone();
+                    div()
+                        .id(("hrow", i))
+                        .group(group.clone())
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .py_1p5()
+                        .when(is_sel, |d| d.bg(bg_hover))
+                        .hover(move |s| s.bg(bg_hover))
+                        .child(
+                            // The label/subline column fills the row and is the load
+                            // hitbox; it clips so a long query never shoves the ✕ off.
+                            div()
+                                .id(("hrow-load", i))
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_0p5()
+                                .cursor_pointer()
+                                .on_click(move |_, _, cx| {
+                                    let sql = sql.clone();
+                                    load_view
+                                        .update(cx, |this, cx| this.load_history(sql, cx))
+                                        .ok();
+                                })
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .font_family(mono)
+                                        .text_size(size_12)
+                                        .text_color(text)
+                                        .child(label),
+                                )
+                                .child(div().text_size(size_10).text_color(faint).child(when)),
+                        )
+                        .child(
+                            // Hover-revealed per-row delete, like the tab close button.
+                            div()
+                                .id(("hrow-del", i))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(16.))
+                                .rounded(px(3.))
+                                .invisible()
+                                .group_hover(group, |s| s.visible())
+                                .cursor_pointer()
+                                .text_color(faint)
+                                .hover(|s| s.bg(bg_elevated).text_color(text))
+                                .on_click(move |_, _, cx| {
+                                    del_view
+                                        .update(cx, |this, cx| this.delete_history(id, cx))
+                                        .ok();
+                                })
+                                .child(crate::icons::icon("x", icon_x, faint)),
+                        )
+                }))
+                .into_any_element()
+        };
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(bg_panel)
+            .child(header)
+            .child(list)
+    }
 }
 
 #[cfg(test)]

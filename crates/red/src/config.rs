@@ -31,6 +31,11 @@ pub struct StoredConnection {
     pub config: ConnectionConfig,
     /// Unix seconds of the last successful connect; `None` until first used.
     pub last_accessed: Option<u64>,
+    /// Pinned to the top of the welcome list and the connection switcher,
+    /// independent of recency — a user's favourite "projects" stay reachable on
+    /// the low ⌘-digit slots no matter what they touched last. Defaults to false;
+    /// omitted from the file when unset so pre-pin configs round-trip unchanged.
+    pub pinned: bool,
 }
 
 /// The on-disk shape used for *loading* — tolerant of both the current structured
@@ -74,6 +79,10 @@ struct RawConnection {
     ai_tier: Option<AiTier>,
     #[serde(default)]
     last_accessed: Option<u64>,
+    /// Pin this connection to the top of the lists (favourite). Absent in pre-pin
+    /// configs, where it defaults to unpinned.
+    #[serde(default)]
+    pinned: bool,
     /// Optional SSH jump host. Absent in pre-SSH configs; secrets are never here.
     #[serde(default)]
     ssh: Option<RawSsh>,
@@ -160,6 +169,7 @@ impl RawConnection {
             id: self.id,
             config,
             last_accessed: self.last_accessed,
+            pinned: self.pinned,
         }
     }
 }
@@ -192,6 +202,10 @@ struct WriteConnection {
     #[serde(skip_serializing_if = "Option::is_none")]
     ai_tier: Option<AiTier>,
     last_accessed: Option<u64>,
+    /// Omitted when unpinned so the common case adds no noise and pre-pin files
+    /// round-trip byte-for-byte.
+    #[serde(skip_serializing_if = "is_false")]
+    pinned: bool,
     /// Optional `[connection.ssh]` sub-table. Must stay the **last** field: TOML
     /// requires a table-valued key to follow all of a struct's scalar keys.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -243,9 +257,16 @@ impl From<&StoredConnection> for WriteConnection {
             ai_enabled: c.ai_enabled,
             ai_tier: c.ai_tier,
             last_accessed: s.last_accessed,
+            pinned: s.pinned,
             ssh: c.ssh.as_ref().map(WriteSsh::from_config),
         }
     }
+}
+
+/// `skip_serializing_if` predicate for the boolean `pinned` flag — `serde` needs a
+/// `fn(&bool) -> bool`, which `std::ops::Not::not` (taking `bool` by value) isn't.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Default, Serialize)]
@@ -399,6 +420,9 @@ mod tests {
                     ..Default::default()
                 },
                 last_accessed: Some(1_700_000_000),
+                // A pinned connection must round-trip (conn-b stays unpinned, so
+                // its flag is omitted from the file and defaults back to false).
+                pinned: true,
             },
             StoredConnection {
                 id: "conn-b".into(),
@@ -420,6 +444,7 @@ mod tests {
                     ssh: None,
                 },
                 last_accessed: None,
+                pinned: false,
             },
         ];
 
@@ -455,6 +480,10 @@ mod tests {
         assert_eq!(back[0].config.ai_tier, None);
         assert_eq!(back[1].config.ai_enabled, Some(false));
         assert_eq!(back[1].config.ai_tier, Some(AiTier::Schema));
+        // The pinned flag round-trips; an unpinned connection omits it and reads
+        // back false.
+        assert!(back[0].pinned);
+        assert!(!back[1].pinned);
     }
 
     #[test]
@@ -482,6 +511,7 @@ mod tests {
                 ..Default::default()
             },
             last_accessed: None,
+            pinned: false,
         }];
 
         let cfg = ConfigFile {

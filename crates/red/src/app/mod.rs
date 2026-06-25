@@ -393,10 +393,12 @@ pub(crate) struct ActiveConn {
     pub conn_id: String,
     pub config: ConnectionConfig,
     pub version: String,
+    /// Width of the Schema side-panel (the second left-dock column). Retained while
+    /// it's hidden so toggling it back restores the previous width.
     pub sidebar_w: Pixels,
     pub sidebar_drag: Option<DragAnchor>,
-    /// When set, the schema sidebar is hidden; `sidebar_w` is retained so toggling
-    /// it back restores the previous width.
+    /// When set, the Schema panel is hidden; `sidebar_w` is retained so toggling it
+    /// back restores the previous width.
     pub sidebar_collapsed: bool,
     pub editor_h: Pixels,
     pub editor_drag: Option<DragAnchor>,
@@ -428,14 +430,18 @@ pub(crate) struct ActiveConn {
     pub grid_focus: FocusHandle,
     /// Which pane currently holds focus — drives focus cycling and the pane ring.
     pub active_pane: Pane,
-    /// Whether the run-bar history popover is open. The entries themselves live in
-    /// the centralized [`AppState::query_history`]; this is just per-connection UI
-    /// state (the popover is anchored to this workspace's run bar).
+    /// Whether the History panel is shown in the left dock. Entries live in the
+    /// centralized [`AppState::query_history`]; this is per-connection UI state.
     pub history_open: bool,
-    /// Focus anchor for the open history popover, and the keyboard-highlighted
-    /// entry within it.
+    /// Focus anchor for the History panel's list (its ↑/↓/Enter navigation), and
+    /// the keyboard-highlighted entry within it.
     pub history_focus: FocusHandle,
     pub history_sel: usize,
+    /// Width of the History side-panel (the leftmost left-dock column, sitting to
+    /// the left of the schema). Retained while it's closed so toggling it back
+    /// restores the previous width.
+    pub history_w: Pixels,
+    pub history_drag: Option<DragAnchor>,
     /// Recency stamp: bumped from [`AppState::next_active_seq`] each time this
     /// workspace is parked (it was foreground until that moment). Drives LRU
     /// eviction when [`MAX_PARKED_SESSIONS`] is exceeded — the lowest stamp is the
@@ -477,6 +483,8 @@ impl ActiveConn {
             history_open: false,
             history_focus: cx.focus_handle(),
             history_sel: 0,
+            history_w: px(240.),
+            history_drag: None,
             last_active_seq: 0,
         }
     }
@@ -586,6 +594,9 @@ pub struct AppState {
     /// An in-flight "Open row as tree" (Track B7), waiting on the focused row's
     /// full `CopyRows` re-fetch to build the tree root.
     pub(crate) pending_tree: Option<crate::tree::PendingTreeRoot>,
+    /// The relation tree's right-click context menu (Track B7): the node id and the
+    /// cursor anchor. `None` when closed.
+    pub(crate) tree_menu: Option<(u64, gpui::Point<gpui::Pixels>)>,
     /// The cell detail inspector, when open (Track B1). Owns its scroll position
     /// and any on-demand full value fetched for a capped/evicted cell.
     pub(crate) inspector: Option<crate::inspector::InspectorState>,
@@ -1374,6 +1385,7 @@ impl AppState {
             pending_copy: None,
             pending_fk: None,
             pending_tree: None,
+            tree_menu: None,
             inspector: None,
             assistant: None,
             focus_assistant: false,

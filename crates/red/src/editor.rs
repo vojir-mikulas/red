@@ -283,7 +283,7 @@ impl AppState {
             theme.bg_elevated,
             theme.bg_hover,
         );
-        let (border, border_soft, radius) = (theme.border, theme.border_soft, theme.radius);
+        let (border, border_soft) = (theme.border, theme.border_soft);
         let (text, muted, faint, dim) = (
             theme.text,
             theme.text_muted,
@@ -300,7 +300,6 @@ impl AppState {
         // so the tab + breadcrumb chrome tracks the UI font even inside the lazy
         // per-tab `.map` closure. The editor *surface* keeps its own mono font.
         let ui_family = theme.font_family.clone();
-        let mono_family = theme.mono_family.clone();
         let (size_11, size_12) = (theme.scale(11.), theme.scale(12.));
         let view = cx.entity().downgrade();
 
@@ -634,114 +633,6 @@ impl AppState {
             )
             .children(ro_chip);
 
-        let history = active.history_open.then(|| {
-            let list = self.query_history.for_conn(&active.conn_id);
-            let selected = active.history_sel;
-            let inner = if list.is_empty() {
-                div()
-                    .px_2()
-                    .py_1()
-                    .text_size(size_11)
-                    .text_color(faint)
-                    .child("No history yet")
-                    .into_any_element()
-            } else {
-                div()
-                    .id("sql-history-list")
-                    .max_h(px(260.))
-                    .overflow_y_scroll()
-                    .children(list.into_iter().enumerate().map(|(i, entry)| {
-                        let load_view = view.clone();
-                        let del_view = view.clone();
-                        let sql = entry.sql.clone();
-                        let id = entry.id;
-                        let is_sel = i == selected;
-                        let group = SharedString::from(format!("hist-{i}"));
-                        div()
-                            .id(("hist", i))
-                            .group(group.clone())
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .px_2()
-                            .py_1()
-                            .when(is_sel, |d| d.bg(bg_hover))
-                            .hover(move |s| s.bg(bg_hover))
-                            .child(
-                                // The label fills the row and is the load hitbox; it
-                                // truncates so a long query never shoves the ✕
-                                // off the edge.
-                                div()
-                                    .id(("hist-load", i))
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .cursor_pointer()
-                                    .font_family(mono_family.clone())
-                                    .text_size(size_11)
-                                    .text_color(text)
-                                    .on_click(move |_, _, cx| {
-                                        let sql = sql.clone();
-                                        load_view
-                                            .update(cx, |this, cx| this.load_history(sql, cx))
-                                            .ok();
-                                    })
-                                    .child(history_label(&entry.sql)),
-                            )
-                            .child(
-                                // Hover-revealed per-row delete, mirroring the tab
-                                // strip's close button.
-                                div()
-                                    .id(("hist-del", i))
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(px(15.))
-                                    .rounded(px(3.))
-                                    .invisible()
-                                    .group_hover(group, |s| s.visible())
-                                    .cursor_pointer()
-                                    .text_color(faint)
-                                    .hover(|s| s.bg(bg_hover).text_color(text))
-                                    .on_click(move |_, _, cx| {
-                                        del_view
-                                            .update(cx, |this, cx| this.delete_history(id, cx))
-                                            .ok();
-                                    })
-                                    .child(crate::icons::icon("x", icon_close, faint)),
-                            )
-                    }))
-                    .into_any_element()
-            };
-            // Anchored to the bottom run bar, opening upward. Focusable so its
-            // ↑/↓ move the highlight, Enter loads it, Esc closes — back to editor.
-            div()
-                .id("sql-history")
-                .key_context("History")
-                .track_focus(&active.history_focus)
-                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _w, cx| {
-                    match event.keystroke.key.as_str() {
-                        "up" => this.history_move(-1, cx),
-                        "down" => this.history_move(1, cx),
-                        "enter" => this.history_accept(cx),
-                        "escape" => this.close_history(cx),
-                        _ => return,
-                    }
-                    cx.stop_propagation();
-                }))
-                .absolute()
-                .bottom(px(38.))
-                .right(px(8.))
-                .w(px(380.))
-                .bg(bg_elevated)
-                .border_1()
-                .border_color(border)
-                .rounded(radius)
-                .overflow_hidden()
-                .child(inner)
-        });
-
         div()
             .relative()
             .size_full()
@@ -759,7 +650,6 @@ impl AppState {
             )
             .child(surface)
             .child(run_bar)
-            .children(history)
     }
 
     /// Run the selection if any, else the statement under the caret. Pushes to
@@ -883,6 +773,8 @@ impl AppState {
         cx.notify();
     }
 
+    /// Show or hide the History panel in the left dock (status-bar toggle, ⌘Y, or
+    /// palette). Opening focuses its list; closing returns focus to the editor.
     pub(crate) fn toggle_history(&mut self, cx: &mut Context<Self>) {
         let opened = if let Phase::Connected(active) = &mut self.phase {
             active.history_open = !active.history_open;
@@ -895,7 +787,8 @@ impl AppState {
             None
         };
         match opened {
-            // Focus the popover so its arrow keys work; closing returns to the editor.
+            // Focus the panel's list so its arrow keys work; closing returns focus
+            // to the editor.
             Some(true) => self.focus_history = true,
             Some(false) => self.pending_focus = Some(crate::app::Pane::Editor),
             None => {}
@@ -903,7 +796,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// Move the history popover's highlight (↑/↓). No-op with an empty history.
+    /// Move the History panel's keyboard highlight (↑/↓). No-op with empty history.
     pub(crate) fn history_move(&mut self, delta: isize, cx: &mut Context<Self>) {
         let len = match &self.phase {
             Phase::Connected(active) => self.query_history.count_for_conn(&active.conn_id),
@@ -919,7 +812,7 @@ impl AppState {
         }
     }
 
-    /// Load the highlighted history entry into the editor (Enter in the popover).
+    /// Load the highlighted history entry into the editor (Enter in the panel).
     pub(crate) fn history_accept(&mut self, cx: &mut Context<Self>) {
         let sql = match &self.phase {
             Phase::Connected(active) => self
@@ -930,13 +823,13 @@ impl AppState {
             _ => None,
         };
         if let Some(sql) = sql {
-            // `load_history` closes the popover and fills the editor.
+            // Fill the editor; the panel stays open so the user can keep browsing.
             self.load_history(sql, cx);
         }
         self.pending_focus = Some(crate::app::Pane::Editor);
     }
 
-    /// Remove one history entry by id (the popover's per-row ✕), keeping the
+    /// Remove one history entry by id (the panel's per-row ✕), keeping the
     /// keyboard highlight in range after the row vanishes.
     pub(crate) fn delete_history(&mut self, id: u64, cx: &mut Context<Self>) {
         self.query_history.delete(id);
@@ -967,24 +860,14 @@ impl AppState {
         cx.notify();
     }
 
-    /// Close the history popover (Esc) and return focus to the editor.
-    pub(crate) fn close_history(&mut self, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase {
-            active.history_open = false;
-        }
-        self.pending_focus = Some(crate::app::Pane::Editor);
-        cx.notify();
-    }
-
+    /// Load a history entry's SQL into the active tab's editor. The dock panel
+    /// stays open (unlike the old transient popover) so the user can keep browsing.
     pub(crate) fn load_history(&mut self, sql: String, cx: &mut Context<Self>) {
         let editor = match &mut self.phase {
-            Phase::Connected(active) => {
-                active.history_open = false;
-                match active.active_mut() {
-                    Some(tab) => tab.editor.clone(),
-                    None => return,
-                }
-            }
+            Phase::Connected(active) => match active.active_mut() {
+                Some(tab) => tab.editor.clone(),
+                None => return,
+            },
             _ => return,
         };
         editor.update(cx, |editor, cx| editor.set_content(sql, cx));

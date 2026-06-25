@@ -115,3 +115,9 @@ opt-level = 2
 #
 #   [patch."https://github.com/vojir-mikulas/flint"]
 #   flint = { path = "../flint" }
+
+# TEMPORARY (do NOT commit): build against the local Flint checkout for the
+# Track B7 relation-tree work — the `Tree::on_secondary` right-click handler isn't
+# in the pinned git rev yet. Remove once Flint is pushed + the `rev` above bumped.
+[patch."https://github.com/vojir-mikulas/flint"]
+flint = { path = "../flint" }

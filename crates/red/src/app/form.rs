@@ -311,6 +311,7 @@ impl AppState {
                     id: crate::config::new_id(),
                     config,
                     last_accessed: None,
+                    pinned: false,
                 });
                 self.connections.len() - 1
             }

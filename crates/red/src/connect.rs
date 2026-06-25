@@ -121,6 +121,7 @@ impl AppState {
                     orig_ix,
                     &stored.config,
                     stored.last_accessed,
+                    stored.pinned,
                     cx,
                 )
                 .into_any_element()
@@ -303,6 +304,13 @@ impl AppState {
         // before any timestamp, so ascending lists never-used/oldest first.
         let asc = self.connect_sort.ascending;
         indices.sort_by(|&a, &b| {
+            // Pinned favourites float to the top regardless of the chosen sort
+            // (false < true, so `b` vs `a` puts pinned first); they're then ordered
+            // among themselves by the active key, like everything else.
+            let pin = self.connections[b].pinned.cmp(&self.connections[a].pinned);
+            if pin != std::cmp::Ordering::Equal {
+                return pin;
+            }
             let ord = match self.connect_sort.field {
                 ConnectSortField::Recent => self.connections[a]
                     .last_accessed
@@ -468,6 +476,7 @@ impl AppState {
         orig_ix: usize,
         config: &red_core::ConnectionConfig,
         last_accessed: Option<u64>,
+        pinned: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
@@ -547,6 +556,11 @@ impl AppState {
                                     .child(config.name.clone()),
                             )
                             .child(Badge::new(badge_label).variant(badge_variant))
+                            // A persistent pin marker on a pinned card (the hover
+                            // actions carry the unpin button).
+                            .when(pinned, |row| {
+                                row.child(crate::icons::icon("pin", theme.scale(12.), theme.accent))
+                            })
                             .when(config.read_only, |row| {
                                 row.child(
                                     div()
@@ -608,6 +622,28 @@ impl AppState {
                             .gap_1()
                             .invisible()
                             .group_hover(group, |s| s.visible())
+                            .child(
+                                IconButton::new(
+                                    SharedString::from(format!("pin-{orig_ix}")),
+                                    crate::icons::icon(
+                                        "pin",
+                                        theme.scale(14.),
+                                        if pinned {
+                                            theme.accent
+                                        } else {
+                                            theme.text_muted
+                                        },
+                                    ),
+                                )
+                                .size(IconButtonSize::Sm)
+                                .tooltip(if pinned { "Unpin" } else { "Pin to top" })
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_pin(orig_ix, cx);
+                                    },
+                                )),
+                            )
                             .child(
                                 IconButton::new(
                                     SharedString::from(format!("edit-{orig_ix}")),

@@ -45,6 +45,7 @@
 #
 # Globals (default keystroke):
 #   ToggleCommandPalette   cmd-k        SwitchConnection       cmd-p
+#   SwitchToPreviousConnection  cmd-shift-p
 #   GoToRow                ctrl-g       Quit                   cmd-q
 #
 # App chrome — bind under context = "RedRoot" (default keystroke):
@@ -61,5 +62,6 @@
 #   ShowShortcuts          cmd-/        RunQuery               cmd-enter
 #   NewConnection          cmd-n        Settings               cmd-,
 #
-# The SQL editor, result-grid navigation, and dialog keys (arrows, copy/paste,
-# Tab cycling) are fixed in this release and not yet rebindable here.
+# ⌘1–⌘9 jump straight to the 1st–9th connection in the switcher's order. Like the
+# SQL editor / grid / dialog keys (arrows, copy/paste, Tab cycling), they're fixed
+# in this release and not yet rebindable here.

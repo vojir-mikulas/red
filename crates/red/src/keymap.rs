@@ -50,6 +50,8 @@ actions!(
         PrevTab,
         /// Show or hide the schema sidebar.
         ToggleSidebar,
+        /// Show or hide the query-history panel in the left dock.
+        ToggleHistory,
         /// Reload the schema tree from the backend.
         RefreshSchema,
         /// Move keyboard focus to the schema sidebar / editor / result grid.
@@ -78,6 +80,9 @@ actions!(
         ReportBug,
         /// Open the connection switcher popover (⌘P).
         SwitchConnection,
+        /// Switch to the previously-used connection (⌘⇧P): foreground the
+        /// most-recently-used warm parked session. Toggles between the last two.
+        SwitchToPreviousConnection,
         /// Open or close the cell detail inspector (⌘I).
         ToggleInspector,
         /// Close the cell detail inspector (Esc) — a no-op when it's shut.
@@ -113,6 +118,15 @@ actions!(
     ]
 );
 
+/// ⌘1–⌘9: jump straight to the n-th connection in the switcher's order. The
+/// payload is the 0-based slot. Carries data, so it can't sit in the unit-only
+/// [`actions!`] table; it's bound programmatically in [`apply`] (like the
+/// OS-shortcut Alt+F4) and so stays out of the rebind editor. `no_json` keeps it
+/// off the JSON-keymap path it's never built from.
+#[derive(Clone, PartialEq, Eq, Default, Debug, gpui::Action)]
+#[action(namespace = red, no_json)]
+pub(crate) struct SwitchToConnectionSlot(pub usize);
+
 /// The keyboard reference, grouped, for the shortcuts overlay (`⌘/`) and the
 /// docs. Kept beside the bindings above so the two don't drift; the overlay is
 /// built from this rather than hand-maintained in the view.
@@ -123,6 +137,8 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
             vec![
                 ("⌘K", "Command palette"),
                 ("⌘P", "Switch connection"),
+                ("⌘⇧P", "Switch to previous connection"),
+                ("⌘1–9", "Jump to connection by position"),
                 ("⌘/", "Keyboard shortcuts"),
                 ("⌘,", "Settings"),
                 ("⌘N", "New connection (welcome screen)"),
@@ -320,6 +336,14 @@ const DEFAULTS: &[ActionDef] = &[
     // quit is ours).
     def("cmd-k", "ToggleCommandPalette", "Command palette", None),
     def("cmd-p", "SwitchConnection", "Switch connection", None),
+    // ⌘⇧P mirrors ⌘P: flip to the previously-used connection (the MRU warm
+    // session). A true global like ⌘P so it fires from any focus.
+    def(
+        "cmd-shift-p",
+        "SwitchToPreviousConnection",
+        "Switch to previous connection",
+        None,
+    ),
     def("ctrl-g", "GoToRow", "Go to row", None),
     def("cmd-q", "Quit", "Quit", None),
     // --- RedRoot: app chrome, fires from any focus within the app ---
@@ -379,7 +403,8 @@ const DEFAULTS: &[ActionDef] = &[
     def("ctrl-shift-tab", "PrevTab", "Previous tab", Some("RedRoot")),
     // Schema sidebar + reload + filter. ⌘F reaches `RedRoot` from the editor (the
     // `CodeEditor` context doesn't bind it), so it always opens search.
-    def("cmd-b", "ToggleSidebar", "Toggle sidebar", Some("RedRoot")),
+    def("cmd-b", "ToggleSidebar", "Toggle schema", Some("RedRoot")),
+    def("cmd-y", "ToggleHistory", "Toggle history", Some("RedRoot")),
     def("cmd-r", "RefreshSchema", "Refresh schema", Some("RedRoot")),
     def("cmd-f", "SearchSchema", "Search schema", Some("RedRoot")),
     // Pane focus: direct jumps (⌥⌘1/2/3) and a cycle (F6 / ⇧F6). ⌥⌘ avoids the
@@ -626,6 +651,17 @@ pub(crate) fn apply(cx: &mut App, overrides: &[KeymapBlock]) -> Vec<String> {
     cx.clear_key_bindings();
     bind_components(cx);
     cx.bind_keys(default_bindings());
+    // ⌘1–⌘9 jump to the first nine connections in the switcher's order. Bound here
+    // (not in DEFAULTS) so the nine slots stay out of the rebind editor — like the
+    // OS-shortcut Alt+F4 below — and as true globals (no context) so they fire from
+    // any focus. `platform_chord` makes them Cmd on macOS / Ctrl elsewhere.
+    cx.bind_keys((1..=9u8).map(|n| {
+        KeyBinding::new(
+            &platform_chord(&format!("cmd-{n}")),
+            SwitchToConnectionSlot((n - 1) as usize),
+            None,
+        )
+    }));
     // Alt+F4 closes the window — the Windows and (most) Linux convention. It
     // usually arrives from the OS / compositor, but not every Wayland compositor
     // binds it, so wire it explicitly. Bound here rather than in `DEFAULTS` so it
@@ -745,6 +781,7 @@ fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<Ke
     Ok(match action {
         "ToggleCommandPalette" => kb!(ToggleCommandPalette),
         "SwitchConnection" => kb!(SwitchConnection),
+        "SwitchToPreviousConnection" => kb!(SwitchToPreviousConnection),
         "GoToRow" => kb!(GoToRow),
         "Quit" => kb!(Quit),
         "CopyResult" => kb!(CopyResult),
@@ -761,6 +798,7 @@ fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<Ke
         "NextTab" => kb!(NextTab),
         "PrevTab" => kb!(PrevTab),
         "ToggleSidebar" => kb!(ToggleSidebar),
+        "ToggleHistory" => kb!(ToggleHistory),
         "RefreshSchema" => kb!(RefreshSchema),
         "SearchSchema" => kb!(SearchSchema),
         "FocusSchema" => kb!(FocusSchema),

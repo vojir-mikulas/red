@@ -156,21 +156,25 @@ impl AppState {
                 .second(results_pane)
         };
 
-        // When collapsed, the schema pane (and its resize split) drop out entirely
-        // and the editor/results fill the width; the status-bar toggle brings it
-        // back, restoring the retained `sidebar_w`. `workspace` is the bare,
-        // self-sizing (`size_full`) split — the `flex_1` fill wrapper is applied
-        // below, *after* deciding whether the assistant dock wraps it. (Wrapping a
-        // `flex_1` element inside the dock's non-flex pane would collapse it — the
-        // dock pane stretches a `size_full` child but doesn't grow a `flex_1` one.)
-        let workspace = if active.sidebar_collapsed {
-            inner.into_any_element()
-        } else {
+        // Two independent left side-panels — History (leftmost) then Schema — each
+        // closable and separately resizable (Zed's multi-panel left dock). Each
+        // wraps the rest in a leading-sized horizontal split; closed, it drops out
+        // and the next pane fills the space. The status-bar toggles bring a panel
+        // back, restoring its retained width. `workspace` is the bare, self-sizing
+        // (`size_full`) result — the `flex_1` fill wrapper is applied below, *after*
+        // deciding whether the assistant dock wraps it. (Wrapping a `flex_1` element
+        // inside the dock's non-flex pane would collapse it — the pane stretches a
+        // `size_full` child but doesn't grow a `flex_1` one.)
+        let show_history = active.history_open;
+        let show_schema = !active.sidebar_collapsed;
+
+        // Innermost column boundary: Schema | (editor / results).
+        let with_schema = if show_schema {
             let schema_pane = self.render_schema(active, window, cx);
             let start = view.clone();
             let resize = view.clone();
             let end = view.clone();
-            let outer = SplitPane::new("shell-split-h", Axis::Horizontal)
+            SplitPane::new("shell-split-schema", Axis::Horizontal)
                 .size(active.sidebar_w)
                 .gutter(px(1.))
                 .drag(active.sidebar_drag)
@@ -206,8 +210,58 @@ impl AppState {
                     .ok();
                 })
                 .first(schema_pane)
-                .second(inner);
-            outer.into_any_element()
+                .second(inner)
+                .into_any_element()
+        } else {
+            inner.into_any_element()
+        };
+
+        // Outermost column boundary: History | (schema | editor / results).
+        let workspace = if show_history {
+            let history_pane = self.render_history(active, cx);
+            let start = view.clone();
+            let resize = view.clone();
+            let end = view.clone();
+            SplitPane::new("shell-split-history", Axis::Horizontal)
+                .size(active.history_w)
+                .gutter(px(1.))
+                .drag(active.history_drag)
+                .min_first(px(180.))
+                .max_first(px(480.))
+                .on_drag_start(move |anchor, _, cx| {
+                    start
+                        .update(cx, |this, cx| {
+                            if let Phase::Connected(a) = &mut this.phase {
+                                a.history_drag = Some(anchor);
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                })
+                .on_resize(move |size, _, cx| {
+                    resize
+                        .update(cx, |this, cx| {
+                            if let Phase::Connected(a) = &mut this.phase {
+                                a.history_w = size;
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                })
+                .on_drag_end(move |_, cx| {
+                    end.update(cx, |this, cx| {
+                        if let Phase::Connected(a) = &mut this.phase {
+                            a.history_drag = None;
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .first(history_pane)
+                .second(with_schema)
+                .into_any_element()
+        } else {
+            with_schema
         };
 
         // With the assistant open, dock it to the right of the whole workspace via
@@ -328,8 +382,8 @@ impl AppState {
                     .child(format!("{} {}", config.kind, active.version)),
             );
 
-        // Sidebar collapse toggle, pinned to the far-left of the status bar so it
-        // stays reachable whether the schema pane is shown or hidden.
+        // Schema + History dock toggles, pinned to the far-left of the status bar so
+        // they stay reachable whether the dock is shown or hidden.
         let sidebar_toggle = div()
             .id("toggle-sidebar")
             .mr_1()
@@ -341,7 +395,7 @@ impl AppState {
             .rounded(px(4.))
             .cursor_pointer()
             .tooltip(Tooltip::text(crate::keymap::localize_hint(
-                "Toggle sidebar  ⌘B",
+                "Toggle schema  ⌘B",
             )))
             .hover(|s| s.bg(theme.bg_elevated))
             .child(crate::icons::icon(
@@ -354,6 +408,32 @@ impl AppState {
                 theme.text_muted,
             ))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)));
+
+        // History panel toggle, accent-tinted while the panel is open.
+        let history_toggle = div()
+            .id("toggle-history")
+            .mr_1()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(20.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .tooltip(Tooltip::text(crate::keymap::localize_hint(
+                "Toggle history  ⌘Y",
+            )))
+            .hover(|s| s.bg(theme.bg_elevated))
+            .child(crate::icons::icon(
+                "history",
+                theme.scale(14.),
+                if active.history_open {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                },
+            ))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx)));
 
         // Assistant toggle, pinned to the far-right of the status bar (mirrors the
         // schema sidebar toggle on the left). Accent-tinted while the panel is open.
@@ -407,6 +487,7 @@ impl AppState {
                     .min_w_0()
                     .items_center()
                     .overflow_hidden()
+                    .child(history_toggle)
                     .child(sidebar_toggle)
                     .child(status_left),
             )

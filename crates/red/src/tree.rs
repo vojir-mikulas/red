@@ -19,7 +19,10 @@ use std::rc::Rc;
 
 use flint::prelude::*;
 use flint::{Button, ButtonSize, ButtonVariant};
-use gpui::{div, prelude::*, px, AnyElement, Context, SharedString, UniformListScrollHandle};
+use gpui::{
+    div, prelude::*, px, AnyElement, ClipboardItem, Context, FocusHandle, MouseButton, Pixels,
+    Point, ScrollStrategy, SharedString, UniformListScrollHandle,
+};
 use red_core::{Column as ResultColumn, ColumnValue, DbKind, FkEdge, ResultFilter, Value};
 use red_service::Command;
 
@@ -38,10 +41,26 @@ pub(crate) struct RelationTreeView {
     pub(crate) epoch: u64,
     next_id: u64,
     root: Node,
+    /// The keyboard-selected node (a stable id, so it survives expand/collapse),
+    /// resolved to a flat index per render.
+    selected: Option<u64>,
+    /// Focus for keyboard navigation (Tier 2) — the tree's `on_nav` only fires
+    /// while this handle is focused.
+    focus: FocusHandle,
     scroll: UniformListScrollHandle,
 }
 
 impl RelationTreeView {
+    fn find(&self, id: u64) -> Option<&Node> {
+        fn go(node: &Node, id: u64) -> Option<&Node> {
+            if node.id == id {
+                return Some(node);
+            }
+            node.children.iter().find_map(|c| go(c, id))
+        }
+        go(&self.root, id)
+    }
+
     fn find_mut(&mut self, id: u64) -> Option<&mut Node> {
         Self::find_in(&mut self.root, id)
     }
@@ -356,6 +375,18 @@ fn leaf(depth: usize, content: RowContent) -> VisibleRow {
     }
 }
 
+/// The next selectable row (one with a `node_id`) above/below `from` — skips the
+/// synthetic loading / empty / load-more rows during keyboard navigation.
+fn next_nav(flat: &[VisibleRow], from: Option<usize>, down: bool) -> Option<usize> {
+    let sel = |i: usize| flat[i].node_id.is_some();
+    match (from, down) {
+        (None, true) => (0..flat.len()).find(|&i| sel(i)),
+        (None, false) => (0..flat.len()).rev().find(|&i| sel(i)),
+        (Some(c), true) => ((c + 1)..flat.len()).find(|&i| sel(i)),
+        (Some(c), false) => (0..c).rev().find(|&i| sel(i)),
+    }
+}
+
 impl AppState {
     /// The focused tab's open relation tree, if any (Track B7).
     pub(crate) fn has_active_tree(&self) -> bool {
@@ -415,22 +446,50 @@ impl AppState {
         let Some(values) = rows.first().cloned() else {
             return true;
         };
+        // The focus handle is minted before the `phase` borrow (it needs `cx`).
+        let focus = cx.focus_handle();
         let Phase::Connected(active) = &mut self.phase else {
             return true;
         };
         let mut next_id = 0u64;
-        let root = record_node(
+        let kind = active.config.kind;
+        let columns = Rc::new(p.columns);
+        let values = Rc::new(values);
+        let mut root = record_node(
             &mut next_id,
             &active.fk_graph,
-            p.schema,
-            p.table,
-            Rc::new(p.columns),
-            Rc::new(values),
+            p.schema.clone(),
+            p.table.clone(),
+            columns.clone(),
+            values.clone(),
         );
+        let root_id = root.id;
+        // Auto-expand the root so its relations show immediately (building them is
+        // synchronous — no query until a relation itself is expanded).
+        if matches!(
+            &root.kind,
+            NodeKind::Record {
+                has_relations: true,
+                ..
+            }
+        ) {
+            root.children = build_relations(
+                &mut next_id,
+                &active.fk_graph,
+                kind,
+                &p.schema,
+                &p.table,
+                &columns,
+                &values,
+            );
+            root.expanded = true;
+        }
         let view = RelationTreeView {
             epoch: new_epoch(),
             next_id,
             root,
+            selected: Some(root_id),
+            focus,
             scroll: UniformListScrollHandle::new(),
         };
         if let Some(tab) = active.active_mut() {
@@ -442,11 +501,231 @@ impl AppState {
 
     /// Close the tree, returning the tab to its grid.
     pub(crate) fn close_tree(&mut self, cx: &mut Context<Self>) {
+        self.tree_menu = None;
         if let Phase::Connected(active) = &mut self.phase {
             if let Some(tab) = active.active_mut() {
                 tab.tree = None;
             }
         }
+        cx.notify();
+    }
+
+    /// Act on a node (double-click / Enter, Tier 1): a relation opens in the grid;
+    /// a record re-roots the tree at itself.
+    fn tree_activate(&mut self, node_id: u64, cx: &mut Context<Self>) {
+        let is_relation = matches!(&self.phase, Phase::Connected(a)
+            if a.active().and_then(|t| t.tree.as_ref()).and_then(|v| v.find(node_id))
+                .is_some_and(|n| matches!(n.kind, NodeKind::Relation { .. })));
+        if is_relation {
+            self.open_relation_in_grid(node_id, cx);
+        } else {
+            self.reroot_tree(node_id, cx);
+        }
+    }
+
+    /// Open a relation node as a normal filtered browse in a tab — the full grid
+    /// (sort / filter / export / edit). The tree is preserved in its own tab.
+    fn open_relation_in_grid(&mut self, node_id: u64, cx: &mut Context<Self>) {
+        let target = match &self.phase {
+            Phase::Connected(active) => active
+                .active()
+                .and_then(|t| t.tree.as_ref())
+                .and_then(|v| v.find(node_id))
+                .and_then(|n| match &n.kind {
+                    NodeKind::Relation {
+                        schema,
+                        table,
+                        filter,
+                        ..
+                    } => Some((schema.clone(), table.clone(), filter.clone())),
+                    _ => None,
+                }),
+            _ => None,
+        };
+        if let Some((schema, table, filter)) = target {
+            self.open_table_browse(schema, table, Some(filter), cx);
+        }
+    }
+
+    /// Re-root the tree at a record node (pivot). The record already holds its
+    /// values, so this needs no fetch.
+    fn reroot_tree(&mut self, node_id: u64, cx: &mut Context<Self>) {
+        let (graph, kind) = match &self.phase {
+            Phase::Connected(a) => (a.fk_graph.clone(), a.config.kind),
+            _ => return,
+        };
+        if let Phase::Connected(active) = &mut self.phase {
+            if let Some(view) = active.active_mut().and_then(|t| t.tree.as_mut()) {
+                let focus = view.focus.clone();
+                let data = view.find(node_id).and_then(|n| match &n.kind {
+                    NodeKind::Record {
+                        schema,
+                        table,
+                        columns,
+                        values,
+                        ..
+                    } => Some((
+                        schema.clone(),
+                        table.clone(),
+                        columns.clone(),
+                        values.clone(),
+                    )),
+                    _ => None,
+                });
+                if let Some((schema, table, columns, values)) = data {
+                    let mut next_id = 0u64;
+                    let mut root = record_node(
+                        &mut next_id,
+                        &graph,
+                        schema.clone(),
+                        table.clone(),
+                        columns.clone(),
+                        values.clone(),
+                    );
+                    let root_id = root.id;
+                    if matches!(
+                        &root.kind,
+                        NodeKind::Record {
+                            has_relations: true,
+                            ..
+                        }
+                    ) {
+                        root.children = build_relations(
+                            &mut next_id,
+                            &graph,
+                            kind,
+                            &schema,
+                            &table,
+                            &columns,
+                            &values,
+                        );
+                        root.expanded = true;
+                    }
+                    *view = RelationTreeView {
+                        epoch: new_epoch(),
+                        next_id,
+                        root,
+                        selected: Some(root_id),
+                        focus,
+                        scroll: UniformListScrollHandle::new(),
+                    };
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Copy a record node's row as tab-separated values (Tier 3).
+    fn copy_tree_record(&mut self, node_id: u64, cx: &mut Context<Self>) {
+        let tsv = match &self.phase {
+            Phase::Connected(active) => active
+                .active()
+                .and_then(|t| t.tree.as_ref())
+                .and_then(|v| v.find(node_id))
+                .and_then(|n| match &n.kind {
+                    NodeKind::Record { values, .. } => Some(
+                        values
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join("\t"),
+                    ),
+                    _ => None,
+                }),
+            _ => None,
+        };
+        if let Some(tsv) = tsv {
+            cx.write_to_clipboard(ClipboardItem::new_string(tsv));
+        }
+    }
+
+    /// Keyboard navigation over the tree (Tier 2): move selection, expand/collapse,
+    /// or activate. Mirrors the schema sidebar's `schema_nav`.
+    fn tree_nav(&mut self, nav: TreeNav, cx: &mut Context<Self>) {
+        let (flat, sel) = match &self.phase {
+            Phase::Connected(active) => {
+                let Some(view) = active.active().and_then(|t| t.tree.as_ref()) else {
+                    return;
+                };
+                let flat = flatten(view);
+                let sel = view
+                    .selected
+                    .and_then(|id| flat.iter().position(|r| r.node_id == Some(id)));
+                (flat, sel)
+            }
+            _ => return,
+        };
+        if flat.is_empty() {
+            return;
+        }
+        match nav {
+            TreeNav::Up => {
+                if let Some(ix) = next_nav(&flat, sel, false) {
+                    self.tree_select_ix(&flat, ix, cx);
+                }
+            }
+            TreeNav::Down => {
+                if let Some(ix) = next_nav(&flat, sel, true) {
+                    self.tree_select_ix(&flat, ix, cx);
+                }
+            }
+            TreeNav::Expand => {
+                let Some(i) = sel else { return };
+                let row = &flat[i];
+                if row.item.has_children && !row.item.expanded {
+                    if let Some(id) = row.node_id {
+                        self.tree_toggle(id, cx);
+                    }
+                } else if row.item.expanded {
+                    if let Some(ix) = next_nav(&flat, sel, true) {
+                        self.tree_select_ix(&flat, ix, cx);
+                    }
+                }
+            }
+            TreeNav::Collapse => {
+                let Some(i) = sel else { return };
+                let row = &flat[i];
+                if row.item.has_children && row.item.expanded {
+                    if let Some(id) = row.node_id {
+                        self.tree_toggle(id, cx);
+                    }
+                } else if row.item.depth > 0 {
+                    if let Some(p) = (0..i)
+                        .rev()
+                        .find(|&j| flat[j].item.depth < row.item.depth && flat[j].node_id.is_some())
+                    {
+                        self.tree_select_ix(&flat, p, cx);
+                    }
+                }
+            }
+            TreeNav::Activate => {
+                let Some(i) = sel else { return };
+                if let Some(id) = flat[i].node_id {
+                    self.tree_activate(id, cx);
+                }
+            }
+        }
+    }
+
+    fn tree_select_ix(&mut self, flat: &[VisibleRow], ix: usize, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase {
+            if let Some(view) = active.active_mut().and_then(|t| t.tree.as_mut()) {
+                view.selected = flat[ix].node_id;
+                view.scroll.scroll_to_item(ix, ScrollStrategy::Top);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Open the right-click context menu on a tree node (Tier 3).
+    fn open_tree_menu(&mut self, node_id: Option<u64>, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(id) = node_id else { return };
+        if let Phase::Connected(active) = &mut self.phase {
+            if let Some(view) = active.active_mut().and_then(|t| t.tree.as_mut()) {
+                view.selected = Some(id);
+            }
+        }
+        self.tree_menu = Some((id, pos));
         cx.notify();
     }
 
@@ -660,8 +939,76 @@ impl AppState {
         let flat = flatten(view);
         let items: Vec<TreeItem> = flat.iter().map(|r| r.item).collect();
         let rows = Rc::new(flat);
-        let (rows_render, rows_toggle, rows_activate) = (rows.clone(), rows.clone(), rows.clone());
-        let (tv, av) = (cx.entity().downgrade(), cx.entity().downgrade());
+        let selected_ix = view
+            .selected
+            .and_then(|id| rows.iter().position(|r| r.node_id == Some(id)));
+        let (rows_render, rows_toggle, rows_activate, rows_select, rows_sec) = (
+            rows.clone(),
+            rows.clone(),
+            rows.clone(),
+            rows.clone(),
+            rows.clone(),
+        );
+        let (tv, av, sv, nv, gv) = (
+            cx.entity().downgrade(),
+            cx.entity().downgrade(),
+            cx.entity().downgrade(),
+            cx.entity().downgrade(),
+            cx.entity().downgrade(),
+        );
+
+        // Tier 3: the right-click context menu, anchored at the cursor. Its actions
+        // depend on the node's kind; a full-cover backdrop dismisses it.
+        let menu_overlay =
+            self.tree_menu.and_then(|(id, pos)| {
+                let node = view.find(id)?;
+                let mut menu = ContextMenu::new("tree-node-menu");
+                match &node.kind {
+                    NodeKind::Relation { .. } => {
+                        menu = menu.item(
+                            ContextMenuItem::new("tree-open-grid", "Open in grid").on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.tree_menu = None;
+                                    this.open_relation_in_grid(id, cx);
+                                    cx.notify();
+                                }),
+                            ),
+                        );
+                    }
+                    NodeKind::Record { .. } => {
+                        menu = menu
+                            .item(
+                                ContextMenuItem::new("tree-reroot", "Open row as tree").on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.tree_menu = None;
+                                        this.reroot_tree(id, cx);
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .item(ContextMenuItem::new("tree-copy", "Copy row").on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.tree_menu = None;
+                                    this.copy_tree_record(id, cx);
+                                    cx.notify();
+                                }),
+                            ));
+                    }
+                }
+                Some(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.tree_menu = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child(floating(div().occlude().child(menu)).at(pos)),
+                )
+            });
 
         let header = div()
             .flex_shrink_0()
@@ -690,24 +1037,43 @@ impl AppState {
             .row_height(px(24.))
             .indent(px(14.))
             .track_scroll(&view.scroll)
+            .focus_handle(view.focus.clone())
+            .selected(selected_ix)
             .disclosure(|expanded, _window, cx| {
                 let name = if expanded { "chevron-down" } else { "chevron" };
                 crate::icons::icon(name, cx.theme().scale(12.), cx.theme().text_faint)
                     .into_any_element()
             })
             .render_row(move |ix, _window, cx| render_row(&rows_render[ix], cx))
+            .on_select(move |ix, _event, _window, cx| {
+                if rows_select[ix].node_id.is_some() {
+                    let flat = rows_select.clone();
+                    sv.update(cx, |this, cx| this.tree_select_ix(&flat, ix, cx))
+                        .ok();
+                }
+            })
             .on_toggle(move |ix, _window, cx| {
                 if let Some(node) = rows_toggle[ix].node_id {
                     tv.update(cx, |this, cx| this.tree_toggle(node, cx)).ok();
                 }
             })
+            // Double-click / Enter acts (Tier 1): relation → open in grid, record →
+            // re-root; the synthetic "Load more" row grows its relation's page.
             .on_activate(move |ix, _window, cx| {
                 let row = &rows_activate[ix];
                 if let Some(node) = row.more_for {
                     av.update(cx, |this, cx| this.tree_load_more(node, cx)).ok();
                 } else if let Some(node) = row.node_id {
-                    av.update(cx, |this, cx| this.tree_toggle(node, cx)).ok();
+                    av.update(cx, |this, cx| this.tree_activate(node, cx)).ok();
                 }
+            })
+            .on_nav(move |nav, _window, cx| {
+                nv.update(cx, |this, cx| this.tree_nav(nav, cx)).ok();
+            })
+            .on_secondary(move |ix, pos, _window, cx| {
+                let node = rows_sec[ix].node_id;
+                gv.update(cx, |this, cx| this.open_tree_menu(node, pos, cx))
+                    .ok();
             });
 
         div()
@@ -725,6 +1091,7 @@ impl AppState {
                     .text_color(text)
                     .child(tree),
             )
+            .children(menu_overlay)
             .into_any_element()
     }
 }

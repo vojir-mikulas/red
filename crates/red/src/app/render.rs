@@ -11,7 +11,8 @@ use crate::keymap::{
     Explain, FindInResult, FocusEditor, FocusGrid, FocusSchema, NewConnection, NewTab, NextTab,
     OpenSavedQueries, PrevTab, RefreshSchema, ReportBug, RevertChanges, RunQuery, SaveQuery,
     SearchSchema, SelectAll, SetNull, Settings, ShowShortcuts, SubmitChanges, SwitchConnection,
-    ToggleAssistant, ToggleFilter, ToggleInspector, ToggleSidebar,
+    SwitchToConnectionSlot, SwitchToPreviousConnection, ToggleAssistant, ToggleFilter,
+    ToggleHistory, ToggleInspector, ToggleSidebar,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
@@ -384,6 +385,14 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &SwitchConnection, window, cx| {
                 this.toggle_switcher(window, cx)
             }))
+            // ⌘⇧P flips to the previous connection; ⌘1–9 jump to the n-th in the
+            // switcher's order. True globals (like ⌘P), so they fire from any focus.
+            .on_action(cx.listener(|this, _: &SwitchToPreviousConnection, _, cx| {
+                this.switch_to_previous(cx)
+            }))
+            .on_action(cx.listener(|this, action: &SwitchToConnectionSlot, _, cx| {
+                this.switch_to_slot(action.0, cx)
+            }))
             .on_action(cx.listener(|this, _: &GoToRow, _, cx| this.open_goto_prompt(cx)))
             .on_action(cx.listener(|this, _: &CopyResult, _, cx| this.copy_result_selection(cx)))
             // ⌘I toggles the cell detail inspector; Esc closes it (no-op when shut).
@@ -408,6 +417,7 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &NextTab, window, cx| this.next_tab(window, cx)))
             .on_action(cx.listener(|this, _: &PrevTab, window, cx| this.prev_tab(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &ToggleHistory, _, cx| this.toggle_history(cx)))
             .on_action(cx.listener(|this, _: &RefreshSchema, _, _| this.refresh_schema()))
             .on_action(cx.listener(|this, _: &SearchSchema, _, cx| {
                 this.focus_search = true;

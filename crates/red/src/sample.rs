@@ -57,6 +57,7 @@ pub(crate) fn first_run_connection() -> Option<StoredConnection> {
             ..Default::default()
         },
         last_accessed: None,
+        pinned: false,
     })
 }
 

@@ -28,6 +28,17 @@ impl AppState {
         self.parked.get_mut(&id).map(|b| b.as_mut())
     }
 
+    /// The most-recently-foregrounded warm parked session, if any — the
+    /// "previous connection" the ⌘⇧P toggle returns to, and the fall-back when the
+    /// foreground session disconnects. (`parked` is a `HashMap`, so this picks by
+    /// `last_active_seq` rather than iteration order.)
+    pub(crate) fn parked_mru(&self) -> Option<SessionId> {
+        self.parked
+            .iter()
+            .max_by_key(|(_, a)| a.last_active_seq)
+            .map(|(id, _)| *id)
+    }
+
     /// Fire a command at the foreground session (the on-screen connection). A
     /// no-op when nothing is foregrounded.
     pub(crate) fn send_active(&self, command: Command) {
@@ -137,14 +148,9 @@ impl AppState {
         if self.foreground_session == Some(id) {
             self.foreground_session = None;
             // Prefer an already-warm connection over the welcome screen — the most
-            // recently foregrounded one (`parked` is a HashMap, so `keys().next()`
-            // would drop the user into an arbitrary session).
-            let mru = self
-                .parked
-                .iter()
-                .max_by_key(|(_, a)| a.last_active_seq)
-                .map(|(id, _)| *id);
-            if let Some(other) = mru {
+            // recently foregrounded one (`parked` is a HashMap, so an arbitrary
+            // pick would drop the user into a random session).
+            if let Some(other) = self.parked_mru() {
                 self.foreground_parked(other, cx);
             } else {
                 self.service.send_global(Command::SetActiveSession(None));
@@ -185,6 +191,18 @@ impl AppState {
         self.confirm_delete_conn = None;
         self.refocus_root = true;
         cx.notify();
+    }
+
+    /// Pin or unpin saved connection `index` (Phase 3). Pinned connections float
+    /// to the top of the welcome list and the switcher and claim the low ⌘-digit
+    /// slots, independent of recency. Persists and refreshes the switcher.
+    pub(crate) fn toggle_pin(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(stored) = self.connections.get_mut(index) {
+            stored.pinned = !stored.pinned;
+            self.persist(cx);
+            self.rebuild_switcher(cx);
+            cx.notify();
+        }
     }
 
     pub(crate) fn delete_connection(&mut self, index: usize, cx: &mut Context<Self>) {
