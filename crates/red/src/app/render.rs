@@ -8,11 +8,11 @@ use gpui::{div, prelude::*, px, ClipboardItem, Focusable, KeyDownEvent, Render, 
 use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::keymap::{
     About, AddRow, BeginEdit, CloseInspector, CloseTab, CycleFocusNext, CycleFocusPrev, DeleteRow,
-    Explain, FindInResult, FocusEditor, FocusGrid, FocusSchema, NewConnection, NewTab, NextTab,
-    OpenSavedQueries, PrevTab, RefreshSchema, ReportBug, RevertChanges, RunQuery, SaveQuery,
-    SearchSchema, SelectAll, SetNull, Settings, ShowShortcuts, SubmitChanges, SwitchConnection,
-    SwitchToConnectionSlot, SwitchToPreviousConnection, ToggleAssistant, ToggleFilter,
-    ToggleHistory, ToggleInspector, ToggleSidebar,
+    Explain, FindInResult, FocusEditor, FocusGrid, FocusOtherHalf, FocusSchema, NewConnection,
+    NewTab, NextTab, OpenSavedQueries, PrevTab, RefreshSchema, ReportBug, RevertChanges, RunQuery,
+    SaveQuery, SearchSchema, SelectAll, SetNull, Settings, ShowShortcuts, SubmitChanges,
+    SwitchConnection, SwitchToConnectionSlot, SwitchToPreviousConnection, ToggleAssistant,
+    ToggleFilter, ToggleHistory, ToggleInspector, ToggleSidebar, ToggleSplit,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
@@ -167,6 +167,11 @@ impl Render for AppState {
         if let Some(pane) = self.pending_focus.take() {
             self.focus_pane(pane, window, cx);
         }
+
+        // Keep the split's focused half in step with where keyboard focus actually
+        // sits, so clicking into either half (incl. its editor) lights it as active
+        // and aims run/export/filter there. No-op when not split.
+        self.sync_split_focus(window, cx);
 
         // The connection form just opened — focus its name field so the user can
         // type immediately (and Tab onward through the fields).
@@ -439,6 +444,9 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &CycleFocusPrev, window, cx| {
                 this.cycle_focus(false, window, cx)
             }))
+            // Side-by-side split (⌘\ toggles it, ⌥⌘\ jumps to the other half).
+            .on_action(cx.listener(|this, _: &ToggleSplit, _, cx| this.toggle_split(cx)))
+            .on_action(cx.listener(|this, _: &FocusOtherHalf, _, cx| this.focus_other_half(cx)))
             .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| this.toggle_shortcuts(cx)))
             // Settings panel: ⌘, and the RED → Settings… / About RED menu items.
             .on_action(cx.listener(|this, _: &Settings, _, cx| this.open_settings(cx)))

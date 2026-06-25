@@ -132,15 +132,14 @@ impl AppState {
         cx.notify();
     }
 
-    /// Whether the active tab has an open plan (drives the grid-or-plan switch in
-    /// the result pane).
-    pub(crate) fn has_active_plan(&self) -> bool {
-        matches!(&self.phase, Phase::Connected(active) if active.active_plan().is_some())
-    }
-
     /// Render the plan pane: a header (title · explained SQL · actions) over the
     /// plan tree, a loading line, or the error.
-    pub(crate) fn render_plan(&self, active: &ActiveConn, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_plan(
+        &self,
+        active: &ActiveConn,
+        tab_idx: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme();
         let (bg, border, text, muted, faint, dim, red) = (
             theme.bg_panel,
@@ -156,10 +155,13 @@ impl AppState {
         let (s11, s12) = (theme.scale(11.), theme.scale(12.));
         let body_size = theme.font_size;
 
-        let Some(view) = active.active_plan() else {
+        let Some(tab) = active.tabs.get(tab_idx) else {
             return div().into_any_element();
         };
-        let has_result = active.active_result().is_some();
+        let Some(view) = tab.plan.as_ref() else {
+            return div().into_any_element();
+        };
+        let has_result = tab.result.is_some();
 
         // --- header: title, explained SQL, actions ---
         let analyzed = view.analyze;

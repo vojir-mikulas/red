@@ -29,9 +29,9 @@ use flint::components::text_input::{
 };
 
 use crate::keymap::{
-    About, CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusSchema,
-    NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, ReportBug, RunQuery, SearchSchema,
-    Settings, ShowShortcuts, SwitchConnection, ToggleSidebar,
+    About, CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusOtherHalf,
+    FocusSchema, NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, ReportBug, RunQuery,
+    SearchSchema, Settings, ShowShortcuts, SwitchConnection, ToggleSidebar, ToggleSplit,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 use crate::Quit;
@@ -74,10 +74,12 @@ pub(crate) fn build_menus() -> Vec<Menu> {
         ]),
         Menu::new("View").items([
             MenuItem::action("Toggle Sidebar", ToggleSidebar),
+            MenuItem::action("Toggle Split View", ToggleSplit),
             MenuItem::separator(),
             MenuItem::action("Focus Schema", FocusSchema),
             MenuItem::action("Focus Editor", FocusEditor),
             MenuItem::action("Focus Grid", FocusGrid),
+            MenuItem::action("Focus Other Split Half", FocusOtherHalf),
             MenuItem::separator(),
             MenuItem::action("Cycle Focus Next", CycleFocusNext),
             MenuItem::action("Cycle Focus Previous", CycleFocusPrev),

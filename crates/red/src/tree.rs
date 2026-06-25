@@ -388,11 +388,6 @@ fn next_nav(flat: &[VisibleRow], from: Option<usize>, down: bool) -> Option<usiz
 }
 
 impl AppState {
-    /// The focused tab's open relation tree, if any (Track B7).
-    pub(crate) fn has_active_tree(&self) -> bool {
-        matches!(&self.phase, Phase::Connected(a) if a.active().is_some_and(|t| t.tree.is_some()))
-    }
-
     /// "Open row as tree": fetch the focused row in full (the inspector's `CopyRows`
     /// path), then build the tree rooted at that record (in [`on_tree_root_rows`]).
     /// No-op when the result isn't a single-table browse (no FK context).
@@ -920,14 +915,20 @@ impl AppState {
 
     /// Render the relation-tree pane: a header (root table · close) over the
     /// flattened, virtualized tree.
-    pub(crate) fn render_tree(&self, active: &ActiveConn, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_tree(
+        &self,
+        active: &ActiveConn,
+        tab_idx: usize,
+        is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme();
         let (bg, border, text, muted) =
             (theme.bg_panel, theme.border, theme.text, theme.text_muted);
         let ui_family = theme.font_family.clone();
         let (s11, s12) = (theme.scale(11.), theme.scale(12.));
 
-        let Some(view) = active.active().and_then(|t| t.tree.as_ref()) else {
+        let Some(view) = active.tabs.get(tab_idx).and_then(|t| t.tree.as_ref()) else {
             return div().into_any_element();
         };
 
@@ -958,9 +959,12 @@ impl AppState {
         );
 
         // Tier 3: the right-click context menu, anchored at the cursor. Its actions
-        // depend on the node's kind; a full-cover backdrop dismisses it.
-        let menu_overlay =
-            self.tree_menu.and_then(|(id, pos)| {
+        // depend on the node's kind; a full-cover backdrop dismisses it. Shown in
+        // the focused half only — it's single-instance app state.
+        let menu_overlay = is_focused
+            .then_some(self.tree_menu)
+            .flatten()
+            .and_then(|(id, pos)| {
                 let node = view.find(id)?;
                 let mut menu = ContextMenu::new("tree-node-menu");
                 match &node.kind {

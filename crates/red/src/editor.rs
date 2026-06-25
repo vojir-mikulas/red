@@ -267,10 +267,16 @@ pub(crate) fn history_label(sql: &str) -> String {
 }
 
 impl AppState {
-    /// The editor pane: toolbar + the `CodeEditor` surface + a history popover.
+    /// The editor pane for the tab at `tab_idx`, shown in split half `half`: the tab
+    /// strip + breadcrumb + the `CodeEditor` surface + run bar. `is_focused` is
+    /// whether this half holds focus; the (single-instance) find bar renders only in
+    /// the focused half.
     pub(crate) fn render_editor(
         &self,
         active: &ActiveConn,
+        tab_idx: usize,
+        half: crate::app::SplitHalf,
+        is_focused: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         // Owned (not borrowed from `cx`) so the agent-tab branch below can call a
@@ -304,7 +310,9 @@ impl AppState {
         let view = cx.entity().downgrade();
 
         // --- tab strip: one tab per open query + a "new query" affordance ---
-        let active_idx = active.active_tab;
+        // This half's strip highlights the tab it shows (`tab_idx`); the other half
+        // (when split) has its own strip highlighting its own tab.
+        let active_idx = tab_idx;
         // Drop-indicator state: the gap a dragged tab would land in, gated on an
         // actual drag so a stale target never paints once the drag ends.
         let tab_count = active.tabs.len();
@@ -347,7 +355,11 @@ impl AppState {
                 .border_color(border)
                 .cursor_pointer()
                 .when(!is_active, |d| d.hover(|s| s.bg(bg_elevated)))
-                .on_click(cx.listener(move |this, _, _, cx| this.set_active_tab(i, cx)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    // Clicking a tab in this half's strip aims it at this half.
+                    this.set_split_focus(half, cx);
+                    this.set_active_tab(i, cx);
+                }))
                 // Drag this tab to reorder; the chip below tracks the cursor.
                 .on_drag(TabDrag(i), move |_, offset, _window, cx| {
                     let title = drag_title.clone();
@@ -519,13 +531,17 @@ impl AppState {
                     .tooltip(Tooltip::text(crate::keymap::localize_hint("New tab  ⌘T")))
                     .text_color(faint)
                     .hover(|s| s.bg(bg_elevated).text_color(text))
-                    .on_click(cx.listener(|this, _, _, cx| this.new_query(cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        // Open the new tab in this half.
+                        this.set_split_focus(half, cx);
+                        this.new_query(cx);
+                    }))
                     .child(crate::icons::icon("plus", theme.scale(13.), faint)),
             );
 
         // No open tab (user closed the last one): keep the strip — its ＋ opens
         // a new query — over an empty pane, and skip the editor/run/breadcrumb.
-        let Some(tab) = active.active() else {
+        let Some(tab) = active.tabs.get(tab_idx) else {
             let empty = div()
                 .flex_1()
                 .min_h(px(0.))
@@ -643,9 +659,11 @@ impl AppState {
             .child(breadcrumb)
             // The find bar (Track B2, Tier 1) sits above the editor when ⌘F opened
             // it against the query; it selects matches in place, so the editor just
-            // repaints.
+            // repaints. Single-instance, so only the focused half renders it.
             .when_some(
-                self.render_find_bar(crate::find::FindTarget::Editor, cx),
+                is_focused
+                    .then(|| self.render_find_bar(crate::find::FindTarget::Editor, cx))
+                    .flatten(),
                 |c, bar| c.child(bar),
             )
             .child(surface)

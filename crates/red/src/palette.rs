@@ -77,6 +77,12 @@ pub(crate) enum Cmd {
     AssistantNewChat,
     /// Reveal the conversations directory in the OS file manager (M-S5).
     RevealConversationStorage,
+    /// Open the side-by-side split (a second query pane on the right).
+    SplitRight,
+    /// Collapse the split back to a single pane.
+    Unsplit,
+    /// Move focus to the other half of the split.
+    FocusOtherHalf,
 }
 
 /// Which free-text prompt the single palette slot is currently serving, so a
@@ -253,6 +259,9 @@ impl AppState {
             Cmd::AssistantHistory => self.open_history_sidebar(cx),
             Cmd::AssistantNewChat => self.new_chat(cx),
             Cmd::RevealConversationStorage => self.reveal_conversation_storage(cx),
+            Cmd::SplitRight => self.split_right(cx),
+            Cmd::Unsplit => self.unsplit(cx),
+            Cmd::FocusOtherHalf => self.focus_other_half(cx),
         }
     }
 
@@ -310,6 +319,23 @@ impl AppState {
                     out.push((
                         PaletteItem::new("cmd:prev-tab", "query: previous tab").hint("⌃⇧Tab"),
                         Cmd::PrevTab,
+                    ));
+                }
+                // Side-by-side split: offer open/focus while split, else open.
+                if active.split.is_some() {
+                    out.push((
+                        PaletteItem::new("cmd:unsplit", "view: unsplit").hint("⌘\\"),
+                        Cmd::Unsplit,
+                    ));
+                    out.push((
+                        PaletteItem::new("cmd:focus-other-half", "view: focus other split half")
+                            .hint("⌥⌘\\"),
+                        Cmd::FocusOtherHalf,
+                    ));
+                } else if active.active().is_some() {
+                    out.push((
+                        PaletteItem::new("cmd:split-right", "view: split right").hint("⌘\\"),
+                        Cmd::SplitRight,
                     ));
                 }
                 // Only meaningful with rows on screen to navigate / copy.

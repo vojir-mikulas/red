@@ -11,7 +11,9 @@ impl AppState {
     pub(crate) fn set_active_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase {
             if index < active.tabs.len() {
-                active.active_tab = index;
+                // Load the tab into the focused half; when split, picking the tab the
+                // other half already shows swaps the two (see `set_focused_tab`).
+                active.set_focused_tab(index);
                 // Selecting a partly off-screen tab scrolls it fully into view.
                 active.tab_scroll.scroll_to_item(index);
             }
@@ -54,7 +56,26 @@ impl AppState {
                     let dest = dest.min(active.tabs.len() - 1);
                     let tab = active.tabs.remove(from);
                     active.tabs.insert(dest, tab);
-                    active.active_tab = dest;
+                    // Remap an old index across the remove(from)+insert(dest) so each
+                    // half keeps pointing at its tab; the focused half is then aimed
+                    // at the dragged tab (its new home, `dest`).
+                    let remap = |idx: usize| -> usize {
+                        if idx == from {
+                            return dest;
+                        }
+                        let j = if idx > from { idx - 1 } else { idx };
+                        if j >= dest {
+                            j + 1
+                        } else {
+                            j
+                        }
+                    };
+                    active.active_tab = remap(active.active_tab);
+                    if let Some(s) = &mut active.split {
+                        s.secondary = remap(s.secondary);
+                    }
+                    active.set_focused_tab(dest);
+                    active.validate_split();
                 }
             }
         }
@@ -95,11 +116,13 @@ impl AppState {
         let index = match &mut self.phase {
             Phase::Connected(active) => {
                 active.tabs.push(tab);
-                active.active_tab = active.tabs.len() - 1;
+                let index = active.tabs.len() - 1;
+                // Open it in the focused half (the new tab is unique, so no swap).
+                active.set_focused_tab(index);
                 // Scroll the freshly-focused tab into view on the next paint, in
                 // case the strip was already scrolled or crowded.
-                active.tab_scroll.scroll_to_item(active.active_tab);
-                active.active_tab
+                active.tab_scroll.scroll_to_item(index);
+                index
             }
             _ => return 0,
         };
@@ -148,16 +171,35 @@ impl AppState {
     pub(crate) fn step_active_tab(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
         if let Phase::Connected(active) = &mut self.phase {
             let n = active.tabs.len();
-            if n > 1 {
-                active.active_tab = if forward {
-                    (active.active_tab + 1) % n
-                } else {
-                    (active.active_tab + n - 1) % n
-                };
-                active.tab_scroll.scroll_to_item(active.active_tab);
-                cx.notify();
-                return true;
+            if n <= 1 {
+                return false;
             }
+            // When split, skip the tab the other half already shows — each half
+            // owns a distinct tab. With only two tabs (one per half) there's
+            // nothing to land on, so the step is a no-op.
+            let other = active.split.as_ref().map(|s| match s.focus {
+                SplitHalf::Primary => s.secondary,
+                SplitHalf::Secondary => active.active_tab,
+            });
+            let cur = active.focused_tab_index();
+            let mut next = cur;
+            for _ in 0..n {
+                next = if forward {
+                    (next + 1) % n
+                } else {
+                    (next + n - 1) % n
+                };
+                if Some(next) != other {
+                    break;
+                }
+            }
+            if next == cur {
+                return false;
+            }
+            active.set_focused_tab(next);
+            active.tab_scroll.scroll_to_item(next);
+            cx.notify();
+            return true;
         }
         false
     }
@@ -236,13 +278,24 @@ impl AppState {
         let free_epoch = match &mut self.phase {
             Phase::Connected(active) if index < active.tabs.len() => {
                 let removed = active.tabs.remove(index);
+                let len = active.tabs.len();
                 // Keep the focus stable: clamp, and shift left if we removed a
                 // tab at or before the focused one. Harmless when the strip is
                 // now empty — `active()` just returns `None`.
                 if active.active_tab >= index && active.active_tab > 0 {
                     active.active_tab -= 1;
                 }
-                active.active_tab = active.active_tab.min(active.tabs.len().saturating_sub(1));
+                active.active_tab = active.active_tab.min(len.saturating_sub(1));
+                // Track the split's right half across the removal the same way; then
+                // collapse the split if the close left it ill-formed (one tab gone,
+                // or both halves now point at the same tab).
+                if let Some(s) = &mut active.split {
+                    if s.secondary >= index && s.secondary > 0 {
+                        s.secondary -= 1;
+                    }
+                    s.secondary = s.secondary.min(len.saturating_sub(1));
+                }
+                active.validate_split();
                 removed.result.map(|g| g.epoch)
             }
             _ => return,

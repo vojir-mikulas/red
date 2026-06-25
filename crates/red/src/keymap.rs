@@ -115,6 +115,11 @@ actions!(
         SetNull,
         /// Select the whole result — every row and data column (⌘A in the grid).
         SelectAll,
+        /// Toggle the side-by-side split (⌘\): open a second query pane to the right
+        /// of the active one, or collapse the split back to one pane.
+        ToggleSplit,
+        /// Move focus to the other half of the split (⌥⌘\).
+        FocusOtherHalf,
     ]
 );
 
@@ -151,6 +156,8 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
                 ("⌥⌘1 / ⌥⌘2 / ⌥⌘3", "Focus schema / editor / grid"),
                 ("F6 / ⇧F6", "Cycle focus forward / back"),
                 ("⌘B", "Toggle schema sidebar"),
+                ("⌘\\", "Split view (two tabs side by side)"),
+                ("⌥⌘\\", "Focus other split half"),
             ],
         ),
         (
@@ -453,6 +460,20 @@ const DEFAULTS: &[ActionDef] = &[
     // item displays this accelerator by looking the action up here. About has no
     // shortcut — it's reachable only from the menu.
     def("cmd-,", "Settings", "Settings", Some("RedRoot")),
+    // Side-by-side split: ⌘\ toggles a second query pane (the Zed idiom); ⌥⌘\ jumps
+    // focus to the other half. `RedRoot`-scoped so they fire from any pane's focus.
+    def(
+        "cmd-\\",
+        "ToggleSplit",
+        "Toggle split view",
+        Some("RedRoot"),
+    ),
+    def(
+        "cmd-alt-\\",
+        "FocusOtherHalf",
+        "Focus other split half",
+        Some("RedRoot"),
+    ),
     // --- staged grid editing (Track B6) ---
     // Scoped to the `Table` context (the result grid's focus context, set by
     // Flint's `Table`) so they fire only with the grid focused and never touch the
@@ -817,6 +838,8 @@ fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<Ke
         "AddRow" => kb!(AddRow),
         "SetNull" => kb!(SetNull),
         "SelectAll" => kb!(SelectAll),
+        "ToggleSplit" => kb!(ToggleSplit),
+        "FocusOtherHalf" => kb!(FocusOtherHalf),
         other => return Err(format!("unknown action “{other}” — skipping")),
     })
 }

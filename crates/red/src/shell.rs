@@ -3,7 +3,7 @@
 //! result grid. The split sizes are caller-owned state on [`ActiveConn`].
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Axis, Context, Window};
+use gpui::{div, prelude::*, px, Axis, Context, MouseButton, Window};
 
 /// Left inset of the top bar. On macOS it clears the seamless traffic lights
 /// overlapping this strip and leaves a little breathing room between them and
@@ -14,7 +14,7 @@ const TITLEBAR_LEFT_INSET: f32 = 88.;
 #[cfg(not(target_os = "macos"))]
 const TITLEBAR_LEFT_INSET: f32 = 12.;
 
-use crate::app::{ActiveConn, AppState, Phase};
+use crate::app::{ActiveConn, AppState, Phase, SplitHalf};
 
 impl AppState {
     pub(crate) fn render_shell(
@@ -27,20 +27,6 @@ impl AppState {
         // mutably) doesn't clash with the theme tokens used throughout this fn.
         let theme = cx.theme().clone();
         let view = cx.entity().downgrade();
-
-        // Pane contents: SQL editor · result grid. The schema explorer is built
-        // below, only when the sidebar is shown.
-        let editor_pane = self.render_editor(active, cx);
-        // The lower pane shows the relation tree (Track B7) or the query plan
-        // (Track B4) when one is open, else the result grid — all share the slot;
-        // running a query clears the plan/tree.
-        let results_pane = if self.has_active_tree() {
-            self.render_tree(active, cx).into_any_element()
-        } else if self.has_active_plan() {
-            self.render_plan(active, cx).into_any_element()
-        } else {
-            self.render_result(active, window, cx).into_any_element()
-        };
 
         let config = &active.config;
 
@@ -113,48 +99,10 @@ impl AppState {
             .child(div().flex_1())
             .child(topbar_right);
 
-        // --- nested split: schema | (editor / results) ---
-        let inner = {
-            let start = view.clone();
-            let resize = view.clone();
-            let end = view.clone();
-            SplitPane::new("shell-split-v", Axis::Vertical)
-                .size(active.editor_h)
-                .gutter(px(1.))
-                .drag(active.editor_drag)
-                .min_first(px(80.))
-                .on_drag_start(move |anchor, _, cx| {
-                    start
-                        .update(cx, |this, cx| {
-                            if let Phase::Connected(a) = &mut this.phase {
-                                a.editor_drag = Some(anchor);
-                            }
-                            cx.notify();
-                        })
-                        .ok();
-                })
-                .on_resize(move |size, _, cx| {
-                    resize
-                        .update(cx, |this, cx| {
-                            if let Phase::Connected(a) = &mut this.phase {
-                                a.editor_h = size;
-                            }
-                            cx.notify();
-                        })
-                        .ok();
-                })
-                .on_drag_end(move |_, cx| {
-                    end.update(cx, |this, cx| {
-                        if let Phase::Connected(a) = &mut this.phase {
-                            a.editor_drag = None;
-                        }
-                        cx.notify();
-                    })
-                    .ok();
-                })
-                .first(editor_pane)
-                .second(results_pane)
-        };
+        // --- work area: schema | (one or two side-by-side editor/result panes) ---
+        // A single pane normally; when `active.split` is set, two halves in a
+        // horizontal split (see `render_work_body`).
+        let inner = self.render_work_body(active, window, cx);
 
         // Two independent left side-panels — History (leftmost) then Schema — each
         // closable and separately resizable (Zed's multi-panel left dock). Each
@@ -510,5 +458,202 @@ impl AppState {
             .child(topbar)
             .child(body)
             .child(statusbar)
+    }
+
+    /// The work area right of the schema dock: a single editor/result pane, or —
+    /// when `active.split` is set — two halves in a resizable horizontal split. Each
+    /// half is a full editor-over-result pane for its own tab (see [`Self::render_half`]).
+    fn render_work_body(
+        &self,
+        active: &ActiveConn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(s) = active.split.as_ref() else {
+            // Single pane — the ordinary layout, behaviourally unchanged.
+            return self.render_half(
+                active,
+                SplitHalf::Primary,
+                active.active_tab,
+                true,
+                window,
+                cx,
+            );
+        };
+
+        let (secondary, focus, width, drag) = (s.secondary, s.focus, s.width, s.drag);
+        let primary_focused = focus == SplitHalf::Primary;
+        let first = self.render_half(
+            active,
+            SplitHalf::Primary,
+            active.active_tab,
+            primary_focused,
+            window,
+            cx,
+        );
+        let second = self.render_half(
+            active,
+            SplitHalf::Secondary,
+            secondary,
+            !primary_focused,
+            window,
+            cx,
+        );
+
+        let view = cx.entity().downgrade();
+        let start = view.clone();
+        let resize = view.clone();
+        let end = view.clone();
+        div()
+            .size_full()
+            .child(
+                SplitPane::new("shell-split-halves", Axis::Horizontal)
+                    .size(width)
+                    .gutter(px(1.))
+                    .drag(drag)
+                    .min_first(px(320.))
+                    .on_drag_start(move |anchor, _, cx| {
+                        start
+                            .update(cx, |this, cx| {
+                                if let Phase::Connected(a) = &mut this.phase {
+                                    if let Some(s) = &mut a.split {
+                                        s.drag = Some(anchor);
+                                    }
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+                    .on_resize(move |size, _, cx| {
+                        resize
+                            .update(cx, |this, cx| {
+                                if let Phase::Connected(a) = &mut this.phase {
+                                    if let Some(s) = &mut a.split {
+                                        s.width = size;
+                                    }
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+                    .on_drag_end(move |_, cx| {
+                        end.update(cx, |this, cx| {
+                            if let Phase::Connected(a) = &mut this.phase {
+                                if let Some(s) = &mut a.split {
+                                    s.drag = None;
+                                }
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .first(first)
+                    .second(second),
+            )
+            .into_any_element()
+    }
+
+    /// One split half: the tab `tab_idx` rendered as the editor-over-result vertical
+    /// split, wrapped so a click anywhere in it focuses the half (`half`) and — while
+    /// split — an accent outline marks the focused one. The editor/result ratio is
+    /// shared between halves (both read `editor_h`).
+    fn render_half(
+        &self,
+        active: &ActiveConn,
+        half: SplitHalf,
+        tab_idx: usize,
+        is_focused: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let is_split = active.split.is_some();
+        let editor_pane = self.render_editor(active, tab_idx, half, is_focused, cx);
+        let results_pane = self.render_results_slot(active, tab_idx, half, is_focused, window, cx);
+
+        let view = cx.entity().downgrade();
+        let start = view.clone();
+        let resize = view.clone();
+        let end = view.clone();
+        let vsplit = SplitPane::new(format!("shell-split-v-{}", half.index()), Axis::Vertical)
+            .size(active.editor_h)
+            .gutter(px(1.))
+            .drag(active.editor_drag)
+            .min_first(px(80.))
+            .on_drag_start(move |anchor, _, cx| {
+                start
+                    .update(cx, |this, cx| {
+                        if let Phase::Connected(a) = &mut this.phase {
+                            a.editor_drag = Some(anchor);
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+            })
+            .on_resize(move |size, _, cx| {
+                resize
+                    .update(cx, |this, cx| {
+                        if let Phase::Connected(a) = &mut this.phase {
+                            a.editor_h = size;
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+            })
+            .on_drag_end(move |_, cx| {
+                end.update(cx, |this, cx| {
+                    if let Phase::Connected(a) = &mut this.phase {
+                        a.editor_drag = None;
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .first(editor_pane)
+            .second(results_pane);
+
+        // The unique wrapper id scopes the two halves' child element ids apart; the
+        // mouse-down aims run/export/filter at whichever half was clicked.
+        div()
+            .id(("split-half", half.index()))
+            .size_full()
+            .flex()
+            .flex_col()
+            .when(is_split, |d| {
+                d.border_1().border_color(if is_focused {
+                    theme.accent
+                } else {
+                    theme.border
+                })
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.set_split_focus(half, cx)),
+            )
+            .child(vsplit)
+            .into_any_element()
+    }
+
+    /// The lower pane for tab `tab_idx`: its relation tree (Track B7) or query plan
+    /// (Track B4) when one is open, else the result grid — all share the slot. Picks
+    /// per-tab (not per-focus) so each half shows its own tab's view.
+    fn render_results_slot(
+        &self,
+        active: &ActiveConn,
+        tab_idx: usize,
+        half: SplitHalf,
+        is_focused: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let tab = active.tabs.get(tab_idx);
+        if tab.is_some_and(|t| t.tree.is_some()) {
+            self.render_tree(active, tab_idx, is_focused, cx)
+        } else if tab.is_some_and(|t| t.plan.is_some()) {
+            self.render_plan(active, tab_idx, cx)
+        } else {
+            self.render_result(active, tab_idx, half, is_focused, window, cx)
+                .into_any_element()
+        }
     }
 }

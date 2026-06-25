@@ -47,7 +47,12 @@ impl<R: BufRead> ImportReader<R> {
                     done: false,
                 };
                 let columns = csv.next_record()?.unwrap_or_default();
-                Ok((columns, Self { inner: Inner::Csv(csv) }))
+                Ok((
+                    columns,
+                    Self {
+                        inner: Inner::Csv(csv),
+                    },
+                ))
             }
             ImportFormat::Jsonl => {
                 let mut reader = reader;
@@ -204,7 +209,10 @@ fn parse_json_object(line: &str) -> io::Result<serde_json::Map<String, serde_jso
 /// verbatim, `null`/missing as `""`, a number/bool via its display form, and a
 /// nested object/array stringified (so it lands in a text column, never explodes the
 /// schema).
-fn project_json(obj: &serde_json::Map<String, serde_json::Value>, columns: &[String]) -> Vec<String> {
+fn project_json(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    columns: &[String],
+) -> Vec<String> {
     columns
         .iter()
         .map(|key| match obj.get(key) {
@@ -250,7 +258,10 @@ mod tests {
     #[test]
     fn csv_embedded_newline_in_quoted_field() {
         let (_, data) = rows(ImportFormat::Csv, "id,note\n1,\"line1\nline2\"\n");
-        assert_eq!(data, vec![vec!["1".to_string(), "line1\nline2".to_string()]]);
+        assert_eq!(
+            data,
+            vec![vec!["1".to_string(), "line1\nline2".to_string()]]
+        );
     }
 
     #[test]

@@ -139,9 +139,16 @@ fn render_cell(
 
 impl AppState {
     /// The results pane: an empty state, an error, or the live windowed grid.
+    /// Render the result pane for the tab at `tab_idx`, shown in split half `half`.
+    /// `is_focused` is whether this half currently has focus: only the focused half
+    /// hosts the shared single-instance overlays (inspector, filter/find bars, the
+    /// cell menu, the stats bar, inline + draft editing) so they never render twice.
     pub(crate) fn render_result(
         &self,
         active: &ActiveConn,
+        tab_idx: usize,
+        half: crate::app::SplitHalf,
+        is_focused: bool,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -181,7 +188,7 @@ impl AppState {
         // `.focus_handle`/`.on_nav` below); the pane draws no focus ring.
         let container = div().size_full().relative().flex().flex_col().bg(bg);
 
-        let grid = match active.active_result() {
+        let grid = match active.tabs.get(tab_idx).and_then(|t| t.result.as_ref()) {
             Some(grid) => grid,
             None => {
                 return container.child(
@@ -405,16 +412,20 @@ impl AppState {
         // the open find bar's term get a soft accent tint via the same `cell_bg`
         // hook. The focused match is *also* the grid selection, so the selection
         // highlight marks "current" on top of this. Keyed by `(ordinal, data col)`.
-        let find_hits: std::collections::HashSet<(usize, usize)> = self
-            .find_bar
-            .as_ref()
+        // Find/edit overlays belong to the focused half only — the find bar, the
+        // inline editor and the stats/draft chrome are single-instance app state.
+        let find_hits: std::collections::HashSet<(usize, usize)> = is_focused
+            .then_some(self.find_bar.as_ref())
+            .flatten()
             .map(|b| b.grid_matches.iter().copied().collect())
             .unwrap_or_default();
         let find_tint = Hsla { a: 0.20, ..accent };
         // The open inline editor's target cell (existing rows only; draft rows host
         // their own editor in the bottom zone), so the renderer swaps in its field.
-        let inline: Option<(usize, usize, Entity<TextInput>)> =
-            self.grid_edit.as_ref().and_then(|e| match &e.slot {
+        let inline: Option<(usize, usize, Entity<TextInput>)> = is_focused
+            .then_some(self.grid_edit.as_ref())
+            .flatten()
+            .and_then(|e| match &e.slot {
                 EditSlot::Row { row, data_col, .. } => Some((*row, *data_col, e.input.clone())),
                 EditSlot::Draft { .. } => None,
             });
@@ -462,7 +473,8 @@ impl AppState {
             .horizontal(true)
             // Keyboard cell cursor: the grid pane's focus handle lives on the
             // table, and arrow/Home/End/Page/⌘-arrow intents drive the selection.
-            .focus_handle(active.grid_focus.clone())
+            // Each split half has its own handle so focus never lands on both.
+            .focus_handle(active.grid_focus_for(half).clone())
             .on_nav(move |nav, extend, _window, cx| {
                 nav_view
                     .update(cx, |this, cx| this.result_cursor_move(nav, extend, cx))
@@ -508,6 +520,8 @@ impl AppState {
                 let extend = mods.shift;
                 sort_view
                     .update(cx, |this, cx| {
+                        // Aim subsequent actions at this half before they resolve.
+                        this.set_split_focus(half, cx);
                         if select_column {
                             // Focus the grid so the cell cursor + ⌘C land on this
                             // selection rather than a still-focused editor/field.
@@ -525,6 +539,8 @@ impl AppState {
                 let abs_row = base + row;
                 cell_view
                     .update(cx, |this, cx| {
+                        // Aim subsequent actions at this half before they resolve.
+                        this.set_split_focus(half, cx);
                         // Focus the grid so the cell cursor + ⌘C land on this
                         // selection, not a still-focused editor/field.
                         this.focus_pane(Pane::Grid, window, cx);
@@ -547,6 +563,7 @@ impl AppState {
                 let abs_row = base + row;
                 sec_view
                     .update(cx, |this, cx| {
+                        this.set_split_focus(half, cx);
                         this.focus_pane(Pane::Grid, window, cx);
                         this.result_select(abs_row, table_col, false, cx);
                         this.cell_menu = Some(pos);
@@ -665,18 +682,29 @@ impl AppState {
             .on_scrub(move |fraction, _, cx| {
                 let target = (fraction as f64 * total.saturating_sub(1) as f64).round() as usize;
                 super::place_window(&scrub_window, &scrub_scroll, total, target, rh);
-                scrub_view.update(cx, |_, cx| cx.notify()).ok();
+                scrub_view
+                    .update(cx, |this, cx| {
+                        this.set_split_focus(half, cx);
+                        cx.notify();
+                    })
+                    .ok();
             });
 
         let grid_pane = container
             .child(toolbar)
             // The filter bar (Track B2) sits between the toolbar and the grid when
             // open; narrowing re-opens the result so the grid below just repaints.
-            .when_some(self.render_filter_bar(cx), |c, bar| c.child(bar))
+            // Single-instance overlays render in the focused half only.
+            .when_some(
+                is_focused.then(|| self.render_filter_bar(cx)).flatten(),
+                |c, bar| c.child(bar),
+            )
             // The find bar (Track B2, Tier 1) sits alongside the filter bar; it
             // only highlights loaded rows, so the grid below just repaints.
             .when_some(
-                self.render_find_bar(crate::find::FindTarget::Grid, cx),
+                is_focused
+                    .then(|| self.render_find_bar(crate::find::FindTarget::Grid, cx))
+                    .flatten(),
                 |c, bar| c.child(bar),
             )
             .child(
@@ -689,16 +717,21 @@ impl AppState {
                     .child(scrollbar),
             )
             // Draft (insert) rows pinned below the grid (Track B6).
-            .when_some(self.render_draft_rows(grid, cx), |c, drafts| {
-                c.child(drafts)
-            })
+            .when_some(
+                is_focused
+                    .then(|| self.render_draft_rows(grid, cx))
+                    .flatten(),
+                |c, drafts| c.child(drafts),
+            )
             // The column-stats bar (a thin summary line) sits just above the footer
             // when the toggle is on.
-            .when(self.stats_bar, |c| c.child(self.render_stats_bar(grid, cx)))
+            .when(is_focused && self.stats_bar, |c| {
+                c.child(self.render_stats_bar(grid, cx))
+            })
             .child(footer)
             // The cell right-click menu floats above the pane, anchored at the
             // cursor; a full-cover backdrop dismisses it on an outside click.
-            .when_some(self.cell_menu, |c, pos| {
+            .when_some(is_focused.then_some(self.cell_menu).flatten(), |c, pos| {
                 c.child(self.render_cell_menu(pos, cx))
             });
 
@@ -707,7 +740,7 @@ impl AppState {
         // width (caller-owned, like the sidebar/editor splits). The inspector never
         // occludes the grid, so the cursor and its live updates stay visible.
         // Closed, the grid keeps the full pane.
-        if self.inspector.is_some() {
+        if is_focused && self.inspector.is_some() {
             let start = view.clone();
             let resize = view.clone();
             let end = view.clone();
