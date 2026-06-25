@@ -332,6 +332,9 @@ pub(crate) struct QueryTab {
     /// The query plan (Track B4 — EXPLAIN), when one is open. Occupies the result
     /// pane in place of the grid; running a query clears it. `None` is the grid.
     pub plan: Option<crate::plan::PlanView>,
+    /// The relation tree (Track B7 — "Open row as tree"), when one is open. Occupies
+    /// the result pane in place of the grid; running a query or closing it clears it.
+    pub tree: Option<crate::tree::RelationTreeView>,
 }
 
 impl QueryTab {
@@ -366,6 +369,7 @@ impl QueryTab {
             editor,
             result: None,
             plan: None,
+            tree: None,
         }
     }
 
@@ -424,9 +428,9 @@ pub(crate) struct ActiveConn {
     pub grid_focus: FocusHandle,
     /// Which pane currently holds focus — drives focus cycling and the pane ring.
     pub active_pane: Pane,
-    /// Recent queries (newest first), shared across all of this connection's
-    /// tabs — re-run any of them from the history popover.
-    pub history: Vec<String>,
+    /// Whether the run-bar history popover is open. The entries themselves live in
+    /// the centralized [`AppState::query_history`]; this is just per-connection UI
+    /// state (the popover is anchored to this workspace's run bar).
     pub history_open: bool,
     /// Focus anchor for the open history popover, and the keyboard-highlighted
     /// entry within it.
@@ -470,7 +474,6 @@ impl ActiveConn {
             schema_focus: cx.focus_handle(),
             grid_focus: cx.focus_handle(),
             active_pane: Pane::Editor,
-            history: Vec::new(),
             history_open: false,
             history_focus: cx.focus_handle(),
             history_sel: 0,
@@ -580,6 +583,9 @@ pub struct AppState {
     /// `CopyRows` re-fetch to read the typed key value before opening the target
     /// browse. The latest follow wins; an earlier reply is then stale and dropped.
     pub(crate) pending_fk: Option<crate::result::PendingFkFollow>,
+    /// An in-flight "Open row as tree" (Track B7), waiting on the focused row's
+    /// full `CopyRows` re-fetch to build the tree root.
+    pub(crate) pending_tree: Option<crate::tree::PendingTreeRoot>,
     /// The cell detail inspector, when open (Track B1). Owns its scroll position
     /// and any on-demand full value fetched for a capped/evicted cell.
     pub(crate) inspector: Option<crate::inspector::InspectorState>,
@@ -764,6 +770,10 @@ pub struct AppState {
     /// The saved conversations shown by the open history picker (M-S5), held only
     /// while it's open so an activation can resolve its index. Loaded on demand.
     pub(crate) loaded_conversations: Vec<crate::conversations::Conversation>,
+    /// The persistent query-history log, centralized across all connections and
+    /// loaded once at startup. Each entry is connection-scoped; the run-bar
+    /// popover filters to the active connection's `conn_id`.
+    pub(crate) query_history: crate::history::QueryHistory,
     /// The connection switcher (⌘P): an always-mounted topbar trigger that opens a
     /// searchable, sectioned popover of the active + recent connections. Its
     /// sections are rebuilt from `connections` + `phase` via [`Self::rebuild_switcher`].
@@ -1363,6 +1373,7 @@ impl AppState {
             next_copy_id: 0,
             pending_copy: None,
             pending_fk: None,
+            pending_tree: None,
             inspector: None,
             assistant: None,
             focus_assistant: false,
@@ -1426,6 +1437,7 @@ impl AppState {
             palette_prompt: PromptKind::GoToRow,
             saved_queries: Vec::new(),
             loaded_conversations: Vec::new(),
+            query_history: crate::history::QueryHistory::load(),
             switcher,
             parked: HashMap::new(),
             foreground_session: None,
@@ -1774,6 +1786,14 @@ impl AppState {
                 }
                 cx.notify();
             }
+            Event::TreeNodeLoaded {
+                epoch,
+                node,
+                columns,
+                rows,
+                more,
+                error,
+            } => self.on_tree_node_loaded(session, epoch, node, columns, rows, more, error, cx),
 
             // --- result grid ---
             Event::ResultReady {

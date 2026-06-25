@@ -36,6 +36,8 @@ pub(crate) enum Cmd {
     NextTab,
     PrevTab,
     ToggleHistory,
+    /// Clear the active connection's query history.
+    ClearHistory,
     ToggleSidebar,
     RefreshSchema,
     Disconnect,
@@ -225,6 +227,7 @@ impl AppState {
                 self.step_active_tab(false, cx);
             }
             Cmd::ToggleHistory => self.toggle_history(cx),
+            Cmd::ClearHistory => self.clear_history(cx),
             Cmd::ToggleSidebar => self.toggle_sidebar(cx),
             Cmd::RefreshSchema => self.refresh_schema(),
             Cmd::Disconnect => self.disconnect(cx),
@@ -346,6 +349,10 @@ impl AppState {
                 out.push((
                     PaletteItem::new("cmd:history", "query: toggle history"),
                     Cmd::ToggleHistory,
+                ));
+                out.push((
+                    PaletteItem::new("cmd:clear-history", "query: clear history"),
+                    Cmd::ClearHistory,
                 ));
                 // Saved queries (B3) — save needs an open tab to save *from*; the
                 // picker is always offered (it reports "none yet" when empty).

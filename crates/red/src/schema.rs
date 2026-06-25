@@ -317,7 +317,7 @@ fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
 /// out of the SQL. MySQL/MariaDB use backticks (double quotes are string literals
 /// there unless `ANSI_QUOTES` is set); SQLite/Postgres use the SQL-standard double
 /// quote. Embedded quote chars are doubled either way.
-fn quote_ident(ident: &str, kind: DbKind) -> String {
+pub(crate) fn quote_ident(ident: &str, kind: DbKind) -> String {
     match kind {
         DbKind::Mysql => format!("`{}`", ident.replace('`', "``")),
         _ => format!("\"{}\"", ident.replace('"', "\"\"")),

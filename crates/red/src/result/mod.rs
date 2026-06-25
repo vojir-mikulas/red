@@ -185,6 +185,17 @@ impl ResultGrid {
         (ncols > 0).then(|| (focus.0, focus.1.saturating_sub(gutter).min(ncols - 1)))
     }
 
+    /// The `(schema, table)` this result browses — `Some` only for a single-table
+    /// preview (the FK click-through / relation-tree entry conditions, Track B7).
+    pub(crate) fn base_table(&self) -> Option<&(String, String)> {
+        self.table.as_ref()
+    }
+
+    /// The result's column metadata — read by the relation tree to build records.
+    pub(crate) fn columns(&self) -> &[ResultColumn] {
+        &self.columns
+    }
+
     /// Recompute which data columns are single-column forward foreign keys of this
     /// grid's base table, from the connection's FK graph (Track B7). An empty set
     /// for non-table results or before the graph loads. Drives the in-grid accent.
@@ -784,6 +795,7 @@ impl AppState {
                 let tab = active.active_mut().unwrap();
                 tab.result = Some(grid);
                 tab.plan = None;
+                tab.tree = None;
                 opened
             }
             _ => return,
@@ -1389,6 +1401,11 @@ impl AppState {
         // An FK click-through (Track B7) also re-fetches one row in full to read the
         // typed key; if this reply is its, it opens the target browse.
         if self.on_fk_rows(id, &rows, cx) {
+            cx.notify();
+            return;
+        }
+        // "Open row as tree" (Track B7) re-fetches the root row in full.
+        if self.on_tree_root_rows(id, &rows, cx) {
             cx.notify();
             return;
         }

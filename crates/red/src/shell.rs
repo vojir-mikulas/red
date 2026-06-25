@@ -31,9 +31,12 @@ impl AppState {
         // Pane contents: SQL editor · result grid. The schema explorer is built
         // below, only when the sidebar is shown.
         let editor_pane = self.render_editor(active, cx);
-        // The lower pane shows the query plan (Track B4) when one is open, else the
-        // result grid — the two share the slot; running a query clears the plan.
-        let results_pane = if self.has_active_plan() {
+        // The lower pane shows the relation tree (Track B7) or the query plan
+        // (Track B4) when one is open, else the result grid — all share the slot;
+        // running a query clears the plan/tree.
+        let results_pane = if self.has_active_tree() {
+            self.render_tree(active, cx).into_any_element()
+        } else if self.has_active_plan() {
             self.render_plan(active, cx).into_any_element()
         } else {
             self.render_result(active, window, cx).into_any_element()

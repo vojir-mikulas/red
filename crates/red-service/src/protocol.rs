@@ -64,6 +64,18 @@ pub enum Command {
     /// `ForeignKeysLoaded`. A failure is swallowed (the feature degrades to absent),
     /// never surfaced as a toast — FK navigation is an optional enhancement.
     LoadForeignKeys,
+    /// Fetch one relation-tree node's rows (Track B7): wrap `base_sql` in `filter`
+    /// (an FK equality), fetch a capped page (`limit`), and reply with
+    /// `TreeNodeLoaded` echoing `epoch`/`node` for routing. Over-fetches by one to
+    /// report whether more rows exist (the node's "Load more"). Display-capped like
+    /// a grid page, so it never materializes fat cells.
+    FetchTreeNode {
+        epoch: u64,
+        node: u64,
+        base_sql: String,
+        filter: Option<ResultFilter>,
+        limit: usize,
+    },
     /// Open `sql` as a grid result: count its rows and report column metadata +
     /// the total. The result is then browsed page-by-page via `FetchPage`, or —
     /// when a seek key resolves — run-by-run via `FetchRun`.
@@ -353,6 +365,18 @@ pub enum Event {
     /// `LoadForeignKeys`. Cached on the connected session for click-through.
     ForeignKeysLoaded {
         graph: Vec<FkEdge>,
+    },
+    /// One relation-tree node's rows (Track B7), in response to `FetchTreeNode`.
+    /// Echoes `epoch`/`node` so a stale reply (the tree closed, the node collapsed)
+    /// is dropped. `more` flags that the page was capped; `error` carries a fetch
+    /// failure for that node (the rest of the tree is unaffected).
+    TreeNodeLoaded {
+        epoch: u64,
+        node: u64,
+        columns: Vec<Column>,
+        rows: Vec<Vec<Value>>,
+        more: bool,
+        error: Option<String>,
     },
     /// A result opened: its columns and total row count (for `OpenResult`).
     /// Echoes the open `epoch` so the grid can ignore a late reply for a result

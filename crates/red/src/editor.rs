@@ -635,7 +635,7 @@ impl AppState {
             .children(ro_chip);
 
         let history = active.history_open.then(|| {
-            let list: Vec<_> = active.history.clone();
+            let list = self.query_history.for_conn(&active.conn_id);
             let selected = active.history_sel;
             let inner = if list.is_empty() {
                 div()
@@ -650,25 +650,67 @@ impl AppState {
                     .id("sql-history-list")
                     .max_h(px(260.))
                     .overflow_y_scroll()
-                    .children(list.into_iter().enumerate().map(|(i, q)| {
-                        let v = view.clone();
-                        let sql = q.clone();
+                    .children(list.into_iter().enumerate().map(|(i, entry)| {
+                        let load_view = view.clone();
+                        let del_view = view.clone();
+                        let sql = entry.sql.clone();
+                        let id = entry.id;
                         let is_sel = i == selected;
+                        let group = SharedString::from(format!("hist-{i}"));
                         div()
                             .id(("hist", i))
+                            .group(group.clone())
+                            .flex()
+                            .items_center()
+                            .gap_1()
                             .px_2()
                             .py_1()
-                            .cursor_pointer()
-                            .font_family(mono_family.clone())
-                            .text_size(size_11)
-                            .text_color(text)
                             .when(is_sel, |d| d.bg(bg_hover))
                             .hover(move |s| s.bg(bg_hover))
-                            .on_click(move |_, _, cx| {
-                                let sql = sql.clone();
-                                v.update(cx, |this, cx| this.load_history(sql, cx)).ok();
-                            })
-                            .child(history_label(&q))
+                            .child(
+                                // The label fills the row and is the load hitbox; it
+                                // truncates so a long query never shoves the ✕
+                                // off the edge.
+                                div()
+                                    .id(("hist-load", i))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .cursor_pointer()
+                                    .font_family(mono_family.clone())
+                                    .text_size(size_11)
+                                    .text_color(text)
+                                    .on_click(move |_, _, cx| {
+                                        let sql = sql.clone();
+                                        load_view
+                                            .update(cx, |this, cx| this.load_history(sql, cx))
+                                            .ok();
+                                    })
+                                    .child(history_label(&entry.sql)),
+                            )
+                            .child(
+                                // Hover-revealed per-row delete, mirroring the tab
+                                // strip's close button.
+                                div()
+                                    .id(("hist-del", i))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(15.))
+                                    .rounded(px(3.))
+                                    .invisible()
+                                    .group_hover(group, |s| s.visible())
+                                    .cursor_pointer()
+                                    .text_color(faint)
+                                    .hover(|s| s.bg(bg_hover).text_color(text))
+                                    .on_click(move |_, _, cx| {
+                                        del_view
+                                            .update(cx, |this, cx| this.delete_history(id, cx))
+                                            .ok();
+                                    })
+                                    .child(crate::icons::icon("x", icon_close, faint)),
+                            )
                     }))
                     .into_any_element()
             };
@@ -756,12 +798,18 @@ impl AppState {
             return;
         }
 
+        // Record into the persistent, connection-scoped history. `record` de-dupes
+        // consecutive identical runs and caps/persists itself. Pull `conn_id` out
+        // first so the borrow of `self.phase` is released before touching
+        // `self.query_history`.
+        let conn_id = match &self.phase {
+            Phase::Connected(active) => Some(active.conn_id.clone()),
+            _ => None,
+        };
+        if let Some(conn_id) = conn_id {
+            self.query_history.record(&conn_id, &sql);
+        }
         if let Phase::Connected(active) = &mut self.phase {
-            // De-dupe consecutive identical runs at the head of the history.
-            if active.history.first() != Some(&sql) {
-                active.history.insert(0, sql.clone());
-                active.history.truncate(50);
-            }
             active.history_open = false;
         }
 
@@ -857,11 +905,14 @@ impl AppState {
 
     /// Move the history popover's highlight (↑/↓). No-op with an empty history.
     pub(crate) fn history_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let len = match &self.phase {
+            Phase::Connected(active) => self.query_history.count_for_conn(&active.conn_id),
+            _ => return,
+        };
+        if len == 0 {
+            return;
+        }
         if let Phase::Connected(active) = &mut self.phase {
-            let len = active.history.len();
-            if len == 0 {
-                return;
-            }
             let sel = active.history_sel as isize + delta;
             active.history_sel = sel.clamp(0, len as isize - 1) as usize;
             cx.notify();
@@ -871,7 +922,11 @@ impl AppState {
     /// Load the highlighted history entry into the editor (Enter in the popover).
     pub(crate) fn history_accept(&mut self, cx: &mut Context<Self>) {
         let sql = match &self.phase {
-            Phase::Connected(active) => active.history.get(active.history_sel).cloned(),
+            Phase::Connected(active) => self
+                .query_history
+                .for_conn(&active.conn_id)
+                .get(active.history_sel)
+                .map(|e| e.sql.clone()),
             _ => None,
         };
         if let Some(sql) = sql {
@@ -879,6 +934,37 @@ impl AppState {
             self.load_history(sql, cx);
         }
         self.pending_focus = Some(crate::app::Pane::Editor);
+    }
+
+    /// Remove one history entry by id (the popover's per-row ✕), keeping the
+    /// keyboard highlight in range after the row vanishes.
+    pub(crate) fn delete_history(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.query_history.delete(id);
+        let len = match &self.phase {
+            Phase::Connected(active) => self.query_history.count_for_conn(&active.conn_id),
+            _ => 0,
+        };
+        if let Phase::Connected(active) = &mut self.phase {
+            if active.history_sel >= len {
+                active.history_sel = len.saturating_sub(1);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Clear the active connection's entire history (the palette command).
+    pub(crate) fn clear_history(&mut self, cx: &mut Context<Self>) {
+        let conn_id = match &self.phase {
+            Phase::Connected(active) => Some(active.conn_id.clone()),
+            _ => None,
+        };
+        if let Some(conn_id) = conn_id {
+            self.query_history.clear_conn(&conn_id);
+        }
+        if let Phase::Connected(active) = &mut self.phase {
+            active.history_sel = 0;
+        }
+        cx.notify();
     }
 
     /// Close the history popover (Esc) and return focus to the editor.

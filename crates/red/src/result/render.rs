@@ -880,11 +880,13 @@ impl AppState {
                         cx.notify();
                     })),
             );
-        // FK click-through (Track B7): jump to the referenced row, or list the tables
-        // that reference this one. Present only when the FK graph resolved edges for
-        // this result's base table.
+        // FK navigation (Track B7): jump to the referenced row, list the tables that
+        // reference this one, or open the row as a relation tree. The first two need
+        // the FK graph to have edges for the focused column/table; the tree needs
+        // only a single-table browse.
         let (fk_forward, fk_reverse) = self.fk_menu();
-        if fk_forward.is_some() || !fk_reverse.is_empty() {
+        let can_tree = matches!(&self.phase, Phase::Connected(a) if a.active_result().is_some_and(|g| g.base_table().is_some()));
+        if fk_forward.is_some() || !fk_reverse.is_empty() || can_tree {
             menu = menu.separator();
         }
         if let Some(target) = fk_forward {
@@ -913,6 +915,17 @@ impl AppState {
                     cx.notify();
                 }),
             ));
+        }
+        if can_tree {
+            menu = menu.item(
+                ContextMenuItem::new("open-tree", "Open row as tree").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.cell_menu = None;
+                        this.open_row_as_tree(cx);
+                        cx.notify();
+                    },
+                )),
+            );
         }
         if editable_cell {
             menu = menu

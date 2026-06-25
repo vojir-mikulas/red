@@ -16,6 +16,7 @@ mod editor;
 mod env;
 mod filter;
 mod find;
+mod history;
 mod icons;
 mod inspector;
 mod keymap;
@@ -35,6 +36,7 @@ mod settings_watch;
 mod shell;
 mod sql;
 mod theme;
+mod tree;
 mod window_chrome;
 
 use gpui::{prelude::*, App, Bounds, TitlebarOptions, WindowBounds, WindowOptions};
