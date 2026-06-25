@@ -28,9 +28,9 @@ use mysql_async::{
     Column as MyColumn, Error as MyError, Opts, OptsBuilder, Pool, Row, Value as MyValue,
 };
 use red_core::{
-    Column, ColumnMeta, EditOp, ExportFormat, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind,
-    ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta,
-    TableDetail, Value,
+    Column, ColumnMeta, ColumnValue, EditOp, ExportFormat, FkEdge, ForeignKeyMeta, IndexMeta,
+    KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage,
+    RowWindow, SchemaMeta, TableDetail, Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, Mutex};
@@ -363,6 +363,47 @@ impl DatabaseDriver for MysqlDriver {
         })
     }
 
+    async fn foreign_keys(&self) -> Result<Vec<FkEdge>> {
+        // `key_column_usage` carries the referenced endpoint per FK column with a
+        // reliable `ordinal_position`, so composite keys group correctly. Scope to
+        // the connected database (`DATABASE()`) to match `list_objects`.
+        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            String,
+        )> = conn
+            .exec(
+                "SELECT table_schema, table_name, column_name, \
+                        referenced_table_schema, referenced_table_name, referenced_column_name, \
+                        constraint_name \
+                 FROM information_schema.key_column_usage \
+                 WHERE referenced_table_name IS NOT NULL AND table_schema = DATABASE() \
+                 ORDER BY table_schema, table_name, constraint_name, ordinal_position",
+                (),
+            )
+            .await
+            .map_err(driver_err)?;
+        let edges = crate::group_fk_edges(rows.into_iter().map(
+            |(from_schema, from_table, from_column, to_schema, to_table, to_column, constraint)| {
+                crate::FkRow {
+                    from_schema: Some(from_schema),
+                    from_table,
+                    from_column,
+                    to_schema,
+                    to_table,
+                    to_column,
+                    constraint,
+                }
+            },
+        ));
+        Ok(edges)
+    }
+
     fn contains_predicate(&self, columns: &[ColumnMeta], term: &str) -> Option<String> {
         // MySQL/MariaDB treat `\` as a string-literal escape in the default mode,
         // so the pattern's backslashes need a second doubling — `true` here.
@@ -375,6 +416,10 @@ impl DatabaseDriver for MysqlDriver {
             true,
             true,
         )
+    }
+
+    fn eq_predicate(&self, pairs: &[ColumnValue]) -> String {
+        crate::eq_clause(pairs, |c| format!("`{}`", escape_ident(c)))
     }
 
     async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64> {
@@ -1033,6 +1078,8 @@ mod tests {
             &driver, &schema, &authors, &books, &recent,
         )
         .await;
+        // Track B7: the connection-wide FK graph reports the same edge.
+        battery::lists_foreign_key_graph(&driver, &schema, &authors, &books).await;
 
         for obj in [
             format!("VIEW `{recent}`"),

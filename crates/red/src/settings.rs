@@ -356,6 +356,11 @@ pub struct AiSettings {
     /// The agent id new chats start on. Empty (or naming a missing agent) resolves
     /// to the legacy provider's built-in, else the first agent.
     pub default_agent: String,
+    /// Folder the agent writes generated HTML reports to (the `generate_report` tool).
+    /// Empty (the default) uses the system temp dir; set it so reports land somewhere
+    /// the user can find them. Created on demand; an unusable folder falls back to the
+    /// temp dir rather than failing the report.
+    pub report_dir: String,
     /// Resource guards on the `read` tier (`[ai.limits]`, M-S7).
     pub limits: AiLimitsSettings,
 }
@@ -387,6 +392,7 @@ impl Default for AiSettings {
             agent_command: String::new(),
             agents: Vec::new(),
             default_agent: String::new(),
+            report_dir: String::new(),
             limits: AiLimitsSettings::default(),
         }
     }

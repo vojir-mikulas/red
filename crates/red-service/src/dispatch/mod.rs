@@ -640,6 +640,20 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 }
             }
 
+            Command::LoadForeignKeys => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    continue;
+                };
+                let driver = state.driver.clone();
+                // Swallow errors: FK navigation is optional, so a failed or
+                // unsupported introspection leaves the graph empty rather than
+                // toasting the user on every connect.
+                if let Ok(graph) = driver.foreign_keys().await {
+                    emit(&events, session_id, Event::ForeignKeysLoaded { graph });
+                }
+            }
+
             Command::DescribeTable { schema, table } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get(&id) else {
@@ -750,6 +764,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     let filtered_sql = match &filter {
                         None => sql.clone(),
                         Some(ResultFilter::Where(expr)) => wrap_where(&sql, expr),
+                        // FK follow (Track B7): an escaped literal `col = v [AND …]`
+                        // predicate from the driver. Empty pairs (shouldn't occur)
+                        // degrade to no filter rather than an invalid `WHERE ()`.
+                        Some(ResultFilter::Eq(pairs)) if !pairs.is_empty() => {
+                            wrap_where(&sql, &driver.eq_predicate(pairs))
+                        }
+                        Some(ResultFilter::Eq(_)) => sql.clone(),
                         Some(ResultFilter::Contains(term)) => {
                             let cols = match &detail {
                                 Some(d) => d.columns.clone(),

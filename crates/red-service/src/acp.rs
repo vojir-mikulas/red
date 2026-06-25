@@ -322,6 +322,7 @@ pub(crate) async fn run_turn(
         conversation_id,
         policy,
         context.theme.as_deref().cloned(),
+        context.report_dir.clone(),
     )
     .await
     {
@@ -538,6 +539,7 @@ async fn ensure_conversation(
     conversation_id: u64,
     policy: AiPolicy,
     theme: Option<ReportTheme>,
+    report_dir: Option<PathBuf>,
 ) -> Result<(AcpConversation, bool), String> {
     let mut guard = manager.lock().await;
     // Restart on crash (M-S3): a conversation whose connection task has ended
@@ -570,7 +572,7 @@ async fn ensure_conversation(
         // here, so it carries the events channel to announce a finished report to the
         // UI (the subscription path never routes individual tool calls back through
         // `run_turn`). Built before `events` is moved into the permission relay.
-        let report = ReportSink::new(events.clone(), session, conversation_id, theme);
+        let report = ReportSink::new(events.clone(), session, conversation_id, theme, report_dir);
         let mcp = McpServer::start(driver, policy, report)
             .await
             .map_err(|e| format!("could not start the DB tool server: {e}"))?;

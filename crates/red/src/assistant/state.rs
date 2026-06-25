@@ -1236,6 +1236,12 @@ impl AppState {
             read_only: active.config.read_only,
             // Paint AI-generated reports in Red's active theme (Ayu, GitHub Dark, …).
             theme: Some(Box::new(report_theme(cx.theme()))),
+            // Where generated reports are written (Settings → AI agent → Report folder).
+            // Empty means "use the system temp dir", so don't send a path at all then.
+            report_dir: {
+                let dir = self.settings.ai.report_dir.trim();
+                (!dir.is_empty()).then(|| std::path::PathBuf::from(dir))
+            },
         }
     }
 }

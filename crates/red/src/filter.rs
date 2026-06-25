@@ -45,7 +45,9 @@ impl AppState {
         let (mode, text) = match self.active_result_filter() {
             Some(ResultFilter::Contains(t)) => (FilterMode::Contains, t),
             Some(ResultFilter::Where(t)) => (FilterMode::Where, t),
-            None => (FilterMode::Contains, String::new()),
+            // An FK-follow `Eq` filter (Track B7) isn't text-editable; opening the
+            // bar starts a fresh contains filter (applying it replaces the FK one).
+            Some(ResultFilter::Eq(_)) | None => (FilterMode::Contains, String::new()),
         };
         let input = cx.new(|cx| TextInput::new(cx).with_placeholder("Filter rows…"));
         if !text.is_empty() {

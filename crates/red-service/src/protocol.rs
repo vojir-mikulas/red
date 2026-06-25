@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use red_core::{
-    AiLimits, AiTier, Column, ConnectionConfig, EditOp, ExportFormat, KeySpec, QueryOptions,
-    QueryPlan, ResultFilter, RowWindow, SchemaMeta, TableDetail, UpdateState, Value,
+    AiLimits, AiTier, Column, ConnectionConfig, EditOp, ExportFormat, FkEdge, KeySpec,
+    QueryOptions, QueryPlan, ResultFilter, RowWindow, SchemaMeta, TableDetail, UpdateState, Value,
 };
 
 /// Identifies one keep-alive backend session. Minted UI-side at connect start so
@@ -59,6 +59,11 @@ pub enum Command {
         schema: String,
         table: String,
     },
+    /// Load the connection-wide foreign-key graph (Track B7) for FK click-through
+    /// and the relation tree. Sent once after connect; replied with
+    /// `ForeignKeysLoaded`. A failure is swallowed (the feature degrades to absent),
+    /// never surfaced as a toast — FK navigation is an optional enhancement.
+    LoadForeignKeys,
     /// Open `sql` as a grid result: count its rows and report column metadata +
     /// the total. The result is then browsed page-by-page via `FetchPage`, or —
     /// when a seek key resolves — run-by-run via `FetchRun`.
@@ -344,6 +349,11 @@ pub enum Event {
         table: String,
         detail: TableDetail,
     },
+    /// The connection-wide foreign-key graph (Track B7), in response to
+    /// `LoadForeignKeys`. Cached on the connected session for click-through.
+    ForeignKeysLoaded {
+        graph: Vec<FkEdge>,
+    },
     /// A result opened: its columns and total row count (for `OpenResult`).
     /// Echoes the open `epoch` so the grid can ignore a late reply for a result
     /// it has already replaced. `key` is the seek key the backend resolved for
@@ -619,6 +629,11 @@ pub struct AiContext {
     /// `generate_report` path reads it. Boxed so `AiContext` (which rides in the
     /// `Command::AiTurn` variant) stays small.
     pub theme: Option<Box<ReportTheme>>,
+    /// Where `generate_report` writes the finished HTML file (Settings → AI agent →
+    /// Report folder). `None` (the default) falls back to the system temp dir. The UI
+    /// fills it from the user's setting; the directory is created on demand and, if it
+    /// can't be used, the report still lands in the temp dir rather than failing.
+    pub report_dir: Option<PathBuf>,
 }
 
 /// A snapshot of the active theme's colors as CSS color strings, handed to the

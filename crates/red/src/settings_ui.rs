@@ -1216,6 +1216,55 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     let show_thinking = Toggle::new("set-ai-thinking", ai.show_thinking)
         .on_change(cx.listener(|this, on: &bool, _, cx| this.set_ai_show_thinking(*on, cx)));
 
+    // Where `generate_report` writes finished HTML files. Empty falls back to the
+    // system temp dir (the historical behavior); a chosen folder keeps reports
+    // somewhere the user can find them. The path is picked with a native folder
+    // dialog; "Reset" clears it back to the temp dir.
+    let report_dir = ai.report_dir.trim();
+    let has_report_dir = !report_dir.is_empty();
+    let report_dir_label: SharedString = if has_report_dir {
+        report_dir.to_string().into()
+    } else {
+        "System temp folder".into()
+    };
+    let report_dir_color = if has_report_dir {
+        theme.text
+    } else {
+        theme.text_faint
+    };
+    let report_folder = div()
+        .flex()
+        .flex_col()
+        .items_end()
+        .gap_1p5()
+        .child(
+            div()
+                .max_w(px(280.))
+                .truncate()
+                .text_size(theme.scale(11.5))
+                .text_color(report_dir_color)
+                .child(report_dir_label),
+        )
+        .child(
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    Button::new("ai-report-dir-pick", "Choose folder…")
+                        .variant(ButtonVariant::Secondary)
+                        .size(ButtonSize::Sm)
+                        .on_click(cx.listener(|this, _, _, cx| this.pick_ai_report_dir(cx))),
+                )
+                .when(has_report_dir, |row| {
+                    row.child(
+                        Button::new("ai-report-dir-reset", "Reset")
+                            .variant(ButtonVariant::Secondary)
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(|this, _, _, cx| this.clear_ai_report_dir(cx))),
+                    )
+                }),
+        );
+
     settings_page_scaffold(
         "AI agent",
         div()
@@ -1289,6 +1338,15 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 "Show thinking",
                 "Surface a summarized “thinking…” affordance while the model reasons.",
                 show_thinking,
+                &theme,
+            ))
+            .child(settings_header("Reports", &theme))
+            .child(setting_row(
+                "Report folder",
+                "Where the agent saves the HTML reports it generates. Leave unset to use \
+                 the system temporary folder; choose a folder to keep reports somewhere you \
+                 can find them. Takes effect on the next report.",
+                report_folder,
                 &theme,
             ))
             .child(settings_header("Agents", &theme))

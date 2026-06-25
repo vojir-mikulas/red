@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ColumnMeta, EditOp, ExportFormat, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind,
-    ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta,
-    TableDetail, Value,
+    Column, ColumnMeta, ColumnValue, EditOp, ExportFormat, FkEdge, ForeignKeyMeta, IndexMeta,
+    KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage,
+    RowWindow, SchemaMeta, TableDetail, Value,
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, ErrorCode, OpenFlags};
@@ -130,6 +130,14 @@ impl DatabaseDriver for SqliteDriver {
         .map_err(driver_err)?
     }
 
+    async fn foreign_keys(&self) -> Result<Vec<FkEdge>> {
+        let path = self.path.clone();
+        let read_only = self.read_only;
+        tokio::task::spawn_blocking(move || foreign_keys_blocking(&path, read_only))
+            .await
+            .map_err(driver_err)?
+    }
+
     fn contains_predicate(&self, columns: &[ColumnMeta], term: &str) -> Option<String> {
         // SQLite treats `\` literally in string literals — no extra escaping.
         crate::contains_clause(
@@ -141,6 +149,10 @@ impl DatabaseDriver for SqliteDriver {
             false,
             true,
         )
+    }
+
+    fn eq_predicate(&self, pairs: &[ColumnValue]) -> String {
+        crate::eq_clause(pairs, quote_ident)
     }
 
     async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64> {
@@ -662,6 +674,85 @@ fn describe_table_blocking(
     })
 }
 
+/// The connection-wide FK graph: for every table in every database namespace,
+/// `PRAGMA foreign_key_list` folded into one [`FkEdge`] per constraint (composite
+/// FKs share an `id`, so consecutive same-`id` rows extend the edge in `seq`
+/// order). SQLite foreign keys never cross databases, so both endpoints carry the
+/// namespace name. One open connection serves the whole walk.
+fn foreign_keys_blocking(path: &Path, read_only: bool) -> Result<Vec<FkEdge>> {
+    let conn = SqliteDriver::open(path, read_only)?;
+
+    // Namespaces: main / temp / any attached DB (PRAGMA database_list col 1 = name).
+    let schema_names: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA database_list").map_err(driver_err)?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(driver_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(driver_err)?;
+        names
+    };
+
+    let mut edges: Vec<FkEdge> = Vec::new();
+    for schema in &schema_names {
+        let sq = quote_ident(schema);
+        // Tables only — views have no foreign keys.
+        let tables: Vec<String> = {
+            let sql = format!(
+                "SELECT name FROM {sq}.sqlite_master \
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(driver_err)?;
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(driver_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(driver_err)?;
+            names
+        };
+
+        for table in tables {
+            // foreign_key_list: id, seq, table, from, to, on_update, on_delete, match.
+            // Rows arrive grouped by `id` in `seq` order; a `to` of NULL means the FK
+            // references the parent's primary key (SQLite leaves it implicit).
+            let tq = quote_ident(&table);
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA {sq}.foreign_key_list({tq})"))
+                .map_err(driver_err)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let id: i64 = row.get(0)?;
+                    let ref_table: String = row.get(2)?;
+                    let from_col: String = row.get(3)?;
+                    let to_col: Option<String> = row.get(4)?;
+                    Ok((id, ref_table, from_col, to_col.unwrap_or_default()))
+                })
+                .map_err(driver_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(driver_err)?;
+
+            let mut current: Option<i64> = None;
+            for (id, ref_table, from_col, to_col) in rows {
+                if current == Some(id) {
+                    if let Some(edge) = edges.last_mut() {
+                        edge.columns.push((from_col, to_col));
+                    }
+                } else {
+                    current = Some(id);
+                    edges.push(FkEdge {
+                        from_schema: Some(schema.clone()),
+                        from_table: table.clone(),
+                        to_schema: Some(schema.clone()),
+                        to_table: ref_table,
+                        columns: vec![(from_col, to_col)],
+                    });
+                }
+            }
+        }
+    }
+    Ok(edges)
+}
+
 /// Runs on a dedicated blocking thread. Opens the connection, prepares the
 /// statement (without stepping — `open_cursor` stays cheap), reports column
 /// metadata, then serves fetch requests until exhausted, errored, or the handle
@@ -898,7 +989,10 @@ mod tests {
                      author_id INTEGER REFERENCES authors(id)
                  );
                  CREATE INDEX idx_books_author ON books(author_id);
-                 CREATE VIEW recent_books AS SELECT * FROM books;",
+                 CREATE VIEW recent_books AS SELECT * FROM books;
+                 INSERT INTO authors(id, name) VALUES (1, 'Ada'), (2, 'Grace');
+                 INSERT INTO books(id, title, author_id)
+                     VALUES (1, 'a', 1), (2, 'b', 1), (3, 'c', 2), (4, 'd', NULL);",
             )
             .unwrap();
         }
@@ -910,6 +1004,18 @@ mod tests {
             "authors",
             "books",
             "recent_books",
+        )
+        .await;
+
+        // Track B7: the FK graph reports the same edge, and an `eq_predicate` follow
+        // narrows `books` to the two rows referencing author 1.
+        battery::lists_foreign_key_graph(&driver, "main", "authors", "books").await;
+        battery::filters_eq(
+            &driver,
+            "SELECT * FROM books",
+            "author_id",
+            Value::Integer(1),
+            2,
         )
         .await;
 

@@ -1061,6 +1061,40 @@ impl AppState {
         cx.notify();
     }
 
+    /// Pick the folder generated reports are written to (Settings → AI agent). Async —
+    /// the native directory dialog runs off-thread; the choice is persisted on return.
+    /// Not pushed to the backend: the report folder rides in each turn's `AiContext`,
+    /// so the next report already picks it up (a subscription chat already running
+    /// keeps its captured folder until it restarts, like the report theme).
+    pub(crate) fn pick_ai_report_dir(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose report folder".into()),
+        });
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            if let Ok(Ok(Some(paths))) = paths.await {
+                if let Some(path) = paths.into_iter().next() {
+                    this.update(cx, |this, cx| {
+                        this.settings.ai.report_dir = path.display().to_string();
+                        this.save_settings();
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Clear the configured report folder, so reports fall back to the system temp dir.
+    pub(crate) fn clear_ai_report_dir(&mut self, cx: &mut Context<Self>) {
+        self.settings.ai.report_dir.clear();
+        self.save_settings();
+        cx.notify();
+    }
+
     /// Toggle background self-updates. Re-arms the backend updater immediately —
     /// turning it on kicks off a check; turning it off parks the timer + network.
     pub(crate) fn set_auto_update(&mut self, on: bool, cx: &mut Context<Self>) {

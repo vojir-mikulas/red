@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ColumnMeta, ColumnValue, EditOp, ExportFormat, KeySpec, QueryOptions, QueryPlan,
-    RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
+    Column, ColumnMeta, ColumnValue, EditOp, ExportFormat, FkEdge, KeySpec, QueryOptions,
+    QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -334,6 +334,81 @@ pub(crate) fn contains_clause(
     (!preds.is_empty()).then(|| format!("({})", preds.join(" OR ")))
 }
 
+/// Render the AND-chain of `column = value` equalities behind every driver's
+/// [`eq_predicate`](DatabaseDriver::eq_predicate) (Track B7 FK follow): only the
+/// identifier `quote` differs per engine. Each value becomes a SQL *literal* (see
+/// [`sql_literal`]) compared with `=` — no column cast, so the comparison stays
+/// index-usable and the engine coerces the untyped literal to the column's type.
+/// `pairs` is non-empty by contract (a follow always has at least one column).
+pub(crate) fn eq_clause(pairs: &[ColumnValue], quote: impl Fn(&str) -> String) -> String {
+    pairs
+        .iter()
+        .map(|cv| format!("{} = {}", quote(&cv.column), sql_literal(&cv.value)))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// A [`Value`] as a SQL literal for an FK-follow equality (see [`eq_clause`]): an
+/// integer/real bare, text single-quoted with embedded quotes doubled. A NULL or a
+/// kind that can never be an FK key (blob / a display-capped cell) renders as the
+/// literal `NULL`, so `col = NULL` matches nothing — a safe no-op rather than an
+/// error, though the UI gates FK follow to non-null int/text values so it shouldn't
+/// arise. The text quoting is the injection guard; no value is interpolated raw.
+fn sql_literal(v: &Value) -> String {
+    match v {
+        Value::Integer(n) => n.to_string(),
+        Value::Real(x) => x.to_string(),
+        Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Null | Value::Blob(_) | Value::Capped(_) => "NULL".to_string(),
+    }
+}
+
+/// One flat foreign-key *column* row from an `information_schema` scan (Postgres /
+/// MySQL), before composite keys are grouped. `constraint` + the `from` endpoint
+/// identify the edge a row belongs to; [`group_fk_edges`] folds consecutive rows of
+/// one constraint into a single [`FkEdge`].
+pub(crate) struct FkRow {
+    pub from_schema: Option<String>,
+    pub from_table: String,
+    pub from_column: String,
+    pub to_schema: Option<String>,
+    pub to_table: String,
+    pub to_column: String,
+    pub constraint: String,
+}
+
+/// Fold flat catalog FK rows into one [`FkEdge`] per constraint, preserving the
+/// column order the query yields. The catalog queries order by
+/// `… constraint_name, ordinal_position`, so a constraint's columns arrive
+/// consecutively: a change in `(from_schema, from_table, constraint)` starts a new
+/// edge, and same-key rows extend the current edge's `columns` (composite key).
+pub(crate) fn group_fk_edges(rows: impl Iterator<Item = FkRow>) -> Vec<FkEdge> {
+    let mut edges: Vec<FkEdge> = Vec::new();
+    let mut current: Option<(String, String, String)> = None;
+    for r in rows {
+        let key = (
+            r.from_schema.clone().unwrap_or_default(),
+            r.from_table.clone(),
+            r.constraint.clone(),
+        );
+        if current.as_ref() == Some(&key) {
+            if let Some(edge) = edges.last_mut() {
+                edge.columns.push((r.from_column, r.to_column));
+            }
+        } else {
+            current = Some(key);
+            edges.push(FkEdge {
+                from_schema: r.from_schema,
+                from_table: r.from_table,
+                to_schema: r.to_schema,
+                to_table: r.to_table,
+                columns: vec![(r.from_column, r.to_column)],
+            });
+        }
+    }
+    edges
+}
+
 /// The SQL string literal `'%term%'` for a `LIKE` contains-match: backslash-escape
 /// the `LIKE` metacharacters (`\` `%` `_`) so the term matches literally, wrap in
 /// `%…%`, then single-quote with embedded quotes doubled. When `backslash_escapes`
@@ -389,6 +464,25 @@ pub trait DatabaseDriver: Send + Sync {
     /// One object's columns, foreign keys, and indexes. Loaded on demand when the
     /// user expands a table, so the initial tree load stays light.
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableDetail>;
+
+    /// The connection-wide foreign-key graph: every declared FK edge across the
+    /// visible namespaces (Track B7), for click-through and the relation tree. One
+    /// catalog pass where the engine allows (Postgres/MySQL `information_schema`);
+    /// SQLite loops `PRAGMA foreign_key_list` over its tables. Read-only and cached
+    /// by the caller (loaded once per connection). An engine without relational FKs
+    /// (ClickHouse) returns an empty graph, so the feature degrades to absent.
+    async fn foreign_keys(&self) -> Result<Vec<FkEdge>>;
+
+    /// Render a conjunction of `column = value` equalities as an escaped *literal*
+    /// predicate for [`red_core::ResultFilter::Eq`] — the FK-follow filter. Each
+    /// value is escaped to match literally with **no column cast** (unlike
+    /// [`contains_predicate`](Self::contains_predicate)'s `(col)::text`, so an index
+    /// on the column stays usable, and comparison context coerces the literal to the
+    /// column type). Synchronous string building; identifiers are quoted, values are
+    /// rendered as literals — never raw UI SQL. NULL values are excluded by the
+    /// caller (a null FK isn't followable); `pairs` is non-empty. Each impl delegates
+    /// to [`eq_clause`] with its own identifier quoting.
+    fn eq_predicate(&self, pairs: &[ColumnValue]) -> String;
 
     /// Render a portable, case-insensitive "contains `term`" predicate over the
     /// searchable columns of a result, for [`red_core::ResultFilter::Contains`].
@@ -754,5 +848,36 @@ mod tests {
             true
         )
         .is_some());
+    }
+
+    #[test]
+    fn eq_clause_escapes_values_and_joins_with_and() {
+        // Identifiers quoted by the engine's `quote`; values rendered as literals —
+        // integer bare, text single-quoted with the embedded quote doubled. The
+        // composite case AND-joins the equalities.
+        let pairs = vec![
+            ColumnValue {
+                column: "a".into(),
+                value: Value::Integer(7),
+                decl_type: None,
+            },
+            ColumnValue {
+                column: "name".into(),
+                value: Value::Text("O'Brien".into()),
+                decl_type: None,
+            },
+        ];
+        let pred = eq_clause(&pairs, |c| format!("\"{c}\""));
+        assert_eq!(pred, r#""a" = 7 AND "name" = 'O''Brien'"#);
+    }
+
+    #[test]
+    fn sql_literal_maps_non_key_kinds_to_null() {
+        // A null / blob / display-capped value can't be an FK key; it renders as the
+        // literal NULL so `col = NULL` matches nothing instead of erroring.
+        assert_eq!(sql_literal(&Value::Null), "NULL");
+        assert_eq!(sql_literal(&Value::Blob(vec![1, 2, 3])), "NULL");
+        assert_eq!(sql_literal(&Value::Integer(5)), "5");
+        assert_eq!(sql_literal(&Value::Text("x".into())), "'x'");
     }
 }

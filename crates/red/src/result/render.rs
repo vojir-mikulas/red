@@ -51,6 +51,8 @@ struct CellColors {
     num: Hsla,
     cyan: Hsla,
     faint: Hsla,
+    /// The brand accent, used to mark a foreign-key cell as navigable (Track B7).
+    accent: Hsla,
 }
 
 /// One grid cell, colored by its pre-classified [`CellKind`] (NULL italic-faint,
@@ -63,13 +65,21 @@ fn render_cell(
     c: CellColors,
     null_display: &SharedString,
     struck: bool,
+    is_fk: bool,
 ) -> gpui::AnyElement {
-    let color = match cell.kind {
+    let kind_color = match cell.kind {
         CellKind::Null | CellKind::Blob => c.faint,
         CellKind::Num => c.num,
         CellKind::Text => c.text,
         CellKind::Uuid => c.muted,
         CellKind::Json => c.cyan,
+    };
+    // A foreign-key cell (Track B7) reads in the brand accent to signal it's a
+    // navigable reference — except NULL/blob, which keep their faint style cue.
+    let color = if is_fk && !matches!(cell.kind, CellKind::Null | CellKind::Blob) {
+        c.accent
+    } else {
+        kind_color
     };
     // The buffer stores a placeholder for NULL; the user's chosen rendering (`∅`,
     // `NULL`, blank, …) is substituted here so it stays a settings concern only.
@@ -133,6 +143,7 @@ impl AppState {
             num,
             cyan,
             faint,
+            accent,
         };
         // The focus + cell-cursor keys live on the `Table` itself (see its
         // `.focus_handle`/`.on_nav` below); the pane draws no focus ring.
@@ -300,6 +311,9 @@ impl AppState {
         let ncols = grid.columns.len();
         let buffer_range = grid.buffer.clone();
         let buffer_row = grid.buffer.clone();
+        // Forward-FK data columns (Track B7), snapshotted into the row closure so the
+        // paint path stays alloc-free — a membership test, computed off-frame.
+        let fk_cols = grid.fk_cols.clone();
         let sender = grid.sender.clone();
         let epoch = grid.epoch;
         let (sort_view, cell_view, nav_view) = (view.clone(), view.clone(), view.clone());
@@ -510,14 +524,15 @@ impl AppState {
                             continue;
                         }
                     }
+                    let is_fk = fk_cols.contains(&c);
                     // A staged value (dirty cell) shadows the resident one.
                     if let Some(cell) = overlay_cells.cells.get(&(abs, c)) {
-                        out.push(render_cell(cell, cell_colors, &null_display, struck));
+                        out.push(render_cell(cell, cell_colors, &null_display, struck, is_fk));
                         continue;
                     }
                     match resident.and_then(|r| r.display.get(c)) {
                         Some(cell) => {
-                            out.push(render_cell(cell, cell_colors, &null_display, struck))
+                            out.push(render_cell(cell, cell_colors, &null_display, struck, is_fk))
                         }
                         None => out.push(div().text_color(faint).child("·").into_any_element()),
                     }
@@ -709,6 +724,7 @@ impl AppState {
             num: theme.orange,
             cyan: theme.cyan,
             faint,
+            accent: theme.accent,
         };
         let row_height = self.settings.grid.density.row_height();
         let mono_family = theme.mono_family.clone();
@@ -776,6 +792,7 @@ impl AppState {
                         &DisplayCell::from_value(v),
                         cell_colors,
                         &null_display,
+                        false,
                         false,
                     ),
                     None => div()
@@ -863,6 +880,40 @@ impl AppState {
                         cx.notify();
                     })),
             );
+        // FK click-through (Track B7): jump to the referenced row, or list the tables
+        // that reference this one. Present only when the FK graph resolved edges for
+        // this result's base table.
+        let (fk_forward, fk_reverse) = self.fk_menu();
+        if fk_forward.is_some() || !fk_reverse.is_empty() {
+            menu = menu.separator();
+        }
+        if let Some(target) = fk_forward {
+            menu = menu.item(
+                ContextMenuItem::new("fk-forward", format!("Go to {target}")).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.cell_menu = None;
+                        this.follow_fk_forward(cx);
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+        for (i, rev) in fk_reverse.into_iter().enumerate() {
+            let label = format!("Show rows in {} ({})", rev.table, rev.from_column);
+            menu = menu.item(ContextMenuItem::new(format!("fk-rev-{i}"), label).on_click(
+                cx.listener(move |this, _, _, cx| {
+                    this.cell_menu = None;
+                    this.follow_fk_reverse(
+                        rev.schema.clone(),
+                        rev.table.clone(),
+                        rev.from_column.clone(),
+                        rev.to_column.clone(),
+                        cx,
+                    );
+                    cx.notify();
+                }),
+            ));
+        }
         if editable_cell {
             menu = menu
                 .item(

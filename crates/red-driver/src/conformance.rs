@@ -179,6 +179,67 @@ pub(crate) async fn introspects_tables_columns_fks_and_indexes(
     );
 }
 
+/// `foreign_keys` reports the connection-wide FK graph (Track B7). Reuses the
+/// introspection fixture (`books.author_id → authors.id`): the edge is present as a
+/// single-column edge with both endpoints' namespace = `schema`, and is discoverable
+/// by its referenced table (the reverse "show referencing rows" lookup).
+pub(crate) async fn lists_foreign_key_graph(
+    driver: &dyn DatabaseDriver,
+    schema: &str,
+    authors: &str,
+    books: &str,
+) {
+    let edges = driver.foreign_keys().await.unwrap();
+    let edge = edges
+        .iter()
+        .find(|e| e.from_table == books && e.to_table == authors)
+        .unwrap_or_else(|| panic!("FK edge {books} → {authors} present in the graph"));
+    assert_eq!(
+        edge.columns,
+        vec![("author_id".to_string(), "id".to_string())],
+        "single-column edge author_id → id"
+    );
+    assert_eq!(
+        edge.from_schema.as_deref(),
+        Some(schema),
+        "from-side namespace"
+    );
+    assert_eq!(
+        edge.to_schema.as_deref(),
+        Some(schema),
+        "referenced namespace"
+    );
+    assert!(
+        edges.iter().any(|e| e.to_table == authors),
+        "the referenced table is discoverable in the reverse direction"
+    );
+}
+
+/// `eq_predicate` renders an escaped equality predicate that narrows a result to the
+/// matching rows (Track B7 FK follow). `base_sql` selects a table where
+/// `column = value` holds in exactly `expected` rows; wrapping the predicate must
+/// reproduce that count, proving the literal is rendered and compared correctly.
+pub(crate) async fn filters_eq(
+    driver: &dyn DatabaseDriver,
+    base_sql: &str,
+    column: &str,
+    value: Value,
+    expected: i64,
+) {
+    let abort = AbortSignal::new();
+    let pred = driver.eq_predicate(&[ColumnValue {
+        column: column.to_string(),
+        value,
+        decl_type: None,
+    }]);
+    let sql = format!("SELECT * FROM ({base_sql}) AS _red_eq WHERE ({pred})");
+    assert_eq!(
+        driver.count(&sql, &abort).await.unwrap(),
+        expected,
+        "FK equality narrows to the matching rows"
+    );
+}
+
 /// `export` streams to CSV and JSON without materializing the result: a field
 /// containing a comma is quoted, and a SQL NULL becomes JSON `null`. `select_sql`
 /// must yield two columns `id, name` = `(1, 'a,b'), (2, NULL)` ordered by `id`.

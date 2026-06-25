@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use flint::prelude::*;
 use gpui::{div, prelude::*, px, App, Context, Entity, UniformListScrollHandle, Window};
-use red_core::{ColumnMeta, DbKind, ObjectKind, SchemaMeta, TableDetail};
+use red_core::{ColumnMeta, DbKind, ObjectKind, ResultFilter, SchemaMeta, TableDetail};
 use red_service::Command;
 
 use crate::app::{ActiveConn, AppState, Phase};
@@ -557,7 +557,28 @@ impl AppState {
     /// tab so the user's current query and result are preserved. No `LIMIT` — the
     /// grid pages through it with flat memory. The new tab's editor is pre-filled.
     pub(crate) fn schema_preview(&mut self, schema: String, table: String, cx: &mut Context<Self>) {
-        let (sql, label, table_ref) = match &mut self.phase {
+        // Highlight the previewed object in the sidebar tree, then open it.
+        if let Phase::Connected(active) = &mut self.phase {
+            active.schema.selected = Some(NodeId::Object {
+                schema: schema.clone(),
+                name: table.clone(),
+            });
+        }
+        self.open_table_browse(schema, table, None, cx);
+    }
+
+    /// Open `SELECT * FROM schema.table` (optionally pre-filtered) in a reused
+    /// pristine tab or a fresh one — the shared path for the sidebar preview and the
+    /// FK click-through (Track B7). The editor is pre-filled with the base SQL; a
+    /// `filter` narrows the result without changing the shown query.
+    pub(crate) fn open_table_browse(
+        &mut self,
+        schema: String,
+        table: String,
+        filter: Option<ResultFilter>,
+        cx: &mut Context<Self>,
+    ) {
+        let (sql, label, table_ref) = match &self.phase {
             Phase::Connected(active) => {
                 let kind = active.config.kind;
                 let sql = format!(
@@ -568,12 +589,7 @@ impl AppState {
                 let label = format!("{schema}.{table}");
                 // The browsed table rides along so the backend can resolve a
                 // keyset seek key for it.
-                let table_ref = (schema.clone(), table.clone());
-                active.schema.selected = Some(NodeId::Object {
-                    schema,
-                    name: table,
-                });
-                (sql, label, table_ref)
+                (sql, label, (schema, table))
             }
             _ => return,
         };
@@ -605,6 +621,6 @@ impl AppState {
             _ => return,
         };
         editor.update(cx, |editor, cx| editor.set_content(sql.clone(), cx));
-        self.open_result(label, sql, Some(table_ref), cx);
+        self.open_result_filtered(label, sql, Some(table_ref), filter, cx);
     }
 }

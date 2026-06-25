@@ -672,7 +672,10 @@ pub struct Column {
 /// per engine (see `DatabaseDriver::contains_predicate`) and wraps
 /// [`Where`](Self::Where) — power-user SQL, same trust level as the editor —
 /// verbatim.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// (`Eq` carries [`ColumnValue`], whose [`Value`] is `PartialEq` but not `Eq` — so
+/// this enum is `PartialEq` only.)
+#[derive(Debug, Clone, PartialEq)]
 pub enum ResultFilter {
     /// "Any text-representable column contains this term" — the portable quick
     /// filter. Rendered per engine to a case-insensitive `LIKE`/`ILIKE` OR-chain
@@ -681,6 +684,14 @@ pub enum ResultFilter {
     /// A raw boolean SQL expression, wrapped verbatim into the `WHERE`. For users
     /// who want a precise predicate; trusted like editor SQL.
     Where(String),
+    /// A conjunction of `column = value` equalities (Track B7 foreign-key follow):
+    /// one [`ColumnValue`] for a single-column FK, several for a composite. Rendered
+    /// per engine to an escaped *literal* predicate (`DatabaseDriver::eq_predicate`)
+    /// AND-joined — comparison context coerces each literal to the column's type, so
+    /// no cast is needed and the column stays index-usable. Built by the UI from an
+    /// [`FkEdge`] + the followed row's values, never from raw SQL; NULL values are
+    /// excluded by the caller (a null FK isn't followable).
+    Eq(Vec<ColumnValue>),
 }
 
 /// A single guarded data edit (Track B5), keyed on a result's primary key. Built by
@@ -943,6 +954,24 @@ pub struct ForeignKeyMeta {
     pub column: String,
     pub ref_table: String,
     pub ref_column: String,
+}
+
+/// One foreign-key edge of the connection-wide relation graph (Track B7). Unlike
+/// the per-table [`ForeignKeyMeta`], this carries both endpoints' namespaces and is
+/// usable in either direction: *forward* (`from_table` points out) backs "go to the
+/// referenced row", *reverse* (`to_table` is pointed at) backs "show referencing
+/// rows". `columns` pairs each local column with its referenced column in key order
+/// — `len > 1` is a composite key. Loaded once per connection via
+/// [`DatabaseDriver::foreign_keys`](../red_driver/trait.DatabaseDriver.html) and
+/// indexed both ways by the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FkEdge {
+    pub from_schema: Option<String>,
+    pub from_table: String,
+    pub to_schema: Option<String>,
+    pub to_table: String,
+    /// `(from_column, to_column)` pairs, in key order.
+    pub columns: Vec<(String, String)>,
 }
 
 /// An index over one or more columns of a table.

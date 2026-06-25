@@ -11,7 +11,7 @@
 //! mutate anything.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,6 +41,9 @@ pub(crate) struct ReportSink {
     /// colors. Captured when the sink is built (per turn on the API-key path; at
     /// conversation start on the subscription path).
     theme: Option<ReportTheme>,
+    /// Where finished report files are written (Settings → AI agent → Report folder),
+    /// captured alongside `theme`. `None` falls back to the system temp dir.
+    report_dir: Option<PathBuf>,
 }
 
 impl ReportSink {
@@ -49,12 +52,14 @@ impl ReportSink {
         session: Option<SessionId>,
         conversation_id: u64,
         theme: Option<ReportTheme>,
+        report_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             events: Some(events),
             session,
             conversation_id,
             theme,
+            report_dir,
         }
     }
 
@@ -66,12 +71,30 @@ impl ReportSink {
             session: None,
             conversation_id: 0,
             theme: None,
+            report_dir: None,
         }
     }
 
     /// The theme to paint the report with, if the UI supplied one.
     fn theme(&self) -> Option<&ReportTheme> {
         self.theme.as_ref()
+    }
+
+    /// The directory a finished report should be written to: the user's configured
+    /// folder when set and usable (created on demand), else the system temp dir. A
+    /// configured folder that can't be created falls back to temp rather than failing
+    /// the report — the user still gets their report, just not where they asked.
+    fn output_dir(&self) -> PathBuf {
+        if let Some(dir) = &self.report_dir {
+            match std::fs::create_dir_all(dir) {
+                Ok(()) => return dir.clone(),
+                Err(e) => tracing::warn!(
+                    "AI report folder {} is unusable ({e}); writing to the temp dir instead",
+                    dir.display()
+                ),
+            }
+        }
+        std::env::temp_dir()
     }
 
     /// Announce a freshly-written report so the UI opens it.
@@ -242,6 +265,7 @@ pub(crate) async fn run_turn(
         session,
         conversation_id,
         context.theme.as_deref().cloned(),
+        context.report_dir.clone(),
     );
 
     // Seed the conversation with the grounded user message and pull the running
@@ -813,7 +837,8 @@ pub(crate) async fn run_tool(
                     false,
                 );
             }
-            let path = std::env::temp_dir()
+            let path = report
+                .output_dir()
                 .join(format!("red-report-{}.html", uuid::Uuid::new_v4().simple()));
             match write_report_file(&path, &html) {
                 Ok(()) => {
@@ -1734,7 +1759,7 @@ mod tests {
         let db = std::env::temp_dir().join(format!("red-gr-{}.db", uuid::Uuid::new_v4().simple()));
         let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let sink = ReportSink::new(tx, None, 7, None);
+        let sink = ReportSink::new(tx, None, 7, None, None);
 
         let (content, ok) = run_tool(
             &driver,
@@ -1787,13 +1812,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generate_report_writes_to_the_configured_folder() {
+        use futures::StreamExt;
+
+        let db =
+            std::env::temp_dir().join(format!("red-grd2-{}.db", uuid::Uuid::new_v4().simple()));
+        let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
+        // A folder that doesn't exist yet: `output_dir` must create it on demand rather
+        // than dropping the report into the temp dir.
+        let out =
+            std::env::temp_dir().join(format!("red-reports-{}", uuid::Uuid::new_v4().simple()));
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let sink = ReportSink::new(tx, None, 21, None, Some(out.clone()));
+
+        let (_content, ok) = run_tool(
+            &driver,
+            "generate_report",
+            &json!({ "title": "Here", "html": "<h1>Here</h1>" }),
+            &AiPolicy::default(),
+            &CancelToken::new(),
+            &sink,
+        )
+        .await;
+        assert!(ok, "expected the report to be generated");
+
+        let (_session, event) = rx.next().await.expect("an AiReportReady event");
+        let Event::AiReportReady { path, .. } = event else {
+            panic!("expected AiReportReady");
+        };
+        assert!(
+            std::path::Path::new(&path).starts_with(&out),
+            "report {path} should live under the configured folder {}",
+            out.display()
+        );
+        assert!(
+            out.is_dir(),
+            "the configured folder should be created on demand"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[tokio::test]
     async fn generate_report_with_charts_is_nonce_gated_and_egress_free() {
         use futures::StreamExt;
 
         let db = std::env::temp_dir().join(format!("red-grc-{}.db", uuid::Uuid::new_v4().simple()));
         let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let sink = ReportSink::new(tx, None, 11, None);
+        let sink = ReportSink::new(tx, None, 11, None, None);
 
         let (content, ok) = run_tool(
             &driver,
@@ -1848,7 +1914,7 @@ mod tests {
         let db = std::env::temp_dir().join(format!("red-grd-{}.db", uuid::Uuid::new_v4().simple()));
         let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let sink = ReportSink::new(tx, None, 13, None);
+        let sink = ReportSink::new(tx, None, 13, None, None);
 
         let (content, ok) = run_tool(
             &driver,
@@ -1893,7 +1959,7 @@ mod tests {
         let db = std::env::temp_dir().join(format!("red-grf-{}.db", uuid::Uuid::new_v4().simple()));
         let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let sink = ReportSink::new(tx, None, 17, None);
+        let sink = ReportSink::new(tx, None, 17, None, None);
 
         let (content, ok) = run_tool(
             &driver,

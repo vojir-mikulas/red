@@ -30,9 +30,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ColumnMeta, ConnectionConfig, EditOp, ExportFormat, KeySpec, ObjectKind, ObjectMeta,
-    QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail,
-    Value,
+    Column, ColumnMeta, ColumnValue, ConnectionConfig, EditOp, ExportFormat, FkEdge, KeySpec,
+    ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow,
+    SchemaMeta, TableDetail, Value,
 };
 use serde_json::Value as Json;
 use tokio::sync::mpsc::UnboundedSender;
@@ -442,6 +442,12 @@ impl DatabaseDriver for ClickhouseDriver {
         })
     }
 
+    async fn foreign_keys(&self) -> Result<Vec<FkEdge>> {
+        // OLAP: ClickHouse has no relational foreign keys, so the graph is empty and
+        // the FK-navigation feature degrades to absent.
+        Ok(Vec::new())
+    }
+
     fn contains_predicate(&self, columns: &[ColumnMeta], term: &str) -> Option<String> {
         // ClickHouse `ILIKE` is case-insensitive; its escape char is always `\` and
         // there is no `ESCAPE` clause, so suppress it (last arg `false`). String
@@ -456,6 +462,10 @@ impl DatabaseDriver for ClickhouseDriver {
             true,
             false,
         )
+    }
+
+    fn eq_predicate(&self, pairs: &[ColumnValue]) -> String {
+        crate::eq_clause(pairs, ch_quote)
     }
 
     async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64> {

@@ -15,13 +15,16 @@ mod render;
 pub(crate) use edit::GridEdit;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use flint::prelude::*;
 use gpui::{point, px, ClipboardItem, Context, Pixels, ScrollHandle, UniformListScrollHandle};
-use red_core::{Column as ResultColumn, ExportFormat, KeySpec, ResultFilter, Value};
+use red_core::{
+    Column as ResultColumn, ColumnValue, ExportFormat, FkEdge, KeySpec, ResultFilter, Value,
+};
 use red_service::{Command, CommandSender, RunFetch, SessionId, SortKey};
 
 use crate::app::{AppState, EditContext, ExportProgress, Notification, Phase};
@@ -64,6 +67,10 @@ pub(crate) struct ResultGrid {
     /// preview — sent with `OpenResult` so the backend can resolve a seek key.
     /// `None` for editor SQL and for sorted re-opens (which wrap the SQL).
     table: Option<(String, String)>,
+    /// Data-column indices that are single-column forward foreign keys of `table`
+    /// (Track B7), recomputed from the connection's FK graph on open / graph-load.
+    /// Drives the in-grid FK accent; always empty for non-table results.
+    fk_cols: HashSet<usize>,
     /// The seek key the backend resolved (`ResultReady`). Track B5 reads its PK to
     /// key a guarded edit; `None` (editor SQL / no usable PK) means not editable.
     key: Option<KeySpec>,
@@ -114,6 +121,7 @@ impl ResultGrid {
             filter: None,
             selection: None,
             table,
+            fk_cols: HashSet::new(),
             key: None,
             buffer: Rc::new(RefCell::new(GridBuffer::new(page_size))),
             pending: edit::PendingChanges::default(),
@@ -175,6 +183,27 @@ impl ResultGrid {
         let focus = self.selection?.focus;
         let ncols = self.columns.len();
         (ncols > 0).then(|| (focus.0, focus.1.saturating_sub(gutter).min(ncols - 1)))
+    }
+
+    /// Recompute which data columns are single-column forward foreign keys of this
+    /// grid's base table, from the connection's FK graph (Track B7). An empty set
+    /// for non-table results or before the graph loads. Drives the in-grid accent.
+    pub(crate) fn set_fk_cols(&mut self, graph: &[FkEdge]) {
+        self.fk_cols.clear();
+        let Some((schema, table)) = &self.table else {
+            return;
+        };
+        for (i, col) in self.columns.iter().enumerate() {
+            let is_fk = graph.iter().any(|e| {
+                e.columns.len() == 1
+                    && e.from_table == *table
+                    && e.from_schema.as_deref() == Some(schema.as_str())
+                    && e.columns[0].0 == col.name
+            });
+            if is_fk {
+                self.fk_cols.insert(i);
+            }
+        }
     }
 
     /// A data column's `(name, declared type)` — for the inspector header.
@@ -600,6 +629,38 @@ pub(crate) struct PendingCopy {
     pub(crate) dcol_hi: usize,
 }
 
+/// An in-flight FK click-through (Track B7) awaiting its single-row `CopyRows`
+/// re-fetch: once the row's typed value(s) arrive, the target browse is opened
+/// filtered to them. See [`AppState::on_fk_rows`].
+pub(crate) struct PendingFkFollow {
+    id: u64,
+    plan: FkPlan,
+}
+
+/// One reverse FK edge surfaced in the cell menu: a table that references the
+/// current grid's table. "Show rows in `table` (`from_column`)" opens `table`
+/// filtered to `from_column = <this row's to_column value>`.
+pub(crate) struct FkReverse {
+    pub(crate) schema: String,
+    pub(crate) table: String,
+    pub(crate) from_column: String,
+    pub(crate) to_column: String,
+}
+
+/// The resolved target of an FK follow: which table to open, and for each of its
+/// filter columns, the source-row column index to read the key value from. One
+/// pair for a single-column FK; several for a composite.
+struct FkPlan {
+    /// The source result's epoch (the `CopyRows` is issued against it).
+    epoch: u64,
+    /// The source row whose key value(s) we fetch in full.
+    row: usize,
+    /// `(schema, table)` of the browse to open.
+    target: (String, String),
+    /// `(target_filter_column, source_column_index)` pairs.
+    filters: Vec<(String, usize)>,
+}
+
 /// How [`ResultGrid::copy_plan`] resolves a selection copy.
 pub(crate) enum CopyPlan {
     /// Ready to copy now — the assembled TSV.
@@ -685,18 +746,39 @@ impl AppState {
         table: Option<(String, String)>,
         cx: &mut Context<Self>,
     ) {
+        self.open_result_filtered(label, base_sql, table, None, cx);
+    }
+
+    /// Like [`open_result`](Self::open_result) but seeds an initial result filter —
+    /// the FK click-through (Track B7) opens the target browse pre-filtered to the
+    /// followed key. The filter rides the grid (so a re-sort preserves it) and the
+    /// first `OpenResult`, exactly like an applied Track B2 filter.
+    pub(crate) fn open_result_filtered(
+        &mut self,
+        label: impl Into<String>,
+        base_sql: String,
+        table: Option<(String, String)>,
+        filter: Option<ResultFilter>,
+        cx: &mut Context<Self>,
+    ) {
         let opened = match &mut self.phase {
             Phase::Connected(active) if active.active().is_some() => {
                 // Bind the grid's load-on-scroll sender to this workspace's session.
                 let sender = self.service.command_sender(active.session);
-                let grid = ResultGrid::new(
+                let mut grid = ResultGrid::new(
                     label.into(),
                     base_sql,
                     table,
                     sender,
                     self.settings.grid.page_size,
                 );
-                let opened = (grid.base_sql.clone(), grid.epoch, grid.table.clone());
+                grid.filter = filter;
+                let opened = (
+                    grid.base_sql.clone(),
+                    grid.epoch,
+                    grid.table.clone(),
+                    grid.filter.clone(),
+                );
                 // Safe: the guard above ensured a focused tab exists. A fresh run
                 // replaces any open plan (Track B4) with its grid.
                 let tab = active.active_mut().unwrap();
@@ -706,14 +788,15 @@ impl AppState {
             }
             _ => return,
         };
-        let (sql, epoch, table) = opened;
-        // A fresh open is never sorted or filtered — the backend keys it from `table`.
+        let (sql, epoch, table, filter) = opened;
+        // A fresh open is never sorted — the backend keys it from `table`; the filter
+        // (FK follow) is pushed into the query like a Track B2 filter.
         self.send_active(Command::OpenResult {
             sql,
             epoch,
             table,
             sort: None,
-            filter: None,
+            filter,
         });
         self.start_query_ticker(cx);
         cx.notify();
@@ -732,8 +815,12 @@ impl AppState {
         // Route to the event's session (it may be a backgrounded workspace), then
         // by epoch within it. A late reply for a closed result finds no match.
         if let Some(active) = self.conn_mut(session) {
+            // Clone the small FK graph so the grid's mutable borrow doesn't collide
+            // with the shared one; mark FK columns now that the column set is known.
+            let graph = active.fk_graph.clone();
             if let Some(grid) = active.result_by_epoch(epoch) {
                 grid.on_ready(columns, total, key);
+                grid.set_fk_cols(&graph);
             }
         }
         cx.notify();
@@ -1294,8 +1381,14 @@ impl AppState {
     pub(crate) fn on_copy_rows(&mut self, id: u64, rows: Vec<Vec<Value>>, cx: &mut Context<Self>) {
         // The detail inspector draws full values from the same `CopyRows` path; if
         // this reply is its in-flight fetch, it claims it (and never reaches the
-        // clipboard). Ids come from one counter, so the two never collide.
+        // clipboard). Ids come from one counter, so the three never collide.
         if self.on_inspect_rows(id, &rows) {
+            cx.notify();
+            return;
+        }
+        // An FK click-through (Track B7) also re-fetches one row in full to read the
+        // typed key; if this reply is its, it opens the target browse.
+        if self.on_fk_rows(id, &rows, cx) {
             cx.notify();
             return;
         }
@@ -1304,5 +1397,173 @@ impl AppState {
         };
         let tsv = rows_tsv(&rows, pending.dcol_lo, pending.dcol_hi);
         cx.write_to_clipboard(ClipboardItem::new_string(tsv));
+    }
+
+    /// FK click-through affordances for the focused cell's grid (Track B7): the
+    /// forward target table name when the focused column is a single-column FK, and
+    /// the reverse edges (tables referencing this grid's table) as
+    /// `(child_schema, child_table, from_column, to_column)`. Empty without a base
+    /// table or a loaded graph. Drives the result cell context menu.
+    pub(crate) fn fk_menu(&self) -> (Option<String>, Vec<FkReverse>) {
+        let empty = (None, Vec::new());
+        let Phase::Connected(active) = &self.phase else {
+            return empty;
+        };
+        let Some(grid) = active.active_result() else {
+            return empty;
+        };
+        let Some((schema, table)) = grid.table.as_ref() else {
+            return empty;
+        };
+        let forward = grid.cursor_cell(self.gutter()).and_then(|(_, col)| {
+            let cname = grid.columns.get(col)?.name.clone();
+            active
+                .fk_graph
+                .iter()
+                .find(|e| {
+                    e.columns.len() == 1
+                        && e.from_table == *table
+                        && e.from_schema.as_deref() == Some(schema.as_str())
+                        && e.columns[0].0 == cname
+                })
+                .map(|e| e.to_table.clone())
+        });
+        let reverse = active
+            .fk_graph
+            .iter()
+            .filter(|e| {
+                e.columns.len() == 1
+                    && e.to_table == *table
+                    && e.to_schema.as_deref() == Some(schema.as_str())
+            })
+            .map(|e| FkReverse {
+                schema: e.from_schema.clone().unwrap_or_default(),
+                table: e.from_table.clone(),
+                from_column: e.columns[0].0.clone(),
+                to_column: e.columns[0].1.clone(),
+            })
+            .collect();
+        (forward, reverse)
+    }
+
+    /// "Go to referenced row": resolve the forward FK of the focused cell, then fetch
+    /// that cell's full value (the target browse opens in [`on_fk_rows`]). No-op if
+    /// the focused column isn't a single-column FK or the graph hasn't loaded.
+    pub(crate) fn follow_fk_forward(&mut self, cx: &mut Context<Self>) {
+        let Phase::Connected(active) = &self.phase else {
+            return;
+        };
+        let Some(grid) = active.active_result() else {
+            return;
+        };
+        let Some((schema, table)) = grid.table.as_ref() else {
+            return;
+        };
+        let Some((row, col)) = grid.cursor_cell(self.gutter()) else {
+            return;
+        };
+        let Some(cname) = grid.columns.get(col).map(|c| c.name.clone()) else {
+            return;
+        };
+        let Some(edge) = active.fk_graph.iter().find(|e| {
+            e.columns.len() == 1
+                && e.from_table == *table
+                && e.from_schema.as_deref() == Some(schema.as_str())
+                && e.columns[0].0 == cname
+        }) else {
+            return;
+        };
+        let plan = FkPlan {
+            epoch: grid.epoch,
+            row,
+            target: (
+                edge.to_schema.clone().unwrap_or_else(|| schema.clone()),
+                edge.to_table.clone(),
+            ),
+            filters: vec![(edge.columns[0].1.clone(), col)],
+        };
+        self.begin_fk_follow(plan, cx);
+    }
+
+    /// "Show referencing rows": open `child` filtered to `child.from_column =
+    /// <this row's to_column value>`. The source value is read from the focused
+    /// row's `to_column` (the referenced column — usually a PK), fetched in full.
+    pub(crate) fn follow_fk_reverse(
+        &mut self,
+        child_schema: String,
+        child_table: String,
+        from_column: String,
+        to_column: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Phase::Connected(active) = &self.phase else {
+            return;
+        };
+        let Some(grid) = active.active_result() else {
+            return;
+        };
+        let Some((row, _)) = grid.cursor_cell(self.gutter()) else {
+            return;
+        };
+        let Some(src) = grid.columns.iter().position(|c| c.name == to_column) else {
+            return;
+        };
+        let plan = FkPlan {
+            epoch: grid.epoch,
+            row,
+            target: (child_schema, child_table),
+            filters: vec![(from_column, src)],
+        };
+        self.begin_fk_follow(plan, cx);
+    }
+
+    /// Issue the single-row `CopyRows` re-fetch that backs an FK follow, recording
+    /// the plan so [`on_fk_rows`](Self::on_fk_rows) can complete it on the reply.
+    fn begin_fk_follow(&mut self, plan: FkPlan, cx: &mut Context<Self>) {
+        let id = self.next_copy_id;
+        self.next_copy_id += 1;
+        let (epoch, row) = (plan.epoch, plan.row);
+        self.pending_fk = Some(PendingFkFollow { id, plan });
+        self.send_active(Command::CopyRows {
+            offset: row,
+            limit: 1,
+            epoch,
+            id,
+        });
+        cx.notify();
+    }
+
+    /// A `CopyRows` reply claimed by a pending FK follow: read the typed key
+    /// value(s) and open the target browse filtered to them. A NULL key isn't
+    /// followable (nothing to point at), so it's reported and dropped. Returns
+    /// whether it claimed the reply.
+    fn on_fk_rows(&mut self, id: u64, rows: &[Vec<Value>], cx: &mut Context<Self>) -> bool {
+        let Some(p) = self.pending_fk.take_if(|p| p.id == id) else {
+            return false;
+        };
+        let Some(row) = rows.first() else {
+            return true;
+        };
+        let mut pairs = Vec::with_capacity(p.plan.filters.len());
+        for (target_col, src) in &p.plan.filters {
+            match row.get(*src) {
+                Some(Value::Null) | None => {
+                    self.notify(
+                        ToastVariant::Info,
+                        "Referenced value is NULL — nothing to follow",
+                        cx,
+                    );
+                    return true;
+                }
+                Some(value) => pairs.push(ColumnValue {
+                    column: target_col.clone(),
+                    value: value.clone(),
+                    decl_type: None,
+                }),
+            }
+        }
+        let (schema, table) = p.plan.target;
+        self.open_table_browse(schema, table, Some(ResultFilter::Eq(pairs)), cx);
+        true
     }
 }

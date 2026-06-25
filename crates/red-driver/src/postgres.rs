@@ -21,9 +21,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use red_core::{
-    Column, ColumnMeta, EditOp, ExportFormat, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind,
-    ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta,
-    TableDetail, Value,
+    Column, ColumnMeta, ColumnValue, EditOp, ExportFormat, FkEdge, ForeignKeyMeta, IndexMeta,
+    KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage,
+    RowWindow, SchemaMeta, TableDetail, Value,
 };
 use std::fs::File;
 use std::io::BufWriter;
@@ -382,6 +382,42 @@ impl DatabaseDriver for PostgresDriver {
         })
     }
 
+    async fn foreign_keys(&self) -> Result<Vec<FkEdge>> {
+        // One pass over the catalog: every FK column with both endpoints' schema +
+        // table, ordered so a composite key's columns arrive together in key order.
+        // System schemas are excluded to match `list_objects`'s visible namespaces.
+        let rows = self
+            .client
+            .query(
+                "SELECT tc.table_schema, tc.table_name, kcu.column_name, \
+                        ccu.table_schema, ccu.table_name, ccu.column_name, tc.constraint_name \
+                 FROM information_schema.table_constraints tc \
+                 JOIN information_schema.key_column_usage kcu \
+                   ON kcu.constraint_name = tc.constraint_name \
+                  AND kcu.table_schema = tc.table_schema \
+                 JOIN information_schema.constraint_column_usage ccu \
+                   ON ccu.constraint_name = tc.constraint_name \
+                  AND ccu.table_schema = tc.table_schema \
+                 WHERE tc.constraint_type = 'FOREIGN KEY' \
+                   AND tc.table_schema NOT IN ('pg_catalog', 'information_schema') \
+                   AND tc.table_schema NOT LIKE 'pg\\_%' \
+                 ORDER BY tc.table_schema, tc.table_name, tc.constraint_name, kcu.ordinal_position",
+                &[],
+            )
+            .await
+            .map_err(driver_err)?;
+        let edges = crate::group_fk_edges(rows.iter().map(|r| crate::FkRow {
+            from_schema: r.get(0),
+            from_table: r.get(1),
+            from_column: r.get(2),
+            to_schema: r.get(3),
+            to_table: r.get(4),
+            to_column: r.get(5),
+            constraint: r.get(6),
+        }));
+        Ok(edges)
+    }
+
     fn contains_predicate(&self, columns: &[ColumnMeta], term: &str) -> Option<String> {
         // Postgres standard strings treat `\` literally — no extra literal escaping.
         crate::contains_clause(
@@ -393,6 +429,10 @@ impl DatabaseDriver for PostgresDriver {
             false,
             true,
         )
+    }
+
+    fn eq_predicate(&self, pairs: &[ColumnValue]) -> String {
+        crate::eq_clause(pairs, pg_quote)
     }
 
     async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64> {
@@ -1248,6 +1288,8 @@ mod tests {
             &driver, &schema, &authors, &books, &recent,
         )
         .await;
+        // Track B7: the connection-wide FK graph reports the same edge.
+        battery::lists_foreign_key_graph(&driver, &schema, &authors, &books).await;
 
         for obj in [
             format!("VIEW {recent}"),

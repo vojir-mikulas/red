@@ -33,7 +33,7 @@ use gpui::{
     prelude::*, px, AsyncApp, Context, ElementId, Entity, FocusHandle, Focusable, Hsla,
     PathPromptOptions, Pixels, ScrollHandle, SharedString, WeakEntity, Window, WindowAppearance,
 };
-use red_core::{ConnectionConfig, DbKind, EditOp, UpdateState};
+use red_core::{ConnectionConfig, DbKind, EditOp, FkEdge, UpdateState};
 use red_service::{AiAuthStatus, Command, Event, ServiceHandle, SessionId, UpdateConfig};
 
 use crate::config::{self, StoredConnection};
@@ -401,6 +401,10 @@ pub(crate) struct ActiveConn {
     pub inspector_w: Pixels,
     pub inspector_drag: Option<DragAnchor>,
     pub schema: SchemaState,
+    /// The connection-wide foreign-key graph (Track B7), prefetched once after
+    /// connect. Empty until it lands (or when the engine has no FKs); drives the
+    /// in-grid FK click-through. See [`Command::LoadForeignKeys`].
+    pub fk_graph: Vec<FkEdge>,
     /// Open query tabs (never empty), and the index of the focused one.
     pub tabs: Vec<QueryTab>,
     pub active_tab: usize,
@@ -457,6 +461,7 @@ impl ActiveConn {
             inspector_w: px(360.),
             inspector_drag: None,
             schema: SchemaState::new(cx),
+            fk_graph: Vec::new(),
             tabs: vec![tab],
             active_tab: 0,
             query_seq: 1,
@@ -571,6 +576,10 @@ pub struct AppState {
     /// full-row re-fetch (`CopyRows`). The latest copy wins; an earlier reply is
     /// then stale and dropped.
     pub(crate) pending_copy: Option<crate::result::PendingCopy>,
+    /// An in-flight FK click-through (Track B7), waiting on its single-row
+    /// `CopyRows` re-fetch to read the typed key value before opening the target
+    /// browse. The latest follow wins; an earlier reply is then stale and dropped.
+    pub(crate) pending_fk: Option<crate::result::PendingFkFollow>,
     /// The cell detail inspector, when open (Track B1). Owns its scroll position
     /// and any on-demand full value fetched for a capped/evicted cell.
     pub(crate) inspector: Option<crate::inspector::InspectorState>,
@@ -1353,6 +1362,7 @@ impl AppState {
             next_export_id: 0,
             next_copy_id: 0,
             pending_copy: None,
+            pending_fk: None,
             inspector: None,
             assistant: None,
             focus_assistant: false,
@@ -1750,6 +1760,19 @@ impl AppState {
                 if session == self.foreground_session {
                     self.refresh_completions(cx);
                 }
+            }
+            Event::ForeignKeysLoaded { graph } => {
+                // Cache the graph and (re)mark FK columns on any already-open grids —
+                // a result may have opened before the prefetch landed.
+                if let Some(active) = self.conn_mut(session) {
+                    active.fk_graph = graph;
+                    for tab in &mut active.tabs {
+                        if let Some(grid) = tab.result.as_mut() {
+                            grid.set_fk_cols(&active.fk_graph);
+                        }
+                    }
+                }
+                cx.notify();
             }
 
             // --- result grid ---

@@ -119,8 +119,11 @@ impl AppState {
                 cx,
             )));
             self.foreground_session = Some(id);
-            // Kick off the schema-tree skeleton load for the sidebar.
+            // Kick off the schema-tree skeleton load for the sidebar, and
+            // background-prefetch the FK graph (Track B7) so grid FK columns can be
+            // marked before any click. Both run off the connect path.
             self.service.send_to(id, Command::LoadObjects);
+            self.service.send_to(id, Command::LoadForeignKeys);
             self.rebuild_switcher(cx);
         }
     }
