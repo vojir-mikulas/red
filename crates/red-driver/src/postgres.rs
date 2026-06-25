@@ -23,7 +23,7 @@ use futures_util::StreamExt;
 use red_core::{
     Column, ColumnMeta, ColumnValue, EditOp, ExportFormat, FkEdge, ForeignKeyMeta, IndexMeta,
     KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage,
-    RowWindow, SchemaMeta, TableDetail, Value,
+    RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use std::fs::File;
 use std::io::BufWriter;
@@ -638,6 +638,50 @@ impl DatabaseDriver for PostgresDriver {
         result
     }
 
+    async fn insert_rows(
+        &self,
+        table: &TableRef,
+        columns: &[Column],
+        rows: &[Vec<Value>],
+    ) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        // Borrow a pool connection so the transaction never shares the cursor's
+        // connection — see `execute`/`apply_edits`.
+        let client = self.acquire().await?;
+        let result = async {
+            client.batch_execute("BEGIN").await.map_err(driver_err)?;
+            let max = crate::insert_chunk_rows(columns.len(), PG_PARAM_CAP);
+            let mut total = 0u64;
+            for chunk in rows.chunks(max) {
+                // Typed placeholders (`$n::int8`, `$n::text::"uuid"`, …) like the
+                // edit path, so Postgres can't re-infer the parameter type.
+                let (sql, params) = crate::insert_sql(table, columns, chunk, pg_quote, |i, v, dt| {
+                    format!("${}{}", i + 1, pg_cast(v, dt))
+                });
+                let owned: Vec<Value> = params.iter().map(|v| (*v).clone()).collect();
+                let boxed = pg_params(Some(&owned))?;
+                let refs: Vec<&(dyn ToSql + Sync)> = boxed
+                    .iter()
+                    .map(|b| -> &(dyn ToSql + Sync) { b.as_ref() })
+                    .collect();
+                match client.execute(&sql, &refs).await {
+                    Ok(affected) => total += affected,
+                    Err(e) => {
+                        crate::warn_rollback(client.batch_execute("ROLLBACK").await, "insert_rows");
+                        return Err(map_pg_err(e));
+                    }
+                }
+            }
+            client.batch_execute("COMMIT").await.map_err(driver_err)?;
+            Ok(total)
+        }
+        .await;
+        self.release(client);
+        result
+    }
+
     async fn explain(&self, sql: &str, analyze: bool) -> Result<QueryPlan> {
         // Default `FORMAT TEXT` — the most stable parse target, and avoids the
         // JSON dependency. Plain `EXPLAIN` never executes the statement;
@@ -751,6 +795,10 @@ impl QueryCursor for PgCursor {
 fn pg_quote(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
+
+/// Postgres' wire-protocol cap on bound parameters per statement (`u16`, 65535),
+/// with margin; a multi-row insert sub-chunks below it.
+const PG_PARAM_CAP: usize = 60_000;
 
 /// The explicit cast for a bound placeholder, pinning the inferred parameter type
 /// to the wire form the value's Rust type encodes (so Postgres can't re-infer it):
@@ -1452,8 +1500,18 @@ mod tests {
         battery::applies_batch_atomic(&driver, &schema, &tb).await;
         battery::read_only_rejects_batch(&ro, &schema, &tb).await;
 
+        // Bulk insert (data import / table copy) on a fresh empty table.
+        let ti = tag("insert");
+        driver
+            .execute(&format!("CREATE TABLE {ti} (id INT PRIMARY KEY, name TEXT)"))
+            .await
+            .unwrap();
+        battery::inserts_rows(&driver, &schema, &ti).await;
+        battery::read_only_rejects_insert_rows(&ro, &schema, &ti).await;
+
         driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
         driver.execute(&format!("DROP TABLE {tb}")).await.unwrap();
+        driver.execute(&format!("DROP TABLE {ti}")).await.unwrap();
     }
 
     /// Editing a column whose value decodes to [`Value::Text`] but whose real type

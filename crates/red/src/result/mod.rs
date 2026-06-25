@@ -21,13 +21,19 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use flint::prelude::*;
-use gpui::{point, px, ClipboardItem, Context, Pixels, ScrollHandle, UniformListScrollHandle};
+use gpui::{
+    point, px, ClipboardItem, Context, PathPromptOptions, Pixels, ScrollHandle,
+    UniformListScrollHandle,
+};
 use red_core::{
-    Column as ResultColumn, ColumnValue, ExportFormat, FkEdge, KeySpec, ResultFilter, Value,
+    Column as ResultColumn, ColumnMap, ColumnValue, ExportFormat, FkEdge, ImportFormat, KeySpec,
+    ResultFilter, TableRef, Value,
 };
 use red_service::{Command, CommandSender, RunFetch, SessionId, SortKey};
 
-use crate::app::{AppState, EditContext, ExportProgress, Notification, Phase};
+use crate::app::{
+    AppState, EditContext, ExportProgress, Notification, PendingImportPeek, PendingWrite, Phase,
+};
 
 use buffer::{next_epoch, window_decision, BufferMode, GridBuffer, KeyedRun, WindowView, WINDOW};
 pub(crate) use render::group_digits;
@@ -335,6 +341,20 @@ impl ResultGrid {
     /// go-to-row prompt's range hint and bound.
     pub(crate) fn total_rows(&self) -> usize {
         self.total
+    }
+
+    /// The import target this browse represents — `(table, its columns)` — or `None`
+    /// when the result isn't a single-table browse (editor SQL / a join). Drives the
+    /// toolbar "Import…" affordance and the name-based column mapping.
+    pub(in crate::result) fn import_target(&self) -> Option<(TableRef, Vec<ResultColumn>)> {
+        let (schema, name) = self.table.clone()?;
+        Some((
+            TableRef {
+                schema: Some(schema),
+                name,
+            },
+            self.columns.clone(),
+        ))
     }
 
     /// `(rows, columns)` once the result is ready — for the shell's status bar.
@@ -1270,7 +1290,12 @@ impl AppState {
                 detail: None,
                 detail_label: None,
                 auto_dismiss: None,
-                export: Some(ExportProgress { id, rows: 0, total }),
+                export: Some(ExportProgress {
+                    id,
+                    rows: 0,
+                    total,
+                    is_import: false,
+                }),
                 expanded: false,
                 hovered: false,
                 dismiss_gen: 0,
@@ -1334,6 +1359,263 @@ impl AppState {
             self.dismiss(nid, cx);
         }
         self.notify(ToastVariant::Info, "Export cancelled", cx);
+    }
+
+    // --- import progress events (data import) ---
+
+    /// `ImportProgress`: advance the import toast's running committed-row count (an
+    /// import streams a file of unknown length, so it shows a count, not a %).
+    pub(crate) fn on_import_progress(&mut self, id: u64, rows: usize, cx: &mut Context<Self>) {
+        if let Some(n) = self
+            .notifications
+            .iter_mut()
+            .find(|n| n.export.as_ref().is_some_and(|e| e.id == id))
+        {
+            if let Some(t) = &mut n.export {
+                t.rows = rows;
+            }
+            n.message = format!("Importing… {rows} row(s)").into();
+        }
+        cx.notify();
+    }
+
+    /// `ImportFinished`: drop the progress toast, leave an auto-dismissing success.
+    pub(crate) fn on_import_finished(&mut self, id: u64, rows: usize, cx: &mut Context<Self>) {
+        if let Some(nid) = self.export_notification_id(id) {
+            self.dismiss(nid, cx);
+        }
+        self.notify(ToastVariant::Success, format!("Imported {rows} row(s)"), cx);
+    }
+
+    /// `ImportFailed`: drop the progress toast, surface the error. Inserts commit per
+    /// chunk, so the message says how far it got.
+    pub(crate) fn on_import_failed(
+        &mut self,
+        id: u64,
+        rows: usize,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(nid) = self.export_notification_id(id) {
+            self.dismiss(nid, cx);
+        }
+        let msg = if rows > 0 {
+            format!("Import failed after {rows} row(s): {message}")
+        } else {
+            format!("Import failed: {message}")
+        };
+        self.notify(ToastVariant::Error, msg, cx);
+    }
+
+    /// `ImportCancelled`: drop the progress toast; earlier chunks stay committed.
+    pub(crate) fn on_import_cancelled(&mut self, id: u64, rows: usize, cx: &mut Context<Self>) {
+        if let Some(nid) = self.export_notification_id(id) {
+            self.dismiss(nid, cx);
+        }
+        let msg = if rows > 0 {
+            format!("Import cancelled ({rows} row(s) kept)")
+        } else {
+            "Import cancelled".to_string()
+        };
+        self.notify(ToastVariant::Info, msg, cx);
+    }
+
+    // --- import trigger (file pick → peek → confirm → import) ---
+
+    /// "Import…" on a single-table browse: pick a CSV/JSONL file, then peek its
+    /// header (backend) so a name-based mapping can be built and **confirmed before
+    /// any write**. No-op (with a hint) on editor SQL / joins — no single target.
+    pub(crate) fn import_into_result(&mut self, cx: &mut Context<Self>) {
+        let target = match &self.phase {
+            Phase::Connected(a) => a.active_result().and_then(|g| g.import_target()),
+            _ => None,
+        };
+        let Some((target, target_cols)) = target else {
+            self.notify(
+                ToastVariant::Info,
+                "Open a single table to import into it",
+                cx,
+            );
+            return;
+        };
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import data file".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = paths.await {
+                if let Some(path) = paths.into_iter().next() {
+                    this.update(cx, |this, _| {
+                        this.begin_import_peek(path, target, target_cols)
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// File chosen: infer the format from its extension, stash the pending peek, and
+    /// ask the backend for the file's source column names.
+    fn begin_import_peek(
+        &mut self,
+        path: PathBuf,
+        target: TableRef,
+        target_cols: Vec<ResultColumn>,
+    ) {
+        let format = match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("jsonl") | Some("ndjson") => ImportFormat::Jsonl,
+            _ => ImportFormat::Csv,
+        };
+        let id = self.next_export_id;
+        self.next_export_id += 1;
+        self.pending_import = Some(PendingImportPeek {
+            id,
+            path: path.clone(),
+            format,
+            target,
+            target_cols,
+        });
+        self.send_active(Command::ImportColumns { path, format, id });
+    }
+
+    /// `ImportColumns`: the file's source columns arrived — build a name-based
+    /// mapping against the pending target, summarize it, and raise the import confirm
+    /// so the user sees the file→table mapping before any write.
+    pub(crate) fn on_import_columns(
+        &mut self,
+        id: u64,
+        source_cols: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(peek) = self.pending_import.take().filter(|p| p.id == id) else {
+            return;
+        };
+        let lower: Vec<String> = source_cols.iter().map(|s| s.to_ascii_lowercase()).collect();
+        let mut mapping = Vec::new();
+        let mut unmatched_target = Vec::new();
+        for col in &peek.target_cols {
+            match lower.iter().position(|s| *s == col.name.to_ascii_lowercase()) {
+                Some(idx) => mapping.push(ColumnMap {
+                    source: idx,
+                    column: col.name.clone(),
+                    decl_type: col.decl_type.clone(),
+                }),
+                None => unmatched_target.push(col.name.clone()),
+            }
+        }
+        if mapping.is_empty() {
+            self.notify(
+                ToastVariant::Error,
+                "No columns in the file match this table's columns",
+                cx,
+            );
+            return;
+        }
+        let ignored_source: Vec<String> = source_cols
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !mapping.iter().any(|m| m.source == *i))
+            .map(|(_, s)| s.clone())
+            .collect();
+        let file = peek
+            .path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let table_disp = match &peek.target.schema {
+            Some(s) => format!("{s}.{}", peek.target.name),
+            None => peek.target.name.clone(),
+        };
+        let prose = format!(
+            "Append rows from {file} into {table_disp}. {} column(s) matched by name; \
+             rows insert in chunks and commit per chunk.",
+            mapping.len()
+        );
+        let mut preview = mapping
+            .iter()
+            .map(|m| {
+                format!(
+                    "{}  ←  {}",
+                    m.column,
+                    source_cols.get(m.source).map(String::as_str).unwrap_or("")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !unmatched_target.is_empty() {
+            preview.push_str(&format!(
+                "\n\nTarget columns left to default/NULL: {}",
+                unmatched_target.join(", ")
+            ));
+        }
+        if !ignored_source.is_empty() {
+            preview.push_str(&format!(
+                "\nFile columns ignored: {}",
+                ignored_source.join(", ")
+            ));
+        }
+        self.confirm_exec = Some(PendingWrite::Import {
+            path: peek.path,
+            format: peek.format,
+            target: peek.target,
+            mapping,
+            id: peek.id,
+            prose,
+            preview,
+        });
+        cx.notify();
+    }
+
+    /// Confirmed: fire the import and stand up the progress toast (its `✕` cancels).
+    pub(crate) fn start_import(
+        &mut self,
+        path: PathBuf,
+        format: ImportFormat,
+        target: TableRef,
+        mapping: Vec<ColumnMap>,
+        id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        /// Default rows per insert chunk (the driver re-clamps to its parameter cap).
+        /// A `[import]` setting is a later refinement.
+        const DEFAULT_IMPORT_CHUNK: usize = 500;
+        self.send_active(Command::Import {
+            path,
+            format,
+            target,
+            mapping,
+            chunk_size: DEFAULT_IMPORT_CHUNK,
+            id,
+        });
+        self.push_notification(
+            Notification {
+                id: 0,
+                variant: ToastVariant::Info,
+                message: "Importing…".into(),
+                detail: None,
+                detail_label: None,
+                auto_dismiss: None,
+                export: Some(ExportProgress {
+                    id,
+                    rows: 0,
+                    total: 0,
+                    is_import: true,
+                }),
+                expanded: false,
+                hovered: false,
+                dismiss_gen: 0,
+            },
+            cx,
+        );
     }
 
     /// "Go to row N" from the palette prompt — `one_based` is the row number the

@@ -14,7 +14,8 @@
 use std::time::Duration;
 
 use red_core::{
-    ColumnValue, EditOp, ExportFormat, KeySpec, ObjectKind, QueryOptions, RedError, TableRef, Value,
+    Column, ColumnValue, EditOp, ExportFormat, KeySpec, ObjectKind, QueryOptions, RedError,
+    TableRef, Value,
 };
 
 use crate::{AbortSignal, DatabaseDriver, PageCap, DEFAULT_DISPLAY_CELL_CAP};
@@ -755,6 +756,98 @@ pub(crate) async fn read_only_rejects_edit(driver: &dyn DatabaseDriver, schema: 
     assert!(
         driver.apply_edit(&edit).await.is_err(),
         "read-only connection must reject a data edit"
+    );
+}
+
+/// Bulk insert (data import / table copy): `insert_rows` adds many rows in **one**
+/// transaction with **no** 1-row assertion, binding every value (a NULL becomes a
+/// literal). The caller seeds an *empty* writable table `(id INTEGER PRIMARY KEY,
+/// name TEXT)`; `schema`/`table` name it. Verifies the reported count equals the
+/// chunk size, the rows land, a SQL-metacharacter value round-trips verbatim (bound,
+/// not interpolated), a NULL inserts as NULL, and an empty chunk is a no-op.
+pub(crate) async fn inserts_rows(driver: &dyn DatabaseDriver, schema: &str, table: &str) {
+    let tref = TableRef {
+        schema: Some(schema.into()),
+        name: table.into(),
+    };
+    let cols = vec![
+        Column {
+            name: "id".into(),
+            decl_type: None,
+        },
+        Column {
+            name: "name".into(),
+            decl_type: None,
+        },
+    ];
+    let abort = AbortSignal::new();
+    let all = format!("SELECT id FROM {table}");
+
+    // An empty chunk opens no transaction and reports zero.
+    assert_eq!(
+        driver.insert_rows(&tref, &cols, &[]).await.unwrap(),
+        0,
+        "empty chunk is a no-op"
+    );
+
+    // A 3-row chunk: a plain value, a SQL-injection-shaped value, and a NULL name.
+    let evil = "'); DROP TABLE x;--";
+    let rows = vec![
+        vec![Value::Integer(1), Value::Text("one".into())],
+        vec![Value::Integer(2), Value::Text(evil.into())],
+        vec![Value::Integer(3), Value::Null],
+    ];
+    let n = driver.insert_rows(&tref, &cols, &rows).await.unwrap();
+    assert_eq!(n, 3, "insert_rows reports the rows inserted");
+    assert_eq!(
+        driver.count(&all, &abort).await.unwrap(),
+        3,
+        "all three rows landed"
+    );
+
+    let page = driver
+        .fetch_page(
+            &format!("SELECT id, name FROM {table} ORDER BY id"),
+            0,
+            10,
+            PageCap::Full,
+            &abort,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.rows[1][1],
+        Value::Text(evil.into()),
+        "value bound, not interpolated — stored verbatim"
+    );
+    assert_eq!(page.rows[2][1], Value::Null, "NULL inserted as NULL");
+}
+
+/// A read-only connection rejects a bulk insert at the engine — defense in depth
+/// behind the UI's opt-in gate. `schema`/`table` name a `(id PK, name)` table.
+pub(crate) async fn read_only_rejects_insert_rows(
+    driver: &dyn DatabaseDriver,
+    schema: &str,
+    table: &str,
+) {
+    let tref = TableRef {
+        schema: Some(schema.into()),
+        name: table.into(),
+    };
+    let cols = vec![
+        Column {
+            name: "id".into(),
+            decl_type: None,
+        },
+        Column {
+            name: "name".into(),
+            decl_type: None,
+        },
+    ];
+    let rows = vec![vec![Value::Integer(7), Value::Text("nope".into())]];
+    assert!(
+        driver.insert_rows(&tref, &cols, &rows).await.is_err(),
+        "read-only connection must reject a bulk insert"
     );
 }
 

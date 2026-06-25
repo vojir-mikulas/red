@@ -33,7 +33,9 @@ use gpui::{
     prelude::*, px, AsyncApp, Context, ElementId, Entity, FocusHandle, Focusable, Hsla,
     PathPromptOptions, Pixels, ScrollHandle, SharedString, WeakEntity, Window, WindowAppearance,
 };
-use red_core::{ConnectionConfig, DbKind, EditOp, FkEdge, UpdateState};
+use red_core::{
+    Column, ColumnMap, ConnectionConfig, DbKind, EditOp, FkEdge, ImportFormat, TableRef, UpdateState,
+};
 use red_service::{AiAuthStatus, Command, Event, ServiceHandle, SessionId, UpdateConfig};
 
 use crate::config::{self, StoredConnection};
@@ -245,6 +247,29 @@ pub(crate) enum PendingWrite {
     /// [`EditOp`]s sent as one `Command::ApplyBatch` on confirm. `epoch` scopes the
     /// reply to its result.
     Batch { ops: Vec<EditOp>, epoch: u64 },
+    /// A confirmed data import (Track: data import): everything to fire
+    /// `Command::Import` on confirm, plus the precomputed `prose`/`preview` the
+    /// confirm dialog shows so the user sees the file→table mapping before any write.
+    Import {
+        path: std::path::PathBuf,
+        format: ImportFormat,
+        target: TableRef,
+        mapping: Vec<ColumnMap>,
+        id: u64,
+        prose: String,
+        preview: String,
+    },
+}
+
+/// A pending `ImportColumns` peek: the chosen file + the target table/columns, held
+/// while the backend reads the source header. When `ImportColumns` returns, the UI
+/// builds a name-based mapping against `target_cols` and raises the import confirm.
+pub(crate) struct PendingImportPeek {
+    pub id: u64,
+    pub path: std::path::PathBuf,
+    pub format: ImportFormat,
+    pub target: TableRef,
+    pub target_cols: Vec<Column>,
 }
 
 /// The editable grid cell under the cursor (Track B6): its identity (the row's PK
@@ -281,13 +306,17 @@ const MAX_PARKED_SESSIONS: usize = 8;
 /// is dropped past this. Visible toasts are already capped lower in the renderer.
 const MAX_NOTIFICATIONS: usize = 50;
 
-/// The live state of the export-progress toast: how many rows have streamed out
-/// of the known `total`, keyed by the export `id` so a `CancelExport` / progress
-/// update targets the right one. Only the export toast carries this.
+/// The live state of a streaming-transfer toast (export *or* import): how many
+/// rows have moved, keyed by the transfer `id` so a cancel / progress update
+/// targets the right one. `total` is the known row count for an export (drives a
+/// %); an import streams a file of unknown length, so `total` is 0 and the toast
+/// shows a running count. `is_import` selects `CancelImport` vs `CancelExport` for
+/// the toast's `✕`.
 pub(crate) struct ExportProgress {
     pub id: u64,
     pub rows: usize,
     pub total: usize,
+    pub is_import: bool,
 }
 
 /// One notification in the bottom-right stack. The stack is newest-last (nearest
@@ -657,6 +686,9 @@ pub struct AppState {
     /// destructive statement, or a staged grid edit batch (Track B6). See
     /// [`PendingWrite`].
     pub(crate) confirm_exec: Option<PendingWrite>,
+    /// A data-import header peek in flight (file chosen, awaiting the source columns
+    /// from the backend so the import confirm can be built). At most one at a time.
+    pub(crate) pending_import: Option<PendingImportPeek>,
     /// The open inline cell editor (Track B6), when the user is editing a grid cell
     /// in place. `None` when no editor is open. The staged change-set itself lives
     /// on the result; this is just the live `TextInput`.
@@ -1406,6 +1438,7 @@ impl AppState {
             find_bar: None,
             cell_menu: None,
             confirm_exec: None,
+            pending_import: None,
             grid_edit: None,
             focus_grid_edit: false,
             grid_edit_blur: None,
@@ -1700,17 +1733,25 @@ impl AppState {
     /// abort the backend stream. The toast stays (now "Cancelling…") until the
     /// `ExportCancelled` event swaps it for a transient one.
     pub(crate) fn close_notification(&mut self, id: u64, cx: &mut Context<Self>) {
-        let export_id = self
+        let transfer = self
             .notifications
             .iter()
             .find(|n| n.id == id)
             .and_then(|n| n.export.as_ref())
-            .map(|e| e.id);
-        match export_id {
-            Some(export_id) => {
-                self.send_active(Command::CancelExport { id: export_id });
+            .map(|e| (e.id, e.is_import));
+        match transfer {
+            Some((transfer_id, is_import)) => {
+                if is_import {
+                    self.send_active(Command::CancelImport { id: transfer_id });
+                } else {
+                    self.send_active(Command::CancelExport { id: transfer_id });
+                }
                 if let Some(n) = self.notifications.iter_mut().find(|n| n.id == id) {
-                    n.message = "Cancelling export…".into();
+                    n.message = if is_import {
+                        "Cancelling import…".into()
+                    } else {
+                        "Cancelling export…".into()
+                    };
                 }
                 cx.notify();
             }
@@ -1847,6 +1888,15 @@ impl AppState {
             Event::ExportFinished { id, path, rows } => self.on_export_finished(id, path, rows, cx),
             Event::ExportCancelled { id } => self.on_export_cancelled(id, cx),
 
+            // --- data import (Track: data import) ---
+            Event::ImportProgress { id, rows } => self.on_import_progress(id, rows, cx),
+            Event::ImportFinished { id, rows } => self.on_import_finished(id, rows, cx),
+            Event::ImportFailed { id, rows, message } => {
+                self.on_import_failed(id, rows, message, cx)
+            }
+            Event::ImportCancelled { id, rows } => self.on_import_cancelled(id, rows, cx),
+            Event::ImportColumns { id, columns } => self.on_import_columns(id, columns, cx),
+
             // --- query plan (Track B4) ---
             Event::PlanReady { epoch, plan } => self.on_plan_ready(session, epoch, plan),
             Event::PlanFailed { epoch, message } => self.on_plan_failed(session, epoch, message),
@@ -1929,6 +1979,14 @@ impl AppState {
             Some(PendingWrite::Batch { ops, epoch }) => {
                 self.send_active(Command::ApplyBatch { epoch, ops });
             }
+            Some(PendingWrite::Import {
+                path,
+                format,
+                target,
+                mapping,
+                id,
+                ..
+            }) => self.start_import(path, format, target, mapping, id, cx),
             None => {}
         }
         // The modal is closing — return focus to the root for the next ⌘K etc.

@@ -22,6 +22,7 @@ mod clickhouse;
 #[cfg(test)]
 mod conformance;
 mod format;
+mod import;
 mod mysql;
 mod pg_text;
 mod plan;
@@ -29,6 +30,7 @@ mod postgres;
 mod sqlite;
 pub use clickhouse::ClickhouseDriver;
 pub use format::html_escape;
+pub use import::ImportReader;
 pub use mysql::MysqlDriver;
 pub use postgres::PostgresDriver;
 pub use sqlite::SqliteDriver;
@@ -242,6 +244,63 @@ pub(crate) fn edit_sql<'a>(
         }
     };
     (sql, params)
+}
+
+/// Render a multi-row `INSERT` into `(sql, ordered bind values)` for one engine —
+/// the bulk sibling of [`edit_sql`], so only quoting and placeholder syntax differ.
+/// `quote` quotes one identifier; `placeholder(i, value, decl_type)` renders the
+/// `i`-th (0-based) **bind slot** for a non-null cell (e.g. `?`, or `$1::int8` /
+/// `$1::text::"uuid"` — a cast to the target column's type). A [`Value::Null`] is
+/// emitted as the literal `NULL` keyword and **not** bound, so the per-engine value
+/// binders never see a null and the bind index only advances for bound cells. Every
+/// row binds `columns` in order; `columns` carries each target column's name and
+/// best-effort `decl_type`. Identifiers are quoted, values are bound — no part of an
+/// insert is string-interpolated.
+pub(crate) fn insert_sql<'a>(
+    table: &TableRef,
+    columns: &[Column],
+    rows: &'a [Vec<Value>],
+    quote: impl Fn(&str) -> String,
+    placeholder: impl Fn(usize, &Value, Option<&str>) -> String,
+) -> (String, Vec<&'a Value>) {
+    let qualify = match &table.schema {
+        Some(s) if !s.is_empty() => format!("{}.{}", quote(s), quote(&table.name)),
+        _ => quote(&table.name),
+    };
+    let col_list = columns
+        .iter()
+        .map(|c| quote(&c.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut params: Vec<&Value> = Vec::new();
+    let mut tuples = Vec::with_capacity(rows.len());
+    for row in rows {
+        debug_assert_eq!(row.len(), columns.len(), "row width must match columns");
+        let mut cells = Vec::with_capacity(columns.len());
+        for (cell, col) in row.iter().zip(columns) {
+            if matches!(cell, Value::Null) {
+                cells.push("NULL".to_string());
+            } else {
+                cells.push(placeholder(params.len(), cell, col.decl_type.as_deref()));
+                params.push(cell);
+            }
+        }
+        tuples.push(format!("({})", cells.join(", ")));
+    }
+    let sql = format!(
+        "INSERT INTO {qualify} ({col_list}) VALUES {}",
+        tuples.join(", ")
+    );
+    (sql, params)
+}
+
+/// The largest number of rows to bind in one `INSERT` statement so the bound-
+/// parameter count (`rows × columns`) stays under an engine's placeholder cap
+/// (`param_cap`). At least 1 — a single row wider than the cap is left for the
+/// engine to reject rather than looping forever. Callers feed `rows.chunks(_)` so a
+/// big insert splits into several statements inside one transaction.
+pub(crate) fn insert_chunk_rows(columns: usize, param_cap: usize) -> usize {
+    (param_cap / columns.max(1)).max(1)
 }
 
 /// The error for an edit whose row count wasn't the expected one — surfaced to the
@@ -584,6 +643,26 @@ pub trait DatabaseDriver: Send + Sync {
     async fn apply_edit(&self, op: &EditOp) -> Result<u64> {
         self.apply_edits(std::slice::from_ref(op)).await
     }
+
+    /// Bulk-insert `rows` into `table` for `columns` (each a target column's name +
+    /// best-effort `decl_type`), as multi-row, fully-bound `INSERT … VALUES
+    /// (…),(…),…` inside **one** transaction — the streaming sibling of
+    /// [`apply_edits`](DatabaseDriver::apply_edits) for data import / table copy.
+    /// Unlike the edit path it makes **no** 1-row assertion (an insert affects
+    /// `rows.len()`) and issues one statement per sub-chunk rather than one per row.
+    /// Every value is bound via the same per-engine binder as an edit (a
+    /// [`Value::Null`] becomes the literal `NULL`, never a typeless bind); the driver
+    /// sub-chunks `rows` to keep the bound-parameter count under the engine cap, all
+    /// in the one transaction, and rolls the whole call back on any error. A
+    /// read-only driver rejects the write at the engine. Returns the rows inserted
+    /// (`== rows.len()` on success); an empty `rows` is a no-op returning 0 without
+    /// opening a transaction.
+    async fn insert_rows(
+        &self,
+        table: &TableRef,
+        columns: &[Column],
+        rows: &[Vec<Value>],
+    ) -> Result<u64>;
 
     /// Run the engine's `EXPLAIN` for `sql` and return a normalized [`QueryPlan`]
     /// (Track B4). Plain `explain` (`analyze = false`) never executes the

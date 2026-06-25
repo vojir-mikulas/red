@@ -13,8 +13,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use red_core::{
-    AiLimits, AiTier, Column, ConnectionConfig, EditOp, ExportFormat, FkEdge, KeySpec,
-    QueryOptions, QueryPlan, ResultFilter, RowWindow, SchemaMeta, TableDetail, UpdateState, Value,
+    AiLimits, AiTier, Column, ColumnMap, ConnectionConfig, EditOp, ExportFormat, FkEdge,
+    ImportFormat, KeySpec, QueryOptions, QueryPlan, ResultFilter, RowWindow, SchemaMeta,
+    TableDetail, TableRef, UpdateState, Value,
 };
 
 /// Identifies one keep-alive backend session. Minted UI-side at connect start so
@@ -179,6 +180,36 @@ pub enum Command {
     /// Abort an in-flight export by `id` (the toast's Cancel). The partial file is
     /// removed so no truncated CSV/JSON is left behind.
     CancelExport {
+        id: u64,
+    },
+    /// Stream a CSV/JSONL file at `path` into `target`, projecting each source row's
+    /// cells to the target columns per `mapping`, inserting in chunks of `chunk_size`
+    /// rows. `id` identifies the import so progress / completion events and a
+    /// `CancelImport` route to it. Runs off the dispatch loop (file IO on a blocking
+    /// thread), holding at most one chunk in memory. Inserts **commit per chunk**
+    /// (v1), so a mid-file failure leaves the earlier rows committed — reported in the
+    /// `ImportFailed` event's `rows`.
+    Import {
+        path: PathBuf,
+        format: ImportFormat,
+        target: TableRef,
+        mapping: Vec<ColumnMap>,
+        chunk_size: usize,
+        id: u64,
+    },
+    /// Abort an in-flight import by `id` (the toast's Cancel). Rows committed in
+    /// earlier chunks remain.
+    CancelImport {
+        id: u64,
+    },
+    /// Peek a CSV/JSONL file's **source column names** (CSV header / first JSONL
+    /// object's keys) without importing, so the UI can build a name-based column
+    /// mapping against the target table and preview it before any write. `id`
+    /// correlates the reply. Replies `ImportColumns` on success, `ImportFailed` on a
+    /// read error. Pure file IO — no session needed.
+    ImportColumns {
+        path: PathBuf,
+        format: ImportFormat,
         id: u64,
     },
     /// Abort the active query / drop its cursor.
@@ -472,6 +503,37 @@ pub enum Event {
     /// the export's toast.
     ExportCancelled {
         id: u64,
+    },
+    /// A streamed import made progress: `rows` rows committed so far (throttled).
+    /// `id` selects the import's toast.
+    ImportProgress {
+        id: u64,
+        rows: usize,
+    },
+    /// A streamed import finished: `rows` rows committed into the target. `id`
+    /// selects the import's toast.
+    ImportFinished {
+        id: u64,
+        rows: usize,
+    },
+    /// An import failed (file open, parse, coercion, or engine error). `rows` rows
+    /// committed in earlier chunks remain (per-chunk commit). `id` selects the toast.
+    ImportFailed {
+        id: u64,
+        rows: usize,
+        message: String,
+    },
+    /// An in-flight import was cancelled. Rows committed in earlier chunks remain.
+    /// `id` selects the import's toast.
+    ImportCancelled {
+        id: u64,
+        rows: usize,
+    },
+    /// The source column names from an `ImportColumns` peek. `id` correlates it to
+    /// the pending UI request, which builds the name-based mapping + confirm dialog.
+    ImportColumns {
+        id: u64,
+        columns: Vec<String>,
     },
     /// The self-updater's state changed (Phases 3–4). Global (`None` session) —
     /// the UI stores it and renders the titlebar pill + About-tab status from it.

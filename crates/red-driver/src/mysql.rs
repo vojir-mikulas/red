@@ -30,7 +30,7 @@ use mysql_async::{
 use red_core::{
     Column, ColumnMeta, ColumnValue, EditOp, ExportFormat, FkEdge, ForeignKeyMeta, IndexMeta,
     KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage,
-    RowWindow, SchemaMeta, TableDetail, Value,
+    RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, Mutex};
@@ -603,6 +603,49 @@ impl DatabaseDriver for MysqlDriver {
         Ok(total)
     }
 
+    async fn insert_rows(
+        &self,
+        table: &TableRef,
+        columns: &[Column],
+        rows: &[Vec<Value>],
+    ) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        conn.query_drop(self.begin_stmt())
+            .await
+            .map_err(map_my_err)?;
+        let max = crate::insert_chunk_rows(columns.len(), MYSQL_PARAM_CAP);
+        let mut total = 0u64;
+        for chunk in rows.chunks(max) {
+            // MySQL auto-coerces a bound string into the column type (incl. JSON),
+            // so no per-type cast is needed — `decl_type` is ignored.
+            let (sql, params) = crate::insert_sql(
+                table,
+                columns,
+                chunk,
+                |id| format!("`{}`", escape_ident(id)),
+                |_, _, _| "?".to_string(),
+            );
+            let bound: Vec<MyValue> = params.iter().map(|v| to_my(v)).collect();
+            let result = if bound.is_empty() {
+                conn.exec_drop(sql.as_str(), ()).await
+            } else {
+                conn.exec_drop(sql.as_str(), bound).await
+            };
+            match result {
+                Ok(()) => total += conn.affected_rows(),
+                Err(e) => {
+                    crate::warn_rollback(conn.query_drop("ROLLBACK").await, "insert_rows");
+                    return Err(map_my_err(e));
+                }
+            }
+        }
+        conn.query_drop("COMMIT").await.map_err(map_my_err)?;
+        Ok(total)
+    }
+
     async fn explain(&self, sql: &str, analyze: bool) -> Result<QueryPlan> {
         let base = strip_trailing(sql);
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
@@ -753,6 +796,10 @@ fn my_row(row: &Row, cap: Option<CellCap>) -> Vec<Value> {
         .map(|i| my_value(row.as_ref(i), &cols[i], CellCap::caps(cap, i)))
         .collect()
 }
+
+/// MySQL's cap on placeholders in a prepared statement (65535), with margin; a
+/// multi-row insert sub-chunks below it.
+const MYSQL_PARAM_CAP: usize = 60_000;
 
 /// A cell value as a bindable MySQL parameter (for seek bounds). A bound comes from
 /// the key column, never capped, so `Capped` is unreachable here.
@@ -1185,8 +1232,20 @@ mod tests {
         battery::applies_batch_atomic(&driver, &schema, &tb).await;
         battery::read_only_rejects_batch(&ro, &schema, &tb).await;
 
+        // Bulk insert (data import / table copy) on a fresh empty table.
+        let ti = tag("insert");
+        driver
+            .execute(&format!(
+                "CREATE TABLE `{ti}` (id INT PRIMARY KEY, name VARCHAR(64))"
+            ))
+            .await
+            .unwrap();
+        battery::inserts_rows(&driver, &schema, &ti).await;
+        battery::read_only_rejects_insert_rows(&ro, &schema, &ti).await;
+
         driver.execute(&format!("DROP TABLE `{t}`")).await.unwrap();
         driver.execute(&format!("DROP TABLE `{tb}`")).await.unwrap();
+        driver.execute(&format!("DROP TABLE `{ti}`")).await.unwrap();
     }
 
     #[tokio::test]

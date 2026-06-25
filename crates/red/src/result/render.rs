@@ -251,6 +251,19 @@ impl AppState {
                             .size(ButtonSize::Sm)
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_filter_bar(cx))),
                     )
+                    .when(self.editing_enabled() && grid.editable_browse(), |t| {
+                        // Import a CSV/JSONL file into this table — shown only on an
+                        // editable keyed browse of a writable connection, like "+ Row"
+                        // (import is a bulk insert). The grid's columns are the target.
+                        t.child(
+                            Button::new("result-import", "Import…")
+                                .variant(ButtonVariant::Ghost)
+                                .size(ButtonSize::Sm)
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.import_into_result(cx)),
+                                ),
+                        )
+                    })
                     .child(
                         Button::new("result-csv", "CSV")
                             .variant(ButtonVariant::Ghost)

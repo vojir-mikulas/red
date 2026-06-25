@@ -1180,6 +1180,27 @@ pub enum ExportFormat {
     Html,
 }
 
+/// A streamed-import source format — the read-side mirror of [`ExportFormat`]. The
+/// reader yields one row of raw text cells at a time, never materializing the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportFormat {
+    Csv,
+    /// Newline-delimited JSON — one JSON object per line.
+    Jsonl,
+}
+
+/// One column mapping for a data import / copy: which **source** cell index feeds
+/// which **target** column (carrying the column's best-effort declared type, used to
+/// coerce the text cell and to cast the bound parameter). Built UI-side from the
+/// file header + the target table's columns; the dispatch import loop reads it to
+/// project each source row into target-column order.
+#[derive(Debug, Clone)]
+pub struct ColumnMap {
+    pub source: usize,
+    pub column: String,
+    pub decl_type: Option<String>,
+}
+
 /// Per-query knobs carried UI → service → driver.
 #[derive(Debug, Clone)]
 pub struct QueryOptions {

@@ -4,13 +4,18 @@
 //! incoming commands so a cancel or timeout can abort one in flight.
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::BufReader;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::UnboundedSender;
-use red_core::{KeyKind, KeySpec, RedError, ResultFilter};
-use red_driver::{AbortSignal, PageCap};
+use red_core::{
+    coerce_edit_value, Column, ColumnMap, ImportFormat, KeyKind, KeySpec, RedError, ResultFilter,
+    TableRef, Value,
+};
+use red_driver::{AbortSignal, DatabaseDriver, ImportReader, PageCap};
 use tokio::sync::mpsc::UnboundedReceiver as CmdReceiver;
 use tokio::sync::Semaphore;
 
@@ -44,6 +49,10 @@ const MAX_CONCURRENT_PAGE_FETCHES: usize = 6;
 /// connection for the file's lifetime, so this bounds connection pinning. Generous
 /// — exports are user-initiated (one per toast) — but no longer unbounded.
 const MAX_CONCURRENT_EXPORTS: usize = 4;
+
+/// How many imports may stream at once across all sessions. Writes are heavier than
+/// reads (and hold a connection in a transaction), so this is tighter than exports.
+const MAX_CONCURRENT_IMPORTS: usize = 2;
 
 /// Hard ceiling on rows pulled by one `CopyRows` (clipboard) request. `CopyRows`
 /// fetches at full fidelity into a single `Vec` carried in one event, so a
@@ -104,6 +113,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
     // separate pool from the page-fetch limit: a long export must not starve
     // interactive paging, nor the reverse.
     let export_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_EXPORTS));
+    let import_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_IMPORTS));
     // Wakes the loop even when no command arrives, so idle sessions get swept.
     let mut sweep = tokio::time::interval(EVICT_SWEEP);
     // `Connect`/`TestConnection` dial off the loop (a slow connect mustn't freeze
@@ -1337,6 +1347,123 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 }
             }
 
+            Command::Import {
+                path,
+                format,
+                target,
+                mapping,
+                chunk_size,
+                id,
+            } => {
+                let Some(sid) = session_id else { continue };
+                let Some(state) = sessions.get(&sid) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let driver = state.driver.clone();
+                // Reuse the session's transfer-cancel registry (a shared id space
+                // with exports) so a `CancelImport` can flip the flag.
+                let cancel = Arc::new(AtomicBool::new(false));
+                lock(&state.exports).insert(id, cancel.clone());
+
+                // Forward throttled committed-row counts to the UI as progress; the
+                // channel closes when the import drops its sender on completion.
+                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+                {
+                    let events = events.clone();
+                    tokio::spawn(async move {
+                        while let Some(rows) = progress_rx.recv().await {
+                            emit(
+                                &events,
+                                session_id,
+                                Event::ImportProgress {
+                                    id,
+                                    rows: rows as usize,
+                                },
+                            );
+                        }
+                    });
+                }
+
+                // Run the import off the dispatch loop (file IO on a blocking thread,
+                // each chunk's `insert_rows` driven with `block_on`).
+                let events = events.clone();
+                let exports = state.exports.clone();
+                let import_limit = import_limit.clone();
+                tokio::spawn(async move {
+                    let _permit = import_limit.acquire_owned().await;
+                    let handle = tokio::runtime::Handle::current();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        run_import_blocking(
+                            driver, path, format, target, mapping, chunk_size, cancel, progress_tx,
+                            handle,
+                        )
+                    })
+                    .await;
+                    lock(&exports).remove(&id);
+                    let (committed, err) = match outcome {
+                        Ok(pair) => pair,
+                        Err(join) => (0, Some(RedError::Driver(format!("import task failed: {join}")))),
+                    };
+                    let rows = committed as usize;
+                    match err {
+                        None => emit(&events, session_id, Event::ImportFinished { id, rows }),
+                        Some(RedError::Interrupted) => {
+                            emit(&events, session_id, Event::ImportCancelled { id, rows })
+                        }
+                        Some(e) => emit(
+                            &events,
+                            session_id,
+                            Event::ImportFailed {
+                                id,
+                                rows,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
+                });
+            }
+
+            Command::CancelImport { id } => {
+                let Some(sid) = session_id else { continue };
+                // Flip the flag; the import's between-rows check picks it up and
+                // replies `ImportCancelled` (earlier committed chunks remain).
+                if let Some(state) = sessions.get(&sid) {
+                    if let Some(cancel) = lock(&state.exports).get(&id) {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+
+            Command::ImportColumns { path, format, id } => {
+                // Peek the header on a blocking thread (cheap file IO, no session
+                // needed); reply with the source column names or an ImportFailed.
+                let events = events.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = File::open(&path)
+                        .map_err(|e| format!("cannot open {}: {e}", path.display()))
+                        .and_then(|f| {
+                            ImportReader::begin(BufReader::new(f), format)
+                                .map(|(cols, _)| cols)
+                                .map_err(|e| format!("read error: {e}"))
+                        });
+                    match result {
+                        Ok(columns) => {
+                            emit(&events, session_id, Event::ImportColumns { id, columns })
+                        }
+                        Err(message) => emit(
+                            &events,
+                            session_id,
+                            Event::ImportFailed {
+                                id,
+                                rows: 0,
+                                message,
+                            },
+                        ),
+                    }
+                });
+            }
+
             Command::Cancel => {
                 let Some(id) = session_id else { continue };
                 // No fetch is in flight here (pull protocol), so cancelling just
@@ -1365,4 +1492,109 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
 /// routes it to the right workspace (`None` for the session-less probe replies).
 pub(crate) fn emit(events: &Events, session: Option<SessionId>, event: Event) {
     let _ = events.unbounded_send((session, event));
+}
+
+/// Stream `path` (CSV/JSONL) into `target`, coercing each source cell to a typed
+/// `Value` per its mapped target column ([`coerce_edit_value`]) and inserting in
+/// chunks of `chunk_size` rows. Runs on a blocking thread (file IO); each chunk's
+/// async [`insert_rows`](DatabaseDriver::insert_rows) is driven with
+/// `handle.block_on`. Holds at most one chunk in memory — never the whole file.
+///
+/// Inserts **commit per chunk** (v1), so the returned committed count is meaningful
+/// even on error/cancel: a mid-file failure leaves earlier chunks committed (atomic
+/// whole-file import is a future option — see `docs/plans/data-import.md`). `cancel`
+/// is checked between rows. Returns `(rows committed, error-or-None)`.
+#[allow(clippy::too_many_arguments)]
+fn run_import_blocking(
+    driver: Arc<dyn DatabaseDriver>,
+    path: std::path::PathBuf,
+    format: ImportFormat,
+    target: TableRef,
+    mapping: Vec<ColumnMap>,
+    chunk_size: usize,
+    cancel: Arc<AtomicBool>,
+    progress: tokio::sync::mpsc::UnboundedSender<u64>,
+    handle: tokio::runtime::Handle,
+) -> (u64, Option<RedError>) {
+    let file = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                0,
+                Some(RedError::Driver(format!(
+                    "cannot open {}: {e}",
+                    path.display()
+                ))),
+            )
+        }
+    };
+    let (_src_cols, mut reader) = match ImportReader::begin(BufReader::new(file), format) {
+        Ok(r) => r,
+        Err(e) => return (0, Some(RedError::Query(format!("read error: {e}")))),
+    };
+    let columns: Vec<Column> = mapping
+        .iter()
+        .map(|m| Column {
+            name: m.column.clone(),
+            decl_type: m.decl_type.clone(),
+        })
+        .collect();
+    let chunk_size = chunk_size.max(1);
+    let mut chunk: Vec<Vec<Value>> = Vec::with_capacity(chunk_size);
+    let mut committed = 0u64;
+    let mut row_no = 0usize;
+
+    // Insert (and commit) the buffered chunk, reporting progress. Returns early from
+    // the enclosing fn with the committed count on engine error.
+    macro_rules! flush {
+        () => {{
+            if !chunk.is_empty() {
+                match handle.block_on(driver.insert_rows(&target, &columns, &chunk)) {
+                    Ok(n) => {
+                        committed += n;
+                        chunk.clear();
+                        let _ = progress.send(committed);
+                    }
+                    Err(e) => return (committed, Some(e)),
+                }
+            }
+        }};
+    }
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return (committed, Some(RedError::Interrupted));
+        }
+        match reader.next_row() {
+            Ok(None) => break,
+            Ok(Some(cells)) => {
+                row_no += 1;
+                let mut values = Vec::with_capacity(columns.len());
+                for m in &mapping {
+                    let raw = cells.get(m.source).map(String::as_str).unwrap_or("");
+                    match coerce_edit_value(raw, m.decl_type.as_deref()) {
+                        Ok(v) => values.push(v),
+                        Err(reason) => {
+                            return (
+                                committed,
+                                Some(RedError::Query(format!("row {row_no}: {reason}"))),
+                            )
+                        }
+                    }
+                }
+                chunk.push(values);
+                if chunk.len() >= chunk_size {
+                    flush!();
+                }
+            }
+            Err(e) => {
+                return (
+                    committed,
+                    Some(RedError::Query(format!("row {}: {e}", row_no + 1))),
+                )
+            }
+        }
+    }
+    flush!();
+    (committed, None)
 }

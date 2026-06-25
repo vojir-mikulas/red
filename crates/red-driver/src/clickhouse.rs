@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use red_core::{
     Column, ColumnMeta, ColumnValue, ConnectionConfig, EditOp, ExportFormat, FkEdge, KeySpec,
     ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow,
-    SchemaMeta, TableDetail, Value,
+    SchemaMeta, TableDetail, TableRef, Value,
 };
 use serde_json::Value as Json;
 use tokio::sync::mpsc::UnboundedSender;
@@ -625,6 +625,24 @@ impl DatabaseDriver for ClickhouseDriver {
             "in-grid editing is not supported on ClickHouse (OLAP): UPDATE/DELETE are \
              asynchronous ALTER … mutations with no transactional rollback. Use the SQL \
              editor for ALTER TABLE … UPDATE/DELETE if you need them."
+                .to_string(),
+        ))
+    }
+
+    async fn insert_rows(
+        &self,
+        _table: &TableRef,
+        _columns: &[Column],
+        rows: &[Vec<Value>],
+    ) -> Result<u64> {
+        // An empty chunk is a no-op (matching the trait contract). Otherwise: this
+        // driver is read-only (v1), so bulk import/copy into ClickHouse is refused
+        // here — same posture as the edit path above.
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        Err(RedError::Driver(
+            "importing/copying data into ClickHouse is not supported (read-only driver)"
                 .to_string(),
         ))
     }

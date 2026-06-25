@@ -932,6 +932,9 @@ impl AppState {
                     .join(";\n");
                 ("Submit changes", prose, combined, "Submit")
             }
+            PendingWrite::Import { prose, preview, .. } => {
+                ("Confirm import", prose.clone(), preview.clone(), "Import")
+            }
         };
         // The batch preview can be many statements; show more than a single edit's
         // one-liner but still cap it so a huge change-set can't blow up the modal.

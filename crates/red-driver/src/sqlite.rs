@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use red_core::{
     Column, ColumnMeta, ColumnValue, EditOp, ExportFormat, FkEdge, ForeignKeyMeta, IndexMeta,
     KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage,
-    RowWindow, SchemaMeta, TableDetail, Value,
+    RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, ErrorCode, OpenFlags};
@@ -310,6 +310,24 @@ impl DatabaseDriver for SqliteDriver {
             .map_err(driver_err)?
     }
 
+    async fn insert_rows(
+        &self,
+        table: &TableRef,
+        columns: &[Column],
+        rows: &[Vec<Value>],
+    ) -> Result<u64> {
+        let path = self.path.clone();
+        let read_only = self.read_only;
+        let table = table.clone();
+        let columns = columns.to_vec();
+        let rows = rows.to_vec();
+        tokio::task::spawn_blocking(move || {
+            insert_rows_blocking(&path, read_only, &table, &columns, &rows)
+        })
+        .await
+        .map_err(driver_err)?
+    }
+
     async fn explain(&self, sql: &str, _analyze: bool) -> Result<QueryPlan> {
         // `EXPLAIN QUERY PLAN` is the readable plan (the bytecode `EXPLAIN` is
         // not); it never steps the statement, so it's safe regardless of the
@@ -401,6 +419,44 @@ fn apply_edits_blocking(path: &Path, read_only: bool, ops: &[EditOp]) -> Result<
             }
             Err(e) => {
                 crate::warn_rollback(conn.execute_batch("ROLLBACK"), "apply_edits");
+                return Err(map_step_err(e));
+            }
+        }
+    }
+    conn.execute_batch("COMMIT").map_err(driver_err)?;
+    Ok(total)
+}
+
+/// SQLite's bound-placeholder cap (`SQLITE_MAX_VARIABLE_NUMBER`, 32766 on the
+/// bundled modern library) with margin; a wide insert sub-chunks below it.
+const SQLITE_PARAM_CAP: usize = 30_000;
+
+/// Bulk-insert `rows` in one transaction, sub-chunking by the parameter cap. Unlike
+/// `apply_edits_blocking` there is **no** per-row 1-row assertion (an insert affects
+/// `rows.len()`); a read-only open rejects at the engine. An empty `rows` opens no
+/// transaction.
+fn insert_rows_blocking(
+    path: &Path,
+    read_only: bool,
+    table: &TableRef,
+    columns: &[Column],
+    rows: &[Vec<Value>],
+) -> Result<u64> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let conn = SqliteDriver::open(path, read_only)?;
+    conn.execute_batch("BEGIN").map_err(driver_err)?;
+    let max = crate::insert_chunk_rows(columns.len(), SQLITE_PARAM_CAP);
+    let mut total = 0u64;
+    for chunk in rows.chunks(max) {
+        let (sql, params) =
+            crate::insert_sql(table, columns, chunk, quote_ident, |_, _, _| "?".to_string());
+        let bound: Vec<rusqlite::types::Value> = params.iter().map(|v| to_sqlite(v)).collect();
+        match conn.execute(&sql, rusqlite::params_from_iter(bound)) {
+            Ok(affected) => total += affected as u64,
+            Err(e) => {
+                crate::warn_rollback(conn.execute_batch("ROLLBACK"), "insert_rows");
                 return Err(map_step_err(e));
             }
         }
@@ -1099,6 +1155,15 @@ mod tests {
         }
         battery::applies_batch_atomic(&driver, "main", "tb").await;
         battery::read_only_rejects_batch(&ro, "main", "tb").await;
+
+        // Bulk insert (data import / table copy) on a fresh *empty* table.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE ti(id INTEGER PRIMARY KEY, name TEXT);")
+                .unwrap();
+        }
+        battery::inserts_rows(&driver, "main", "ti").await;
+        battery::read_only_rejects_insert_rows(&ro, "main", "ti").await;
 
         std::fs::remove_file(&path).ok();
     }
