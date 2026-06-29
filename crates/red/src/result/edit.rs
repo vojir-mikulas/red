@@ -671,6 +671,7 @@ impl AppState {
                 table,
                 sort,
                 filter,
+                joins: Vec::new(),
             });
             self.start_query_ticker(cx);
         }

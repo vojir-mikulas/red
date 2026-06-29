@@ -11,8 +11,10 @@
 
 use flint::{Palette, PaletteEvent, PaletteItem, ToastVariant};
 use gpui::{actions, prelude::*, Context, ElementId, Entity, SharedString};
+use red_core::{ColumnMap, ColumnMeta, CopyMode, TableRef};
+use red_service::Command;
 
-use crate::app::{AppState, Phase};
+use crate::app::{AppState, PendingCopyNewTable, PendingCopyPeek, Phase};
 
 actions!(red, [ToggleCommandPalette, GoToRow, CopyResult]);
 
@@ -61,6 +63,21 @@ pub(crate) enum Cmd {
     OpenSavedQueries,
     /// Open the saved query at this index (into a new tab) — picker activation.
     OpenSavedQuery(usize),
+    /// Open the "Copy to…" target picker for the current result.
+    CopyToTable,
+    /// Copy the current result into the candidate table at this index — the
+    /// "Copy to…" target-picker activation.
+    CopyTarget(usize),
+    /// Copy the current result into a *new* table in the writable namespace at this
+    /// index — the "✦ New table…" rows of the "Copy to…" picker. Opens a name prompt,
+    /// then creates the table from the source's column shape before streaming.
+    CopyNewTable(usize),
+    /// Open the "Migrate schema to…" picker for the foreground connection's selected
+    /// schema (all its tables → another database).
+    MigrateSchema,
+    /// Migrate the pending source schema into the target namespace at this index — the
+    /// "Migrate to…" picker activation.
+    MigrateTarget(usize),
     /// EXPLAIN the active tab's query and open the plan view (B4).
     Explain,
     /// EXPLAIN ANALYZE the active tab's query (runs it — read queries only).
@@ -92,6 +109,8 @@ pub(crate) enum Cmd {
 pub(crate) enum PromptKind {
     GoToRow,
     SaveQuery,
+    /// Naming the target of a "copy into a *new* table" (see [`Cmd::CopyNewTable`]).
+    CopyNewTable,
 }
 
 impl AppState {
@@ -184,6 +203,7 @@ impl AppState {
                 match kind {
                     PromptKind::GoToRow => self.submit_goto(text, cx),
                     PromptKind::SaveQuery => self.submit_save(text, cx),
+                    PromptKind::CopyNewTable => self.submit_copy_new_table(text, cx),
                 }
             }
             PaletteEvent::Dismiss => self.close_palette(),
@@ -251,6 +271,11 @@ impl AppState {
             Cmd::SaveQuery => self.open_save_prompt(cx),
             Cmd::OpenSavedQueries => self.open_saved_picker(cx),
             Cmd::OpenSavedQuery(index) => self.open_saved_query(index, cx),
+            Cmd::CopyToTable => self.open_copy_picker(cx),
+            Cmd::CopyTarget(index) => self.pick_copy_target(index, cx),
+            Cmd::CopyNewTable(index) => self.pick_copy_new_table(index, cx),
+            Cmd::MigrateSchema => self.open_migrate_picker(cx),
+            Cmd::MigrateTarget(index) => self.pick_migrate_target(index, cx),
             Cmd::Explain => self.explain_query(false, cx),
             Cmd::ExplainAnalyze => self.explain_query(true, cx),
             Cmd::SubmitChanges => self.submit_changes(cx),
@@ -338,6 +363,14 @@ impl AppState {
                         Cmd::SplitRight,
                     ));
                 }
+                // Whole-schema migration — offered only when the selected/only schema
+                // has tables to move (the handler picks the target database).
+                if self.migrate_source().is_some() {
+                    out.push((
+                        PaletteItem::new("cmd:migrate-schema", "schema: migrate to…"),
+                        Cmd::MigrateSchema,
+                    ));
+                }
                 // Only meaningful with rows on screen to navigate / copy.
                 if active.active_result().is_some() {
                     out.push((
@@ -347,6 +380,10 @@ impl AppState {
                     out.push((
                         PaletteItem::new("cmd:copy", "result: copy selection").hint("⌘C"),
                         Cmd::CopySelection,
+                    ));
+                    out.push((
+                        PaletteItem::new("cmd:copy-to-table", "result: copy to table…"),
+                        Cmd::CopyToTable,
                     ));
                 }
                 // Staged data editing (B6) — offered on a writable, edit-enabled
@@ -635,5 +672,300 @@ impl AppState {
             editor.update(cx, |editor, cx| editor.set_content(query.sql, cx));
         }
         cx.notify();
+    }
+
+    /// "Copy to…" (the result toolbar): open a picker over every writable table in
+    /// every open connection (the foreground + parked live sessions), so the user
+    /// names a target for the copy. The source is *implicit* — the focused result
+    /// (filter included). No-op (with a hint) when nothing's open to copy from / into.
+    pub(crate) fn open_copy_picker(&mut self, cx: &mut Context<Self>) {
+        // Source must be an open result (the thing you're looking at).
+        let has_source = matches!(
+            &self.phase,
+            Phase::Connected(active) if active.active_result().is_some()
+        );
+        if !has_source {
+            self.notify(ToastVariant::Info, "Open a result to copy from", cx);
+            return;
+        }
+        let candidates = self.copy_target_candidates();
+        let namespaces = self.copy_namespace_candidates();
+        if candidates.is_empty() && namespaces.is_empty() {
+            self.notify(
+                ToastVariant::Info,
+                "No writable connection to copy into — open one first",
+                cx,
+            );
+            return;
+        }
+        let mut entries: Vec<(PaletteItem, Cmd)> = Vec::new();
+        // "✦ New table…" rows first — create a fresh table in any writable namespace
+        // (same connection's other schema/database, or another open connection).
+        for (i, ns) in namespaces.iter().enumerate() {
+            let id = ElementId::from(SharedString::from(format!("copy-new:{i}")));
+            let item = PaletteItem::new(id, format!("✦ New table in {}…", ns.schema))
+                .hint(ns.conn_name.clone());
+            entries.push((item, Cmd::CopyNewTable(i)));
+        }
+        // …then every existing writable table (copy into it, mapped by name).
+        for (i, c) in candidates.iter().enumerate() {
+            let id = ElementId::from(SharedString::from(format!("copy-target:{i}")));
+            let item = PaletteItem::new(id, format!("{}.{}", c.schema, c.table.name))
+                .hint(c.conn_name.clone());
+            entries.push((item, Cmd::CopyTarget(i)));
+        }
+        self.copy_targets = candidates;
+        self.copy_new_namespaces = namespaces;
+        self.palette_cmds = entries
+            .iter()
+            .map(|(item, cmd)| (item.id.clone(), *cmd))
+            .collect();
+        let items: Vec<PaletteItem> = entries.into_iter().map(|(item, _)| item).collect();
+
+        let palette = cx.new(|cx| {
+            let mut p = Palette::new(cx);
+            p.set_placeholder("Copy into table…", cx);
+            p.set_items(items, cx);
+            p
+        });
+        let sub = cx.subscribe(&palette, Self::on_palette_event);
+        self.palette = Some((palette, sub));
+        cx.notify();
+    }
+
+    /// A target table was picked: stash the source (the focused result's epoch +
+    /// columns) and target, then peek the target's columns so the copy can be mapped
+    /// by name and confirmed before any write (mirrors the import file-header peek).
+    fn pick_copy_target(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(candidate) = self.copy_targets.get(index).cloned() else {
+            return;
+        };
+        let source = match &self.phase {
+            Phase::Connected(active) => active
+                .active_result()
+                .map(|g| (g.epoch, g.columns().to_vec())),
+            _ => None,
+        };
+        let Some((source_epoch, source_cols)) = source else {
+            self.notify(
+                ToastVariant::Error,
+                "The source result is no longer open",
+                cx,
+            );
+            return;
+        };
+        let id = self.next_export_id;
+        self.next_export_id += 1;
+        let target_label = format!(
+            "{} · {}.{}",
+            candidate.conn_name, candidate.schema, candidate.table.name
+        );
+        self.pending_copy_target = Some(PendingCopyPeek {
+            id,
+            source_epoch,
+            source_cols,
+            target: candidate.table.clone(),
+            target_session: candidate.session,
+            target_label,
+        });
+        self.service.send_to(
+            candidate.session,
+            Command::CopyTargetColumns {
+                id,
+                target: candidate.table,
+            },
+        );
+        cx.notify();
+    }
+
+    /// A "✦ New table…" namespace was picked: stash the source (the focused result's
+    /// epoch + columns) and the target namespace, then open a prompt for the new
+    /// table's name. On submit, [`submit_copy_new_table`] creates the table from the
+    /// source's column shape and streams the rows in.
+    fn pick_copy_new_table(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(ns) = self.copy_new_namespaces.get(index).cloned() else {
+            return;
+        };
+        let source = match &self.phase {
+            Phase::Connected(active) => active
+                .active_result()
+                .map(|g| (g.epoch, g.columns().to_vec())),
+            _ => None,
+        };
+        let Some((source_epoch, source_cols)) = source else {
+            self.notify(
+                ToastVariant::Error,
+                "The source result is no longer open",
+                cx,
+            );
+            return;
+        };
+        let placeholder = format!("New table name in {} · {}", ns.conn_name, ns.schema);
+        self.pending_copy_new = Some(PendingCopyNewTable {
+            source_epoch,
+            source_cols,
+            session: ns.session,
+            conn_name: ns.conn_name,
+            schema: ns.schema,
+        });
+        let prompt = cx.new(|cx| {
+            let mut p = Palette::new(cx).prompt();
+            p.set_placeholder(placeholder, cx);
+            p
+        });
+        let sub = cx.subscribe(&prompt, Self::on_palette_event);
+        self.palette = Some((prompt, sub));
+        self.palette_cmds.clear();
+        self.palette_prompt = PromptKind::CopyNewTable;
+        cx.notify();
+    }
+
+    /// Submit of the new-table-name prompt: validate the name, guard against a name
+    /// collision (so the create path never silently appends into an existing,
+    /// possibly mismatched table), build a `create_table` spec + an identity column
+    /// mapping from the source's columns, and fire the streamed create-then-copy.
+    /// Creating a brand-new table destroys nothing, so this skips the destructive
+    /// copy confirm and goes straight to the transfer toast.
+    fn submit_copy_new_table(&mut self, text: &str, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_copy_new.take() else {
+            return;
+        };
+        let name = text.trim();
+        if name.is_empty() {
+            self.notify(ToastVariant::Error, "Enter a name for the new table", cx);
+            return;
+        }
+        if self.namespace_has_table(pending.session, &pending.schema, name) {
+            self.notify(
+                ToastVariant::Error,
+                format!(
+                    "“{name}” already exists in {} · {} — use Copy to… to copy into it",
+                    pending.conn_name, pending.schema
+                ),
+                cx,
+            );
+            return;
+        }
+        if pending.source_cols.is_empty() {
+            self.notify(
+                ToastVariant::Error,
+                "The source result has no columns to copy",
+                cx,
+            );
+            return;
+        }
+        // Identity mapping + a create spec from the source columns. A result carries no
+        // PK / not-null / default, so the new table's columns are plain and nullable;
+        // their declared types are mapped into the target dialect by `create_table`.
+        let mapping: Vec<ColumnMap> = pending
+            .source_cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| ColumnMap {
+                source: i,
+                column: c.name.clone(),
+                decl_type: c.decl_type.clone(),
+            })
+            .collect();
+        let create: Vec<ColumnMeta> = pending
+            .source_cols
+            .iter()
+            .map(|c| ColumnMeta {
+                name: c.name.clone(),
+                type_name: c.decl_type.clone(),
+                not_null: false,
+                primary_key: false,
+                default: None,
+                auto_increment: false,
+            })
+            .collect();
+        let target = TableRef {
+            schema: Some(pending.schema.clone()),
+            name: name.to_string(),
+        };
+        let id = self.next_export_id;
+        self.next_export_id += 1;
+        self.start_copy(
+            id,
+            pending.source_epoch,
+            target,
+            pending.session,
+            mapping,
+            CopyMode::Append,
+            Some(create),
+            cx,
+        );
+    }
+
+    /// "schema: migrate to…": take the foreground connection's selected schema (all its
+    /// tables) and open a picker over every *other* writable namespace (a target
+    /// database). On pick, [`pick_migrate_target`] fires the whole-schema migration.
+    /// No-op (with a hint) when nothing is migratable / no target is open.
+    pub(crate) fn open_migrate_picker(&mut self, cx: &mut Context<Self>) {
+        let Some((session, schema, tables)) = self.migrate_source() else {
+            self.notify(
+                ToastVariant::Info,
+                "Select a schema with tables to migrate",
+                cx,
+            );
+            return;
+        };
+        // Targets: every writable namespace except the source schema itself.
+        let targets: Vec<_> = self
+            .copy_namespace_candidates()
+            .into_iter()
+            .filter(|ns| !(ns.session == session && ns.schema == schema))
+            .collect();
+        if targets.is_empty() {
+            self.notify(
+                ToastVariant::Info,
+                "No other writable database to migrate into — open one first",
+                cx,
+            );
+            return;
+        }
+        let table_count = tables.len();
+        let entries: Vec<(PaletteItem, Cmd)> = targets
+            .iter()
+            .enumerate()
+            .map(|(i, ns)| {
+                let id = ElementId::from(SharedString::from(format!("migrate-target:{i}")));
+                let item = PaletteItem::new(id, format!("{} ({table_count} table(s))", ns.schema))
+                    .hint(ns.conn_name.clone());
+                (item, Cmd::MigrateTarget(i))
+            })
+            .collect();
+        self.pending_migrate = Some((session, schema, tables));
+        self.migrate_targets = targets;
+        self.palette_cmds = entries
+            .iter()
+            .map(|(item, cmd)| (item.id.clone(), *cmd))
+            .collect();
+        let items: Vec<PaletteItem> = entries.into_iter().map(|(item, _)| item).collect();
+        let palette = cx.new(|cx| {
+            let mut p = Palette::new(cx);
+            p.set_placeholder("Migrate schema into database…", cx);
+            p.set_items(items, cx);
+            p
+        });
+        let sub = cx.subscribe(&palette, Self::on_palette_event);
+        self.palette = Some((palette, sub));
+        cx.notify();
+    }
+
+    /// A target namespace was picked for a migrate: fire the whole-schema migration
+    /// (the source is the foreground connection's chosen schema, stashed in
+    /// `pending_migrate`).
+    fn pick_migrate_target(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(target) = self.migrate_targets.get(index).cloned() else {
+            return;
+        };
+        // The source is the foreground session (`start_migrate` uses `send_active`).
+        let Some((_source_session, source_schema, tables)) = self.pending_migrate.take() else {
+            return;
+        };
+        let id = self.next_export_id;
+        self.next_export_id += 1;
+        self.start_migrate(id, source_schema, tables, target.session, target.schema, cx);
     }
 }

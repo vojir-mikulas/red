@@ -21,9 +21,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use red_core::{
-    Column, ColumnMeta, ColumnValue, EditOp, ExportFormat, FkEdge, ForeignKeyMeta, IndexMeta,
-    KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage,
-    RowWindow, SchemaMeta, TableDetail, TableRef, Value,
+    Column, ColumnMeta, ColumnValue, DbKind, EditOp, ExportFormat, FkEdge, FkJoin, ForeignKeyMeta,
+    IndexMeta, KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result,
+    ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use std::fs::File;
 use std::io::BufWriter;
@@ -214,7 +214,7 @@ impl DatabaseDriver for PostgresDriver {
         self.version.clone()
     }
 
-    async fn open_cursor(&self, sql: &str, _opts: QueryOptions) -> Result<Box<dyn QueryCursor>> {
+    async fn open_cursor(&self, sql: &str, opts: QueryOptions) -> Result<Box<dyn QueryCursor>> {
         let (stmt, columns) = prepare_columns(&self.client, sql).await?;
         let stream = self
             .client
@@ -229,6 +229,7 @@ impl DatabaseDriver for PostgresDriver {
             columns,
             stream: Mutex::new(Box::pin(stream)),
             cancel,
+            full: opts.full_fidelity,
         }))
     }
 
@@ -315,12 +316,15 @@ impl DatabaseDriver for PostgresDriver {
                 let type_name: String = row.get(1);
                 let nullable: String = row.get(2);
                 let default: Option<String> = row.get(3);
+                // `serial`/`bigserial` columns default to `nextval('…_seq')`.
+                let auto_increment = default.as_deref().is_some_and(|d| d.starts_with("nextval"));
                 ColumnMeta {
                     primary_key: pk.contains(&name),
                     not_null: nullable == "NO",
                     type_name: Some(type_name),
                     default,
                     name,
+                    auto_increment,
                 }
             })
             .collect();
@@ -433,6 +437,10 @@ impl DatabaseDriver for PostgresDriver {
 
     fn eq_predicate(&self, pairs: &[ColumnValue]) -> String {
         crate::eq_clause(pairs, pg_quote)
+    }
+
+    fn fk_join_wrap(&self, base: &str, base_cols: &[String], joins: &[FkJoin]) -> String {
+        crate::join_wrap(base, base_cols, joins, pg_quote)
     }
 
     async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64> {
@@ -701,6 +709,61 @@ impl DatabaseDriver for PostgresDriver {
         result
     }
 
+    async fn clear_table(&self, table: &TableRef) -> Result<u64> {
+        let qualify = match &table.schema {
+            Some(s) if !s.is_empty() => format!("{}.{}", pg_quote(s), pg_quote(&table.name)),
+            _ => pg_quote(&table.name),
+        };
+        let client = self.acquire().await?;
+        let result = async {
+            client.batch_execute("BEGIN").await.map_err(driver_err)?;
+            match client.execute(&format!("DELETE FROM {qualify}"), &[]).await {
+                Ok(affected) => {
+                    client.batch_execute("COMMIT").await.map_err(driver_err)?;
+                    Ok(affected)
+                }
+                Err(e) => {
+                    crate::warn_rollback(client.batch_execute("ROLLBACK").await, "clear_table");
+                    Err(map_pg_err(e))
+                }
+            }
+        }
+        .await;
+        self.release(client);
+        result
+    }
+
+    async fn create_table(&self, table: &TableRef, columns: &[ColumnMeta]) -> Result<u64> {
+        let sql = crate::create_table_sql(table, columns, DbKind::Postgres, pg_quote);
+        self.execute(&sql).await
+    }
+
+    fn quote_table(&self, table: &TableRef) -> String {
+        crate::qualify_table(table, pg_quote)
+    }
+
+    async fn create_index(
+        &self,
+        table: &TableRef,
+        name: &str,
+        unique: bool,
+        columns: &[String],
+    ) -> Result<u64> {
+        let sql = crate::create_index_sql(table, name, unique, columns, DbKind::Postgres, pg_quote);
+        self.execute(&sql).await
+    }
+
+    async fn add_foreign_key(
+        &self,
+        child: &TableRef,
+        columns: &[String],
+        parent: &TableRef,
+        ref_columns: &[String],
+    ) -> Result<u64> {
+        let sql = crate::add_fk_sql(child, columns, parent, ref_columns, pg_quote);
+        self.execute(&sql).await
+    }
+
     async fn explain(&self, sql: &str, analyze: bool) -> Result<QueryPlan> {
         // Default `FORMAT TEXT` — the most stable parse target, and avoids the
         // JSON dependency. Plain `EXPLAIN` never executes the statement;
@@ -774,6 +837,9 @@ struct PgCursor {
     columns: Vec<Column>,
     stream: Mutex<Pin<Box<RowStream>>>,
     cancel: CancelToken,
+    /// Read cells at full fidelity (the table-copy read) rather than the display
+    /// fat-cell cap — see [`QueryOptions::full_fidelity`](red_core::QueryOptions).
+    full: bool,
 }
 
 #[async_trait]
@@ -784,7 +850,12 @@ impl QueryCursor for PgCursor {
 
     async fn next_window(&self, max: usize) -> Result<RowWindow> {
         // Offset-mode display stream (editor run) — cap every cell, no key exempt.
-        let cap = CellCap::display([None, None]);
+        // A full-fidelity reader (the table copy) reads byte-exact instead.
+        let cap = if self.full {
+            None
+        } else {
+            CellCap::display([None, None])
+        };
         let mut stream = self.stream.lock().await;
         let mut rows = Vec::with_capacity(crate::window_prealloc(max));
         for _ in 0..max {

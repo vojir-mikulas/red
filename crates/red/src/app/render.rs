@@ -4,6 +4,7 @@
 
 use flint::prelude::*;
 use gpui::{div, prelude::*, px, ClipboardItem, Focusable, KeyDownEvent, Render, Window};
+use red_core::CopyMode;
 
 use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::keymap::{
@@ -943,7 +944,13 @@ impl AppState {
             PendingWrite::Import { prose, preview, .. } => {
                 ("Confirm import", prose.clone(), preview.clone(), "Import")
             }
+            PendingWrite::Copy { prose, preview, .. } => {
+                ("Copy to table", prose.clone(), preview.clone(), "Append")
+            }
         };
+        // A copy offers two actions — Append (keep the target's rows) and Replace all
+        // (truncate first, behind the danger styling) — rather than one run button.
+        let is_copy = matches!(&pending, PendingWrite::Copy { .. });
         // The batch preview can be many statements; show more than a single edit's
         // one-liner but still cap it so a huge change-set can't blow up the modal.
         let preview: String = sql.chars().take(1200).collect();
@@ -962,20 +969,35 @@ impl AppState {
                     .text_color(theme.text)
                     .child(preview),
             );
-        let footer = div()
-            .flex()
-            .justify_end()
-            .gap_2()
-            .child(
-                Button::new("confirm-cancel", "Cancel")
-                    .variant(ButtonVariant::Secondary)
-                    .on_click(cx.listener(|this, _, _, cx| this.cancel_destructive(cx))),
-            )
-            .child(
+        let mut footer = div().flex().justify_end().gap_2().child(
+            Button::new("confirm-cancel", "Cancel")
+                .variant(ButtonVariant::Secondary)
+                .on_click(cx.listener(|this, _, _, cx| this.cancel_destructive(cx))),
+        );
+        if is_copy {
+            footer = footer
+                .child(
+                    Button::new("confirm-copy-replace", "Replace all")
+                        .variant(ButtonVariant::Danger)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm_copy(CopyMode::TruncateInsert, cx)
+                        })),
+                )
+                .child(
+                    // Enter (the modal's confirm) also runs Append — the safe default.
+                    Button::new("confirm-copy-append", run_label)
+                        .variant(ButtonVariant::Primary)
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.confirm_copy(CopyMode::Append, cx)),
+                        ),
+                );
+        } else {
+            footer = footer.child(
                 Button::new("confirm-run", run_label)
                     .variant(ButtonVariant::Danger)
                     .on_click(cx.listener(|this, _, _, cx| this.confirm_destructive(cx))),
             );
+        }
         Modal::new("confirm-destructive")
             .title(title)
             .width(px(440.))

@@ -20,10 +20,11 @@ use crate::sql::CompletionContext;
 /// we hand it a few more so prefix-narrowing has headroom.
 const MAX_CANDIDATES: usize = 20;
 
-/// In-app drag payload for the tab strip: the source tab's index. A tab drop
-/// target reads it to reorder via [`AppState::move_tab`].
+/// In-app drag payload for the tab strip: the source tab's index. A strip drop
+/// reorders via [`AppState::drop_tab`]; a drop onto the *other* split half moves
+/// the tab across via [`AppState::move_tab_to_half`].
 #[derive(Clone, Copy)]
-struct TabDrag(usize);
+pub(crate) struct TabDrag(pub usize);
 
 /// The floating chip rendered under the cursor while a tab is being dragged.
 /// GPUI's `on_drag` wants an `Entity<impl Render>`, so the tab strip mints one
@@ -310,16 +311,19 @@ impl AppState {
         let view = cx.entity().downgrade();
 
         // --- tab strip: one tab per open query + a "new query" affordance ---
-        // This half's strip highlights the tab it shows (`tab_idx`); the other half
-        // (when split) has its own strip highlighting its own tab.
-        let active_idx = tab_idx;
+        // This half's strip shows only the tabs that belong to it (Zed-style); the
+        // other half (when split) has its own strip. The highlighted one is the
+        // pane's active tab (which is the `tab_idx` the body renders).
+        let active_idx = active.pane_active(half);
+        let pane_indices = active.pane_tab_indices(half);
+        let last_in_pane = pane_indices.last().copied();
         // Drop-indicator state: the gap a dragged tab would land in, gated on an
         // actual drag so a stale target never paints once the drag ends.
-        let tab_count = active.tabs.len();
         let drop_target = active.tab_drop_target;
         let dragging = cx.has_active_drag();
-        let tabs = active.tabs.iter().enumerate().map(|(i, t)| {
-            let is_active = i == active_idx;
+        let tabs = pane_indices.iter().map(|&i| {
+            let t = &active.tabs[i];
+            let is_active = Some(i) == active_idx;
             let (tab_bg, tab_text) = if is_active {
                 (bg_app, text)
             } else {
@@ -331,9 +335,10 @@ impl AppState {
             // Group so the close button reveals only on this tab's hover.
             let group = SharedString::from(format!("sql-tab-{i}"));
             // The dragged tab lands before this tab (gap == i) or after it
-            // (gap == i+1); the bar paints on whichever edge the gap names.
+            // (gap == i+1); the bar paints on whichever edge the gap names. The
+            // after-bar shows only on this pane's last tab.
             let bar_before = dragging && drop_target == Some(i);
-            let bar_after = dragging && i + 1 == tab_count && drop_target == Some(tab_count);
+            let bar_after = dragging && Some(i) == last_in_pane && drop_target == Some(i + 1);
             div()
                 .id(("sql-tab", i))
                 .group(group.clone())
@@ -400,8 +405,12 @@ impl AppState {
                 })
                 .on_drop::<TabDrag>(move |drag, _window, cx| {
                     let from = drag.0;
+                    // Handle it here so it doesn't also bubble to the half wrapper's
+                    // cross-half drop (which would double-move). Dropping on a half's
+                    // strip lands the tab in that half, then reorders to the gap.
+                    cx.stop_propagation();
                     drop_view
-                        .update(cx, |this, cx| this.drop_tab(from, cx))
+                        .update(cx, |this, cx| this.drop_tab(from, half, cx))
                         .ok();
                 })
                 .when(bar_before, |d| {
@@ -480,17 +489,15 @@ impl AppState {
             .items_stretch()
             .overflow_x_scroll()
             .track_scroll(&active.tab_scroll)
-            // Capture phase runs the viewport before its tabs, so this clears
-            // the indicator whenever the cursor isn't over the strip; a tab the
-            // cursor *is* over then re-sets the gap. Net: the indicator only
-            // shows while dragging within the tab bar.
+            // Clear the gap indicator when the drag leaves the strip *vertically*
+            // (down into the editor/result body, where the cross-half drop takes
+            // over). We deliberately ignore horizontal exit: with two side-by-side
+            // strips, a drag crossing to the other strip stays at the same Y, and
+            // clearing on horizontal exit would race the other strip's gap set.
             .on_drag_move::<TabDrag>(move |e, _window, cx| {
                 let b = e.bounds;
                 let p = e.event.position;
-                let outside = p.x < b.origin.x
-                    || p.x >= b.origin.x + b.size.width
-                    || p.y < b.origin.y
-                    || p.y >= b.origin.y + b.size.height;
+                let outside = p.y < b.origin.y || p.y >= b.origin.y + b.size.height;
                 if outside {
                     strip_move_view
                         .update(cx, |this, cx| this.clear_tab_drop_target(cx))
@@ -498,12 +505,13 @@ impl AppState {
                 }
             })
             // Release anywhere in the strip (incl. the trailing space) commits
-            // using the gap the hovered tab last set. Harmless if a tab already
-            // handled the drop — `drop_tab` consumes the target once.
+            // using the gap the hovered tab last set, landing the tab in this half.
+            // `stop_propagation` keeps it off the half wrapper's cross-half drop.
             .on_drop::<TabDrag>(move |drag, _window, cx| {
                 let from = drag.0;
+                cx.stop_propagation();
                 strip_drop_view
-                    .update(cx, |this, cx| this.drop_tab(from, cx))
+                    .update(cx, |this, cx| this.drop_tab(from, half, cx))
                     .ok();
             })
             .children(tabs);
@@ -716,9 +724,6 @@ impl AppState {
         };
         if let Some(conn_id) = conn_id {
             self.query_history.record(&conn_id, &sql);
-        }
-        if let Phase::Connected(active) = &mut self.phase {
-            active.history_open = false;
         }
 
         // Row-returning statements stream into the grid; writes execute in a

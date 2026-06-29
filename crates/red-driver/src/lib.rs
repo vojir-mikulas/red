@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ColumnMeta, ColumnStats, ColumnValue, EditOp, ExportFormat, FkEdge, KeySpec,
-    QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail,
-    TableRef, Value,
+    Column, ColumnMeta, ColumnStats, ColumnValue, DbKind, EditOp, ExportFormat, FkEdge, FkJoin,
+    KeySpec, QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta,
+    TableDetail, TableRef, Value, BASE_ALIAS,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -304,6 +304,164 @@ pub(crate) fn insert_chunk_rows(columns: usize, param_cap: usize) -> usize {
     (param_cap / columns.max(1)).max(1)
 }
 
+/// Qualify and quote a table reference (`schema.name`, or just `name` when there's no
+/// schema) using `quote` — the shared body of every driver's [`quote_table`] and the
+/// `CREATE TABLE` builder. Identifiers are quoted, never interpolated raw.
+pub(crate) fn qualify_table(table: &TableRef, quote: impl Fn(&str) -> String) -> String {
+    match &table.schema {
+        Some(s) if !s.is_empty() => format!("{}.{}", quote(s), quote(&table.name)),
+        _ => quote(&table.name),
+    }
+}
+
+/// Build a `CREATE TABLE IF NOT EXISTS` for `table` from `columns`, spelling each
+/// column's declared type into `kind`'s dialect via [`red_core::typemap`] — the
+/// shared body of every driver's [`create_table`](DatabaseDriver::create_table). A
+/// Postgres `int4`/`numeric(10,2)`/`jsonb`/`uuid` becomes a faithful column in the
+/// target engine instead of invalid DDL; a type the lattice can't classify falls
+/// through verbatim (the engine accepts or rejects it, like dbgate). `NOT NULL` is
+/// emitted, primary-key columns are gathered into a trailing `PRIMARY KEY (…)`, and an
+/// auto-increment column is re-spelled per dialect (SQLite `INTEGER PRIMARY KEY`,
+/// Postgres `serial`/`bigserial`, MySQL `… AUTO_INCREMENT`) so the migrated table keeps
+/// auto-numbering. Indexes and foreign keys are **not** emitted here — they ride a
+/// deferred pass after the data loads (`docs/plans/database-migration.md` Phase 3).
+/// Identifiers are quoted by `quote`; the only interpolated type text comes from the
+/// fixed per-engine spelling table, never raw user input.
+pub(crate) fn create_table_sql(
+    table: &TableRef,
+    columns: &[ColumnMeta],
+    kind: DbKind,
+    quote: impl Fn(&str) -> String,
+) -> String {
+    use red_core::typemap::{normalize, spell, NormType};
+    let qualify = qualify_table(table, &quote);
+    let pk_count = columns.iter().filter(|c| c.primary_key).count();
+    // SQLite expresses a sole-INTEGER-PK auto-increment column *inline* as
+    // `INTEGER PRIMARY KEY` (the rowid alias), which then must NOT also appear in a
+    // trailing PRIMARY KEY clause.
+    let sqlite_inline_pk = kind == DbKind::Sqlite
+        && pk_count == 1
+        && columns.iter().any(|c| c.primary_key && c.auto_increment);
+    let mut defs: Vec<String> = columns
+        .iter()
+        .map(|c| {
+            let nt = normalize(c.type_name.as_deref().unwrap_or(""));
+            if c.auto_increment {
+                match kind {
+                    DbKind::Sqlite if sqlite_inline_pk && c.primary_key => {
+                        format!("{} INTEGER PRIMARY KEY", quote(&c.name))
+                    }
+                    // A non-sole-PK auto-inc in SQLite can't be the rowid alias; emit a
+                    // plain INTEGER (the values still carry across; future auto-numbering
+                    // is the only loss).
+                    DbKind::Sqlite => format!("{} INTEGER", quote(&c.name)),
+                    DbKind::Postgres => {
+                        let serial = if matches!(nt, NormType::BigInt) {
+                            "bigserial"
+                        } else {
+                            "serial"
+                        };
+                        format!("{} {serial}", quote(&c.name))
+                    }
+                    DbKind::Mysql => {
+                        format!("{} {} AUTO_INCREMENT", quote(&c.name), spell(kind, &nt))
+                    }
+                    DbKind::Clickhouse => format!("{} {}", quote(&c.name), spell(kind, &nt)),
+                }
+            } else {
+                let ty = spell(kind, &nt);
+                let null = if c.not_null { " NOT NULL" } else { "" };
+                format!("{} {ty}{null}", quote(&c.name))
+            }
+        })
+        .collect();
+    if pk_count > 0 && !sqlite_inline_pk {
+        let pk = columns
+            .iter()
+            .filter(|c| c.primary_key)
+            .map(|c| quote(&c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        defs.push(format!("PRIMARY KEY ({pk})"));
+    }
+    format!("CREATE TABLE IF NOT EXISTS {qualify} ({})", defs.join(", "))
+}
+
+/// Build a `CREATE [UNIQUE] INDEX` for `table` over `columns` in `kind`'s dialect — the
+/// shared body of every driver's [`create_index`](DatabaseDriver::create_index), run as
+/// the migration's deferred index pass. `IF NOT EXISTS` is used where the engine
+/// supports it (not MySQL). Identifiers are quoted by `quote`, never interpolated raw.
+pub(crate) fn create_index_sql(
+    table: &TableRef,
+    name: &str,
+    unique: bool,
+    columns: &[String],
+    kind: DbKind,
+    quote: impl Fn(&str) -> String,
+) -> String {
+    let uniq = if unique { "UNIQUE " } else { "" };
+    // MySQL has no `IF NOT EXISTS` for `CREATE INDEX`; SQLite and Postgres do.
+    let guard = if matches!(kind, DbKind::Mysql) {
+        ""
+    } else {
+        "IF NOT EXISTS "
+    };
+    let cols = columns
+        .iter()
+        .map(|c| quote(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match kind {
+        // SQLite puts the schema on the *index name*; the table name in `CREATE INDEX`
+        // is never schema-qualified (`CREATE INDEX main.ix ON child(...)`).
+        DbKind::Sqlite => {
+            let idx = match &table.schema {
+                Some(s) if !s.is_empty() => format!("{}.{}", quote(s), quote(name)),
+                _ => quote(name),
+            };
+            format!(
+                "CREATE {uniq}INDEX {guard}{idx} ON {} ({cols})",
+                quote(&table.name)
+            )
+        }
+        // Postgres/MySQL: bare index name, schema-qualified table.
+        _ => format!(
+            "CREATE {uniq}INDEX {guard}{} ON {} ({cols})",
+            quote(name),
+            qualify_table(table, &quote)
+        ),
+    }
+}
+
+/// Build an `ALTER TABLE … ADD FOREIGN KEY (…) REFERENCES … (…)` in `kind`'s dialect —
+/// the shared body of every (FK-capable) driver's [`add_foreign_key`]. No referential
+/// actions are emitted (`FkEdge` doesn't carry them). Identifiers are quoted, never
+/// interpolated raw. `kind` is currently unused (the syntax is the same on Postgres and
+/// MySQL) but kept for symmetry with the other builders and future per-dialect needs.
+pub(crate) fn add_fk_sql(
+    child: &TableRef,
+    columns: &[String],
+    parent: &TableRef,
+    ref_columns: &[String],
+    quote: impl Fn(&str) -> String,
+) -> String {
+    let cols = columns
+        .iter()
+        .map(|c| quote(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let refs = ref_columns
+        .iter()
+        .map(|c| quote(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "ALTER TABLE {} ADD FOREIGN KEY ({cols}) REFERENCES {} ({refs})",
+        qualify_table(child, &quote),
+        qualify_table(parent, &quote)
+    )
+}
+
 /// The error for an edit whose row count wasn't the expected one — surfaced to the
 /// user in the result pane (not as a silent success). `affected = 0` means the row
 /// changed or vanished under us; `> 1` means the key was less unique than believed.
@@ -406,6 +564,104 @@ pub(crate) fn eq_clause(pairs: &[ColumnValue], quote: impl Fn(&str) -> String) -
         .map(|cv| format!("{} = {}", quote(&cv.column), sql_literal(&cv.value)))
         .collect::<Vec<_>>()
         .join(" AND ")
+}
+
+/// Wrap `base` so each [`FkJoin`]'s selected columns ride **inline, next to the
+/// foreign-key column they expand from** — the shared half of every relational
+/// driver's [`fk_join_wrap`](DatabaseDriver::fk_join_wrap) (inline FK expansion,
+/// Track B7). Only the identifier `quote` differs per engine.
+///
+/// `base_cols` is the base result's columns in their natural order (from
+/// `describe_table`). The projection emits each base column in turn and, right after
+/// a foreign-key column, the chosen columns of the table(s) it references — in
+/// depth-first order, so a nested chain (`tier → cascade → placement`) lands grouped
+/// under its anchor (dbgate's column layout). Each join contributes a
+/// `LEFT JOIN <ref> AS <alias>` plus its columns as `<alias>.<col> AS "<dotted path>"`;
+/// the dotted output name's first segment is the base FK column it anchors to, and the
+/// full path orders siblings (a parent FK sorts before its descendants).
+///
+/// A `LEFT JOIN` (never inner) keeps rows whose FK is NULL/orphaned, and the
+/// unique-target gate (caller-enforced — the UI only offers unique-key FKs) keeps the
+/// row count identical, so `count`, the keyset key, and paging over the wrapped result
+/// are all unaffected. Downstream code addresses columns by *name*, so reordering them
+/// is transparent to keyset/FK-accent/edit/stats.
+///
+/// `joins` is ordered outer→inner: each hop's [`parent_alias`](FkJoin::parent_alias)
+/// is an earlier join's alias or [`BASE_ALIAS`]. Empty `joins` returns `base`
+/// untouched; an empty `base_cols` (the base order is unknown) falls back to
+/// `_red_base.*` then the joined columns appended — correct, just not interleaved. A
+/// trailing `;`/whitespace is stripped so the subquery wrap stays well-formed.
+pub(crate) fn join_wrap(
+    base: &str,
+    base_cols: &[String],
+    joins: &[FkJoin],
+    quote: impl Fn(&str) -> String,
+) -> String {
+    if joins.is_empty() {
+        return base.to_string();
+    }
+    let qualify = |schema: &Option<String>, table: &str| match schema {
+        Some(s) if !s.is_empty() => format!("{}.{}", quote(s), quote(table)),
+        _ => quote(table),
+    };
+    // The `LEFT JOIN` chain (declaration order = outer→inner).
+    let mut from = String::new();
+    for j in joins {
+        let on =
+            j.on.iter()
+                .map(|(p, c)| format!("{}.{} = {}.{}", j.parent_alias, quote(p), j.alias, quote(c)))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+        from.push_str(&format!(
+            " LEFT JOIN {} AS {} ON {on}",
+            qualify(&j.to_schema, &j.to_table),
+            j.alias
+        ));
+    }
+    // Every selected joined column, tagged with its dotted path (anchor = first
+    // segment, the full path orders siblings depth-first) and its source alias.
+    let mut joined: Vec<(Vec<&str>, &str, &str, &str)> = Vec::new();
+    for j in joins {
+        for (leaf, out) in &j.select {
+            joined.push((out.split('.').collect(), j.alias.as_str(), leaf, out));
+        }
+    }
+    let render =
+        |g: &(Vec<&str>, &str, &str, &str)| format!("{}.{} AS {}", g.1, quote(g.2), quote(g.3));
+
+    let mut selects: Vec<String> = Vec::new();
+    if base_cols.is_empty() {
+        // Base order unknown: keep base columns contiguous via `*`, joined appended.
+        selects.push(format!("{BASE_ALIAS}.*"));
+        joined.sort_by(|a, b| a.0.cmp(&b.0));
+        selects.extend(joined.iter().map(&render));
+    } else {
+        for bc in base_cols {
+            selects.push(format!("{BASE_ALIAS}.{}", quote(bc)));
+            // The joined columns anchored at this FK column, depth-first.
+            let mut group: Vec<_> = joined
+                .iter()
+                .filter(|g| g.0.first() == Some(&bc.as_str()))
+                .collect();
+            group.sort_by(|a, b| a.0.cmp(&b.0));
+            selects.extend(group.into_iter().map(&render));
+        }
+        // Safety net: a joined column whose anchor isn't a base column (shouldn't
+        // arise) is appended rather than silently dropped.
+        let anchored: std::collections::HashSet<&str> =
+            base_cols.iter().map(String::as_str).collect();
+        let mut orphans: Vec<_> = joined
+            .iter()
+            .filter(|g| !g.0.first().is_some_and(|a| anchored.contains(a)))
+            .collect();
+        orphans.sort_by(|a, b| a.0.cmp(&b.0));
+        selects.extend(orphans.into_iter().map(&render));
+    }
+    format!(
+        "SELECT {} FROM ({}) AS {BASE_ALIAS}{from}",
+        selects.join(", "),
+        format::strip_trailing(base)
+    )
 }
 
 /// A [`Value`] as a SQL literal for an FK-follow equality (see [`eq_clause`]): an
@@ -626,6 +882,25 @@ pub trait DatabaseDriver: Send + Sync {
     /// to [`eq_clause`] with its own identifier quoting.
     fn eq_predicate(&self, pairs: &[ColumnValue]) -> String;
 
+    /// Wrap `base` so each inline FK expansion (Track B7) `LEFT JOIN`s its referenced
+    /// table and selects the chosen columns *inline, next to the FK column they expand
+    /// from* — the inline sibling of [`eq_predicate`](Self::eq_predicate). `base_cols`
+    /// is the base result's columns in order (so the projection can interleave). Returns
+    /// `base` unchanged for an empty `joins` or an engine without relational FKs (the
+    /// default impl, which ClickHouse keeps); the relational engines override it to
+    /// delegate to [`join_wrap`] with their own identifier quoting. Synchronous string
+    /// building; identifiers are quoted, never raw UI SQL. The unique-target gate is the
+    /// caller's (the UI only offers unique-key FKs), so the join can't change the row
+    /// count — `count`, the keyset key, and paging stay correct over the wrapped result.
+    fn fk_join_wrap(&self, base: &str, base_cols: &[String], joins: &[FkJoin]) -> String {
+        let _ = base_cols;
+        debug_assert!(
+            joins.is_empty(),
+            "fk_join_wrap not supported by this engine"
+        );
+        base.to_string()
+    }
+
     /// Render a portable, case-insensitive "contains `term`" predicate over the
     /// searchable columns of a result, for [`red_core::ResultFilter::Contains`].
     /// The service wraps `SELECT * FROM (base) WHERE <predicate>`; `columns` are the
@@ -763,6 +1038,65 @@ pub trait DatabaseDriver: Send + Sync {
         table: &TableRef,
         columns: &[Column],
         rows: &[Vec<Value>],
+    ) -> Result<u64>;
+
+    /// Empty `table` in one transaction — `DELETE FROM <table>` — returning the rows
+    /// removed. The `TruncateInsert` table-copy mode runs this before streaming the
+    /// source in, so the target is refreshed rather than appended to. Identifier is
+    /// quoted by the engine's own helper (never interpolated UI text); a read-only
+    /// driver rejects it at the engine, like every other write seam. `DELETE` (not
+    /// `TRUNCATE`) is used for cross-engine uniformity and transactional safety —
+    /// MySQL's `TRUNCATE` auto-commits and resets auto-increment, which a refresh
+    /// shouldn't silently do.
+    async fn clear_table(&self, table: &TableRef) -> Result<u64>;
+
+    /// Create `table` with `columns` **if it doesn't already exist**, in this engine's
+    /// dialect — the keystone of "copy into a *new* table" / whole-database migration.
+    /// Each column's declared type is mapped into this engine via
+    /// [`red_core::typemap`] (so a cross-engine create produces faithful DDL, not a
+    /// foreign type that fails at execute time), `NOT NULL` and a composite
+    /// `PRIMARY KEY` are carried, and the `CREATE` runs through the same transaction
+    /// wrapper as [`execute`](DatabaseDriver::execute) (shared body:
+    /// [`create_table_sql`]). Defaults, indexes, foreign keys, and auto-increment are
+    /// **not** emitted in v1 (see `docs/plans/database-migration.md`). Idempotent
+    /// (`IF NOT EXISTS`). A read-only driver (ClickHouse) rejects it at the engine, so
+    /// it is never a migration target. Returns the engine's affected-row count (0 for
+    /// DDL on most engines).
+    async fn create_table(&self, table: &TableRef, columns: &[ColumnMeta]) -> Result<u64>;
+
+    /// Qualify + quote `table` for this engine (`"schema"."name"`, `` `schema`.`name` ``)
+    /// so the migration job can build a `SELECT * FROM <table>` source query without
+    /// interpolating raw identifiers. Pure string, no I/O (shared body:
+    /// [`qualify_table`]). Implemented by every driver, including read-only ClickHouse,
+    /// which can be a migration *source*.
+    fn quote_table(&self, table: &TableRef) -> String;
+
+    /// Create a secondary index on `table` over `columns` (optionally `unique`) in this
+    /// engine's dialect — the migration's **deferred index pass**, run after the data
+    /// loads (shared body: [`create_index_sql`]). Built from the source table's
+    /// [`IndexMeta`](red_core::IndexMeta); the primary-key-backing index is filtered out
+    /// by the caller. A read-only driver (ClickHouse) rejects it. The migrate job treats
+    /// a failure as non-fatal (logs + continues — an index is decoration, the data is in).
+    async fn create_index(
+        &self,
+        table: &TableRef,
+        name: &str,
+        unique: bool,
+        columns: &[String],
+    ) -> Result<u64>;
+
+    /// Add a foreign key from `child(columns)` to `parent(ref_columns)` in this engine's
+    /// dialect — the migration's **deferred FK pass**, run after all tables exist + are
+    /// filled (so dependency order can't block) (shared body: [`add_fk_sql`]).
+    /// **SQLite can't `ALTER TABLE ADD CONSTRAINT`**, so its impl returns an error the
+    /// migrate job treats as a logged skip; ClickHouse (read-only/OLAP) likewise. The
+    /// migrate job is best-effort: a failed FK is logged, not fatal.
+    async fn add_foreign_key(
+        &self,
+        child: &TableRef,
+        columns: &[String],
+        parent: &TableRef,
+        ref_columns: &[String],
     ) -> Result<u64>;
 
     /// Run the engine's `EXPLAIN` for `sql` and return a normalized [`QueryPlan`]
@@ -941,7 +1275,102 @@ mod tests {
             not_null: false,
             primary_key: false,
             default: None,
+            auto_increment: false,
         }
+    }
+
+    #[test]
+    fn create_table_sql_emits_auto_increment_per_dialect() {
+        let cols = vec![
+            ColumnMeta {
+                name: "id".into(),
+                type_name: Some("bigint".into()),
+                not_null: true,
+                primary_key: true,
+                default: None,
+                auto_increment: true,
+            },
+            ColumnMeta {
+                name: "name".into(),
+                type_name: Some("text".into()),
+                not_null: false,
+                primary_key: false,
+                default: None,
+                auto_increment: false,
+            },
+        ];
+        let t = TableRef {
+            schema: None,
+            name: "t".into(),
+        };
+        // SQLite: a sole INTEGER PK auto-inc column is emitted inline as the rowid
+        // alias, and must NOT also appear in a trailing PRIMARY KEY clause.
+        let s = create_table_sql(&t, &cols, DbKind::Sqlite, |i| format!("\"{i}\""));
+        assert!(s.contains("\"id\" INTEGER PRIMARY KEY"), "{s}");
+        assert!(!s.contains("PRIMARY KEY (\"id\")"), "{s}");
+        // Postgres: bigserial (Int → serial) + a trailing PK clause.
+        let p = create_table_sql(&t, &cols, DbKind::Postgres, |i| format!("\"{i}\""));
+        assert!(p.contains("\"id\" bigserial"), "{p}");
+        assert!(p.contains("PRIMARY KEY (\"id\")"), "{p}");
+        // MySQL: `<type> AUTO_INCREMENT` + a trailing PK clause.
+        let m = create_table_sql(&t, &cols, DbKind::Mysql, |i| format!("`{i}`"));
+        assert!(m.contains("`id` bigint AUTO_INCREMENT"), "{m}");
+        assert!(m.contains("PRIMARY KEY (`id`)"), "{m}");
+    }
+
+    #[test]
+    fn add_fk_and_create_index_sql_quote_identifiers() {
+        let child = TableRef {
+            schema: Some("public".into()),
+            name: "child".into(),
+        };
+        let parent = TableRef {
+            schema: Some("public".into()),
+            name: "parent".into(),
+        };
+        let q = |i: &str| format!("\"{i}\"");
+        assert_eq!(
+            add_fk_sql(&child, &["parent_id".into()], &parent, &["id".into()], q),
+            "ALTER TABLE \"public\".\"child\" ADD FOREIGN KEY (\"parent_id\") \
+             REFERENCES \"public\".\"parent\" (\"id\")"
+        );
+        // Postgres: UNIQUE off, `IF NOT EXISTS` supported.
+        assert_eq!(
+            create_index_sql(
+                &child,
+                "ix_child_pid",
+                false,
+                &["parent_id".into()],
+                DbKind::Postgres,
+                q
+            ),
+            "CREATE INDEX IF NOT EXISTS \"ix_child_pid\" ON \"public\".\"child\" (\"parent_id\")"
+        );
+        // MySQL: UNIQUE on, no `IF NOT EXISTS`, composite columns.
+        let myq = |i: &str| format!("`{i}`");
+        assert_eq!(
+            create_index_sql(
+                &child,
+                "ix",
+                true,
+                &["a".into(), "b".into()],
+                DbKind::Mysql,
+                myq
+            ),
+            "CREATE UNIQUE INDEX `ix` ON `public`.`child` (`a`, `b`)"
+        );
+        // SQLite: the schema rides on the *index name*, the table is bare.
+        assert_eq!(
+            create_index_sql(
+                &child,
+                "ix",
+                false,
+                &["parent_id".into()],
+                DbKind::Sqlite,
+                q
+            ),
+            "CREATE INDEX IF NOT EXISTS \"public\".\"ix\" ON \"child\" (\"parent_id\")"
+        );
     }
 
     #[test]
@@ -1049,6 +1478,104 @@ mod tests {
         ];
         let pred = eq_clause(&pairs, |c| format!("\"{c}\""));
         assert_eq!(pred, r#""a" = 7 AND "name" = 'O''Brien'"#);
+    }
+
+    #[test]
+    fn join_wrap_empty_is_noop() {
+        // No expansions → the base SQL is returned untouched (no subquery wrap).
+        assert_eq!(
+            join_wrap("SELECT * FROM t", &["id".into()], &[], |c| format!(
+                "\"{c}\""
+            )),
+            "SELECT * FROM t"
+        );
+    }
+
+    #[test]
+    fn join_wrap_interleaves_joined_column_next_to_its_fk() {
+        // One FK expansion: the chosen ref column lands *right after* its FK column
+        // (`tier_id`), not at the end — base columns before and after keep their slots.
+        // The trailing `;` on the base is stripped before the subquery wrap.
+        let base_cols = vec!["id".into(), "tier_id".into(), "name".into()];
+        let joins = vec![FkJoin {
+            alias: "_red_j0".into(),
+            parent_alias: "_red_base".into(),
+            on: vec![("tier_id".into(), "id".into())],
+            to_schema: Some("main".into()),
+            to_table: "tier".into(),
+            select: vec![("name".into(), "tier_id.name".into())],
+        }];
+        assert_eq!(
+            join_wrap(
+                "SELECT * FROM \"main\".\"channel\";",
+                &base_cols,
+                &joins,
+                |c| { format!("\"{c}\"") }
+            ),
+            "SELECT _red_base.\"id\", _red_base.\"tier_id\", \
+             _red_j0.\"name\" AS \"tier_id.name\", _red_base.\"name\" \
+             FROM (SELECT * FROM \"main\".\"channel\") AS _red_base \
+             LEFT JOIN \"main\".\"tier\" AS _red_j0 ON _red_base.\"tier_id\" = _red_j0.\"id\""
+        );
+    }
+
+    #[test]
+    fn join_wrap_chains_hops_depth_first_under_the_anchor() {
+        // A two-hop chain (tier → cascade): both joined columns anchor under the base
+        // `tier_id`, depth-first — the deeper `tier_id.cascade_id.name` sorts before
+        // the shallower `tier_id.name` (segment-wise), so the cascade subtree stays
+        // grouped. The second hop's `ON` references the first hop's alias.
+        let base_cols = vec!["id".into(), "tier_id".into()];
+        let joins = vec![
+            FkJoin {
+                alias: "_red_j0".into(),
+                parent_alias: "_red_base".into(),
+                on: vec![("tier_id".into(), "id".into())],
+                to_schema: None,
+                to_table: "tier".into(),
+                select: vec![("name".into(), "tier_id.name".into())],
+            },
+            FkJoin {
+                alias: "_red_j1".into(),
+                parent_alias: "_red_j0".into(),
+                on: vec![("cascade_id".into(), "id".into())],
+                to_schema: None,
+                to_table: "cascade".into(),
+                select: vec![("name".into(), "tier_id.cascade_id.name".into())],
+            },
+        ];
+        assert_eq!(
+            join_wrap("SELECT * FROM channel", &base_cols, &joins, |c| format!(
+                "\"{c}\""
+            )),
+            "SELECT _red_base.\"id\", _red_base.\"tier_id\", \
+             _red_j1.\"name\" AS \"tier_id.cascade_id.name\", \
+             _red_j0.\"name\" AS \"tier_id.name\" \
+             FROM (SELECT * FROM channel) AS _red_base \
+             LEFT JOIN \"tier\" AS _red_j0 ON _red_base.\"tier_id\" = _red_j0.\"id\" \
+             LEFT JOIN \"cascade\" AS _red_j1 ON _red_j0.\"cascade_id\" = _red_j1.\"id\""
+        );
+    }
+
+    #[test]
+    fn join_wrap_empty_base_cols_falls_back_to_star_and_appends() {
+        // Base order unknown → `_red_base.*` then the joined columns appended (still
+        // correct, just not interleaved). Also covers the composite-FK `ON` AND-chain.
+        let joins = vec![FkJoin {
+            alias: "_red_j0".into(),
+            parent_alias: "_red_base".into(),
+            on: vec![("a".into(), "x".into()), ("b".into(), "y".into())],
+            to_schema: None,
+            to_table: "ref".into(),
+            select: vec![("label".into(), "fk.label".into())],
+        }];
+        assert_eq!(
+            join_wrap("SELECT * FROM t", &[], &joins, |c| format!("\"{c}\"")),
+            "SELECT _red_base.*, _red_j0.\"label\" AS \"fk.label\" \
+             FROM (SELECT * FROM t) AS _red_base \
+             LEFT JOIN \"ref\" AS _red_j0 \
+             ON _red_base.\"a\" = _red_j0.\"x\" AND _red_base.\"b\" = _red_j0.\"y\""
+        );
     }
 
     #[test]

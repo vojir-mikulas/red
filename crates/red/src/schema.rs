@@ -598,32 +598,13 @@ impl AppState {
         let reuse = matches!(&self.phase, Phase::Connected(a) if a.active().is_some_and(|t| t.is_pristine(cx)));
         if reuse {
             if let Phase::Connected(active) = &mut self.phase {
-                // Repurpose the focused half's untouched tab, but relocate it to the
-                // end so a table preview always opens as the last (appended) tab
-                // rather than wherever the focus happened to sit.
+                // Repurpose the focused half's untouched tab in place (it stays in its
+                // pane); just relabel it to the previewed table.
                 let from = active.focused_tab_index();
-                let mut tab = active.tabs.remove(from);
-                tab.title = label.clone();
-                active.tabs.push(tab);
-                let last = active.tabs.len() - 1;
-                // The other half's index shifts down if it sat after the removed
-                // slot; fix it before re-pointing the focused half at the preview.
-                match active.split.as_ref().map(|s| s.focus) {
-                    Some(crate::app::SplitHalf::Primary) => {
-                        if let Some(s) = &mut active.split {
-                            if s.secondary > from {
-                                s.secondary -= 1;
-                            }
-                        }
-                    }
-                    Some(crate::app::SplitHalf::Secondary) if active.active_tab > from => {
-                        active.active_tab -= 1;
-                    }
-                    _ => {}
+                if let Some(tab) = active.tabs.get_mut(from) {
+                    tab.title = label.clone();
                 }
-                active.set_focused_tab(last);
-                active.tab_scroll.scroll_to_item(last);
-                active.validate_split();
+                active.tab_scroll.scroll_to_item(from);
             }
         } else {
             // No pristine tab to reuse (incl. the empty-strip case) — open one.

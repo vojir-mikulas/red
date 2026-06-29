@@ -28,9 +28,9 @@ use mysql_async::{
     Column as MyColumn, Error as MyError, Opts, OptsBuilder, Pool, Row, Value as MyValue,
 };
 use red_core::{
-    Column, ColumnMeta, ColumnValue, EditOp, ExportFormat, FkEdge, ForeignKeyMeta, IndexMeta,
-    KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage,
-    RowWindow, SchemaMeta, TableDetail, TableRef, Value,
+    Column, ColumnMeta, ColumnValue, DbKind, EditOp, ExportFormat, FkEdge, FkJoin, ForeignKeyMeta,
+    IndexMeta, KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result,
+    ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, Mutex};
@@ -207,6 +207,7 @@ impl DatabaseDriver for MysqlDriver {
         let alive = Arc::new(AtomicBool::new(true));
         let cancel = self.kill_token(conn_id, alive.clone());
 
+        let full = opts.full_fidelity;
         let (tx, rx) = mpsc::channel::<Result<Vec<Value>>>(opts.window.max(1));
         tokio::spawn(async move {
             let mut conn = conn;
@@ -218,7 +219,12 @@ impl DatabaseDriver for MysqlDriver {
                 }
             };
             // Offset-mode display stream (editor run) — cap every cell, no exempt key.
-            let cap = CellCap::display([None, None]);
+            // A full-fidelity reader (the table copy) reads byte-exact instead.
+            let cap = if full {
+                None
+            } else {
+                CellCap::display([None, None])
+            };
             loop {
                 match result.next().await {
                     Ok(Some(row)) => {
@@ -303,9 +309,9 @@ impl DatabaseDriver for MysqlDriver {
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
 
         // Columns (`column_key = 'PRI'` ⇒ primary-key member).
-        let column_rows: Vec<(String, String, String, Option<String>, String)> = conn
+        let column_rows: Vec<(String, String, String, Option<String>, String, String)> = conn
             .exec(
-                "SELECT column_name, data_type, is_nullable, column_default, column_key \
+                "SELECT column_name, data_type, is_nullable, column_default, column_key, extra \
                  FROM information_schema.columns \
                  WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
                 (schema, table),
@@ -315,12 +321,14 @@ impl DatabaseDriver for MysqlDriver {
         let columns = column_rows
             .into_iter()
             .map(
-                |(name, data_type, is_nullable, default, column_key)| ColumnMeta {
+                |(name, data_type, is_nullable, default, column_key, extra)| ColumnMeta {
                     primary_key: column_key == "PRI",
                     not_null: is_nullable == "NO",
                     type_name: Some(data_type),
                     default,
                     name,
+                    // `extra` carries `auto_increment` for AUTO_INCREMENT columns.
+                    auto_increment: extra.eq_ignore_ascii_case("auto_increment"),
                 },
             )
             .collect();
@@ -420,6 +428,10 @@ impl DatabaseDriver for MysqlDriver {
 
     fn eq_predicate(&self, pairs: &[ColumnValue]) -> String {
         crate::eq_clause(pairs, |c| format!("`{}`", escape_ident(c)))
+    }
+
+    fn fk_join_wrap(&self, base: &str, base_cols: &[String], joins: &[FkJoin]) -> String {
+        crate::join_wrap(base, base_cols, joins, |c| format!("`{}`", escape_ident(c)))
     }
 
     async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64> {
@@ -667,6 +679,66 @@ impl DatabaseDriver for MysqlDriver {
         }
         conn.query_drop("COMMIT").await.map_err(map_my_err)?;
         Ok(total)
+    }
+
+    async fn clear_table(&self, table: &TableRef) -> Result<u64> {
+        let quote = |id: &str| format!("`{}`", escape_ident(id));
+        let qualify = match &table.schema {
+            Some(s) if !s.is_empty() => format!("{}.{}", quote(s), quote(&table.name)),
+            _ => quote(&table.name),
+        };
+        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        conn.query_drop(self.begin_stmt())
+            .await
+            .map_err(map_my_err)?;
+        match conn.query_drop(format!("DELETE FROM {qualify}")).await {
+            Ok(()) => {
+                let affected = conn.affected_rows();
+                conn.query_drop("COMMIT").await.map_err(map_my_err)?;
+                Ok(affected)
+            }
+            Err(e) => {
+                crate::warn_rollback(conn.query_drop("ROLLBACK").await, "clear_table");
+                Err(map_my_err(e))
+            }
+        }
+    }
+
+    async fn create_table(&self, table: &TableRef, columns: &[ColumnMeta]) -> Result<u64> {
+        let sql = crate::create_table_sql(table, columns, DbKind::Mysql, |id| {
+            format!("`{}`", escape_ident(id))
+        });
+        self.execute(&sql).await
+    }
+
+    fn quote_table(&self, table: &TableRef) -> String {
+        crate::qualify_table(table, |id| format!("`{}`", escape_ident(id)))
+    }
+
+    async fn create_index(
+        &self,
+        table: &TableRef,
+        name: &str,
+        unique: bool,
+        columns: &[String],
+    ) -> Result<u64> {
+        let sql = crate::create_index_sql(table, name, unique, columns, DbKind::Mysql, |id| {
+            format!("`{}`", escape_ident(id))
+        });
+        self.execute(&sql).await
+    }
+
+    async fn add_foreign_key(
+        &self,
+        child: &TableRef,
+        columns: &[String],
+        parent: &TableRef,
+        ref_columns: &[String],
+    ) -> Result<u64> {
+        let sql = crate::add_fk_sql(child, columns, parent, ref_columns, |id| {
+            format!("`{}`", escape_ident(id))
+        });
+        self.execute(&sql).await
     }
 
     async fn explain(&self, sql: &str, analyze: bool) -> Result<QueryPlan> {

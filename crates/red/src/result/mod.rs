@@ -9,6 +9,7 @@
 //! state plus the `AppState` command handlers that drive it).
 
 mod buffer;
+mod copy;
 mod edit;
 mod render;
 
@@ -26,13 +27,14 @@ use gpui::{
     UniformListScrollHandle,
 };
 use red_core::{
-    Column as ResultColumn, ColumnMap, ColumnStats, ColumnValue, ExportFormat, FkEdge,
-    ImportFormat, KeySpec, ResultFilter, TableRef, Value,
+    Column as ResultColumn, ColumnMap, ColumnStats, ColumnValue, ExportFormat, FkEdge, FkJoin,
+    ImportFormat, KeySpec, ResultFilter, TableRef, Value, BASE_ALIAS,
 };
 use red_service::{Command, CommandSender, RunFetch, SessionId, SortKey};
 
 use crate::app::{
     AppState, EditContext, ExportProgress, Notification, PendingImportPeek, PendingWrite, Phase,
+    TransferKind,
 };
 
 use buffer::{next_epoch, window_decision, BufferMode, GridBuffer, KeyedRun, WindowView, WINDOW};
@@ -51,6 +53,132 @@ pub(crate) fn new_epoch() -> u64 {
 /// sync with the `Column` widths built in [`render`].
 pub(in crate::result) const DATA_COL_WIDTH: f32 = 180.0;
 pub(in crate::result) const GUTTER_WIDTH: f32 = 56.0;
+
+/// One inline-expanded reference column (Track B7): a dotted path from the base
+/// table down through single-column FKs to a leaf column — e.g.
+/// `["tier_id", "cascade_id", "name"]`, shown and aliased as
+/// `tier_id.cascade_id.name`. The leading segments are FK columns (each resolved
+/// against the connection's FK graph); the last is the selected leaf column.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(in crate::result) struct ExpandedCol {
+    /// FK columns then the leaf column; `len >= 2`.
+    pub(in crate::result) path: Vec<String>,
+}
+
+impl ExpandedCol {
+    /// The dotted unique name / output column alias (`tier_id.name`).
+    pub(in crate::result) fn dotted(&self) -> String {
+        self.path.join(".")
+    }
+}
+
+/// The cell-menu data for expanding the focused FK cell's reference table inline
+/// (Track B7): the referenced table's name (the section header) and each of its
+/// columns with whether it's already shown and the dotted path that toggles it.
+/// Built only when the focused column is a single-column FK whose target table is
+/// already described (the eager prefetch usually has it).
+pub(in crate::result) struct ReferenceMenu {
+    pub(in crate::result) ref_table: String,
+    pub(in crate::result) columns: Vec<ReferenceMenuItem>,
+}
+
+/// One row of a [`ReferenceMenu`]: a referenced-table column the user can toggle.
+pub(in crate::result) struct ReferenceMenuItem {
+    pub(in crate::result) label: String,
+    pub(in crate::result) path: Vec<String>,
+    pub(in crate::result) shown: bool,
+}
+
+/// The bundle a grid hands the app for a re-open driven by an expansion change: the
+/// base SQL, the fresh epoch, the table ref, the preserved sort + filter, the
+/// resolved joins, and the superseded epoch to close.
+type ReopenSpec = (
+    String,
+    u64,
+    Option<(String, String)>,
+    Option<SortKey>,
+    Option<ResultFilter>,
+    Vec<FkJoin>,
+    u64,
+);
+
+/// Resolve a browse's [`ExpandedCol`] list into the ordered [`FkJoin`] spec the
+/// backend folds into the query. Each distinct FK *prefix* of a path becomes one
+/// `LEFT JOIN` (deduped, so several leaves under one reference share a join), keyed
+/// off the FK graph: the edge for `(current table, fk column)` gives the target
+/// table and the `ON` column pairs, and the target becomes the next hop's table —
+/// so a chain like `tier → cascade → placement` resolves hop by hop. A path whose
+/// FK can't be resolved (graph not loaded, not a single-column FK) is skipped. Join
+/// aliases are simple, unique identifiers (`_red_j0`, …); the meaningful dotted name
+/// rides as the select output alias.
+pub(in crate::result) fn build_joins(
+    graph: &[FkEdge],
+    base: (&str, &str),
+    expansion: &[ExpandedCol],
+) -> Vec<FkJoin> {
+    // Each resolved FK prefix → (alias, the table that prefix points at).
+    let mut resolved: HashMap<Vec<String>, (String, Option<String>, String)> = HashMap::new();
+    let mut idx_by_alias: HashMap<String, usize> = HashMap::new();
+    let mut joins: Vec<FkJoin> = Vec::new();
+    let mut next_alias = 0usize;
+
+    for col in expansion {
+        if col.path.len() < 2 {
+            continue;
+        }
+        let fk_path = &col.path[..col.path.len() - 1];
+        let leaf = col.path[col.path.len() - 1].clone();
+        let mut parent_alias = BASE_ALIAS.to_string();
+        let mut cur_schema = Some(base.0.to_string());
+        let mut cur_table = base.1.to_string();
+        let mut ok = true;
+        // Ensure every prefix [..=i] of the FK path is joined, walking from the base.
+        for i in 0..fk_path.len() {
+            let prefix = fk_path[..=i].to_vec();
+            let (alias, ch_schema, ch_table) = if let Some(e) = resolved.get(&prefix) {
+                e.clone()
+            } else {
+                let fkcol = &fk_path[i];
+                let Some(edge) = graph.iter().find(|e| {
+                    e.columns.len() == 1
+                        && e.from_table == cur_table
+                        && e.from_schema.as_deref() == cur_schema.as_deref()
+                        && e.columns[0].0 == *fkcol
+                }) else {
+                    ok = false;
+                    break;
+                };
+                let alias = format!("_red_j{next_alias}");
+                next_alias += 1;
+                // SQLite edges may omit the target schema; stay within the current
+                // namespace rather than dropping qualification.
+                let to_schema = edge.to_schema.clone().or_else(|| cur_schema.clone());
+                idx_by_alias.insert(alias.clone(), joins.len());
+                joins.push(FkJoin {
+                    alias: alias.clone(),
+                    parent_alias: parent_alias.clone(),
+                    on: edge.columns.clone(),
+                    to_schema: to_schema.clone(),
+                    to_table: edge.to_table.clone(),
+                    select: Vec::new(),
+                });
+                let entry = (alias, to_schema, edge.to_table.clone());
+                resolved.insert(prefix, entry.clone());
+                entry
+            };
+            parent_alias = alias;
+            cur_schema = ch_schema;
+            cur_table = ch_table;
+        }
+        if !ok {
+            continue;
+        }
+        if let Some(&ji) = idx_by_alias.get(&parent_alias) {
+            joins[ji].select.push((leaf, col.dotted()));
+        }
+    }
+    joins
+}
 
 /// All the state for one open result. When the row-number gutter is shown
 /// (`grid.row_numbers`) it occupies table column `0`, so data column `n` sits at
@@ -77,6 +205,27 @@ pub(crate) struct ResultGrid {
     /// (Track B7), recomputed from the connection's FK graph on open / graph-load.
     /// Drives the in-grid FK accent; always empty for non-table results.
     fk_cols: HashSet<usize>,
+    /// Inline FK expansion (Track B7): the reference columns the user pulled into
+    /// this browse, each a dotted path from the base table (`["tier_id","name"]` →
+    /// shown as `tier_id.name`). The source of truth the cell menu / Columns panel
+    /// toggle; [`joins`](Self::joins) is derived from it against the FK graph. Empty
+    /// for an unexpanded browse, editor SQL, or a no-FK engine.
+    pub(in crate::result) expansion: Vec<ExpandedCol>,
+    /// The resolved `LEFT JOIN` spec sent with `OpenResult`, rebuilt from
+    /// [`expansion`](Self::expansion) + the FK graph whenever either changes
+    /// ([`rebuild_joins`](Self::rebuild_joins)). Cached here so the re-open paths
+    /// (sort / filter / edit refresh) carry it without re-resolving.
+    joins: Vec<FkJoin>,
+    /// Result-column indices that are inline-expanded (joined) reference columns —
+    /// recomputed from [`expansion`](Self::expansion) when the column set lands.
+    /// Drives the joined-column tint and excludes them from editing (they aren't
+    /// base-table columns).
+    joined_cols: HashSet<usize>,
+    /// Which FK nodes are expanded open in the Columns panel's tree (Track B7),
+    /// keyed by their dotted FK path (`["tier_id","cascade_id"]`). Purely panel UI
+    /// state — distinct from [`expansion`](Self::expansion) (the *checked* columns);
+    /// expanding a node only reveals its children, it doesn't add a column.
+    pub(in crate::result) tree_expanded: HashSet<Vec<String>>,
     /// The seek key the backend resolved (`ResultReady`). Track B5 reads its PK to
     /// key a guarded edit; `None` (editor SQL / no usable PK) means not editable.
     key: Option<KeySpec>,
@@ -152,6 +301,10 @@ impl ResultGrid {
             selection: None,
             table,
             fk_cols: HashSet::new(),
+            expansion: Vec::new(),
+            joins: Vec::new(),
+            joined_cols: HashSet::new(),
+            tree_expanded: HashSet::new(),
             key: None,
             buffer: Rc::new(RefCell::new(GridBuffer::new(page_size))),
             pending: edit::PendingChanges::default(),
@@ -247,6 +400,129 @@ impl ResultGrid {
                 self.fk_cols.insert(i);
             }
         }
+    }
+
+    /// Recompute which result columns are inline-expanded reference columns (Track
+    /// B7), matching each column's name against the [`expansion`](Self::expansion)'s
+    /// dotted output aliases. Called when a fresh column set lands. Drives the
+    /// joined-column tint and the edit exclusion (these aren't base-table columns).
+    pub(in crate::result) fn set_joined_cols(&mut self) {
+        self.joined_cols.clear();
+        if self.expansion.is_empty() {
+            return;
+        }
+        let names: HashSet<String> = self.expansion.iter().map(|e| e.dotted()).collect();
+        for (i, col) in self.columns.iter().enumerate() {
+            if names.contains(&col.name) {
+                self.joined_cols.insert(i);
+            }
+        }
+    }
+
+    /// If result column `i` is an inline-expanded reference column, its expansion
+    /// path — for a "hide this column" toggle from the cell menu.
+    pub(in crate::result) fn expansion_path_at(&self, i: usize) -> Option<Vec<String>> {
+        if !self.joined_cols.contains(&i) {
+            return None;
+        }
+        let name = &self.columns.get(i)?.name;
+        self.expansion
+            .iter()
+            .find(|e| &e.dotted() == name)
+            .map(|e| e.path.clone())
+    }
+
+    /// The dotted output aliases currently expanded under base FK column `fk_col`
+    /// (single-hop), so the cell menu can check the columns already shown.
+    pub(in crate::result) fn shown_under(&self, fk_col: &str) -> HashSet<String> {
+        self.expansion
+            .iter()
+            .filter(|e| e.path.first().map(String::as_str) == Some(fk_col))
+            .map(|e| e.dotted())
+            .collect()
+    }
+
+    /// Rebuild the resolved [`joins`](Self::joins) from the current
+    /// [`expansion`](Self::expansion) against `graph`. Called after the expansion is
+    /// toggled and when the FK graph (re)loads.
+    pub(crate) fn rebuild_joins(&mut self, graph: &[FkEdge]) {
+        self.joins = match &self.table {
+            Some((s, t)) => build_joins(graph, (s.as_str(), t.as_str()), &self.expansion),
+            None => Vec::new(),
+        };
+    }
+
+    /// Toggle one reference column in the expansion (add if absent, remove if
+    /// present), returning whether the expansion changed. The caller rebuilds the
+    /// joins and re-opens.
+    pub(in crate::result) fn toggle_expansion(&mut self, path: Vec<String>) -> bool {
+        match self.expansion.iter().position(|e| e.path == path) {
+            Some(pos) => {
+                self.expansion.remove(pos);
+            }
+            None => self.expansion.push(ExpandedCol { path }),
+        }
+        true
+    }
+
+    /// The resolved joins to send with an `OpenResult` (re)open.
+    pub(in crate::result) fn open_joins(&self) -> Vec<FkJoin> {
+        self.joins.clone()
+    }
+
+    /// Whether any reference columns are currently expanded into this browse.
+    pub(crate) fn has_expansion(&self) -> bool {
+        !self.expansion.is_empty()
+    }
+
+    /// Whether the dotted path is currently a shown (checked) reference column.
+    pub(crate) fn is_shown(&self, path: &[String]) -> bool {
+        self.expansion.iter().any(|e| e.path == path)
+    }
+
+    /// Whether the Columns-panel tree node at `path` is expanded open.
+    pub(crate) fn is_tree_expanded(&self, path: &[String]) -> bool {
+        self.tree_expanded.contains(path)
+    }
+
+    /// Toggle a Columns-panel tree node open/closed, returning the new state (`true`
+    /// = now open). Pure panel UI state; doesn't touch the joins.
+    pub(crate) fn toggle_tree_node(&mut self, path: Vec<String>) -> bool {
+        if self.tree_expanded.remove(&path) {
+            false
+        } else {
+            self.tree_expanded.insert(path);
+            true
+        }
+    }
+
+    /// Reset the grid's live view for an expansion-driven re-open and return the
+    /// [`ReopenSpec`] the app sends — mirroring the re-sort / filter re-open
+    /// (selection cleared, buffer + timer reset, a fresh epoch so in-flight pages for
+    /// the old SQL are dropped), preserving the current header-click sort + filter.
+    pub(in crate::result) fn reopen_spec(&mut self) -> ReopenSpec {
+        let old_epoch = self.epoch;
+        self.selection = None;
+        self.ready = false;
+        self.restart_timer();
+        self.reset_buffer();
+        self.epoch = next_epoch();
+        let sort = self.sort.and_then(|(dcol, asc)| {
+            self.columns.get(dcol).map(|col| SortKey {
+                position: dcol + 1,
+                column: col.name.clone(),
+                descending: !asc,
+            })
+        });
+        (
+            self.base_sql.clone(),
+            self.epoch,
+            self.table.clone(),
+            sort,
+            self.filter.clone(),
+            self.open_joins(),
+            old_epoch,
+        )
     }
 
     /// A data column's `(name, declared type)` — for the inspector header.
@@ -348,6 +624,11 @@ impl ResultGrid {
         let (row, col) = self.cursor_cell(gutter)?;
         let target = self.columns.get(col)?;
         if target.name == pk_column {
+            return None;
+        }
+        // An inline-expanded reference column (Track B7) is read-only — it belongs to
+        // a joined table, not this browse's base table, so it can't be UPDATE'd here.
+        if self.joined_cols.contains(&col) {
             return None;
         }
         let pk_value = self.cell_value(row, pk_idx)?;
@@ -948,6 +1229,7 @@ impl AppState {
             table,
             sort: None,
             filter,
+            joins: Vec::new(),
         });
         self.start_query_ticker(cx);
         cx.notify();
@@ -972,6 +1254,7 @@ impl AppState {
             if let Some(grid) = active.result_by_epoch(epoch) {
                 grid.on_ready(columns, total, key);
                 grid.set_fk_cols(&graph);
+                grid.set_joined_cols();
             }
         }
         cx.notify();
@@ -1095,6 +1378,7 @@ impl AppState {
                         grid.table.clone(),
                         sort,
                         grid.filter.clone(),
+                        grid.open_joins(),
                         grid.epoch,
                         old_epoch,
                     ))
@@ -1103,7 +1387,7 @@ impl AppState {
             },
             _ => None,
         };
-        if let Some((sql, table, sort, filter, epoch, old_epoch)) = reopen {
+        if let Some((sql, table, sort, filter, joins, epoch, old_epoch)) = reopen {
             // Evict the superseded SQL so the backend's result map can't grow.
             self.send_active(Command::CloseResult { epoch: old_epoch });
             self.send_active(Command::OpenResult {
@@ -1112,6 +1396,7 @@ impl AppState {
                 table,
                 sort: Some(sort),
                 filter,
+                joins,
             });
             self.start_query_ticker(cx);
         }
@@ -1152,6 +1437,7 @@ impl AppState {
                         grid.table.clone(),
                         sort,
                         grid.filter.clone(),
+                        grid.open_joins(),
                         grid.epoch,
                         old_epoch,
                     ))
@@ -1160,7 +1446,7 @@ impl AppState {
             },
             _ => None,
         };
-        if let Some((sql, table, sort, filter, epoch, old_epoch)) = reopen {
+        if let Some((sql, table, sort, filter, joins, epoch, old_epoch)) = reopen {
             self.send_active(Command::CloseResult { epoch: old_epoch });
             self.send_active(Command::OpenResult {
                 sql,
@@ -1168,6 +1454,123 @@ impl AppState {
                 table,
                 sort,
                 filter,
+                joins,
+            });
+            self.start_query_ticker(cx);
+        }
+        cx.notify();
+    }
+
+    /// Toggle one inline-expanded reference column (Track B7) into / out of the
+    /// active browse, then re-open it (new epoch) so the backend re-runs with the
+    /// updated `LEFT JOIN` set, preserving the current sort + filter. `path` is the
+    /// dotted FK path (`["tier_id","name"]`). No-op unless the active result is a
+    /// single-table browse.
+    pub(crate) fn toggle_reference_column(&mut self, path: Vec<String>, cx: &mut Context<Self>) {
+        let reopen = match &mut self.phase {
+            Phase::Connected(active) => {
+                let graph = active.fk_graph.clone();
+                match active.active_result_mut() {
+                    Some(grid) if grid.table.is_some() => {
+                        grid.toggle_expansion(path);
+                        grid.rebuild_joins(&graph);
+                        Some(grid.reopen_spec())
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        self.apply_reopen(reopen, cx);
+    }
+
+    /// Drop every inline-expanded reference column from the active browse and re-open
+    /// it unexpanded. No-op when nothing is expanded.
+    pub(crate) fn clear_reference_columns(&mut self, cx: &mut Context<Self>) {
+        let reopen = match &mut self.phase {
+            Phase::Connected(active) => match active.active_result_mut() {
+                Some(grid) if grid.has_expansion() => {
+                    grid.expansion.clear();
+                    grid.joins.clear();
+                    Some(grid.reopen_spec())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        self.apply_reopen(reopen, cx);
+    }
+
+    /// Build the inline-FK-expansion menu for the focused cell (Track B7): when the
+    /// focused column is a single-column forward FK and its target table has been
+    /// described, list the target's columns with their current shown state. `None`
+    /// for a non-FK cell, an undescribed target, editor SQL, or before the graph
+    /// loads — the cell menu then omits the section.
+    pub(in crate::result) fn reference_menu(&self) -> Option<ReferenceMenu> {
+        let Phase::Connected(active) = &self.phase else {
+            return None;
+        };
+        let grid = active.active_result()?;
+        let (schema, table) = grid.table.as_ref()?;
+        let (_, col) = grid.cursor_cell(self.gutter())?;
+        let cname = grid.columns.get(col)?.name.clone();
+        let edge = active.fk_graph.iter().find(|e| {
+            e.columns.len() == 1
+                && e.from_table == *table
+                && e.from_schema.as_deref() == Some(schema.as_str())
+                && e.columns[0].0 == cname
+        })?;
+        let ref_schema = edge.to_schema.clone().unwrap_or_else(|| schema.clone());
+        let ref_table = edge.to_table.clone();
+        let detail = active
+            .schema
+            .details
+            .get(&(ref_schema, ref_table.clone()))?;
+        let shown = grid.shown_under(&cname);
+        let columns = detail
+            .columns
+            .iter()
+            .map(|c| {
+                let path = vec![cname.clone(), c.name.clone()];
+                ReferenceMenuItem {
+                    shown: shown.contains(&path.join(".")),
+                    label: c.name.clone(),
+                    path,
+                }
+            })
+            .collect();
+        Some(ReferenceMenu { ref_table, columns })
+    }
+
+    /// The expansion path of the focused cell when it sits in an inline-expanded
+    /// reference column — for the cell menu's "hide this column" action.
+    pub(in crate::result) fn focused_joined_path(&self) -> Option<Vec<String>> {
+        let Phase::Connected(active) = &self.phase else {
+            return None;
+        };
+        let grid = active.active_result()?;
+        let (_, col) = grid.cursor_cell(self.gutter())?;
+        grid.expansion_path_at(col)
+    }
+
+    /// Whether the active result currently has any inline-expanded reference columns
+    /// (drives the cell menu's "Hide all reference columns" item).
+    pub(in crate::result) fn active_has_expansion(&self) -> bool {
+        matches!(&self.phase, Phase::Connected(a) if a.active_result().is_some_and(|g| g.has_expansion()))
+    }
+
+    /// Close the superseded epoch and re-open the active grid from a
+    /// [`ResultGrid::reopen_spec`] bundle (shared by the expansion toggles).
+    fn apply_reopen(&mut self, reopen: Option<ReopenSpec>, cx: &mut Context<Self>) {
+        if let Some((sql, epoch, table, sort, filter, joins, old_epoch)) = reopen {
+            self.send_active(Command::CloseResult { epoch: old_epoch });
+            self.send_active(Command::OpenResult {
+                sql,
+                epoch,
+                table,
+                sort,
+                filter,
+                joins,
             });
             self.start_query_ticker(cx);
         }
@@ -1518,7 +1921,7 @@ impl AppState {
                     id,
                     rows: 0,
                     total,
-                    is_import: false,
+                    kind: TransferKind::Export,
                 }),
                 expanded: false,
                 hovered: false,
@@ -1835,7 +2238,7 @@ impl AppState {
                     id,
                     rows: 0,
                     total: 0,
-                    is_import: true,
+                    kind: TransferKind::Import,
                 }),
                 expanded: false,
                 hovered: false,
@@ -2091,5 +2494,78 @@ impl AppState {
         let (schema, table) = p.plan.target;
         self.open_table_browse(schema, table, Some(ResultFilter::Eq(pairs)), cx);
         true
+    }
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::{build_joins, ExpandedCol};
+    use red_core::FkEdge;
+
+    fn edge(from: &str, fk: &str, to: &str, refc: &str) -> FkEdge {
+        FkEdge {
+            from_schema: Some("main".into()),
+            from_table: from.into(),
+            to_schema: Some("main".into()),
+            to_table: to.into(),
+            columns: vec![(fk.into(), refc.into())],
+        }
+    }
+
+    fn exp(path: &[&str]) -> ExpandedCol {
+        ExpandedCol {
+            path: path.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// A two-hop chain (`channel → tier → cascade`): the shared first hop is
+    /// resolved once (deduped), the deeper hop chains off it (`parent_alias` is the
+    /// first hop's alias), and each leaf is selected from its hop with the dotted
+    /// output alias.
+    #[test]
+    fn chains_and_dedupes_shared_prefixes() {
+        let graph = vec![
+            edge("channel", "tier_id", "tier", "id"),
+            edge("tier", "cascade_id", "cascade", "id"),
+        ];
+        let expansion = vec![
+            exp(&["tier_id", "name"]),
+            exp(&["tier_id", "cascade_id", "name"]),
+        ];
+        let joins = build_joins(&graph, ("main", "channel"), &expansion);
+
+        assert_eq!(joins.len(), 2, "shared `tier_id` hop is joined once");
+        // First hop: off the base, selecting tier.name.
+        assert_eq!(joins[0].alias, "_red_j0");
+        assert_eq!(joins[0].parent_alias, "_red_base");
+        assert_eq!(joins[0].to_table, "tier");
+        assert_eq!(joins[0].on, vec![("tier_id".into(), "id".into())]);
+        assert_eq!(
+            joins[0].select,
+            vec![("name".into(), "tier_id.name".into())]
+        );
+        // Second hop: chains off the first, selecting cascade.name.
+        assert_eq!(joins[1].alias, "_red_j1");
+        assert_eq!(joins[1].parent_alias, "_red_j0");
+        assert_eq!(joins[1].to_table, "cascade");
+        assert_eq!(
+            joins[1].select,
+            vec![("name".into(), "tier_id.cascade_id.name".into())]
+        );
+    }
+
+    /// A path whose FK can't be resolved against the graph is skipped, leaving the
+    /// resolvable ones intact (a missing edge degrades to no join, never a panic).
+    #[test]
+    fn skips_unresolvable_paths() {
+        let graph = vec![edge("channel", "tier_id", "tier", "id")];
+        let expansion = vec![exp(&["bogus", "x"]), exp(&["tier_id", "name"])];
+        let joins = build_joins(&graph, ("main", "channel"), &expansion);
+        assert_eq!(joins.len(), 1);
+        assert_eq!(joins[0].to_table, "tier");
+        assert_eq!(
+            joins[0].select,
+            vec![("name".into(), "tier_id.name".into())]
+        );
     }
 }

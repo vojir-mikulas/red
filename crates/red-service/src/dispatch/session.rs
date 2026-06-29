@@ -4,7 +4,7 @@
 //! connect outcome onto the loop's session map.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -111,8 +111,40 @@ pub(crate) struct SessionState {
     pub(crate) results: ResultMap,
     pub(crate) inflight: HashMap<u64, InFlight>,
     pub(crate) exports: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
+    /// In-use pin against idle eviction: the number of background jobs currently
+    /// reading from or writing to this session. A table copy reads from a session
+    /// that is, by definition, *not* the foreground (you copy A→B; at most one side
+    /// is on-screen) and may run for many minutes with no commands — so without a
+    /// pin its source could be evicted mid-copy (tunnel dropped, connection broken),
+    /// since only *commands* bump `last_used`. The copy job increments this on both
+    /// ends via a [`PinGuard`] and `evict_idle` skips any session that is foreground
+    /// **or** pinned. Lock-free and miscount-proof (the guard decrements on finish,
+    /// cancel, or panic). Also closes the latent single-session export-vs-eviction
+    /// race for free. Shared `Arc` so a spawned job holds the pin independent of the
+    /// session map.
+    pub(crate) busy: Arc<AtomicUsize>,
     /// Bumped on every command routed here; idle eviction reads it.
     pub(crate) last_used: Instant,
+}
+
+/// RAII pin holding a session's [`busy`](SessionState::busy) counter up while a
+/// background job (a table copy) uses it. Increments on construction, decrements on
+/// drop — so the pin unwinds correctly on normal finish, cancel, or panic, and a
+/// session can never be left pinned by a job that died. A copy holds one of these
+/// per end (source + target).
+pub(crate) struct PinGuard(Arc<AtomicUsize>);
+
+impl PinGuard {
+    pub(crate) fn new(busy: Arc<AtomicUsize>) -> Self {
+        busy.fetch_add(1, Ordering::SeqCst);
+        PinGuard(busy)
+    }
+}
+
+impl Drop for PinGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// A connection's optional AI policy overrides (M-S7), carried from its
@@ -140,6 +172,7 @@ impl SessionState {
             results: Arc::new(Mutex::new(HashMap::new())),
             inflight: HashMap::new(),
             exports: Arc::new(Mutex::new(HashMap::new())),
+            busy: Arc::new(AtomicUsize::new(0)),
             last_used: Instant::now(),
         }
     }
@@ -301,7 +334,13 @@ pub(crate) fn evict_idle(
     let now = Instant::now();
     let stale: Vec<SessionId> = sessions
         .iter()
-        .filter(|(id, s)| Some(**id) != foreground && now.duration_since(s.last_used) >= IDLE_EVICT)
+        .filter(|(id, s)| {
+            Some(**id) != foreground
+                // A background copy pins both ends so its source/target (and their
+                // tunnels) survive a multi-minute transfer with no commands.
+                && s.busy.load(Ordering::Relaxed) == 0
+                && now.duration_since(s.last_used) >= IDLE_EVICT
+        })
         .map(|(id, _)| *id)
         .collect();
     for id in stale {

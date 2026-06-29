@@ -3,7 +3,7 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use std::time::{Duration, Instant};
 
-use red_core::{ConnectionConfig, DbKind, QueryOptions, Value};
+use red_core::{ConnectionConfig, DbKind, FkJoin, QueryOptions, Value};
 
 /// The session every single-session test drives. Real multi-session routing is
 /// exercised by [`keeps_two_sessions_warm`].
@@ -55,6 +55,7 @@ async fn streams_query_in_bounded_windows() {
             opts: QueryOptions {
                 window: 1000,
                 timeout: None,
+                full_fidelity: false,
             },
         },
     );
@@ -103,6 +104,7 @@ async fn cancels_query_mid_flight() {
             opts: QueryOptions {
                 window: 1_000_000_000,
                 timeout: None,
+                full_fidelity: false,
             },
         },
     );
@@ -140,6 +142,7 @@ async fn query_times_out() {
             opts: QueryOptions {
                 window: 1_000_000_000,
                 timeout: Some(Duration::from_millis(50)),
+                full_fidelity: false,
             },
         },
     );
@@ -392,6 +395,7 @@ async fn opens_and_pages_result() {
             table: None,
             sort: None,
             filter: None,
+            joins: Vec::new(),
         },
     );
     match next(&mut events).await {
@@ -454,6 +458,7 @@ async fn computes_column_stats_for_open_result() {
             table: None,
             sort: None,
             filter: None,
+            joins: Vec::new(),
         },
     );
     assert!(matches!(
@@ -492,6 +497,112 @@ async fn computes_column_stats_for_open_result() {
     send(&handle, Command::Shutdown);
 }
 
+/// Inline FK expansion (Track B7): an `OpenResult` carrying a `LEFT JOIN` spec
+/// decorates a table browse with the referenced table's columns — reported *inline,
+/// right after the FK column they expand from* — without changing the row count (the
+/// orphan-FK row survives with NULL joined cells) or the keyset key. `channel`'s FK
+/// sits in the middle (`id, tier_id, name`), so the joined column landing at index 2
+/// proves the interleaving (not an append-at-end).
+#[tokio::test]
+async fn fk_join_expands_referenced_columns_inline() {
+    let path = std::env::temp_dir().join(format!("red_svc_fkjoin_{}.db", std::process::id()));
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tier(id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO tier VALUES (1, 'Tier A'), (2, 'Tier B');
+             CREATE TABLE channel(id INTEGER PRIMARY KEY,
+                 tier_id INTEGER REFERENCES tier(id), name TEXT);
+             INSERT INTO channel VALUES (1, 1, 'ch1'), (2, 2, 'ch2'), (3, NULL, 'ch3');",
+        )
+        .unwrap();
+    }
+
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), true)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    // Browse `channel`, expanding its `tier_id` FK into `tier.name` inline.
+    send(
+        &handle,
+        Command::OpenResult {
+            sql: "SELECT * FROM channel".into(),
+            epoch: 1,
+            table: Some(("main".into(), "channel".into())),
+            sort: None,
+            filter: None,
+            joins: vec![FkJoin {
+                alias: "_red_j0".into(),
+                parent_alias: "_red_base".into(),
+                on: vec![("tier_id".into(), "id".into())],
+                to_schema: Some("main".into()),
+                to_table: "tier".into(),
+                select: vec![("name".into(), "tier_id.name".into())],
+            }],
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::ResultReady {
+            columns,
+            total,
+            key,
+            ..
+        }) => {
+            // The joined column is interleaved right after its FK column (`tier_id`),
+            // not appended at the end — `name` stays last.
+            assert_eq!(
+                columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+                vec!["id", "tier_id", "tier_id.name", "name"]
+            );
+            // The unique-target LEFT JOIN preserves cardinality — count is unchanged.
+            assert_eq!(total, 3);
+            // The base PK is still the seek key (joins don't disturb it).
+            assert_eq!(key.expect("PK key").column, "id");
+        }
+        other => panic!("expected ResultReady, got {other:?}"),
+    }
+
+    // Read the rows in key order; the joined value rides in the column right after
+    // `tier_id` (index 2), NULL for the orphan-FK row.
+    send(
+        &handle,
+        Command::FetchRun {
+            epoch: 1,
+            fetch: RunFetch::Forward { after: None },
+            limit: 10,
+            seq: 1,
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::ResultRunLoaded { rows, .. }) => {
+            assert_eq!(rows.len(), 3);
+            assert_eq!(
+                rows[0],
+                vec![
+                    Value::Integer(1),
+                    Value::Integer(1),
+                    Value::Text("Tier A".into()),
+                    Value::Text("ch1".into()),
+                ]
+            );
+            assert_eq!(rows[1][2], Value::Text("Tier B".into()));
+            // Orphan FK (tier_id NULL) → LEFT JOIN keeps the row, joined cell NULL.
+            assert_eq!(rows[2][1], Value::Null);
+            assert_eq!(rows[2][2], Value::Null);
+        }
+        other => panic!("expected ResultRunLoaded, got {other:?}"),
+    }
+
+    std::fs::remove_file(&path).ok();
+}
+
 /// The keyset path end-to-end: a table browse resolves its PK as the seek
 /// key, contiguous runs extend from boundary keys, and a far jump lands by
 /// key-space interpolation with estimated ordinals.
@@ -528,6 +639,7 @@ async fn resolves_key_and_serves_runs() {
             table: Some(("main".into(), "t".into())),
             sort: None,
             filter: None,
+            joins: Vec::new(),
         },
     );
     match next(&mut events).await {
@@ -728,6 +840,7 @@ async fn mariadb_keyset_end_to_end() {
             table: Some((p.database.clone(), table.clone())),
             sort: None,
             filter: None,
+            joins: Vec::new(),
         },
     );
     match next(&mut events).await {
@@ -887,6 +1000,7 @@ async fn text_key_jump_falls_back_to_offset() {
             table: Some(("main".into(), "t".into())),
             sort: None,
             filter: None,
+            joins: Vec::new(),
         },
     );
     match next(&mut events).await {
@@ -988,6 +1102,7 @@ async fn keeps_two_sessions_warm() {
             table: None,
             sort: None,
             filter: None,
+            joins: Vec::new(),
         },
     );
     handle.send_to(
@@ -998,6 +1113,7 @@ async fn keeps_two_sessions_warm() {
             table: None,
             sort: None,
             filter: None,
+            joins: Vec::new(),
         },
     );
 
@@ -1049,6 +1165,735 @@ async fn keeps_two_sessions_warm() {
     }
 
     handle.send_to(b, Command::Shutdown);
+}
+
+/// Drain copy events until the terminal one, asserting only `CopyProgress` arrives
+/// in between. Returns the terminal event (`CopyFinished`/`CopyFailed`/...). Copy
+/// events route globally (`None` session), so the tag is ignored.
+async fn drain_copy(
+    events: &mut UnboundedReceiver<(Option<SessionId>, Event)>,
+    copy_id: u64,
+) -> Event {
+    loop {
+        match events.next().await.map(|(_, e)| e) {
+            Some(Event::CopyProgress { id, .. }) => assert_eq!(id, copy_id),
+            Some(
+                e @ (Event::CopyFinished { .. }
+                | Event::CopyFailed { .. }
+                | Event::CopyCancelled { .. }),
+            ) => return e,
+            other => panic!("unexpected event during copy: {other:?}"),
+        }
+    }
+}
+
+/// Seed a writable scratch DB with `src` (3 rows) and an empty `dst`, returning its
+/// path. The caller connects writable and removes the file at the end.
+fn seed_copy_db(tag: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("red_svc_copy_{tag}_{}.db", std::process::id()));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE src(id INTEGER PRIMARY KEY, name TEXT);
+         INSERT INTO src VALUES (1,'one'),(2,'two'),(3,'three');
+         CREATE TABLE dst(id INTEGER PRIMARY KEY, name TEXT);",
+    )
+    .unwrap();
+    path
+}
+
+/// The headline round-trip: open a result, stream it into another table in the same
+/// connection (Append), and verify the rows landed verbatim.
+#[tokio::test]
+async fn copies_result_into_table() {
+    use red_core::{ColumnMap, CopyMode, TableRef};
+    let path = seed_copy_db("rt");
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), false)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    // Open the source so the copy can reference its epoch (filter included for free).
+    send(
+        &handle,
+        Command::OpenResult {
+            sql: "SELECT id, name FROM src".into(),
+            epoch: 1,
+            table: None,
+            sort: None,
+            filter: None,
+            joins: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::ResultReady {
+            epoch: 1,
+            total: 3,
+            ..
+        })
+    ));
+
+    send(
+        &handle,
+        Command::CopyToTable {
+            id: 7,
+            source_epoch: 1,
+            target: TableRef {
+                schema: Some("main".into()),
+                name: "dst".into(),
+            },
+            target_session: S,
+            mapping: vec![
+                ColumnMap {
+                    source: 0,
+                    column: "id".into(),
+                    decl_type: None,
+                },
+                ColumnMap {
+                    source: 1,
+                    column: "name".into(),
+                    decl_type: None,
+                },
+            ],
+            mode: CopyMode::Append,
+            create: None,
+        },
+    );
+    match drain_copy(&mut events, 7).await {
+        Event::CopyFinished { id, rows } => {
+            assert_eq!(id, 7);
+            assert_eq!(rows, 3, "all three rows copied");
+        }
+        other => panic!("expected CopyFinished, got {other:?}"),
+    }
+
+    // The rows landed in dst.
+    send(
+        &handle,
+        Command::OpenResult {
+            sql: "SELECT id, name FROM dst ORDER BY id".into(),
+            epoch: 2,
+            table: None,
+            sort: None,
+            filter: None,
+            joins: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::ResultReady { total: 3, .. })
+    ));
+    send(
+        &handle,
+        Command::FetchPage {
+            offset: 0,
+            limit: 10,
+            epoch: 2,
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::ResultPageLoaded { rows, .. }) => {
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[2][1], Value::Text("three".into()));
+        }
+        other => panic!("expected ResultPageLoaded, got {other:?}"),
+    }
+
+    send(&handle, Command::Shutdown);
+    std::fs::remove_file(&path).ok();
+}
+
+/// "Copy into a *new* table": with `create: Some(columns)` the target is created from
+/// the source's column shape (types spelled into the target dialect via
+/// `red_core::typemap`) before the rows stream in — the keystone of database
+/// migration. The `created` table does not exist beforehand.
+#[tokio::test]
+async fn copies_result_into_a_new_table() {
+    use red_core::{ColumnMap, ColumnMeta, CopyMode, TableRef};
+    let path = seed_copy_db("create");
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), false)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    send(
+        &handle,
+        Command::OpenResult {
+            sql: "SELECT id, name FROM src".into(),
+            epoch: 1,
+            table: None,
+            sort: None,
+            filter: None,
+            joins: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::ResultReady {
+            epoch: 1,
+            total: 3,
+            ..
+        })
+    ));
+
+    // Target `created` does not exist — `create` carries the column shape to build it.
+    send(
+        &handle,
+        Command::CopyToTable {
+            id: 9,
+            source_epoch: 1,
+            target: TableRef {
+                schema: Some("main".into()),
+                name: "created".into(),
+            },
+            target_session: S,
+            mapping: vec![
+                ColumnMap {
+                    source: 0,
+                    column: "id".into(),
+                    decl_type: Some("INTEGER".into()),
+                },
+                ColumnMap {
+                    source: 1,
+                    column: "name".into(),
+                    decl_type: Some("TEXT".into()),
+                },
+            ],
+            mode: CopyMode::Append,
+            create: Some(vec![
+                ColumnMeta {
+                    name: "id".into(),
+                    type_name: Some("INTEGER".into()),
+                    not_null: true,
+                    primary_key: true,
+                    default: None,
+                    auto_increment: false,
+                },
+                ColumnMeta {
+                    name: "name".into(),
+                    type_name: Some("TEXT".into()),
+                    not_null: false,
+                    primary_key: false,
+                    default: None,
+                    auto_increment: false,
+                },
+            ]),
+        },
+    );
+    match drain_copy(&mut events, 9).await {
+        Event::CopyFinished { id, rows } => {
+            assert_eq!(id, 9);
+            assert_eq!(
+                rows, 3,
+                "all three rows copied into the freshly-created table"
+            );
+        }
+        other => panic!("expected CopyFinished, got {other:?}"),
+    }
+
+    // The table was created (the SELECT would error otherwise) and the rows landed.
+    send(
+        &handle,
+        Command::OpenResult {
+            sql: "SELECT id, name FROM created ORDER BY id".into(),
+            epoch: 2,
+            table: None,
+            sort: None,
+            filter: None,
+            joins: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::ResultReady { total: 3, .. })
+    ));
+    send(
+        &handle,
+        Command::FetchPage {
+            offset: 0,
+            limit: 10,
+            epoch: 2,
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::ResultPageLoaded { rows, .. }) => {
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0][0], Value::Integer(1));
+            assert_eq!(rows[2][1], Value::Text("three".into()));
+        }
+        other => panic!("expected ResultPageLoaded, got {other:?}"),
+    }
+
+    send(&handle, Command::Shutdown);
+    std::fs::remove_file(&path).ok();
+}
+
+/// `TruncateInsert` clears the target first (via `clear_table`) so the copy is a
+/// refresh, not an append: a pre-existing target row is gone afterward.
+#[tokio::test]
+async fn copy_truncate_insert_refreshes_target() {
+    use red_core::{ColumnMap, CopyMode, TableRef};
+    let path = seed_copy_db("trunc");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("INSERT INTO dst VALUES (99,'stale');")
+            .unwrap();
+    }
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), false)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+    send(
+        &handle,
+        Command::OpenResult {
+            sql: "SELECT id, name FROM src".into(),
+            epoch: 1,
+            table: None,
+            sort: None,
+            filter: None,
+            joins: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::ResultReady { epoch: 1, .. })
+    ));
+    send(
+        &handle,
+        Command::CopyToTable {
+            id: 3,
+            source_epoch: 1,
+            target: TableRef {
+                schema: Some("main".into()),
+                name: "dst".into(),
+            },
+            target_session: S,
+            mapping: vec![
+                ColumnMap {
+                    source: 0,
+                    column: "id".into(),
+                    decl_type: None,
+                },
+                ColumnMap {
+                    source: 1,
+                    column: "name".into(),
+                    decl_type: None,
+                },
+            ],
+            mode: CopyMode::TruncateInsert,
+            create: None,
+        },
+    );
+    match drain_copy(&mut events, 3).await {
+        Event::CopyFinished { rows, .. } => assert_eq!(rows, 3),
+        other => panic!("expected CopyFinished, got {other:?}"),
+    }
+
+    // Exactly the 3 source rows remain — the stale row (id 99) was truncated.
+    send(
+        &handle,
+        Command::OpenResult {
+            sql: "SELECT id FROM dst WHERE id = 99".into(),
+            epoch: 2,
+            table: None,
+            sort: None,
+            filter: None,
+            joins: Vec::new(),
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::ResultReady { total, .. }) => assert_eq!(total, 0, "id 99 was truncated"),
+        other => panic!("expected ResultReady, got {other:?}"),
+    }
+    send(&handle, Command::Shutdown);
+    std::fs::remove_file(&path).ok();
+}
+
+/// Gap 2 (correctness invariant): a copy reads at **full fidelity**, never the
+/// display fat-cell cap — a long `TEXT` value copies byte-exact, not truncated.
+#[tokio::test]
+async fn copy_is_byte_exact_for_long_values() {
+    use red_core::{ColumnMap, CopyMode, TableRef};
+    let path = std::env::temp_dir().join(format!("red_svc_copy_big_{}.db", std::process::id()));
+    let big = "x".repeat(5000); // far over any display cap
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE src(id INTEGER PRIMARY KEY, big TEXT);
+             CREATE TABLE dst(id INTEGER PRIMARY KEY, big TEXT);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO src VALUES (1, ?1)", [&big])
+            .unwrap();
+    }
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), false)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+    send(
+        &handle,
+        Command::OpenResult {
+            sql: "SELECT id, big FROM src".into(),
+            epoch: 1,
+            table: None,
+            sort: None,
+            filter: None,
+            joins: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::ResultReady { epoch: 1, .. })
+    ));
+    send(
+        &handle,
+        Command::CopyToTable {
+            id: 1,
+            source_epoch: 1,
+            target: TableRef {
+                schema: Some("main".into()),
+                name: "dst".into(),
+            },
+            target_session: S,
+            mapping: vec![
+                ColumnMap {
+                    source: 0,
+                    column: "id".into(),
+                    decl_type: None,
+                },
+                ColumnMap {
+                    source: 1,
+                    column: "big".into(),
+                    decl_type: Some("TEXT".into()),
+                },
+            ],
+            mode: CopyMode::Append,
+            create: None,
+        },
+    );
+    assert!(matches!(
+        drain_copy(&mut events, 1).await,
+        Event::CopyFinished { rows: 1, .. }
+    ));
+
+    // Read the *length* back (an integer dodges the read-side display cap): the full
+    // 5000 bytes landed, so the copy never saw `Value::Capped`.
+    send(
+        &handle,
+        Command::OpenResult {
+            sql: "SELECT length(big) FROM dst".into(),
+            epoch: 2,
+            table: None,
+            sort: None,
+            filter: None,
+            joins: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::ResultReady { total: 1, .. })
+    ));
+    send(
+        &handle,
+        Command::FetchPage {
+            offset: 0,
+            limit: 1,
+            epoch: 2,
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::ResultPageLoaded { rows, .. }) => {
+            assert_eq!(
+                rows[0][0],
+                Value::Integer(5000),
+                "long TEXT copied byte-exact"
+            );
+        }
+        other => panic!("expected ResultPageLoaded, got {other:?}"),
+    }
+    send(&handle, Command::Shutdown);
+    std::fs::remove_file(&path).ok();
+}
+
+/// Cross-connection copy (Phase 2): source in session A, target in session B — the
+/// backend bridges A's cursor to B's `insert_rows` with both ends pinned. Two
+/// separate DBs prove the rows really cross the connection boundary.
+#[tokio::test]
+async fn copies_across_connections() {
+    use red_core::{ColumnMap, CopyMode, TableRef};
+    let a = SessionId(1);
+    let b = SessionId(2);
+    let src_path = std::env::temp_dir().join(format!("red_svc_copy_a_{}.db", std::process::id()));
+    let dst_path = std::env::temp_dir().join(format!("red_svc_copy_b_{}.db", std::process::id()));
+    {
+        let conn = rusqlite::Connection::open(&src_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE src(id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO src VALUES (1,'one'),(2,'two');",
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(&dst_path).unwrap();
+        conn.execute_batch("CREATE TABLE dst(id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+    }
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    handle.send_to(
+        a,
+        Command::Connect(sqlite(src_path.to_str().unwrap(), false)),
+    );
+    assert!(matches!(
+        events.next().await,
+        Some((Some(s), Event::Connected { .. })) if s == a
+    ));
+    handle.send_to(
+        b,
+        Command::Connect(sqlite(dst_path.to_str().unwrap(), false)),
+    );
+    assert!(matches!(
+        events.next().await,
+        Some((Some(s), Event::Connected { .. })) if s == b
+    ));
+
+    // Source result on A; copy it into B's `dst`.
+    handle.send_to(
+        a,
+        Command::OpenResult {
+            sql: "SELECT id, name FROM src".into(),
+            epoch: 1,
+            table: None,
+            sort: None,
+            filter: None,
+            joins: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        events.next().await,
+        Some((Some(s), Event::ResultReady { epoch: 1, .. })) if s == a
+    ));
+    handle.send_to(
+        a,
+        Command::CopyToTable {
+            id: 5,
+            source_epoch: 1,
+            target: TableRef {
+                schema: Some("main".into()),
+                name: "dst".into(),
+            },
+            target_session: b,
+            mapping: vec![
+                ColumnMap {
+                    source: 0,
+                    column: "id".into(),
+                    decl_type: None,
+                },
+                ColumnMap {
+                    source: 1,
+                    column: "name".into(),
+                    decl_type: None,
+                },
+            ],
+            mode: CopyMode::Append,
+            create: None,
+        },
+    );
+    match drain_copy(&mut events, 5).await {
+        Event::CopyFinished { rows, .. } => assert_eq!(rows, 2),
+        other => panic!("expected CopyFinished, got {other:?}"),
+    }
+
+    // The rows are now in B's database, not A's.
+    handle.send_to(
+        b,
+        Command::OpenResult {
+            sql: "SELECT id, name FROM dst ORDER BY id".into(),
+            epoch: 1,
+            table: None,
+            sort: None,
+            filter: None,
+            joins: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        events.next().await,
+        Some((Some(s), Event::ResultReady { total: 2, .. })) if s == b
+    ));
+    handle.send_to(b, Command::Shutdown);
+    std::fs::remove_file(&src_path).ok();
+    std::fs::remove_file(&dst_path).ok();
+}
+
+/// Phase 2: migrate *many* tables from one connection into another (empty) one in a
+/// single job — each table is created on the target from the source's shape and its
+/// rows streamed in. The source is listed `child` before `parent`, but the FK
+/// `child → parent` orders `parent` first.
+#[tokio::test]
+async fn migrates_all_tables_into_another_connection() {
+    let a = SessionId(1);
+    let b = SessionId(2);
+    let src_path =
+        std::env::temp_dir().join(format!("red_svc_migrate_a_{}.db", std::process::id()));
+    let dst_path =
+        std::env::temp_dir().join(format!("red_svc_migrate_b_{}.db", std::process::id()));
+    {
+        let conn = rusqlite::Connection::open(&src_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO parent VALUES (1,'a'),(2,'b');
+             CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id), tag TEXT);
+             INSERT INTO child VALUES (10,1,'x'),(20,1,'y'),(30,2,'z');
+             CREATE INDEX ix_child_parent ON child(parent_id);",
+        )
+        .unwrap();
+        // dst: an empty database (no tables) — migrate creates them.
+        rusqlite::Connection::open(&dst_path).unwrap();
+    }
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    handle.send_to(
+        a,
+        Command::Connect(sqlite(src_path.to_str().unwrap(), false)),
+    );
+    assert!(matches!(
+        events.next().await,
+        Some((Some(s), Event::Connected { .. })) if s == a
+    ));
+    handle.send_to(
+        b,
+        Command::Connect(sqlite(dst_path.to_str().unwrap(), false)),
+    );
+    assert!(matches!(
+        events.next().await,
+        Some((Some(s), Event::Connected { .. })) if s == b
+    ));
+
+    // Migrate both tables (listed child-first to exercise FK ordering) from A into B.
+    handle.send_to(
+        a,
+        Command::MigrateTables {
+            id: 11,
+            source_schema: Some("main".into()),
+            tables: vec!["child".into(), "parent".into()],
+            target_session: b,
+            target_schema: Some("main".into()),
+        },
+    );
+    match drain_copy(&mut events, 11).await {
+        Event::CopyFinished { rows, .. } => {
+            assert_eq!(rows, 5, "2 parent + 3 child rows migrated")
+        }
+        other => panic!("expected CopyFinished, got {other:?}"),
+    }
+
+    // Both tables now exist on B (a missing table would error, not ResultReady) with
+    // their rows.
+    handle.send_to(
+        b,
+        Command::OpenResult {
+            sql: "SELECT count(*) FROM parent".into(),
+            epoch: 1,
+            table: None,
+            sort: None,
+            filter: None,
+            joins: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        events.next().await,
+        Some((Some(s), Event::ResultReady { total: 1, .. })) if s == b
+    ));
+    handle.send_to(
+        b,
+        Command::OpenResult {
+            sql: "SELECT id, parent_id, tag FROM child ORDER BY id".into(),
+            epoch: 2,
+            table: None,
+            sort: None,
+            filter: None,
+            joins: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        events.next().await,
+        Some((Some(s), Event::ResultReady { total: 3, .. })) if s == b
+    ));
+    handle.send_to(
+        b,
+        Command::FetchPage {
+            offset: 0,
+            limit: 10,
+            epoch: 2,
+        },
+    );
+    match events.next().await.map(|(_, e)| e) {
+        Some(Event::ResultPageLoaded { rows, .. }) => {
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0][0], Value::Integer(10));
+            assert_eq!(rows[0][2], Value::Text("x".into()));
+        }
+        other => panic!("expected ResultPageLoaded, got {other:?}"),
+    }
+
+    // The deferred index pass recreated `ix_child_parent` on the target.
+    handle.send_to(
+        b,
+        Command::OpenResult {
+            sql: "SELECT count(*) FROM sqlite_master \
+                  WHERE type='index' AND name='ix_child_parent'"
+                .into(),
+            epoch: 3,
+            table: None,
+            sort: None,
+            filter: None,
+            joins: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        events.next().await,
+        Some((Some(s), Event::ResultReady { total: 1, .. })) if s == b
+    ));
+    handle.send_to(
+        b,
+        Command::FetchPage {
+            offset: 0,
+            limit: 1,
+            epoch: 3,
+        },
+    );
+    match events.next().await.map(|(_, e)| e) {
+        Some(Event::ResultPageLoaded { rows, .. }) => {
+            assert_eq!(rows[0][0], Value::Integer(1), "index recreated on target");
+        }
+        other => panic!("expected ResultPageLoaded, got {other:?}"),
+    }
+
+    handle.send_to(b, Command::Shutdown);
+    std::fs::remove_file(&src_path).ok();
+    std::fs::remove_file(&dst_path).ok();
 }
 
 #[test]

@@ -13,9 +13,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use red_core::{
-    AiLimits, AiTier, Column, ColumnMap, ColumnStats, ConnectionConfig, EditOp, ExportFormat,
-    FkEdge, ImportFormat, KeySpec, QueryOptions, QueryPlan, ResultFilter, RowWindow, SchemaMeta,
-    TableDetail, TableRef, UpdateState, Value,
+    AiLimits, AiTier, Column, ColumnMap, ColumnMeta, ColumnStats, ConnectionConfig, CopyMode,
+    EditOp, ExportFormat, FkEdge, FkJoin, ImportFormat, KeySpec, QueryOptions, QueryPlan,
+    ResultFilter, RowWindow, SchemaMeta, TableDetail, TableRef, UpdateState, Value,
 };
 
 /// Identifies one keep-alive backend session. Minted UI-side at connect start so
@@ -100,12 +100,21 @@ pub enum Command {
     /// probe, so the total, the seek key, sort, and export all operate on the
     /// filtered set. The wrap preserves `SELECT *`, so the key column survives and
     /// keyset paging is unaffected. `None` is the unfiltered open.
+    ///
+    /// `joins` (Track B7, inline FK expansion) decorates a table browse with extra,
+    /// dotted-aliased columns pulled from referenced tables: the backend wraps the
+    /// (already-filtered) base in `SELECT _red_base.*, <ref cols> FROM (base) AS
+    /// _red_base LEFT JOIN …` (see [`DatabaseDriver::fk_join_wrap`]). Base columns
+    /// stay first, so their positions/key/sort are unaffected; the unique-target gate
+    /// keeps the row count identical, so count/keyset/paging are unchanged. Empty for
+    /// an unexpanded browse, editor SQL, or an engine without relational FKs.
     OpenResult {
         sql: String,
         epoch: u64,
         table: Option<(String, String)>,
         sort: Option<SortKey>,
         filter: Option<ResultFilter>,
+        joins: Vec<FkJoin>,
     },
     /// Fetch one random-access page of an open result (grid load-on-scroll).
     /// `epoch` selects which open result; an unknown epoch is ignored (the tab
@@ -216,6 +225,64 @@ pub enum Command {
     /// earlier chunks remain.
     CancelImport {
         id: u64,
+    },
+    /// Describe a copy **target** table's columns (name + declared type) so the UI
+    /// can auto-map a source result's columns onto it by name before any write —
+    /// the copy's equivalent of `ImportColumns`' file-header peek. The envelope's
+    /// [`SessionId`] is the **target** connection (which may differ from the source
+    /// for a cross-connection copy). `id` correlates the `CopyTargetColumns` reply;
+    /// a describe failure comes back as `CopyFailed`.
+    CopyTargetColumns {
+        id: u64,
+        target: TableRef,
+    },
+    /// Stream a (filtered/sorted) open result straight into another table — the
+    /// table-copy headline. The envelope's [`SessionId`] is the **source** session;
+    /// `source_epoch` selects its open result, whose already-wrapped SQL is re-read
+    /// at **full fidelity** (never the display cap) through a fresh cursor — so the
+    /// copy is byte-exact and includes any `⌘⇧F` filter / sort. `target_session` is
+    /// where `target` lives (equal to the source for a same-connection copy, another
+    /// open connection for a cross-connection one); both ends are pinned against idle
+    /// eviction for the copy's lifetime. `mapping` projects each source column onto a
+    /// target column by name; `mode` chooses Append vs Truncate+insert. Runs off the
+    /// dispatch loop, one chunk resident, committing per chunk like import. `id`
+    /// routes progress / completion events and a `CancelCopy`.
+    ///
+    /// When `create` is `Some`, the target table is **created first** from that column
+    /// shape (types mapped into the target dialect via `red_core::typemap`), before the
+    /// rows stream in — this is "copy into a *new* table" / database migration. The
+    /// `create` columns mirror the source result's columns; `IF NOT EXISTS` makes it a
+    /// no-op if the table already exists. `None` requires the target to pre-exist (the
+    /// original same-shape copy).
+    CopyToTable {
+        id: u64,
+        source_epoch: u64,
+        target: TableRef,
+        target_session: SessionId,
+        mapping: Vec<ColumnMap>,
+        mode: CopyMode,
+        create: Option<Vec<ColumnMeta>>,
+    },
+    /// Abort an in-flight copy by `id` (the toast's Cancel). Rows committed in
+    /// earlier chunks remain (per-chunk commit, like import).
+    CancelCopy {
+        id: u64,
+    },
+    /// Migrate **many** tables in one job — the whole-database headline. The
+    /// envelope's [`SessionId`] is the **source** session; `source_schema` names the
+    /// namespace they live in and `tables` the table names to move. Each is created
+    /// on `target_session` under `target_schema` (from the source's column shape, types
+    /// mapped into the target dialect) and its rows streamed in — FK-ordered, skipping
+    /// any table that already exists on the target (migrate populates a *fresh*
+    /// database, never appends into an existing table). Both ends are pinned for the
+    /// job's lifetime; it reuses the `Copy*` progress/terminal events and a
+    /// `CancelCopy { id }`. One window resident at a time, committing per chunk.
+    MigrateTables {
+        id: u64,
+        source_schema: Option<String>,
+        tables: Vec<String>,
+        target_session: SessionId,
+        target_schema: Option<String>,
     },
     /// Peek a CSV/JSONL file's **source column names** (CSV header / first JSONL
     /// object's keys) without importing, so the UI can build a name-based column
@@ -563,6 +630,38 @@ pub enum Event {
     ImportColumns {
         id: u64,
         columns: Vec<String>,
+    },
+    /// A copy target table's columns (name + declared type), in response to
+    /// `CopyTargetColumns`. `id` correlates it to the pending copy; the UI maps the
+    /// source result's columns onto these by name and raises the copy confirm.
+    CopyTargetColumns {
+        id: u64,
+        columns: Vec<Column>,
+    },
+    /// A streamed copy made progress: `rows` rows committed so far (throttled). `id`
+    /// selects the copy's transfer toast.
+    CopyProgress {
+        id: u64,
+        rows: usize,
+    },
+    /// A streamed copy finished: `rows` rows committed into the target. `id` selects
+    /// the copy's toast.
+    CopyFinished {
+        id: u64,
+        rows: usize,
+    },
+    /// A copy failed (target describe, source read, coercion, truncate, or engine
+    /// error). `rows` rows committed in earlier chunks remain. `id` selects the toast.
+    CopyFailed {
+        id: u64,
+        rows: usize,
+        message: String,
+    },
+    /// An in-flight copy was cancelled. Rows committed in earlier chunks remain. `id`
+    /// selects the copy's toast.
+    CopyCancelled {
+        id: u64,
+        rows: usize,
     },
     /// The self-updater's state changed (Phases 3–4). Global (`None` session) —
     /// the UI stores it and renders the titlebar pill + About-tab status from it.

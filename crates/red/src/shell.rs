@@ -115,8 +115,58 @@ impl AppState {
         // `size_full` child but doesn't grow a `flex_1` one.)
         let show_history = active.history_open;
         let show_schema = !active.sidebar_collapsed;
+        let show_columns = active.columns_open;
 
-        // Innermost column boundary: Schema | (editor / results).
+        // Innermost-left column boundary: Columns (inline FK expansion) | (editor /
+        // results) — closest to the work area, since it's contextual to the result.
+        let with_columns = if show_columns {
+            let columns_pane = self.render_columns_panel(active, cx);
+            let start = view.clone();
+            let resize = view.clone();
+            let end = view.clone();
+            SplitPane::new("shell-split-columns", Axis::Horizontal)
+                .size(active.columns_w)
+                .gutter(px(1.))
+                .drag(active.columns_drag)
+                .min_first(px(180.))
+                .max_first(px(480.))
+                .on_drag_start(move |anchor, _, cx| {
+                    start
+                        .update(cx, |this, cx| {
+                            if let Phase::Connected(a) = &mut this.phase {
+                                a.columns_drag = Some(anchor);
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                })
+                .on_resize(move |size, _, cx| {
+                    resize
+                        .update(cx, |this, cx| {
+                            if let Phase::Connected(a) = &mut this.phase {
+                                a.columns_w = size;
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                })
+                .on_drag_end(move |_, cx| {
+                    end.update(cx, |this, cx| {
+                        if let Phase::Connected(a) = &mut this.phase {
+                            a.columns_drag = None;
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .first(columns_pane)
+                .second(inner)
+                .into_any_element()
+        } else {
+            inner.into_any_element()
+        };
+
+        // Innermost column boundary: Schema | (columns | editor / results).
         let with_schema = if show_schema {
             let schema_pane = self.render_schema(active, window, cx);
             let start = view.clone();
@@ -158,10 +208,10 @@ impl AppState {
                     .ok();
                 })
                 .first(schema_pane)
-                .second(inner)
+                .second(with_columns)
                 .into_any_element()
         } else {
-            inner.into_any_element()
+            with_columns
         };
 
         // Outermost column boundary: History | (schema | editor / results).
@@ -383,6 +433,30 @@ impl AppState {
             ))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx)));
 
+        // Columns panel toggle (inline FK expansion) — accent-tinted while open.
+        let columns_toggle = div()
+            .id("toggle-columns")
+            .mr_1()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(20.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .tooltip(Tooltip::text("Toggle reference columns"))
+            .hover(|s| s.bg(theme.bg_elevated))
+            .child(crate::icons::icon(
+                "col",
+                theme.scale(14.),
+                if active.columns_open {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                },
+            ))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_columns_panel(cx)));
+
         // Assistant toggle, pinned to the far-right of the status bar (mirrors the
         // schema sidebar toggle on the left). Accent-tinted while the panel is open.
         // Hidden entirely when the assistant is disabled for this connection (the
@@ -437,6 +511,7 @@ impl AppState {
                     .overflow_hidden()
                     .child(history_toggle)
                     .child(sidebar_toggle)
+                    .child(columns_toggle)
                     .child(status_left),
             )
             .child(
@@ -481,12 +556,19 @@ impl AppState {
             );
         };
 
-        let (secondary, focus, width, drag) = (s.secondary, s.focus, s.width, s.drag);
+        let (focus, width, drag) = (s.focus, s.width, s.drag);
         let primary_focused = focus == SplitHalf::Primary;
+        // Each half renders its pane's active tab (its strip shows only its own tabs).
+        let primary_tab = active
+            .pane_active(SplitHalf::Primary)
+            .unwrap_or(active.active_tab);
+        let secondary_tab = active
+            .pane_active(SplitHalf::Secondary)
+            .unwrap_or(s.secondary);
         let first = self.render_half(
             active,
             SplitHalf::Primary,
-            active.active_tab,
+            primary_tab,
             primary_focused,
             window,
             cx,
@@ -494,7 +576,7 @@ impl AppState {
         let second = self.render_half(
             active,
             SplitHalf::Secondary,
-            secondary,
+            secondary_tab,
             !primary_focused,
             window,
             cx,
@@ -614,17 +696,30 @@ impl AppState {
 
         // The unique wrapper id scopes the two halves' child element ids apart; the
         // mouse-down aims run/export/filter at whichever half was clicked.
+        let accent = theme.accent;
+        let border = theme.border;
+        let drop_view = view.clone();
         div()
             .id(("split-half", half.index()))
             .size_full()
             .flex()
             .flex_col()
-            .when(is_split, |d| {
-                d.border_1().border_color(if is_focused {
-                    theme.accent
-                } else {
-                    theme.border
-                })
+            .when(is_split, move |d| {
+                d.border_1()
+                    .border_color(if is_focused { accent } else { border })
+                    // A tab dragged from either strip and dropped onto this half's
+                    // body moves (or swaps) it here. The strips handle their own
+                    // drops (reorder) and stop propagation, so this fires only for
+                    // the editor/result area. `drag_over` tints the hovered half.
+                    .drag_over::<crate::editor::TabDrag>(move |s, _, _, _| {
+                        s.border_color(accent).bg(accent.opacity(0.06))
+                    })
+                    .on_drop::<crate::editor::TabDrag>(move |drag, _window, cx| {
+                        let from = drag.0;
+                        drop_view
+                            .update(cx, |this, cx| this.move_tab_to_half(from, half, cx))
+                            .ok();
+                    })
             })
             .on_mouse_down(
                 MouseButton::Left,

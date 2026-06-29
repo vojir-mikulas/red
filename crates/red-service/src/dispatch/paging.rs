@@ -390,6 +390,7 @@ pub(crate) fn col_meta_from_result(c: &red_core::Column) -> red_core::ColumnMeta
         not_null: false,
         primary_key: false,
         default: None,
+        auto_increment: false,
     }
 }
 

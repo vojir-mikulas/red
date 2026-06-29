@@ -302,6 +302,18 @@ impl AppState {
                             .size(ButtonSize::Sm)
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_filter_bar(cx))),
                     )
+                    // "Copy to…" — stream this result (filter included) into another
+                    // table, same connection or another open one. Offered on any
+                    // ready result; the source may be read-only (only the target must
+                    // be writable, gated in the picker).
+                    .when(grid.ready, |t| {
+                        t.child(
+                            Button::new("result-copy-to", "Copy to…")
+                                .variant(ButtonVariant::Ghost)
+                                .size(ButtonSize::Sm)
+                                .on_click(cx.listener(|this, _, _, cx| this.open_copy_picker(cx))),
+                        )
+                    })
                     .when(self.editing_enabled() && grid.editable_browse(), |t| {
                         // Import a CSV/JSONL file into this table — shown only on an
                         // editable keyed browse of a writable connection, like "+ Row"
@@ -378,6 +390,10 @@ impl AppState {
         // Forward-FK data columns (Track B7), snapshotted into the row closure so the
         // paint path stays alloc-free — a membership test, computed off-frame.
         let fk_cols = grid.fk_cols.clone();
+        // Inline-expanded reference columns (Track B7), snapshotted for the cell-bg
+        // hook so a faint wash marks them as derived, not base-table, data.
+        let joined_cols = grid.joined_cols.clone();
+        let joined_tint = Hsla { a: 0.05, ..cyan };
         let sender = grid.sender.clone();
         let epoch = grid.epoch;
         let (sort_view, cell_view, nav_view) = (view.clone(), view.clone(), view.clone());
@@ -492,6 +508,11 @@ impl AppState {
                 }
                 if table_col >= gutter && find_hits.contains(&(abs, table_col - gutter)) {
                     return Some(find_tint);
+                }
+                // A joined reference column (read-only, derived) gets a faint wash —
+                // lowest priority, so a find/edit/delete tint still wins on top.
+                if table_col >= gutter && joined_cols.contains(&(table_col - gutter)) {
+                    return Some(joined_tint);
                 }
                 None
             })
@@ -1133,6 +1154,64 @@ impl AppState {
                         cx.notify();
                     },
                 )),
+            );
+        }
+        // Inline FK expansion (Track B7): pull the focused FK cell's referenced
+        // columns into the grid (a ✓ marks ones already shown), hide a joined
+        // column, or clear them all. The per-column list comes from the referenced
+        // table's prefetched detail; the Columns panel is the fuller, recursive UI.
+        let ref_menu = self.reference_menu();
+        let joined_path = self.focused_joined_path();
+        let has_expansion = self.active_has_expansion();
+        if ref_menu.as_ref().is_some_and(|m| !m.columns.is_empty())
+            || joined_path.is_some()
+            || has_expansion
+        {
+            menu = menu.separator();
+        }
+        if let Some(ref_menu) = ref_menu {
+            if !ref_menu.columns.is_empty() {
+                menu = menu.item(
+                    ContextMenuItem::new("ref-hdr", format!("Show from {}", ref_menu.ref_table))
+                        .disabled(true),
+                );
+                for (i, item) in ref_menu.columns.into_iter().enumerate() {
+                    let mark = if item.shown { "✓ " } else { "    " };
+                    let path = item.path;
+                    menu = menu.item(
+                        ContextMenuItem::new(
+                            format!("ref-col-{i}"),
+                            format!("{mark}{}", item.label),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.cell_menu = None;
+                            this.toggle_reference_column(path.clone(), cx);
+                            cx.notify();
+                        })),
+                    );
+                }
+            }
+        }
+        if let Some(path) = joined_path {
+            menu = menu.item(
+                ContextMenuItem::new("ref-hide", format!("Hide {}", path.join("."))).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.cell_menu = None;
+                        this.toggle_reference_column(path.clone(), cx);
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+        if has_expansion {
+            menu = menu.item(
+                ContextMenuItem::new("ref-clear", "Hide all reference columns").on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.cell_menu = None;
+                        this.clear_reference_columns(cx);
+                        cx.notify();
+                    }),
+                ),
             );
         }
         if editable_cell {

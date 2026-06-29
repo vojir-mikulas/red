@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::UnboundedSender;
 use red_core::{
-    coerce_edit_value, Column, ColumnMap, ImportFormat, KeyKind, KeySpec, RedError, ResultFilter,
-    TableRef, Value,
+    coerce_edit_value, Column, ColumnMap, ColumnMeta, CopyMode, FkEdge, ImportFormat, KeyKind,
+    KeySpec, QueryOptions, RedError, ResultFilter, TableRef, Value,
 };
 use red_driver::{AbortSignal, DatabaseDriver, ImportReader, PageCap};
 use tokio::sync::mpsc::UnboundedReceiver as CmdReceiver;
@@ -53,6 +53,17 @@ const MAX_CONCURRENT_EXPORTS: usize = 4;
 /// How many imports may stream at once across all sessions. Writes are heavier than
 /// reads (and hold a connection in a transaction), so this is tighter than exports.
 const MAX_CONCURRENT_IMPORTS: usize = 2;
+
+/// How many table copies may stream at once across all sessions. A copy pins a
+/// connection on *each* end (source read + target write) for its whole lifetime, so
+/// this is kept as tight as imports — a couple of millions-of-rows transfers can run
+/// together without fanning out an unbounded number of pinned connections.
+const MAX_CONCURRENT_COPIES: usize = 2;
+
+/// Rows per source window / insert chunk in a table copy (the driver re-clamps the
+/// insert to its bound-parameter cap). Keeps the copy one-chunk-resident regardless
+/// of how many rows move; a `[copy]` knob is a later refinement, like import's.
+const COPY_CHUNK_ROWS: usize = 500;
 
 /// Hard ceiling on rows pulled by one `CopyRows` (clipboard) request. `CopyRows`
 /// fetches at full fidelity into a single `Vec` carried in one event, so a
@@ -114,6 +125,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
     // interactive paging, nor the reverse.
     let export_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_EXPORTS));
     let import_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_IMPORTS));
+    let copy_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_COPIES));
     // Wakes the loop even when no command arrives, so idle sessions get swept.
     let mut sweep = tokio::time::interval(EVICT_SWEEP);
     // `Connect`/`TestConnection` dial off the loop (a slow connect mustn't freeze
@@ -748,6 +760,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 table,
                 sort,
                 filter,
+                joins,
             } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get_mut(&id) else {
@@ -856,13 +869,25 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             }
                         }
                     };
+                    // Inline FK expansion (Track B7): decorate the filtered base with
+                    // the chosen referenced columns, interleaved next to the FK column
+                    // they expand from (the base column order comes from `detail`). The
+                    // unique-target gate keeps the row count identical, so `count` /
+                    // `bounds` (probed on `filtered_sql`) need no join; columns are
+                    // addressed by name downstream, so the reorder is transparent. Empty
+                    // `joins` (or a no-FK engine) leaves `filtered_sql` untouched.
+                    let base_cols: Vec<String> = detail
+                        .as_ref()
+                        .map(|d| d.columns.iter().map(|c| c.name.clone()).collect())
+                        .unwrap_or_default();
+                    let joined_sql = driver.fk_join_wrap(&filtered_sql, &base_cols, &joins);
                     // The SQL later page/run fetches re-run. Keyset orders itself
                     // (driver adds `ORDER BY (sort_col, pk)`), so it pages the
                     // *filtered* query; a sorted result that fell back to OFFSET must
                     // still be ordered, so wrap it by output position.
                     let effective_sql = match (&sort, &key) {
-                        (Some(s), None) => wrap_sorted(&filtered_sql, s.position, s.descending),
-                        _ => filtered_sql.clone(),
+                        (Some(s), None) => wrap_sorted(&joined_sql, s.position, s.descending),
+                        _ => joined_sql.clone(),
                     };
                     // `LIMIT 0` reads column metadata without stepping rows;
                     // counting and the key-bounds probe run concurrently with it.
@@ -882,10 +907,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     // Race the (potentially full-table `COUNT(*)`) probe against the
                     // statement timeout: on expiry, abort the bundle at the engine
                     // and report a timeout instead of leaving the result "running".
+                    // Count on the *unjoined* filtered SQL (joins are unique-target, so
+                    // they don't change cardinality — and this avoids joining for a
+                    // bare `COUNT(*)`); columns come from the *joined* SQL so the
+                    // reported column set includes the expanded reference columns.
                     let probe = async {
                         tokio::join!(
                             driver.count(&filtered_sql, &abort),
-                            driver.fetch_page(&filtered_sql, 0, 0, PageCap::Full, &abort),
+                            driver.fetch_page(&joined_sql, 0, 0, PageCap::Full, &abort),
                             bounds
                         )
                     };
@@ -1512,6 +1541,249 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 }
             }
 
+            Command::CopyTargetColumns { id, target } => {
+                // Describe the copy target's columns on the *target* session (the
+                // envelope's), so the UI can auto-map by name before any write.
+                let Some(sid) = session_id else { continue };
+                let Some(state) = sessions.get(&sid) else {
+                    emit(
+                        &events,
+                        None,
+                        Event::CopyFailed {
+                            id,
+                            rows: 0,
+                            message: "target connection isn't open".into(),
+                        },
+                    );
+                    continue;
+                };
+                let driver = state.driver.clone();
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let schema = target.schema.clone().unwrap_or_default();
+                    match driver.describe_table(&schema, &target.name).await {
+                        Ok(detail) => {
+                            let columns = detail
+                                .columns
+                                .iter()
+                                .map(|c| Column {
+                                    name: c.name.clone(),
+                                    decl_type: c.type_name.clone(),
+                                })
+                                .collect();
+                            emit(&events, None, Event::CopyTargetColumns { id, columns });
+                        }
+                        Err(e) => emit(
+                            &events,
+                            None,
+                            Event::CopyFailed {
+                                id,
+                                rows: 0,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
+                });
+            }
+
+            Command::CopyToTable {
+                id,
+                source_epoch,
+                target,
+                target_session,
+                mapping,
+                mode,
+                create,
+            } => {
+                // Fail fast with a `CopyFailed` (the toast's terminal event) on any
+                // missing piece, so the UI never strands a "Copying…" toast.
+                macro_rules! copy_fail {
+                    ($msg:expr) => {{
+                        emit(
+                            &events,
+                            None,
+                            Event::CopyFailed {
+                                id,
+                                rows: 0,
+                                message: $msg.into(),
+                            },
+                        );
+                        continue;
+                    }};
+                }
+                let Some(source_sid) = session_id else {
+                    continue;
+                };
+                // Source: the open result's already-wrapped (filtered/sorted) SQL,
+                // re-read at full fidelity through a fresh cursor.
+                let Some(src_state) = sessions.get(&source_sid) else {
+                    copy_fail!("source connection isn't open")
+                };
+                let Some(source_sql) = lock(&src_state.results)
+                    .get(&source_epoch)
+                    .map(|s| s.sql.clone())
+                else {
+                    copy_fail!("no open result to copy")
+                };
+                let src = src_state.driver.clone();
+                let src_busy = src_state.busy.clone();
+                let exports = src_state.exports.clone();
+                // Target: another open session (or the same one). Its driver does the
+                // writes; both ends are pinned for the copy's lifetime.
+                let Some(dst_state) = sessions.get(&target_session) else {
+                    copy_fail!("target connection isn't open")
+                };
+                let dst = dst_state.driver.clone();
+                let dst_busy = dst_state.busy.clone();
+
+                // Register the cancel flag on the source session's transfer registry
+                // (shared id space with exports/imports) so a `CancelCopy` flips it.
+                let cancel = Arc::new(AtomicBool::new(false));
+                lock(&exports).insert(id, cancel.clone());
+
+                // Copy events route *globally* (`None` session): the op spans two
+                // connections and its toast lives on the UI's global notification
+                // list, surviving a `⌘P` connection switch. `copy_job` emits its own
+                // `CopyProgress` inline so the terminal event below strictly follows
+                // the last progress (no separate forwarder to race it).
+                let events = events.clone();
+                let copy_limit = copy_limit.clone();
+                tokio::spawn(async move {
+                    let _permit = copy_limit.acquire_owned().await;
+                    // Pin both ends so neither is evicted mid-copy (no commands touch
+                    // a background source/target for minutes); RAII so the pins lift
+                    // on finish, cancel, or panic.
+                    let _src_pin = PinGuard::new(src_busy);
+                    let _dst_pin = PinGuard::new(dst_busy);
+                    let (committed, err) = copy_job(
+                        src,
+                        dst,
+                        source_sql,
+                        target,
+                        mapping,
+                        mode,
+                        create,
+                        cancel,
+                        events.clone(),
+                        id,
+                    )
+                    .await;
+                    lock(&exports).remove(&id);
+                    let rows = committed as usize;
+                    match err {
+                        None => emit(&events, None, Event::CopyFinished { id, rows }),
+                        Some(RedError::Interrupted) => {
+                            emit(&events, None, Event::CopyCancelled { id, rows })
+                        }
+                        Some(e) => emit(
+                            &events,
+                            None,
+                            Event::CopyFailed {
+                                id,
+                                rows,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
+                });
+            }
+
+            Command::CancelCopy { id } => {
+                let Some(sid) = session_id else { continue };
+                // Flip the flag; the copy's between-chunks check picks it up and
+                // replies `CopyCancelled` (earlier committed chunks remain).
+                if let Some(state) = sessions.get(&sid) {
+                    if let Some(cancel) = lock(&state.exports).get(&id) {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+
+            Command::MigrateTables {
+                id,
+                source_schema,
+                tables,
+                target_session,
+                target_schema,
+            } => {
+                // Fail fast with a `CopyFailed` (the toast's terminal event) on any
+                // missing piece, so the UI never strands a "Migrating…" toast.
+                macro_rules! migrate_fail {
+                    ($msg:expr) => {{
+                        emit(
+                            &events,
+                            None,
+                            Event::CopyFailed {
+                                id,
+                                rows: 0,
+                                message: $msg.into(),
+                            },
+                        );
+                        continue;
+                    }};
+                }
+                let Some(source_sid) = session_id else {
+                    continue;
+                };
+                let Some(src_state) = sessions.get(&source_sid) else {
+                    migrate_fail!("source connection isn't open")
+                };
+                let src = src_state.driver.clone();
+                let src_busy = src_state.busy.clone();
+                let exports = src_state.exports.clone();
+                let Some(dst_state) = sessions.get(&target_session) else {
+                    migrate_fail!("target connection isn't open")
+                };
+                let dst = dst_state.driver.clone();
+                let dst_busy = dst_state.busy.clone();
+                if tables.is_empty() {
+                    migrate_fail!("no tables to migrate")
+                }
+
+                // Reuse the copy cancel registry + the `Copy*` events/toast: a migrate
+                // is N copies under one id (one toast, one Cancel).
+                let cancel = Arc::new(AtomicBool::new(false));
+                lock(&exports).insert(id, cancel.clone());
+
+                let events = events.clone();
+                let copy_limit = copy_limit.clone();
+                tokio::spawn(async move {
+                    let _permit = copy_limit.acquire_owned().await;
+                    // Pin both ends for the whole multi-table job (no commands touch a
+                    // background source/target for minutes); RAII lifts on finish/cancel.
+                    let _src_pin = PinGuard::new(src_busy);
+                    let _dst_pin = PinGuard::new(dst_busy);
+                    let (committed, err) = migrate_job(
+                        src,
+                        dst,
+                        source_schema,
+                        tables,
+                        target_schema,
+                        cancel,
+                        events.clone(),
+                        id,
+                    )
+                    .await;
+                    lock(&exports).remove(&id);
+                    let rows = committed as usize;
+                    match err {
+                        None => emit(&events, None, Event::CopyFinished { id, rows }),
+                        Some(RedError::Interrupted) => {
+                            emit(&events, None, Event::CopyCancelled { id, rows })
+                        }
+                        Some(e) => emit(
+                            &events,
+                            None,
+                            Event::CopyFailed {
+                                id,
+                                rows,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
+                });
+            }
+
             Command::ImportColumns { path, format, id } => {
                 // Peek the header on a blocking thread (cheap file IO, no session
                 // needed); reply with the source column names or an ImportFailed.
@@ -1674,4 +1946,468 @@ fn run_import_blocking(
     }
     flush!();
     (committed, None)
+}
+
+/// Stream an open result (`source_sql`, already filtered/sorted/wrapped) from `src`
+/// straight into `target` on `dst` — the table-copy job. Reuses the read seam
+/// (`open_cursor`/`next_window`, **full fidelity** so a long TEXT/blob copies
+/// byte-exact, never the display cap — `data-import.md`'s Gap 2) and the write seam
+/// (`insert_rows`); `src` and `dst` may be the same driver (same-connection copy) or
+/// two different engines (cross-connection). One window is resident at a time, so
+/// memory is bounded by [`COPY_CHUNK_ROWS`], not row count.
+///
+/// `mapping` projects each source row into target-column order by the source column
+/// **index** it carries; each value rides as a typed [`Value`] and `insert_rows`
+/// binds it under the **target** column's `decl_type` (so a cross-engine
+/// `uuid`/`json`/… text round-trips into its target column). For `TruncateInsert`
+/// the target is cleared first. Inserts **commit per chunk** (like import), so the
+/// returned committed count is meaningful on error/cancel. `cancel` is checked
+/// between chunks. Returns `(rows committed, error-or-None)`.
+#[allow(clippy::too_many_arguments)]
+async fn copy_job(
+    src: Arc<dyn DatabaseDriver>,
+    dst: Arc<dyn DatabaseDriver>,
+    source_sql: String,
+    target: TableRef,
+    mapping: Vec<ColumnMap>,
+    mode: CopyMode,
+    create: Option<Vec<ColumnMeta>>,
+    cancel: Arc<AtomicBool>,
+    events: Events,
+    id: u64,
+) -> (u64, Option<RedError>) {
+    if mapping.is_empty() {
+        return (
+            0,
+            Some(RedError::Query("no columns map onto the target".into())),
+        );
+    }
+    // The target columns, in insert order (name + declared type for the bind cast).
+    let target_columns: Vec<Column> = mapping
+        .iter()
+        .map(|m| Column {
+            name: m.column.clone(),
+            decl_type: m.decl_type.clone(),
+        })
+        .collect();
+
+    // "Copy into a *new* table" / migration: create the target from the source's
+    // column shape (types mapped into the target dialect) before any read. `IF NOT
+    // EXISTS`, so a pre-existing target is a no-op. Done before the truncate so a
+    // Truncate+insert into a freshly-created table can't fail on a missing table.
+    if let Some(columns) = &create {
+        if cancel.load(Ordering::Relaxed) {
+            return (0, Some(RedError::Interrupted));
+        }
+        if let Err(e) = dst.create_table(&target, columns).await {
+            return (0, Some(e));
+        }
+    }
+
+    // Truncate+insert clears the target first (behind the UI's destructive confirm).
+    if matches!(mode, CopyMode::TruncateInsert) {
+        if cancel.load(Ordering::Relaxed) {
+            return (0, Some(RedError::Interrupted));
+        }
+        if let Err(e) = dst.clear_table(&target).await {
+            return (0, Some(e));
+        }
+    }
+
+    // Stream the source rows in, projecting per `mapping`, emitting `CopyProgress`
+    // (one tick per committed chunk) so the caller's terminal event can never be
+    // overtaken by a trailing progress from a separate forwarder task.
+    stream_into(
+        &src,
+        &dst,
+        &source_sql,
+        &target,
+        &mapping,
+        &target_columns,
+        &cancel,
+        0,
+        |total| {
+            emit(
+                &events,
+                None,
+                Event::CopyProgress {
+                    id,
+                    rows: total as usize,
+                },
+            )
+        },
+    )
+    .await
+}
+
+/// Stream `source_sql` from `src` into `target` on `dst`: open a full-fidelity forward
+/// cursor (each source row seen exactly once, never `Value::Capped`), project each row
+/// into target-column order by the source index `mapping` carries, and `insert_rows` in
+/// chunks — committing per chunk so the returned count is meaningful on error/cancel.
+/// `on_progress(total)` is called after each committed chunk with `base` plus the rows
+/// committed so far, so a single copy reports its own running count and a multi-table
+/// migrate reports a *cumulative* count across tables. `cancel` is checked between
+/// chunks. Returns `(rows committed by this call, error-or-None)`. Memory is bounded by
+/// [`COPY_CHUNK_ROWS`], not row count. Shared by [`copy_job`] and [`migrate_job`].
+#[allow(clippy::too_many_arguments)]
+async fn stream_into(
+    src: &Arc<dyn DatabaseDriver>,
+    dst: &Arc<dyn DatabaseDriver>,
+    source_sql: &str,
+    target: &TableRef,
+    mapping: &[ColumnMap],
+    target_columns: &[Column],
+    cancel: &Arc<AtomicBool>,
+    base: u64,
+    mut on_progress: impl FnMut(u64),
+) -> (u64, Option<RedError>) {
+    let opts = QueryOptions {
+        window: COPY_CHUNK_ROWS,
+        timeout: None,
+        full_fidelity: true,
+    };
+    let cursor = match src.open_cursor(source_sql, opts).await {
+        Ok(c) => c,
+        Err(e) => return (0, Some(e)),
+    };
+    let mut committed = 0u64;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return (committed, Some(RedError::Interrupted));
+        }
+        let window = match cursor.next_window(COPY_CHUNK_ROWS).await {
+            Ok(w) => w,
+            Err(e) => return (committed, Some(e)),
+        };
+        if !window.rows.is_empty() {
+            let chunk: Vec<Vec<Value>> = window
+                .rows
+                .iter()
+                .map(|row| {
+                    mapping
+                        .iter()
+                        .map(|m| row.get(m.source).cloned().unwrap_or(Value::Null))
+                        .collect()
+                })
+                .collect();
+            match dst.insert_rows(target, target_columns, &chunk).await {
+                Ok(n) => {
+                    committed += n;
+                    on_progress(base + committed);
+                }
+                Err(e) => return (committed, Some(e)),
+            }
+        }
+        if window.exhausted {
+            break;
+        }
+    }
+    (committed, None)
+}
+
+/// Order `tables` so a table's foreign-key parents come **before** it (children last)
+/// — Kahn's algorithm over the FK edges restricted to the migrated set, ties broken by
+/// input order, cycles broken by emitting the next remaining table. Only edges whose
+/// *both* endpoints are in `tables` (and, when `schema` is given, in that namespace)
+/// constrain the order; self-references are ignored. With v1 not yet recreating FKs the
+/// order is cosmetic (the fresh tables carry no constraints), but it lands parent rows
+/// first and makes the Phase-3 deferred-FK pass a drop-in.
+fn order_by_fk(tables: &[String], schema: Option<&str>, fks: &[FkEdge]) -> Vec<String> {
+    use std::collections::{HashMap, HashSet};
+    // Unique lowercased keys in input order, and the original display name per key.
+    let mut order: Vec<String> = Vec::new();
+    let mut orig: HashMap<String, String> = HashMap::new();
+    for t in tables {
+        let k = t.to_ascii_lowercase();
+        if orig.insert(k.clone(), t.clone()).is_none() {
+            order.push(k);
+        }
+    }
+    let in_set = |t: &str| orig.contains_key(&t.to_ascii_lowercase());
+    let in_scope = |s: &Option<String>| {
+        schema.is_none_or(|sc| s.as_deref().is_none_or(|x| x.eq_ignore_ascii_case(sc)))
+    };
+    // deps[child] = parents (lowercased) it must follow.
+    let mut deps: HashMap<String, HashSet<String>> =
+        order.iter().map(|k| (k.clone(), HashSet::new())).collect();
+    for fk in fks {
+        let child = fk.from_table.to_ascii_lowercase();
+        let parent = fk.to_table.to_ascii_lowercase();
+        if child != parent
+            && in_set(&fk.from_table)
+            && in_set(&fk.to_table)
+            && in_scope(&fk.from_schema)
+            && in_scope(&fk.to_schema)
+        {
+            deps.get_mut(&child).unwrap().insert(parent);
+        }
+    }
+    let mut done: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::with_capacity(order.len());
+    while out.len() < order.len() {
+        let mut progressed = false;
+        for k in &order {
+            if done.contains(k) {
+                continue;
+            }
+            if deps[k].iter().all(|p| done.contains(p)) {
+                out.push(orig[k].clone());
+                done.insert(k.clone());
+                progressed = true;
+            }
+        }
+        if !progressed {
+            // A cycle among the remaining tables: emit the next one in input order.
+            match order.iter().find(|k| !done.contains(*k)) {
+                Some(k) => {
+                    out.push(orig[k].clone());
+                    done.insert(k.clone());
+                }
+                None => break,
+            }
+        }
+    }
+    out
+}
+
+/// Migrate many tables from `src` into `dst` in one job — the whole-database move.
+/// Orders the tables FK-parents-first ([`order_by_fk`]), skips any that already exist
+/// on the target (migrate populates a *fresh* database, never appends into an existing
+/// table), and for each: `describe_table` → `create_table` (column shape mapped into
+/// the target dialect) → stream the rows via [`stream_into`]. Reuses the `Copy*` events
+/// with a cumulative `CopyProgress`. Both ends are pinned by the caller; `cancel` is
+/// checked between tables and between chunks. Returns `(total rows committed, err)`.
+#[allow(clippy::too_many_arguments)]
+async fn migrate_job(
+    src: Arc<dyn DatabaseDriver>,
+    dst: Arc<dyn DatabaseDriver>,
+    source_schema: Option<String>,
+    tables: Vec<String>,
+    target_schema: Option<String>,
+    cancel: Arc<AtomicBool>,
+    events: Events,
+    id: u64,
+) -> (u64, Option<RedError>) {
+    // FK graph for ordering (best-effort: a failure just falls back to listed order).
+    let fks = src.foreign_keys().await.unwrap_or_default();
+    let ordered = order_by_fk(&tables, source_schema.as_deref(), &fks);
+
+    // Tables already present on the target → skipped (never appended into).
+    let existing: std::collections::HashSet<String> = match dst.list_objects().await {
+        Ok(schemas) => schemas
+            .iter()
+            .filter(|s| {
+                target_schema
+                    .as_deref()
+                    .is_none_or(|t| s.name.eq_ignore_ascii_case(t))
+            })
+            .flat_map(|s| s.objects.iter().map(|o| o.name.to_ascii_lowercase()))
+            .collect(),
+        Err(_) => std::collections::HashSet::new(),
+    };
+
+    let mut committed = 0u64;
+    // Tables actually migrated (name + their source detail), retained for the deferred
+    // index/FK passes after all data lands.
+    let mut migrated: Vec<(String, red_core::TableDetail)> = Vec::new();
+    for table in ordered {
+        if cancel.load(Ordering::Relaxed) {
+            return (committed, Some(RedError::Interrupted));
+        }
+        if existing.contains(&table.to_ascii_lowercase()) {
+            continue;
+        }
+        let detail = match src
+            .describe_table(source_schema.as_deref().unwrap_or(""), &table)
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => return (committed, Some(e)),
+        };
+        if detail.columns.is_empty() {
+            continue; // nothing to shape a CREATE from (e.g. a 0-column view)
+        }
+        let target = TableRef {
+            schema: target_schema.clone(),
+            name: table.clone(),
+        };
+        if let Err(e) = dst.create_table(&target, &detail.columns).await {
+            return (committed, Some(e));
+        }
+        // Identity mapping + target columns from the source's columns.
+        let mapping: Vec<ColumnMap> = detail
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| ColumnMap {
+                source: i,
+                column: c.name.clone(),
+                decl_type: c.type_name.clone(),
+            })
+            .collect();
+        let target_columns: Vec<Column> = detail
+            .columns
+            .iter()
+            .map(|c| Column {
+                name: c.name.clone(),
+                decl_type: c.type_name.clone(),
+            })
+            .collect();
+        let source_ref = TableRef {
+            schema: source_schema.clone(),
+            name: table.clone(),
+        };
+        let source_sql = format!("SELECT * FROM {}", src.quote_table(&source_ref));
+        let (delta, err) = stream_into(
+            &src,
+            &dst,
+            &source_sql,
+            &target,
+            &mapping,
+            &target_columns,
+            &cancel,
+            committed,
+            |total| {
+                emit(
+                    &events,
+                    None,
+                    Event::CopyProgress {
+                        id,
+                        rows: total as usize,
+                    },
+                )
+            },
+        )
+        .await;
+        committed += delta;
+        if let Some(e) = err {
+            return (committed, Some(e));
+        }
+        migrated.push((table, detail));
+    }
+
+    // Deferred index pass: recreate secondary indexes after the data loads, skipping
+    // the primary-key-backing / engine-auto index (already created with the table).
+    // Best-effort — a failed index is logged, not fatal (the data is already in).
+    for (table, detail) in &migrated {
+        if cancel.load(Ordering::Relaxed) {
+            return (committed, Some(RedError::Interrupted));
+        }
+        let pk: std::collections::HashSet<String> = detail
+            .columns
+            .iter()
+            .filter(|c| c.primary_key)
+            .map(|c| c.name.to_ascii_lowercase())
+            .collect();
+        let target = TableRef {
+            schema: target_schema.clone(),
+            name: table.clone(),
+        };
+        for idx in &detail.indexes {
+            let cols: std::collections::HashSet<String> =
+                idx.columns.iter().map(|c| c.to_ascii_lowercase()).collect();
+            let lname = idx.name.to_ascii_lowercase();
+            let backs_pk = !pk.is_empty() && cols == pk;
+            let pk_named = lname == "primary"
+                || lname.starts_with("sqlite_autoindex")
+                || lname.ends_with("_pkey");
+            if idx.columns.is_empty() || backs_pk || pk_named {
+                continue;
+            }
+            if let Err(e) = dst
+                .create_index(&target, &idx.name, idx.unique, &idx.columns)
+                .await
+            {
+                tracing::warn!(table = %table, index = %idx.name, error = %e, "migrate: index recreation skipped");
+            }
+        }
+    }
+
+    // Deferred FK pass: recreate foreign keys among the migrated set now that every
+    // table exists + is filled (so dependency order can't block). Best-effort — logged,
+    // not fatal, and a no-op on engines that can't `ALTER … ADD a foreign key (SQLite).
+    let migrated_set: std::collections::HashSet<String> = migrated
+        .iter()
+        .map(|(t, _)| t.to_ascii_lowercase())
+        .collect();
+    let in_scope = |s: &Option<String>| {
+        source_schema
+            .as_deref()
+            .is_none_or(|sc| s.as_deref().is_none_or(|x| x.eq_ignore_ascii_case(sc)))
+    };
+    for fk in &fks {
+        if cancel.load(Ordering::Relaxed) {
+            return (committed, Some(RedError::Interrupted));
+        }
+        // Only FKs whose both endpoints were migrated (and, when scoped, in the source
+        // schema) — mirrors `order_by_fk`'s in-scope rule.
+        if !migrated_set.contains(&fk.from_table.to_ascii_lowercase())
+            || !migrated_set.contains(&fk.to_table.to_ascii_lowercase())
+            || !in_scope(&fk.from_schema)
+            || !in_scope(&fk.to_schema)
+        {
+            continue;
+        }
+        let child = TableRef {
+            schema: target_schema.clone(),
+            name: fk.from_table.clone(),
+        };
+        let parent = TableRef {
+            schema: target_schema.clone(),
+            name: fk.to_table.clone(),
+        };
+        let cols: Vec<String> = fk.columns.iter().map(|(f, _)| f.clone()).collect();
+        let refs: Vec<String> = fk.columns.iter().map(|(_, t)| t.clone()).collect();
+        if let Err(e) = dst.add_foreign_key(&child, &cols, &parent, &refs).await {
+            tracing::warn!(child = %fk.from_table, parent = %fk.to_table, error = %e, "migrate: foreign key skipped");
+        }
+    }
+
+    (committed, None)
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    fn fk(from: &str, to: &str) -> FkEdge {
+        FkEdge {
+            from_schema: None,
+            from_table: from.into(),
+            to_schema: None,
+            to_table: to.into(),
+            columns: vec![],
+        }
+    }
+
+    #[test]
+    fn orders_fk_parents_before_children() {
+        let tables = vec!["child".to_string(), "parent".to_string()];
+        // child → parent, so parent must be created/filled first.
+        let out = order_by_fk(&tables, None, &[fk("child", "parent")]);
+        assert_eq!(out, vec!["parent".to_string(), "child".to_string()]);
+    }
+
+    #[test]
+    fn falls_back_to_input_order_without_fks() {
+        let tables = vec!["b".to_string(), "a".to_string()];
+        assert_eq!(order_by_fk(&tables, None, &[]), tables);
+    }
+
+    #[test]
+    fn ignores_edges_to_tables_outside_the_migrated_set() {
+        // `child → outsider` doesn't constrain order (outsider isn't migrated).
+        let tables = vec!["child".to_string(), "parent".to_string()];
+        let out = order_by_fk(&tables, None, &[fk("child", "outsider")]);
+        assert_eq!(out, tables);
+    }
+
+    #[test]
+    fn tolerates_cycles_and_self_refs() {
+        let tables = vec!["x".to_string(), "y".to_string()];
+        // x↔y is a cycle and x→x a self-ref; every table is still emitted exactly once.
+        let out = order_by_fk(&tables, None, &[fk("x", "y"), fk("y", "x"), fk("x", "x")]);
+        assert_eq!(out.len(), 2);
+        assert!(out.contains(&"x".to_string()) && out.contains(&"y".to_string()));
+    }
 }

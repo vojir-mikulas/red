@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ColumnMeta, ColumnValue, EditOp, ExportFormat, FkEdge, ForeignKeyMeta, IndexMeta,
-    KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage,
-    RowWindow, SchemaMeta, TableDetail, TableRef, Value,
+    Column, ColumnMeta, ColumnValue, DbKind, EditOp, ExportFormat, FkEdge, FkJoin, ForeignKeyMeta,
+    IndexMeta, KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result,
+    ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, ErrorCode, OpenFlags};
@@ -79,10 +79,11 @@ impl DatabaseDriver for SqliteDriver {
         rusqlite::version().to_string()
     }
 
-    async fn open_cursor(&self, sql: &str, _opts: QueryOptions) -> Result<Box<dyn QueryCursor>> {
+    async fn open_cursor(&self, sql: &str, opts: QueryOptions) -> Result<Box<dyn QueryCursor>> {
         let path = self.path.clone();
         let read_only = self.read_only;
         let sql = sql.to_string();
+        let full = opts.full_fidelity;
 
         // Capacity 1: the handle sends one `FetchReq` then awaits its reply
         // before sending the next, so a single slot is all that's ever in flight —
@@ -94,7 +95,9 @@ impl DatabaseDriver for SqliteDriver {
         // One blocking-pool thread owns the connection + statement + rows for the
         // whole cursor lifetime. RED runs a single session with one active query,
         // so holding one pool thread per cursor is fine.
-        tokio::task::spawn_blocking(move || cursor_thread(&path, &sql, read_only, meta_tx, req_rx));
+        tokio::task::spawn_blocking(move || {
+            cursor_thread(&path, &sql, read_only, full, meta_tx, req_rx)
+        });
 
         let meta = meta_rx
             .await
@@ -153,6 +156,10 @@ impl DatabaseDriver for SqliteDriver {
 
     fn eq_predicate(&self, pairs: &[ColumnValue]) -> String {
         crate::eq_clause(pairs, quote_ident)
+    }
+
+    fn fk_join_wrap(&self, base: &str, base_cols: &[String], joins: &[FkJoin]) -> String {
+        crate::join_wrap(base, base_cols, joins, quote_ident)
     }
 
     async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64> {
@@ -358,6 +365,69 @@ impl DatabaseDriver for SqliteDriver {
         })
         .await
         .map_err(driver_err)?
+    }
+
+    async fn clear_table(&self, table: &TableRef) -> Result<u64> {
+        let path = self.path.clone();
+        let read_only = self.read_only;
+        let table = table.clone();
+        tokio::task::spawn_blocking(move || {
+            let qualify = match &table.schema {
+                Some(s) if !s.is_empty() => {
+                    format!("{}.{}", quote_ident(s), quote_ident(&table.name))
+                }
+                _ => quote_ident(&table.name),
+            };
+            let conn = SqliteDriver::open(&path, read_only)?;
+            conn.execute_batch("BEGIN").map_err(driver_err)?;
+            match conn.execute(&format!("DELETE FROM {qualify}"), []) {
+                Ok(affected) => {
+                    conn.execute_batch("COMMIT").map_err(driver_err)?;
+                    Ok(affected as u64)
+                }
+                Err(e) => {
+                    crate::warn_rollback(conn.execute_batch("ROLLBACK"), "clear_table");
+                    Err(map_step_err(e))
+                }
+            }
+        })
+        .await
+        .map_err(driver_err)?
+    }
+
+    async fn create_table(&self, table: &TableRef, columns: &[ColumnMeta]) -> Result<u64> {
+        let sql = crate::create_table_sql(table, columns, DbKind::Sqlite, quote_ident);
+        self.execute(&sql).await
+    }
+
+    fn quote_table(&self, table: &TableRef) -> String {
+        crate::qualify_table(table, quote_ident)
+    }
+
+    async fn create_index(
+        &self,
+        table: &TableRef,
+        name: &str,
+        unique: bool,
+        columns: &[String],
+    ) -> Result<u64> {
+        let sql =
+            crate::create_index_sql(table, name, unique, columns, DbKind::Sqlite, quote_ident);
+        self.execute(&sql).await
+    }
+
+    async fn add_foreign_key(
+        &self,
+        _child: &TableRef,
+        _columns: &[String],
+        _parent: &TableRef,
+        _ref_columns: &[String],
+    ) -> Result<u64> {
+        // SQLite cannot add a foreign key to an existing table (its `ALTER TABLE` is
+        // limited to rename / add-column / drop-column). The migrate job logs + skips.
+        Err(RedError::Driver(
+            "SQLite cannot add a foreign key to an existing table".to_string(),
+        ))
     }
 
     async fn explain(&self, sql: &str, _analyze: bool) -> Result<QueryPlan> {
@@ -680,7 +750,7 @@ fn describe_table_blocking(
         let mut stmt = conn
             .prepare(&format!("PRAGMA {sq}.table_info({tq})"))
             .map_err(driver_err)?;
-        let rows = stmt
+        let mut rows = stmt
             .query_map([], |row| {
                 let type_name: Option<String> = row.get(2)?;
                 let not_null: i64 = row.get(3)?;
@@ -691,11 +761,24 @@ fn describe_table_blocking(
                     not_null: not_null != 0,
                     primary_key: pk != 0,
                     default: row.get(4)?,
+                    auto_increment: false,
                 })
             })
             .map_err(driver_err)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(driver_err)?;
+        // A *sole* `INTEGER PRIMARY KEY` column is SQLite's rowid alias and
+        // auto-increments — detectable only after the columns are gathered.
+        if rows.iter().filter(|c| c.primary_key).count() == 1 {
+            if let Some(c) = rows.iter_mut().find(|c| {
+                c.primary_key
+                    && c.type_name
+                        .as_deref()
+                        .is_some_and(|t| t.eq_ignore_ascii_case("integer"))
+            }) {
+                c.auto_increment = true;
+            }
+        }
         rows
     };
 
@@ -850,6 +933,7 @@ fn cursor_thread(
     path: &Path,
     sql: &str,
     read_only: bool,
+    full: bool,
     meta_tx: oneshot::Sender<Result<CursorMeta>>,
     mut req_rx: mpsc::Receiver<FetchReq>,
 ) {
@@ -894,7 +978,7 @@ fn cursor_thread(
     }
 
     while let Some(FetchReq { max, reply }) = req_rx.blocking_recv() {
-        let result = fetch_window(&mut rows, column_count, max);
+        let result = fetch_window(&mut rows, column_count, max, full);
         let stop = result.as_ref().map(|w| w.exhausted).unwrap_or(true);
         let _ = reply.send(result);
         if stop {
@@ -909,10 +993,17 @@ fn fetch_window(
     rows: &mut rusqlite::Rows<'_>,
     column_count: usize,
     max: usize,
+    full: bool,
 ) -> Result<RowWindow> {
     // The cursor backs the editor-run / initial-window stream — offset-mode
-    // display, so cap every cell (no seek key resolved here to exempt).
-    let cap = CellCap::display([None, None]);
+    // display, so cap every cell (no seek key resolved here to exempt). A
+    // full-fidelity reader (the table copy) passes `full` to read byte-exact
+    // values instead of the display cap.
+    let cap = if full {
+        None
+    } else {
+        CellCap::display([None, None])
+    };
     let mut out = Vec::with_capacity(crate::window_prealloc(max));
     for _ in 0..max {
         match rows.next() {

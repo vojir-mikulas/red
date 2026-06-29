@@ -43,22 +43,26 @@ impl AppState {
         }
     }
 
-    /// Finish a tab-strip drag: move the dragged tab (`from`) into the gap the
-    /// indicator settled on. The dragged tab follows the cursor and stays
-    /// focused. Clears the indicator regardless.
-    pub(crate) fn drop_tab(&mut self, from: usize, cx: &mut Context<Self>) {
+    /// Finish a tab-strip drag onto half `half`'s strip: assign the dragged tab
+    /// (`from`) to that half and move it into the gap the indicator settled on. Lands
+    /// the tab in `half` and focuses it; `normalize_panes` collapses the split if the
+    /// drag emptied the source half. Clears the indicator regardless.
+    pub(crate) fn drop_tab(&mut self, from: usize, half: SplitHalf, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase {
             if let Some(gap) = active.tab_drop_target.take() {
                 if from < active.tabs.len() {
+                    // The dragged tab now belongs to the strip it was dropped on.
+                    active.tabs[from].pane = half;
                     // `gap` indexes the pre-removal strip; shift left when the
                     // dragged tab sat before the gap.
                     let dest = if from < gap { gap - 1 } else { gap };
                     let dest = dest.min(active.tabs.len() - 1);
                     let tab = active.tabs.remove(from);
                     active.tabs.insert(dest, tab);
-                    // Remap an old index across the remove(from)+insert(dest) so each
-                    // half keeps pointing at its tab; the focused half is then aimed
-                    // at the dragged tab (its new home, `dest`).
+                    // Remap the other pane's active index across remove(from)+insert(dest)
+                    // so it keeps pointing at its tab; the dropped half is aimed at
+                    // the moved tab (its new home, `dest`), and `normalize_panes` then
+                    // repairs anything stale (and collapses an emptied half).
                     let remap = |idx: usize| -> usize {
                         if idx == from {
                             return dest;
@@ -73,12 +77,43 @@ impl AppState {
                     active.active_tab = remap(active.active_tab);
                     if let Some(s) = &mut active.split {
                         s.secondary = remap(s.secondary);
+                        s.focus = half;
                     }
-                    active.set_focused_tab(dest);
-                    active.validate_split();
+                    active.set_pane_active(half, dest);
+                    active.normalize_panes();
                 }
             }
         }
+        cx.notify();
+    }
+
+    /// Move tab `from` into split half `half` and focus that half — the drop target
+    /// for dragging a tab across the divider onto a half's body (no reorder). Lands
+    /// the tab in `half`; `normalize_panes` collapses the split if it emptied the
+    /// source half. No-op when not split or `from` is stale.
+    pub(crate) fn move_tab_to_half(
+        &mut self,
+        from: usize,
+        half: SplitHalf,
+        cx: &mut Context<Self>,
+    ) {
+        if let Phase::Connected(active) = &mut self.phase {
+            if active.split.is_none() || from >= active.tabs.len() {
+                return;
+            }
+            active.tabs[from].pane = half;
+            if let Some(s) = &mut active.split {
+                s.focus = half;
+            }
+            active.set_pane_active(half, from);
+            active.tab_scroll.scroll_to_item(from);
+            active.tab_drop_target = None;
+            active.normalize_panes();
+        } else {
+            return;
+        }
+        // Land focus in the half the tab moved to on the next paint.
+        self.pending_focus = Some(Pane::Editor);
         cx.notify();
     }
 
@@ -112,13 +147,15 @@ impl AppState {
         }
     }
 
-    pub(crate) fn push_tab(&mut self, tab: QueryTab, cx: &mut Context<Self>) -> usize {
+    pub(crate) fn push_tab(&mut self, mut tab: QueryTab, cx: &mut Context<Self>) -> usize {
         let index = match &mut self.phase {
             Phase::Connected(active) => {
+                // The new tab joins the focused half and becomes its active tab.
+                let half = active.focused_half();
+                tab.pane = half;
                 active.tabs.push(tab);
                 let index = active.tabs.len() - 1;
-                // Open it in the focused half (the new tab is unique, so no swap).
-                active.set_focused_tab(index);
+                active.set_pane_active(half, index);
                 // Scroll the freshly-focused tab into view on the next paint, in
                 // case the strip was already scrolled or crowded.
                 active.tab_scroll.scroll_to_item(index);
@@ -170,32 +207,20 @@ impl AppState {
     /// keyboard path knows when to chase focus.
     pub(crate) fn step_active_tab(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
         if let Phase::Connected(active) = &mut self.phase {
-            let n = active.tabs.len();
-            if n <= 1 {
+            // Cycle within the focused pane's own tabs (each half has its own set).
+            let half = active.focused_half();
+            let pane_tabs = active.pane_tab_indices(half);
+            if pane_tabs.len() <= 1 {
                 return false;
             }
-            // When split, skip the tab the other half already shows — each half
-            // owns a distinct tab. With only two tabs (one per half) there's
-            // nothing to land on, so the step is a no-op.
-            let other = active.split.as_ref().map(|s| match s.focus {
-                SplitHalf::Primary => s.secondary,
-                SplitHalf::Secondary => active.active_tab,
-            });
             let cur = active.focused_tab_index();
-            let mut next = cur;
-            for _ in 0..n {
-                next = if forward {
-                    (next + 1) % n
-                } else {
-                    (next + n - 1) % n
-                };
-                if Some(next) != other {
-                    break;
-                }
-            }
-            if next == cur {
-                return false;
-            }
+            let pos = pane_tabs.iter().position(|&g| g == cur).unwrap_or(0);
+            let n = pane_tabs.len();
+            let next = if forward {
+                pane_tabs[(pos + 1) % n]
+            } else {
+                pane_tabs[(pos + n - 1) % n]
+            };
             active.set_focused_tab(next);
             active.tab_scroll.scroll_to_item(next);
             cx.notify();
@@ -278,24 +303,18 @@ impl AppState {
         let free_epoch = match &mut self.phase {
             Phase::Connected(active) if index < active.tabs.len() => {
                 let removed = active.tabs.remove(index);
-                let len = active.tabs.len();
-                // Keep the focus stable: clamp, and shift left if we removed a
-                // tab at or before the focused one. Harmless when the strip is
-                // now empty — `active()` just returns `None`.
+                // Shift both panes' active indices left when they sat after the
+                // removed tab; `normalize_panes` then collapses the split if this
+                // emptied a half and re-points each pane's active at a tab it owns.
                 if active.active_tab >= index && active.active_tab > 0 {
                     active.active_tab -= 1;
                 }
-                active.active_tab = active.active_tab.min(len.saturating_sub(1));
-                // Track the split's right half across the removal the same way; then
-                // collapse the split if the close left it ill-formed (one tab gone,
-                // or both halves now point at the same tab).
                 if let Some(s) = &mut active.split {
                     if s.secondary >= index && s.secondary > 0 {
                         s.secondary -= 1;
                     }
-                    s.secondary = s.secondary.min(len.saturating_sub(1));
                 }
-                active.validate_split();
+                active.normalize_panes();
                 removed.result.map(|g| g.epoch)
             }
             _ => return,

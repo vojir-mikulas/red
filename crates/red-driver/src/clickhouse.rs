@@ -335,7 +335,7 @@ impl DatabaseDriver for ClickhouseDriver {
         self.version.clone()
     }
 
-    async fn open_cursor(&self, sql: &str, _opts: QueryOptions) -> Result<Box<dyn QueryCursor>> {
+    async fn open_cursor(&self, sql: &str, opts: QueryOptions) -> Result<Box<dyn QueryCursor>> {
         let query_id = new_query_id();
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancel = self.cursor_cancel_token(&query_id, cancelled.clone());
@@ -345,6 +345,7 @@ impl DatabaseDriver for ClickhouseDriver {
             types,
             cancelled,
             cancel,
+            full: opts.full_fidelity,
             inner: Mutex::new(ChStream {
                 resp,
                 buf,
@@ -432,6 +433,7 @@ impl DatabaseDriver for ClickhouseDriver {
                     type_name: Some(type_name),
                     default: None,
                     name,
+                    auto_increment: false,
                 }
             })
             .collect();
@@ -667,6 +669,52 @@ impl DatabaseDriver for ClickhouseDriver {
         ))
     }
 
+    async fn clear_table(&self, _table: &TableRef) -> Result<u64> {
+        // Read-only (v1): refusing here keeps ClickHouse out of the copy *target*
+        // picker honest — the same posture as `insert_rows` above.
+        Err(RedError::Driver(
+            "clearing/copying into a ClickHouse table is not supported (read-only driver)"
+                .to_string(),
+        ))
+    }
+
+    async fn create_table(&self, _table: &TableRef, _columns: &[ColumnMeta]) -> Result<u64> {
+        // Read-only (v1): refusing here keeps ClickHouse out of the migration *target*
+        // picker honest — the same posture as `insert_rows`/`clear_table` above.
+        Err(RedError::Driver(
+            "creating/copying into a ClickHouse table is not supported (read-only driver)"
+                .to_string(),
+        ))
+    }
+
+    fn quote_table(&self, table: &TableRef) -> String {
+        crate::qualify_table(table, ch_quote)
+    }
+
+    async fn create_index(
+        &self,
+        _table: &TableRef,
+        _name: &str,
+        _unique: bool,
+        _columns: &[String],
+    ) -> Result<u64> {
+        Err(RedError::Driver(
+            "creating indexes in ClickHouse is not supported (read-only driver)".to_string(),
+        ))
+    }
+
+    async fn add_foreign_key(
+        &self,
+        _child: &TableRef,
+        _columns: &[String],
+        _parent: &TableRef,
+        _ref_columns: &[String],
+    ) -> Result<u64> {
+        Err(RedError::Driver(
+            "foreign keys in ClickHouse are not supported (read-only driver)".to_string(),
+        ))
+    }
+
     async fn explain(&self, sql: &str, _analyze: bool) -> Result<QueryPlan> {
         // ClickHouse `EXPLAIN` is plan-only and read-only-safe — it never executes the
         // statement, so there is no `EXPLAIN ANALYZE` actual-time/row counterpart; the
@@ -773,6 +821,10 @@ struct ChCursor {
     types: Vec<String>,
     cancelled: Arc<AtomicBool>,
     cancel: CancelToken,
+    /// Read cells at full fidelity (the table-copy read, e.g. ClickHouse → SQLite)
+    /// rather than the display fat-cell cap — see
+    /// [`QueryOptions::full_fidelity`](red_core::QueryOptions).
+    full: bool,
     inner: Mutex<ChStream>,
 }
 
@@ -792,7 +844,12 @@ impl QueryCursor for ChCursor {
 
     async fn next_window(&self, max: usize) -> Result<RowWindow> {
         // Offset-mode display stream (editor run) — cap every cell, no key exempt.
-        let cap = CellCap::display([None, None]);
+        // A full-fidelity reader (the table copy) reads byte-exact instead.
+        let cap = if self.full {
+            None
+        } else {
+            CellCap::display([None, None])
+        };
         let mut inner = self.inner.lock().await;
         let mut rows = Vec::with_capacity(window_prealloc(max));
         loop {

@@ -34,8 +34,8 @@ use gpui::{
     PathPromptOptions, Pixels, ScrollHandle, SharedString, WeakEntity, Window, WindowAppearance,
 };
 use red_core::{
-    Column, ColumnMap, ConnectionConfig, DbKind, EditOp, FkEdge, ImportFormat, TableRef,
-    UpdateState,
+    Column, ColumnMap, ColumnMeta, ConnectionConfig, CopyMode, DbKind, EditOp, FkEdge,
+    ImportFormat, TableRef, UpdateState,
 };
 use red_service::{AiAuthStatus, Command, Event, ServiceHandle, SessionId, UpdateConfig};
 
@@ -300,6 +300,25 @@ pub(crate) enum PendingWrite {
         prose: String,
         preview: String,
     },
+    /// A confirmed table copy (result → another table). Carries everything to fire
+    /// `Command::CopyToTable` on confirm plus the precomputed `prose`/`preview` (the
+    /// name-based mapping) the dialog shows. The confirm offers two modes: Append (the
+    /// default `mode`) and Truncate+insert (the danger button), so the destructive
+    /// refresh is opt-in behind a distinct, clearly-labeled action.
+    Copy {
+        id: u64,
+        source_epoch: u64,
+        target: TableRef,
+        target_session: SessionId,
+        mapping: Vec<ColumnMap>,
+        mode: CopyMode,
+        /// `Some` for "copy into a *new* table" — the column shape to `create_table`
+        /// the target from before streaming (types mapped into the target dialect).
+        /// `None` for a copy into an existing table (the original same-shape path).
+        create: Option<Vec<ColumnMeta>>,
+        prose: String,
+        preview: String,
+    },
 }
 
 /// A pending `ImportColumns` peek: the chosen file + the target table/columns, held
@@ -311,6 +330,55 @@ pub(crate) struct PendingImportPeek {
     pub format: ImportFormat,
     pub target: TableRef,
     pub target_cols: Vec<Column>,
+}
+
+/// One candidate copy **target** in the "Copy to…" picker: a table in an open
+/// (writable) connection. The picker lists these across the foreground + parked
+/// live sessions; activating one starts the target-column peek.
+#[derive(Clone)]
+pub(crate) struct CopyTargetCandidate {
+    pub session: SessionId,
+    pub conn_name: String,
+    pub schema: String,
+    pub table: TableRef,
+}
+
+/// A pending "Copy to…" target peek: the chosen source (the foreground result's
+/// epoch + columns) and target (table + its session + a display label), held while
+/// the backend describes the target's columns. When `CopyTargetColumns` returns, the
+/// UI auto-maps source→target by name and raises the copy confirm.
+pub(crate) struct PendingCopyPeek {
+    pub id: u64,
+    pub source_epoch: u64,
+    pub source_cols: Vec<Column>,
+    pub target: TableRef,
+    pub target_session: SessionId,
+    pub target_label: String,
+}
+
+/// A distinct writable namespace (a connection's schema/database) offered in the
+/// "Copy to…" picker as a **"new table"** target. Selecting one prompts for a table
+/// name; the source's column shape then creates it (`create_table`, types mapped into
+/// the target dialect) before the rows stream in — the "copy into a *new* table" /
+/// migration path. Mirrors [`CopyTargetCandidate`] but addresses a namespace, not an
+/// existing table, so an *empty* database can be a target.
+#[derive(Clone)]
+pub(crate) struct CopyNamespace {
+    pub session: SessionId,
+    pub conn_name: String,
+    pub schema: String,
+}
+
+/// A pending "new table" copy: the chosen source (the focused result's epoch +
+/// columns) and the target namespace, held while the user types the new table's name
+/// in the prompt. On submit the UI builds a `create_table` spec + an identity column
+/// mapping and fires `CopyToTable { create: Some(..) }`.
+pub(crate) struct PendingCopyNewTable {
+    pub source_epoch: u64,
+    pub source_cols: Vec<Column>,
+    pub session: SessionId,
+    pub conn_name: String,
+    pub schema: String,
 }
 
 /// The editable grid cell under the cursor (Track B6): its identity (the row's PK
@@ -347,17 +415,41 @@ const MAX_PARKED_SESSIONS: usize = 8;
 /// is dropped past this. Visible toasts are already capped lower in the renderer.
 const MAX_NOTIFICATIONS: usize = 50;
 
-/// The live state of a streaming-transfer toast (export *or* import): how many
-/// rows have moved, keyed by the transfer `id` so a cancel / progress update
-/// targets the right one. `total` is the known row count for an export (drives a
-/// %); an import streams a file of unknown length, so `total` is 0 and the toast
-/// shows a running count. `is_import` selects `CancelImport` vs `CancelExport` for
-/// the toast's `✕`.
+/// Which streamed transfer a progress toast tracks — selects the right cancel
+/// command for the toast's `✕` and the verb in its messages.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransferKind {
+    Export,
+    Import,
+    /// A table copy (result → another table), possibly across connections.
+    Copy,
+    /// A whole-schema migration (many tables → another database), reusing the copy
+    /// backend + `Copy*` events but labelled "Migrate" in the toast.
+    Migrate,
+}
+
+impl TransferKind {
+    /// The (gerund, past, noun) verbs for the copy-family toasts — `Copy` and
+    /// `Migrate` share the streaming backend and `Copy*` events but read differently.
+    /// `Export`/`Import` have their own toasts and never call this.
+    pub(crate) fn copy_verbs(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            TransferKind::Migrate => ("Migrating", "Migrated", "Migration"),
+            _ => ("Copying", "Copied", "Copy"),
+        }
+    }
+}
+
+/// The live state of a streaming-transfer toast (export, import, *or* copy): how
+/// many rows have moved, keyed by the transfer `id` so a cancel / progress update
+/// targets the right one. `total` is the known row count for an export/copy (drives
+/// a %); an import streams a file of unknown length, so `total` is 0 and the toast
+/// shows a running count. `kind` selects the cancel command for the `✕`.
 pub(crate) struct ExportProgress {
     pub id: u64,
     pub rows: usize,
     pub total: usize,
-    pub is_import: bool,
+    pub kind: TransferKind,
 }
 
 /// One notification in the bottom-right stack. The stack is newest-last (nearest
@@ -405,6 +497,10 @@ pub(crate) struct QueryTab {
     /// The relation tree (Track B7 — "Open row as tree"), when one is open. Occupies
     /// the result pane in place of the grid; running a query or closing it clears it.
     pub tree: Option<crate::tree::RelationTreeView>,
+    /// Which split half owns this tab (Zed-style): each pane's tab strip shows only
+    /// its own tabs, so the two halves never duplicate. Always `Primary` while the
+    /// work area is unsplit; a drag across the divider (or `split_right`) reassigns it.
+    pub pane: SplitHalf,
 }
 
 impl QueryTab {
@@ -440,6 +536,8 @@ impl QueryTab {
             result: None,
             plan: None,
             tree: None,
+            // New tabs join the focused pane; `push_tab` reassigns this when split.
+            pane: SplitHalf::Primary,
         }
     }
 
@@ -519,6 +617,12 @@ pub(crate) struct ActiveConn {
     /// restores the previous width.
     pub history_w: Pixels,
     pub history_drag: Option<DragAnchor>,
+    /// Whether the Columns panel (inline FK expansion, Track B7) is shown in the left
+    /// dock — the recursive tree that picks referenced columns into the active browse.
+    /// Per-connection UI state; the picked columns live on the result grid.
+    pub columns_open: bool,
+    pub columns_w: Pixels,
+    pub columns_drag: Option<DragAnchor>,
     /// Recency stamp: bumped from [`AppState::next_active_seq`] each time this
     /// workspace is parked (it was foreground until that moment). Drives LRU
     /// eviction when [`MAX_PARKED_SESSIONS`] is exceeded — the lowest stamp is the
@@ -564,6 +668,9 @@ impl ActiveConn {
             history_sel: 0,
             history_w: px(240.),
             history_drag: None,
+            columns_open: false,
+            columns_w: px(260.),
+            columns_drag: None,
             last_active_seq: 0,
         }
     }
@@ -579,22 +686,51 @@ impl ActiveConn {
         }
     }
 
-    /// Point the focused half at tab `i`. When split, picking the tab the *other*
-    /// half already shows swaps the two (each half always shows a distinct tab).
+    /// Point the focused half at tab `i` (a global index that already belongs to that
+    /// half — each strip shows only its own tabs, so a strip click never crosses).
     pub(crate) fn set_focused_tab(&mut self, i: usize) {
-        match &mut self.split {
-            Some(s) => {
-                let (focused, other) = match s.focus {
-                    SplitHalf::Primary => (&mut self.active_tab, &mut s.secondary),
-                    SplitHalf::Secondary => (&mut s.secondary, &mut self.active_tab),
-                };
-                if *other == i {
-                    // The other half holds it — swap so neither half duplicates a tab.
-                    *other = *focused;
+        let half = self.focused_half();
+        self.set_pane_active(half, i);
+    }
+
+    /// Record `i` as the active tab of `half` (the global index its strip highlights
+    /// and its editor/result render).
+    pub(crate) fn set_pane_active(&mut self, half: SplitHalf, i: usize) {
+        match half {
+            SplitHalf::Primary => self.active_tab = i,
+            SplitHalf::Secondary => {
+                if let Some(s) = &mut self.split {
+                    s.secondary = i;
                 }
-                *focused = i;
             }
-            None => self.active_tab = i,
+        }
+    }
+
+    /// Global indices of the tabs that belong to `half`, in strip (global) order.
+    pub(crate) fn pane_tab_indices(&self, half: SplitHalf) -> Vec<usize> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.pane == half)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// First tab belonging to `half`, if any.
+    fn first_tab_in(&self, half: SplitHalf) -> Option<usize> {
+        self.tabs.iter().position(|t| t.pane == half)
+    }
+
+    /// The active tab of `half`: its stored index when that still names a tab in the
+    /// half, else the first tab in the half (or `None` when the half is empty).
+    pub(crate) fn pane_active(&self, half: SplitHalf) -> Option<usize> {
+        let stored = match half {
+            SplitHalf::Primary => Some(self.active_tab),
+            SplitHalf::Secondary => self.split.as_ref().map(|s| s.secondary),
+        };
+        match stored {
+            Some(i) if self.tabs.get(i).is_some_and(|t| t.pane == half) => Some(i),
+            _ => self.first_tab_in(half),
         }
     }
 
@@ -646,21 +782,51 @@ impl ActiveConn {
             .find(|g| g.epoch == epoch)
     }
 
-    /// Collapse the split if it's no longer well-formed — fewer than two tabs, or a
-    /// `secondary` that's out of range or has collided with `active_tab` (each half
-    /// must show a distinct, existing tab). The safety net every tab mutation ends
-    /// on, after it has shifted the stored indices for the change it made.
-    pub(crate) fn validate_split(&mut self) {
-        let collapse = match &self.split {
-            Some(s) => {
-                self.tabs.len() < 2
-                    || s.secondary >= self.tabs.len()
-                    || s.secondary == self.active_tab
-            }
-            None => false,
-        };
-        if collapse {
+    /// Restore the pane invariants after any tab mutation: collapse the split when a
+    /// half has emptied (its last tab closed or dragged away — everything folds back
+    /// to one pane), and re-point each pane's active index at a tab it actually owns.
+    /// The single safety net every add / close / move / reorder ends on.
+    pub(crate) fn normalize_panes(&mut self) {
+        if self.tabs.is_empty() {
+            self.active_tab = 0;
             self.split = None;
+            return;
+        }
+        if self.split.is_some() {
+            let has_primary = self.tabs.iter().any(|t| t.pane == SplitHalf::Primary);
+            let has_secondary = self.tabs.iter().any(|t| t.pane == SplitHalf::Secondary);
+            if !has_primary || !has_secondary {
+                // A half emptied — collapse, keeping the surviving half's tab on screen.
+                let survivor = if has_primary {
+                    SplitHalf::Primary
+                } else {
+                    SplitHalf::Secondary
+                };
+                let keep = self.pane_active(survivor).unwrap_or(0);
+                for t in &mut self.tabs {
+                    t.pane = SplitHalf::Primary;
+                }
+                self.split = None;
+                self.active_tab = keep.min(self.tabs.len() - 1);
+                return;
+            }
+            // Both halves populated — clamp each active index into its own pane.
+            if let Some(p) = self.pane_active(SplitHalf::Primary) {
+                self.active_tab = p;
+            }
+            if let Some(s) = self.pane_active(SplitHalf::Secondary) {
+                if let Some(state) = &mut self.split {
+                    state.secondary = s;
+                }
+            }
+        } else {
+            // Single pane: every tab lives in `Primary`; keep `active_tab` in range.
+            for t in &mut self.tabs {
+                t.pane = SplitHalf::Primary;
+            }
+            if self.active_tab >= self.tabs.len() {
+                self.active_tab = self.tabs.len() - 1;
+            }
         }
     }
 
@@ -728,6 +894,25 @@ pub struct AppState {
     /// full-row re-fetch (`CopyRows`). The latest copy wins; an earlier reply is
     /// then stale and dropped.
     pub(crate) pending_copy: Option<crate::result::PendingCopy>,
+    /// A pending "Copy to…" target peek, held while the backend describes the picked
+    /// target table's columns (mirrors `pending_import`). When `CopyTargetColumns`
+    /// returns, the UI builds the name-based mapping and raises the copy confirm.
+    pub(crate) pending_copy_target: Option<PendingCopyPeek>,
+    /// The candidate target tables backing the open "Copy to…" picker, indexed by the
+    /// picker's `Cmd::CopyTarget(usize)` activation (mirrors `saved_queries`).
+    pub(crate) copy_targets: Vec<CopyTargetCandidate>,
+    /// The distinct writable namespaces backing the "✦ New table…" rows of the open
+    /// "Copy to…" picker, indexed by `Cmd::CopyNewTable(usize)`.
+    pub(crate) copy_new_namespaces: Vec<CopyNamespace>,
+    /// A pending "new table" copy, held while the user types the table name in the
+    /// prompt (mirrors `pending_copy_target`).
+    pub(crate) pending_copy_new: Option<PendingCopyNewTable>,
+    /// The target namespaces backing the open "Migrate to…" picker, indexed by
+    /// `Cmd::MigrateTarget(usize)`.
+    pub(crate) migrate_targets: Vec<CopyNamespace>,
+    /// The source of a pending whole-schema migrate — `(source session, source schema,
+    /// table names)` — held while the user picks a target namespace from the picker.
+    pub(crate) pending_migrate: Option<(SessionId, String, Vec<String>)>,
     /// An in-flight FK click-through (Track B7), waiting on its single-row
     /// `CopyRows` re-fetch to read the typed key value before opening the target
     /// browse. The latest follow wins; an earlier reply is then stale and dropped.
@@ -1531,6 +1716,12 @@ impl AppState {
             next_export_id: 0,
             next_copy_id: 0,
             pending_copy: None,
+            pending_copy_target: None,
+            copy_targets: Vec::new(),
+            copy_new_namespaces: Vec::new(),
+            pending_copy_new: None,
+            migrate_targets: Vec::new(),
+            pending_migrate: None,
             pending_fk: None,
             pending_tree: None,
             tree_menu: None,
@@ -1855,20 +2046,29 @@ impl AppState {
             .iter()
             .find(|n| n.id == id)
             .and_then(|n| n.export.as_ref())
-            .map(|e| (e.id, e.is_import));
+            .map(|e| (e.id, e.kind));
         match transfer {
-            Some((transfer_id, is_import)) => {
-                if is_import {
-                    self.send_active(Command::CancelImport { id: transfer_id });
-                } else {
-                    self.send_active(Command::CancelExport { id: transfer_id });
-                }
+            Some((transfer_id, kind)) => {
+                let (cancel, msg) = match kind {
+                    TransferKind::Import => (
+                        Command::CancelImport { id: transfer_id },
+                        "Cancelling import…",
+                    ),
+                    TransferKind::Export => (
+                        Command::CancelExport { id: transfer_id },
+                        "Cancelling export…",
+                    ),
+                    TransferKind::Copy => {
+                        (Command::CancelCopy { id: transfer_id }, "Cancelling copy…")
+                    }
+                    TransferKind::Migrate => (
+                        Command::CancelCopy { id: transfer_id },
+                        "Cancelling migration…",
+                    ),
+                };
+                self.send_active(cancel);
                 if let Some(n) = self.notifications.iter_mut().find(|n| n.id == id) {
-                    n.message = if is_import {
-                        "Cancelling import…".into()
-                    } else {
-                        "Cancelling export…".into()
-                    };
+                    n.message = msg.into();
                 }
                 cx.notify();
             }
@@ -1941,6 +2141,10 @@ impl AppState {
                 }
                 if session == self.foreground_session {
                     self.refresh_completions(cx);
+                    // Repaint views that read the catalog (the schema tree and the
+                    // Columns panel's lazily-expanded FK nodes) so a freshly-arrived
+                    // description renders without waiting for an unrelated frame.
+                    cx.notify();
                 }
             }
             Event::ForeignKeysLoaded { graph } => {
@@ -1951,6 +2155,9 @@ impl AppState {
                     for tab in &mut active.tabs {
                         if let Some(grid) = tab.result.as_mut() {
                             grid.set_fk_cols(&active.fk_graph);
+                            // A browse may carry an expansion from before the graph
+                            // landed; (re)resolve its joins now they're available.
+                            grid.rebuild_joins(&active.fk_graph);
                         }
                     }
                 }
@@ -2022,6 +2229,15 @@ impl AppState {
             }
             Event::ImportCancelled { id, rows } => self.on_import_cancelled(id, rows, cx),
             Event::ImportColumns { id, columns } => self.on_import_columns(id, columns, cx),
+
+            // --- table copy (result → another table) ---
+            Event::CopyTargetColumns { id, columns } => {
+                self.on_copy_target_columns(id, columns, cx)
+            }
+            Event::CopyProgress { id, rows } => self.on_copy_progress(id, rows, cx),
+            Event::CopyFinished { id, rows } => self.on_copy_finished(id, rows, cx),
+            Event::CopyFailed { id, rows, message } => self.on_copy_failed(id, rows, message, cx),
+            Event::CopyCancelled { id, rows } => self.on_copy_cancelled(id, rows, cx),
 
             // --- query plan (Track B4) ---
             Event::PlanReady { epoch, plan } => self.on_plan_ready(session, epoch, plan),
@@ -2113,9 +2329,57 @@ impl AppState {
                 id,
                 ..
             }) => self.start_import(path, format, target, mapping, id, cx),
+            Some(PendingWrite::Copy {
+                id,
+                source_epoch,
+                target,
+                target_session,
+                mapping,
+                mode,
+                create,
+                ..
+            }) => self.start_copy(
+                id,
+                source_epoch,
+                target,
+                target_session,
+                mapping,
+                mode,
+                create,
+                cx,
+            ),
             None => {}
         }
         // The modal is closing — return focus to the root for the next ⌘K etc.
+        self.refocus_root = true;
+        cx.notify();
+    }
+
+    /// Confirm a pending copy with an explicit `mode` — the copy dialog's two action
+    /// buttons (Append / Replace all). Overrides the stored mode so "Replace all"
+    /// truncates first; "Append" keeps the target's rows.
+    pub(crate) fn confirm_copy(&mut self, mode: CopyMode, cx: &mut Context<Self>) {
+        if let Some(PendingWrite::Copy {
+            id,
+            source_epoch,
+            target,
+            target_session,
+            mapping,
+            create,
+            ..
+        }) = self.confirm_exec.take()
+        {
+            self.start_copy(
+                id,
+                source_epoch,
+                target,
+                target_session,
+                mapping,
+                mode,
+                create,
+                cx,
+            );
+        }
         self.refocus_root = true;
         cx.notify();
     }
@@ -2246,71 +2510,57 @@ impl AppState {
         }
     }
 
-    /// Open the split: render a second query pane to the right of the active one and
-    /// focus it. The right half shows the next existing tab, or — if the active tab
-    /// is the only one — a fresh blank tab opened beside it. No-op unless connected,
-    /// or when already split.
+    /// Open the split: a second query pane to the right, focused, holding a fresh
+    /// blank tab. The left pane keeps all its tabs (each half owns its own tabs, so
+    /// nothing is duplicated); drag a tab across the divider to move it over. No-op
+    /// unless connected with a tab open, or when already split.
     pub(crate) fn split_right(&mut self, cx: &mut Context<Self>) {
-        // Bail unless connected, with a tab open, and not already split.
         match &self.phase {
             Phase::Connected(active) if active.split.is_none() && active.active().is_some() => {}
             _ => return,
         }
-        // A distinct existing tab for the right half, or a fresh one beside it.
-        let existing = match &self.phase {
+        // Mint the blank tab's title (bumps the seq) outside the build, since
+        // `QueryTab::new` needs `cx`.
+        let title = match &mut self.phase {
             Phase::Connected(active) => {
-                let primary = active.active_tab;
-                (0..active.tabs.len()).find(|&i| i != primary)
+                active.query_seq += 1;
+                format!("query {}", active.query_seq)
             }
             _ => return,
         };
-        let (secondary, opened_new) = match existing {
-            Some(i) => (i, false),
-            None => {
-                // Mint the blank tab's title (bumps the seq), then build it outside
-                // the `&mut active` borrow since `QueryTab::new` needs `cx`.
-                let title = match &mut self.phase {
-                    Phase::Connected(active) => {
-                        active.query_seq += 1;
-                        format!("query {}", active.query_seq)
-                    }
-                    _ => return,
-                };
-                let tab = QueryTab::new(title, cx);
-                match &mut self.phase {
-                    Phase::Connected(active) => {
-                        active.tabs.push(tab);
-                        (active.tabs.len() - 1, true)
-                    }
-                    _ => return,
-                }
-            }
-        };
+        let mut tab = QueryTab::new(title, cx);
+        tab.pane = SplitHalf::Secondary;
         if let Phase::Connected(active) = &mut self.phase {
+            active.tabs.push(tab);
+            let secondary = active.tabs.len() - 1;
             active.split = Some(SplitState {
                 secondary,
                 focus: SplitHalf::Secondary,
                 width: px(Self::SPLIT_DEFAULT_WIDTH),
                 drag: None,
             });
+            active.normalize_panes();
         }
-        // The new half is now focused — seed its editor's completions (if fresh) and
-        // focus it on the next paint.
-        if opened_new {
-            self.refresh_completions(cx);
-        }
+        // The new half is now focused — seed its editor's completions and focus it.
+        self.refresh_completions(cx);
         self.pending_focus = Some(Pane::Editor);
         cx.notify();
     }
 
-    /// Collapse the split back to one pane, keeping whichever half was focused on
-    /// screen. No-op when not split.
+    /// Collapse the split back to one pane: every tab folds into the single strip,
+    /// keeping whichever half was focused on screen. No-op when not split.
     pub(crate) fn unsplit(&mut self, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase {
             if let Some(s) = active.split.take() {
-                if s.focus == SplitHalf::Secondary {
-                    active.active_tab = s.secondary;
+                let keep = if s.focus == SplitHalf::Secondary {
+                    s.secondary
+                } else {
+                    active.active_tab
+                };
+                for t in &mut active.tabs {
+                    t.pane = SplitHalf::Primary;
                 }
+                active.active_tab = keep.min(active.tabs.len().saturating_sub(1));
             } else {
                 return;
             }

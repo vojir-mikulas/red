@@ -7,6 +7,7 @@
 mod app;
 mod assets;
 mod assistant;
+mod columns_panel;
 mod config;
 mod connect;
 mod conversations;

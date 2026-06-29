@@ -4,6 +4,8 @@
 
 use std::fmt;
 
+pub mod typemap;
+
 /// Which database engine a connection targets. Drives driver selection and,
 /// via [`DbKind::all`]/the metadata accessors, how the connection form renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -977,6 +979,12 @@ pub struct ColumnMeta {
     pub not_null: bool,
     pub primary_key: bool,
     pub default: Option<String>,
+    /// The column auto-numbers (SQLite `INTEGER PRIMARY KEY` rowid alias, Postgres
+    /// `serial`/identity, MySQL `AUTO_INCREMENT`). Detected by `describe_table` and
+    /// re-emitted per-dialect by the migration's `create_table` so the target table
+    /// keeps auto-numbering future inserts. `false` for result-derived columns (a
+    /// query result carries no such flag) and read-only engines.
+    pub auto_increment: bool,
 }
 
 /// A foreign-key edge from a local column to a referenced table/column. The tree
@@ -1004,6 +1012,44 @@ pub struct FkEdge {
     pub to_table: String,
     /// `(from_column, to_column)` pairs, in key order.
     pub columns: Vec<(String, String)>,
+}
+
+/// The base subquery's alias in an inline-FK-expansion wrap (see [`FkJoin`] and the
+/// driver's `join_wrap`): the result exposes `_red_base.*` first, so every base
+/// column keeps its position and name. Shared so the UI's join builder and the
+/// driver's SQL wrapper agree on the same identifier for a first hop's parent.
+pub const BASE_ALIAS: &str = "_red_base";
+
+/// One inline foreign-key *column expansion* (Track B7): a `LEFT JOIN` that pulls
+/// selected columns of a referenced table into a browse as extra, dotted-aliased
+/// columns. The service folds an ordered `Vec<FkJoin>` into the result's base SQL
+/// (see `join_wrap`), so each hop decorates the page without changing its row count
+/// — the join target is always a *unique* key, so a `LEFT JOIN` matches ≤1 row.
+///
+/// Joins are ordered outer→inner: a deeper hop's [`parent_alias`](Self::parent_alias)
+/// names an *earlier* join's [`alias`](Self::alias) (or the base, `_red_base`), so a
+/// chain like `tier → cascade → placement` references only already-declared aliases.
+/// Aliases are caller-assigned, simple identifiers (`_red_j0`, `_red_j1`, …) so they
+/// never need quoting or length-shortening; the meaningful dotted names live in the
+/// output [`select`](Self::select) aliases (e.g. `tier_id.name`), which is how the
+/// grid keys a joined cell back to its tree column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FkJoin {
+    /// This join's table alias — a simple, unique identifier (`_red_j0`, …).
+    pub alias: String,
+    /// The alias this join's `ON` reads its local columns from: an earlier join's
+    /// [`alias`](Self::alias), or the base subquery alias (`_red_base`) for a first hop.
+    pub parent_alias: String,
+    /// `(parent_column, target_column)` equalities forming the `ON` clause, in key
+    /// order — usually one pair (a single-column FK), `len > 1` for a composite key.
+    pub on: Vec<(String, String)>,
+    /// The referenced table's namespace, when the engine qualifies by schema.
+    pub to_schema: Option<String>,
+    /// The referenced table.
+    pub to_table: String,
+    /// `(target_column, output_alias)` columns to select from the joined table. The
+    /// output alias is the dotted tree path (`tier_id.name`), unique across the result.
+    pub select: Vec<(String, String)>,
 }
 
 /// An index over one or more columns of a table.
@@ -1246,6 +1292,13 @@ pub struct QueryOptions {
     /// expiry (see `drive_fetch`). The windowed `OpenResult` path uses the global
     /// `statement_timeout` instead. `None` = no cap.
     pub timeout: Option<std::time::Duration>,
+    /// Read every cell at **full fidelity** — never the display fat-cell cap. The
+    /// interactive cursor caps long text/blobs for paint performance
+    /// (`Value::Capped`), which is right for the grid but **data loss** for a copy:
+    /// the table-copy read sets this so a long `TEXT`/blob round-trips byte-exact
+    /// into the target (the same invariant export holds via `PageCap::Full`). The
+    /// default is `false` — the grid's streaming path stays capped.
+    pub full_fidelity: bool,
 }
 
 impl Default for QueryOptions {
@@ -1253,8 +1306,22 @@ impl Default for QueryOptions {
         Self {
             window: 1000,
             timeout: None,
+            full_fidelity: false,
         }
     }
+}
+
+/// How a table copy writes into its target ([`crate`]'s `CopyToTable`). Append is
+/// the default "add these rows"; `TruncateInsert` clears the target first (behind
+/// the destructive confirm) — "refresh this table from the source". Upsert/merge is
+/// deliberately **not** here: it needs a per-engine conflict-key seam and a key
+/// picker, which is the on-ramp to the sync machinery table-copy exists to avoid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyMode {
+    /// Insert the source rows into the target as-is (the target keeps its rows).
+    Append,
+    /// Clear the target (`DELETE FROM`) before inserting — a full refresh.
+    TruncateInsert,
 }
 
 /// The error type that crosses every RED layer boundary.
@@ -1333,6 +1400,7 @@ mod key_tests {
             not_null,
             primary_key,
             default: None,
+            auto_increment: false,
         }
     }
 
