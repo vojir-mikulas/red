@@ -983,6 +983,15 @@ pub struct AppState {
     /// when open. The right-click selects the cell first, so the menu's Inspect/
     /// Copy act on it; `None` keeps the menu closed.
     pub(crate) cell_menu: Option<gpui::Point<gpui::Pixels>>,
+    /// Window-coordinate anchor for the result toolbar's "Export" dropdown, when
+    /// open (CSV / JSON / HTML grouped into one menu); `None` keeps it closed.
+    pub(crate) export_menu: Option<gpui::Point<gpui::Pixels>>,
+    /// Window-coordinate anchor for the result toolbar's "More" dropdown, when
+    /// open (Stats toggle · Copy to…); `None` keeps it closed.
+    pub(crate) more_menu: Option<gpui::Point<gpui::Pixels>>,
+    /// Whether the cell menu's "Show from <table>" flyout (the FK column list) is
+    /// open. Set on hover of its parent row; reset whenever the cell menu opens.
+    pub(crate) ref_submenu_open: bool,
     /// A pending write awaiting the user's confirmation before it runs: an editor
     /// destructive statement, or a staged grid edit batch (Track B6). See
     /// [`PendingWrite`].
@@ -1745,6 +1754,9 @@ impl AppState {
             filter_bar: None,
             find_bar: None,
             cell_menu: None,
+            export_menu: None,
+            more_menu: None,
+            ref_submenu_open: false,
             confirm_exec: None,
             pending_import: None,
             grid_edit: None,

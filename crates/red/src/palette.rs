@@ -41,6 +41,7 @@ pub(crate) enum Cmd {
     /// Clear the active connection's query history.
     ClearHistory,
     ToggleSidebar,
+    ToggleColumnsPanel,
     RefreshSchema,
     Disconnect,
     /// Move keyboard focus to the schema / editor / grid pane.
@@ -255,6 +256,7 @@ impl AppState {
             Cmd::ToggleHistory => self.toggle_history(cx),
             Cmd::ClearHistory => self.clear_history(cx),
             Cmd::ToggleSidebar => self.toggle_sidebar(cx),
+            Cmd::ToggleColumnsPanel => self.toggle_columns_panel(cx),
             Cmd::RefreshSchema => self.refresh_schema(),
             Cmd::Disconnect => self.disconnect(cx),
             // Pane focus needs a `Window`; defer it to the next render (drained
@@ -464,6 +466,10 @@ impl AppState {
                 out.push((
                     PaletteItem::new("cmd:sidebar", "view: toggle sidebar").hint("⌘B"),
                     Cmd::ToggleSidebar,
+                ));
+                out.push((
+                    PaletteItem::new("cmd:columns", "view: toggle columns panel").hint("⇧⌘C"),
+                    Cmd::ToggleColumnsPanel,
                 ));
                 out.push((
                     PaletteItem::new("cmd:refresh", "schema: refresh").hint("⌘R"),

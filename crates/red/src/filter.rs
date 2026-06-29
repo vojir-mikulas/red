@@ -83,7 +83,8 @@ impl AppState {
     }
 
     /// Apply the bar's current text as the result filter (Enter / the Apply
-    /// button). An empty term clears the filter. Closes the bar afterward.
+    /// button). An empty term clears the filter. The bar stays open (focus kept in
+    /// the input) so the filter can be refined or re-run; Esc / the ✕ closes it.
     pub(crate) fn submit_filter(&mut self, cx: &mut Context<Self>) {
         let Some((text, mode)) = self
             .filter_bar
@@ -101,8 +102,9 @@ impl AppState {
             })
         };
         self.apply_result_filter(filter, cx);
-        self.filter_bar = None;
-        self.refocus_root = true;
+        // Keep the bar open with focus back in its input (covers the Apply button,
+        // where focus was on the button), so the filter can be tweaked and re-run.
+        self.focus_filter = true;
         cx.notify();
     }
 

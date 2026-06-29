@@ -1079,10 +1079,18 @@ pub struct KeySpec {
     /// matters): an `Int` lead supports fraction jumps, `Other` degrades to
     /// `OFFSET` for far jumps.
     pub kind: KeyKind,
+    /// The lead column's declared type (best-effort), so a driver that pins bind
+    /// types can cast the keyset cursor back to the column's type. Without it a
+    /// text-decoded cursor (a uuid/timestamp/numeric key) binds as `text` and the
+    /// seek comparison `col > $1::text` has no operator (Postgres 42883).
+    pub column_type: Option<String>,
     /// The PK tiebreaker, appended after [`column`](Self::column) when sorting by
     /// a non-PK column so rows sharing a `column` value order deterministically.
     /// `None` for a plain browse (the lead column is itself the unique key).
     pub tiebreak: Option<String>,
+    /// The tiebreaker column's declared type, paired with [`tiebreak`](Self::tiebreak)
+    /// for the same cursor-cast reason as [`column_type`](Self::column_type).
+    pub tiebreak_type: Option<String>,
     /// The sort direction of the lead column (header click). `false` (ascending)
     /// for a plain browse. The tiebreaker shares this direction.
     pub descending: bool,
@@ -1104,9 +1112,17 @@ impl KeySpec {
         KeySpec {
             column: column.into(),
             kind,
+            column_type: None,
             tiebreak: None,
+            tiebreak_type: None,
             descending: false,
         }
+    }
+
+    /// The lead column's declared type for the seek cursor cast.
+    pub fn with_column_type(mut self, type_name: Option<String>) -> KeySpec {
+        self.column_type = type_name;
+        self
     }
 
     /// The seek columns in order — the lead column then the tiebreaker, if any.
@@ -1119,6 +1135,16 @@ impl KeySpec {
         cols
     }
 
+    /// The seek columns' declared types, index-aligned with [`column_names`](Self::column_names)
+    /// — for a driver that casts the bound cursor back to each column's type.
+    pub fn column_types(&self) -> Vec<Option<&str>> {
+        let mut types = vec![self.column_type.as_deref()];
+        if self.tiebreak.is_some() {
+            types.push(self.tiebreak_type.as_deref());
+        }
+        types
+    }
+
     /// Resolve a table's seek key from its introspected detail: a single-column
     /// primary key, or failing that a single-column unique not-null index.
     /// `None` (composite or nullable key, or no key at all) means the result
@@ -1129,8 +1155,9 @@ impl KeySpec {
         // nullable, so an integer key passes without `not_null`; any other
         // nullable key disqualifies keyset (NULLs don't order reliably).
         let kind = key_kind(column);
-        (column.not_null || kind == KeyKind::Int)
-            .then(|| KeySpec::single(column.name.clone(), kind))
+        (column.not_null || kind == KeyKind::Int).then(|| {
+            KeySpec::single(column.name.clone(), kind).with_column_type(column.type_name.clone())
+        })
     }
 
     /// Resolve the composite seek key for a header-click sort by `sort_col`: the
@@ -1147,7 +1174,9 @@ impl KeySpec {
             return Some(KeySpec {
                 column: pk.name.clone(),
                 kind: key_kind(pk),
+                column_type: pk.type_name.clone(),
                 tiebreak: None,
+                tiebreak_type: None,
                 descending,
             });
         }
@@ -1157,7 +1186,9 @@ impl KeySpec {
         (lead.not_null || kind == KeyKind::Int).then(|| KeySpec {
             column: lead.name.clone(),
             kind,
+            column_type: lead.type_name.clone(),
             tiebreak: Some(pk.name.clone()),
+            tiebreak_type: pk.type_name.clone(),
             descending,
         })
     }
@@ -1473,6 +1504,34 @@ mod key_tests {
             ..Default::default()
         };
         assert!(KeySpec::from_detail(&detail).is_none());
+    }
+
+    #[test]
+    fn key_carries_column_types_for_the_cursor_cast() {
+        // A uuid PK: the key must carry "uuid" so the driver casts the keyset
+        // cursor back to it (`$1::text::"uuid"`) instead of binding bare text —
+        // otherwise `id > $1::text` is a 42883 "no operator" error on Postgres.
+        let detail = TableDetail {
+            columns: vec![
+                col("id", "uuid", true, true),
+                col("created_at", "timestamptz", true, false),
+            ],
+            ..Default::default()
+        };
+        let key = KeySpec::from_detail(&detail).unwrap();
+        assert_eq!(key.column_type.as_deref(), Some("uuid"));
+        assert_eq!(key.column_types(), vec![Some("uuid")]);
+
+        // A header-click sort by a non-PK column leads with that column's type and
+        // appends the PK as a typed tiebreaker — both need their cast.
+        let sorted = KeySpec::sorted(&detail, "created_at", true).unwrap();
+        assert_eq!(sorted.column_type.as_deref(), Some("timestamptz"));
+        assert_eq!(sorted.tiebreak.as_deref(), Some("id"));
+        assert_eq!(sorted.tiebreak_type.as_deref(), Some("uuid"));
+        assert_eq!(
+            sorted.column_types(),
+            vec![Some("timestamptz"), Some("uuid")]
+        );
     }
 
     #[test]

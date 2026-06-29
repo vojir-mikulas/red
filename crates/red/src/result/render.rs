@@ -279,18 +279,6 @@ impl AppState {
                         )
                     })
                     .child(
-                        // Toggle the column-stats bar. Reads as "filled" while on;
-                        // selecting a column then shows its pushed-down summary.
-                        Button::new("result-stats", "Stats")
-                            .variant(if self.stats_bar {
-                                ButtonVariant::Secondary
-                            } else {
-                                ButtonVariant::Ghost
-                            })
-                            .size(ButtonSize::Sm)
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_stats_bar(cx))),
-                    )
-                    .child(
                         // ⌘⇧F — toggle the filter bar. Reads as "filled" while a
                         // filter is applied (Track B2).
                         Button::new("result-filter", "Filter")
@@ -302,24 +290,12 @@ impl AppState {
                             .size(ButtonSize::Sm)
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_filter_bar(cx))),
                     )
-                    // "Copy to…" — stream this result (filter included) into another
-                    // table, same connection or another open one. Offered on any
-                    // ready result; the source may be read-only (only the target must
-                    // be writable, gated in the picker).
-                    .when(grid.ready, |t| {
-                        t.child(
-                            Button::new("result-copy-to", "Copy to…")
-                                .variant(ButtonVariant::Ghost)
-                                .size(ButtonSize::Sm)
-                                .on_click(cx.listener(|this, _, _, cx| this.open_copy_picker(cx))),
-                        )
-                    })
                     .when(self.editing_enabled() && grid.editable_browse(), |t| {
                         // Import a CSV/JSONL file into this table — shown only on an
                         // editable keyed browse of a writable connection, like "+ Row"
                         // (import is a bulk insert). The grid's columns are the target.
                         t.child(
-                            Button::new("result-import", "Import…")
+                            Button::new("result-import", "Import")
                                 .variant(ButtonVariant::Ghost)
                                 .size(ButtonSize::Sm)
                                 .on_click(
@@ -328,30 +304,37 @@ impl AppState {
                         )
                     })
                     .child(
-                        Button::new("result-csv", "CSV")
-                            .variant(ButtonVariant::Ghost)
+                        // CSV / JSON / HTML are grouped into one "Export" dropdown
+                        // to keep the toolbar uncluttered; it opens a menu at the
+                        // cursor (see `render_export_menu`). HTML is a plain themed
+                        // export alongside CSV/JSON — AI-authored *reports* are a
+                        // separate, on-demand thing the assistant generates.
+                        Button::new("result-export", "Export ▾")
+                            .variant(if self.export_menu.is_some() {
+                                ButtonVariant::Secondary
+                            } else {
+                                ButtonVariant::Ghost
+                            })
                             .size(ButtonSize::Sm)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.export_result(ExportFormat::Csv, cx)
+                            .on_click(cx.listener(|this, ev: &gpui::ClickEvent, _, cx| {
+                                this.export_menu = Some(ev.position());
+                                cx.notify();
                             })),
                     )
                     .child(
-                        Button::new("result-json", "JSON")
-                            .variant(ButtonVariant::Ghost)
+                        // The less-used actions (Stats toggle, "Copy to…") collapse
+                        // into one "More" dropdown at the end of the row to keep the
+                        // toolbar uncluttered (see `render_more_menu`).
+                        Button::new("result-more", "More ▾")
+                            .variant(if self.more_menu.is_some() {
+                                ButtonVariant::Secondary
+                            } else {
+                                ButtonVariant::Ghost
+                            })
                             .size(ButtonSize::Sm)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.export_result(ExportFormat::Json, cx)
-                            })),
-                    )
-                    .child(
-                        // Save the table as a themed standalone HTML file (a plain
-                        // export format alongside CSV/JSON). AI-authored *reports* are
-                        // a separate, on-demand thing the assistant generates.
-                        Button::new("result-html", "HTML")
-                            .variant(ButtonVariant::Ghost)
-                            .size(ButtonSize::Sm)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.export_result(ExportFormat::Html, cx)
+                            .on_click(cx.listener(|this, ev: &gpui::ClickEvent, _, cx| {
+                                this.more_menu = Some(ev.position());
+                                cx.notify();
                             })),
                     ),
             );
@@ -588,6 +571,7 @@ impl AppState {
                         this.focus_pane(Pane::Grid, window, cx);
                         this.result_select(abs_row, table_col, false, cx);
                         this.cell_menu = Some(pos);
+                        this.ref_submenu_open = false;
                         cx.notify();
                     })
                     .ok();
@@ -754,6 +738,16 @@ impl AppState {
             // cursor; a full-cover backdrop dismisses it on an outside click.
             .when_some(is_focused.then_some(self.cell_menu).flatten(), |c, pos| {
                 c.child(self.render_cell_menu(pos, cx))
+            })
+            // The toolbar "Export" dropdown floats the same way, anchored at the
+            // cursor where its button was clicked.
+            .when_some(
+                is_focused.then_some(self.export_menu).flatten(),
+                |c, pos| c.child(self.render_export_menu(pos, cx)),
+            )
+            // The toolbar "More" dropdown (Stats · Copy to…), likewise.
+            .when_some(is_focused.then_some(self.more_menu).flatten(), |c, pos| {
+                c.child(self.render_more_menu(pos, cx))
             });
 
         // With the detail inspector open, dock it to the right of the grid via a
@@ -1171,14 +1165,23 @@ impl AppState {
         }
         if let Some(ref_menu) = ref_menu {
             if !ref_menu.columns.is_empty() {
-                menu = menu.item(
-                    ContextMenuItem::new("ref-hdr", format!("Show from {}", ref_menu.ref_table))
-                        .disabled(true),
-                );
+                // The referenced table's columns can run long (every column of a
+                // wide table), so they live in a hover-opened flyout rather than
+                // padding out the main menu. `ref_submenu_open` is set on hover and
+                // reset when the menu reopens; ignoring the leave event keeps the
+                // flyout up while the cursor crosses the gap into it.
+                let mut sub = Submenu::new("ref-cols", format!("Show from {}", ref_menu.ref_table))
+                    .open(self.ref_submenu_open)
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if *hovered && !this.ref_submenu_open {
+                            this.ref_submenu_open = true;
+                            cx.notify();
+                        }
+                    }));
                 for (i, item) in ref_menu.columns.into_iter().enumerate() {
                     let mark = if item.shown { "✓ " } else { "    " };
                     let path = item.path;
-                    menu = menu.item(
+                    sub = sub.item(
                         ContextMenuItem::new(
                             format!("ref-col-{i}"),
                             format!("{mark}{}", item.label),
@@ -1190,6 +1193,7 @@ impl AppState {
                         })),
                     );
                 }
+                menu = menu.submenu(sub);
             }
         }
         if let Some(path) = joined_path {
@@ -1253,6 +1257,90 @@ impl AppState {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.cell_menu = None;
+                    cx.notify();
+                }),
+            )
+            .child(floating(div().occlude().child(menu)).at(pos))
+    }
+
+    /// The result toolbar's "Export" dropdown — CSV / JSON / HTML grouped into one
+    /// menu, anchored at `pos` (where the button was clicked). A full-cover backdrop
+    /// dismisses it on an outside click, mirroring [`Self::render_cell_menu`].
+    fn render_export_menu(&self, pos: Point<Pixels>, cx: &mut Context<Self>) -> impl IntoElement {
+        let menu = ContextMenu::new("result-export-menu")
+            .item(
+                ContextMenuItem::new("export-csv", "CSV").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.export_menu = None;
+                        this.export_result(ExportFormat::Csv, cx);
+                        cx.notify();
+                    },
+                )),
+            )
+            .item(
+                ContextMenuItem::new("export-json", "JSON").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.export_menu = None;
+                        this.export_result(ExportFormat::Json, cx);
+                        cx.notify();
+                    },
+                )),
+            )
+            .item(
+                ContextMenuItem::new("export-html", "HTML").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.export_menu = None;
+                        this.export_result(ExportFormat::Html, cx);
+                        cx.notify();
+                    },
+                )),
+            );
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.export_menu = None;
+                    cx.notify();
+                }),
+            )
+            .child(floating(div().occlude().child(menu)).at(pos))
+    }
+
+    /// The result toolbar's "More" dropdown — the less-used actions (the Stats
+    /// toggle and "Copy to…") collected into one menu, anchored at `pos`. A
+    /// full-cover backdrop dismisses it, mirroring [`Self::render_cell_menu`].
+    fn render_more_menu(&self, pos: Point<Pixels>, cx: &mut Context<Self>) -> impl IntoElement {
+        // "Copy to…" needs a ready result as its source; the Stats toggle is
+        // always available and carries a leading check while its bar is on.
+        let ready = matches!(&self.phase, Phase::Connected(a) if a.active_result().is_some_and(|g| g.ready));
+        let stats_label = if self.stats_bar { "✓ Stats" } else { "Stats" };
+        let mut menu = ContextMenu::new("result-more-menu").item(
+            ContextMenuItem::new("more-stats", stats_label).on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.more_menu = None;
+                    this.toggle_stats_bar(cx);
+                    cx.notify();
+                },
+            )),
+        );
+        if ready {
+            menu = menu.item(ContextMenuItem::new("more-copy-to", "Copy to…").on_click(
+                cx.listener(|this, _, _, cx| {
+                    this.more_menu = None;
+                    this.open_copy_picker(cx);
+                    cx.notify();
+                }),
+            ));
+        }
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.more_menu = None;
                     cx.notify();
                 }),
             )

@@ -56,6 +56,7 @@
 #   CloseTab               cmd-w        NextTab                ctrl-tab
 #   PrevTab                ctrl-shift-tab
 #   ToggleSidebar          cmd-b        RefreshSchema          cmd-r
+#   ToggleColumnsPanel     cmd-shift-c
 #   SearchSchema           cmd-f        FocusSchema            cmd-alt-1
 #   FocusEditor            cmd-alt-2    FocusGrid              cmd-alt-3
 #   CycleFocusNext         f6           CycleFocusPrev         shift-f6

@@ -357,7 +357,7 @@ impl AppState {
                 .child(chevron)
                 .child(checkbox)
                 .child(crate::icons::icon(
-                    if is_fk { "link" } else { "col" },
+                    if is_fk { "link" } else { "columns" },
                     icon_sm,
                     if is_fk { accent } else { faint },
                 ))

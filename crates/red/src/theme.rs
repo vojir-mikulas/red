@@ -444,6 +444,13 @@ pub fn github_dark() -> Theme {
 /// bars and side panels read as distinct depths (the Zed Ayu look): the editor is
 /// the deepest canvas, bars sit one step up, side panels are the raised "ui" tone,
 /// popovers float highest.
+///
+/// Flint's stock Ayu text and border tones are calibrated for its near-black
+/// surfaces; against RED's lighter bars/popovers (`bg_bar`/`bg_elevated` at
+/// `#2d2f33`) the dimmer tones collapse — `text_faint`/`text_dim` fell to
+/// ~1.8:1 and `border_soft`/`border_strong` sat *darker* than the surface they
+/// drew on. They're retuned here so secondary text clears WCAG AA on both the
+/// dark canvas and the raised chrome, and borders read as structure everywhere.
 pub fn ayu_dark() -> Theme {
     Theme {
         accent: h(0xdc2626),
@@ -451,13 +458,26 @@ pub fn ayu_dark() -> Theme {
         accent_ghost: h(0xdc2626).opacity(0.18),
         on_accent: h(0xffffff),
         bg_selected: h(0x4a2126),
-        border: h(0x3f4043),
+
+        // Secondary text, lifted to clear AA on the lighter bars (was tuned for
+        // Ayu's near-black surfaces and washed out on RED's raised chrome).
+        text_muted: h(0x9ba0aa), // secondary labels — AA on canvas and bars
+        text_faint: h(0x777d88), // tertiary hints
+        text_dim: h(0x61687a),   // disabled / placeholder
+
+        // Borders sized to read on the raised `#2d2f33` chrome, not just the
+        // near-black canvas (Flint's soft/strong tones were darker than the bar).
+        border: h(0x42454b),
+        border_soft: h(0x34373d),
+        border_strong: h(0x53565d),
 
         bg_app: h(0x0e1015),      // editor / results canvas
         bg_panel_2: h(0x181a1f),  // deep wells (tab-strip troughs)
         bg_panel: h(0x1f2126),    // side panels
         bg_bar: h(0x2d2f33),      // toolbars / tab strip
         bg_elevated: h(0x2d2f33), // popovers / modals
+        bg_hover: h(0x1a1e26),    // row / control hover — a clear lift on canvas
+        bg_active: h(0x232832),   // pressed / active row
         ..Theme::ayu_dark()
     }
 }

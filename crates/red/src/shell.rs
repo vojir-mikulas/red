@@ -444,10 +444,12 @@ impl AppState {
             .size(px(20.))
             .rounded(px(4.))
             .cursor_pointer()
-            .tooltip(Tooltip::text("Toggle reference columns"))
+            .tooltip(Tooltip::text(crate::keymap::localize_hint(
+                "Toggle reference columns  ⇧⌘C",
+            )))
             .hover(|s| s.bg(theme.bg_elevated))
             .child(crate::icons::icon(
-                "col",
+                "columns",
                 theme.scale(14.),
                 if active.columns_open {
                     theme.accent

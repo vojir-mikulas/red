@@ -176,6 +176,23 @@ impl AppState {
         }
     }
 
+    /// Esc dismisses the topmost transient overlay: an open toolbar dropdown
+    /// ("Export" / "More") or the cell context menu first, and only when none are
+    /// open does it fall back to closing the detail inspector. So a menu yields to
+    /// Esc before the inspector does, and Esc still does nothing from a bare grid.
+    pub(crate) fn dismiss_overlay(&mut self, cx: &mut Context<Self>) {
+        let mut closed = false;
+        closed |= self.cell_menu.take().is_some();
+        closed |= self.export_menu.take().is_some();
+        closed |= self.more_menu.take().is_some();
+        if closed {
+            self.ref_submenu_open = false;
+            cx.notify();
+            return;
+        }
+        self.close_inspector(cx);
+    }
+
     /// Esc: close the inspector if open (a no-op otherwise, so Esc keeps doing
     /// nothing from the grid when the pane is closed).
     pub(crate) fn close_inspector(&mut self, cx: &mut Context<Self>) {

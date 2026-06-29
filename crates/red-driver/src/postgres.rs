@@ -508,9 +508,14 @@ impl DatabaseDriver for PostgresDriver {
         // Each placeholder carries an explicit cast: the parameter's wire type is
         // fixed by the Rust value (i64 → int8), and without the cast Postgres
         // would infer the column's narrower type (int4) and reject the bind.
+        // Cast each cursor bind back to its key column's type: a text-decoded
+        // cursor (uuid/timestamp/numeric key) would otherwise bind as `text` and
+        // `col > $1::text` has no operator (42883). Int/real values pin their own
+        // wire type and ignore the column type.
+        let key_types = key.column_types();
         let (where_clause, order_by) =
             crate::seek_clauses(key, bound_len, descending, false, pg_quote, |i| {
-                format!("${}{}", i + 1, pg_cast(&bound.unwrap()[i], None))
+                format!("${}{}", i + 1, pg_cast(&bound.unwrap()[i], key_types[i]))
             });
         let sql = format!(
             "SELECT * FROM ({base}) AS _red {where_clause}ORDER BY {order_by} LIMIT {limit}"
@@ -543,9 +548,10 @@ impl DatabaseDriver for PostgresDriver {
     ) -> Result<ResultPage> {
         let base = strip_trailing(sql);
         let bound_len = from.map_or(0, <[Value]>::len);
+        let key_types = key.column_types();
         let (where_clause, order_by) =
             crate::seek_clauses(key, bound_len, false, true, pg_quote, |i| {
-                format!("${}{}", i + 1, pg_cast(&from.unwrap()[i], None))
+                format!("${}{}", i + 1, pg_cast(&from.unwrap()[i], key_types[i]))
             });
         let sql = format!(
             "SELECT * FROM ({base}) AS _red {where_clause}\
@@ -1553,7 +1559,9 @@ mod tests {
         let key_asc = KeySpec {
             column: "grp".into(),
             kind: KeyKind::Int,
+            column_type: None,
             tiebreak: Some("id".into()),
+            tiebreak_type: None,
             descending: false,
         };
         let key_desc = KeySpec {

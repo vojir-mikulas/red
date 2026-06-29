@@ -600,7 +600,8 @@ impl AppState {
             .line_height(px(ed.font_size * ed.line_height))
             .child(tab.editor.clone());
 
-        // --- bottom run bar: Run · history · ……… · read-only ---
+        // --- bottom run bar: Run · Explain · Save · ……… · read-only ---
+        // (Query history now lives in the left dock, toggled with ⌘Y.)
         let ro_chip = active.config.read_only.then(|| {
             div()
                 .ml_auto()
@@ -636,12 +637,6 @@ impl AppState {
                     .size(ButtonSize::Sm)
                     .icon(crate::icons::icon("play", theme.scale(11.), on_accent))
                     .on_click(cx.listener(|this, _, _, cx| this.run_editor_query(cx))),
-            )
-            .child(
-                Button::new("sql-history", "History")
-                    .variant(ButtonVariant::Ghost)
-                    .size(ButtonSize::Sm)
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx))),
             )
             .child(
                 Button::new("sql-explain", "Explain")

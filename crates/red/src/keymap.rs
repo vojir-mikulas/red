@@ -52,6 +52,9 @@ actions!(
         ToggleSidebar,
         /// Show or hide the query-history panel in the left dock.
         ToggleHistory,
+        /// Show or hide the reference-columns panel (inline FK expansion) in the
+        /// left dock.
+        ToggleColumnsPanel,
         /// Reload the schema tree from the backend.
         RefreshSchema,
         /// Move keyboard focus to the schema sidebar / editor / result grid.
@@ -412,6 +415,12 @@ const DEFAULTS: &[ActionDef] = &[
     // `CodeEditor` context doesn't bind it), so it always opens search.
     def("cmd-b", "ToggleSidebar", "Toggle schema", Some("RedRoot")),
     def("cmd-y", "ToggleHistory", "Toggle history", Some("RedRoot")),
+    def(
+        "cmd-shift-c",
+        "ToggleColumnsPanel",
+        "Toggle columns panel",
+        Some("RedRoot"),
+    ),
     def("cmd-r", "RefreshSchema", "Refresh schema", Some("RedRoot")),
     def("cmd-f", "SearchSchema", "Search schema", Some("RedRoot")),
     // Pane focus: direct jumps (⌥⌘1/2/3) and a cycle (F6 / ⇧F6). ⌥⌘ avoids the
@@ -820,6 +829,7 @@ fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<Ke
         "PrevTab" => kb!(PrevTab),
         "ToggleSidebar" => kb!(ToggleSidebar),
         "ToggleHistory" => kb!(ToggleHistory),
+        "ToggleColumnsPanel" => kb!(ToggleColumnsPanel),
         "RefreshSchema" => kb!(RefreshSchema),
         "SearchSchema" => kb!(SearchSchema),
         "FocusSchema" => kb!(FocusSchema),

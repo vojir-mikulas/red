@@ -1375,7 +1375,9 @@ mod tests {
         let key_asc = KeySpec {
             column: "grp".into(),
             kind: KeyKind::Int,
+            column_type: None,
             tiebreak: Some("id".into()),
+            tiebreak_type: None,
             descending: false,
         };
         let key_desc = KeySpec {
