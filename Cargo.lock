@@ -2485,6 +2485,7 @@ dependencies = [
 [[package]]
 name = "flint"
 version = "0.1.0"
+source = "git+https://github.com/vojir-mikulas/flint?rev=42c8cbdfe1360bb6576dae0901bcecb612ee3152#42c8cbdfe1360bb6576dae0901bcecb612ee3152"
 dependencies = [
  "gpui",
  "unicode-segmentation",

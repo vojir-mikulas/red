@@ -79,11 +79,29 @@ jobs:
             --key $RUNNER_TEMP/key.p8 --key-id "$KEY_ID" --issuer "$ISSUER" --wait
           xcrun stapler staple "build/Red-$VERSION.dmg"
 
+      # Slice this version's section out of CHANGELOG.md so the Release body
+      # matches the curated notes (and the in-app "What's New" panel). Keys off
+      # the `## [x.y.z]` heading — rename `## [Unreleased]` before tagging.
+      - name: Extract release notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" {f=1; next}
+            /^## \[/ {f=0}
+            f
+          ' CHANGELOG.md > build/RELEASE_NOTES.md
+          if [ ! -s build/RELEASE_NOTES.md ]; then
+            echo "::warning::No CHANGELOG section for $VERSION; falling back to [Unreleased]."
+            awk '/^## \[Unreleased\]/{f=1; next} /^## \[/{f=0} f' \
+              CHANGELOG.md > build/RELEASE_NOTES.md
+          fi
+          cat build/RELEASE_NOTES.md
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: build/Red-*.dmg
-          generate_release_notes: true
+          body_path: build/RELEASE_NOTES.md
           fail_on_unmatched_files: true
 
   linux:

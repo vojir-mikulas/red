@@ -25,7 +25,7 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "137e677a
 # gpui to the SAME rev as above; Cargo unifies the two git deps only at a
 # matching URL+rev, so bumping Flint is coordinated with the gpui pin. For local
 # Flint+RED work, override with a `[patch]` or a path dep.
-flint = { git = "https://github.com/vojir-mikulas/flint", rev = "8e693d68ca171f646f85e596eeaa09f20ac2f929" }
+flint = { git = "https://github.com/vojir-mikulas/flint", rev = "42c8cbdfe1360bb6576dae0901bcecb612ee3152" }
 
 # --- Async / backend bridge (mirrors Nyx: Tokio backend ↔ GPUI over channels) ---
 tokio = { version = "1", default-features = false }
@@ -116,8 +116,3 @@ opt-level = 2
 #   [patch."https://github.com/vojir-mikulas/flint"]
 #   flint = { path = "../flint" }
 
-# TEMPORARY (do NOT commit): build against the local Flint checkout for the
-# Track B7 relation-tree work — the `Tree::on_secondary` right-click handler isn't
-# in the pinned git rev yet. Remove once Flint is pushed + the `rev` above bumped.
-[patch."https://github.com/vojir-mikulas/flint"]
-flint = { path = "../flint" }
