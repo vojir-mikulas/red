@@ -7,6 +7,7 @@
 mod app;
 mod assets;
 mod assistant;
+mod changelog;
 mod columns_panel;
 mod config;
 mod connect;
@@ -22,6 +23,7 @@ mod icons;
 mod inspector;
 mod keymap;
 mod keymap_config;
+mod local_state;
 mod markdown;
 mod menu;
 mod palette;

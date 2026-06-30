@@ -41,6 +41,12 @@ pub const DEFAULT_SETTINGS: &str = include_str!("../../../assets/default-setting
 /// (and the override format) in front of them to edit.
 pub const DEFAULT_KEYMAP: &str = include_str!("../../../assets/default-keymap.toml");
 
+/// The project changelog, baked into the binary so the in-app "What's New" panel
+/// shows this build's release notes offline. The canonical file is the
+/// Keep-a-Changelog `CHANGELOG.md` at the workspace root; `crate::changelog`
+/// slices the section for the running version out of it.
+pub const CHANGELOG: &str = include_str!("../../../CHANGELOG.md");
+
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         Ok(Self::get(path).map(|file| file.data))

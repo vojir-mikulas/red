@@ -11,8 +11,9 @@ use crate::keymap::{
     About, AddRow, BeginEdit, CloseInspector, CloseTab, CycleFocusNext, CycleFocusPrev, DeleteRow,
     Explain, FindInResult, FocusEditor, FocusGrid, FocusOtherHalf, FocusSchema, NewConnection,
     NewTab, NextTab, OpenSavedQueries, PrevTab, RefreshSchema, ReportBug, RevertChanges, RunQuery,
-    SaveQuery, SearchSchema, SelectAll, SetNull, Settings, ShowShortcuts, SubmitChanges,
-    SwitchConnection, SwitchToConnectionSlot, SwitchToPreviousConnection, ToggleAssistant,
+    SaveQuery, SearchSchema, SelectAll, SetNull, Settings, ShowChangelog, ShowShortcuts,
+    SubmitChanges, SwitchConnection, SwitchToConnectionSlot, SwitchToPreviousConnection,
+    ToggleAssistant,
     ToggleColumnsPanel, ToggleFilter, ToggleHistory, ToggleInspector, ToggleSidebar, ToggleSplit,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
@@ -155,6 +156,12 @@ impl Render for AppState {
         // (compiled out) in a normal build.
         #[cfg(feature = "dev-stats")]
         self.dev_stats.begin_frame();
+
+        // First frame after an update: raise the one-shot "RED updated to X" toast
+        // (`pending_update` was set in `new`). `take` ensures it fires only once.
+        if let Some(version) = self.pending_update.take() {
+            self.notify_update(version, cx);
+        }
 
         // An overlay just closed (or we're starting up): reclaim focus so the
         // global ⌘K binding has a live dispatch target again.
@@ -375,6 +382,8 @@ impl Render for AppState {
 
         let shortcuts = self.shortcuts_open.then(|| self.render_shortcuts(cx));
 
+        let whats_new = self.whats_new_open.then(|| self.render_whats_new(cx));
+
         let theme = cx.theme();
         // Copied out now (Hsla is Copy) so the client-decoration frame at the end
         // of this fn doesn't hold `theme`'s borrow of `cx` across the dev-stats
@@ -454,6 +463,7 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &ToggleSplit, _, cx| this.toggle_split(cx)))
             .on_action(cx.listener(|this, _: &FocusOtherHalf, _, cx| this.focus_other_half(cx)))
             .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| this.toggle_shortcuts(cx)))
+            .on_action(cx.listener(|this, _: &ShowChangelog, _, cx| this.toggle_whats_new(cx)))
             // Settings panel: ⌘, and the RED → Settings… / About RED menu items.
             .on_action(cx.listener(|this, _: &Settings, _, cx| this.open_settings(cx)))
             .on_action(cx.listener(|this, _: &About, _, cx| this.open_about(cx)))
@@ -560,6 +570,7 @@ impl Render for AppState {
             .children(confirm_delete)
             .children(settings)
             .children(shortcuts)
+            .children(whats_new)
             // The connection form modal is rendered at the root so it works in any
             // phase (the welcome screen *and* the connected shell, e.g. opened from
             // the switcher's "New connection…").
@@ -712,6 +723,26 @@ impl AppState {
                     .size(IconButtonSize::Sm)
                     .on_click(move |_, _, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                    }),
+                );
+            }
+            // A call-to-action button (e.g. the post-update toast's "Show
+            // changelog"), accent-tinted to stand out from copy/close, ahead of the
+            // close button. Clicking opens the panel and dismisses this toast.
+            if let Some(crate::app::NotificationAction::ShowChangelog) = n.action {
+                let weak = weak.clone();
+                actions = actions.child(
+                    IconButton::new(
+                        ("toast-changelog", id),
+                        crate::icons::icon("view", action_size, theme.accent),
+                    )
+                    .size(IconButtonSize::Sm)
+                    .on_click(move |_, _, cx| {
+                        weak.update(cx, |this, cx| {
+                            this.close_notification(id, cx);
+                            this.open_whats_new(cx);
+                        })
+                        .ok();
                     }),
                 );
             }

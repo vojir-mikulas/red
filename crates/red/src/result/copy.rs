@@ -296,6 +296,7 @@ impl AppState {
                 expanded: false,
                 hovered: false,
                 dismiss_gen: 0,
+                action: None,
             },
             cx,
         );
@@ -454,6 +455,7 @@ impl AppState {
                 expanded: false,
                 hovered: false,
                 dismiss_gen: 0,
+                action: None,
             },
             cx,
         );

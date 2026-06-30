@@ -101,6 +101,8 @@ pub(crate) enum Cmd {
     Unsplit,
     /// Move focus to the other half of the split.
     FocusOtherHalf,
+    /// Open the "What's New" changelog overlay.
+    ShowChangelog,
 }
 
 /// Which free-text prompt the single palette slot is currently serving, so a
@@ -270,6 +272,7 @@ impl AppState {
             Cmd::NewConnection => self.open_new_form(cx),
             Cmd::GoToRow => self.open_goto_prompt(cx),
             Cmd::ShowShortcuts => self.toggle_shortcuts(cx),
+            Cmd::ShowChangelog => self.toggle_whats_new(cx),
             Cmd::SaveQuery => self.open_save_prompt(cx),
             Cmd::OpenSavedQueries => self.open_saved_picker(cx),
             Cmd::OpenSavedQuery(index) => self.open_saved_query(index, cx),
@@ -519,6 +522,10 @@ impl AppState {
         out.push((
             PaletteItem::new("cmd:shortcuts", "view: keyboard shortcuts").hint("⌘/"),
             Cmd::ShowShortcuts,
+        ));
+        out.push((
+            PaletteItem::new("cmd:whats-new", "help: what's new"),
+            Cmd::ShowChangelog,
         ));
         out.push((
             PaletteItem::new("cmd:settings", "view: settings").hint("⌘,"),

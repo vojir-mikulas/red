@@ -68,6 +68,9 @@ actions!(
         CycleFocusPrev,
         /// Open the keyboard-shortcuts reference overlay.
         ShowShortcuts,
+        /// Open the "What's New" changelog overlay. No default binding — reached
+        /// from the Help menu and the `help: what's new` palette command.
+        ShowChangelog,
         /// ⌘↵ from anywhere: run the active tab's query — or, while the connection
         /// form is open, test the connection.
         RunQuery,

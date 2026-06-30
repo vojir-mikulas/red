@@ -473,6 +473,17 @@ pub(crate) struct Notification {
     pub expanded: bool,
     pub hovered: bool,
     pub dismiss_gen: u64,
+    /// An optional trailing call-to-action button (e.g. the post-update toast's
+    /// "Show changelog"). `None` for an ordinary toast.
+    pub action: Option<NotificationAction>,
+}
+
+/// The call-to-action a toast can offer beyond copy/close — rendered as a trailing
+/// accent button in `render_notifications`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotificationAction {
+    /// Open the "What's New" panel (the post-update announcement toast).
+    ShowChangelog,
 }
 
 /// The default editor text a fresh query tab opens with. A tab still holding
@@ -1156,6 +1167,14 @@ pub struct AppState {
     pub(crate) titlebar_drag: bool,
     /// Whether the keyboard-shortcuts reference overlay (`⌘/`) is showing.
     pub(crate) shortcuts_open: bool,
+    /// Whether the "What's New" changelog overlay is showing (Help menu /
+    /// `help: what's new` palette command / the post-update toast).
+    pub(crate) whats_new_open: bool,
+    /// Set in [`Self::new`] when this build's version differs from the last one
+    /// recorded: the version to announce in a one-shot "RED updated to X" toast,
+    /// raised on the first render. `None` on a first-ever launch or an unchanged
+    /// version.
+    pub(crate) pending_update: Option<SharedString>,
     /// Keyboard-highlighted saved-connection card on the disconnected screen.
     /// Indexes the *visible* (filtered + sorted) list, not `connections`.
     pub(crate) connect_sel: usize,
@@ -1700,6 +1719,19 @@ impl AppState {
         })
         .detach();
 
+        // One-shot "updated to X" announcement: compare this build's version to
+        // the last one we recorded. A first-ever launch records silently (there's
+        // no prior version to have updated *from*); a changed version is remembered
+        // so the first render can raise a toast. Either way we mark the current
+        // version seen now, so the toast fires exactly once per update.
+        let mut local_state = crate::local_state::LocalState::load();
+        let current_version = crate::changelog::VERSION;
+        let is_update = local_state
+            .last_seen()
+            .is_some_and(|seen| seen != current_version);
+        local_state.mark_seen(current_version);
+        let pending_update = is_update.then(|| SharedString::from(current_version));
+
         Self {
             service,
             connections,
@@ -1812,6 +1844,8 @@ impl AppState {
             refocus_root: true,
             titlebar_drag: false,
             shortcuts_open: false,
+            whats_new_open: false,
+            pending_update,
             connect_sel: 0,
             connect_search,
             connect_sort: ConnectSort {
@@ -1905,6 +1939,7 @@ impl AppState {
                 expanded: false,
                 hovered: false,
                 dismiss_gen: 0,
+                action: None,
             },
             cx,
         )
@@ -1937,6 +1972,7 @@ impl AppState {
                 expanded: false,
                 hovered: false,
                 dismiss_gen: 0,
+                action: None,
             },
             cx,
         )
@@ -2411,6 +2447,7 @@ impl AppState {
             || self.confirm_close_tab.is_some()
             || self.confirm_delete_conn.is_some()
             || self.shortcuts_open
+            || self.whats_new_open
             || self.settings_open
             || self.form.is_some()
     }
@@ -2426,6 +2463,50 @@ impl AppState {
             self.refocus_root = true;
         }
         cx.notify();
+    }
+
+    /// Open or close the "What's New" changelog overlay (Help menu / `help: what's
+    /// new` palette command). Opening focuses the modal so Esc closes it; closing
+    /// returns focus to the root, like the other keyboard-driven overlays.
+    pub(crate) fn toggle_whats_new(&mut self, cx: &mut Context<Self>) {
+        self.set_whats_new(!self.whats_new_open, cx);
+    }
+
+    /// Open the "What's New" overlay (the post-update toast's "Show changelog").
+    pub(crate) fn open_whats_new(&mut self, cx: &mut Context<Self>) {
+        self.set_whats_new(true, cx);
+    }
+
+    fn set_whats_new(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.whats_new_open = open;
+        if open {
+            self.focus_modal = true;
+        } else {
+            self.refocus_root = true;
+        }
+        cx.notify();
+    }
+
+    /// Raise the one-shot "RED updated to X" toast. Persistent (no auto-dismiss) so
+    /// the user doesn't miss it, with a "Show changelog" action that opens the
+    /// What's New panel. Called once from `render` when `pending_update` is set.
+    pub(crate) fn notify_update(&mut self, version: SharedString, cx: &mut Context<Self>) {
+        self.push_notification(
+            Notification {
+                id: 0,
+                variant: ToastVariant::Info,
+                message: format!("RED updated to {version}").into(),
+                detail: Some("See what's new in this release.".into()),
+                detail_label: None,
+                auto_dismiss: None,
+                export: None,
+                expanded: false,
+                hovered: false,
+                dismiss_gen: 0,
+                action: Some(NotificationAction::ShowChangelog),
+            },
+            cx,
+        );
     }
 
     // --- pane focus ---
