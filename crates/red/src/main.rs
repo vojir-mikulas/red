@@ -8,8 +8,8 @@ mod app;
 mod assets;
 mod assistant;
 mod changelog;
+mod cli;
 mod columns_panel;
-mod config;
 mod connect;
 mod conversations;
 #[cfg(feature = "dev-stats")]
@@ -33,15 +33,24 @@ mod queries;
 mod result;
 mod sample;
 mod schema;
-mod secrets;
 mod settings;
 mod settings_ui;
 mod settings_watch;
 mod shell;
 mod sql;
 mod theme;
-mod tree;
 mod window_chrome;
+
+// Connection-list persistence and OS-keychain access were extracted into the
+// UI-free `red-config` crate so a headless CLI can read the same
+// `connections.toml` and keychain. Re-exported under their original paths so
+// every existing `crate::config::*` / `crate::secrets::*` call site is unchanged.
+mod config {
+    pub use red_config::config::*;
+}
+mod secrets {
+    pub use red_config::secrets::*;
+}
 
 use gpui::{prelude::*, App, Bounds, TitlebarOptions, WindowBounds, WindowOptions};
 use gpui_platform::application;
@@ -64,6 +73,13 @@ gpui::actions!(red, [Quit]);
 gpui::actions!(red, [ToggleDevStats]);
 
 fn main() {
+    // Headless CLI: when argv names a verb (`red query|exec|test|connections`)
+    // this runs the command and exits before any GPUI init. A bare `red` returns
+    // `None` and falls through to the desktop app below.
+    if let Some(code) = cli::run() {
+        std::process::exit(i32::from(code));
+    }
+
     init_tracing();
 
     // macOS GUI launches inherit a minimal PATH that omits Homebrew / Node, which

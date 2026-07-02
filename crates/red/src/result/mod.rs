@@ -1271,7 +1271,6 @@ impl AppState {
                 let tab = active.active_mut().unwrap();
                 tab.result = Some(grid);
                 tab.plan = None;
-                tab.tree = None;
                 opened
             }
             _ => return,
@@ -2371,11 +2370,6 @@ impl AppState {
         // An FK click-through (Track B7) also re-fetches one row in full to read the
         // typed key; if this reply is its, it opens the target browse.
         if self.on_fk_rows(id, &rows, cx) {
-            cx.notify();
-            return;
-        }
-        // "Open row as tree" (Track B7) re-fetches the root row in full.
-        if self.on_tree_root_rows(id, &rows, cx) {
             cx.notify();
             return;
         }

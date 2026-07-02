@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[package]
+name = "red-config"
+description = "RED connection-list persistence + OS-keychain access. UI-free, so both the GPUI app and a headless CLI share one connections.toml and one keychain."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Domain types (ConnectionConfig, DbKind, Ssh*). `serde` powers the TOML shapes.
+red-core = { workspace = true, features = ["serde"] }
+serde.workspace = true
+toml.workspace = true
+dirs.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# Wipes cached plaintext credentials from memory on drop (see secrets.rs cache).
+zeroize.workspace = true
+
+# The keychain backend is chosen per-OS here (Cargo features being additive, the
+# backend can't be picked in the workspace dep without leaking to every
+# platform): macOS → Keychain, Windows → Credential Manager, Linux → freedesktop
+# Secret Service over D-Bus (`crypto-rust` keeps the encrypted session pure-Rust,
+# so no OpenSSL native dep leaks into a portable Linux build). Moved here from the
+# `red` binary crate so the CLI shares one keychain implementation.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { workspace = true, features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { workspace = true, features = ["sync-secret-service", "crypto-rust"] }

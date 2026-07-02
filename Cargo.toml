@@ -96,6 +96,9 @@ hex = "0.4"
 # Wipes cached plaintext credentials from memory on drop (see secrets.rs cache).
 zeroize = "1"
 
+# --- CLI (headless mode: `red query|exec|copy|migrate …`) ---
+clap = { version = "4", features = ["derive"] }
+
 # --- Errors / logging ---
 anyhow = "1"
 thiserror = "2"
@@ -110,6 +113,7 @@ notify = "6"
 
 # --- Internal crates ---
 red-core = { path = "crates/red-core" }
+red-config = { path = "crates/red-config" }
 red-driver = { path = "crates/red-driver" }
 red-service = { path = "crates/red-service" }
 red-ai = { path = "crates/red-ai" }

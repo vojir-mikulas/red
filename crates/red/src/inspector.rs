@@ -186,7 +186,6 @@ impl AppState {
         closed |= self.export_menu.take().is_some();
         closed |= self.more_menu.take().is_some();
         if closed {
-            self.ref_submenu_open = false;
             cx.notify();
             return;
         }

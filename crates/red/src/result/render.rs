@@ -571,7 +571,6 @@ impl AppState {
                         this.focus_pane(Pane::Grid, window, cx);
                         this.result_select(abs_row, table_col, false, cx);
                         this.cell_menu = Some(pos);
-                        this.ref_submenu_open = false;
                         cx.notify();
                     })
                     .ok();
@@ -1103,13 +1102,11 @@ impl AppState {
                         cx.notify();
                     })),
             );
-        // FK navigation (Track B7): jump to the referenced row, list the tables that
-        // reference this one, or open the row as a relation tree. The first two need
-        // the FK graph to have edges for the focused column/table; the tree needs
-        // only a single-table browse.
+        // FK navigation (Track B7): jump to the referenced row or list the tables that
+        // reference this one. Both need the FK graph to have edges for the focused
+        // column/table.
         let (fk_forward, fk_reverse) = self.fk_menu();
-        let can_tree = matches!(&self.phase, Phase::Connected(a) if a.active_result().is_some_and(|g| g.base_table().is_some()));
-        if fk_forward.is_some() || !fk_reverse.is_empty() || can_tree {
+        if fk_forward.is_some() || !fk_reverse.is_empty() {
             menu = menu.separator();
         }
         if let Some(target) = fk_forward {
@@ -1139,17 +1136,6 @@ impl AppState {
                 }),
             ));
         }
-        if can_tree {
-            menu = menu.item(
-                ContextMenuItem::new("open-tree", "Open row as tree").on_click(cx.listener(
-                    |this, _, _, cx| {
-                        this.cell_menu = None;
-                        this.open_row_as_tree(cx);
-                        cx.notify();
-                    },
-                )),
-            );
-        }
         // Inline FK expansion (Track B7): pull the focused FK cell's referenced
         // columns into the grid (a ✓ marks ones already shown), hide a joined
         // column, or clear them all. The per-column list comes from the referenced
@@ -1167,17 +1153,9 @@ impl AppState {
             if !ref_menu.columns.is_empty() {
                 // The referenced table's columns can run long (every column of a
                 // wide table), so they live in a hover-opened flyout rather than
-                // padding out the main menu. `ref_submenu_open` is set on hover and
-                // reset when the menu reopens; ignoring the leave event keeps the
-                // flyout up while the cursor crosses the gap into it.
-                let mut sub = Submenu::new("ref-cols", format!("Show from {}", ref_menu.ref_table))
-                    .open(self.ref_submenu_open)
-                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                        if *hovered && !this.ref_submenu_open {
-                            this.ref_submenu_open = true;
-                            cx.notify();
-                        }
-                    }));
+                // padding out the main menu. `ContextMenu` opens it on hover and
+                // closes it again when a sibling row is entered.
+                let mut sub = Submenu::new("ref-cols", format!("Show from {}", ref_menu.ref_table));
                 for (i, item) in ref_menu.columns.into_iter().enumerate() {
                     let mark = if item.shown { "✓ " } else { "    " };
                     let path = item.path;

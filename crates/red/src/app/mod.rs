@@ -536,9 +536,6 @@ pub(crate) struct QueryTab {
     /// The query plan (Track B4 — EXPLAIN), when one is open. Occupies the result
     /// pane in place of the grid; running a query clears it. `None` is the grid.
     pub plan: Option<crate::plan::PlanView>,
-    /// The relation tree (Track B7 — "Open row as tree"), when one is open. Occupies
-    /// the result pane in place of the grid; running a query or closing it clears it.
-    pub tree: Option<crate::tree::RelationTreeView>,
     /// Which split half owns this tab (Zed-style): each pane's tab strip shows only
     /// its own tabs, so the two halves never duplicate. Always `Primary` while the
     /// work area is unsplit; a drag across the divider (or `split_right`) reassigns it.
@@ -577,7 +574,6 @@ impl QueryTab {
             editor,
             result: None,
             plan: None,
-            tree: None,
             // New tabs join the focused pane; `push_tab` reassigns this when split.
             pane: SplitHalf::Primary,
         }
@@ -959,12 +955,6 @@ pub struct AppState {
     /// `CopyRows` re-fetch to read the typed key value before opening the target
     /// browse. The latest follow wins; an earlier reply is then stale and dropped.
     pub(crate) pending_fk: Option<crate::result::PendingFkFollow>,
-    /// An in-flight "Open row as tree" (Track B7), waiting on the focused row's
-    /// full `CopyRows` re-fetch to build the tree root.
-    pub(crate) pending_tree: Option<crate::tree::PendingTreeRoot>,
-    /// The relation tree's right-click context menu (Track B7): the node id and the
-    /// cursor anchor. `None` when closed.
-    pub(crate) tree_menu: Option<(u64, gpui::Point<gpui::Pixels>)>,
     /// The cell detail inspector, when open (Track B1). Owns its scroll position
     /// and any on-demand full value fetched for a capped/evicted cell.
     pub(crate) inspector: Option<crate::inspector::InspectorState>,
@@ -1031,9 +1021,6 @@ pub struct AppState {
     /// Window-coordinate anchor for the result toolbar's "More" dropdown, when
     /// open (Stats toggle · Copy to…); `None` keeps it closed.
     pub(crate) more_menu: Option<gpui::Point<gpui::Pixels>>,
-    /// Whether the cell menu's "Show from <table>" flyout (the FK column list) is
-    /// open. Set on hover of its parent row; reset whenever the cell menu opens.
-    pub(crate) ref_submenu_open: bool,
     /// A pending write awaiting the user's confirmation before it runs: an editor
     /// destructive statement, or a staged grid edit batch (Track B6). See
     /// [`PendingWrite`].
@@ -1802,8 +1789,6 @@ impl AppState {
             migrate_targets: Vec::new(),
             pending_migrate: None,
             pending_fk: None,
-            pending_tree: None,
-            tree_menu: None,
             inspector: None,
             assistant: None,
             focus_assistant: false,
@@ -1826,7 +1811,6 @@ impl AppState {
             cell_menu: None,
             export_menu: None,
             more_menu: None,
-            ref_submenu_open: false,
             confirm_exec: None,
             pending_import: None,
             grid_edit: None,
@@ -2251,15 +2235,6 @@ impl AppState {
                 }
                 cx.notify();
             }
-            Event::TreeNodeLoaded {
-                epoch,
-                node,
-                columns,
-                rows,
-                more,
-                error,
-            } => self.on_tree_node_loaded(session, epoch, node, columns, rows, more, error, cx),
-
             // --- result grid ---
             Event::ResultReady {
                 columns,

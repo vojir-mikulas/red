@@ -676,63 +676,6 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 }
             }
 
-            Command::FetchTreeNode {
-                epoch,
-                node,
-                base_sql,
-                filter,
-                limit,
-            } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get(&id) else {
-                    continue;
-                };
-                let driver = state.driver.clone();
-                // Apply the FK equality (or a raw WHERE) like an OpenResult filter,
-                // then fetch one display-capped page, over-fetching by one to detect
-                // "more". A failure is reported per-node (the tree stays usable).
-                let filtered = match &filter {
-                    Some(ResultFilter::Eq(pairs)) => {
-                        wrap_where(&base_sql, &driver.eq_predicate(pairs))
-                    }
-                    Some(ResultFilter::Where(expr)) => wrap_where(&base_sql, expr),
-                    Some(ResultFilter::Contains(_)) | None => base_sql.clone(),
-                };
-                let abort = AbortSignal::new();
-                let ev = match driver
-                    .fetch_page(
-                        &filtered,
-                        0,
-                        limit + 1,
-                        PageCap::Display { key: None },
-                        &abort,
-                    )
-                    .await
-                {
-                    Ok(mut page) => {
-                        let more = page.rows.len() > limit;
-                        page.rows.truncate(limit);
-                        Event::TreeNodeLoaded {
-                            epoch,
-                            node,
-                            columns: page.columns,
-                            rows: page.rows,
-                            more,
-                            error: None,
-                        }
-                    }
-                    Err(e) => Event::TreeNodeLoaded {
-                        epoch,
-                        node,
-                        columns: Vec::new(),
-                        rows: Vec::new(),
-                        more: false,
-                        error: Some(e.to_string()),
-                    },
-                };
-                emit(&events, session_id, ev);
-            }
-
             Command::DescribeTable { schema, table } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get(&id) else {

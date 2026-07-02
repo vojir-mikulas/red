@@ -35,17 +35,21 @@ rust-embed.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-# Backend + domain types. `serde` on red-core powers config persistence, which
-# lives at the app edge (config.rs).
+# Backend + domain types. `serde` on red-core powers config persistence.
 red-core = { workspace = true, features = ["serde"] }
 red-service.workspace = true
+# Connection-list persistence + OS keychain, extracted so the headless CLI can
+# share one connections.toml and one keychain (re-exported as `crate::config` /
+# `crate::secrets`). Owns the `keyring`/`zeroize` deps that used to live here.
+red-config.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 dirs.workspace = true
 notify.workspace = true
-zeroize.workspace = true
+# Headless CLI mode (src/cli/): argv parsing for `red query|exec|test|connections`.
+clap.workspace = true
 
 # Connection import: decrypt DBeaver (AES-128-CBC) and DBGate (simple-encryptor:
 # AES-256-CBC + SHA-256 key + HMAC-SHA256) credential stores. See src/import/.
@@ -58,20 +62,11 @@ hex.workspace = true
 
 # macOS uses font-kit (CoreText) for font loading; Windows/Linux use GPUI's own
 # backend. Features are additive, so this only adds to the base workspace deps.
-# The keychain backend is also chosen per-OS here (Cargo features being additive,
-# the backend can't be picked in the workspace dep without leaking to every
-# platform): macOS → Keychain, Windows → Credential Manager, Linux → freedesktop
-# Secret Service over D-Bus (`crypto-rust` keeps the encrypted session pure-Rust,
-# so no OpenSSL native dep leaks into a portable Linux build).
+# The per-OS keychain backend now lives in `red-config` (shared with the CLI).
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui = { workspace = true, features = ["font-kit"] }
 gpui_platform = { workspace = true, features = ["font-kit"] }
-keyring = { workspace = true, features = ["apple-native"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-keyring = { workspace = true, features = ["windows-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui = { workspace = true, features = ["x11", "wayland"] }
 gpui_platform = { workspace = true, features = ["x11", "wayland"] }
-keyring = { workspace = true, features = ["sync-secret-service", "crypto-rust"] }

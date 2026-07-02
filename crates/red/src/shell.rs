@@ -731,9 +731,9 @@ impl AppState {
             .into_any_element()
     }
 
-    /// The lower pane for tab `tab_idx`: its relation tree (Track B7) or query plan
-    /// (Track B4) when one is open, else the result grid — all share the slot. Picks
-    /// per-tab (not per-focus) so each half shows its own tab's view.
+    /// The lower pane for tab `tab_idx`: its query plan (Track B4) when one is open,
+    /// else the result grid — both share the slot. Picks per-tab (not per-focus) so
+    /// each half shows its own tab's view.
     fn render_results_slot(
         &self,
         active: &ActiveConn,
@@ -744,9 +744,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let tab = active.tabs.get(tab_idx);
-        if tab.is_some_and(|t| t.tree.is_some()) {
-            self.render_tree(active, tab_idx, is_focused, cx)
-        } else if tab.is_some_and(|t| t.plan.is_some()) {
+        if tab.is_some_and(|t| t.plan.is_some()) {
             self.render_plan(active, tab_idx, cx)
         } else {
             self.render_result(active, tab_idx, half, is_focused, window, cx)
