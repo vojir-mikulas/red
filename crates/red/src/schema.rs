@@ -317,9 +317,16 @@ fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
 /// out of the SQL. MySQL/MariaDB use backticks (double quotes are string literals
 /// there unless `ANSI_QUOTES` is set); SQLite/Postgres use the SQL-standard double
 /// quote. Embedded quote chars are doubled either way.
+///
+/// ClickHouse also uses double quotes but, unlike SQLite/Postgres, honors backslash
+/// escapes inside them, so its backslashes are doubled too — otherwise a table name
+/// ending in `\` escapes the closing quote and breaks out.
 pub(crate) fn quote_ident(ident: &str, kind: DbKind) -> String {
     match kind {
         DbKind::Mysql => format!("`{}`", ident.replace('`', "``")),
+        DbKind::Clickhouse => {
+            format!("\"{}\"", ident.replace('\\', "\\\\").replace('"', "\"\""))
+        }
         _ => format!("\"{}\"", ident.replace('"', "\"\"")),
     }
 }

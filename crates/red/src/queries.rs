@@ -85,7 +85,16 @@ pub(crate) fn save(name: &str, sql: &str) -> Result<PathBuf> {
     let contents = format!("-- name: {}\n\n{}\n", name.trim(), body.trim_end());
 
     let tmp = dest.with_extension(format!("sql.tmp.{}", std::process::id()));
-    let mut file = std::fs::File::create(&tmp).context("creating the query temp file")?;
+    // Owner-only on Unix: a saved snippet can embed literal credentials or PII in a
+    // `WHERE` clause, the same content class as the query history (`history.rs`).
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp).context("creating the query temp file")?;
     file.write_all(contents.as_bytes())?;
     file.sync_all()?;
     drop(file);

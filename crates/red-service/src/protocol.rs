@@ -737,7 +737,7 @@ pub enum AiAgentKind {
 /// `settings.toml` (`[[ai.agents]]`, or the synthesized legacy built-ins) plus the
 /// per-agent API key read from the OS keyring. The service keys its provider
 /// registry by [`id`](Self::id); a turn names that id.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct AiAgentProfile {
     /// Stable id — the per-turn selector and keyring account (`ai-key:<id>`).
     pub id: String,
@@ -756,6 +756,30 @@ pub struct AiAgentProfile {
     /// (a turn on it replies with `AiError`). Unused for `Acp` (the agent owns its
     /// own auth).
     pub api_key: String,
+}
+
+/// Hand-written so the API key is **never** printed — matching the redacting `Debug`
+/// on `ConnectionConfig`/`SshConfig`, so a stray `{profile:?}` (or a debug-log of the
+/// command stream carrying an `AiConfig`) can't spill the key into the logs.
+impl std::fmt::Debug for AiAgentProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AiAgentProfile")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("command", &self.command)
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field(
+                "api_key",
+                &if self.api_key.is_empty() {
+                    "<unset>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .finish()
+    }
 }
 
 /// How the AI assistant is configured, carried by `ConfigureAi`. Built UI-side

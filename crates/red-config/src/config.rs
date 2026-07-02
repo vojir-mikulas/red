@@ -382,14 +382,34 @@ fn migrate_secrets(connections: &mut [StoredConnection]) -> bool {
     true
 }
 
-/// Persist the connection list (without passwords — those live in the keychain).
-/// Creates the config dir if needed.
+/// Persist the connection list. Normally password-free (secrets live in the
+/// keychain), but a legacy file whose keychain migration failed can still hold
+/// plaintext passwords ([`migrate_secrets`]), so the file is written owner-only on
+/// Unix and atomically (temp + rename) — never leaving a world-readable credential
+/// or a half-written file. Creates the config dir if needed.
 pub fn save(connections: &[StoredConnection]) -> Result<()> {
+    use std::io::Write;
+
     let path = config_path().context("no platform config directory")?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, serialize(connections)?)?;
+    let contents = serialize(connections)?;
+    let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(&tmp)
+        .context("creating the connections temp file")?;
+    f.write_all(contents.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, &path).context("renaming the connections temp file")?;
     Ok(())
 }
 

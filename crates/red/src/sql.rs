@@ -323,6 +323,100 @@ pub fn classify(sql: &str) -> StatementKind {
         .unwrap_or(StatementKind::Query)
 }
 
+/// A conservative read-only gate for **AI-suggested** SQL that would auto-execute
+/// (the agent's `open_query` tool / the "Open in a query tab" chip): the statement
+/// must be a single SELECT/WITH/EXPLAIN/VALUES with no statement separator and no
+/// embedded write keyword or dangerous server-side function. Anything else is loaded
+/// into the tab but *not* run, so a model can never silently execute a write on a
+/// writable connection — closing the [`classify`]-only gate's hole where a
+/// data-modifying CTE (`WITH x AS (DELETE … RETURNING …) SELECT …`) or a
+/// side-effecting function (`SELECT lo_export(…)`) leads with a read keyword.
+///
+/// This is the UI twin of `red-service`'s `is_read_only_select`, and reasons the
+/// same way — over a noise-stripped copy (literals/quoted-identifiers/comments
+/// blanked) so a write word inside a string can't fool it and a quoted column named
+/// like one can't trip it. Keep the two token lists in sync. False positives are
+/// fine: a rejected read just doesn't auto-run; the user can still press Run.
+pub fn is_read_only(sql: &str) -> bool {
+    let stripped = strip_noise(sql);
+    let trimmed = stripped.trim().trim_end_matches(';').trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // A `;` (outside a literal, already blanked) could chain a write past the prefix.
+    if trimmed.contains(';') {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let read_prefix = ["select", "with", "explain", "values"]
+        .iter()
+        .any(|p| lower.starts_with(p));
+    if !read_prefix {
+        return false;
+    }
+    // Whole-word write verbs (the data-modifying CTE verbs, `INTO` for
+    // `SELECT … INTO`/`OUTFILE`, sequence advancers) and the well-known file/exec/
+    // remote-SQL functions — reserved or underscore-qualified names that can't be a
+    // bare column in a real read (a column so named would be quoted, hence blanked).
+    const WRITE_TOKENS: &[&str] = &[
+        "insert", "update", "delete", "merge", "into", "nextval", "setval",
+    ];
+    const DANGEROUS_FNS: &[&str] = &[
+        "lo_import",
+        "lo_export",
+        "pg_read_file",
+        "pg_read_binary_file",
+        "pg_ls_dir",
+        "pg_stat_file",
+        "pg_logical_emit_message",
+        "dblink_exec",
+        "pg_file_write",
+        "pg_file_unlink",
+        "pg_file_rename",
+        "load_file",
+        "sys_exec",
+        "sys_eval",
+    ];
+    !WRITE_TOKENS
+        .iter()
+        .chain(DANGEROUS_FNS)
+        .any(|w| has_word(&lower, w))
+}
+
+/// A copy of `sql` with string literals, quoted identifiers, and comments blanked to
+/// spaces (reusing [`tokenize`], which marks both `'…'` and `"…"` as `String`), so a
+/// keyword scan sees only live SQL. Length- and boundary-preserving: every blanked
+/// span is a whole token, so replacing its bytes with ASCII spaces keeps valid UTF-8.
+fn strip_noise(sql: &str) -> String {
+    let mut bytes = sql.as_bytes().to_vec();
+    for (range, style) in tokenize(sql) {
+        if matches!(style, TokenStyle::String | TokenStyle::Comment) {
+            for b in &mut bytes[range] {
+                *b = b' ';
+            }
+        }
+    }
+    String::from_utf8(bytes).unwrap_or_default()
+}
+
+/// Whether `word` occurs in `haystack` as a whole ASCII word — not as a fragment of
+/// a longer identifier (so `updated_at` doesn't match `update`). Both are lower-case.
+fn has_word(haystack: &str, word: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(word) {
+        let start = from + rel;
+        let end = start + word.len();
+        let left_ok = start == 0 || !is_ident_continue(bytes[start - 1]);
+        let right_ok = end == bytes.len() || !is_ident_continue(bytes[end]);
+        if left_ok && right_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
 /// The single `;`-delimited statement to run for a caret at `cursor`: the
 /// statement the caret sits in, or — when it sits in a blank/comment-only region
 /// (commonly just past the final `;`) — the nearest non-empty statement before it.
@@ -930,6 +1024,43 @@ mod tests {
         );
         // Trailing terminator / empty statements are ignored.
         assert_eq!(classify("DELETE FROM t;"), StatementKind::Destructive);
+    }
+
+    #[test]
+    fn is_read_only_allows_plain_reads() {
+        assert!(is_read_only("SELECT * FROM users"));
+        assert!(is_read_only("  select id from t where name = 'a'  "));
+        assert!(is_read_only("WITH x AS (SELECT 1) SELECT * FROM x"));
+        assert!(is_read_only("EXPLAIN SELECT * FROM t"));
+        assert!(is_read_only("VALUES (1), (2)"));
+        assert!(is_read_only("SELECT * FROM t;")); // a single trailing terminator is fine
+                                                   // A write word appearing only inside a string literal or a quoted identifier
+                                                   // is blanked before the scan, so a legitimate read isn't rejected.
+        assert!(is_read_only("SELECT 'delete me' AS note FROM t"));
+        assert!(is_read_only("SELECT \"delete\" FROM t"));
+        // `updated_at` must not match the `update` write token (whole-word only).
+        assert!(is_read_only("SELECT updated_at FROM t"));
+    }
+
+    #[test]
+    fn is_read_only_rejects_writes_and_side_effects() {
+        // Plain writes / DDL never lead with a read keyword.
+        assert!(!is_read_only("INSERT INTO t VALUES (1)"));
+        assert!(!is_read_only("UPDATE t SET a = 1"));
+        assert!(!is_read_only("DROP TABLE t"));
+        // The hole the leading-keyword classifier misses: a data-modifying CTE and a
+        // side-effecting function that both *lead* with a read keyword.
+        assert!(!is_read_only(
+            "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x"
+        ));
+        assert!(!is_read_only("SELECT lo_export(oid, '/tmp/x') FROM t"));
+        assert!(!is_read_only("SELECT load_file('/etc/passwd')"));
+        assert!(!is_read_only("SELECT * INTO other FROM t"));
+        // A chained statement can smuggle a write past a leading read.
+        assert!(!is_read_only("SELECT 1; DROP TABLE users"));
+        // Nothing runnable.
+        assert!(!is_read_only(""));
+        assert!(!is_read_only("  -- just a note"));
     }
 
     #[test]

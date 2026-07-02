@@ -427,7 +427,7 @@ impl DatabaseDriver for MysqlDriver {
     }
 
     fn eq_predicate(&self, pairs: &[ColumnValue]) -> String {
-        crate::eq_clause(pairs, |c| format!("`{}`", escape_ident(c)))
+        crate::eq_clause(pairs, |c| format!("`{}`", escape_ident(c)), true)
     }
 
     fn fk_join_wrap(&self, base: &str, base_cols: &[String], joins: &[FkJoin]) -> String {

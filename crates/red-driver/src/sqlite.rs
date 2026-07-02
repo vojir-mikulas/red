@@ -155,7 +155,7 @@ impl DatabaseDriver for SqliteDriver {
     }
 
     fn eq_predicate(&self, pairs: &[ColumnValue]) -> String {
-        crate::eq_clause(pairs, quote_ident)
+        crate::eq_clause(pairs, quote_ident, false)
     }
 
     fn fk_join_wrap(&self, base: &str, base_cols: &[String], joins: &[FkJoin]) -> String {

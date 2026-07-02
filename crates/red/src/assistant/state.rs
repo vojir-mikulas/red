@@ -721,10 +721,12 @@ impl AppState {
         cx.notify();
     }
 
-    /// Open `sql` in a fresh query tab in the workspace. A read-only SELECT runs
-    /// automatically (the data lands in the grid); anything else is loaded for the
-    /// user to run, so the editor's own write-confirm path still applies. Shared by
-    /// the assistant's "Open in a query tab" chip and the agent's open_query tool.
+    /// Open `sql` in a fresh query tab in the workspace. Only a genuine read-only
+    /// query (see [`crate::sql::is_read_only`]) runs automatically; anything else —
+    /// including a data-modifying CTE or a side-effecting function that merely *leads*
+    /// with a read keyword — is loaded for the user to run by hand, so an agent (which
+    /// reaches this via `open_query`) can never silently execute a write on a writable
+    /// connection. Shared by the assistant's "Open in a query tab" chip and the tool.
     pub(crate) fn open_query_in_tab(&mut self, sql: String, cx: &mut Context<Self>) {
         if !matches!(self.phase, Phase::Connected(_)) {
             return;
@@ -736,7 +738,7 @@ impl AppState {
                     .update(cx, |e, cx| e.set_content(sql.clone(), cx));
             }
         }
-        if matches!(crate::sql::classify(&sql), crate::sql::StatementKind::Query) {
+        if crate::sql::is_read_only(&sql) {
             self.run_editor_query(cx);
         }
         cx.notify();

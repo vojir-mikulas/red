@@ -436,7 +436,7 @@ impl DatabaseDriver for PostgresDriver {
     }
 
     fn eq_predicate(&self, pairs: &[ColumnValue]) -> String {
-        crate::eq_clause(pairs, pg_quote)
+        crate::eq_clause(pairs, pg_quote, false)
     }
 
     fn fk_join_wrap(&self, base: &str, base_cols: &[String], joins: &[FkJoin]) -> String {

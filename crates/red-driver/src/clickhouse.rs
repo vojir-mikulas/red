@@ -467,7 +467,7 @@ impl DatabaseDriver for ClickhouseDriver {
     }
 
     fn eq_predicate(&self, pairs: &[ColumnValue]) -> String {
-        crate::eq_clause(pairs, ch_quote)
+        crate::eq_clause(pairs, ch_quote, true)
     }
 
     async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64> {
@@ -919,9 +919,13 @@ fn host_authority(host: &str, port: u16) -> String {
     }
 }
 
-/// Quote a ClickHouse identifier with backticks, doubling any embedded backtick.
+/// Quote a ClickHouse identifier with backticks. ClickHouse processes backslash
+/// escapes *inside* backtick-quoted identifiers (unlike MySQL backticks), so the
+/// backslash must be doubled as well as the backtick — otherwise a name ending in
+/// `\` (or a smuggled `` \` ``) escapes the closing backtick and breaks out of the
+/// identifier. Double `\` first so the backticks added next aren't re-escaped.
 fn ch_quote(ident: &str) -> String {
-    format!("`{}`", ident.replace('`', "``"))
+    format!("`{}`", ident.replace('\\', "\\\\").replace('`', "``"))
 }
 
 /// Extract the next newline-delimited line from `buf` (consuming it, including the

@@ -558,10 +558,27 @@ pub(crate) fn contains_clause(
 /// [`sql_literal`]) compared with `=` — no column cast, so the comparison stays
 /// index-usable and the engine coerces the untyped literal to the column's type.
 /// `pairs` is non-empty by contract (a follow always has at least one column).
-pub(crate) fn eq_clause(pairs: &[ColumnValue], quote: impl Fn(&str) -> String) -> String {
+///
+/// `backslash_escapes` must match the engine's string-literal rules: MySQL (default
+/// mode) and ClickHouse treat `\` as an escape inside `'…'`, so a value's backslashes
+/// must be doubled too, not just its quotes — see [`sql_literal`]. Postgres (with the
+/// default `standard_conforming_strings`) and SQLite treat `\` as a literal byte, so
+/// they pass `false`. Getting this wrong is a SQL-injection hole: an unescaped
+/// trailing `\` lets a value break out of the literal.
+pub(crate) fn eq_clause(
+    pairs: &[ColumnValue],
+    quote: impl Fn(&str) -> String,
+    backslash_escapes: bool,
+) -> String {
     pairs
         .iter()
-        .map(|cv| format!("{} = {}", quote(&cv.column), sql_literal(&cv.value)))
+        .map(|cv| {
+            format!(
+                "{} = {}",
+                quote(&cv.column),
+                sql_literal(&cv.value, backslash_escapes)
+            )
+        })
         .collect::<Vec<_>>()
         .join(" AND ")
 }
@@ -670,11 +687,24 @@ pub(crate) fn join_wrap(
 /// literal `NULL`, so `col = NULL` matches nothing — a safe no-op rather than an
 /// error, though the UI gates FK follow to non-null int/text values so it shouldn't
 /// arise. The text quoting is the injection guard; no value is interpolated raw.
-fn sql_literal(v: &Value) -> String {
+///
+/// On an engine where `\` escapes inside a string literal (`backslash_escapes` —
+/// MySQL/ClickHouse), embedded backslashes are *also* doubled, exactly as
+/// [`like_pattern`] does; without this a value such as `\' OR 1=1 -- ` escapes the
+/// closing quote and injects SQL (the FK-follow value comes from a result cell, which
+/// on a hostile/shared database is attacker-controlled). Postgres/SQLite treat `\` as
+/// a literal byte, so they pass `false` and only the quote is doubled.
+fn sql_literal(v: &Value, backslash_escapes: bool) -> String {
     match v {
         Value::Integer(n) => n.to_string(),
         Value::Real(x) => x.to_string(),
-        Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Text(s) => {
+            let mut lit = s.replace('\'', "''");
+            if backslash_escapes {
+                lit = lit.replace('\\', "\\\\");
+            }
+            format!("'{lit}'")
+        }
         Value::Null | Value::Blob(_) | Value::Capped(_) => "NULL".to_string(),
     }
 }
@@ -1476,8 +1506,31 @@ mod tests {
                 decl_type: None,
             },
         ];
-        let pred = eq_clause(&pairs, |c| format!("\"{c}\""));
+        let pred = eq_clause(&pairs, |c| format!("\"{c}\""), false);
         assert_eq!(pred, r#""a" = 7 AND "name" = 'O''Brien'"#);
+    }
+
+    #[test]
+    fn sql_literal_escapes_backslash_only_on_backslash_engines() {
+        // A value ending in `\` before a quote is the FK-follow injection vector: on
+        // MySQL/ClickHouse (`backslash_escapes = true`) the backslash is doubled so it
+        // can't escape the closing quote; on Postgres/SQLite it's a literal byte.
+        let v = Value::Text(r"\' OR 1=1 -- ".into());
+        // Postgres/SQLite: only the quote is doubled (backslash is literal there).
+        assert_eq!(sql_literal(&v, false), r"'\'' OR 1=1 -- '");
+        // MySQL/ClickHouse: the backslash is doubled too, so the payload stays inside
+        // the string literal — `'\\'' OR 1=1 -- '` reads back as the literal text.
+        assert_eq!(sql_literal(&v, true), r"'\\'' OR 1=1 -- '");
+        // The whole eq predicate carries the escaping through per-engine.
+        let pairs = vec![ColumnValue {
+            column: "c".into(),
+            value: v,
+            decl_type: None,
+        }];
+        assert_eq!(
+            eq_clause(&pairs, |c| format!("`{c}`"), true),
+            r"`c` = '\\'' OR 1=1 -- '"
+        );
     }
 
     #[test]
@@ -1582,10 +1635,10 @@ mod tests {
     fn sql_literal_maps_non_key_kinds_to_null() {
         // A null / blob / display-capped value can't be an FK key; it renders as the
         // literal NULL so `col = NULL` matches nothing instead of erroring.
-        assert_eq!(sql_literal(&Value::Null), "NULL");
-        assert_eq!(sql_literal(&Value::Blob(vec![1, 2, 3])), "NULL");
-        assert_eq!(sql_literal(&Value::Integer(5)), "5");
-        assert_eq!(sql_literal(&Value::Text("x".into())), "'x'");
+        assert_eq!(sql_literal(&Value::Null, false), "NULL");
+        assert_eq!(sql_literal(&Value::Blob(vec![1, 2, 3]), false), "NULL");
+        assert_eq!(sql_literal(&Value::Integer(5), false), "5");
+        assert_eq!(sql_literal(&Value::Text("x".into()), false), "'x'");
     }
 
     #[test]
