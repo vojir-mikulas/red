@@ -12,7 +12,7 @@
 
 use flint::prelude::*;
 use gpui::Context;
-use red_core::{Column, ColumnMap, ConnectionConfig, CopyMode, DbKind, ObjectKind, TableRef};
+use red_core::{Column, ColumnMap, ConnectionConfig, CopyMode, ObjectKind, TableRef};
 use red_service::{Command, SessionId};
 
 use crate::app::{
@@ -22,15 +22,15 @@ use crate::app::{
 use crate::schema::SchemaState;
 
 /// Append one connection's writable tables to `out` as copy-target candidates.
-/// Read-only and ClickHouse connections are skipped — they refuse inserts, so they
-/// must never appear as a target.
+/// Read-only connections and engines that can't accept inserts are skipped — they'd
+/// refuse the copy, so they must never appear as a target.
 fn collect_targets(
     out: &mut Vec<CopyTargetCandidate>,
     session: SessionId,
     config: &ConnectionConfig,
     schema: &SchemaState,
 ) {
-    if config.read_only || config.kind == DbKind::Clickhouse {
+    if config.read_only || !config.kind.write_caps().insert {
         return;
     }
     for ns in &schema.schemas {
@@ -52,16 +52,16 @@ fn collect_targets(
 
 /// Append one connection's writable namespaces (schemas/databases) to `out` as
 /// "new table" copy targets — *every* namespace the schema tree shows, including an
-/// empty one, so you can migrate into a brand-new/empty database. Read-only and
-/// ClickHouse connections are skipped (they can't be a write target), mirroring
-/// [`collect_targets`].
+/// empty one, so you can migrate into a brand-new/empty database. Read-only
+/// connections and engines that can't accept inserts are skipped (they can't be a
+/// write target), mirroring [`collect_targets`].
 fn collect_namespaces(
     out: &mut Vec<CopyNamespace>,
     session: SessionId,
     config: &ConnectionConfig,
     schema: &SchemaState,
 ) {
-    if config.read_only || config.kind == DbKind::Clickhouse {
+    if config.read_only || !config.kind.write_caps().insert {
         return;
     }
     for ns in &schema.schemas {

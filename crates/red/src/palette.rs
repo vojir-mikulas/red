@@ -348,11 +348,15 @@ impl AppState {
     }
 
     /// Whether guarded in-grid editing is enabled for the active connection (Track
-    /// B5): any writable (non-read-only) connection. Read-only is the safe default.
+    /// B5): a writable (non-read-only) connection whose engine supports the
+    /// transactional, exactly-one-row edit contract. Read-only is the safe default,
+    /// and an OLAP engine (ClickHouse) is excluded even when writable — its async,
+    /// non-atomic mutations can't honor the guarded-edit guarantees.
     pub(crate) fn editing_enabled(&self) -> bool {
         matches!(
             &self.phase,
-            Phase::Connected(active) if !active.config.read_only
+            Phase::Connected(active)
+                if !active.config.read_only && active.config.kind.write_caps().guarded_edit
         )
     }
 

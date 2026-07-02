@@ -15,9 +15,11 @@ pub enum DbKind {
     #[default]
     Sqlite,
     Mysql,
-    /// ClickHouse — the OLAP engine, reached over its HTTP interface. Read-only in
-    /// v1 (no in-grid editing — `UPDATE`/`DELETE` are async `ALTER … UPDATE`
-    /// mutations with no transaction/rollback), so its driver refuses `apply_edits`.
+    /// ClickHouse — the OLAP engine, reached over its HTTP interface. A writable
+    /// connection can be an INSERT / copy / migration *target*, but has no in-grid
+    /// editing: `UPDATE`/`DELETE` are async `ALTER … UPDATE` mutations with no
+    /// transaction/rollback over a non-unique sort key, so its driver refuses
+    /// `apply_edits` (see [`DbKind::write_caps`]).
     Clickhouse,
 }
 
@@ -71,6 +73,48 @@ impl DbKind {
             _ => None,
         }
     }
+
+    /// What write operations this engine can honor, *independent* of the
+    /// connection's `read_only` flag (a read-only connection refuses every write
+    /// regardless). Both the UI (which only holds a [`DbKind`] + `read_only`, never
+    /// the driver) and the driver consult this so the affordances they offer and the
+    /// operations they'll actually run agree — replacing the scattered
+    /// `== DbKind::Clickhouse` checks that used to disagree with the read-only gate.
+    pub const fn write_caps(self) -> WriteCaps {
+        match self {
+            // The relational engines: transactional, PK-guarded in-grid editing and
+            // bulk insert / copy-and-migrate target.
+            DbKind::Postgres | DbKind::Sqlite | DbKind::Mysql => WriteCaps {
+                insert: true,
+                guarded_edit: true,
+                best_effort_edit: false,
+            },
+            // ClickHouse (OLAP): a writable connection can be an INSERT / copy /
+            // migration *target*, but has no transactional, exactly-one-row in-grid
+            // editing — its `UPDATE`/`DELETE` are asynchronous, non-atomic mutations
+            // over a non-unique sort key (a best-effort edit mode is a later phase).
+            DbKind::Clickhouse => WriteCaps {
+                insert: true,
+                guarded_edit: false,
+                best_effort_edit: false,
+            },
+        }
+    }
+}
+
+/// The write operations an engine can honor, independent of a connection's
+/// `read_only` flag (see [`DbKind::write_caps`]). A cheap `Copy` descriptor the UI
+/// reads to gate the edit affordances and the copy/migration target pickers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteCaps {
+    /// Bulk `INSERT` / data import / copy-and-migrate *target* is possible.
+    pub insert: bool,
+    /// Transactional, guarded, exactly-one-row in-grid `UPDATE`/`DELETE` (the
+    /// relational edit contract) is possible.
+    pub guarded_edit: bool,
+    /// Best-effort, non-atomic in-grid `UPDATE`/`DELETE` (async mutations, no
+    /// rollback, no one-row guarantee) is possible — reserved for a later phase.
+    pub best_effort_edit: bool,
 }
 
 impl fmt::Display for DbKind {

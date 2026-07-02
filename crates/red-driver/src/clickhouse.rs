@@ -8,13 +8,18 @@
 //! via `red-ai`), and **out-of-band cancel** is a `KILL QUERY WHERE query_id = …`
 //! over a second request — the same shape MySQL's `KILL QUERY` cancel proves.
 //!
-//! Read-only first (v1): `read_only` appends the `readonly=1` server setting, so a
-//! write is refused at the engine. In-grid editing is **unsupported** — ClickHouse
-//! `UPDATE`/`DELETE` are asynchronous `ALTER TABLE … UPDATE` mutations with no
-//! transaction or rollback, so the trait's "batch in one transaction, assert exactly
-//! one row, roll back on failure" contract cannot be honored; [`apply_edits`] returns
-//! a typed error. `execute` (DDL / `INSERT` from the SQL editor) still runs on a
-//! writable connection.
+//! Writes are gated on the connection's `read_only` flag (like every engine): when
+//! set it appends the `readonly=1` server setting, so any write is refused at the
+//! engine. A *writable* ClickHouse connection can be an INSERT / copy / migration
+//! **target** — [`insert_rows`](ClickhouseDriver::insert_rows) streams an
+//! `INSERT … FORMAT JSONCompactEachRow`, [`create_table`](ClickhouseDriver::create_table)
+//! emits `MergeTree` DDL, and [`clear_table`](ClickhouseDriver::clear_table)
+//! `TRUNCATE`s. In-grid **editing** stays **unsupported**: ClickHouse `UPDATE`/`DELETE`
+//! are asynchronous `ALTER TABLE … UPDATE` mutations with no transaction or rollback
+//! over a non-unique sort key, so the trait's "batch in one transaction, assert exactly
+//! one row, roll back on failure" contract cannot be honored; [`apply_edits`] returns a
+//! typed error (a best-effort mutation mode is a later phase). Secondary indexes and
+//! foreign keys have no OLAP equivalent, so those migration passes are logged skips.
 //!
 //! Value mapping leans on the engine: the `JSON…` formats render every type to JSON
 //! text for us, so a cell is a "JSON scalar/array → [`Value`]" map — no hand-written
@@ -30,9 +35,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ColumnMeta, ColumnValue, ConnectionConfig, EditOp, ExportFormat, FkEdge, KeySpec,
-    ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow,
-    SchemaMeta, TableDetail, TableRef, Value,
+    Column, ColumnMeta, ColumnValue, ConnectionConfig, DbKind, EditOp, ExportFormat, FkEdge,
+    KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage,
+    RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use serde_json::Value as Json;
 use tokio::sync::mpsc::UnboundedSender;
@@ -58,6 +63,13 @@ type OpenedStream = (Vec<Column>, Vec<String>, reqwest::Response, Vec<u8>);
 /// report columns without stepping rows, and the per-row newline framing is the
 /// natural windowed read.
 const ROW_FORMAT: &str = "JSONCompactEachRowWithNamesAndTypes";
+
+/// The format an `INSERT … FORMAT …` body carries: one JSON array per row, with
+/// **no** names/types header (unlike [`ROW_FORMAT`], which the *read* path uses to
+/// learn its columns up front). The column list rides in the `INSERT INTO … (cols)`
+/// clause instead, so the two header lines a WithNamesAndTypes insert would demand
+/// aren't sent — and can't be mistaken for the first two data rows.
+const INSERT_FORMAT: &str = "JSONCompactEachRow";
 
 /// A live ClickHouse session over the HTTP interface. Holds the reused
 /// `reqwest::Client`, the resolved endpoint, and the credentials (sent per request
@@ -653,38 +665,82 @@ impl DatabaseDriver for ClickhouseDriver {
 
     async fn insert_rows(
         &self,
-        _table: &TableRef,
-        _columns: &[Column],
+        table: &TableRef,
+        columns: &[Column],
         rows: &[Vec<Value>],
     ) -> Result<u64> {
-        // An empty chunk is a no-op (matching the trait contract). Otherwise: this
-        // driver is read-only (v1), so bulk import/copy into ClickHouse is refused
-        // here — same posture as the edit path above.
+        // An empty chunk is a no-op (matching the trait contract) without a round-trip.
         if rows.is_empty() {
             return Ok(0);
         }
-        Err(RedError::Driver(
-            "importing/copying data into ClickHouse is not supported (read-only driver)"
-                .to_string(),
-        ))
+        // ClickHouse's HTTP interface has no bound-parameter protocol for bulk rows,
+        // so insert the native way: an `INSERT … FORMAT JSONCompactEachRow` statement
+        // followed by one JSON array per row in the same POST body. `serde_json` does
+        // the escaping, so no value is string-interpolated into SQL.
+        let cols = columns
+            .iter()
+            .map(|c| ch_quote(&c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut body = format!(
+            "INSERT INTO {} ({cols}) FORMAT {INSERT_FORMAT}\n",
+            crate::qualify_table(table, ch_quote)
+        );
+        for row in rows {
+            let cells: Vec<Json> = row.iter().map(ch_json_cell).collect();
+            body.push_str(&serde_json::to_string(&cells).map_err(driver_err)?);
+            body.push('\n');
+        }
+        // `wait_end_of_query=1` on a writable connection so the summary's
+        // `written_rows` is known at the response head (mirrors `execute`); a
+        // read-only connection carries `readonly=1` and the engine refuses the write.
+        let qid = new_query_id();
+        let settings: Vec<(String, String)> = if self.read_only {
+            Vec::new()
+        } else {
+            vec![("wait_end_of_query".to_string(), "1".to_string())]
+        };
+        let resp = self
+            .build_query(body, &qid, &settings)
+            .send()
+            .await
+            .map_err(driver_err)?;
+        let status = resp.status();
+        let summary = resp
+            .headers()
+            .get("x-clickhouse-summary")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let resp_body = resp.bytes().await.map_err(driver_err)?;
+        if !status.is_success() {
+            return Err(ch_error(&resp_body));
+        }
+        // The summary carries the real count; fall back to the row count we sent.
+        Ok(summary
+            .as_deref()
+            .and_then(parse_written_rows)
+            .unwrap_or(rows.len() as u64))
     }
 
-    async fn clear_table(&self, _table: &TableRef) -> Result<u64> {
-        // Read-only (v1): refusing here keeps ClickHouse out of the copy *target*
-        // picker honest — the same posture as `insert_rows` above.
-        Err(RedError::Driver(
-            "clearing/copying into a ClickHouse table is not supported (read-only driver)"
-                .to_string(),
+    async fn clear_table(&self, table: &TableRef) -> Result<u64> {
+        // `TRUNCATE` is ClickHouse's clean, synchronous table-empty — the natural
+        // copy-replace op. (The trait's DELETE-for-uniformity note is about MySQL's
+        // auto-committing, auto-increment-resetting TRUNCATE; ClickHouse's has no such
+        // surprise.) It reports no row count, so the affected count comes back 0. A
+        // read-only connection is refused at the engine via `execute`.
+        self.execute(&format!(
+            "TRUNCATE TABLE {}",
+            crate::qualify_table(table, ch_quote)
         ))
+        .await
     }
 
-    async fn create_table(&self, _table: &TableRef, _columns: &[ColumnMeta]) -> Result<u64> {
-        // Read-only (v1): refusing here keeps ClickHouse out of the migration *target*
-        // picker honest — the same posture as `insert_rows`/`clear_table` above.
-        Err(RedError::Driver(
-            "creating/copying into a ClickHouse table is not supported (read-only driver)"
-                .to_string(),
-        ))
+    async fn create_table(&self, table: &TableRef, columns: &[ColumnMeta]) -> Result<u64> {
+        // ClickHouse DDL diverges enough from the shared `create_table_sql` (an engine
+        // + sort key are mandatory, nullability is `Nullable(T)` not a `NOT NULL`
+        // suffix) to warrant its own builder. Runs through `execute`, so a read-only
+        // connection is refused at the engine.
+        self.execute(&ch_create_table_sql(table, columns)).await
     }
 
     fn quote_table(&self, table: &TableRef) -> String {
@@ -698,8 +754,10 @@ impl DatabaseDriver for ClickhouseDriver {
         _unique: bool,
         _columns: &[String],
     ) -> Result<u64> {
+        // ClickHouse's data-skipping indexes aren't relational secondary indexes, so a
+        // migrated index has no faithful equivalent — the migrate job logs the skip.
         Err(RedError::Driver(
-            "creating indexes in ClickHouse is not supported (read-only driver)".to_string(),
+            "secondary indexes have no relational equivalent on ClickHouse (OLAP)".to_string(),
         ))
     }
 
@@ -710,8 +768,9 @@ impl DatabaseDriver for ClickhouseDriver {
         _parent: &TableRef,
         _ref_columns: &[String],
     ) -> Result<u64> {
+        // ClickHouse (OLAP) has no foreign keys — the migrate job logs the skip.
         Err(RedError::Driver(
-            "foreign keys in ClickHouse are not supported (read-only driver)".to_string(),
+            "foreign keys are not supported on ClickHouse (OLAP)".to_string(),
         ))
     }
 
@@ -916,6 +975,73 @@ fn host_authority(host: &str, port: u16) -> String {
         format!("[{host}]:{port}")
     } else {
         format!("{host}:{port}")
+    }
+}
+
+/// Build a ClickHouse `CREATE TABLE IF NOT EXISTS … ENGINE = MergeTree ORDER BY …`.
+/// The shared [`create_table_sql`](crate::create_table_sql) isn't usable here:
+/// ClickHouse expresses nullability as `Nullable(T)` (columns are NOT NULL by
+/// default, with no `NOT NULL` suffix), a `MergeTree` table *requires* an `ENGINE`
+/// and an `ORDER BY`, and the relational trailing `PRIMARY KEY (…)` clause maps onto
+/// the sort key instead. Column types are spelled into ClickHouse's dialect via
+/// [`typemap`](red_core::typemap); the primary-key columns become the `ORDER BY`
+/// (or `tuple()` — the no-sort-key sentinel — when the source had none). A nullable
+/// sort-key column (a migration source can have one) needs `allow_nullable_key`,
+/// which MergeTree otherwise rejects. Identifiers are quoted, never interpolated raw.
+fn ch_create_table_sql(table: &TableRef, columns: &[ColumnMeta]) -> String {
+    use red_core::typemap::{normalize, spell};
+    let defs: Vec<String> = columns
+        .iter()
+        .map(|c| {
+            let nt = normalize(c.type_name.as_deref().unwrap_or(""));
+            let ty = spell(DbKind::Clickhouse, &nt);
+            // NOT NULL is the ClickHouse default; a nullable source column wraps.
+            let ty = if c.not_null {
+                ty
+            } else {
+                format!("Nullable({ty})")
+            };
+            format!("{} {ty}", ch_quote(&c.name))
+        })
+        .collect();
+    let pk: Vec<&ColumnMeta> = columns.iter().filter(|c| c.primary_key).collect();
+    let order_by = if pk.is_empty() {
+        "tuple()".to_string()
+    } else {
+        format!(
+            "({})",
+            pk.iter()
+                .map(|c| ch_quote(&c.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let settings = if pk.iter().any(|c| !c.not_null) {
+        " SETTINGS allow_nullable_key = 1"
+    } else {
+        ""
+    };
+    format!(
+        "CREATE TABLE IF NOT EXISTS {} ({}) ENGINE = MergeTree ORDER BY {order_by}{settings}",
+        crate::qualify_table(table, ch_quote),
+        defs.join(", ")
+    )
+}
+
+/// Map a [`Value`] to the JSON cell an `INSERT … FORMAT JSONCompactEachRow` body
+/// carries. A [`Value::Capped`] never reaches a write path by contract (capped cells
+/// are display-only), but is mapped to its head defensively rather than dropped. A
+/// blob becomes a JSON string via lossy UTF-8 — ClickHouse's only binary-ish type is
+/// `String`, and a genuinely non-UTF-8 blob copied in from another engine is a rare
+/// edge that would need `RowBinary` to preserve exactly.
+fn ch_json_cell(v: &Value) -> Json {
+    match v {
+        Value::Null => Json::Null,
+        Value::Integer(n) => Json::from(*n),
+        Value::Real(x) => Json::from(*x),
+        Value::Text(s) => Json::from(s.as_str()),
+        Value::Blob(b) => Json::from(String::from_utf8_lossy(b).into_owned()),
+        Value::Capped(c) => Json::from(c.head.as_str()),
     }
 }
 
@@ -1641,6 +1767,206 @@ mod tests {
         );
         std::fs::remove_file(&csv_path).ok();
         driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
+    }
+
+    // Server-free unit test — always runs (no ClickHouse needed).
+    #[test]
+    fn create_table_sql_builds_mergetree_ddl() {
+        let tref = TableRef {
+            schema: Some("db".into()),
+            name: "t".into(),
+        };
+        let col = |name: &str, ty: &str, not_null: bool, pk: bool| ColumnMeta {
+            name: name.into(),
+            type_name: Some(ty.into()),
+            not_null,
+            primary_key: pk,
+            default: None,
+            auto_increment: false,
+        };
+
+        // A NOT NULL int PK + a nullable text: types spelled via typemap, the nullable
+        // column wrapped, the PK as the MergeTree ORDER BY.
+        let sql = ch_create_table_sql(
+            &tref,
+            &[
+                col("id", "integer", true, true),
+                col("name", "text", false, false),
+            ],
+        );
+        assert_eq!(
+            sql,
+            "CREATE TABLE IF NOT EXISTS `db`.`t` \
+             (`id` Int32, `name` Nullable(String)) ENGINE = MergeTree ORDER BY (`id`)"
+        );
+
+        // No primary key → the no-sort-key sentinel `tuple()`.
+        let sql = ch_create_table_sql(&tref, &[col("v", "integer", false, false)]);
+        assert!(
+            sql.ends_with("ENGINE = MergeTree ORDER BY tuple()"),
+            "no PK → ORDER BY tuple(): {sql}"
+        );
+
+        // A nullable sort-key column needs `allow_nullable_key`.
+        let sql = ch_create_table_sql(&tref, &[col("id", "integer", false, true)]);
+        assert!(
+            sql.contains("ORDER BY (`id`) SETTINGS allow_nullable_key = 1"),
+            "nullable PK opts into allow_nullable_key: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn writes_create_insert_read_clear() {
+        // ClickHouse as a copy/migration *target*: `create_table` emits MergeTree DDL
+        // from cross-engine `ColumnMeta` (types spelled via typemap, nullable columns
+        // wrapped `Nullable`, PK → ORDER BY), `insert_rows` streams a native
+        // JSONCompactEachRow body, and `clear_table` TRUNCATEs. In-grid UPDATE/DELETE
+        // stays unsupported (see `editing_is_unsupported`).
+        let url = url_or_skip!();
+        let driver = ClickhouseDriver::connect(&url, false).await.unwrap();
+        let db = database(&url);
+        let t = tag("writes");
+        let tref = TableRef {
+            schema: Some(db.clone()),
+            name: t.clone(),
+        };
+        // Source-shaped column metadata (foreign type spellings on purpose, so the
+        // typemap path is exercised): a NOT NULL int PK, a nullable text, a nullable
+        // float.
+        let col = |name: &str, ty: &str, not_null: bool, pk: bool| ColumnMeta {
+            name: name.into(),
+            type_name: Some(ty.into()),
+            not_null,
+            primary_key: pk,
+            default: None,
+            auto_increment: false,
+        };
+        let columns = vec![
+            col("id", "integer", true, true),
+            col("name", "text", false, false),
+            col("score", "double precision", false, false),
+        ];
+        driver.create_table(&tref, &columns).await.unwrap();
+        // Idempotent: a second create over the same table is a no-op, not an error.
+        driver.create_table(&tref, &columns).await.unwrap();
+
+        // The created table carries the PK as its (MergeTree) sort key, and the
+        // nullable columns are Nullable.
+        let detail = driver.describe_table(&db, &t).await.unwrap();
+        let dcol = |n: &str| detail.columns.iter().find(|c| c.name == n).unwrap();
+        assert!(dcol("id").primary_key, "id is the MergeTree sort key");
+        assert!(dcol("id").not_null, "the PK column is NOT NULL");
+        assert!(
+            !dcol("name").not_null,
+            "a nullable source column stays Nullable"
+        );
+
+        // Bulk insert: a plain row, a SQL-metacharacter value (escaped by serde_json,
+        // never interpolated), and a NULL name.
+        let insert_cols = vec![
+            Column {
+                name: "id".into(),
+                decl_type: None,
+            },
+            Column {
+                name: "name".into(),
+                decl_type: None,
+            },
+            Column {
+                name: "score".into(),
+                decl_type: None,
+            },
+        ];
+        let evil = "'); DROP TABLE x;--";
+        let rows = vec![
+            vec![
+                Value::Integer(1),
+                Value::Text("one".into()),
+                Value::Real(1.5),
+            ],
+            vec![Value::Integer(2), Value::Text(evil.into()), Value::Null],
+            vec![Value::Integer(3), Value::Null, Value::Real(3.25)],
+        ];
+        let n = driver
+            .insert_rows(&tref, &insert_cols, &rows)
+            .await
+            .unwrap();
+        assert_eq!(n, 3, "insert_rows reports the rows inserted");
+
+        // An empty chunk is a no-op returning 0, without a round-trip.
+        assert_eq!(
+            driver.insert_rows(&tref, &insert_cols, &[]).await.unwrap(),
+            0
+        );
+
+        let abort = AbortSignal::new();
+        let all = format!("SELECT id, name, score FROM {t} ORDER BY id");
+        assert_eq!(
+            driver.count(&all, &abort).await.unwrap(),
+            3,
+            "all rows landed"
+        );
+        let page = driver
+            .fetch_page(&all, 0, 10, PageCap::Full, &abort)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.rows[1][1],
+            Value::Text(evil.into()),
+            "value stored verbatim — escaped by serde_json, not interpolated"
+        );
+        assert_eq!(page.rows[2][1], Value::Null, "NULL inserted as NULL");
+
+        // `clear_table` empties the table (TRUNCATE); the rows are gone.
+        driver.clear_table(&tref).await.unwrap();
+        assert_eq!(
+            driver.count(&all, &abort).await.unwrap(),
+            0,
+            "clear_table (TRUNCATE) emptied the table"
+        );
+
+        driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_only_rejects_writes() {
+        // Defense in depth: a read-only ClickHouse connection refuses every write
+        // seam at the engine (`readonly=1`), even though the UI already gates them.
+        let url = url_or_skip!();
+        let driver = ClickhouseDriver::connect(&url, true).await.unwrap();
+        let tref = TableRef {
+            schema: Some(database(&url)),
+            name: "red_ro_writes".into(),
+        };
+        let columns = vec![ColumnMeta {
+            name: "id".into(),
+            type_name: Some("integer".into()),
+            not_null: true,
+            primary_key: true,
+            default: None,
+            auto_increment: false,
+        }];
+        assert!(
+            driver.create_table(&tref, &columns).await.is_err(),
+            "read-only rejects create_table"
+        );
+        let cols = vec![Column {
+            name: "id".into(),
+            decl_type: None,
+        }];
+        assert!(
+            driver
+                .insert_rows(&tref, &cols, &[vec![Value::Integer(1)]])
+                .await
+                .is_err(),
+            "read-only rejects insert_rows"
+        );
+        assert!(
+            driver.clear_table(&tref).await.is_err(),
+            "read-only rejects clear_table"
+        );
+        // An empty insert chunk is still a short-circuit no-op (no engine round-trip).
+        assert_eq!(driver.insert_rows(&tref, &cols, &[]).await.unwrap(), 0);
     }
 
     #[tokio::test]
