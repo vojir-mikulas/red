@@ -492,8 +492,8 @@ impl AppState {
                 if table_col >= gutter && find_hits.contains(&(abs, table_col - gutter)) {
                     return Some(find_tint);
                 }
-                // A joined reference column (read-only, derived) gets a faint wash —
-                // lowest priority, so a find/edit/delete tint still wins on top.
+                // A joined reference column (derived from a referenced table) gets a
+                // faint wash — lowest priority, so a find/edit/delete tint wins on top.
                 if table_col >= gutter && joined_cols.contains(&(table_col - gutter)) {
                     return Some(joined_tint);
                 }

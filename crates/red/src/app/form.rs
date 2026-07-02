@@ -334,7 +334,10 @@ impl AppState {
     /// A blank password (or a file engine, which has none) clears any prior
     /// entry. If the keychain write fails we keep the password in memory for this
     /// session and warn, so the connection still works until next launch.
-    fn store_credential(
+    ///
+    /// `pub(crate)` so the connection importer routes imported passwords the same
+    /// way a form save does (see [`crate::app::import_ui`]).
+    pub(crate) fn store_credential(
         &mut self,
         index: usize,
         password: &str,
@@ -361,7 +364,10 @@ impl AppState {
     /// `None` when the tunnel is off — which clears both SSH entries. A non-empty
     /// secret is stored; an empty one clears its entry (e.g. agent auth, which has
     /// no secret). A keychain write failure warns but doesn't block the save.
-    fn store_ssh_credentials(
+    ///
+    /// `pub(crate)` so the connection importer reuses it (see
+    /// [`crate::app::import_ui`]).
+    pub(crate) fn store_ssh_credentials(
         &mut self,
         index: usize,
         secrets: Option<(String, String)>,

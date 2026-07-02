@@ -835,22 +835,35 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         }
                         None => None,
                     };
-                    // Narrow the result *before* any probe: the filter wraps the
-                    // base in `SELECT * FROM (base) WHERE <pred>` so count, bounds,
-                    // and paging all see the filtered set. The wrap keeps `SELECT *`,
-                    // so the key column survives and keyset is unaffected. A
-                    // `Contains` needs the result's columns — the table's (a browse)
-                    // or, for editor SQL, a cheap `LIMIT 0` probe.
-                    let filtered_sql = match &filter {
-                        None => sql.clone(),
-                        Some(ResultFilter::Where(expr)) => wrap_where(&sql, expr),
+                    // Inline FK expansion (Track B7): decorate the base with the chosen
+                    // referenced columns, interleaved next to the FK column they expand
+                    // from (the base column order comes from `detail`). The join runs
+                    // *before* the filter so a `WHERE` can reference the expanded
+                    // (dotted-alias) columns, not just base columns — the unique-target
+                    // gate keeps the row count identical, so the join is transparent to
+                    // keyset. Empty `joins` (or a no-FK engine) leaves `sql` untouched.
+                    let base_cols: Vec<String> = detail
+                        .as_ref()
+                        .map(|d| d.columns.iter().map(|c| c.name.clone()).collect())
+                        .unwrap_or_default();
+                    let joined_sql = driver.fk_join_wrap(&sql, &base_cols, &joins);
+                    // Build the filter predicate, then wrap it *around* the joined query
+                    // (`SELECT * FROM (joined) WHERE <pred>`) so count, bounds, and
+                    // paging all see the filtered set — and a `Where`/`Eq` predicate can
+                    // name any output column, including an expanded reference column
+                    // (`"tier_id.name"`). The wrap keeps `SELECT *`, so the key column
+                    // survives and keyset is unaffected. A `Contains` searches the base
+                    // table's columns (or, for editor SQL, a cheap `LIMIT 0` probe).
+                    let pred: Option<String> = match &filter {
+                        None => None,
+                        Some(ResultFilter::Where(expr)) => Some(expr.clone()),
                         // FK follow (Track B7): an escaped literal `col = v [AND …]`
                         // predicate from the driver. Empty pairs (shouldn't occur)
                         // degrade to no filter rather than an invalid `WHERE ()`.
                         Some(ResultFilter::Eq(pairs)) if !pairs.is_empty() => {
-                            wrap_where(&sql, &driver.eq_predicate(pairs))
+                            Some(driver.eq_predicate(pairs))
                         }
-                        Some(ResultFilter::Eq(_)) => sql.clone(),
+                        Some(ResultFilter::Eq(_)) => None,
                         Some(ResultFilter::Contains(term)) => {
                             let cols = match &detail {
                                 Some(d) => d.columns.clone(),
@@ -862,42 +875,38 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                     Err(_) => Vec::new(),
                                 },
                             };
-                            match driver.contains_predicate(&cols, term) {
-                                Some(pred) => wrap_where(&sql, &pred),
-                                // Nothing searchable (all-blob / empty) — no filter.
-                                None => sql.clone(),
-                            }
+                            driver.contains_predicate(&cols, term)
                         }
                     };
-                    // Inline FK expansion (Track B7): decorate the filtered base with
-                    // the chosen referenced columns, interleaved next to the FK column
-                    // they expand from (the base column order comes from `detail`). The
-                    // unique-target gate keeps the row count identical, so `count` /
-                    // `bounds` (probed on `filtered_sql`) need no join; columns are
-                    // addressed by name downstream, so the reorder is transparent. Empty
-                    // `joins` (or a no-FK engine) leaves `filtered_sql` untouched.
-                    let base_cols: Vec<String> = detail
-                        .as_ref()
-                        .map(|d| d.columns.iter().map(|c| c.name.clone()).collect())
-                        .unwrap_or_default();
-                    let joined_sql = driver.fk_join_wrap(&filtered_sql, &base_cols, &joins);
+                    let filtered_sql = match &pred {
+                        Some(p) => wrap_where(&joined_sql, p),
+                        None => joined_sql.clone(),
+                    };
+                    // Count / bounds narrow with the filter; with none, they're
+                    // cardinality-identical to the unjoined base (the join is
+                    // unique-target), so a bare count skips the join.
+                    let probe_sql = if pred.is_some() {
+                        filtered_sql.clone()
+                    } else {
+                        sql.clone()
+                    };
                     // The SQL later page/run fetches re-run. Keyset orders itself
                     // (driver adds `ORDER BY (sort_col, pk)`), so it pages the
                     // *filtered* query; a sorted result that fell back to OFFSET must
                     // still be ordered, so wrap it by output position.
                     let effective_sql = match (&sort, &key) {
-                        (Some(s), None) => wrap_sorted(&joined_sql, s.position, s.descending),
-                        _ => joined_sql.clone(),
+                        (Some(s), None) => wrap_sorted(&filtered_sql, s.position, s.descending),
+                        _ => filtered_sql.clone(),
                     };
                     // `LIMIT 0` reads column metadata without stepping rows;
                     // counting and the key-bounds probe run concurrently with it.
-                    // Probes run on `filtered_sql` — ordering doesn't change the
-                    // count, the column set, or the lead column's min/max, but the
-                    // filter narrows all three, so the total and bounds reflect it.
+                    // Count / bounds run on `probe_sql` — the unjoined base when there's
+                    // no filter, else the joined+filtered query — so the total and
+                    // bounds reflect the filter; ordering never changes either.
                     let bounds = async {
                         match &key {
                             Some(k) if k.kind == KeyKind::Int => driver
-                                .key_bounds(&filtered_sql, k, &abort)
+                                .key_bounds(&probe_sql, k, &abort)
                                 .await
                                 .ok()
                                 .flatten(),
@@ -907,13 +916,11 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     // Race the (potentially full-table `COUNT(*)`) probe against the
                     // statement timeout: on expiry, abort the bundle at the engine
                     // and report a timeout instead of leaving the result "running".
-                    // Count on the *unjoined* filtered SQL (joins are unique-target, so
-                    // they don't change cardinality — and this avoids joining for a
-                    // bare `COUNT(*)`); columns come from the *joined* SQL so the
-                    // reported column set includes the expanded reference columns.
+                    // Columns come from the *joined* SQL so the reported column set
+                    // includes the expanded reference columns even with no filter.
                     let probe = async {
                         tokio::join!(
-                            driver.count(&filtered_sql, &abort),
+                            driver.count(&probe_sql, &abort),
                             driver.fetch_page(&joined_sql, 0, 0, PageCap::Full, &abort),
                             bounds
                         )

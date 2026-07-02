@@ -540,6 +540,7 @@ impl AppState {
             ctx.pk_value,
             ctx.original,
             value,
+            ctx.foreign,
         );
         cx.notify();
     }

@@ -16,11 +16,10 @@ use std::collections::{HashMap, HashSet};
 use flint::{TextInput, TextInputEvent, ToastVariant};
 use gpui::{prelude::*, Context, Entity, Focusable, Subscription};
 use red_core::{coerce_edit_value, ColumnValue, EditOp, TableRef, Value};
-use red_service::{Command, SortKey};
 
 use super::buffer::DisplayCell;
 use super::ResultGrid;
-use crate::app::{AppState, Pane, PendingWrite, Phase};
+use crate::app::{AppState, ForeignEdit, Pane, PendingWrite, Phase};
 
 /// A hashable identity for a row's primary-key value, so staged edits survive the
 /// windowed buffer's eviction (they key by PK, not by row index). Only the PK
@@ -43,14 +42,24 @@ impl PkKey {
     }
 }
 
-/// One staged row update: the columns the user changed (data-column index → new
-/// value), the PK value (to build the `UPDATE`), and the absolute row the PK sat
+/// One staged cell change: the new value, plus — for an inline-expanded FK column
+/// (Track B7) — the referenced-table target the edit writes to. A base-table cell
+/// carries `foreign = None` and is written via its row's PK; a joined cell carries
+/// the [`ForeignEdit`] resolved when the edit began, so submit needn't re-resolve it
+/// against a possibly-evicted buffer row.
+pub(crate) struct StagedCell {
+    pub(crate) value: Value,
+    pub(crate) foreign: Option<ForeignEdit>,
+}
+
+/// One staged row update: the columns the user changed (data-column index → staged
+/// cell), the PK value (to build the base `UPDATE`), and the absolute row the PK sat
 /// at when staged. The row stays valid for an updates-only batch (no rows move),
 /// so submit can patch the resident buffer in place without a refetch.
 pub(crate) struct UpdatedRow {
     pub(crate) pk_value: Value,
     pub(crate) row: usize,
-    pub(crate) cells: HashMap<usize, Value>,
+    pub(crate) cells: HashMap<usize, StagedCell>,
 }
 
 /// One row marked for deletion: the PK value (to build the `DELETE`) and the
@@ -90,7 +99,10 @@ impl PendingChanges {
     /// The staged value for a resident row's `(pk, data_col)`, for the render
     /// overlay. `None` when that cell isn't dirty.
     pub(crate) fn cell_override(&self, pk: &PkKey, col: usize) -> Option<&Value> {
-        self.updates.get(pk).and_then(|u| u.cells.get(&col))
+        self.updates
+            .get(pk)
+            .and_then(|u| u.cells.get(&col))
+            .map(|c| &c.value)
     }
 
     /// A render overlay snapshot for the visible grid: each staged cell formatted to
@@ -103,7 +115,7 @@ impl PendingChanges {
             .flat_map(|u| {
                 u.cells
                     .iter()
-                    .map(move |(col, v)| ((u.row, *col), DisplayCell::from_value(v)))
+                    .map(move |(col, c)| ((u.row, *col), DisplayCell::from_value(&c.value)))
             })
             .collect();
         let deleted = self.deletes.values().map(|d| d.row).collect();
@@ -152,6 +164,10 @@ pub(crate) struct EditOverlay {
 
 /// The cell an open inline editor targets — an existing keyed row, or a draft
 /// (insert) row identified by its index in [`PendingChanges::inserts`].
+// `Row` is inherently far larger than `Draft` (it carries the cell's full identity —
+// two `Value`s plus the FK write target); this enum is single-instance, short-lived
+// app state (one open editor), so the size skew doesn't warrant boxing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub(crate) enum EditSlot {
     Row {
@@ -159,6 +175,9 @@ pub(crate) enum EditSlot {
         data_col: usize,
         pk_value: Value,
         original: Value,
+        /// Set when the cell is an inline-expanded FK column — the referenced-table
+        /// write target (Track B7). `None` for an ordinary base-table cell.
+        foreign: Option<ForeignEdit>,
     },
     Draft {
         index: usize,
@@ -211,17 +230,38 @@ impl ResultGrid {
         let mut ops = Vec::new();
 
         for u in self.pending.updates.values() {
-            let set: Vec<ColumnValue> = u
-                .cells
-                .iter()
-                .filter_map(|(c, v)| {
-                    col_meta(*c).map(|(column, decl_type)| ColumnValue {
-                        column,
-                        value: v.clone(),
-                        decl_type,
-                    })
-                })
-                .collect();
+            // Base-table cells fold into one `UPDATE … WHERE pk = ?`; each inline-
+            // expanded FK cell (Track B7) is its own `UPDATE <ref> … WHERE <fk key>`
+            // against the referenced table it came from.
+            let mut set: Vec<ColumnValue> = Vec::new();
+            for (c, cell) in &u.cells {
+                match &cell.foreign {
+                    None => {
+                        if let Some((column, decl_type)) = col_meta(*c) {
+                            set.push(ColumnValue {
+                                column,
+                                value: cell.value.clone(),
+                                decl_type,
+                            });
+                        }
+                    }
+                    Some(f) => ops.push(EditOp::Update {
+                        table: f.table.clone(),
+                        key: ColumnValue {
+                            column: f.key_column.clone(),
+                            value: f.key_value.clone(),
+                            decl_type: f.key_type.clone(),
+                        },
+                        set: vec![ColumnValue {
+                            column: f.set_column.clone(),
+                            value: cell.value.clone(),
+                            // The referenced column's type (the joined result column)
+                            // rides along so a jsonb/uuid/timestamp value casts back.
+                            decl_type: col_meta(*c).and_then(|(_, dt)| dt),
+                        }],
+                    }),
+                }
+            }
             if set.is_empty() {
                 continue;
             }
@@ -289,6 +329,7 @@ impl AppState {
             data_col: ctx.data_col,
             pk_value: ctx.pk_value.clone(),
             original: ctx.original.clone(),
+            foreign: ctx.foreign.clone(),
         };
         self.open_cell_editor(slot, ctx.decl_type.clone(), ctx.epoch, &current, cx);
     }
@@ -387,7 +428,10 @@ impl AppState {
                 data_col,
                 pk_value,
                 original,
-            } => self.stage_existing_value(edit.epoch, row, data_col, pk_value, original, value),
+                foreign,
+            } => self.stage_existing_value(
+                edit.epoch, row, data_col, pk_value, original, value, foreign,
+            ),
             EditSlot::Draft { index, data_col } => {
                 self.stage_draft_value(edit.epoch, index, data_col, value)
             }
@@ -415,6 +459,7 @@ impl AppState {
     /// Stage a new value for an existing keyed cell. A value equal to the resident
     /// original clears any prior staged edit (un-dirties the cell) rather than
     /// staging a no-op; otherwise it's recorded under the row's PK.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn stage_existing_value(
         &mut self,
         epoch: u64,
@@ -423,6 +468,7 @@ impl AppState {
         pk_value: Value,
         original: Value,
         value: Value,
+        foreign: Option<ForeignEdit>,
     ) {
         let Some(pk) = PkKey::from_value(&pk_value) else {
             return;
@@ -450,7 +496,7 @@ impl AppState {
                             cells: HashMap::new(),
                         });
                     entry.row = row;
-                    entry.cells.insert(data_col, value);
+                    entry.cells.insert(data_col, StagedCell { value, foreign });
                 }
             }
         }
@@ -482,6 +528,7 @@ impl AppState {
             ctx.pk_value,
             ctx.original,
             Value::Null,
+            ctx.foreign,
         );
         cx.notify();
     }
@@ -605,14 +652,23 @@ impl AppState {
     pub(crate) fn on_batch_applied(&mut self, epoch: u64, _applied: u64, cx: &mut Context<Self>) {
         let mut reload = false;
         if let Some(grid) = self.result_by_epoch(epoch) {
+            // A foreign (inline-expanded FK) edit rewrites a referenced row that may
+            // be shared by several base rows, so an in-place patch would leave the
+            // other rows stale — reload so the whole denormalized view re-resolves,
+            // same as a structural (delete/insert) change.
+            let foreign = grid
+                .pending
+                .updates
+                .values()
+                .any(|u| u.cells.values().any(|c| c.foreign.is_some()));
             let structural = !grid.pending.deletes.is_empty() || !grid.pending.inserts.is_empty();
-            if structural {
+            if structural || foreign {
                 reload = true;
             } else {
                 let updates = std::mem::take(&mut grid.pending.updates);
                 for u in updates.into_values() {
-                    for (col, value) in u.cells {
-                        grid.patch_cell(u.row, col, value);
+                    for (col, cell) in u.cells {
+                        grid.patch_cell(u.row, col, cell.value);
                     }
                 }
             }
@@ -633,47 +689,14 @@ impl AppState {
     }
 
     /// Re-open the active result with its current sort + filter under a fresh epoch
-    /// — used after a structural submit so deletes/inserts re-resolve. Mirrors the
-    /// re-open in `apply_result_filter`.
+    /// — used after a structural submit (deletes/inserts) or a foreign FK-column edit
+    /// so the result re-resolves. Reuses [`ResultGrid::reopen_spec`] so the inline FK
+    /// expansion (the `LEFT JOIN` set) is carried through the reload rather than lost.
     fn reload_active_result(&mut self, cx: &mut Context<Self>) {
         let reopen = match &mut self.phase {
-            Phase::Connected(active) => active.active_result_mut().map(|grid| {
-                let old_epoch = grid.epoch;
-                grid.selection = None;
-                grid.ready = false;
-                grid.restart_timer();
-                grid.reset_buffer();
-                grid.pending = PendingChanges::default();
-                grid.epoch = super::new_epoch();
-                let sort = grid.sort.and_then(|(dcol, asc)| {
-                    grid.columns.get(dcol).map(|col| SortKey {
-                        position: dcol + 1,
-                        column: col.name.clone(),
-                        descending: !asc,
-                    })
-                });
-                (
-                    grid.base_sql.clone(),
-                    grid.table.clone(),
-                    sort,
-                    grid.filter.clone(),
-                    grid.epoch,
-                    old_epoch,
-                )
-            }),
+            Phase::Connected(active) => active.active_result_mut().map(|grid| grid.reopen_spec()),
             _ => None,
         };
-        if let Some((sql, table, sort, filter, epoch, old_epoch)) = reopen {
-            self.send_active(Command::CloseResult { epoch: old_epoch });
-            self.send_active(Command::OpenResult {
-                sql,
-                epoch,
-                table,
-                sort,
-                filter,
-                joins: Vec::new(),
-            });
-            self.start_query_ticker(cx);
-        }
+        self.apply_reopen(reopen, cx);
     }
 }

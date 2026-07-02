@@ -13,8 +13,8 @@ use crate::keymap::{
     NewTab, NextTab, OpenSavedQueries, PrevTab, RefreshSchema, ReportBug, RevertChanges, RunQuery,
     SaveQuery, SearchSchema, SelectAll, SetNull, Settings, ShowChangelog, ShowShortcuts,
     SubmitChanges, SwitchConnection, SwitchToConnectionSlot, SwitchToPreviousConnection,
-    ToggleAssistant,
-    ToggleColumnsPanel, ToggleFilter, ToggleHistory, ToggleInspector, ToggleSidebar, ToggleSplit,
+    ToggleAssistant, ToggleColumnsPanel, ToggleFilter, ToggleHistory, ToggleInspector,
+    ToggleSidebar, ToggleSplit,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
@@ -384,6 +384,11 @@ impl Render for AppState {
 
         let whats_new = self.whats_new_open.then(|| self.render_whats_new(cx));
 
+        let import_preview = self
+            .import_preview
+            .as_ref()
+            .map(|p| self.render_import_preview(p, cx));
+
         let theme = cx.theme();
         // Copied out now (Hsla is Copy) so the client-decoration frame at the end
         // of this fn doesn't hold `theme`'s borrow of `cx` across the dev-stats
@@ -571,6 +576,7 @@ impl Render for AppState {
             .children(settings)
             .children(shortcuts)
             .children(whats_new)
+            .children(import_preview)
             // The connection form modal is rendered at the root so it works in any
             // phase (the welcome screen *and* the connected shell, e.g. opened from
             // the switcher's "New connection…").

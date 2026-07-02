@@ -49,7 +49,7 @@ impl AppState {
             // bar starts a fresh contains filter (applying it replaces the FK one).
             Some(ResultFilter::Eq(_)) | None => (FilterMode::Contains, String::new()),
         };
-        let input = cx.new(|cx| TextInput::new(cx).with_placeholder("Filter rows…"));
+        let input = cx.new(|cx| TextInput::new(cx).with_placeholder(filter_placeholder(mode)));
         if !text.is_empty() {
             input.update(cx, |i, cx| i.set_content(text, cx));
         }
@@ -78,6 +78,8 @@ impl AppState {
     pub(crate) fn set_filter_mode(&mut self, mode: FilterMode, cx: &mut Context<Self>) {
         if let Some(bar) = &mut self.filter_bar {
             bar.mode = mode;
+            bar.input
+                .update(cx, |i, cx| i.set_placeholder(filter_placeholder(mode), cx));
             cx.notify();
         }
     }
@@ -177,5 +179,15 @@ impl AppState {
             );
         }
         Some(row.into_any_element())
+    }
+}
+
+/// The bar's input placeholder for a filter mode. `WHERE` is raw SQL, so the hint
+/// nudges toward an expression and reminds that an inline-expanded reference column
+/// is referenced by its quoted dotted name (`"tier_id.name"`).
+fn filter_placeholder(mode: FilterMode) -> &'static str {
+    match mode {
+        FilterMode::Contains => "Filter rows…",
+        FilterMode::Where => "WHERE expression, e.g. amount > 100 or \"tier_id.name\" = 'x'",
     }
 }

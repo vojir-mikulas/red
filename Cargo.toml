@@ -82,6 +82,17 @@ dirs = "5"
 # Backend features are additive and per-OS, so the consuming crate selects them
 # per target (see crates/red/Cargo.toml); the public API is backend-agnostic.
 keyring = "3"
+
+# --- Connection import (decrypt DBeaver / DBGate credential stores) ---
+# DBeaver ships an AES-128-CBC credentials file (hardcoded key); DBGate encrypts
+# each field with node's `simple-encryptor` (AES-256-CBC + SHA-256 key +
+# HMAC-SHA256). Pure-Rust RustCrypto — no OpenSSL / native crypto enters the build.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+hex = "0.4"
 # Wipes cached plaintext credentials from memory on drop (see secrets.rs cache).
 zeroize = "1"
 

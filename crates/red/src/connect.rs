@@ -129,6 +129,7 @@ impl AppState {
             .collect();
         let toolbar = (!self.connections.is_empty()).then(|| self.connect_toolbar(cx));
         let new_button = self.new_button(cx);
+        let import_link = self.import_link(cx);
         let connections_header = self.connections_header(cx);
         let settings_gear = IconButton::new(
             "connect-settings",
@@ -223,6 +224,7 @@ impl AppState {
             .children(toolbar)
             .child(saved)
             .child(new_button)
+            .child(import_link)
             .child(footer);
 
         let screen = div()
@@ -468,6 +470,31 @@ impl AppState {
                     .child(crate::keymap::localize_hint("⌘N")),
             )
             .on_click(cx.listener(|this, _, _, cx| this.open_new_form(cx)))
+    }
+
+    /// A quiet link under the New-connection button that pulls saved connections in
+    /// from DBeaver or DBGate — zero-friction onboarding for users already living
+    /// in another tool. Clicking runs detection (see [`Self::open_import_picker`]).
+    fn import_link(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .mt_2()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .text_size(theme.scale(12.))
+            .text_color(theme.text_faint)
+            .child("Coming from another tool?")
+            .child(
+                div()
+                    .id("connect-import")
+                    .cursor_pointer()
+                    .text_color(theme.accent)
+                    .hover(|s| s.underline())
+                    .child("Import from DBeaver or DBGate")
+                    .on_click(cx.listener(|this, _, _, cx| this.open_import_picker(cx))),
+            )
     }
 
     fn connection_card(

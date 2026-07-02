@@ -33,11 +33,16 @@ use red_core::{
 use red_service::{Command, CommandSender, RunFetch, SessionId, SortKey};
 
 use crate::app::{
-    AppState, EditContext, ExportProgress, Notification, PendingImportPeek, PendingWrite, Phase,
-    TransferKind,
+    AppState, EditContext, ExportProgress, ForeignEdit, Notification, PendingImportPeek,
+    PendingWrite, Phase, TransferKind,
 };
 
 use buffer::{next_epoch, window_decision, BufferMode, GridBuffer, KeyedRun, WindowView, WINDOW};
+
+/// The resolved identity of an editable cell — `(row, data_col, pk_value, decl_type,
+/// foreign)` — returned by [`ResultGrid::edit_identity`]. `foreign` is `Some` for an
+/// inline-expanded FK column that writes back to its referenced table (Track B7).
+type EditIdentity = (usize, usize, Value, Option<String>, Option<ForeignEdit>);
 pub(crate) use render::group_digits;
 
 /// Mint a fresh, process-unique epoch for a non-grid consumer (the plan view,
@@ -218,8 +223,8 @@ pub(crate) struct ResultGrid {
     joins: Vec<FkJoin>,
     /// Result-column indices that are inline-expanded (joined) reference columns —
     /// recomputed from [`expansion`](Self::expansion) when the column set lands.
-    /// Drives the joined-column tint and excludes them from editing (they aren't
-    /// base-table columns).
+    /// Drives the joined-column tint; editing a single-hop one writes back to the
+    /// referenced table (see [`foreign_edit_for`](Self::foreign_edit_for)).
     joined_cols: HashSet<usize>,
     /// Which FK nodes are expanded open in the Columns panel's tree (Track B7),
     /// keyed by their dotted FK path (`["tier_id","cascade_id"]`). Purely panel UI
@@ -566,7 +571,7 @@ impl ResultGrid {
     /// the target cell is binary / display-clipped (no safe inline round-trip).
     /// `gutter` is the data-column table offset (see [`AppState::gutter`]).
     pub(crate) fn edit_target(&self, gutter: usize) -> Option<EditContext> {
-        let (row, col, pk_value, decl_type) = self.edit_identity(gutter)?;
+        let (row, col, pk_value, decl_type, foreign) = self.edit_identity(gutter)?;
         let original = self.cell_value(row, col)?;
         // A resident inline edit needs a safe round-trip: no binary, and no
         // display-clipped cell (we'd only have its head). The inspector's
@@ -582,6 +587,7 @@ impl ResultGrid {
             pk_value,
             decl_type,
             original,
+            foreign,
         })
     }
 
@@ -594,7 +600,7 @@ impl ResultGrid {
         if matches!(original, Value::Blob(_)) {
             return None;
         }
-        let (row, col, pk_value, decl_type) = self.edit_identity(gutter)?;
+        let (row, col, pk_value, decl_type, foreign) = self.edit_identity(gutter)?;
         Some(EditContext {
             epoch: self.epoch,
             row,
@@ -602,19 +608,17 @@ impl ResultGrid {
             pk_value,
             decl_type,
             original,
+            foreign,
         })
     }
 
     /// The row identity + target column for an inline edit, independent of the
     /// cell's current value — shared by [`edit_target`] (resident value) and
-    /// [`edit_target_full`] (a supplied loaded value). Returns
-    /// `(row, data_col, pk_value, decl_type)`. `None` unless this is an editable
-    /// single-table keyed browse with a usable (present, uncapped) PK and the
-    /// cursor sitting off the PK column.
-    pub(crate) fn edit_identity(
-        &self,
-        gutter: usize,
-    ) -> Option<(usize, usize, Value, Option<String>)> {
+    /// [`edit_target_full`] (a supplied loaded value). `foreign` is `Some` when the
+    /// cell is a single-hop inline-expanded FK column (the edit rewrites the
+    /// referenced table). `None` unless this is an editable single-table keyed browse
+    /// with a usable (present, uncapped) PK and the cursor sitting off the PK column.
+    pub(crate) fn edit_identity(&self, gutter: usize) -> Option<EditIdentity> {
         self.table.as_ref()?; // must be a single-table browse to be editable
         let key = self.key.as_ref()?;
         // The identity column: the tiebreaker (the PK) for a sorted browse, else the
@@ -626,16 +630,68 @@ impl ResultGrid {
         if target.name == pk_column {
             return None;
         }
-        // An inline-expanded reference column (Track B7) is read-only — it belongs to
-        // a joined table, not this browse's base table, so it can't be UPDATE'd here.
-        if self.joined_cols.contains(&col) {
-            return None;
-        }
+        // An inline-expanded reference column (Track B7) writes back to the *joined*
+        // table, not this browse's base table — resolve its foreign target. A
+        // multi-hop / composite / orphaned-FK expansion can't be resolved and stays
+        // read-only (`foreign_edit_for` returns `None`).
+        let foreign = if self.joined_cols.contains(&col) {
+            Some(self.foreign_edit_for(col, row)?)
+        } else {
+            None
+        };
         let pk_value = self.cell_value(row, pk_idx)?;
         if matches!(pk_value, Value::Null | Value::Capped(_)) {
             return None;
         }
-        Some((row, col, pk_value, target.decl_type.clone()))
+        Some((row, col, pk_value, target.decl_type.clone(), foreign))
+    }
+
+    /// Resolve the referenced-table write target for the inline-expanded FK column at
+    /// result column `col` in absolute `row` (Track B7 editable joined columns). The
+    /// referenced row is identified by the FK value resident in the base row, so only
+    /// a **single-hop** join (parent = the base subquery) with a **single-column** key
+    /// is editable; a deeper chain would need an intermediate join's value that may
+    /// not be resident, and a composite key isn't expressible as one
+    /// [`EditOp::Update`](red_core::EditOp) predicate. `None` (stay read-only) when
+    /// the column isn't a resolvable join output, the hop is nested/composite, or the
+    /// row's FK is NULL/clipped (an orphaned reference has no row to update).
+    fn foreign_edit_for(&self, col: usize, row: usize) -> Option<ForeignEdit> {
+        let name = self.columns.get(col)?.name.clone(); // dotted alias, e.g. "tier_id.name"
+        let join = self
+            .joins
+            .iter()
+            .find(|j| j.select.iter().any(|(_, out)| out == &name))?;
+        // Single-hop only: the referenced row's key value must be a base column.
+        if join.parent_alias != red_core::BASE_ALIAS {
+            return None;
+        }
+        // Single-column key only (a composite FK isn't one WHERE predicate).
+        let [(parent_col, target_col)] = join.on.as_slice() else {
+            return None;
+        };
+        let parent_idx = self.columns.iter().position(|c| &c.name == parent_col)?;
+        let key_value = self.cell_value(row, parent_idx)?;
+        if matches!(key_value, Value::Null | Value::Capped(_)) {
+            return None;
+        }
+        let set_column = join
+            .select
+            .iter()
+            .find(|(_, out)| out == &name)
+            .map(|(leaf, _)| leaf.clone())?;
+        Some(ForeignEdit {
+            table: red_core::TableRef {
+                schema: join.to_schema.clone(),
+                name: join.to_table.clone(),
+            },
+            key_column: target_col.clone(),
+            key_value,
+            key_type: self
+                .columns
+                .get(parent_idx)
+                .and_then(|c| c.decl_type.clone()),
+            set_column,
+        })
     }
 
     /// Patch the resident cell at `(row, data_col)` to `value` in place, after a
@@ -2569,5 +2625,164 @@ mod join_tests {
             joins[0].select,
             vec![("name".into(), "tier_id.name".into())]
         );
+    }
+}
+
+/// Editing an inline-expanded FK column (Track B7): a joined cell resolves to an
+/// `UPDATE` against its *referenced* table, keyed by the FK value from the base row.
+#[cfg(test)]
+mod foreign_edit_tests {
+    use super::*;
+    use crate::result::edit::{PkKey, StagedCell, UpdatedRow};
+    use red_core::{Column, EditOp, FkJoin, KeyKind, KeySpec, TableRef, Value, BASE_ALIAS};
+    use red_service::{spawn, SessionId};
+    use std::collections::HashMap;
+
+    fn col(name: &str, ty: &str) -> Column {
+        Column {
+            name: name.into(),
+            decl_type: Some(ty.into()),
+        }
+    }
+
+    /// A single-hop expanded browse: `channel(id, tier_id)` with `tier_id.name`
+    /// pulled inline from `tier` via a `LEFT JOIN`, with one row resident
+    /// (`id=10, tier_id=3, tier_id.name='Gold'`).
+    fn expanded_grid() -> ResultGrid {
+        let handle = spawn();
+        let sender = handle.command_sender(SessionId(1));
+        let mut grid = ResultGrid::new(
+            "channel".into(),
+            "SELECT * FROM channel".into(),
+            Some(("main".into(), "channel".into())),
+            sender,
+            100,
+        );
+        grid.columns = vec![
+            col("id", "integer"),
+            col("tier_id", "integer"),
+            col("tier_id.name", "text"),
+        ];
+        grid.key = Some(KeySpec::single("id", KeyKind::Int));
+        grid.joins = vec![FkJoin {
+            alias: "_red_j0".into(),
+            parent_alias: BASE_ALIAS.into(),
+            on: vec![("tier_id".into(), "id".into())],
+            to_schema: Some("main".into()),
+            to_table: "tier".into(),
+            select: vec![("name".into(), "tier_id.name".into())],
+        }];
+        grid.expansion = vec![ExpandedCol {
+            path: vec!["tier_id".into(), "name".into()],
+        }];
+        grid.set_joined_cols();
+        grid.buffer.borrow_mut().insert_page(
+            0,
+            vec![vec![
+                Value::Integer(10),
+                Value::Integer(3),
+                Value::Text("Gold".into()),
+            ]],
+        );
+        grid
+    }
+
+    #[test]
+    fn resolves_single_hop_target() {
+        let grid = expanded_grid();
+        // Column 2 is `tier_id.name`; row 0's `tier_id` is 3.
+        let f = grid
+            .foreign_edit_for(2, 0)
+            .expect("single-hop FK column is editable");
+        assert_eq!(
+            f.table,
+            TableRef {
+                schema: Some("main".into()),
+                name: "tier".into()
+            }
+        );
+        assert_eq!(f.key_column, "id");
+        assert_eq!(f.key_value, Value::Integer(3)); // the FK value, not the base PK
+        assert_eq!(f.set_column, "name"); // the leaf, not the dotted alias
+        assert_eq!(f.key_type.as_deref(), Some("integer")); // for the WHERE cast
+    }
+
+    #[test]
+    fn refuses_nested_base_and_null_fk() {
+        // A nested hop (parent is another join, not the base) stays read-only — the
+        // referenced row's key value wouldn't be resident in the base row.
+        let mut nested = expanded_grid();
+        nested.joins[0].parent_alias = "_red_j9".into();
+        assert!(nested.foreign_edit_for(2, 0).is_none());
+
+        // A base column isn't a join output — no foreign target.
+        let base = expanded_grid();
+        assert!(base.foreign_edit_for(0, 0).is_none());
+
+        // An orphaned / NULL FK has no referenced row to update.
+        let null_fk = expanded_grid();
+        null_fk.buffer.borrow_mut().patch_cell(0, 1, Value::Null);
+        assert!(null_fk.foreign_edit_for(2, 0).is_none());
+    }
+
+    #[test]
+    fn build_ops_splits_base_and_foreign_updates() {
+        let mut grid = expanded_grid();
+        let f = grid.foreign_edit_for(2, 0).unwrap();
+        // Stage a base edit (`tier_id`) and a foreign edit (`tier_id.name`) on one row.
+        let mut cells = HashMap::new();
+        cells.insert(
+            1,
+            StagedCell {
+                value: Value::Integer(4),
+                foreign: None,
+            },
+        );
+        cells.insert(
+            2,
+            StagedCell {
+                value: Value::Text("Platinum".into()),
+                foreign: Some(f),
+            },
+        );
+        grid.pending.updates.insert(
+            PkKey::Int(10),
+            UpdatedRow {
+                pk_value: Value::Integer(10),
+                row: 0,
+                cells,
+            },
+        );
+        let ops = grid.build_edit_ops();
+        assert_eq!(
+            ops.len(),
+            2,
+            "one base UPDATE + one referenced-table UPDATE"
+        );
+
+        let (base_key, base_set) = ops
+            .iter()
+            .find_map(|op| match op {
+                EditOp::Update { table, key, set } if table.name == "channel" => Some((key, set)),
+                _ => None,
+            })
+            .expect("base UPDATE present");
+        assert_eq!(base_key.column, "id");
+        assert_eq!(base_key.value, Value::Integer(10));
+        assert_eq!(base_set.len(), 1);
+        assert_eq!(base_set[0].column, "tier_id");
+
+        let (fk_key, fk_set) = ops
+            .iter()
+            .find_map(|op| match op {
+                EditOp::Update { table, key, set } if table.name == "tier" => Some((key, set)),
+                _ => None,
+            })
+            .expect("referenced-table UPDATE present");
+        assert_eq!(fk_key.column, "id");
+        assert_eq!(fk_key.value, Value::Integer(3)); // the FK value identifies the ref row
+        assert_eq!(fk_set[0].column, "name"); // leaf, not the dotted alias
+        assert_eq!(fk_set[0].value, Value::Text("Platinum".into()));
+        assert_eq!(fk_set[0].decl_type.as_deref(), Some("text"));
     }
 }

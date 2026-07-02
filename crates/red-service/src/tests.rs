@@ -603,6 +603,91 @@ async fn fk_join_expands_referenced_columns_inline() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A `WHERE` filter on an inline-expanded FK column (Track B7): the join runs
+/// *before* the filter, so a predicate can reference the joined dotted-alias column
+/// (`"tier_id.name"`), and the total / rows narrow to the matching referenced rows
+/// while the base PK stays the seek key.
+#[tokio::test]
+async fn where_filters_on_expanded_fk_column() {
+    use red_core::ResultFilter;
+    let path = std::env::temp_dir().join(format!("red_svc_fkfilter_{}.db", std::process::id()));
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tier(id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO tier VALUES (1, 'Tier A'), (2, 'Tier B');
+             CREATE TABLE channel(id INTEGER PRIMARY KEY,
+                 tier_id INTEGER REFERENCES tier(id), name TEXT);
+             INSERT INTO channel VALUES (1, 1, 'ch1'), (2, 2, 'ch2'), (3, 2, 'ch3');",
+        )
+        .unwrap();
+    }
+
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), true)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    // Browse `channel` expanding `tier_id → tier.name`, filtered to only the rows
+    // whose *referenced* tier is 'Tier B' (channels 2 and 3).
+    send(
+        &handle,
+        Command::OpenResult {
+            sql: "SELECT * FROM channel".into(),
+            epoch: 1,
+            table: Some(("main".into(), "channel".into())),
+            sort: None,
+            filter: Some(ResultFilter::Where("\"tier_id.name\" = 'Tier B'".into())),
+            joins: vec![FkJoin {
+                alias: "_red_j0".into(),
+                parent_alias: "_red_base".into(),
+                on: vec![("tier_id".into(), "id".into())],
+                to_schema: Some("main".into()),
+                to_table: "tier".into(),
+                select: vec![("name".into(), "tier_id.name".into())],
+            }],
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::ResultReady { total, key, .. }) => {
+            assert_eq!(
+                total, 2,
+                "only the two 'Tier B' channels survive the filter"
+            );
+            assert_eq!(key.expect("PK key").column, "id");
+        }
+        other => panic!("expected ResultReady, got {other:?}"),
+    }
+
+    send(
+        &handle,
+        Command::FetchRun {
+            epoch: 1,
+            fetch: RunFetch::Forward { after: None },
+            limit: 10,
+            seq: 1,
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::ResultRunLoaded { rows, .. }) => {
+            assert_eq!(rows.len(), 2);
+            // Both rows carry the filtered joined value, ids 2 and 3.
+            assert_eq!(rows[0][0], Value::Integer(2));
+            assert_eq!(rows[1][0], Value::Integer(3));
+            assert_eq!(rows[0][2], Value::Text("Tier B".into()));
+        }
+        other => panic!("expected ResultRunLoaded, got {other:?}"),
+    }
+
+    std::fs::remove_file(&path).ok();
+}
+
 /// The keyset path end-to-end: a table browse resolves its PK as the seek
 /// key, contiguous runs extend from boundary keys, and a far jump lands by
 /// key-space interpolation with estimated ordinals.

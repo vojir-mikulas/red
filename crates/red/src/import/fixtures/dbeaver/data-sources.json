@@ -1,0 +1,59 @@
+{
+  "connections": {
+    "postgres-jdbc-1": {
+      "provider": "postgresql",
+      "driver": "postgres-jdbc",
+      "name": "PostgreSQL - prod",
+      "save-password": true,
+      "read-only": true,
+      "folder": "PG",
+      "configuration": {
+        "host": "db.example.com",
+        "port": "5432",
+        "database": "app",
+        "url": "jdbc:postgresql://db.example.com:5432/app",
+        "handlers": {
+          "ssh_tunnel": {
+            "type": "tunnel",
+            "enabled": true,
+            "user": "ec2-user",
+            "properties": {
+              "host": "bastion.example.com",
+              "port": "2222",
+              "authType": "PUBLIC_KEY",
+              "keyPath": "/home/me/.ssh/id_ed25519"
+            }
+          }
+        }
+      }
+    },
+    "mysql8-1": {
+      "provider": "mysql",
+      "driver": "mariaDB",
+      "name": "MariaDB local",
+      "save-password": true,
+      "configuration": {
+        "host": "127.0.0.1",
+        "port": "",
+        "database": "shop"
+      }
+    },
+    "sqlite_jdbc-1": {
+      "provider": "sqlite",
+      "driver": "sqlite_jdbc",
+      "name": "Local SQLite",
+      "configuration": {
+        "url": "jdbc:sqlite:/data/app.db"
+      }
+    },
+    "mssql-1": {
+      "provider": "sqlserver",
+      "driver": "mssql",
+      "name": "SQL Server",
+      "configuration": {
+        "host": "win.example.com",
+        "port": "1433"
+      }
+    }
+  }
+}

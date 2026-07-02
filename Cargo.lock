@@ -6215,12 +6215,17 @@ dependencies = [
 name = "red"
 version = "0.12.0"
 dependencies = [
+ "aes 0.8.4",
  "anyhow",
+ "base64 0.22.1",
+ "cbc 0.1.2",
  "dirs 5.0.1",
  "flint",
  "futures",
  "gpui",
  "gpui_platform",
+ "hex",
+ "hmac 0.12.1",
  "keyring",
  "notify",
  "red-core",
@@ -6228,6 +6233,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",

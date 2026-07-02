@@ -20,6 +20,7 @@ mod filter;
 mod find;
 mod history;
 mod icons;
+mod import;
 mod inspector;
 mod keymap;
 mod keymap_config;

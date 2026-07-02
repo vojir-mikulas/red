@@ -14,6 +14,7 @@
 
 mod connect;
 mod form;
+mod import_ui;
 mod keymap_edit;
 mod render;
 mod settings;
@@ -395,6 +396,36 @@ pub(crate) struct EditContext {
     pub pk_value: red_core::Value,
     pub decl_type: Option<String>,
     pub original: red_core::Value,
+    /// Set when the edited cell is an inline-expanded foreign-key column (Track
+    /// B7): the edit updates the *referenced* table's row, not this browse's base
+    /// table. `None` for an ordinary base-table cell (updated via the row's PK).
+    pub foreign: Option<ForeignEdit>,
+}
+
+/// The referenced-table target for editing an inline-expanded foreign-key column
+/// (Track B7). A joined column shows a value from a *referenced* table, so writing
+/// it back is an `UPDATE <ref> SET <col> = ? WHERE <ref key> = <fk value>` — a
+/// different table and row than the base browse's PK edit. Resolved single-hop only
+/// (the referenced row is identified by the FK value resident in the base row);
+/// multi-hop / composite-key expansions stay read-only. Note the referenced row may
+/// be shared by several base rows, so the edit changes all of them — the confirm
+/// preview shows the literal `UPDATE`, and the batch reloads afterwards so the
+/// denormalized view re-resolves.
+#[derive(Clone)]
+pub(crate) struct ForeignEdit {
+    /// The referenced table being updated.
+    pub table: red_core::TableRef,
+    /// The referenced table's unique key column the foreign key points at (the
+    /// join's target column) — the `WHERE` predicate.
+    pub key_column: String,
+    /// The foreign-key value from the base row, identifying the referenced row.
+    pub key_value: red_core::Value,
+    /// The base foreign-key column's declared type, so the `WHERE` bind casts back
+    /// to the key column's type (a uuid/text key needs the cast on Postgres).
+    pub key_type: Option<String>,
+    /// The referenced column being set — the join leaf (`name`), not the dotted
+    /// output alias (`tier_id.name`) the result column carries.
+    pub set_column: String,
 }
 
 /// How long a transient (info / success) toast stays up before it auto-dismisses.
@@ -1170,6 +1201,13 @@ pub struct AppState {
     /// Whether the "What's New" changelog overlay is showing (Help menu /
     /// `help: what's new` palette command / the post-update toast).
     pub(crate) whats_new_open: bool,
+    /// A pending connection import awaiting confirmation: the parsed/decrypted
+    /// report plus a title, rendered as the import preview modal. `None` when no
+    /// import is in flight (see [`import_ui`]).
+    pub(crate) import_preview: Option<import_ui::ImportPreview>,
+    /// Detected import sources (DBeaver/DBGate installs) backing the source
+    /// picker; indexed by [`crate::palette::Cmd::ImportFrom`].
+    pub(crate) import_candidates: Vec<crate::import::discover::Found>,
     /// Set in [`Self::new`] when this build's version differs from the last one
     /// recorded: the version to announce in a one-shot "RED updated to X" toast,
     /// raised on the first render. `None` on a first-ever launch or an unchanged
@@ -1845,6 +1883,8 @@ impl AppState {
             titlebar_drag: false,
             shortcuts_open: false,
             whats_new_open: false,
+            import_preview: None,
+            import_candidates: Vec::new(),
             pending_update,
             connect_sel: 0,
             connect_search,
@@ -2450,6 +2490,7 @@ impl AppState {
             || self.whats_new_open
             || self.settings_open
             || self.form.is_some()
+            || self.import_preview.is_some()
     }
 
     /// Open or close the keyboard-shortcuts overlay (`⌘/` / palette command).

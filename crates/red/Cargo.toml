@@ -47,6 +47,15 @@ dirs.workspace = true
 notify.workspace = true
 zeroize.workspace = true
 
+# Connection import: decrypt DBeaver (AES-128-CBC) and DBGate (simple-encryptor:
+# AES-256-CBC + SHA-256 key + HMAC-SHA256) credential stores. See src/import/.
+aes.workspace = true
+cbc.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+base64.workspace = true
+hex.workspace = true
+
 # macOS uses font-kit (CoreText) for font loading; Windows/Linux use GPUI's own
 # backend. Features are additive, so this only adds to the base workspace deps.
 # The keychain backend is also chosen per-OS here (Cargo features being additive,

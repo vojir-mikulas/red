@@ -54,6 +54,11 @@ pub(crate) enum Cmd {
     CopySelection,
     /// Open a new-connection form (disconnected phase).
     NewConnection,
+    /// Detect DBeaver/DBGate installs and start a connection import (disconnected
+    /// phase). Opens a source picker, or imports directly when there's just one.
+    ImportConnections,
+    /// Import from the detected source at this index — the source-picker activation.
+    ImportFrom(usize),
     /// Open the "go to row…" prompt (only when a result is open).
     GoToRow,
     /// Open the keyboard-shortcuts reference overlay.
@@ -270,6 +275,8 @@ impl AppState {
             Cmd::SearchSchema => self.focus_search = true,
             Cmd::CopySelection => self.copy_result_selection(cx),
             Cmd::NewConnection => self.open_new_form(cx),
+            Cmd::ImportConnections => self.open_import_picker(cx),
+            Cmd::ImportFrom(index) => self.run_import(index, cx),
             Cmd::GoToRow => self.open_goto_prompt(cx),
             Cmd::ShowShortcuts => self.toggle_shortcuts(cx),
             Cmd::ShowChangelog => self.toggle_whats_new(cx),
@@ -293,6 +300,51 @@ impl AppState {
             Cmd::Unsplit => self.unsplit(cx),
             Cmd::FocusOtherHalf => self.focus_other_half(cx),
         }
+    }
+
+    /// Detect installed DBeaver/DBGate sources and start an import. Nothing found
+    /// → an info toast. Exactly one source → import it straight away. Several →
+    /// open a picker (`Cmd::ImportFrom`), reusing the palette plumbing.
+    pub(crate) fn open_import_picker(&mut self, cx: &mut Context<Self>) {
+        let found = crate::import::discover::detect();
+        if found.is_empty() {
+            self.notify(
+                ToastVariant::Info,
+                "No DBeaver or DBGate connections found on this machine.",
+                cx,
+            );
+            return;
+        }
+        self.import_candidates = found;
+        if self.import_candidates.len() == 1 {
+            self.run_import(0, cx);
+            return;
+        }
+        let entries: Vec<(PaletteItem, Cmd)> = self
+            .import_candidates
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let id = ElementId::from(SharedString::from(format!("import-src:{i}")));
+                let item = PaletteItem::new(id, f.label.clone()).hint(f.dir.display().to_string());
+                (item, Cmd::ImportFrom(i))
+            })
+            .collect();
+        self.palette_cmds = entries
+            .iter()
+            .map(|(item, cmd)| (item.id.clone(), *cmd))
+            .collect();
+        let items: Vec<PaletteItem> = entries.into_iter().map(|(item, _)| item).collect();
+
+        let palette = cx.new(|cx| {
+            let mut p = Palette::new(cx);
+            p.set_placeholder("Import connections from…", cx);
+            p.set_items(items, cx);
+            p
+        });
+        let sub = cx.subscribe(&palette, Self::on_palette_event);
+        self.palette = Some((palette, sub));
+        cx.notify();
     }
 
     /// Whether guarded in-grid editing is enabled for the active connection (Track
@@ -509,6 +561,13 @@ impl AppState {
                 out.push((
                     PaletteItem::new("cmd:new-conn", "connection: new").hint("⌘N"),
                     Cmd::NewConnection,
+                ));
+                out.push((
+                    PaletteItem::new(
+                        "cmd:import-conns",
+                        "connection: import from DBeaver / DBGate…",
+                    ),
+                    Cmd::ImportConnections,
                 ));
             }
             // Mid-connect there's nothing query-shaped to do; only globals show.
