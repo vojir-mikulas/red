@@ -946,7 +946,14 @@ fn my_value(value: Option<&MyValue>, col: &MyColumn, max: Option<usize>) -> Valu
     match value {
         None | Some(MyValue::NULL) => Value::Null,
         Some(MyValue::Int(n)) => Value::Integer(*n),
-        Some(MyValue::UInt(n)) => Value::Integer(*n as i64),
+        // `BIGINT UNSIGNED` spans past `i64::MAX`; an `as i64` cast would wrap a
+        // large id/counter to a negative value (silent corruption on read). Keep
+        // it as `Integer` while it fits, and fall back to exact text above the
+        // ceiling so the true digits survive rather than a wrapped number.
+        Some(MyValue::UInt(n)) => match i64::try_from(*n) {
+            Ok(i) => Value::Integer(i),
+            Err(_) => Value::Text(n.to_string()),
+        },
         Some(MyValue::Float(f)) => Value::Real(*f as f64),
         Some(MyValue::Double(f)) => Value::Real(*f),
         Some(MyValue::Bytes(bytes)) => bytes_value(bytes, col, max),

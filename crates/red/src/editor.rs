@@ -636,19 +636,30 @@ impl AppState {
                     .variant(ButtonVariant::Primary)
                     .size(ButtonSize::Sm)
                     .icon(crate::icons::icon("play", theme.scale(11.), on_accent))
-                    .on_click(cx.listener(|this, _, _, cx| this.run_editor_query(cx))),
+                    // Aim the action at the half this bar lives in, not whichever
+                    // half currently holds focus (mirrors the tab/＋ handlers).
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_split_focus(half, cx);
+                        this.run_editor_query(cx);
+                    })),
             )
             .child(
                 Button::new("sql-explain", "Explain")
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::Sm)
-                    .on_click(cx.listener(|this, _, _, cx| this.explain_query(false, cx))),
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_split_focus(half, cx);
+                        this.explain_query(false, cx);
+                    })),
             )
             .child(
                 Button::new("sql-save", "Save")
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::Sm)
-                    .on_click(cx.listener(|this, _, _, cx| this.open_save_prompt(cx))),
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_split_focus(half, cx);
+                        this.open_save_prompt(cx);
+                    })),
             )
             .children(ro_chip);
 
@@ -671,6 +682,31 @@ impl AppState {
             )
             .child(surface)
             .child(run_bar)
+    }
+
+    /// The base `(schema, table)` a hand-typed `SELECT * FROM <table>` browses, when
+    /// one can be resolved against the connection catalog — so the editor result
+    /// gets the schema-tree browse's FK affordances and keyset paging. `None` for any
+    /// query that isn't a plain single-table star select ([`crate::sql::single_table_star`]),
+    /// or whose table can't be pinned to exactly one namespace in the catalog.
+    ///
+    /// The resolved schema string has to match what the driver's FK graph and tree
+    /// use, so it's taken from the catalog (`SchemaMeta.name`) rather than a guess: a
+    /// bare name resolves only when a single namespace holds it; an explicit
+    /// qualifier must name a real object. An ambiguous bare name (same table in two
+    /// namespaces) stays `None` — the engine picks by search-path, which we don't
+    /// track, so guessing could tag the wrong table.
+    fn resolve_browse_table(&self, sql: &str) -> Option<(String, String)> {
+        let (schema_hint, table) = crate::sql::single_table_star(sql)?;
+        let Phase::Connected(active) = &self.phase else {
+            return None;
+        };
+        let resolved = resolve_in_catalog(&active.schema.schemas, schema_hint.as_deref(), &table);
+        tracing::debug!(
+            ?schema_hint, %table, ns = active.schema.schemas.len(), ?resolved,
+            "resolve_browse_table for FK affordances"
+        );
+        resolved
     }
 
     /// Run the selection if any, else the statement under the caret. Pushes to
@@ -753,11 +789,17 @@ impl AppState {
                     );
                     return;
                 }
+                // When the query is a plain `SELECT * FROM <table>`, tag the result
+                // with that base table so it gets the same FK affordances (accent,
+                // click-through, reference-column tree) and keyset paging as a browse
+                // opened from the schema tree. Resolve before the auto-limit shadows
+                // `sql` — the sniffer accepts a trailing LIMIT either way.
+                let table = self.resolve_browse_table(&sql);
                 // Guard a bare `SELECT *` against flooding the grid: append the
                 // configured `LIMIT` unless the user wrote their own.
                 let sql =
                     crate::sql::auto_limit(&sql, self.settings.query.auto_limit).unwrap_or(sql);
-                self.open_result("query", sql, None, cx)
+                self.open_result("query", sql, table, cx)
             }
             crate::sql::StatementKind::Write => self.execute_sql(sql, cx),
             crate::sql::StatementKind::Destructive => {
@@ -912,5 +954,101 @@ impl AppState {
                 editor.set_rich_completions(completion_provider(index), cx)
             });
         }
+    }
+}
+
+/// Resolve a sniffed `(schema_hint, table)` against the connection's namespace
+/// catalog to the canonical `(schema, table)` — the pair the FK graph and browse
+/// paths key off. Split out from [`AppState::resolve_browse_table`] so the matching
+/// rules are unit-testable without a live connection.
+///
+/// The returned schema/table strings carry the catalog's canonical casing (the same
+/// `list_objects` source the FK graph is built from), so the exact `==` match in
+/// `ResultGrid::set_fk_cols` lines up. An explicit qualifier must confirm a real
+/// object; a bare name resolves only when exactly one namespace holds it (ambiguous
+/// → `None`, since the engine would pick by search-path, which RED doesn't track).
+fn resolve_in_catalog(
+    schemas: &[red_core::SchemaMeta],
+    schema_hint: Option<&str>,
+    table: &str,
+) -> Option<(String, String)> {
+    let object_in = |ns: &red_core::SchemaMeta| {
+        ns.objects
+            .iter()
+            .find(|o| o.name.eq_ignore_ascii_case(table))
+            .map(|o| o.name.clone())
+    };
+    match schema_hint {
+        Some(schema) => schemas
+            .iter()
+            .find(|ns| ns.name.eq_ignore_ascii_case(schema))
+            .and_then(|ns| object_in(ns).map(|name| (ns.name.clone(), name))),
+        None => {
+            let mut hits = schemas
+                .iter()
+                .filter_map(|ns| object_in(ns).map(|name| (ns.name.clone(), name)));
+            let first = hits.next()?;
+            hits.next().is_none().then_some(first)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_in_catalog;
+    use red_core::{ObjectKind, ObjectMeta, SchemaMeta};
+
+    fn ns(name: &str, objects: &[&str]) -> SchemaMeta {
+        SchemaMeta {
+            name: name.into(),
+            objects: objects
+                .iter()
+                .map(|o| ObjectMeta {
+                    name: (*o).into(),
+                    kind: ObjectKind::Table,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn resolves_bare_name_in_single_namespace() {
+        let cat = [ns("main", &["users", "tiers"])];
+        assert_eq!(
+            resolve_in_catalog(&cat, None, "users"),
+            Some(("main".into(), "users".into()))
+        );
+        // Canonical casing comes from the catalog, not the typed name.
+        assert_eq!(
+            resolve_in_catalog(&cat, None, "USERS"),
+            Some(("main".into(), "users".into()))
+        );
+        // Unknown table → no tag.
+        assert_eq!(resolve_in_catalog(&cat, None, "ghost"), None);
+    }
+
+    #[test]
+    fn bare_name_in_two_namespaces_is_ambiguous() {
+        let cat = [ns("public", &["users"]), ns("audit", &["users"])];
+        // Same name in two schemas — the engine would pick by search-path, so we don't.
+        assert_eq!(resolve_in_catalog(&cat, None, "users"), None);
+    }
+
+    #[test]
+    fn explicit_qualifier_must_confirm_in_catalog() {
+        let cat = [ns("public", &["users"]), ns("audit", &["events"])];
+        assert_eq!(
+            resolve_in_catalog(&cat, Some("public"), "users"),
+            Some(("public".into(), "users".into()))
+        );
+        // The qualifier disambiguates a name that would otherwise be ambiguous.
+        let dup = [ns("public", &["users"]), ns("audit", &["users"])];
+        assert_eq!(
+            resolve_in_catalog(&dup, Some("audit"), "users"),
+            Some(("audit".into(), "users".into()))
+        );
+        // A qualifier naming a table the schema doesn't hold → no tag.
+        assert_eq!(resolve_in_catalog(&cat, Some("public"), "events"), None);
+        assert_eq!(resolve_in_catalog(&cat, Some("nope"), "users"), None);
     }
 }

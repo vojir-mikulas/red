@@ -201,6 +201,11 @@ enum PartialBlock {
     },
 }
 
+/// Upper bound on distinct SSE content-block indices we'll materialize. A real
+/// turn has a handful of blocks; the cap turns a hostile/oversized `index` into a
+/// dropped event instead of an unbounded allocation.
+const MAX_CONTENT_BLOCKS: usize = 1024;
+
 impl TurnAccumulator {
     fn handle_event(&mut self, event: &Json, tx: &UnboundedSender<Delta>) {
         match event.get("type").and_then(Json::as_str) {
@@ -248,6 +253,14 @@ impl TurnAccumulator {
                     _ => PartialBlock::Text(String::new()),
                 };
                 let idx = event.get("index").and_then(Json::as_u64).unwrap_or(0) as usize;
+                // `index` is off the SSE wire and the endpoint is a configurable /
+                // proxied `base_url`; a hostile or buggy stream could send a huge
+                // value and force a multi-GB `resize_with`. Real responses have a
+                // handful of blocks, so drop an implausibly-indexed event rather
+                // than allocate for it.
+                if idx >= MAX_CONTENT_BLOCKS {
+                    return;
+                }
                 if idx >= self.blocks.len() {
                     self.blocks
                         .resize_with(idx + 1, || PartialBlock::Text(String::new()));

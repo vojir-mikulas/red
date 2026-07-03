@@ -369,7 +369,13 @@ pub fn is_read_only(sql: &str) -> bool {
         "pg_ls_dir",
         "pg_stat_file",
         "pg_logical_emit_message",
+        // `dblink`/`dblink_send_query` run arbitrary SQL on a remote (often the
+        // same loopback) server from inside a SELECT — a write channel that reads
+        // as read-only. Block the bare and async forms, not just `dblink_exec`.
+        "dblink",
         "dblink_exec",
+        "dblink_open",
+        "dblink_send_query",
         "pg_file_write",
         "pg_file_unlink",
         "pg_file_rename",
@@ -541,6 +547,222 @@ pub fn auto_limit(sql: &str, n: u32) -> Option<String> {
         return None;
     }
     Some(format!("{trimmed} LIMIT {n}"))
+}
+
+/// The single physical table a hand-typed `SELECT * FROM <table>` reads, as an
+/// optional-schema + table name — so a browse typed into the editor gets the same
+/// foreign-key affordances (in-grid accent, click-through, the reference-column
+/// tree) as one opened from the schema tree, which only fire when the result maps
+/// to one known base table (Track B7).
+///
+/// Deliberately narrow — returns `None` for anything that isn't provably a
+/// single-table star select, because the FK machinery keys off the result's
+/// columns *being exactly that table's columns*:
+///
+/// - only `SELECT *` (a projection could omit the PK the keyset pages on, or an FK
+///   column the reference-column join wraps on — both would break);
+/// - one table in `FROM`, no `JOIN`, no comma list, no `FROM (subquery)`;
+/// - no top-level set operation (`UNION`/`INTERSECT`/`EXCEPT`), whose shape differs.
+///
+/// A trailing `WHERE`/`ORDER BY`/`LIMIT`/… and subqueries *inside* them are fine —
+/// they don't change the column set. Scans a noise-stripped copy so keywords inside
+/// string literals / quoted identifiers / comments can't fool it. The bare table
+/// name still has to be resolved against the connection catalog by the caller.
+pub fn single_table_star(sql: &str) -> Option<(Option<String>, String)> {
+    // Lex the raw SQL — [`lex_simple`] skips string literals and comments and unwraps
+    // quoted identifiers ("pg/sqlite" or `mysql`), so a quoted table name still parses
+    // and a keyword inside a literal/comment can't fool the scan. A stray statement
+    // separator surfaces as `Other`, which the parse below rejects.
+    let toks = lex_simple(sql.trim().trim_end_matches(';'));
+    if toks.is_empty() {
+        return None;
+    }
+
+    // A top-level set operation makes the result a union of shapes, not the table —
+    // reject it wherever it appears at paren-depth 0 (nested in a subquery is fine).
+    let mut depth = 0i32;
+    for t in &toks {
+        match t {
+            SimpleToken::LParen => depth += 1,
+            SimpleToken::RParen => depth = (depth - 1).max(0),
+            SimpleToken::Word(w) if depth == 0 && is_setop(w) => return None,
+            _ => {}
+        }
+    }
+
+    let mut it = toks.iter().peekable();
+    // `SELECT`
+    match it.next() {
+        Some(SimpleToken::Word(w)) if w.eq_ignore_ascii_case("select") => {}
+        _ => return None,
+    }
+    // exactly `*` — no projection, no `DISTINCT`/`ALL`/aggregate.
+    if !matches!(it.next(), Some(SimpleToken::Star)) {
+        return None;
+    }
+    // `FROM`
+    match it.next() {
+        Some(SimpleToken::Word(w)) if w.eq_ignore_ascii_case("from") => {}
+        _ => return None,
+    }
+    // The dotted table reference: `table`, `schema.table`, or `db.schema.table`.
+    // The last part is the table; the one before it (if any) is the schema.
+    let mut parts: Vec<String> = Vec::new();
+    match it.next() {
+        Some(SimpleToken::Word(w)) if !is_from_stop(w) => parts.push(w.clone()),
+        _ => return None,
+    }
+    while matches!(it.peek(), Some(SimpleToken::Dot)) {
+        it.next();
+        match it.next() {
+            Some(SimpleToken::Word(w)) => parts.push(w.clone()),
+            _ => return None,
+        }
+    }
+    let table = parts.last().cloned()?;
+    let schema = (parts.len() >= 2).then(|| parts[parts.len() - 2].clone());
+
+    // An optional alias — `AS x` or a bare `x` that isn't a clause keyword.
+    if let Some(SimpleToken::Word(w)) = it.peek() {
+        if w.eq_ignore_ascii_case("as") {
+            it.next();
+            if !matches!(it.next(), Some(SimpleToken::Word(_))) {
+                return None;
+            }
+        } else if !is_from_stop(w) {
+            it.next();
+        }
+    }
+
+    // Whatever follows the `FROM` item must be a shape-preserving tail clause or the
+    // end — a `JOIN`, a comma (second table), or another `(subquery)` disqualifies.
+    match it.peek() {
+        None => {}
+        Some(SimpleToken::Word(w)) if is_tail_clause(w) => {}
+        _ => return None,
+    }
+
+    Some((schema, table))
+}
+
+/// A word that ends the `FROM` table item: a clause keyword or a join word (so it's
+/// never mistaken for the table's alias, and a `JOIN` after the table disqualifies).
+fn is_from_stop(w: &str) -> bool {
+    is_tail_clause(w)
+        || is_join_word(w)
+        || is_setop(w)
+        || w.eq_ignore_ascii_case("on")
+        || w.eq_ignore_ascii_case("using")
+}
+
+/// A clause that can follow the single table without changing its column set.
+fn is_tail_clause(w: &str) -> bool {
+    matches!(
+        w.to_ascii_lowercase().as_str(),
+        "where" | "group" | "order" | "having" | "limit" | "offset" | "window" | "fetch" | "for"
+    )
+}
+
+fn is_join_word(w: &str) -> bool {
+    matches!(
+        w.to_ascii_lowercase().as_str(),
+        "join" | "inner" | "left" | "right" | "full" | "cross" | "natural"
+    )
+}
+
+fn is_setop(w: &str) -> bool {
+    matches!(
+        w.to_ascii_lowercase().as_str(),
+        "union" | "intersect" | "except"
+    )
+}
+
+/// A coarse token for [`single_table_star`]'s FROM-clause parse — words (bare or
+/// quoted identifiers) plus the punctuation that changes a query's shape (`*`, `,`,
+/// `.`, parens). Everything else (operators, numbers, `;`) collapses to `Other`,
+/// which the parse just rejects on.
+#[derive(PartialEq, Eq)]
+enum SimpleToken {
+    Word(String),
+    Star,
+    Comma,
+    Dot,
+    LParen,
+    RParen,
+    Other,
+}
+
+/// Lex for the single-table sniff: identifiers (bare + quoted), the shape
+/// punctuation, and nothing else. String literals and comments are skipped so a
+/// keyword inside them can't fool the parse; a quoted identifier (`"…"`/`` `…` ``)
+/// yields its inner name as a `Word` so quoted table/schema names still resolve.
+fn lex_simple(s: &str) -> Vec<SimpleToken> {
+    let b = s.as_bytes();
+    let n = b.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let c = b[i];
+        // Line comment: `--` to end of line.
+        if c == b'-' && i + 1 < n && b[i + 1] == b'-' {
+            i += 2;
+            while i < n && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment: `/* … */`.
+        if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(n);
+            continue;
+        }
+        // String literal — its content is data; a `SELECT *` never has one where a
+        // token is expected, so emit `Other` to fail the parse if it appears.
+        if c == b'\'' {
+            i += 1;
+            while i < n && b[i] != b'\'' {
+                i += 1;
+            }
+            i = (i + 1).min(n);
+            out.push(SimpleToken::Other);
+            continue;
+        }
+        // Quoted identifier (`"pg/sqlite"` or `` `mysql` ``) → its inner name.
+        if c == b'"' || c == b'`' {
+            let quote = c;
+            let start = i + 1;
+            i += 1;
+            while i < n && b[i] != quote {
+                i += 1;
+            }
+            out.push(SimpleToken::Word(s[start..i.min(n)].to_string()));
+            i = (i + 1).min(n);
+            continue;
+        }
+        if is_ident_start(c) {
+            let start = i;
+            while i < n && is_ident_continue(b[i]) {
+                i += 1;
+            }
+            out.push(SimpleToken::Word(s[start..i].to_string()));
+            continue;
+        }
+        match c {
+            b'*' => out.push(SimpleToken::Star),
+            b',' => out.push(SimpleToken::Comma),
+            b'.' => out.push(SimpleToken::Dot),
+            b'(' => out.push(SimpleToken::LParen),
+            b')' => out.push(SimpleToken::RParen),
+            _ if c.is_ascii_whitespace() => {}
+            _ => out.push(SimpleToken::Other),
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Replace non-ASCII Unicode whitespace — most commonly U+00A0, the non-breaking
@@ -962,6 +1184,83 @@ mod tests {
         // Disabled by a zero limit, and skipped for multi-statement batches.
         assert_eq!(auto_limit("SELECT * FROM t", 0), None);
         assert_eq!(auto_limit("SELECT 1; SELECT 2", 1000), None);
+    }
+
+    #[test]
+    fn single_table_star_matches_plain_browses() {
+        let t = |s: &str| single_table_star(s);
+        // Bare, schema-qualified, and db.schema.table all resolve their table (+schema).
+        assert_eq!(t("SELECT * FROM users"), Some((None, "users".into())));
+        assert_eq!(
+            t("select * from public.users"),
+            Some((Some("public".into()), "users".into()))
+        );
+        assert_eq!(
+            t("SELECT * FROM shop.public.orders"),
+            Some((Some("public".into()), "orders".into()))
+        );
+        // Shape-preserving tails (WHERE / ORDER BY / LIMIT, the appended auto-limit),
+        // an alias, and subqueries/commas *inside* a WHERE are all fine.
+        assert_eq!(
+            t("SELECT * FROM users WHERE id = 1 ORDER BY id LIMIT 1000"),
+            Some((None, "users".into()))
+        );
+        assert_eq!(t("SELECT * FROM users u"), Some((None, "users".into())));
+        assert_eq!(
+            t("SELECT * FROM users AS u WHERE u.active"),
+            Some((None, "users".into()))
+        );
+        assert_eq!(
+            t("SELECT * FROM users WHERE id IN (1, 2, 3)"),
+            Some((None, "users".into()))
+        );
+        assert_eq!(
+            t("SELECT * FROM users WHERE tier_id IN (SELECT id FROM tiers)"),
+            Some((None, "users".into()))
+        );
+        // A keyword hiding in a string literal / comment can't fool the scan.
+        assert_eq!(
+            t("SELECT * FROM users WHERE note = 'a join b'"),
+            Some((None, "users".into()))
+        );
+        assert_eq!(
+            t("SELECT * FROM users -- join orders\n WHERE id = 1"),
+            Some((None, "users".into()))
+        );
+        assert_eq!(t("SELECT * FROM users ;"), Some((None, "users".into())));
+        // Quoted identifiers (pg/sqlite `"…"`, MySQL backticks) resolve to the inner
+        // name — RED's own browse SQL is fully quoted, and users copy it.
+        assert_eq!(t(r#"SELECT * FROM "users""#), Some((None, "users".into())));
+        assert_eq!(
+            t(r#"SELECT * FROM "public"."users""#),
+            Some((Some("public".into()), "users".into()))
+        );
+        assert_eq!(t("SELECT * FROM `users`"), Some((None, "users".into())));
+        assert_eq!(
+            t(r#"SELECT * FROM "users" WHERE "id" = 1"#),
+            Some((None, "users".into()))
+        );
+    }
+
+    #[test]
+    fn single_table_star_rejects_non_single_table_shapes() {
+        let no = |s: &str| assert_eq!(single_table_star(s), None, "should reject: {s}");
+        // Projections — a missing PK/FK column would break keyset paging and the
+        // reference-column join wrap, so only `SELECT *` qualifies.
+        no("SELECT id, name FROM users");
+        no("SELECT count(*) FROM users");
+        no("SELECT DISTINCT * FROM users");
+        // Joins, comma lists, and a FROM subquery aren't a single base table.
+        no("SELECT * FROM users u JOIN tiers t ON u.tier_id = t.id");
+        no("SELECT * FROM users, tiers");
+        no("SELECT * FROM (SELECT * FROM users) x");
+        // Top-level set operations change the result shape.
+        no("SELECT * FROM users UNION SELECT * FROM admins");
+        // A chained second statement, and non-SELECT statements.
+        no("SELECT * FROM users; DROP TABLE users");
+        no("UPDATE users SET active = 1");
+        no("WITH x AS (SELECT 1) SELECT * FROM x");
+        no("");
     }
 
     #[test]

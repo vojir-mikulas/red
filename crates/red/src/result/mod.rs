@@ -1276,6 +1276,21 @@ impl AppState {
             _ => return,
         };
         let (sql, epoch, table, filter) = opened;
+        // Ensure the base table's column detail is loaded so the reference-column tree
+        // (Track B7) can render — a schema-tree browse prefetches this, but a hand-typed
+        // `SELECT * FROM t` resolved to a base table may not have it yet. Idempotent: it
+        // only fires when the detail is missing (the accent path needs only the FK graph,
+        // not this — but the columns panel reads the base table's columns from here).
+        if let Some((schema, tbl)) = &table {
+            let missing = matches!(&self.phase, Phase::Connected(active)
+                if !active.schema.details.contains_key(&(schema.clone(), tbl.clone())));
+            if missing {
+                self.send_active(Command::DescribeTable {
+                    schema: schema.clone(),
+                    table: tbl.clone(),
+                });
+            }
+        }
         // A fresh open is never sorted — the backend keys it from `table`; the filter
         // (FK follow) is pushed into the query like a Track B2 filter.
         self.send_active(Command::OpenResult {

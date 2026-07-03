@@ -1012,7 +1012,14 @@ fn is_read_only_select(sql: &str) -> bool {
         "pg_ls_dir",
         "pg_stat_file",
         "pg_logical_emit_message",
+        // `dblink`/`dblink_send_query` run arbitrary SQL on a remote (often the
+        // same loopback) server from inside a SELECT — a write channel that reads
+        // as read-only here. `dblink_exec` is the obvious one; the bare and async
+        // forms are the same hole under a different name.
+        "dblink",
         "dblink_exec",
+        "dblink_open",
+        "dblink_send_query",
         "pg_file_write",
         "pg_file_unlink",
         "pg_file_rename",
@@ -1667,6 +1674,13 @@ mod tests {
         assert!(!is_read_only_select("SELECT pg_read_file('/etc/passwd')"));
         assert!(!is_read_only_select(
             "SELECT dblink_exec('dbname=x', 'DELETE FROM t')"
+        ));
+        // Bare and async `dblink` run arbitrary remote SQL just like `dblink_exec`.
+        assert!(!is_read_only_select(
+            "SELECT * FROM dblink('dbname=x', 'DELETE FROM t RETURNING id') AS r(id int)"
+        ));
+        assert!(!is_read_only_select(
+            "SELECT dblink_send_query('c', 'DELETE FROM t')"
         ));
         assert!(!is_read_only_select("select load_file('/etc/passwd')"));
         // A write keyword merely *inside a literal or quoted identifier* is harmless
