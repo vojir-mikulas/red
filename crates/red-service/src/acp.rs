@@ -4,7 +4,7 @@
 //! server we host (`crate::mcp`); this module just keeps one live ACP
 //! conversation per `conversation_id`, feeds it grounded prompts, and relays the
 //! streamed deltas as the **same** `Event::AiDelta`/`AiTurnFinished`/`AiError`
-//! the API-key path emits — so the panel is reused unchanged.
+//! the API-key path emits, so the panel is reused unchanged.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -35,7 +35,7 @@ const MCP_SERVER_NAME: &str = "red-db";
 /// agent down (M-S3). An idle agent is a parked subprocess plus an open MCP port;
 /// a fresh prompt after teardown just restarts it (a new agent session, so the
 /// grounding instruction is re-folded). Mirrors `dispatch::IDLE_EVICT` for
-/// sessions — a conversation outlives its DB session's idle window so a brief
+/// sessions: a conversation outlives its DB session's idle window so a brief
 /// reconnect doesn't kill the chat, but a long-abandoned one is reclaimed.
 const IDLE_TEARDOWN: Duration = Duration::from_secs(900);
 
@@ -53,7 +53,7 @@ struct Conversation {
     /// server holds a now-dead driver clone.
     session: Option<SessionId>,
     first_turn: bool,
-    /// When this conversation last started or finished a turn — the idle sweep
+    /// When this conversation last started or finished a turn; the idle sweep
     /// reclaims it once this is older than [`IDLE_TEARDOWN`].
     last_used: Instant,
     /// True while a turn is in flight, so the idle sweep never evicts an agent
@@ -75,7 +75,7 @@ pub(crate) struct AcpManager {
     next_request_id: u64,
     /// Crash-restart bookkeeping per conversation, so a reliably-crashing agent
     /// can't be re-spawned on every turn (see [`AcpManager::allow_restart`]). Kept
-    /// after the `Conversation` itself is dropped — that's the point: it has to
+    /// after the `Conversation` itself is dropped, and that's the point: it has to
     /// outlive the dead agent to bound how often it comes back.
     restarts: HashMap<u64, RestartTracker>,
     /// In-flight interactive sign-ins (paste-code OAuth), keyed by agent id. The
@@ -89,7 +89,7 @@ pub(crate) struct AcpManager {
 }
 
 /// Cap on outstanding (un-answered) permission prompts. The UI serializes one
-/// prompt at a time; a higher number means an agent is spamming requests — deny
+/// prompt at a time; a higher number means an agent is spamming requests, so deny
 /// the overflow rather than let the map grow without bound.
 const MAX_PENDING_PERMISSIONS: usize = 32;
 
@@ -163,7 +163,7 @@ impl AcpManager {
     /// Drop restart trackers whose conversation no longer exists, so the map can't
     /// outgrow the live conversation set. Eviction is a clean teardown (idle sweep,
     /// session close, re-auth), not a crash, so resetting the budget for a
-    /// reclaimed conversation is correct — a rapidly-crashing one stays recent and
+    /// reclaimed conversation is correct; a rapidly-crashing one stays recent and
     /// is retained, keeping its budget intact.
     fn prune_restarts(&mut self) {
         let conversations = &self.conversations;
@@ -203,7 +203,7 @@ impl AcpManager {
     }
 
     /// Drop the parked sink for a finished sign-in, but only if it's still the one
-    /// this attempt parked (matching `token`) — a sign-in restarted for the same
+    /// this attempt parked (matching `token`): a sign-in restarted for the same
     /// agent installs a fresh token, so the stale predecessor's cleanup is skipped.
     fn clear_login(&mut self, agent_id: &str, token: u64) {
         if self.logins.get(agent_id).is_some_and(|(t, _)| *t == token) {
@@ -237,7 +237,7 @@ impl AcpManager {
 
     /// Reclaim conversations idle past [`IDLE_TEARDOWN`] (M-S3), skipping any with
     /// a turn in flight. Called from the dispatch idle sweep, mirroring the
-    /// session-eviction pass — a parked agent is a subprocess plus an MCP port we
+    /// session-eviction pass; a parked agent is a subprocess plus an MCP port we
     /// can release and lazily rebuild on the next prompt.
     pub(crate) fn evict_idle(&mut self) {
         let now = Instant::now();
@@ -252,7 +252,7 @@ impl AcpManager {
     }
 
     /// Drop every conversation not mid-turn so its next prompt re-spawns the agent
-    /// and re-runs the ACP handshake (M-S4) — used after a Settings re-auth so live
+    /// and re-runs the ACP handshake (M-S4); used after a Settings re-auth so live
     /// chats pick up the newly signed-in account. A conversation with a turn in
     /// flight is left alone, the same way the idle sweep skips it.
     pub(crate) fn drop_idle(&mut self) {
@@ -434,7 +434,7 @@ pub(crate) async fn run_turn(
 /// pastes. We park a code sink the UI fires via `AiSubmitLoginCode`, relay the
 /// CLI's lifecycle as `AiLoginPrompt`/`AiLoginFinished`, and on success force idle
 /// conversations to re-handshake so they adopt the (possibly switched) account.
-/// Red never sees the OAuth tokens — the CLI owns them.
+/// Red never sees the OAuth tokens; the CLI owns them.
 pub(crate) async fn start_login(
     manager: Arc<tokio::sync::Mutex<AcpManager>>,
     command: String,
@@ -490,7 +490,7 @@ pub(crate) async fn start_login(
 
 /// Ask the agent's bundled CLI who is signed in and emit it as `AiAgentAuthStatus`.
 /// A failure (no CLI, spawn error, non-Claude agent) is logged and reported as
-/// "not signed in" rather than surfaced as an error — Settings just shows a sign-in
+/// "not signed in" rather than surfaced as an error; Settings just shows a sign-in
 /// affordance.
 pub(crate) async fn check_auth_status(command: String, agent_id: String, events: Events) {
     let status = match red_acp::auth_status(&command).await {
@@ -544,13 +544,13 @@ async fn ensure_conversation(
     let mut guard = manager.lock().await;
     // Restart on crash (M-S3): a conversation whose connection task has ended
     // (agent exited / crashed) can't serve another turn, so drop it and fall
-    // through to a fresh start — a new agent session, so grounding re-folds.
+    // through to a fresh start: a new agent session, so grounding re-folds.
     if guard
         .conversations
         .get(&conversation_id)
         .is_some_and(|c| !c.agent.is_alive())
     {
-        tracing::debug!("ACP conversation {conversation_id} died — restarting");
+        tracing::debug!("ACP conversation {conversation_id} died; restarting");
         guard.conversations.remove(&conversation_id);
         // Bound crash-restarts: a reliably-crashing agent would otherwise re-spawn a
         // subprocess + MCP bind on every prompt. Past the budget, refuse this turn.
@@ -676,7 +676,7 @@ async fn permission_relay(
         } = perm;
         // Park the decision sink; dropping it on overflow denies the call.
         let Some(request_id) = manager.lock().await.park_permission(decide) else {
-            tracing::warn!("too many pending AI permission prompts — denying");
+            tracing::warn!("too many pending AI permission prompts; denying");
             continue;
         };
         emit(
@@ -778,7 +778,7 @@ pub(crate) async fn set_config_option(
                 message: e.to_string(),
             },
         ),
-        // The agent connection ended before answering — leave the dropdown as-is.
+        // The agent connection ended before answering; leave the dropdown as-is.
         Err(_) => {}
     }
 }

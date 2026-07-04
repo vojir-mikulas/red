@@ -1,7 +1,7 @@
 //! Client-side window decorations (Linux/Wayland).
 //!
-//! On macOS and Windows the OS draws the window frame — titlebar, drag region,
-//! min/max/close buttons, resize borders — and GPUI reports
+//! On macOS and Windows the OS draws the window frame (titlebar, drag region,
+//! min/max/close buttons, resize borders) and GPUI reports
 //! [`Decorations::Server`]. There is nothing for us to do.
 //!
 //! On Linux, GNOME/Wayland (and X11 with Motif hints) hand the application
@@ -21,8 +21,12 @@ use flint::Theme;
 use gpui::{
     canvas, div, prelude::*, px, AnyElement, Bounds, CursorStyle, Decorations, HitboxBehavior,
     Hsla, MouseButton, Pixels, Point, ResizeEdge, Size, StatefulInteractiveElement, Tiling,
-    WeakEntity, Window, WindowControlArea,
+    WeakEntity, Window,
 };
+// Only referenced when we build our own drag region; never on Windows, where the
+// native caption bar owns window-move (see `draggable`).
+#[cfg(not(target_os = "windows"))]
+use gpui::WindowControlArea;
 
 use crate::app::AppState;
 
@@ -125,49 +129,66 @@ pub(crate) fn frame(
         .into_any_element()
 }
 
-/// Make `el` — a titlebar / drag strip — move the window when dragged.
+/// Make `el` (a titlebar / drag strip) move the window when dragged.
 ///
 /// On macOS the `WindowControlArea::Drag` hit-test does the work (and the
 /// double-click zooms/minimises per System Settings). On Linux the hit-test is
 /// ignored, so we run an explicit interactive move: arm on mouse-down, and fire
 /// [`Window::start_window_move`] on the first drag motion (a plain click never
 /// moves, so it still reaches the controls underneath).
+///
+/// **Not on Windows.** Windows keeps its native caption bar (see
+/// `main::titlebar_options`), so this strip must *not* also be a drag region:
+/// GPUI translates `WindowControlArea::Drag` into an `HTCAPTION` hit-test, and
+/// because the hit-test resolver matches the strip's hitbox anywhere in the
+/// cursor stack (not just the topmost), the whole bar reads as caption, which
+/// both moves the window on drag *and* swallows clicks on the controls sitting
+/// in it (the Settings gear, the connection switcher, …). The native caption
+/// already handles window-move there, so we leave the strip as plain content.
 pub(crate) fn draggable<E>(el: E, window: &Window, view: WeakEntity<AppState>) -> E
 where
     E: StatefulInteractiveElement,
 {
-    let el = el
-        .window_control_area(WindowControlArea::Drag)
-        .on_click(|event, window, _| {
-            if event.click_count() == 2 {
-                #[cfg(target_os = "macos")]
-                window.titlebar_double_click();
-                #[cfg(not(target_os = "macos"))]
-                window.zoom_window();
-            }
-        });
-
-    if !matches!(window.window_decorations(), Decorations::Client { .. }) {
-        return el;
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (window, view);
+        el
     }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let el = el
+            .window_control_area(WindowControlArea::Drag)
+            .on_click(|event, window, _| {
+                if event.click_count() == 2 {
+                    #[cfg(target_os = "macos")]
+                    window.titlebar_double_click();
+                    #[cfg(not(target_os = "macos"))]
+                    window.zoom_window();
+                }
+            });
 
-    let arm = view.clone();
-    let disarm = view.clone();
-    let go = view.clone();
-    el.on_mouse_down(MouseButton::Left, move |_e, _window, cx| {
-        arm.update(cx, |this, _| this.titlebar_drag = true).ok();
-    })
-    .on_mouse_up(MouseButton::Left, move |_e, _window, cx| {
-        disarm.update(cx, |this, _| this.titlebar_drag = false).ok();
-    })
-    .on_mouse_move(move |_e, window, cx| {
-        let armed = go
-            .update(cx, |this, _| std::mem::take(&mut this.titlebar_drag))
-            .unwrap_or(false);
-        if armed {
-            window.start_window_move();
+        if !matches!(window.window_decorations(), Decorations::Client { .. }) {
+            return el;
         }
-    })
+
+        let arm = view.clone();
+        let disarm = view.clone();
+        let go = view.clone();
+        el.on_mouse_down(MouseButton::Left, move |_e, _window, cx| {
+            arm.update(cx, |this, _| this.titlebar_drag = true).ok();
+        })
+        .on_mouse_up(MouseButton::Left, move |_e, _window, cx| {
+            disarm.update(cx, |this, _| this.titlebar_drag = false).ok();
+        })
+        .on_mouse_move(move |_e, window, cx| {
+            let armed = go
+                .update(cx, |this, _| std::mem::take(&mut this.titlebar_drag))
+                .unwrap_or(false);
+            if armed {
+                window.start_window_move();
+            }
+        })
+    }
 }
 
 /// The minimize / maximize / close cluster, drawn only when the window uses

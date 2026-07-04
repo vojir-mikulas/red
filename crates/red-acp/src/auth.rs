@@ -1,7 +1,7 @@
 //! Subscription **sign-in** and "who is logged in" for the Claude Agent ACP agent.
 //!
 //! The agent (`@agentclientprotocol/claude-agent-acp`) never advertises an auth
-//! method to Red — it only offers terminal-login methods when the *client* asks
+//! method to Red; it only offers terminal-login methods when the *client* asks
 //! for the `auth.terminal` capability, and even then its `authenticate` RPC isn't
 //! implemented for them. So the old "spawn a probe handshake to pop `/login`"
 //! approach was a silent no-op once signed in. Instead the agent ships a CLI: run
@@ -15,7 +15,7 @@
 //!   then feed the code back over stdin (the `code` receiver).
 //! - `auth logout` → clears the stored credential.
 //!
-//! Red never sees the OAuth tokens — the bundled CLI owns them.
+//! Red never sees the OAuth tokens: the bundled CLI owns them.
 
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -36,7 +36,7 @@ const STATUS_TIMEOUT: Duration = Duration::from_secs(45);
 const LOGIN_URL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long to wait for the user to finish authorizing in the browser before
-/// giving up (the common path completes on its own via the browser callback — no
+/// giving up (the common path completes on its own via the browser callback, no
 /// code paste needed). Long enough to find a password / pass 2FA.
 const LOGIN_COMPLETE_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -48,7 +48,7 @@ const LOGIN_FINISH_TIMEOUT: Duration = Duration::from_secs(120);
 /// can't grow the buffer without bound.
 const STDERR_CAP: usize = 4096;
 
-/// The agent's `auth status --json` payload — who (if anyone) is signed in. Unknown
+/// The agent's `auth status --json` payload: who (if anyone) is signed in. Unknown
 /// fields are ignored; every field defaults so a `{"loggedIn": false}` still parses.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct AuthStatus {
@@ -56,7 +56,7 @@ pub struct AuthStatus {
     pub logged_in: bool,
     #[serde(default)]
     pub email: Option<String>,
-    /// e.g. `"max"`, `"pro"` — the Claude subscription tier (claude.ai auth only).
+    /// e.g. `"max"`, `"pro"`: the Claude subscription tier (claude.ai auth only).
     #[serde(rename = "subscriptionType", default)]
     pub subscription_type: Option<String>,
     /// e.g. `"claude.ai"` or `"console"`.
@@ -202,7 +202,7 @@ async fn run_login_inner(
 
     // Phase 2: the sign-in completes one of two ways, whichever happens first:
     //  - the **common** path: the user authorizes in the browser and the CLI's own
-    //    callback finishes it, so the process just exits — no code paste needed;
+    //    callback finishes it, so the process just exits (no code paste needed);
     //  - the **fallback** path: the CLI shows a code and waits on stdin for it, which
     //    the user pastes (relayed over `code`).
     // Cancellation drops the `code` sender, which resolves it with an error.
@@ -210,7 +210,7 @@ async fn run_login_inner(
     let mut cancelled = false;
     let exited = tokio::select! {
         biased;
-        // The CLI finished on its own (browser callback) — or timed out waiting.
+        // The CLI finished on its own (browser callback), or timed out waiting.
         res = timeout(LOGIN_COMPLETE_TIMEOUT, child.wait()) => Some(res),
         // The user pasted a code (or cancelled). Touch `child` only after the select.
         pasted = code => {
@@ -223,12 +223,12 @@ async fn run_login_inner(
     };
 
     let status = match exited {
-        // Completed via the browser callback — the usual, paste-free path.
+        // Completed via the browser callback: the usual, paste-free path.
         Some(Ok(Ok(status))) => status,
         Some(Ok(Err(e))) => return Err(format!("sign-in process error: {e}")),
         Some(Err(_)) => {
             let _ = child.start_kill();
-            return Err("sign-in timed out — no response from the browser".into());
+            return Err("sign-in timed out: no response from the browser".into());
         }
         None if cancelled => {
             let _ = child.start_kill();
@@ -264,7 +264,7 @@ async fn run_login_inner(
             .map(|b| b.trim().to_string())
             .unwrap_or_default();
         Err(if stderr.is_empty() {
-            "sign-in failed — the code may be wrong or expired".into()
+            "sign-in failed; the code may be wrong or expired".into()
         } else {
             stderr
         })

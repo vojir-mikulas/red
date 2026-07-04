@@ -1,7 +1,7 @@
 //! The result filter bar (Track B2): a small input strip above the grid that
 //! narrows the whole result by pushing a predicate into the query. Distinct from
 //! find-in-result (which only highlights loaded rows), a filter **re-opens** the
-//! result under a new epoch with the predicate wrapped in — so the count, the
+//! result under a new epoch with the predicate wrapped in, so the count, the
 //! keyset seek key, sort, and export all operate on the filtered set, never
 //! materializing it (the wrap keeps `SELECT *`, so the key column survives).
 //!
@@ -61,7 +61,7 @@ impl AppState {
             TextInputEvent::Change => {}
         });
         self.filter_bar = Some(FilterBarState { input, mode, sub });
-        // The Window isn't in hand here — focus the input on the next render.
+        // The Window isn't in hand here; focus the input on the next render.
         self.focus_filter = true;
         cx.notify();
     }
@@ -131,7 +131,7 @@ impl AppState {
         let ui_family = theme.font_family.clone();
         let has_filter = self.active_result_filter().is_some();
 
-        // A segmented mode toggle — the active mode reads as "filled".
+        // A segmented mode toggle; the active mode reads as "filled".
         let seg = |id: &'static str, label: &'static str, mode: FilterMode| {
             let active = bar.mode == mode;
             Button::new(id, label)

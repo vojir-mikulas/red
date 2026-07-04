@@ -1,5 +1,5 @@
 //! The result grid: a virtualized, horizontally-scrolling table backed by a
-//! random-access window buffer. The grid never holds the whole result — its
+//! random-access window buffer. The grid never holds the whole result; its
 //! load-on-scroll callback fetches the pages around the viewport and evicts the
 //! rest, so memory stays flat over a multi-million-row result. Cell ranges select
 //! and copy as TSV; clicking a column header sorts (re-running with `ORDER BY`).
@@ -39,14 +39,14 @@ use crate::app::{
 
 use buffer::{next_epoch, window_decision, BufferMode, GridBuffer, KeyedRun, WindowView, WINDOW};
 
-/// The resolved identity of an editable cell — `(row, data_col, pk_value, decl_type,
-/// foreign)` — returned by [`ResultGrid::edit_identity`]. `foreign` is `Some` for an
+/// The resolved identity of an editable cell, `(row, data_col, pk_value, decl_type,
+/// foreign)`, returned by [`ResultGrid::edit_identity`]. `foreign` is `Some` for an
 /// inline-expanded FK column that writes back to its referenced table (Track B7).
 type EditIdentity = (usize, usize, Value, Option<String>, Option<ForeignEdit>);
 pub(crate) use render::group_digits;
 
 /// Mint a fresh, process-unique epoch for a non-grid consumer (the plan view,
-/// Track B4) so its echoed replies are dropped once superseded — shares the
+/// Track B4) so its echoed replies are dropped once superseded; it shares the
 /// grid's monotonic source so the two never collide.
 pub(crate) fn new_epoch() -> u64 {
     next_epoch()
@@ -60,7 +60,7 @@ pub(in crate::result) const DATA_COL_WIDTH: f32 = 180.0;
 pub(in crate::result) const GUTTER_WIDTH: f32 = 56.0;
 
 /// One inline-expanded reference column (Track B7): a dotted path from the base
-/// table down through single-column FKs to a leaf column — e.g.
+/// table down through single-column FKs to a leaf column, e.g.
 /// `["tier_id", "cascade_id", "name"]`, shown and aliased as
 /// `tier_id.cascade_id.name`. The leading segments are FK columns (each resolved
 /// against the connection's FK graph); the last is the selected leaf column.
@@ -111,7 +111,7 @@ type ReopenSpec = (
 /// backend folds into the query. Each distinct FK *prefix* of a path becomes one
 /// `LEFT JOIN` (deduped, so several leaves under one reference share a join), keyed
 /// off the FK graph: the edge for `(current table, fk column)` gives the target
-/// table and the `ON` column pairs, and the target becomes the next hop's table —
+/// table and the `ON` column pairs, and the target becomes the next hop's table,
 /// so a chain like `tier → cascade → placement` resolves hop by hop. A path whose
 /// FK can't be resolved (graph not loaded, not a single-column FK) is skipped. Join
 /// aliases are simple, unique identifiers (`_red_j0`, …); the meaningful dotted name
@@ -196,14 +196,14 @@ pub(crate) struct ResultGrid {
     pub(in crate::result) total: usize,
     pub(in crate::result) ready: bool,
     pub(in crate::result) error: Option<String>,
-    /// `(data column, ascending)` — `None` is unsorted.
+    /// `(data column, ascending)`; `None` is unsorted.
     pub(in crate::result) sort: Option<(usize, bool)>,
     /// The active result filter (Track B2), pushed into the query on (re)open.
     /// `None` is unfiltered. Survives a re-sort (both ride the same `OpenResult`).
     pub(in crate::result) filter: Option<ResultFilter>,
     pub(in crate::result) selection: Option<CellRange>,
     /// The `(schema, table)` this result browses, when it's a plain table
-    /// preview — sent with `OpenResult` so the backend can resolve a seek key.
+    /// preview, sent with `OpenResult` so the backend can resolve a seek key.
     /// `None` for editor SQL and for sorted re-opens (which wrap the SQL).
     table: Option<(String, String)>,
     /// Data-column indices that are single-column forward foreign keys of `table`
@@ -221,21 +221,21 @@ pub(crate) struct ResultGrid {
     /// ([`rebuild_joins`](Self::rebuild_joins)). Cached here so the re-open paths
     /// (sort / filter / edit refresh) carry it without re-resolving.
     joins: Vec<FkJoin>,
-    /// Result-column indices that are inline-expanded (joined) reference columns —
+    /// Result-column indices that are inline-expanded (joined) reference columns,
     /// recomputed from [`expansion`](Self::expansion) when the column set lands.
     /// Drives the joined-column tint; editing a single-hop one writes back to the
     /// referenced table (see [`foreign_edit_for`](Self::foreign_edit_for)).
     joined_cols: HashSet<usize>,
     /// Which FK nodes are expanded open in the Columns panel's tree (Track B7),
     /// keyed by their dotted FK path (`["tier_id","cascade_id"]`). Purely panel UI
-    /// state — distinct from [`expansion`](Self::expansion) (the *checked* columns);
+    /// state, distinct from [`expansion`](Self::expansion) (the *checked* columns);
     /// expanding a node only reveals its children, it doesn't add a column.
     pub(in crate::result) tree_expanded: HashSet<Vec<String>>,
     /// The seek key the backend resolved (`ResultReady`). Track B5 reads its PK to
     /// key a guarded edit; `None` (editor SQL / no usable PK) means not editable.
     key: Option<KeySpec>,
     pub(in crate::result) buffer: Rc<RefCell<GridBuffer>>,
-    /// Staged, not-yet-submitted edits for this result (Track B6) — keyed by PK so
+    /// Staged, not-yet-submitted edits for this result (Track B6), keyed by PK so
     /// they survive the windowed buffer's eviction. Cleared on every (re)open.
     pub(in crate::result) pending: edit::PendingChanges,
     pub(in crate::result) sender: CommandSender,
@@ -249,13 +249,13 @@ pub(crate) struct ResultGrid {
     /// here. See `WINDOW` and `prepare_window`.
     pub(in crate::result) window_base: Rc<Cell<usize>>,
     /// Rows per fetched page (the `grid.page_size` in effect when this result was
-    /// opened) — used to (re)build the buffer in either paging mode. A live result
+    /// opened), used to (re)build the buffer in either paging mode. A live result
     /// keeps the page it was opened with; a settings change applies to the next open.
     page_size: usize,
     /// Identifies the current open SQL; bumped on every (re)open so stale page
     /// fetches and late `ResultReady`/`ResultPageLoaded` replies are ignored.
     pub(crate) epoch: u64,
-    /// When the current query was issued — drives the live "running…" timer.
+    /// When the current query was issued; drives the live "running…" timer.
     query_started: Instant,
     /// Frozen wall-clock time the query took, set once it lands (ready or error).
     /// `None` while still running, so the elapsed time keeps counting up.
@@ -340,32 +340,32 @@ impl ResultGrid {
         self.query_elapsed = None;
     }
 
-    /// Freeze the elapsed time — the query has landed (ready or error).
+    /// Freeze the elapsed time: the query has landed (ready or error).
     fn stop_timer(&mut self) {
         if self.query_elapsed.is_none() {
             self.query_elapsed = Some(self.query_started.elapsed());
         }
     }
 
-    /// Whether the open query has landed (ready or errored) vs. still running —
+    /// Whether the open query has landed (ready or errored) vs. still running;
     /// drives the shell's live query-timer ticker.
     pub(crate) fn is_ready(&self) -> bool {
         self.ready
     }
 
-    /// Drop any cell selection — used when the gutter offset changes under it (the
+    /// Drop any cell selection; used when the gutter offset changes under it (the
     /// selection is stored in table-column coordinates, see `AppState::set_row_numbers`).
     pub(crate) fn clear_selection(&mut self) {
         self.selection = None;
     }
 
-    /// The error this result failed with, if any — surfaced so the assistant's
+    /// The error this result failed with, if any, surfaced so the assistant's
     /// "Explain error" action can ground a turn in the last query failure.
     pub(crate) fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
 
-    /// The `(absolute row, data column)` of the cell under the keyboard cursor —
+    /// The `(absolute row, data column)` of the cell under the keyboard cursor:
     /// the selection's focus, mapped through the gutter and clamped to the data
     /// columns. `None` when nothing is selected or the result has no columns. The
     /// detail inspector resolves the focused cell through this.
@@ -375,13 +375,13 @@ impl ResultGrid {
         (ncols > 0).then(|| (focus.0, focus.1.saturating_sub(gutter).min(ncols - 1)))
     }
 
-    /// The `(schema, table)` this result browses — `Some` only for a single-table
+    /// The `(schema, table)` this result browses; `Some` only for a single-table
     /// preview (the FK click-through / relation-tree entry conditions, Track B7).
     pub(crate) fn base_table(&self) -> Option<&(String, String)> {
         self.table.as_ref()
     }
 
-    /// The result's column metadata — read by the relation tree to build records.
+    /// The result's column metadata, read by the relation tree to build records.
     pub(crate) fn columns(&self) -> &[ResultColumn] {
         &self.columns
     }
@@ -425,7 +425,7 @@ impl ResultGrid {
     }
 
     /// If result column `i` is an inline-expanded reference column, its expansion
-    /// path — for a "hide this column" toggle from the cell menu.
+    /// path, for a "hide this column" toggle from the cell menu.
     pub(in crate::result) fn expansion_path_at(&self, i: usize) -> Option<Vec<String>> {
         if !self.joined_cols.contains(&i) {
             return None;
@@ -502,7 +502,7 @@ impl ResultGrid {
     }
 
     /// Reset the grid's live view for an expansion-driven re-open and return the
-    /// [`ReopenSpec`] the app sends — mirroring the re-sort / filter re-open
+    /// [`ReopenSpec`] the app sends, mirroring the re-sort / filter re-open
     /// (selection cleared, buffer + timer reset, a fresh epoch so in-flight pages for
     /// the old SQL are dropped), preserving the current header-click sort + filter.
     pub(in crate::result) fn reopen_spec(&mut self) -> ReopenSpec {
@@ -530,7 +530,7 @@ impl ResultGrid {
         )
     }
 
-    /// A data column's `(name, declared type)` — for the inspector header.
+    /// A data column's `(name, declared type)`, for the inspector header.
     pub(crate) fn column_meta(&self, col: usize) -> Option<(String, Option<String>)> {
         self.columns
             .get(col)
@@ -549,13 +549,13 @@ impl ResultGrid {
     }
 
     /// Whether this result is an editable single-table keyed browse (a base table
-    /// plus a resolved PK) — the precondition for any staged edit / insert / delete.
+    /// plus a resolved PK): the precondition for any staged edit / insert / delete.
     pub(crate) fn editable_browse(&self) -> bool {
         self.table.is_some() && self.key.is_some()
     }
 
-    /// The data-column index of the identity (PK) column — the sorted browse's
-    /// tiebreaker, else the lead key — when this is an editable browse and the PK
+    /// The data-column index of the identity (PK) column (the sorted browse's
+    /// tiebreaker, else the lead key), when this is an editable browse and the PK
     /// column is present in the result.
     pub(in crate::result) fn pk_column_index(&self) -> Option<usize> {
         let key = self.key.as_ref()?;
@@ -563,7 +563,7 @@ impl ResultGrid {
         self.columns.iter().position(|c| c.name == pk_column)
     }
 
-    /// Assemble the guarded-edit target (Track B5) for the cell under the cursor —
+    /// Assemble the guarded-edit target (Track B5) for the cell under the cursor:
     /// the base table, its PK column + value (the row's identity), and the focused
     /// column's name / declared type / current value. `None` when the result isn't
     /// an editable single-table keyed browse, the cursor is on the PK column itself
@@ -594,7 +594,7 @@ impl ResultGrid {
     /// Like [`edit_target`], but for a value fetched in full out-of-band (the
     /// inspector's "Load full value"): the *resident* cell may be display-capped, so
     /// the caller supplies `original` rather than reading the clipped buffer. This
-    /// is what makes a large `TEXT`/JSON cell editable. Binary is still refused —
+    /// is what makes a large `TEXT`/JSON cell editable. Binary is still refused;
     /// there is no text round-trip for a blob.
     pub(crate) fn edit_target_full(&self, gutter: usize, original: Value) -> Option<EditContext> {
         if matches!(original, Value::Blob(_)) {
@@ -613,7 +613,7 @@ impl ResultGrid {
     }
 
     /// The row identity + target column for an inline edit, independent of the
-    /// cell's current value — shared by [`edit_target`] (resident value) and
+    /// cell's current value; shared by [`edit_target`] (resident value) and
     /// [`edit_target_full`] (a supplied loaded value). `foreign` is `Some` when the
     /// cell is a single-hop inline-expanded FK column (the edit rewrites the
     /// referenced table). `None` unless this is an editable single-table keyed browse
@@ -631,7 +631,7 @@ impl ResultGrid {
             return None;
         }
         // An inline-expanded reference column (Track B7) writes back to the *joined*
-        // table, not this browse's base table — resolve its foreign target. A
+        // table, not this browse's base table; resolve its foreign target. A
         // multi-hop / composite / orphaned-FK expansion can't be resolved and stays
         // read-only (`foreign_edit_for` returns `None`).
         let foreign = if self.joined_cols.contains(&col) {
@@ -695,18 +695,18 @@ impl ResultGrid {
     }
 
     /// Patch the resident cell at `(row, data_col)` to `value` in place, after a
-    /// committed edit (Track B5) — avoids a refetch round-trip for the common case.
+    /// committed edit (Track B5); avoids a refetch round-trip for the common case.
     pub(crate) fn patch_cell(&mut self, row: usize, data_col: usize, value: Value) {
         self.buffer.borrow_mut().patch_cell(row, data_col, value);
     }
 
-    /// Total rows in the open result (0 until `ResultReady`) — for the
+    /// Total rows in the open result (0 until `ResultReady`), for the
     /// go-to-row prompt's range hint and bound.
     pub(crate) fn total_rows(&self) -> usize {
         self.total
     }
 
-    /// The import target this browse represents — `(table, its columns)` — or `None`
+    /// The import target this browse represents, `(table, its columns)`, or `None`
     /// when the result isn't a single-table browse (editor SQL / a join). Drives the
     /// toolbar "Import…" affordance and the name-based column mapping.
     pub(in crate::result) fn import_target(&self) -> Option<(TableRef, Vec<ResultColumn>)> {
@@ -720,7 +720,7 @@ impl ResultGrid {
         ))
     }
 
-    /// `(rows, columns)` once the result is ready — for the shell's status bar.
+    /// `(rows, columns)` once the result is ready, for the shell's status bar.
     pub fn status_counts(&self) -> Option<(usize, usize)> {
         self.ready
             .then_some((self.total, self.columns.len()))
@@ -732,7 +732,7 @@ impl ResultGrid {
     /// column, offset otherwise.
     fn on_ready(&mut self, columns: Vec<ResultColumn>, total: usize, key: Option<KeySpec>) {
         // Keyed only when every key column (lead, then tiebreaker) is present in
-        // the result — a `SELECT *` table browse always satisfies this.
+        // the result; a `SELECT *` table browse always satisfies this.
         let key_cols = key.as_ref().and_then(|k| {
             let cols: Vec<usize> = k
                 .column_names()
@@ -791,7 +791,7 @@ impl ResultGrid {
             window_decision(total, self.window_base.get(), local_first, viewport_rows);
         if let Some(new_local_first) = reanchor {
             // The window slid; shift the list's pixel offset by the same amount
-            // so the rows on screen don't move — the user only ever sees one
+            // so the rows on screen don't move; the user only ever sees one
             // continuous scroll.
             let st = self.scroll.0.borrow();
             st.base_handle
@@ -800,7 +800,7 @@ impl ResultGrid {
         self.window_base.set(base);
 
         // Scrollbar position is absolute (fraction of the whole result), not of
-        // the window — so the thumb reflects where we are in all 50M rows.
+        // the window, so the thumb reflects where we are in all 50M rows.
         let denom = total.saturating_sub(viewport_rows).max(1) as f32;
         let fraction = (abs_first as f32 / denom).clamp(0.0, 1.0);
         let thumb = if total > 0 {
@@ -821,7 +821,7 @@ impl ResultGrid {
         *self.buffer.borrow_mut() = GridBuffer::new(self.page_size);
         self.window_base.set(0);
         self.pending = edit::PendingChanges::default();
-        // A re-open computes a new epoch's SQL — the prior summary no longer applies.
+        // A re-open computes a new epoch's SQL; the prior summary no longer applies.
         self.stats = None;
         self.stats_cache.clear();
     }
@@ -871,7 +871,7 @@ impl ResultGrid {
         Some((self.epoch, column, numeric, distinct))
     }
 
-    /// Re-request the visible column's summary with `count(distinct)` forced on —
+    /// Re-request the visible column's summary with `count(distinct)` forced on:
     /// the bar's "[compute]" affordance when the guard withheld it. Returns the
     /// `(epoch, column, numeric)` to send, or `None` when no column is shown.
     fn force_distinct_request(&mut self) -> Option<(u64, String, bool)> {
@@ -913,7 +913,7 @@ impl ResultGrid {
         }
     }
 
-    /// Jump the grid to `ordinal` (0-based) — the explicit "go to row N". Places
+    /// Jump the grid to `ordinal` (0-based): the explicit "go to row N". Places
     /// the virtual-scroll window so the row sits at the viewport top, then, for a
     /// keyed result, forces an **exact** relocation (keyset auto-jumps would only
     /// interpolate). An offset result needs no special fetch: positioning alone
@@ -934,12 +934,12 @@ impl ResultGrid {
 
     /// Find-in-result (Track B2, Tier 1): resident cells whose display text
     /// contains `term_lower` (already lower-cased), as `(ordinal, data column)`.
-    /// Scans only loaded rows — see [`buffer::GridBuffer::find_matches`].
+    /// Scans only loaded rows; see [`buffer::GridBuffer::find_matches`].
     pub(crate) fn find_matches(&self, term_lower: &str) -> Vec<(usize, usize)> {
         self.buffer.borrow().find_matches(term_lower)
     }
 
-    /// Select `(ordinal, table_col)` and scroll it into view — the find bar's
+    /// Select `(ordinal, table_col)` and scroll it into view: the find bar's
     /// "reveal this match", so the grid's selection highlight marks the current
     /// match. `table_col` is in table-column space (gutter included).
     pub(crate) fn reveal_cell(&mut self, ordinal: usize, table_col: usize, row_height: f32) {
@@ -947,7 +947,7 @@ impl ResultGrid {
         self.go_to_row(ordinal, row_height);
     }
 
-    /// How many whole rows the on-screen viewport shows — the PageUp/PageDown
+    /// How many whole rows the on-screen viewport shows, i.e. the PageUp/PageDown
     /// step. Reads the list's last measured viewport height (0 before first paint).
     pub(in crate::result) fn viewport_rows(&self, row_height: f32) -> usize {
         let rh = row_height.max(1.0);
@@ -960,7 +960,7 @@ impl ResultGrid {
     }
 
     /// The absolute ordinal of the first row currently visible at the viewport
-    /// top — where a fresh keyboard cursor starts when nothing is selected yet.
+    /// top, where a fresh keyboard cursor starts when nothing is selected yet.
     pub(in crate::result) fn first_visible_row(&self, row_height: f32) -> usize {
         let rh = row_height.max(1.0);
         let st = self.scroll.0.borrow();
@@ -973,7 +973,7 @@ impl ResultGrid {
     /// `abs_row`. Two regimes: if the row left the resident buffer window, reuse
     /// the proven `go_to_row` jump (recenter + keyed exact relocation); if it's
     /// still in the window but scrolled out of the viewport, nudge the list's
-    /// pixel offset by the minimum so the row sits at the near edge — no full
+    /// pixel offset by the minimum so the row sits at the near edge. No full
     /// recenter, so a one-row step never restyles the whole window.
     pub(in crate::result) fn scroll_cursor_into_view(&self, abs_row: usize, row_height: f32) {
         if self.total == 0 {
@@ -983,7 +983,7 @@ impl ResultGrid {
         let len = self.total.min(WINDOW);
         let base = self.window_base.get();
         if abs_row < base || abs_row >= base + len {
-            // Off the resident window — recenter (and, when keyed, fetch exactly).
+            // Off the resident window: recenter (and, when keyed, fetch exactly).
             self.go_to_row(abs_row, rh);
             return;
         }
@@ -1001,13 +1001,13 @@ impl ResultGrid {
         } else if local >= local_first + viewport_rows {
             local + 1 - viewport_rows
         } else {
-            return; // already visible — leave the scroll untouched
+            return; // already visible; leave the scroll untouched
         };
         st.base_handle
             .set_offset(point(off.x, px(-(new_first as f32 * rh))));
     }
 
-    /// Keep the keyboard cursor's *column* on screen after a horizontal move —
+    /// Keep the keyboard cursor's *column* on screen after a horizontal move:
     /// the wide-mode counterpart to [`scroll_cursor_into_view`]. Columns are
     /// fixed-width (a [`GUTTER_WIDTH`] row-number column when shown, then
     /// [`DATA_COL_WIDTH`] per data column), so the focused cell's x-extent is
@@ -1033,7 +1033,7 @@ impl ResultGrid {
         } else if col_right > scroll_left + viewport_w {
             col_right - viewport_w
         } else {
-            return; // already fully visible — leave the scroll untouched
+            return; // already fully visible; leave the scroll untouched
         };
         let content_w = gutter_w + self.columns.len() as f32 * DATA_COL_WIDTH;
         let max_left = (content_w - viewport_w).max(0.0);
@@ -1150,7 +1150,7 @@ struct FkPlan {
 
 /// How [`ResultGrid::copy_plan`] resolves a selection copy.
 pub(crate) enum CopyPlan {
-    /// Ready to copy now — the assembled TSV.
+    /// Ready to copy now: the assembled TSV.
     Ready(String),
     /// The selection holds display-clipped cells; re-fetch the rows in full
     /// (`CopyRows`) and assemble the clipboard text from the reply. `dcol_lo..=dcol_hi`
@@ -1165,7 +1165,7 @@ pub(crate) enum CopyPlan {
 }
 
 /// Assemble TSV from freshly re-fetched rows over data columns `dcol_lo..=dcol_hi`
-/// (NULL → empty) — the [`CopyPlan::Refetch`] counterpart to the buffer path.
+/// (NULL → empty); the [`CopyPlan::Refetch`] counterpart to the buffer path.
 pub(crate) fn rows_tsv(rows: &[Vec<Value>], dcol_lo: usize, dcol_hi: usize) -> String {
     let mut out = String::new();
     for row in rows {
@@ -1236,7 +1236,7 @@ impl AppState {
         self.open_result_filtered(label, base_sql, table, None, cx);
     }
 
-    /// Like [`open_result`](Self::open_result) but seeds an initial result filter —
+    /// Like [`open_result`](Self::open_result) but seeds an initial result filter:
     /// the FK click-through (Track B7) opens the target browse pre-filtered to the
     /// followed key. The filter rides the grid (so a re-sort preserves it) and the
     /// first `OpenResult`, exactly like an applied Track B2 filter.
@@ -1277,10 +1277,10 @@ impl AppState {
         };
         let (sql, epoch, table, filter) = opened;
         // Ensure the base table's column detail is loaded so the reference-column tree
-        // (Track B7) can render — a schema-tree browse prefetches this, but a hand-typed
+        // (Track B7) can render; a schema-tree browse prefetches this, but a hand-typed
         // `SELECT * FROM t` resolved to a base table may not have it yet. Idempotent: it
         // only fires when the detail is missing (the accent path needs only the FK graph,
-        // not this — but the columns panel reads the base table's columns from here).
+        // not this, but the columns panel reads the base table's columns from here).
         if let Some((schema, tbl)) = &table {
             let missing = matches!(&self.phase, Phase::Connected(active)
                 if !active.schema.details.contains_key(&(schema.clone(), tbl.clone())));
@@ -1291,7 +1291,7 @@ impl AppState {
                 });
             }
         }
-        // A fresh open is never sorted — the backend keys it from `table`; the filter
+        // A fresh open is never sorted (the backend keys it from `table`); the filter
         // (FK follow) is pushed into the query like a Track B2 filter.
         self.send_active(Command::OpenResult {
             sql,
@@ -1330,7 +1330,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// A keyset run fetch failed — free the grid's in-flight slot so scrolling
+    /// A keyset run fetch failed; free the grid's in-flight slot so scrolling
     /// can fetch again (the error itself arrives separately as a toast).
     pub(crate) fn on_result_run_failed(
         &mut self,
@@ -1345,7 +1345,7 @@ impl AppState {
         }
     }
 
-    /// A keyset run window arrived — extend/relocate the grid's run and repaint.
+    /// A keyset run window arrived: extend/relocate the grid's run and repaint.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_result_run(
         &mut self,
@@ -1368,7 +1368,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// A page arrived — drop it into the buffer and repaint.
+    /// A page arrived: drop it into the buffer and repaint.
     pub(crate) fn on_result_page(
         &mut self,
         session: Option<SessionId>,
@@ -1575,7 +1575,7 @@ impl AppState {
     /// focused column is a single-column forward FK and its target table has been
     /// described, list the target's columns with their current shown state. `None`
     /// for a non-FK cell, an undescribed target, editor SQL, or before the graph
-    /// loads — the cell menu then omits the section.
+    /// loads; the cell menu then omits the section.
     pub(in crate::result) fn reference_menu(&self) -> Option<ReferenceMenu> {
         let Phase::Connected(active) = &self.phase else {
             return None;
@@ -1613,7 +1613,7 @@ impl AppState {
     }
 
     /// The expansion path of the focused cell when it sits in an inline-expanded
-    /// reference column — for the cell menu's "hide this column" action.
+    /// reference column, for the cell menu's "hide this column" action.
     pub(in crate::result) fn focused_joined_path(&self) -> Option<Vec<String>> {
         let Phase::Connected(active) = &self.phase else {
             return None;
@@ -1703,7 +1703,7 @@ impl AppState {
                 };
             }
         }
-        // A new cell selection — refresh the stats bar to its column.
+        // A new cell selection; refresh the stats bar to its column.
         self.refresh_column_stats(cx);
         cx.notify();
     }
@@ -1762,14 +1762,14 @@ impl AppState {
                 grid.scroll_col_into_view(new_col, gutter);
             }
         }
-        // The keyboard cursor moved — update the stats bar to the focused column.
+        // The keyboard cursor moved; update the stats bar to the focused column.
         self.refresh_column_stats(cx);
         cx.notify();
     }
 
     /// ⌘/Ctrl-click on a header: select that whole data column (every row). With
     /// `extend` (⌘/Ctrl+Shift-click), grow the existing selection to span every
-    /// column between its anchor and this one — full-height, so it reads as a
+    /// column between its anchor and this one; full-height, so it reads as a
     /// multi-column block. The selection spans the full result, so copying it
     /// re-fetches the off-window rows in full (see [`ResultGrid::copy_plan`]). The
     /// gutter isn't selectable.
@@ -1801,12 +1801,12 @@ impl AppState {
                 };
             }
         }
-        // Header ⌘/Ctrl-click selected this whole column — its natural stats target.
+        // Header ⌘/Ctrl-click selected this whole column, its natural stats target.
         self.refresh_column_stats(cx);
         cx.notify();
     }
 
-    /// ⌘A: select the whole result — every row and every data column. Like
+    /// ⌘A: select the whole result (every row and every data column). Like
     /// [`Self::result_select_column`] the selection spans the full result, so
     /// copying it re-fetches the off-window rows in full (see
     /// [`ResultGrid::copy_plan`]). Anchored top-left, focused bottom-right, both in
@@ -1895,7 +1895,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// A `ColumnStatsReady` reply landed — cache it and update the bar.
+    /// A `ColumnStatsReady` reply landed: cache it and update the bar.
     pub(crate) fn on_column_stats(
         &mut self,
         session: Option<SessionId>,
@@ -1912,7 +1912,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// A `ColumnStatsFailed` reply landed — mark the bar "unavailable" (scoped, no
+    /// A `ColumnStatsFailed` reply landed: mark the bar "unavailable" (scoped, no
     /// global toast).
     pub(crate) fn on_column_stats_failed(
         &mut self,
@@ -1958,7 +1958,7 @@ impl AppState {
 
     /// Begin an export once the save path is chosen: allocate its id, fire the
     /// command off to the backend, and stand up the persistent progress toast
-    /// (its `✕` is a Cancel — see [`AppState::close_notification`]). The total is
+    /// (its `✕` is a Cancel; see [`AppState::close_notification`]). The total is
     /// the open result's row count, already known from `ResultReady`.
     fn start_export(
         &mut self,
@@ -2122,7 +2122,7 @@ impl AppState {
 
     /// "Import…" on a single-table browse: pick a CSV/JSONL file, then peek its
     /// header (backend) so a name-based mapping can be built and **confirmed before
-    /// any write**. No-op (with a hint) on editor SQL / joins — no single target.
+    /// any write**. No-op (with a hint) on editor SQL / joins: no single target.
     pub(crate) fn import_into_result(&mut self, cx: &mut Context<Self>) {
         let target = match &self.phase {
             Phase::Connected(a) => a.active_result().and_then(|g| g.import_target()),
@@ -2184,7 +2184,7 @@ impl AppState {
         self.send_active(Command::ImportColumns { path, format, id });
     }
 
-    /// `ImportColumns`: the file's source columns arrived — build a name-based
+    /// `ImportColumns`: the file's source columns arrived, so build a name-based
     /// mapping against the pending target, summarize it, and raise the import confirm
     /// so the user sees the file→table mapping before any write.
     pub(crate) fn on_import_columns(
@@ -2320,7 +2320,7 @@ impl AppState {
         );
     }
 
-    /// "Go to row N" from the palette prompt — `one_based` is the row number the
+    /// "Go to row N" from the palette prompt; `one_based` is the row number the
     /// user typed (1-based). Scrolls the active result's grid to that exact row,
     /// clamped to the result's bounds. No-op when no result is open.
     pub(crate) fn go_to_row(&mut self, one_based: usize, cx: &mut Context<Self>) {
@@ -2340,7 +2340,7 @@ impl AppState {
             _ => None,
         };
         match plan {
-            // Everything selected is resident in full — copy straight away.
+            // Everything selected is resident in full, so copy straight away.
             Some(CopyPlan::Ready(tsv)) => {
                 cx.write_to_clipboard(ClipboardItem::new_string(tsv));
             }
@@ -2483,7 +2483,7 @@ impl AppState {
 
     /// "Show referencing rows": open `child` filtered to `child.from_column =
     /// <this row's to_column value>`. The source value is read from the focused
-    /// row's `to_column` (the referenced column — usually a PK), fetched in full.
+    /// row's `to_column` (the referenced column, usually a PK), fetched in full.
     pub(crate) fn follow_fk_reverse(
         &mut self,
         child_schema: String,
@@ -2546,7 +2546,7 @@ impl AppState {
                 Some(Value::Null) | None => {
                     self.notify(
                         ToastVariant::Info,
-                        "Referenced value is NULL — nothing to follow",
+                        "Referenced value is NULL; nothing to follow",
                         cx,
                     );
                     return true;
@@ -2718,13 +2718,13 @@ mod foreign_edit_tests {
 
     #[test]
     fn refuses_nested_base_and_null_fk() {
-        // A nested hop (parent is another join, not the base) stays read-only — the
+        // A nested hop (parent is another join, not the base) stays read-only; the
         // referenced row's key value wouldn't be resident in the base row.
         let mut nested = expanded_grid();
         nested.joins[0].parent_alias = "_red_j9".into();
         assert!(nested.foreign_edit_for(2, 0).is_none());
 
-        // A base column isn't a join output — no foreign target.
+        // A base column isn't a join output, so no foreign target.
         let base = expanded_grid();
         assert!(base.foreign_edit_for(0, 0).is_none());
 

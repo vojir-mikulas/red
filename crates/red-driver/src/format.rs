@@ -3,7 +3,7 @@
 //! knowledge, lifted here so every driver writes byte-identical CSV/JSON and a
 //! new driver doesn't fork yet another copy.
 //!
-//! Blobs export as a `<N bytes>` length marker, not their bytes (hex/base64) — a
+//! Blobs export as a `<N bytes>` length marker, not their bytes (hex/base64); a
 //! deliberate v0.1 choice: the streaming export path never materializes cell bytes,
 //! and a text CSV/JSON of raw binary is rarely what a user wants. Binary-faithful
 //! export is a later format option.
@@ -45,7 +45,7 @@ impl ProgressThrottle {
     }
 
     /// Maybe emit `written` (the running row count). A failed send (UI gone) is
-    /// ignored — progress is best-effort.
+    /// ignored; progress is best-effort.
     pub(crate) fn tick(&mut self, written: u64) {
         if written.saturating_sub(self.last_sent) >= PROGRESS_ROWS
             || self.last_at.elapsed() >= PROGRESS_INTERVAL
@@ -144,7 +144,7 @@ impl<W: Write> ExportWriter<W> {
         Ok(self.written)
     }
 
-    /// Rows written so far — feeds the progress throttle.
+    /// Rows written so far; feeds the progress throttle.
     pub(crate) fn written(&self) -> u64 {
         self.written
     }
@@ -266,7 +266,7 @@ pub(crate) fn csv_cell(value: &Value) -> String {
         Value::Real(x) => x.to_string(),
         Value::Text(s) => s.clone(),
         Value::Blob(b) => format!("<{} bytes>", b.len()),
-        // Export never caps, so a `Capped` can't reach here — rendered for totality.
+        // Export never caps, so a `Capped` can't reach here; rendered for totality.
         Value::Capped(_) => value.to_string(),
     }
 }
@@ -305,7 +305,7 @@ mod tests {
     use super::*;
 
     /// The HTML report is a self-contained document: a head, a typed table header,
-    /// one escaped `<tr>` per row, a NULL marker, and a row-count footer — and a
+    /// one escaped `<tr>` per row, a NULL marker, and a row-count footer; and a
     /// cell that smuggles markup is escaped, not interpreted.
     #[test]
     fn html_report_is_well_formed_and_escaped() {

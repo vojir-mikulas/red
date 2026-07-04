@@ -6,7 +6,7 @@ Red helps you inspect schemas, browse large tables, run SQL queries, and export 
 
 > **Roughly Enough Data.** Show enough to make decisions quickly.
 
-Built with GPUI and rendered natively on the GPU — no Electron, no browser runtime, no web stack.
+Built with GPUI and rendered natively on the GPU. No Electron, no browser runtime, no web stack.
 
 > **Status: MVP.** Core workflows are functional, but APIs and UI are still evolving. Expect rough edges and breaking changes before the first stable release.
 
@@ -29,7 +29,7 @@ Built with GPUI and rendered natively on the GPU — no Electron, no browser run
 * Saved queries
 * Data export
 * Multiple connections with a quick connection switcher
-* AI assistant sidebar — grounded chat over your schema, via the Claude API or a Claude subscription
+* AI assistant sidebar with grounded chat over your schema, via the Claude API or a Claude subscription
 * SSH tunneling through a jump host
 * Themes (Ayu Dark / Light, High Contrast) and a fully customizable keymap
 * Production-safe inspection workflows
@@ -38,13 +38,13 @@ Built with GPUI and rendered natively on the GPU — no Electron, no browser run
 
 Prebuilt, signed binaries are on the [latest release](https://github.com/vojir-mikulas/red/releases/latest):
 
-* **macOS** — download the `.dmg` (signed & notarized).
-* **Linux** — download the `.AppImage`, `chmod +x` it, and run.
-* **Windows** — download the `.exe`, or the `.zip` if you prefer to unpack it.
+* **macOS**: download the `.dmg` (signed and notarized).
+* **Linux**: download the `.AppImage`, `chmod +x` it, and run.
+* **Windows**: download the `.exe`, or the `.zip` if you prefer to unpack it.
 
-Or build from source — see [Development](#development).
+Or build from source; see [Development](#development).
 
-On first launch Red seeds a small, read-only **Sample database** so you can explore the schema browser, run queries, and try the result grid immediately — no database setup required.
+On first launch Red seeds a small, read-only **Sample database** so you can explore the schema browser, run queries, and try the result grid immediately, with no database setup required.
 
 ## Privacy
 
@@ -56,11 +56,11 @@ A GPUI main thread renders the interface while a Tokio backend service owns data
 
 Workspace crates:
 
-* `red` — desktop application
-* `red-core` — shared domain types
-* `red-driver` — database driver abstractions and implementations
-* `red-service` — backend runtime and query lifecycle
-* `red-ai` / `red-acp` — AI assistant providers (direct API and agent-client-protocol)
+* `red`: desktop application
+* `red-core`: shared domain types
+* `red-driver`: database driver abstractions and implementations
+* `red-service`: backend runtime and query lifecycle
+* `red-ai` / `red-acp`: AI assistant providers (direct API and agent-client-protocol)
 
 UI components and theming come from Flint, a shared component library built on GPUI.
 

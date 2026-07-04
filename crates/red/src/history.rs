@@ -1,18 +1,18 @@
-//! Query history — a persistent, connection-scoped log of executed statements.
+//! Query history: a persistent, connection-scoped log of executed statements.
 //!
 //! Every statement the user runs from the editor is recorded here so it survives
 //! a restart, unlike the old in-memory `Vec<String>` that died with the session.
 //! The log is centralized on [`AppState`] (one store across all connections) but
 //! each entry carries its `conn_id`, so the History panel shows only the active
-//! connection's history while the file keeps everything — the groundwork for a
+//! connection's history while the file keeps everything, the groundwork for a
 //! future cross-connection history sidebar (see `docs/plans/query-history.md`).
 //!
 //! Storage is one JSON file, `<config>/red/history.json`, rewritten atomically
-//! (temp + rename) on every change — the same crash-safe discipline as
+//! (temp + rename) on every change: the same crash-safe discipline as
 //! `conversations.rs`/`queries.rs`. The log is capped per connection (and a
 //! global backstop), so the file stays small enough that a full rewrite per run
 //! is cheap. Like those modules, a missing or corrupt file is simply an empty
-//! log — one bad file never blocks startup. Written owner-only (`0o600`) on Unix:
+//! log; one bad file never blocks startup. Written owner-only (`0o600`) on Unix:
 //! a statement can embed literal credentials or PII.
 
 use std::collections::HashMap;
@@ -47,7 +47,7 @@ pub(crate) struct HistoryEntry {
     pub ran_unix: u64,
 }
 
-/// The on-disk shape — a wrapper object (not a bare array) so the format can grow
+/// The on-disk shape: a wrapper object (not a bare array) so the format can grow
 /// later fields without breaking older files.
 #[derive(Default, Serialize, Deserialize)]
 struct HistoryFile {
@@ -82,7 +82,7 @@ impl QueryHistory {
                     Vec::new()
                 }
             },
-            // Missing file or unreadable dir — an empty log, not an error.
+            // Missing file or unreadable dir means an empty log, not an error.
             _ => Vec::new(),
         };
         // `id` is monotonic, so descending `id` is reverse-chronological.
@@ -141,7 +141,7 @@ impl QueryHistory {
         }
     }
 
-    /// One connection's entries, newest-first — what the panel renders.
+    /// One connection's entries, newest-first; what the panel renders.
     pub(crate) fn for_conn(&self, conn_id: &str) -> Vec<HistoryEntry> {
         self.entries
             .iter()
@@ -167,7 +167,7 @@ impl QueryHistory {
         self.entries.truncate(MAX_TOTAL);
     }
 
-    /// Write the whole log to disk atomically. A failure is logged, not fatal —
+    /// Write the whole log to disk atomically. A failure is logged, not fatal:
     /// history is best-effort, never worth interrupting a query over.
     fn persist(&self) {
         let Some(path) = self.path.clone() else {
@@ -207,7 +207,7 @@ fn save(path: &PathBuf, entries: &[HistoryEntry]) -> Result<()> {
 }
 
 /// A short, human relative time ("just now", "5m ago", "3h ago", "2d ago") for a
-/// row's subline. Empty for a missing/future stamp (clock skew) — no fake time.
+/// row's subline. Empty for a missing/future stamp (clock skew); no fake time.
 fn relative_time(unix: u64) -> String {
     let now = crate::conversations::now_unix();
     if unix == 0 || now < unix {
@@ -454,7 +454,7 @@ mod tests {
     fn de_dupes_consecutive_identical_runs_per_connection() {
         let mut h = in_memory();
         h.record("a", "select 1");
-        h.record("a", "select 1"); // immediate repeat — ignored
+        h.record("a", "select 1"); // immediate repeat, ignored
         assert_eq!(h.for_conn("a").len(), 1);
         // A different connection's identical SQL is its own entry.
         h.record("b", "select 1");

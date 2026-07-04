@@ -1,6 +1,6 @@
 //! The backend thread. Mirrors `nyx-service`: a dedicated OS thread runs its own
 //! Tokio runtime, owns the active database session, and communicates with the
-//! GPUI UI over two channels — `Command` in (UI → service, a Tokio mpsc usable
+//! GPUI UI over two channels: `Command` in (UI → service, a Tokio mpsc usable
 //! from any thread) and `Event` out (service → UI, a `futures` mpsc the GPUI
 //! foreground executor can `await` as a `Stream`). The UI never blocks on the
 //! backend.
@@ -9,7 +9,7 @@
 //! delivers the first window; each `FetchMore` pulls the next. This gives true
 //! end-to-end backpressure (the backend never races ahead of the consumer) and
 //! is the seam the result grid's lazy load-on-scroll plugs into. A fetch is
-//! raced against incoming commands so a `Cancel` — or a `timeout` — can abort an
+//! raced against incoming commands so a `Cancel` (or a `timeout`) can abort an
 //! in-flight query out-of-band rather than dropping a future.
 //!
 //! Layout: [`protocol`] holds the `Command`/`Event`/`RunFetch` wire types,
@@ -64,7 +64,7 @@ pub struct ServiceHandle {
 }
 
 impl ServiceHandle {
-    /// Fire a command at a specific session. Infallible from the caller's view —
+    /// Fire a command at a specific session. Infallible from the caller's view:
     /// if the backend is gone the command is dropped.
     pub fn send_to(&self, session: SessionId, command: Command) {
         let _ = self.commands.send((Some(session), command));
@@ -86,7 +86,7 @@ impl ServiceHandle {
     }
 
     /// Take the event stream. Call once; it moves into the UI's async loop. Each
-    /// item is `(session, event)` — the session the event belongs to.
+    /// item is `(session, event)`, the session the event belongs to.
     pub fn take_events(&mut self) -> Option<UnboundedReceiver<(Option<SessionId>, Event)>> {
         self.events.take()
     }
@@ -102,7 +102,7 @@ pub fn spawn() -> ServiceHandle {
     // is emitted only from a task holding a `page_fetch_limit` permit, and exports
     // from an `export_limit` permit (see `dispatch`). So even if the GPUI consumer
     // stalls (a modal, a slow frame), at most `MAX_CONCURRENT_PAGE_FETCHES` row
-    // windows can be in flight — the queue can't balloon without bound. The
+    // windows can be in flight, so the queue can't balloon without bound. The
     // remaining producers (errors, status, throttled progress counts) carry small
     // payloads at human/throttled rates. Backpressure thus lives on the producer
     // side (the semaphores) rather than on the channel, which keeps `emit` a cheap

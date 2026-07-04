@@ -18,7 +18,7 @@ use red_core::{AiTier, ConnectionConfig, DbKind, SshAuth, SshConfig};
 use serde::{Deserialize, Serialize};
 
 /// A saved connection plus a recency stamp for "recent" ordering. The in-memory
-/// `config.password` is normally empty — it's materialized from the keychain only
+/// `config.password` is normally empty: it's materialized from the keychain only
 /// transiently (connect / edit / test) and never held here long-term, so it can't
 /// leak via a serialized [`StoredConnection`]. Serialization is deliberately *not*
 /// derived; saving goes through the password-free [`WriteConnection`].
@@ -32,13 +32,13 @@ pub struct StoredConnection {
     /// Unix seconds of the last successful connect; `None` until first used.
     pub last_accessed: Option<u64>,
     /// Pinned to the top of the welcome list and the connection switcher,
-    /// independent of recency — a user's favourite "projects" stay reachable on
+    /// independent of recency, so a user's favourite "projects" stay reachable on
     /// the low ⌘-digit slots no matter what they touched last. Defaults to false;
     /// omitted from the file when unset so pre-pin configs round-trip unchanged.
     pub pinned: bool,
 }
 
-/// The on-disk shape used for *loading* — tolerant of both the current structured
+/// The on-disk shape used for *loading*, tolerant of both the current structured
 /// fields and the legacy single-`dsn` format (and a legacy plaintext `password`),
 /// so upgrading never drops a saved connection. Saving always writes the
 /// password-free structured shape via [`WriteConnection`].
@@ -88,7 +88,7 @@ struct RawConnection {
     ssh: Option<RawSsh>,
 }
 
-/// On-disk SSH config — flat scalars (no enum) so it round-trips through TOML
+/// On-disk SSH config: flat scalars (no enum) so it round-trips through TOML
 /// cleanly as a `[connection.ssh]` sub-table. Secrets are never stored here;
 /// they live in the keychain keyed by the connection id.
 #[derive(Default, Deserialize)]
@@ -180,8 +180,8 @@ struct RawConfigFile {
     connections: Vec<RawConnection>,
 }
 
-/// The on-disk shape used for *saving*. Deliberately omits `password` — that
-/// lives in the keychain, keyed by `id` — so a write can never spill a secret to
+/// The on-disk shape used for *saving*. Deliberately omits `password` (that
+/// lives in the keychain, keyed by `id`) so a write can never spill a secret to
 /// disk. Mirrors the flat `[[connection]]` table the loader expects.
 #[derive(Serialize)]
 struct WriteConnection {
@@ -212,7 +212,7 @@ struct WriteConnection {
     ssh: Option<WriteSsh>,
 }
 
-/// On-disk SSH config (save side) — mirror of [`RawSsh`], password-free. `auth`
+/// On-disk SSH config (save side): mirror of [`RawSsh`], password-free. `auth`
 /// is a plain string so the table needs no TOML enum gymnastics.
 #[derive(Serialize)]
 struct WriteSsh {
@@ -263,7 +263,7 @@ impl From<&StoredConnection> for WriteConnection {
     }
 }
 
-/// `skip_serializing_if` predicate for the boolean `pinned` flag — `serde` needs a
+/// `skip_serializing_if` predicate for the boolean `pinned` flag; `serde` needs a
 /// `fn(&bool) -> bool`, which `std::ops::Not::not` (taking `bool` by value) isn't.
 fn is_false(b: &bool) -> bool {
     !*b
@@ -276,7 +276,7 @@ struct ConfigFile {
 }
 
 /// Mint a new stable connection id. Monotonic-ish (nanosecond clock + a
-/// process-local counter to break same-instant ties) — unique enough to key a
+/// process-local counter to break same-instant ties), unique enough to key a
 /// keychain entry for a local, single-user app.
 pub fn new_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -305,8 +305,8 @@ pub fn config_path() -> Option<PathBuf> {
 
 /// Load the saved connections, newest-used first. Missing/unreadable/malformed
 /// config yields an empty list (with a warning), never an error. On load we also
-/// run a one-time [`migrate_secrets`] pass — assign ids to legacy entries and
-/// move any plaintext password into the keychain — rewriting the stripped file if
+/// run a one-time [`migrate_secrets`] pass (assign ids to legacy entries and
+/// move any plaintext password into the keychain), rewriting the stripped file if
 /// anything changed.
 pub fn load() -> Vec<StoredConnection> {
     let Some(path) = config_path() else {
@@ -385,7 +385,7 @@ fn migrate_secrets(connections: &mut [StoredConnection]) -> bool {
 /// Persist the connection list. Normally password-free (secrets live in the
 /// keychain), but a legacy file whose keychain migration failed can still hold
 /// plaintext passwords ([`migrate_secrets`]), so the file is written owner-only on
-/// Unix and atomically (temp + rename) — never leaving a world-readable credential
+/// Unix and atomically (temp + rename), never leaving a world-readable credential
 /// or a half-written file. Creates the config dir if needed.
 pub fn save(connections: &[StoredConnection]) -> Result<()> {
     use std::io::Write;
@@ -413,7 +413,7 @@ pub fn save(connections: &[StoredConnection]) -> Result<()> {
     Ok(())
 }
 
-/// Render the connection list to the exact TOML bytes [`save`] writes — so a
+/// Render the connection list to the exact TOML bytes [`save`] writes, so a
 /// caller can hash them ahead of a save to suppress the watcher's self-reload.
 pub fn serialize(connections: &[StoredConnection]) -> Result<String> {
     let cfg = ConfigFile {
@@ -452,7 +452,7 @@ mod tests {
                     host: "db".into(),
                     port: Some(5432),
                     user: "analytics".into(),
-                    // Passwords belong in the keychain — saving must drop them.
+                    // Passwords belong in the keychain; saving must drop them.
                     password: "secret".into(),
                     database: "analytics".into(),
                     color: 3,
@@ -563,7 +563,7 @@ mod tests {
                 path: "/home/me/.ssh/id_ed25519".into()
             }
         );
-        // Secrets come back empty — they belong in the keychain.
+        // Secrets come back empty: they belong in the keychain.
         assert_eq!(ssh.password, "");
         assert_eq!(ssh.passphrase, "");
     }

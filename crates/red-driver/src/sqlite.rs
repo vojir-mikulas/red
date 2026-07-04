@@ -25,7 +25,7 @@ use crate::format::{strip_trailing, ExportWriter, ProgressThrottle};
 use crate::{driver_err, AbortSignal, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor};
 
 /// A SQLite connection target: a file path (or `:memory:`) plus the read-only
-/// posture. Cheap to clone — it holds no live handle.
+/// posture. Cheap to clone; it holds no live handle.
 #[derive(Debug, Clone)]
 pub struct SqliteDriver {
     path: PathBuf,
@@ -86,7 +86,7 @@ impl DatabaseDriver for SqliteDriver {
         let full = opts.full_fidelity;
 
         // Capacity 1: the handle sends one `FetchReq` then awaits its reply
-        // before sending the next, so a single slot is all that's ever in flight —
+        // before sending the next, so a single slot is all that's ever in flight:
         // a bound, not a buffer. Keeps the channel honest about the "one window at
         // a time" contract rather than letting requests pile up unboundedly.
         let (req_tx, req_rx) = mpsc::channel::<FetchReq>(1);
@@ -142,7 +142,7 @@ impl DatabaseDriver for SqliteDriver {
     }
 
     fn contains_predicate(&self, columns: &[ColumnMeta], term: &str) -> Option<String> {
-        // SQLite treats `\` literally in string literals — no extra escaping.
+        // SQLite treats `\` literally in string literals, so no extra escaping.
         crate::contains_clause(
             columns,
             term,
@@ -198,7 +198,7 @@ impl DatabaseDriver for SqliteDriver {
             if abort.is_aborted() {
                 return Err(RedError::Interrupted);
             }
-            // One aggregate row, read full-fidelity (no cap — these are scalars).
+            // One aggregate row, read full-fidelity (no cap; these are scalars).
             let mut stmt = conn.prepare(&sql).map_err(driver_err)?;
             let column_count = stmt.column_count();
             let mut rows = stmt.query([]).map_err(driver_err)?;
@@ -433,7 +433,7 @@ impl DatabaseDriver for SqliteDriver {
     async fn explain(&self, sql: &str, _analyze: bool) -> Result<QueryPlan> {
         // `EXPLAIN QUERY PLAN` is the readable plan (the bytecode `EXPLAIN` is
         // not); it never steps the statement, so it's safe regardless of the
-        // (ignored — SQLite has no ANALYZE) `analyze` flag. Columns: id, parent,
+        // (ignored, as SQLite has no ANALYZE) `analyze` flag. Columns: id, parent,
         // notused, detail.
         let path = self.path.clone();
         let read_only = self.read_only;
@@ -568,7 +568,7 @@ fn insert_rows_blocking(
     Ok(total)
 }
 
-/// Stream the result of `sql` to `path`, one row at a time — never collecting the
+/// Stream the result of `sql` to `path`, one row at a time, never collecting the
 /// whole result in memory. Checks `cancel` per row (bailing with the partial file
 /// removed) and reports the running row count through `progress` (throttled).
 #[allow(clippy::too_many_arguments)]
@@ -597,7 +597,7 @@ fn export_blocking(
     let mut throttle = ProgressThrottle::new(progress);
 
     // Bail on cancel: drop the writer, remove the partial file, and report
-    // interruption — never leave a truncated CSV/JSON behind.
+    // interruption; never leave a truncated CSV/JSON behind.
     macro_rules! bail_if_cancelled {
         () => {
             if cancel.load(Ordering::Relaxed) {
@@ -675,14 +675,14 @@ fn fetch_page_blocking(
 }
 
 /// Quote a SQLite identifier (schema/table) for safe interpolation into a PRAGMA
-/// or `sqlite_master` query — wrap in double quotes, doubling any embedded quote.
+/// or `sqlite_master` query: wrap in double quotes, doubling any embedded quote.
 /// PRAGMA arguments can't be bound parameters, so quoting is the injection guard.
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
 /// The tree skeleton: each database in `PRAGMA database_list` with its table/view
-/// names. Names + kinds only — cheap by contract (no `COUNT(*)`, no column walk).
+/// names. Names + kinds only, cheap by contract (no `COUNT(*)`, no column walk).
 /// Empty namespaces are dropped except `main`, so a fresh DB still shows its root.
 fn list_objects_blocking(path: &Path, read_only: bool) -> Result<Vec<SchemaMeta>> {
     let conn = SqliteDriver::open(path, read_only)?;
@@ -768,7 +768,7 @@ fn describe_table_blocking(
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(driver_err)?;
         // A *sole* `INTEGER PRIMARY KEY` column is SQLite's rowid alias and
-        // auto-increments — detectable only after the columns are gathered.
+        // auto-increments, detectable only after the columns are gathered.
         if rows.iter().filter(|c| c.primary_key).count() == 1 {
             if let Some(c) = rows.iter_mut().find(|c| {
                 c.primary_key
@@ -868,7 +868,7 @@ fn foreign_keys_blocking(path: &Path, read_only: bool) -> Result<Vec<FkEdge>> {
     let mut edges: Vec<FkEdge> = Vec::new();
     for schema in &schema_names {
         let sq = quote_ident(schema);
-        // Tables only — views have no foreign keys.
+        // Tables only; views have no foreign keys.
         let tables: Vec<String> = {
             let sql = format!(
                 "SELECT name FROM {sq}.sqlite_master \
@@ -926,7 +926,7 @@ fn foreign_keys_blocking(path: &Path, read_only: bool) -> Result<Vec<FkEdge>> {
 }
 
 /// Runs on a dedicated blocking thread. Opens the connection, prepares the
-/// statement (without stepping — `open_cursor` stays cheap), reports column
+/// statement (without stepping, so `open_cursor` stays cheap), reports column
 /// metadata, then serves fetch requests until exhausted, errored, or the handle
 /// is dropped (channel closed), at which point the statement is finalized.
 fn cursor_thread(
@@ -995,7 +995,7 @@ fn fetch_window(
     max: usize,
     full: bool,
 ) -> Result<RowWindow> {
-    // The cursor backs the editor-run / initial-window stream — offset-mode
+    // The cursor backs the editor-run / initial-window stream: offset-mode
     // display, so cap every cell (no seek key resolved here to exempt). A
     // full-fidelity reader (the table copy) passes `full` to read byte-exact
     // values instead of the display cap.
@@ -1024,7 +1024,7 @@ fn fetch_window(
 }
 
 /// Map one row's cells to [`Value`]s. With a display `cap`, a non-key over-cap
-/// text cell keeps only its prefix and a non-key blob only its length — the bytes
+/// text cell keeps only its prefix and a non-key blob only its length; the bytes
 /// past the cap are never copied (`ValueRef` borrows the step buffer, so the cap
 /// is read off the slice). `cap = None` (export / clipboard re-fetch) is full
 /// fidelity, and the exempt key column rides through whole either way.
@@ -1054,7 +1054,7 @@ fn extract_row(
     Ok(cells)
 }
 
-/// A `sqlite3_interrupt` during a step surfaces as `OperationInterrupted` — map
+/// A `sqlite3_interrupt` during a step surfaces as `OperationInterrupted`; map
 /// it to the distinct `Interrupted` variant so the service can tell a cancel from
 /// a genuine query failure.
 fn map_step_err(e: rusqlite::Error) -> RedError {
@@ -1114,7 +1114,7 @@ mod tests {
         )
     }
 
-    /// A unique temp-file path so introspection runs against a real on-disk DB —
+    /// A unique temp-file path so introspection runs against a real on-disk DB;
     /// `:memory:` can't be used because each `open` would see a fresh empty DB.
     fn temp_db_path(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1199,8 +1199,8 @@ mod tests {
         )
         .await;
 
-        // Column stats (pushdown summary): `author_id` is 1,1,2,NULL — total 4,
-        // non_null 3, distinct 2 — and an `author_id = 1` filter narrows it to 2.
+        // Column stats (pushdown summary): `author_id` is 1,1,2,NULL (total 4,
+        // non_null 3, distinct 2), and an `author_id = 1` filter narrows it to 2.
         battery::column_stats_summary(
             &driver,
             "SELECT * FROM books",
@@ -1224,7 +1224,7 @@ mod tests {
     async fn shipped_sample_db_opens_read_only_and_introspects() {
         // The "Sample database" preview that ships with the app (sample/sample.db,
         // regenerated from sample/sample.sql) must open read-only through the real
-        // driver and introspect cleanly — that's the path the welcome card hits.
+        // driver and introspect cleanly; that's the path the welcome card hits.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sample/sample.db");
         assert!(path.exists(), "shipped sample.db is missing at {path:?}");
 
@@ -1394,7 +1394,7 @@ mod tests {
         {
             let conn = Connection::open(&path).unwrap();
             // `hex(zeroblob(2500))` is 5000 ASCII '0' chars; `zeroblob(5000)` is a
-            // 5000-byte blob — both far over the display cap.
+            // 5000-byte blob: both far over the display cap.
             conn.execute_batch(
                 "CREATE TABLE big(id INTEGER PRIMARY KEY, t TEXT, b BLOB);
                  INSERT INTO big VALUES (1, hex(zeroblob(2500)), zeroblob(5000));",

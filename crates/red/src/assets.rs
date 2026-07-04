@@ -10,7 +10,7 @@ use rust_embed::RustEmbed;
 
 /// The UI (sans) font family, as registered with the text system.
 pub const FONT_UI: &str = "IBM Plex Sans";
-/// The monospace font family (for SQL, values, sizes) — IBM Plex Mono, the
+/// The monospace font family (for SQL, values, sizes): IBM Plex Mono, the
 /// family the design specifies (`--mono`).
 pub const FONT_MONO: &str = "IBM Plex Mono";
 
@@ -31,12 +31,12 @@ const FONT_FILES: &[&str] = &[
 #[include = "red.svg"]
 pub struct Assets;
 
-/// The bundled, fully-commented reference settings — RED's settings docs. Baked
+/// The bundled, fully-commented reference settings, RED's settings docs. Baked
 /// into the binary so "open default settings" works in a shipped app, and copied
 /// into a fresh `settings.toml` on first open.
 pub const DEFAULT_SETTINGS: &str = include_str!("../../../assets/default-settings.toml");
 
-/// The bundled, fully-commented reference keymap — RED's keybinding docs. Seeded
+/// The bundled, fully-commented reference keymap, RED's keybinding docs. Seeded
 /// into a fresh `keymap.toml` on first open so a user has the full default list
 /// (and the override format) in front of them to edit.
 pub const DEFAULT_KEYMAP: &str = include_str!("../../../assets/default-keymap.toml");

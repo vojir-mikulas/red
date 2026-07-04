@@ -1,4 +1,4 @@
-//! The connection manager — the disconnected landing screen: a card listing
+//! The connection manager (the disconnected landing screen): a card listing
 //! saved connections (click to connect, edit/delete actions) plus the add/edit
 //! modal form. Pure assembly over Flint components; all state + actions live on
 //! [`AppState`] (`app.rs`).
@@ -37,7 +37,7 @@ fn engine_tint(kind: DbKind, theme: &Theme) -> Hsla {
 }
 
 /// A connection's last-used time as a coarse relative label ("just now", "5m
-/// ago", "never") — the per-card recency the design shows on the right.
+/// ago", "never"): the per-card recency the design shows on the right.
 pub(crate) fn fmt_ago(secs: Option<u64>) -> String {
     let Some(secs) = secs else {
         return "never".into();
@@ -53,7 +53,7 @@ pub(crate) fn fmt_ago(secs: Option<u64>) -> String {
 
 impl AppState {
     /// The "Saved connections" heading: the label, a hairline rule that fills the
-    /// row, and a subtle "Edit file" affordance on the right — the file-first escape
+    /// row, and a subtle "Edit file" affordance on the right: the file-first escape
     /// hatch that opens `connections.toml` (mirrors the settings panel's "Open
     /// settings file"). Edits to the file re-read live via the connections watcher.
     fn connections_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -84,7 +84,7 @@ impl AppState {
             .flex()
             .items_center()
             .gap_2()
-            .mt(px(26.))
+            .mt(px(20.))
             .mb_2()
             .child(
                 div()
@@ -102,7 +102,7 @@ impl AppState {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        // Build the cards first — they reborrow `cx` mutably — then read the theme
+        // Build the cards first (they reborrow `cx` mutably), then read the theme
         // for the surrounding chrome (it holds an immutable borrow). The form modal
         // is rendered at the root (see `render.rs`) so it works in any phase.
         //
@@ -129,7 +129,6 @@ impl AppState {
             .collect();
         let toolbar = (!self.connections.is_empty()).then(|| self.connect_toolbar(cx));
         let new_button = self.new_button(cx);
-        let import_link = self.import_link(cx);
         let connections_header = self.connections_header(cx);
         let settings_gear = IconButton::new(
             "connect-settings",
@@ -140,30 +139,33 @@ impl AppState {
         .a11y_label("Settings")
         .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
 
-        // Quiet footer: Red is pre-1.0, so invite bug reports straight from the
-        // first screen. The link reuses the shared `open_external` seam.
+        // Quiet footer: the import and bug-report links share one line to keep
+        // the screen short. Both reuse existing seams.
         let footer_theme = cx.theme().clone();
-        let footer =
+        let footer_link = |id: &'static str, label: &'static str| {
             div()
-                .pt(px(28.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .gap_1()
-                .text_size(footer_theme.scale(12.))
+                .id(id)
+                .cursor_pointer()
                 .text_color(footer_theme.text_faint)
-                .child("Red is in early development — found a bug?")
-                .child(
-                    div()
-                        .id("connect-report-bug")
-                        .cursor_pointer()
-                        .text_color(footer_theme.accent)
-                        .hover(|s| s.underline())
-                        .child("Report it")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.open_external(crate::app::ISSUES_URL, cx)
-                        })),
-                );
+                .hover(|s| s.text_color(footer_theme.text_muted).underline())
+                .child(label)
+        };
+        let footer = div()
+            .pt(px(18.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .text_size(footer_theme.scale(12.))
+            .text_color(footer_theme.text_faint)
+            .child(
+                footer_link("connect-import", "Import from DBeaver or DBGate")
+                    .on_click(cx.listener(|this, _, _, cx| this.open_import_picker(cx))),
+            )
+            .child("·")
+            .child(footer_link("connect-report-bug", "Report a bug").on_click(
+                cx.listener(|this, _, _, cx| this.open_external(crate::app::ISSUES_URL, cx)),
+            ));
 
         let theme = cx.theme();
 
@@ -178,7 +180,7 @@ impl AppState {
             .child(
                 gpui::svg()
                     .path("red.svg")
-                    .size(theme.scale(40.))
+                    .size(theme.scale(28.))
                     .flex_none()
                     .text_color(gpui::rgb(0xdc2626)),
             )
@@ -188,7 +190,7 @@ impl AppState {
                 div()
                     .text_color(theme.text)
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_size(theme.scale(34.))
+                    .text_size(theme.scale(24.))
                     .child("Red"),
             );
 
@@ -217,14 +219,13 @@ impl AppState {
             .w_full()
             .max_w(px(620.))
             .px_8()
-            .pt(px(72.))
-            .pb(px(60.))
+            .pt(px(44.))
+            .pb(px(32.))
             .child(header)
             .child(connections_header)
             .children(toolbar)
             .child(saved)
             .child(new_button)
-            .child(import_link)
             .child(footer);
 
         let screen = div()
@@ -239,7 +240,7 @@ impl AppState {
             .font_family(theme.font_family.clone())
             .child(column);
 
-        // Only a slim strip at the top drags the window (double-click zooms) —
+        // Only a slim strip at the top drags the window (double-click zooms),
         // mirroring the connected shell, where dragging is confined to the topbar.
         // The rest of the welcome screen stays clickable without moving the window.
         // It sits in the column's empty top padding, behind the settings gear.
@@ -472,31 +473,6 @@ impl AppState {
             .on_click(cx.listener(|this, _, _, cx| this.open_new_form(cx)))
     }
 
-    /// A quiet link under the New-connection button that pulls saved connections in
-    /// from DBeaver or DBGate — zero-friction onboarding for users already living
-    /// in another tool. Clicking runs detection (see [`Self::open_import_picker`]).
-    fn import_link(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        div()
-            .mt_2()
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap_1()
-            .text_size(theme.scale(12.))
-            .text_color(theme.text_faint)
-            .child("Coming from another tool?")
-            .child(
-                div()
-                    .id("connect-import")
-                    .cursor_pointer()
-                    .text_color(theme.accent)
-                    .hover(|s| s.underline())
-                    .child("Import from DBeaver or DBGate")
-                    .on_click(cx.listener(|this, _, _, cx| this.open_import_picker(cx))),
-            )
-    }
-
     fn connection_card(
         &self,
         display_ix: usize,
@@ -517,7 +493,7 @@ impl AppState {
             DbKind::Clickhouse => (BadgeVariant::Accent, "ClickHouse"),
         };
         let group = SharedString::from(format!("connect-card-{orig_ix}"));
-        // Accessible name: the connection's name, engine, and read-only state —
+        // Accessible name: the connection's name, engine, and read-only state;
         // the card is the welcome screen's primary action, announced as a button.
         let a11y_name = if config.read_only {
             format!("{}, {}, read-only", config.name, badge_label)
@@ -619,7 +595,7 @@ impl AppState {
                     ),
             )
             // The last-used recency, shown by default and hidden on hover to make
-            // room for the actions — so sorting by "Recent" is legible at a glance.
+            // room for the actions, so sorting by "Recent" is legible at a glance.
             .child(
                 div()
                     .flex_none()
@@ -712,7 +688,7 @@ impl AppState {
         let view = cx.entity().downgrade();
         let is_file = form.kind.is_file();
         // Per-field validation messages, shown only once the user has tried to
-        // submit (or test) — so a fresh form isn't pre-littered with red text.
+        // submit (or test), so a fresh form isn't pre-littered with red text.
         let errors = if form.submitted {
             self.form_config(cx)
                 .map(|c| AppState::form_errors(&c))
@@ -726,8 +702,8 @@ impl AppState {
             "New connection"
         };
 
-        // Network engines get a live connection-string field that mirrors — and is
-        // mirrored by — the structured fields. File engines have only a path.
+        // Network engines get a live connection-string field that mirrors (and is
+        // mirrored by) the structured fields. File engines have only a path.
         let conn_str_field = (!is_file)
             .then(|| labeled_field("Connection string", theme).child(self.conn_str_input.clone()));
 
@@ -789,7 +765,7 @@ impl AppState {
         }
 
         // `Toggle::label` is a11y-only (sets aria-label, paints nothing), so pair it
-        // with a visible caption — tinted accent when on, like the Read-only row.
+        // with a visible caption, tinted accent when on, like the Read-only row.
         let toggle = div()
             .flex()
             .items_center()
@@ -981,7 +957,7 @@ impl AppState {
             .child(
                 labeled_field(
                     // MySQL can browse the whole server, so its database is
-                    // optional — blank shows every database.
+                    // optional; blank shows every database.
                     if form.kind == DbKind::Mysql {
                         "Database (optional)"
                     } else {
@@ -1013,7 +989,7 @@ impl AppState {
             .into_any_element()
     }
 
-    /// The engine segmented control — one cell per `DbKind`, with the engine tint
+    /// The engine segmented control: one cell per `DbKind`, with the engine tint
     /// dot. Data-driven off `DbKind::all`, so a new driver appears automatically.
     fn render_engine_picker(
         &self,
@@ -1059,7 +1035,7 @@ impl AppState {
 
     /// The AI write opt-in (Feature B): lets the assistant propose INSERT/UPDATE/
     /// DELETE on this connection, each gated by per-statement approval. Shown only
-    /// when the assistant is enabled and the connection is *writable* — write access
+    /// when the assistant is enabled and the connection is *writable*; write access
     /// is meaningless (and blocked) on a read-only connection, so unticking
     /// "Read-only" is the prerequisite. `None` hides the row otherwise.
     fn render_ai_write_row(
@@ -1090,7 +1066,7 @@ impl AppState {
                             .text_size(theme.scale(11.5))
                             .text_color(theme.text_muted)
                             .child(
-                                "The agent may propose INSERT/UPDATE/DELETE — each needs your \
+                                "The agent may propose INSERT/UPDATE/DELETE. Each needs your \
                                  approval; DDL and unqualified changes are always blocked.",
                             ),
                     ),
@@ -1271,7 +1247,7 @@ impl AppState {
     }
 }
 
-/// The first validation message tagged for `field`, if any — the per-input lookup
+/// The first validation message tagged for `field`, if any; the per-input lookup
 /// over the form's collected [`AppState::form_errors`].
 fn field_err(errors: &[(FormField, &'static str)], field: FormField) -> Option<&'static str> {
     errors

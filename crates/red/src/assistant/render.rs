@@ -44,7 +44,7 @@ impl AppState {
             red_service::AiConfigCategory::Model,
             red_service::AiConfigCategory::Reasoning,
             // The agent's permission mode (default / accept edits / auto / bypass),
-            // advertised as a `Mode` selector — round-trips like the others.
+            // advertised as a `Mode` selector; round-trips like the others.
             red_service::AiConfigCategory::Mode,
         ] {
             let Some(opt) = options
@@ -149,7 +149,7 @@ impl AppState {
         if chat.messages.is_empty() {
             let hint = if is_subscription {
                 "Ask a question about the connected database. Chatting via your Claude \
-                 subscription (Claude Code) — the first message starts the agent, which reads \
+                 subscription (Claude Code). The first message starts the agent, which reads \
                  the schema and runs capped, read-only SELECTs through Red's tools."
             } else {
                 "Ask a question about the connected database. The agent can read the \
@@ -161,7 +161,7 @@ impl AppState {
                     .text_color(theme.text_muted)
                     .child(hint),
             );
-            // Before the first message, the chat's agent can still be switched —
+            // Before the first message, the chat's agent can still be switched:
             // offer the picker when more than one agent is usable (M-S6).
             if let Some(picker) = self.render_agent_picker(chat, &theme, cx) {
                 body = body.child(picker);
@@ -367,7 +367,7 @@ impl AppState {
                 .on_click(cx.listener(|this, _, _, cx| this.new_chat(cx)))
         });
 
-        // Deletion lives only in the history sidebar (each row's trash) — the chat
+        // Deletion lives only in the history sidebar (each row's trash); the chat
         // view never deletes the conversation it's showing.
         let header_actions = div()
             .flex()
@@ -417,7 +417,7 @@ impl AppState {
                                 .child(crate::icons::icon("edit", theme.scale(10.), theme.yellow))
                                 .child("writes")
                                 .tooltip(flint::Tooltip::text(
-                                    "This connection allows the agent to propose writes — \
+                                    "This connection allows the agent to propose writes; \
                                          each one needs your approval.",
                                 )),
                         )
@@ -487,7 +487,7 @@ impl AppState {
     }
 
     /// The merged history sidebar: the single editable draft, the open chats, and
-    /// the saved conversations on disk — one searchable list. Clicking a row opens
+    /// the saved conversations on disk, in one searchable list. Clicking a row opens
     /// or restores it; each non-draft row can be renamed or deleted in place.
     fn render_assistant_list(
         &self,
@@ -596,7 +596,7 @@ impl AppState {
             .p_2();
         if rows.is_empty() {
             let hint = if query.is_empty() {
-                "No conversations yet — they're kept here as you chat."
+                "No conversations yet. They're kept here as you chat."
             } else {
                 "No conversations match your search."
             };
@@ -804,7 +804,7 @@ impl AppState {
 
     /// The empty-chat agent picker (M-S6): one selectable chip per usable agent, to
     /// bind a new chat to an agent before its first message. Shown only when more
-    /// than one agent is usable — a single agent needs no choice. The chips wrap, so
+    /// than one agent is usable (a single agent needs no choice). The chips wrap, so
     /// a handful of agents lay out cleanly.
     fn render_agent_picker(
         &self,
@@ -1011,7 +1011,7 @@ impl AppState {
     /// One chat bubble. `index` is the bubble's position in the transcript, used as a
     /// stable per-frame element-id basis for the copy/insert chips (so equal-length
     /// messages never collide). `reveal` is `Some(n)` for the live, still-typing
-    /// assistant bubble — only its first `n` characters show and a blinking caret
+    /// assistant bubble: only its first `n` characters show and a blinking caret
     /// trails them; `None` renders the whole message (every settled turn).
     fn render_bubble(
         &self,
@@ -1034,7 +1034,7 @@ impl AppState {
 
         // Label row: the author, plus a copy-to-clipboard affordance for the
         // message text (assistant turns can be long; this beats hand-selecting).
-        // Hidden while typing — the text isn't final yet.
+        // Hidden while typing, since the text isn't final yet.
         let mut label_row = div().flex().items_center().justify_between().child(
             div()
                 .text_size(theme.scale(10.5))
@@ -1079,12 +1079,12 @@ impl AppState {
             bubble = bubble.child(think);
         }
 
-        // Answer text. Assistant turns are Markdown — render them (on the revealed
+        // Answer text. Assistant turns are Markdown, so render them (on the revealed
         // prefix while typing); user turns are plain.
         if msg.role == ChatRole::Assistant {
             if !shown.is_empty() {
                 // A settled bubble renders from its cached parse (frame-stable); the
-                // live one still parses its revealed prefix fresh each tick — but
+                // live one still parses its revealed prefix fresh each tick, but
                 // that's a single message, not the whole transcript.
                 let md = if live {
                     crate::markdown::render(shown, theme)
@@ -1172,7 +1172,7 @@ impl AppState {
 }
 
 /// The first `n` characters of `s` (a byte-safe prefix), or all of it when shorter.
-/// Drives the streaming reveal — slicing on a char boundary so multibyte text never
+/// Drives the streaming reveal, slicing on a char boundary so multibyte text never
 /// panics mid-codepoint.
 fn take_chars(s: &str, n: usize) -> &str {
     match s.char_indices().nth(n) {

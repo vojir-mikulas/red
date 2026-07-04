@@ -6,7 +6,7 @@
 //! (`tier → cascade → placement`); checking a column adds it to the grid as an
 //! extra, dotted-aliased column via a `LEFT JOIN` (see [`crate::result::build_joins`]
 //! and the driver's `fk_join_wrap`). This is dbgate's data-grid column tree, built on
-//! RED's windowed cursor — the join decorates one page, never the whole table.
+//! RED's windowed cursor; the join decorates one page, never the whole table.
 //!
 //! The tree's *expanded* nodes and the *checked* columns are both result-grid state
 //! (so they're scoped to the open browse); the catalog (a referenced table's columns)
@@ -22,7 +22,7 @@ use crate::app::{ActiveConn, AppState, Phase};
 
 /// Horizontal indent per tree level.
 const INDENT: f32 = 14.0;
-/// Recursion-depth cap — deep enough for any real normalized schema, shallow enough
+/// Recursion-depth cap: deep enough for any real normalized schema, shallow enough
 /// that a self-referential / cyclic FK can't loop the renderer forever.
 const MAX_DEPTH: usize = 8;
 
@@ -205,7 +205,7 @@ impl AppState {
     /// Append one table's columns to `out` and recurse into each *expanded* FK node.
     /// `prefix` is the dotted FK path from the base table to this level (empty at the
     /// base); `depth` is the indent / a recursion guard. Reads the table's columns
-    /// from the prefetched catalog — an expanded-but-not-yet-described node shows a
+    /// from the prefetched catalog; an expanded-but-not-yet-described node shows a
     /// "loading…" line until its `TableDescribed` lands.
     #[allow(clippy::too_many_arguments)]
     fn push_columns_level(
@@ -260,7 +260,7 @@ impl AppState {
             let checkable = depth >= 1;
             let checked = checkable && grid.is_shown(&col_path);
 
-            // Chevron (FK nodes only) — toggles the subtree open.
+            // Chevron (FK nodes only); toggles the subtree open.
             let chevron = if is_fk {
                 let (s, t) = target.clone().unwrap();
                 let node = col_path.clone();
@@ -291,7 +291,7 @@ impl AppState {
                 div().flex_shrink_0().size(px(14.)).into_any_element()
             };
 
-            // Checkbox (reference columns only) — toggles the column into the grid.
+            // Checkbox (reference columns only); toggles the column into the grid.
             let checkbox = if checkable {
                 let path = col_path.clone();
                 let mut sq = div()

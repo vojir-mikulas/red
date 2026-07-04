@@ -1,11 +1,11 @@
-//! The query-plan view (Track B4 — EXPLAIN). An Explain action runs the engine's
+//! The query-plan view (Track B4, EXPLAIN). An Explain action runs the engine's
 //! `EXPLAIN` for the editor's current query and shows the normalized plan tree in
 //! the result pane, in place of the grid. The driver does the engine-specific
 //! formatting (`DatabaseDriver::explain` → `red_core::QueryPlan`); this module is
 //! purely the UI: the action, the per-tab `PlanView` state, the `PlanReady` /
 //! `PlanFailed` handlers, and the rendering.
 //!
-//! A plan is tiny and bounded, so it's held whole — the "never materialize" budget
+//! A plan is tiny and bounded, so it's held whole: the "never materialize" budget
 //! rule is about row data, not a fixed-size plan. Closing the plan frees it.
 
 use flint::prelude::*;
@@ -22,7 +22,7 @@ pub(crate) struct PlanView {
     /// Identifies this explain request; a `PlanReady`/`PlanFailed` for a different
     /// epoch (the tab re-explained or switched) is dropped.
     pub epoch: u64,
-    /// The SQL that was explained — shown truncated in the header.
+    /// The SQL that was explained; shown truncated in the header.
     pub sql: String,
     /// Whether this was an `EXPLAIN ANALYZE` (actuals + hot-node tint).
     pub analyze: bool,
@@ -37,13 +37,13 @@ pub(crate) enum PlanState {
     Loading,
     /// The plan arrived.
     Ready(QueryPlan),
-    /// `EXPLAIN` failed (bad SQL, unsupported statement) — shown in the pane.
+    /// `EXPLAIN` failed (bad SQL, unsupported statement); shown in the pane.
     Failed(String),
 }
 
 impl AppState {
     /// Run `EXPLAIN` (or `EXPLAIN ANALYZE` when `analyze`) for the active tab's
-    /// current query — its selection if any, else the whole buffer — and open a
+    /// current query (its selection if any, else the whole buffer) and open a
     /// plan view in the result pane. `analyze` *executes* the statement, so it's
     /// gated to read queries; plain explain never executes and is unconditional.
     pub(crate) fn explain_query(&mut self, analyze: bool, cx: &mut Context<Self>) {
@@ -62,12 +62,12 @@ impl AppState {
             return;
         }
 
-        // EXPLAIN ANALYZE runs the statement — refuse it for anything but a read
+        // EXPLAIN ANALYZE runs the statement, so refuse it for anything but a read
         // query (a confirmed `EXPLAIN ANALYZE DELETE …` would still delete).
         if analyze && !matches!(crate::sql::classify(&sql), crate::sql::StatementKind::Query) {
             self.notify(
                 ToastVariant::Error,
-                "Explain Analyze runs the statement — it's only available for read queries.",
+                "Explain Analyze runs the statement, so it's only available for read queries.",
                 cx,
             );
             return;
@@ -93,7 +93,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// A plan arrived — drop it into the matching tab's plan view (by session,
+    /// A plan arrived: drop it into the matching tab's plan view (by session,
     /// then epoch), unless it's been superseded.
     pub(crate) fn on_plan_ready(
         &mut self,
@@ -108,7 +108,7 @@ impl AppState {
         }
     }
 
-    /// An explain failed — show the message in the plan pane (not a global toast).
+    /// An explain failed: show the message in the plan pane (not a global toast).
     pub(crate) fn on_plan_failed(
         &mut self,
         session: Option<red_service::SessionId>,
@@ -425,7 +425,7 @@ fn node_actual_time(node: &PlanNode) -> Option<f64> {
 }
 
 /// Collapse `sql` to a single trimmed line, truncated to `max` chars with an
-/// ellipsis — for the plan header's "what was explained" subtitle.
+/// ellipsis, for the plan header's "what was explained" subtitle.
 fn one_line(sql: &str, max: usize) -> String {
     let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() > max {

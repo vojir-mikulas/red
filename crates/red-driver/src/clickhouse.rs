@@ -1,4 +1,4 @@
-//! ClickHouse driver — the fourth source of `DatabaseDriver`, the first OLAP
+//! ClickHouse driver: the fourth source of `DatabaseDriver`, the first OLAP
 //! engine, proving the abstraction against a column store. Built on the
 //! **HTTP interface** (port 8123) rather than a heavy native-protocol crate: the
 //! `JSONCompactEachRowWithNamesAndTypes` format returns column names *and* types in
@@ -6,12 +6,12 @@
 //! directly onto reading newline-delimited lines off the byte stream. This keeps
 //! the dependency-light ethos (reqwest/rustls + serde_json are already in the tree
 //! via `red-ai`), and **out-of-band cancel** is a `KILL QUERY WHERE query_id = …`
-//! over a second request — the same shape MySQL's `KILL QUERY` cancel proves.
+//! over a second request, the same shape MySQL's `KILL QUERY` cancel proves.
 //!
 //! Writes are gated on the connection's `read_only` flag (like every engine): when
 //! set it appends the `readonly=1` server setting, so any write is refused at the
 //! engine. A *writable* ClickHouse connection can be an INSERT / copy / migration
-//! **target** — [`insert_rows`](ClickhouseDriver::insert_rows) streams an
+//! **target**: [`insert_rows`](ClickhouseDriver::insert_rows) streams an
 //! `INSERT … FORMAT JSONCompactEachRow`, [`create_table`](ClickhouseDriver::create_table)
 //! emits `MergeTree` DDL, and [`clear_table`](ClickhouseDriver::clear_table)
 //! `TRUNCATE`s. In-grid **editing** stays **unsupported**: ClickHouse `UPDATE`/`DELETE`
@@ -22,7 +22,7 @@
 //! foreign keys have no OLAP equivalent, so those migration passes are logged skips.
 //!
 //! Value mapping leans on the engine: the `JSON…` formats render every type to JSON
-//! text for us, so a cell is a "JSON scalar/array → [`Value`]" map — no hand-written
+//! text for us, so a cell is a "JSON scalar/array → [`Value`]" map; no hand-written
 //! binary decoder. Integers come back as JSON numbers (or quoted strings for the
 //! 64-bit widths, which JSON can't hold losslessly); composites (`Array`, `Tuple`,
 //! `Map`) and the date/decimal/uuid/enum shapes render as text.
@@ -68,7 +68,7 @@ const ROW_FORMAT: &str = "JSONCompactEachRowWithNamesAndTypes";
 /// **no** names/types header (unlike [`ROW_FORMAT`], which the *read* path uses to
 /// learn its columns up front). The column list rides in the `INSERT INTO … (cols)`
 /// clause instead, so the two header lines a WithNamesAndTypes insert would demand
-/// aren't sent — and can't be mistaken for the first two data rows.
+/// aren't sent, and can't be mistaken for the first two data rows.
 const INSERT_FORMAT: &str = "JSONCompactEachRow";
 
 /// A live ClickHouse session over the HTTP interface. Holds the reused
@@ -76,7 +76,7 @@ const INSERT_FORMAT: &str = "JSONCompactEachRow";
 /// as `X-ClickHouse-*` headers, never in the logged URL).
 pub struct ClickhouseDriver {
     client: reqwest::Client,
-    /// `http://host:port/` — every request POSTs its SQL here with the query/format
+    /// `http://host:port/`: every request POSTs its SQL here with the query/format
     /// options as URL params.
     base_url: String,
     user: String,
@@ -175,7 +175,7 @@ impl ClickhouseDriver {
     /// Build a POST carrying `sql` in the body, with the query id, the read-only
     /// posture, and any `extra` URL params (parameter binds / settings). Credentials
     /// ride in headers, not the URL. A read-only connection appends `readonly=1`, so
-    /// a write — including a write attempted through `execute` — is refused at the
+    /// a write (including a write attempted through `execute`) is refused at the
     /// engine.
     fn build_query(
         &self,
@@ -203,7 +203,7 @@ impl ClickhouseDriver {
     /// `ASYNC` so the kill returns without waiting for the doomed query to wind down.
     /// The kill never carries `readonly=1` (a read-only session still cancels its own
     /// query). Query ids are unique UUIDs, so a kill that races a just-finished fetch
-    /// targets an id that no longer exists — a harmless no-op, so no liveness flag is
+    /// targets an id that no longer exists, a harmless no-op, so no liveness flag is
     /// needed (unlike MySQL's recycled thread ids).
     fn kill_token(&self, target_query_id: &str) -> CancelToken {
         let client = self.client.clone();
@@ -231,8 +231,8 @@ impl ClickhouseDriver {
     }
 
     /// Run `base_sql` (FORMAT appended here) to completion and collect every row.
-    /// Only the bounded one-shot paths use this — `count`, `fetch_page` (`LIMIT`),
-    /// the seeks, `key_bounds`, introspection — so the whole (small) response fits in
+    /// Only the bounded one-shot paths use this: `count`, `fetch_page` (`LIMIT`),
+    /// the seeks, `key_bounds`, introspection. Thus the whole (small) response fits in
     /// memory; the unbounded cursor/export paths stream instead. `abort` arms a
     /// `KILL QUERY` for the request's lifetime, so a superseded fetch is cancelled at
     /// the engine, not merely abandoned.
@@ -296,7 +296,7 @@ impl ClickhouseDriver {
     /// returning the live response and whatever bytes were buffered past the header.
     /// Shared by the cursor and `export`. A query that fails *before* streaming
     /// (syntax/permission) surfaces here as a non-success status with the error in
-    /// the body — the validation the trait expects at open time.
+    /// the body: the validation the trait expects at open time.
     async fn open_stream(&self, base_sql: &str, query_id: &str) -> Result<OpenedStream> {
         let sql = format!("{base_sql} FORMAT {ROW_FORMAT}");
         let resp = self
@@ -500,7 +500,7 @@ impl DatabaseDriver for ClickhouseDriver {
         distinct: bool,
         abort: &AbortSignal,
     ) -> Result<red_core::ColumnStats> {
-        // OLAP loves aggregates — a plain read, like every other ClickHouse path.
+        // OLAP loves aggregates; this is a plain read, like every other ClickHouse path.
         let base = crate::stats_sql(sql, column, numeric, distinct, ch_quote);
         let (_, types, rows) = self.run_collect(base, &[], abort).await?;
         // One aggregate row, decoded by the response's column types then read
@@ -647,7 +647,7 @@ impl DatabaseDriver for ClickhouseDriver {
 
     async fn apply_edits(&self, ops: &[EditOp]) -> Result<u64> {
         // An empty batch is a no-op (matching the trait contract) so a stray submit
-        // doesn't error. Otherwise: ClickHouse is OLAP — `UPDATE`/`DELETE` are
+        // doesn't error. Otherwise: ClickHouse is OLAP, so `UPDATE`/`DELETE` are
         // asynchronous `ALTER TABLE … UPDATE` mutations with no transaction or
         // rollback, so the atomic, exactly-one-row contract this method promises
         // cannot be honored. Refuse clearly rather than half-apply something the grid
@@ -723,7 +723,7 @@ impl DatabaseDriver for ClickhouseDriver {
     }
 
     async fn clear_table(&self, table: &TableRef) -> Result<u64> {
-        // `TRUNCATE` is ClickHouse's clean, synchronous table-empty — the natural
+        // `TRUNCATE` is ClickHouse's clean, synchronous table-empty, the natural
         // copy-replace op. (The trait's DELETE-for-uniformity note is about MySQL's
         // auto-committing, auto-increment-resetting TRUNCATE; ClickHouse's has no such
         // surprise.) It reports no row count, so the affected count comes back 0. A
@@ -755,7 +755,7 @@ impl DatabaseDriver for ClickhouseDriver {
         _columns: &[String],
     ) -> Result<u64> {
         // ClickHouse's data-skipping indexes aren't relational secondary indexes, so a
-        // migrated index has no faithful equivalent — the migrate job logs the skip.
+        // migrated index has no faithful equivalent; the migrate job logs the skip.
         Err(RedError::Driver(
             "secondary indexes have no relational equivalent on ClickHouse (OLAP)".to_string(),
         ))
@@ -768,14 +768,14 @@ impl DatabaseDriver for ClickhouseDriver {
         _parent: &TableRef,
         _ref_columns: &[String],
     ) -> Result<u64> {
-        // ClickHouse (OLAP) has no foreign keys — the migrate job logs the skip.
+        // ClickHouse (OLAP) has no foreign keys, so the migrate job logs the skip.
         Err(RedError::Driver(
             "foreign keys are not supported on ClickHouse (OLAP)".to_string(),
         ))
     }
 
     async fn explain(&self, sql: &str, _analyze: bool) -> Result<QueryPlan> {
-        // ClickHouse `EXPLAIN` is plan-only and read-only-safe — it never executes the
+        // ClickHouse `EXPLAIN` is plan-only and read-only-safe: it never executes the
         // statement, so there is no `EXPLAIN ANALYZE` actual-time/row counterpart; the
         // `analyze` flag is accepted but ignored. The output is an indentation-nested
         // text plan with no node markers, parsed by `plan::from_indent_tree`.
@@ -881,7 +881,7 @@ struct ChCursor {
     cancelled: Arc<AtomicBool>,
     cancel: CancelToken,
     /// Read cells at full fidelity (the table-copy read, e.g. ClickHouse → SQLite)
-    /// rather than the display fat-cell cap — see
+    /// rather than the display fat-cell cap; see
     /// [`QueryOptions::full_fidelity`](red_core::QueryOptions).
     full: bool,
     inner: Mutex<ChStream>,
@@ -902,7 +902,7 @@ impl QueryCursor for ChCursor {
     }
 
     async fn next_window(&self, max: usize) -> Result<RowWindow> {
-        // Offset-mode display stream (editor run) — cap every cell, no key exempt.
+        // Offset-mode display stream (editor run): cap every cell, no key exempt.
         // A full-fidelity reader (the table copy) reads byte-exact instead.
         let cap = if self.full {
             None
@@ -985,7 +985,7 @@ fn host_authority(host: &str, port: u16) -> String {
 /// and an `ORDER BY`, and the relational trailing `PRIMARY KEY (…)` clause maps onto
 /// the sort key instead. Column types are spelled into ClickHouse's dialect via
 /// [`typemap`](red_core::typemap); the primary-key columns become the `ORDER BY`
-/// (or `tuple()` — the no-sort-key sentinel — when the source had none). A nullable
+/// (or `tuple()`, the no-sort-key sentinel, when the source had none). A nullable
 /// sort-key column (a migration source can have one) needs `allow_nullable_key`,
 /// which MergeTree otherwise rejects. Identifiers are quoted, never interpolated raw.
 fn ch_create_table_sql(table: &TableRef, columns: &[ColumnMeta]) -> String {
@@ -1031,7 +1031,7 @@ fn ch_create_table_sql(table: &TableRef, columns: &[ColumnMeta]) -> String {
 /// Map a [`Value`] to the JSON cell an `INSERT … FORMAT JSONCompactEachRow` body
 /// carries. A [`Value::Capped`] never reaches a write path by contract (capped cells
 /// are display-only), but is mapped to its head defensively rather than dropped. A
-/// blob becomes a JSON string via lossy UTF-8 — ClickHouse's only binary-ish type is
+/// blob becomes a JSON string via lossy UTF-8; ClickHouse's only binary-ish type is
 /// `String`, and a genuinely non-UTF-8 blob copied in from another engine is a rare
 /// edge that would need `RowBinary` to preserve exactly.
 fn ch_json_cell(v: &Value) -> Json {
@@ -1047,7 +1047,7 @@ fn ch_json_cell(v: &Value) -> Json {
 
 /// Quote a ClickHouse identifier with backticks. ClickHouse processes backslash
 /// escapes *inside* backtick-quoted identifiers (unlike MySQL backticks), so the
-/// backslash must be doubled as well as the backtick — otherwise a name ending in
+/// backslash must be doubled as well as the backtick; otherwise a name ending in
 /// `\` (or a smuggled `` \` ``) escapes the closing backtick and breaks out of the
 /// identifier. Double `\` first so the backticks added next aren't re-escaped.
 fn ch_quote(ident: &str) -> String {
@@ -1080,7 +1080,7 @@ fn try_header(buf: &[u8]) -> Option<(Vec<String>, Vec<String>, usize)> {
 }
 
 /// Parse a whole `JSONCompactEachRowWithNamesAndTypes` body into columns, the raw
-/// type strings, and the raw JSON cell rows — the collected (bounded) read path.
+/// type strings, and the raw JSON cell rows: the collected (bounded) read path.
 fn parse_block(body: &[u8]) -> Result<RowBlock> {
     let mut lines = body
         .split(|&b| b == b'\n')
@@ -1164,7 +1164,7 @@ fn ch_value(v: &Json, ch_type: &str, max: Option<usize>) -> Value {
             }
             text_value(s, max)
         }
-        // Composite (Array / Tuple / Map / Nested) — render the compact JSON text.
+        // Composite (Array / Tuple / Map / Nested): render the compact JSON text.
         other => text_value(&other.to_string(), max),
     }
 }
@@ -1199,14 +1199,14 @@ fn ch_base_type(ty: &str) -> &str {
 }
 
 /// Whether a ClickHouse type is an integer family (`Int8`..`Int256`,
-/// `UInt8`..`UInt256`) — but not `Interval*`, which also begins `Int`-adjacent.
+/// `UInt8`..`UInt256`), but not `Interval*`, which also begins `Int`-adjacent.
 fn is_ch_int(ty: &str) -> bool {
     let base = ch_base_type(ty);
     base.starts_with("UInt") || (base.starts_with("Int") && !base.starts_with("Interval"))
 }
 
 /// Whether a ClickHouse type is a floating type (`Float32`/`Float64`). `Decimal`
-/// is deliberately *not* here — it's rendered as exact text to avoid f64 rounding.
+/// is deliberately *not* here; it's rendered as exact text to avoid f64 rounding.
 fn is_ch_float(ty: &str) -> bool {
     ch_base_type(ty).starts_with("Float")
 }
@@ -1306,12 +1306,12 @@ fn clean_error(body: &[u8]) -> String {
 // ClickHouse is OLAP: the conformance battery's 3 edit scenarios are excluded by
 // design (no transactional in-grid editing), and two scenarios are replaced by
 // ClickHouse-specific variants because their relational assumptions don't hold:
-//   * introspection — ClickHouse has no foreign keys or secondary indexes, so the
+//   * introspection: ClickHouse has no foreign keys or secondary indexes, so the
 //     shared helper (which asserts both) is replaced by a tables/views/columns/PK
 //     check with empty FK/index vecs;
 //   * the contains filter and the display-cap check assert a distinct BLOB type,
 //     which ClickHouse lacks (binary is `String`), so those get tailored variants.
-// Everything else — streaming, cancel, seek, count, export, explain, read-only — runs
+// Everything else (streaming, cancel, seek, count, export, explain, read-only) runs
 // the shared battery unchanged.
 #[cfg(test)]
 mod tests {
@@ -1345,7 +1345,7 @@ mod tests {
         format!("red_{name}_{}_{n}", std::process::id())
     }
 
-    /// The connection's database — unqualified fixtures land here, so introspection
+    /// The connection's database: unqualified fixtures land here, so introspection
     /// filters to it. Pulled from the DSN we connected with.
     fn database(url: &str) -> String {
         red_core::ConnectionConfig::parse_conn_str(url)
@@ -1371,7 +1371,7 @@ mod tests {
     async fn streams_in_bounded_windows() {
         let url = url_or_skip!();
         let driver = ClickhouseDriver::connect(&url, true).await.unwrap();
-        // `system.numbers` is a server-side streaming source — no fixture, never
+        // `system.numbers` is a server-side streaming source: no fixture, never
         // materialized server-side, mirroring the windowed read.
         battery::streams_in_bounded_windows(
             &driver,
@@ -1457,8 +1457,8 @@ mod tests {
             "id is in the (MergeTree) primary key"
         );
         assert!(col("title").not_null, "a non-Nullable column is NOT NULL");
-        assert!(detail.foreign_keys.is_empty(), "OLAP — no foreign keys");
-        assert!(detail.indexes.is_empty(), "OLAP — no secondary indexes");
+        assert!(detail.foreign_keys.is_empty(), "OLAP: no foreign keys");
+        assert!(detail.indexes.is_empty(), "OLAP: no secondary indexes");
 
         driver
             .execute(&format!("DROP TABLE {recent}"))
@@ -1630,7 +1630,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        // author_id is 1,1,2,NULL — NULLs + duplicates, narrowable by `author_id = 1`.
+        // author_id is 1,1,2,NULL: NULLs + duplicates, narrowable by `author_id = 1`.
         driver
             .execute(&format!(
                 "INSERT INTO {t} VALUES (1, 'a', 1), (2, 'b', 1), (3, 'c', 2), (4, 'd', NULL)"
@@ -1769,7 +1769,7 @@ mod tests {
         driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
     }
 
-    // Server-free unit test — always runs (no ClickHouse needed).
+    // Server-free unit test; always runs (no ClickHouse needed).
     #[test]
     fn create_table_sql_builds_mergetree_ddl() {
         let tref = TableRef {
@@ -1913,7 +1913,7 @@ mod tests {
         assert_eq!(
             page.rows[1][1],
             Value::Text(evil.into()),
-            "value stored verbatim — escaped by serde_json, not interpolated"
+            "value stored verbatim: escaped by serde_json, not interpolated"
         );
         assert_eq!(page.rows[2][1], Value::Null, "NULL inserted as NULL");
 

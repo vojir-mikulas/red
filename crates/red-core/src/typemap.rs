@@ -1,4 +1,4 @@
-//! A small normalized type lattice for cross-engine table creation — the keystone of
+//! A small normalized type lattice for cross-engine table creation, the keystone of
 //! the database-migration / "copy into a *new* table" path.
 //!
 //! dbgate carries a column's declared-type string **verbatim** across engines and
@@ -7,7 +7,7 @@
 //! it back out for the *target* engine, so a Postgres `int4` / `numeric(10,2)` /
 //! `bool` / `timestamptz` becomes a faithful MySQL/SQLite/Postgres column rather than
 //! invalid DDL. Types the lattice can't classify (`tsvector`, arrays, custom enums)
-//! fall through **verbatim** — exactly dbgate's behaviour — and report `true` from
+//! fall through **verbatim** (exactly dbgate's behaviour) and report `true` from
 //! [`is_lossy`] so the UI can warn before the user consents.
 //!
 //! This lives in `red-core` (not a driver) because both sides need it: the drivers
@@ -50,7 +50,7 @@ pub enum NormType {
 }
 
 /// Parse an engine-native declared type (`"character varying(255)"`, `"int4"`,
-/// `"Nullable(Int64)"`, `"DECIMAL(10,2)"`) into the lattice — best-effort, dialect-
+/// `"Nullable(Int64)"`, `"DECIMAL(10,2)"`) into the lattice: best-effort, dialect-
 /// agnostic, case-insensitive. An empty/`None` type maps to unbounded text.
 pub fn normalize(decl: &str) -> NormType {
     let raw = decl.trim();
@@ -123,7 +123,7 @@ pub fn normalize(decl: &str) -> NormType {
 }
 
 /// Spell a [`NormType`] as a `CREATE TABLE` column type for `kind`'s dialect.
-/// [`NormType::Unknown`] passes through verbatim (the source spelling) — the engine
+/// [`NormType::Unknown`] passes through verbatim (the source spelling); the engine
 /// accepts it (SQLite, by affinity) or rejects it at execute time, like dbgate.
 pub fn spell(kind: DbKind, t: &NormType) -> String {
     match kind {

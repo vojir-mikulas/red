@@ -1,17 +1,17 @@
-//! Conversation history — persisted AI chats, one JSON file per conversation (M-S5).
+//! Conversation history: persisted AI chats, one JSON file per conversation (M-S5).
 //!
 //! The assistant panel streams an ephemeral transcript; saved conversations are
 //! what the user keeps. Each lives as one file under
 //! `<config>/red/conversations/*.json`, beside `queries/`, `themes/`, and
-//! `settings.toml`. JSON (not Markdown) because a chat carries structured turns —
-//! roles, summarized thinking, the provider it ran on — that round-trip cleanly,
+//! `settings.toml`. JSON (not Markdown) because a chat carries structured turns
+//! (roles, summarized thinking, the provider it ran on) that round-trip cleanly,
 //! and the file stays plain enough to read, hand-edit, or delete in a file manager.
 //!
 //! Like the saved-queries loader in `queries.rs`, this is just the filesystem:
 //! there is no database and nothing is read at startup. The history picker calls
 //! [`load`] on demand, so external edits/deletions show up on the next open and
-//! saved chats cost the budget nothing at idle. **No secrets ever land here** —
-//! the subscription path's tokens stay with the agent; this stores only the
+//! saved chats cost the budget nothing at idle. **No secrets ever land here.**
+//! The subscription path's tokens stay with the agent; this stores only the
 //! transcript, title, and which backend produced it.
 
 use std::path::{Path, PathBuf};
@@ -39,14 +39,14 @@ pub(crate) struct StoredMessage {
 pub(crate) struct Conversation {
     /// Display title, derived from the first user message at save time.
     pub title: String,
-    /// Which backend produced it (`"subscription"`, `"anthropic"`, …) — recorded
+    /// Which backend produced it (`"subscription"`, `"anthropic"`, …), recorded
     /// for display and for a future per-chat binding (M-S6). Informational in M-S5,
     /// where a single active chat runs on the current `[ai] provider`.
     pub provider: String,
     /// Unix seconds when first saved.
     #[serde(default)]
     pub created_unix: u64,
-    /// Unix seconds of the most recent save — the picker's sort key.
+    /// Unix seconds of the most recent save; the picker's sort key.
     #[serde(default)]
     pub updated_unix: u64,
     /// The transcript, oldest first.
@@ -74,7 +74,7 @@ pub(crate) fn now_unix() -> u64 {
 }
 
 /// Read every `*.json` in the conversations dir, skipping (with a warning) any that
-/// won't parse — one bad file never blocks the others. Sorted by `updated_unix`
+/// won't parse, so one bad file never blocks the others. Sorted by `updated_unix`
 /// descending (most recent first) for the picker. A missing dir is an empty list.
 pub(crate) fn load() -> Vec<Conversation> {
     let Some(dir) = conversations_dir() else {
@@ -109,7 +109,7 @@ pub(crate) fn load() -> Vec<Conversation> {
 }
 
 /// Write `conv` to `<dir>/<stem>.json` atomically (temp file + rename) so a crash
-/// can't leave a partial file. Re-saving the same stem overwrites in place — the
+/// can't leave a partial file. Re-saving the same stem overwrites in place; the
 /// caller keeps the stem stable across a conversation's turns.
 pub(crate) fn save(stem: &str, conv: &Conversation) -> Result<PathBuf> {
     use std::io::Write;
@@ -121,7 +121,7 @@ pub(crate) fn save(stem: &str, conv: &Conversation) -> Result<PathBuf> {
     let contents = serde_json::to_string_pretty(conv).context("serializing the conversation")?;
     let tmp = dest.with_extension(format!("json.tmp.{}", std::process::id()));
     // Owner-only (0o600) on Unix: a transcript can quote query results the user
-    // asked about, so it's confidential even though no credentials land here — the
+    // asked about, so it's confidential even though no credentials land here; the
     // same posture as the AI report/audit files. `rename` preserves the mode.
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -141,7 +141,7 @@ pub(crate) fn save(stem: &str, conv: &Conversation) -> Result<PathBuf> {
 }
 
 /// Delete a saved conversation's file (the panel's Delete action). A missing file
-/// is fine — the user may have removed it by hand.
+/// is fine, since the user may have removed it by hand.
 pub(crate) fn delete(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -170,7 +170,7 @@ pub(crate) fn unique_stem(title: &str) -> String {
     base
 }
 
-/// A filesystem-safe stem for a title — lowercased, non-alphanumerics folded to
+/// A filesystem-safe stem for a title: lowercased, non-alphanumerics folded to
 /// `-`, edges trimmed, capped so a long first message doesn't make a long filename.
 /// Mirrors `queries.rs`'s `slug`.
 fn slug(title: &str) -> String {

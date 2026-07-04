@@ -4,7 +4,7 @@
 //!
 //! The core is a *counting global allocator*: every allocation and free bumps
 //! process-wide atomics, so a caller (the perf HUD, toggled with ⌥⌘P) can read
-//! allocations-per-frame and live bytes —
+//! allocations-per-frame and live bytes,
 //! the direct measure of the per-frame heap churn RED's render path is tuned to
 //! avoid. The only overhead is a couple of relaxed atomic adds per call, paid
 //! solely in `dev-stats` builds.
@@ -76,7 +76,7 @@ pub fn snapshot() -> Counters {
 
 // --- process RSS ----------------------------------------------------------
 
-/// The process's resident set size in bytes — the true footprint (heap + GPU
+/// The process's resident set size in bytes: the true footprint (heap + GPU
 /// driver + runtime + code), the thing `live_bytes` can't see. A syscall, so the
 /// HUD samples it on a throttle, not every frame. `None` if the platform read
 /// failed or isn't implemented.
@@ -162,11 +162,11 @@ pub fn rss_bytes() -> Option<usize> {
 /// numbers settle into a trend instead of strobing frame to frame.
 const RING: usize = 120;
 
-/// How often to re-read process RSS — a syscall, so it's throttled well below the
-/// frame rate.
+/// How often to re-read process RSS. It's a syscall, so it's throttled well below
+/// the frame rate.
 const RSS_INTERVAL: Duration = Duration::from_millis(250);
 
-/// A tiny fixed-size ring of `f32` samples with a running average — the smoother
+/// A tiny fixed-size ring of `f32` samples with a running average; the smoother
 /// behind the build-ms and allocs/frame readouts.
 struct Ring {
     samples: [f32; RING],
@@ -212,7 +212,7 @@ pub struct DevStats {
     rss: Option<usize>,
     last_rss: Instant,
     last_render: Instant,
-    /// Wall-clock gap since the previous render — the repaint cadence during
+    /// Wall-clock gap since the previous render: the repaint cadence during
     /// interaction (meaningless while idle; see the plan's fps caveat).
     interval_ms: f32,
 }
@@ -295,7 +295,7 @@ impl DevStats {
     }
 }
 
-/// A glance at the active result grid's footprint, for the HUD — confirms the
+/// A glance at the active result grid's footprint, for the HUD; confirms the
 /// windowed buffer stays flat over a huge result.
 pub struct GridSnapshot {
     /// Rows the buffer currently holds resident (bounded by the window margin).

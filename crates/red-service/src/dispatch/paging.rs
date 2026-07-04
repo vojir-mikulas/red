@@ -28,7 +28,7 @@ pub(crate) const BUILD_TRIGGER_DEPTH: usize = 100_000;
 /// A sparse `ordinal → key` index over an open keyset result: one entry every
 /// [`CHECKPOINT_STRIDE`] rows, built by a single background ordered traversal.
 /// Lets an exact jump to row N seek to the nearest checkpoint and skip `< stride`
-/// rows — O(stride), not O(N). Shared via `Arc<Mutex<…>>` so the build task fills
+/// rows: O(stride), not O(N). Shared via `Arc<Mutex<…>>` so the build task fills
 /// it incrementally while fetches read it.
 #[derive(Debug, Default)]
 pub(crate) struct CheckpointIndex {
@@ -40,7 +40,7 @@ pub(crate) struct CheckpointIndex {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub(crate) enum BuildStatus {
-    /// Not yet built (or invalidated by a write) — eligible to start.
+    /// Not yet built (or invalidated by a write); eligible to start.
     #[default]
     Idle,
     /// A background build is in flight; don't start another.
@@ -57,7 +57,7 @@ pub(crate) enum BuildStatus {
 pub(crate) struct OpenSpec {
     pub(crate) sql: String,
     pub(crate) key: Option<KeySpec>,
-    /// Positions of the key columns within a result row (lead, then tiebreaker) —
+    /// Positions of the key columns within a result row (lead, then tiebreaker);
     /// the checkpoint build reads each checkpoint's key tuple out of the row at
     /// these indices. Empty when the result isn't keyset-keyed.
     pub(crate) key_cols: Vec<usize>,
@@ -176,7 +176,7 @@ pub(crate) async fn run_fetch(
         RunFetch::Jump { ordinal, exact } => {
             // Key-space interpolation: land near `ordinal / total` of the key
             // range in one indexed seek. Approximate (exact only for dense,
-            // uniform keys) — the grid renders the run's ordinals with a `≈`.
+            // uniform keys); the grid renders the run's ordinals with a `≈`.
             // Skipped for an exact "go to row N": that wants the precise row, so
             // it falls straight through to the exact `OFFSET` page below.
             // Interpolates on the *lead* column only (a one-element prefix bound),
@@ -211,7 +211,7 @@ pub(crate) async fn run_fetch(
                                 abort,
                             )
                             .await?;
-                        // Jumping to ordinal 0 seeks from the true start — exact.
+                        // Jumping to ordinal 0 seeks from the true start, so exact.
                         if !page.rows.is_empty() {
                             return Ok((page.rows, *ordinal != 0));
                         }
@@ -221,7 +221,7 @@ pub(crate) async fn run_fetch(
                 }
             }
             // Exact jump: serve from the checkpoint index when it reaches this
-            // depth — seek to the nearest checkpoint, then skip `< stride` rows
+            // depth: seek to the nearest checkpoint, then skip `< stride` rows
             // (O(stride), exact). The build is kicked off by the `FetchRun` arm.
             if *exact {
                 if let Some((cp_ordinal, cp_key)) = nearest_checkpoint(spec, *ordinal) {
@@ -234,9 +234,9 @@ pub(crate) async fn run_fetch(
                     }
                 }
             }
-            // No usable key/bounds/index: one `OFFSET` page — O(ordinal), but a
-            // one-off; ordinals stay exact. Keyed mode, so the key column rides
-            // through verbatim — these rows' keys seed the run's seek bounds.
+            // No usable key/bounds/index: one `OFFSET` page (O(ordinal), but a
+            // one-off; ordinals stay exact). Keyed mode, so the key column rides
+            // through verbatim, and these rows' keys seed the run's seek bounds.
             let page = driver
                 .fetch_page(
                     &spec.sql,
@@ -313,7 +313,7 @@ pub(crate) async fn build_checkpoints(
     let mut skip = 0usize;
 
     loop {
-        // The tab closed or re-sorted — abandon the scan.
+        // The tab closed or re-sorted; abandon the scan.
         if !lock(&results).contains_key(&epoch) {
             return;
         }
@@ -322,7 +322,7 @@ pub(crate) async fn build_checkpoints(
             .await
         {
             Ok(page) => page,
-            // A superseded build's in-flight stride comes back interrupted — a
+            // A superseded build's in-flight stride comes back interrupted: a
             // clean stop, not a failure; leave the status so a later jump retries.
             Err(RedError::Interrupted) => {
                 lock(&spec.checkpoints).status = BuildStatus::Idle;
@@ -359,7 +359,7 @@ pub(crate) async fn build_checkpoints(
 
 /// Wrap a base query in `ORDER BY <position>` for the `OFFSET`-fallback sorted
 /// path (a sorted browse with no resolvable PK). Ordering by output *position*
-/// is engine-agnostic — it needs no identifier quoting — and the derived table is
+/// is engine-agnostic (it needs no identifier quoting), and the derived table is
 /// aliased because MySQL and Postgres both reject an unaliased subquery in `FROM`.
 pub(crate) fn wrap_sorted(base: &str, position: usize, descending: bool) -> String {
     let base = base.trim_end().trim_end_matches(';').trim_end();
@@ -381,7 +381,7 @@ pub(crate) fn wrap_where(base: &str, pred: &str) -> String {
 
 /// Lift a result-set [`red_core::Column`] to a [`red_core::ColumnMeta`] for the
 /// contains-filter column list, used when filtering editor SQL (no table to
-/// introspect). Only the name and declared type matter — `decl_type` lets the
+/// introspect). Only the name and declared type matter; `decl_type` lets the
 /// predicate skip blob columns; nullability / PK are irrelevant to a text search.
 pub(crate) fn col_meta_from_result(c: &red_core::Column) -> red_core::ColumnMeta {
     red_core::ColumnMeta {
@@ -462,7 +462,7 @@ mod checkpoint_tests {
     }
 
     /// The build walks the result in `CHECKPOINT_STRIDE` strides, recording the
-    /// key at each — and an exact jump is then served from the nearest one.
+    /// key at each, and an exact jump is then served from the nearest one.
     #[tokio::test]
     async fn builds_index_and_serves_exact_jump() {
         let (path, driver) = driver_with(25_000, "build");
@@ -530,7 +530,7 @@ mod checkpoint_tests {
 
     /// The open-result backstop GC: past [`MAX_OPEN_RESULTS`], reaping drops the
     /// lowest-epoch entries (and their in-flight handles) down to the cap, never
-    /// touching the just-opened epoch — so a leaking caller is bounded, not
+    /// touching the just-opened epoch, so a leaking caller is bounded, not
     /// unbounded. Below the cap it's a no-op.
     #[test]
     fn reap_excess_results_caps_to_the_lowest_epochs() {

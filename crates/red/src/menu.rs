@@ -1,9 +1,9 @@
 //! The native macOS menu bar. [`build_menus`] returns the static menu tree that
 //! `main.rs` hands to `cx.set_menus` at startup; on macOS GPUI mounts it as the
 //! global menu bar at the top of the screen (the seamless in-window titlebar is
-//! untouched — see `main.rs::titlebar_options`).
+//! untouched; see `main.rs::titlebar_options`).
 //!
-//! Every item references an **action struct that already exists** — the same
+//! Every item references an **action struct that already exists**: the same
 //! types `keymap.rs` binds. GPUI looks each action up in the keybinding registry
 //! and renders its accelerator automatically, so the menu and the keymap can't
 //! drift: `keymap.rs` stays the single source of truth for shortcuts.
@@ -12,12 +12,12 @@
 //! with [`OsAction`]s. On macOS those route through the standard Edit-menu
 //! selectors, so menu Copy/Cut/Paste/Select All drive editing inside the
 //! connection form's text fields. (The SQL `CodeEditor` uses a *separate* set of
-//! clipboard actions in Flint, so the menu items don't reach it — its own ⌘C/⌘V
+//! clipboard actions in Flint, so the menu items don't reach it; its own ⌘C/⌘V
 //! keystrokes still work. Unifying the two is tracked in `docs/deferred.md`.)
 //!
 //! The tree is a static snapshot. Dynamic content (Open Recent, `.checked()`
 //! state) would need a `refresh_menus` helper that re-calls `set_menus`; both are
-//! deferred — see `docs/deferred.md`.
+//! deferred (see `docs/deferred.md`).
 
 use gpui::{Menu, MenuItem, OsAction, SystemMenuType};
 
@@ -63,7 +63,7 @@ pub(crate) fn build_menus() -> Vec<Menu> {
             MenuItem::action("New Connection…", NewConnection),
         ]),
         Menu::new("Edit").items([
-            // Clipboard for text fields. Undo/Redo are intentionally omitted —
+            // Clipboard for text fields. Undo/Redo are intentionally omitted;
             // Flint's inputs have no undo stack yet (see `docs/deferred.md`).
             MenuItem::os_action("Cut", InputCut, OsAction::Cut),
             MenuItem::os_action("Copy", InputCopy, OsAction::Copy),
@@ -89,7 +89,7 @@ pub(crate) fn build_menus() -> Vec<Menu> {
             MenuItem::action("Command Palette…", ToggleCommandPalette),
         ]),
         Menu::new("Query").items([
-            // ⌘↵ runs the active tab's query — or tests the connection while the
+            // ⌘↵ runs the active tab's query, or tests the connection while the
             // connection form is open (the unified `RunQuery` action).
             MenuItem::action("Run Query", RunQuery),
             MenuItem::action("Refresh Schema", RefreshSchema),

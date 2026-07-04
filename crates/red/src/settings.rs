@@ -1,13 +1,13 @@
-//! Persisted UI preferences — a structured, hand-editable, Zed-style config.
+//! Persisted UI preferences: a structured, hand-editable, Zed-style config.
 //!
 //! These are app-wide presentation settings, not per-connection data, so they
 //! live in their own `settings.toml` beside `connections.toml` in the platform
 //! config dir. The flat key set grew into nested sections ([`AppearanceSettings`],
-//! [`GridSettings`], …); each is `#[serde(default)]` so a partial — or slightly
-//! wrong — file keeps every key it *can* read and defaults only the rest. A single
+//! [`GridSettings`], …); each is `#[serde(default)]` so a partial (or slightly
+//! wrong) file keeps every key it *can* read and defaults only the rest. A single
 //! bad key must never reset the whole file.
 //!
-//! Writes go through a temp-file + atomic rename; reads **never** fail — a missing
+//! Writes go through a temp-file + atomic rename; reads **never** fail. A missing
 //! or malformed file degrades to [`Settings::default`], because preferences are
 //! convenience, not user data, and a bad file must never block launch. A
 //! recoverable problem (one unreadable section, a typo'd value) surfaces as a
@@ -173,13 +173,13 @@ pub struct GridSettings {
     pub row_numbers: bool,
     /// What a SQL `NULL` renders as (e.g. `∅`, `NULL`, or blank).
     pub null_display: String,
-    /// Hard cap on the characters of any one cell the grid keeps resident — the
+    /// Hard cap on the characters of any one cell the grid keeps resident, the
     /// fat-cell memory rail. Clamped to a sane floor on load.
     pub max_cell_chars: usize,
     /// The streaming/keyset fetch window: how many rows a page request pulls.
     pub page_size: usize,
     /// Row threshold above which the column-stats bar withholds the (potentially
-    /// full-scan) `count(distinct)` until the user explicitly asks for it — so
+    /// full-scan) `count(distinct)` until the user explicitly asks for it, so
     /// selecting a column never silently launches a heavy query on a huge result.
     pub stats_distinct_max_rows: usize,
 }
@@ -210,7 +210,7 @@ pub enum Density {
 impl Density {
     pub const ALL: [Density; 3] = [Density::Compact, Density::Comfortable, Density::Spacious];
 
-    /// Index into [`Self::ALL`] — drives the segmented control.
+    /// Index into [`Self::ALL`]; drives the segmented control.
     pub fn index(self) -> usize {
         match self {
             Density::Compact => 0,
@@ -236,7 +236,7 @@ impl Density {
 
 // --- query -------------------------------------------------------------------
 
-/// Query-execution safety rails — RED's on-brand big-result defaults.
+/// Query-execution safety rails: RED's on-brand big-result defaults.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct QuerySettings {
@@ -271,7 +271,7 @@ impl QuerySettings {
 // --- behavior ----------------------------------------------------------------
 
 /// Session behaviour. `restore_last_session` is modeled but not yet wired (it
-/// touches the connection lifecycle + keychain — a follow-up). `false` is the
+/// touches the connection lifecycle + keychain, a follow-up). `false` is the
 /// derived default.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -313,18 +313,18 @@ impl UpdateSettings {
 // --- ai ----------------------------------------------------------------------
 
 /// AI assistant configuration (the right-docked chat sidebar). The API key does
-/// **not** live here — it routes through the OS keyring (see `crate::secrets`),
+/// **not** live here; it routes through the OS keyring (see `crate::secrets`),
 /// the same secret store connection passwords use. Only the non-secret knobs
 /// (provider, model, the thinking-display toggle) are persisted in `settings.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AiSettings {
-    /// The master switch. `false` is a true kill switch — no panel entry point,
+    /// The master switch. `false` is a true kill switch: no panel entry point,
     /// no MCP server, no agent process (M-S7). A connection can override it.
     pub enabled: bool,
     /// Which backend handles turns:
-    /// - `"anthropic"` (default) — the Claude Messages API, billed to an API key.
-    /// - `"subscription"` — Claude Code over ACP, billed to the user's Pro/Max
+    /// - `"anthropic"` (default): the Claude Messages API, billed to an API key.
+    /// - `"subscription"`: Claude Code over ACP, billed to the user's Pro/Max
     ///   subscription (the agent owns its own login; no key needed).
     pub provider: String,
     /// Database access tier the assistant's tools run at (M-S7): `"off"` (no DB
@@ -337,13 +337,13 @@ pub struct AiSettings {
     pub model: String,
     /// Default subscription-agent model selector, as the agent's opaque value id
     /// (set from the composer's dropdown). Applied to each new chat's session; empty
-    /// lets the agent keep its own default. Last choice wins — changing the dropdown
+    /// lets the agent keep its own default. Last choice wins: changing the dropdown
     /// rewrites this, but never retroactively changes already-open chats.
     pub subscription_model: String,
     /// Default subscription-agent reasoning-level selector (opaque value id), same
     /// semantics as `subscription_model`.
     pub subscription_reasoning: String,
-    /// Default subscription-agent permission-mode selector (opaque value id) — the
+    /// Default subscription-agent permission-mode selector (opaque value id): the
     /// agent's accept policy (default / accept edits / auto / bypass). Same
     /// last-choice-wins semantics as `subscription_model`.
     pub subscription_mode: String,
@@ -405,13 +405,13 @@ impl Default for AiSettings {
 
 /// The two built-in agent ids. Kept byte-stable: `"anthropic"` is the keyring
 /// account (`ai-key:anthropic`) and the binding old saved chats persist, and both
-/// are what legacy configs synthesize — renaming would orphan keys and chats.
+/// are what legacy configs synthesize; renaming would orphan keys and chats.
 pub const BUILTIN_API_AGENT: &str = "anthropic";
 pub const BUILTIN_ACP_AGENT: &str = "subscription";
 
 /// One user-defined agent profile (`[[ai.agents]]`). `kind` selects the backend:
 /// `"api"` (the Messages API via `red-ai`, optionally at a custom `base_url`) or
-/// `"acp"` (an external agent over ACP via `red-acp`, launched by `command` —
+/// `"acp"` (an external agent over ACP via `red-acp`, launched by `command`:
 /// Claude Code, `codex acp`, a local agent). The API key never lives here; it's in
 /// the OS keyring under `ai-key:<id>`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -601,7 +601,7 @@ impl FileSettingsStore {
             Ok(v) => v,
             Err(e) => {
                 // Fail closed: if we can't read the user's file at all, don't assume
-                // they wanted the assistant on — disable it rather than reverting to
+                // they wanted the assistant on; disable it rather than reverting to
                 // the permissive `AiSettings::default()`.
                 return LoadReport {
                     settings: Settings {
@@ -609,7 +609,7 @@ impl FileSettingsStore {
                         ..Settings::default()
                     },
                     warnings: vec![format!(
-                        "settings.toml isn't valid TOML ({e}) — using defaults; the assistant is \
+                        "settings.toml isn't valid TOML ({e}): using defaults; the assistant is \
                          disabled until it's fixed"
                     )],
                     migrated: false,
@@ -630,7 +630,7 @@ impl FileSettingsStore {
         let migrated = apply_legacy(&mut settings, &value);
 
         // Keep typography in a sane range so a stray hand-edit (0, negative, NaN,
-        // absurdly large) can't break layout. Silent — clamping isn't an "error".
+        // absurdly large) can't break layout. Silent; clamping isn't an "error".
         settings.appearance.ui_font_size = clamp_font_size(settings.appearance.ui_font_size);
         settings.editor.font_size = clamp_font_size(settings.editor.font_size);
         settings.editor.line_height = if settings.editor.line_height.is_finite() {
@@ -676,8 +676,8 @@ impl FileSettingsStore {
     }
 }
 
-/// The font sizes (px) the UI will accept. A value outside this range — or a NaN
-/// / infinity — falls back to the safe floor rather than breaking layout.
+/// The font sizes (px) the UI will accept. A value outside this range (or a NaN
+/// / infinity) falls back to the safe floor rather than breaking layout.
 pub const MIN_FONT_SIZE: f32 = 8.0;
 pub const MAX_FONT_SIZE: f32 = 32.0;
 
@@ -702,7 +702,7 @@ fn clamp_font_size(size: f32) -> f32 {
 }
 
 /// Deserialize one named section independently, defaulting (with a warning) if it
-/// is present but unreadable — so a single mistyped value degrades just its own
+/// is present but unreadable, so a single mistyped value degrades just its own
 /// section, never the whole file.
 fn section<T: Default + DeserializeOwned>(
     value: &toml::Value,
@@ -715,7 +715,7 @@ fn section<T: Default + DeserializeOwned>(
             Ok(parsed) => parsed,
             Err(e) => {
                 warnings.push(format!(
-                    "settings.toml: couldn't read [{key}] ({e}) — keeping defaults for that section"
+                    "settings.toml: couldn't read [{key}] ({e}); keeping defaults for that section"
                 ));
                 T::default()
             }
@@ -726,7 +726,7 @@ fn section<T: Default + DeserializeOwned>(
 /// Like [`section`] but **fails closed** for the security-sensitive `[ai]` table.
 /// A malformed section disables the assistant ([`AiSettings::disabled`]) instead of
 /// reverting to the permissive default (`enabled = true`, read tier), so a stray
-/// hand-edit — a typo'd key, a wrong-typed value — can't silently re-enable AI
+/// hand-edit (a typo'd key, a wrong-typed value) can't silently re-enable AI
 /// access against the user's intent. A missing section still uses the normal
 /// default (the shipped behavior).
 fn ai_section(value: &toml::Value, warnings: &mut Vec<String>) -> AiSettings {
@@ -736,7 +736,7 @@ fn ai_section(value: &toml::Value, warnings: &mut Vec<String>) -> AiSettings {
             Ok(parsed) => parsed,
             Err(e) => {
                 warnings.push(format!(
-                    "settings.toml: couldn't read [ai] ({e}) — the assistant is disabled until \
+                    "settings.toml: couldn't read [ai] ({e}); the assistant is disabled until \
                      it's fixed"
                 ));
                 AiSettings::disabled()
@@ -937,7 +937,7 @@ mod tests {
     fn malformed_ai_section_fails_closed() {
         // A wrong-typed key in [ai] (here a string for the bool `show_thinking`)
         // fails the whole section. It must disable the assistant rather than revert
-        // to the permissive default — even though `enabled = true` is set here, a
+        // to the permissive default; even though `enabled = true` is set here, a
         // parse failure must not leave AI on.
         let t = temp_store();
         write(

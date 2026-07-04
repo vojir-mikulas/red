@@ -22,7 +22,7 @@ impl AppState {
     pub(crate) fn toggle_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.switcher.read(cx).is_open() {
             // Closing: the popover's search field held focus, so dropping it leaves
-            // `window.focused()` dangling — reclaim the root (like `close_palette`)
+            // `window.focused()` dangling; reclaim the root (like `close_palette`)
             // or the *next* ⌘P finds no dispatch target and won't reopen.
             self.switcher.update(cx, |s, cx| s.close(cx));
             self.refocus_root = true;
@@ -30,7 +30,7 @@ impl AppState {
             return;
         }
         // Opening the popover only makes sense where its trigger is mounted (the
-        // connected topbar anchors it). The welcome screen has no anchor — but it
+        // connected topbar anchors it). The welcome screen has no anchor, but it
         // *is* a richer, searchable connection manager, so ⌘P keeps one meaning
         // ("quickly pick a connection") by focusing its search box. The transient
         // connecting splash has neither, so there it's a no-op.
@@ -84,12 +84,12 @@ impl AppState {
         let Some(target) = self.connections.get(index).map(|c| c.id.clone()) else {
             return;
         };
-        // Already the on-screen connection — nothing to do. Match on the stable id,
+        // Already the on-screen connection; nothing to do. Match on the stable id,
         // not the display name (two saved connections may share a name).
         if matches!(&self.phase, Phase::Connected(a) if a.conn_id == target) {
             return;
         }
-        // A warm parked session for this connection — the instant-switch path.
+        // A warm parked session for this connection: the instant-switch path.
         if let Some(&warm) = self
             .parked
             .iter()
@@ -99,7 +99,7 @@ impl AppState {
             self.switch_to_warm(warm, cx);
             return;
         }
-        // Cold — open a new session (parking the current one warm).
+        // Cold: open a new session (parking the current one warm).
         self.connect(index, cx);
     }
 
@@ -120,7 +120,7 @@ impl AppState {
         self.rebuild_switcher(cx);
     }
 
-    /// ⌘⇧P — flip to the previous connection: foreground the most-recently-used
+    /// ⌘⇧P: flip to the previous connection: foreground the most-recently-used
     /// warm parked session. Because switching *away* stamps the outgoing
     /// connection as most-recent, this toggles A ⇄ B. A no-op when nothing's parked.
     pub(crate) fn switch_to_previous(&mut self, cx: &mut Context<Self>) {
@@ -129,7 +129,7 @@ impl AppState {
         }
     }
 
-    /// ⌘1–⌘9 — jump to the `slot`-th (0-based) connection in the switcher's order
+    /// ⌘1–⌘9: jump to the `slot`-th (0-based) connection in the switcher's order
     /// (pinned, then this window, then open, then recent). Out-of-range is a no-op.
     pub(crate) fn switch_to_slot(&mut self, slot: usize, cx: &mut Context<Self>) {
         let order = switcher_order(&self.connections, &self.phase, &self.parked);
@@ -168,7 +168,7 @@ impl SwitcherBuckets {
         order
     }
 
-    /// The active connection's index *if* it warrants its own "This window" row —
+    /// The active connection's index *if* it warrants its own "This window" row:
     /// it's saved and hasn't already floated into the pinned bucket.
     fn this_window(&self) -> Option<usize> {
         self.active.filter(|ai| !self.pinned.contains(ai))
@@ -202,7 +202,7 @@ fn switcher_buckets(
         .collect();
     pinned.sort_by_key(|&i| std::cmp::Reverse(connections[i].last_accessed));
 
-    // "Open" — non-pinned, non-active warm sessions (recency desc).
+    // "Open": non-pinned, non-active warm sessions (recency desc).
     let mut open: Vec<usize> = connections
         .iter()
         .enumerate()
@@ -211,7 +211,7 @@ fn switcher_buckets(
         .collect();
     open.sort_by_key(|&i| std::cmp::Reverse(connections[i].last_accessed));
 
-    // "Recent" — non-pinned, non-active cold recents (recency desc, capped).
+    // "Recent": non-pinned, non-active cold recents (recency desc, capped).
     let mut recent: Vec<usize> = connections
         .iter()
         .enumerate()
@@ -291,8 +291,8 @@ pub(super) fn switcher_sections(
         item
     };
 
-    // Layer the state cues onto a row — the active checkmark + warm/connecting
-    // badge, a warm badge + target for an open session, else a recency line — so a
+    // Layer the state cues onto a row (the active checkmark + warm/connecting
+    // badge, a warm badge + target for an open session, else a recency line) so a
     // pinned row reads the same as it would under This window / Open / Recent.
     let decorate = |index: usize| -> SwitcherItem {
         let item = row(index);
@@ -345,7 +345,7 @@ pub(super) fn switcher_sections(
     (label.into(), dot, sections)
 }
 
-/// The switcher's pinned footer actions — always visible beneath the
+/// The switcher's pinned footer actions, always visible beneath the
 /// scrollable connection list.
 pub(super) fn switcher_footer() -> Vec<SwitcherItem> {
     vec![

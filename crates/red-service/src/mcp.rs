@@ -5,7 +5,7 @@
 //!
 //! It serves the exact same four read-only tools the API-key path uses
 //! (`crate::ai::tool_catalog` / `run_tool`), bound to one session's
-//! `DatabaseDriver` — so the model browses the database through the same guards a
+//! `DatabaseDriver`, so the model browses the database through the same guards a
 //! human does and (in M1) cannot mutate anything.
 //!
 //! Hardening: bound to loopback on a random port, gated by a per-session bearer
@@ -46,7 +46,7 @@ pub(crate) struct McpServer {
 impl McpServer {
     /// Bind a fresh loopback server backed by `driver`, gated by `policy`, and
     /// start accepting. The policy (access tier + resource guards, M-S7) is
-    /// captured here and enforced on every `tools/list`/`tools/call` — so the
+    /// captured here and enforced on every `tools/list`/`tools/call`, so the
     /// subscription agent sees exactly the catalog the tier allows and can't
     /// exceed the limits, the same gate the API-key path runs under.
     pub(crate) async fn start(
@@ -56,7 +56,7 @@ impl McpServer {
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let port = listener.local_addr()?.port();
-        // Two v4 UUIDs of entropy — a loopback-only secret, not a long-term key.
+        // Two v4 UUIDs of entropy: a loopback-only secret, not a long-term key.
         let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let url = format!("http://127.0.0.1:{port}/mcp");
 
@@ -87,7 +87,7 @@ impl McpServer {
                             report.clone(),
                         )
                     });
-                    // Errors here are per-connection (client hung up) — drop quietly.
+                    // Errors here are per-connection (client hung up); drop quietly.
                     let _ = http1::Builder::new().serve_connection(io, service).await;
                 });
             }
@@ -180,12 +180,12 @@ async fn dispatch(
         }
         "ping" => Ok(json!({})),
         "tools/list" => {
-            // The tier filters the catalog (M-S7) — the agent never even sees a
+            // The tier filters the catalog (M-S7): the agent never even sees a
             // tool above its access tier. The subscription/MCP path additionally
             // withholds *write* tools: a write executes only on the API-key path,
             // where per-statement approval is enforced in-process *before* the tool
             // runs. The MCP server can't verify the external agent actually prompted
-            // the user, so it never offers (or runs) a mutating tool — reads only.
+            // the user, so it never offers (or runs) a mutating tool; reads only.
             let tools: Vec<Json> = tool_catalog(&policy)
                 .into_iter()
                 .filter(|t| !crate::ai::is_write_tool(&t.name))
@@ -220,7 +220,7 @@ async fn dispatch(
             // (M-S7). Over budget → a tool error the model can recover from, not a
             // transport failure. Reserve a slot with a compare-update (not a plain
             // `fetch_add`) so a rejected over-budget call doesn't keep inflating the
-            // counter — matching the API path's check-then-increment in
+            // counter, matching the API path's check-then-increment in
             // `AiState::charge_tool_call`.
             let max = policy.limits.max_tool_calls;
             let over_budget = max != 0
@@ -423,7 +423,7 @@ mod tests {
         )
         .await;
         // The read-only gate (shared with the API-key path) reports a tool error,
-        // not a transport error — the model can recover from it.
+        // not a transport error, so the model can recover from it.
         assert_eq!(reply["result"]["isError"], json!(true));
     }
 
@@ -496,7 +496,7 @@ mod tests {
     #[tokio::test]
     async fn write_tier_is_read_only_over_mcp() {
         // Even at the Write tier on a writable connection, the subscription/MCP path
-        // never exposes or runs a write tool — writes are the API-key path's alone.
+        // never exposes or runs a write tool; writes are the API-key path's alone.
         let path = std::env::temp_dir().join(format!("red-mcp-w-{}.db", Uuid::new_v4()));
         {
             let conn = rusqlite::Connection::open(&path).unwrap();

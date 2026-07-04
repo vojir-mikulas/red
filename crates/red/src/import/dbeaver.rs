@@ -1,13 +1,13 @@
 //! DBeaver connection import.
 //!
 //! DBeaver stores connections in `<workspace>/<project>/.dbeaver/`:
-//! - `data-sources.json` — plaintext connection metadata (host/port/db/driver,
+//! - `data-sources.json`: plaintext connection metadata (host/port/db/driver,
 //!   SSH/SSL handlers), keyed by a stable connection id. **No secrets.**
-//! - `credentials-config.json` — the usernames + passwords, encrypted, correlated
+//! - `credentials-config.json`: the usernames + passwords, encrypted, correlated
 //!   by the same connection id.
 //!
 //! The credentials file is **AES-128-CBC / PKCS7** under a key hardcoded in
-//! DBeaver's `DefaultSecureStorage.LOCAL_KEY_CACHE` (public — it ships in the
+//! DBeaver's `DefaultSecureStorage.LOCAL_KEY_CACHE` (public; it ships in the
 //! binary). The file is raw binary: the first 16 bytes are the IV (fresh per
 //! write), the rest is ciphertext. When the user enabled a master password the
 //! hardcoded key won't decrypt it; we degrade to importing without passwords
@@ -28,7 +28,7 @@ use serde_json::Value as JsonValue;
 use super::{ImportReport, ImportedConnection};
 
 /// DBeaver's hardcoded AES-128 key (`DefaultSecureStorage.LOCAL_KEY_CACHE`), the
-/// signed Java bytes reinterpreted as unsigned. Public knowledge — it is compiled
+/// signed Java bytes reinterpreted as unsigned. Public knowledge; it is compiled
 /// into every DBeaver build that uses this storage path.
 const DBEAVER_KEY: [u8; 16] = [
     186, 187, 74, 159, 119, 74, 184, 83, 201, 108, 45, 101, 61, 254, 84, 74,

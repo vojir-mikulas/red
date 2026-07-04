@@ -2,11 +2,11 @@
 //! text, for the types `tokio-postgres` won't decode without an optional crate
 //! (chrono/uuid/serde_json/rust_decimal). Without these a `numeric`, `timestamp`,
 //! `date`, `time`, `uuid`, or `json(b)` cell decode-fails and surfaces as a silent
-//! NULL — the "wait, where's my data?" bug. We render the wire bytes ourselves
+//! NULL (the "wait, where's my data?" bug). We render the wire bytes ourselves
 //! instead. Every function is pure (bytes in, `String` out), so the formats are
 //! unit-tested without a live server.
 
-/// Microseconds per day — the unit of PostgreSQL's binary `timestamp`/`time`.
+/// Microseconds per day: the unit of PostgreSQL's binary `timestamp`/`time`.
 const USECS_PER_DAY: i64 = 86_400_000_000;
 /// Days between the Unix epoch (1970-01-01) and the PostgreSQL epoch (2000-01-01),
 /// which is the zero point of the binary `timestamp`/`date` encodings.
@@ -136,7 +136,7 @@ pub(crate) fn uuid_to_string(raw: &[u8]) -> Option<String> {
 }
 
 /// `(year, month, day)` from a day count relative to the Unix epoch. Howard
-/// Hinnant's `civil_from_days` — exact across the proleptic Gregorian calendar
+/// Hinnant's `civil_from_days`, exact across the proleptic Gregorian calendar
 /// with no lookup table.
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;

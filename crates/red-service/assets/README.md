@@ -3,7 +3,7 @@
 `report-charts.js` is the trusted bundle injected into AI-generated reports that
 contain interactive charts. It is **Chart.js v4 (UMD, minified)** concatenated
 with `report-renderer.js` (our small renderer). It is the only executable code in
-a report — it runs under the report's CSP nonce; the model's HTML and chart specs
+a report, running under the report's CSP nonce; the model's HTML and chart specs
 never execute. The report CSP also sets `connect-src 'none'`, so the bundle has no
 network egress.
 

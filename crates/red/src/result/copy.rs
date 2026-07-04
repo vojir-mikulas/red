@@ -1,8 +1,8 @@
-//! The "Copy to…" flow — stream a (filtered/sorted) result straight into another
+//! The "Copy to…" flow: stream a (filtered/sorted) result straight into another
 //! table, in the **same** connection or **another open** one. This is the on-ideology
 //! slice of dbgate's sprawling data-transfer suite: one gesture (pick a target,
-//! confirm a name-based mapping), no wizard, no intermediary file, no saved job —
-//! a streamed, typed, cancellable operation.
+//! confirm a name-based mapping), no wizard, no intermediary file, no saved job;
+//! just a streamed, typed, cancellable operation.
 //!
 //! The UI half: build the candidate target list, peek the target's columns
 //! (`CopyTargetColumns`), auto-map source→target by name, raise the copy confirm
@@ -22,7 +22,7 @@ use crate::app::{
 use crate::schema::SchemaState;
 
 /// Append one connection's writable tables to `out` as copy-target candidates.
-/// Read-only connections and engines that can't accept inserts are skipped — they'd
+/// Read-only connections and engines that can't accept inserts are skipped; they'd
 /// refuse the copy, so they must never appear as a target.
 fn collect_targets(
     out: &mut Vec<CopyTargetCandidate>,
@@ -51,7 +51,7 @@ fn collect_targets(
 }
 
 /// Append one connection's writable namespaces (schemas/databases) to `out` as
-/// "new table" copy targets — *every* namespace the schema tree shows, including an
+/// "new table" copy targets: *every* namespace the schema tree shows, including an
 /// empty one, so you can migrate into a brand-new/empty database. Read-only
 /// connections and engines that can't accept inserts are skipped (they can't be a
 /// write target), mirroring [`collect_targets`].
@@ -77,7 +77,7 @@ fn collect_namespaces(
 /// worth flagging in the preview (best-effort, non-blocking): same base type token is
 /// fine, and any number→number pairing is fine (int→bigint, etc.). Everything else is
 /// surfaced so the user consents before a possibly-lossy cross-engine cast (e.g.
-/// `tags text[] → text`). The copy itself never refuses — it binds under the target
+/// `tags text[] → text`). The copy itself never refuses; it binds under the target
 /// type and lets the engine reject a truly impossible bind.
 fn type_changed(src: &str, dst: &str) -> bool {
     let base = |t: &str| {
@@ -108,7 +108,7 @@ impl AppState {
     }
 
     /// The distinct writable namespaces (schemas/databases) across every open
-    /// connection — the "✦ New table…" rows of the "Copy to…" picker. Selecting one
+    /// connection: the "✦ New table…" rows of the "Copy to…" picker. Selecting one
     /// then prompts for a name and *creates* the table from the source's column shape,
     /// so this covers "migrate into a different / same-connection database".
     pub(crate) fn copy_namespace_candidates(&self) -> Vec<CopyNamespace> {
@@ -122,7 +122,7 @@ impl AppState {
         out
     }
 
-    /// Whether `session` already has a table/view named `name` in `schema` — the
+    /// Whether `session` already has a table/view named `name` in `schema`: the
     /// collision guard for "new table" copies, so the create path never silently
     /// appends into a pre-existing (possibly mismatched) table.
     pub(crate) fn namespace_has_table(&self, session: SessionId, schema: &str, name: &str) -> bool {
@@ -139,7 +139,7 @@ impl AppState {
         self.parked.get(&session).is_some_and(|c| has(&c.schema))
     }
 
-    /// `CopyTargetColumns`: the picked target's columns arrived — auto-map the source
+    /// `CopyTargetColumns`: the picked target's columns arrived, so auto-map the source
     /// result's columns onto them **by name**, summarize the mapping (flagging lossy
     /// type changes, unmatched target columns, and ignored source columns), and raise
     /// the copy confirm so the user sees exactly what will move before any write.
@@ -310,7 +310,7 @@ impl AppState {
             .map(|n| n.id)
     }
 
-    /// The kind (Copy vs Migrate) of the transfer toast carrying `copy_id` — the
+    /// The kind (Copy vs Migrate) of the transfer toast carrying `copy_id`; the
     /// shared `Copy*` handlers read it for the right verb; defaults to `Copy` if the
     /// toast is already gone.
     fn copy_kind(&self, copy_id: u64) -> TransferKind {

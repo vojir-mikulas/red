@@ -1,4 +1,4 @@
-//! Track B6 — DataGrip-style staged grid editing.
+//! Track B6: DataGrip-style staged grid editing.
 //!
 //! Editing is no longer a per-cell modal round-trip (the old B5 palette prompt).
 //! The user edits cells *in place*, the changes accumulate in a per-result
@@ -7,7 +7,7 @@
 //! **Revert** drops it.
 //!
 //! The load-bearing decision: staged edits key by **primary key**, not row index,
-//! so they survive the windowed buffer's eviction — a dirty cell is recognised by
+//! so they survive the windowed buffer's eviction; a dirty cell is recognised by
 //! its row's PK at paint time. The set is bounded by how many edits the user made,
 //! never by result size, so it stays inside the perf budget.
 
@@ -42,8 +42,8 @@ impl PkKey {
     }
 }
 
-/// One staged cell change: the new value, plus — for an inline-expanded FK column
-/// (Track B7) — the referenced-table target the edit writes to. A base-table cell
+/// One staged cell change: the new value, plus, for an inline-expanded FK column
+/// (Track B7), the referenced-table target the edit writes to. A base-table cell
 /// carries `foreign = None` and is written via its row's PK; a joined cell carries
 /// the [`ForeignEdit`] resolved when the edit began, so submit needn't re-resolve it
 /// against a possibly-evicted buffer row.
@@ -162,9 +162,9 @@ pub(crate) struct EditOverlay {
     pub(crate) deleted: HashSet<usize>,
 }
 
-/// The cell an open inline editor targets — an existing keyed row, or a draft
+/// The cell an open inline editor targets: an existing keyed row, or a draft
 /// (insert) row identified by its index in [`PendingChanges::inserts`].
-// `Row` is inherently far larger than `Draft` (it carries the cell's full identity —
+// `Row` is inherently far larger than `Draft` (it carries the cell's full identity:
 // two `Value`s plus the FK write target); this enum is single-instance, short-lived
 // app state (one open editor), so the size skew doesn't warrant boxing.
 #[allow(clippy::large_enum_variant)]
@@ -175,7 +175,7 @@ pub(crate) enum EditSlot {
         data_col: usize,
         pk_value: Value,
         original: Value,
-        /// Set when the cell is an inline-expanded FK column — the referenced-table
+        /// Set when the cell is an inline-expanded FK column: the referenced-table
         /// write target (Track B7). `None` for an ordinary base-table cell.
         foreign: Option<ForeignEdit>,
     },
@@ -201,7 +201,7 @@ impl ResultGrid {
     /// Build the ordered batch of [`EditOp`]s the staged change-set represents:
     /// updates, then deletes, then draft inserts. Empty (no-column) updates/inserts
     /// are skipped. Returns an empty vec when the result has no usable PK (it can't
-    /// be edited) — the caller treats that as nothing to submit.
+    /// be edited); the caller treats that as nothing to submit.
     pub(in crate::result) fn build_edit_ops(&self) -> Vec<EditOp> {
         let Some((schema, name)) = self.table.clone() else {
             return Vec::new();
@@ -214,7 +214,7 @@ impl ResultGrid {
             schema: Some(schema.clone()),
             name: name.clone(),
         };
-        // The column's `(name, declared type)` — the type rides along so the driver
+        // The column's `(name, declared type)`; the type rides along so the driver
         // can bind a text-decoded value (jsonb, timestamp, …) back into its column.
         let col_meta = |c: usize| {
             self.columns
@@ -334,7 +334,7 @@ impl AppState {
         self.open_cell_editor(slot, ctx.decl_type.clone(), ctx.epoch, &current, cx);
     }
 
-    /// Begin editing a draft (insert) row's cell — from a click in the draft zone.
+    /// Begin editing a draft (insert) row's cell, from a click in the draft zone.
     pub(crate) fn begin_draft_edit(
         &mut self,
         index: usize,
@@ -380,7 +380,7 @@ impl AppState {
             other => other.to_string(),
         };
         let input = cx.new(|cx| {
-            // `bare`: no box of its own — it fills the grid cell, inheriting the
+            // `bare`: no box of its own; it fills the grid cell, inheriting the
             // row's height, padding, font, and selection highlight, so the cell
             // itself becomes the input rather than a smaller box inside it.
             let mut input = TextInput::new(cx).bare();
@@ -602,7 +602,7 @@ impl AppState {
 
     /// Submit the staged change-set: build the batch, then open the count + combined
     /// preview confirm (the destructive-statement guard, kept by design). No-op with
-    /// nothing staged — the caller (⌘↵ in the grid) falls back to running the query.
+    /// nothing staged; the caller (⌘↵ in the grid) falls back to running the query.
     pub(crate) fn submit_changes(&mut self, cx: &mut Context<Self>) {
         // Flush a half-typed cell first so it isn't silently dropped.
         if self.grid_edit.is_some() {
@@ -654,7 +654,7 @@ impl AppState {
         if let Some(grid) = self.result_by_epoch(epoch) {
             // A foreign (inline-expanded FK) edit rewrites a referenced row that may
             // be shared by several base rows, so an in-place patch would leave the
-            // other rows stale — reload so the whole denormalized view re-resolves,
+            // other rows stale; reload so the whole denormalized view re-resolves,
             // same as a structural (delete/insert) change.
             let foreign = grid
                 .pending
@@ -688,8 +688,8 @@ impl AppState {
         cx.notify();
     }
 
-    /// Re-open the active result with its current sort + filter under a fresh epoch
-    /// — used after a structural submit (deletes/inserts) or a foreign FK-column edit
+    /// Re-open the active result with its current sort + filter under a fresh epoch;
+    /// used after a structural submit (deletes/inserts) or a foreign FK-column edit
     /// so the result re-resolves. Reuses [`ResultGrid::reopen_spec`] so the inline FK
     /// expansion (the `LEFT JOIN` set) is carried through the reload rather than lost.
     fn reload_active_result(&mut self, cx: &mut Context<Self>) {

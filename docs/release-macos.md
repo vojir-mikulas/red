@@ -7,8 +7,8 @@
 This is the canonical release guide. It assumes the repo state as of writing:
 the binary target is **`Red`** (`crates/red/Cargo.toml`), all runtime assets
 (fonts, icons, default settings) are **baked into the binary** via `rust-embed`,
-and there is currently **no `.app` bundle** — macOS derives the menu title from
-the executable filename. Bundling is the first thing this plan adds.
+and there is currently **no `.app` bundle**, so macOS derives the menu title from
+the executable filename. Bundling is the first thing this guide adds.
 
 ## Why this matters
 
@@ -20,7 +20,7 @@ modern macOS. That is the bar for a public download.
 
 We distribute **outside the Mac App Store** using a **Developer ID Application**
 certificate. This needs the hardened runtime and notarization, but **not** the
-App Sandbox — so the DB drivers' network access and Keychain use work without
+App Sandbox, so the DB drivers' network access and Keychain use work without
 sandbox entitlements.
 
 ---
@@ -32,13 +32,13 @@ sandbox entitlements.
 | **Apple Developer Program** | <https://developer.apple.com/programs/> | $99/yr. Individual is fine; the Team ID is what matters. |
 | **Team ID** | Membership page → "Team ID" (10 chars, e.g. `A1B2C3D4E5`) | Goes into the bundle/notarization. |
 | **Developer ID Application certificate** | See §1 | The signing identity for distributed apps. |
-| **App Store Connect API key** | See §2 | Used by `notarytool` in CI — no Apple ID password in CI. |
+| **App Store Connect API key** | See §2 | Used by `notarytool` in CI; no Apple ID password needed there. |
 | Xcode command-line tools | `xcode-select --install` | Provides `codesign`, `notarytool`, `stapler`, `iconutil`. |
 
-> **Bundle identifier:** pick one now and never change it — it ties the
+> **Bundle identifier:** pick one now and never change it; it ties the
 > notarization ticket, Keychain items, and `defaults` domain together. Use a
 > reverse-DNS string you control, e.g. `dev.vojir.red` or `com.github.vojir-mikulas.red`.
-> This guide uses **`dev.vojir.red`** as a placeholder — replace consistently.
+> This guide uses **`dev.vojir.red`** as a placeholder; replace consistently.
 
 ---
 
@@ -82,7 +82,7 @@ password. Cleaner for CI and not tied to one person.
 ## 3. Bundle the `.app`
 
 A macOS `.app` is a directory with a fixed layout. Because all Red assets are
-embedded in the binary, the bundle is minimal — binary + `Info.plist` + icon.
+embedded in the binary, the bundle is minimal: binary + `Info.plist` + icon.
 
 ```
 Red.app/
@@ -121,7 +121,7 @@ echo "wrote $OUT"
 > SVG→PNG: `rsvg-convert -w 1024 -h 1024 assets/red.svg -o build/icon-1024.png`
 > (`brew install librsvg`), or export once from a design tool and commit
 > `assets/icon-1024.png` so CI needs no SVG toolchain. The brand mark is a mask
-> tinted to the accent `#dc2626` — bake a solid background into the icon master
+> tinted to the accent `#dc2626`; bake a solid background into the icon master
 > so it reads on both Finder light/dark.
 
 ### 3b. `Info.plist`
@@ -153,7 +153,7 @@ git tag at build time (§5/§6).
 
 ### 3c. Bundle script
 
-Commit `scripts/bundle-mac.sh` — builds release, assembles the `.app`,
+Commit `scripts/bundle-mac.sh`: it builds release, assembles the `.app`, and
 substitutes the version. (Signing/notarization live in §4–6 and call into this.)
 
 ```sh
@@ -200,7 +200,7 @@ nested frameworks today, so it's a single `codesign` of the bundle.
 
 Commit `crates/red/resources/red.entitlements`. Red is **not** sandboxed; this
 file stays minimal. Only add an entitlement when something breaks under the
-hardened runtime (it shouldn't — no JIT, no unsigned plugin loading).
+hardened runtime (it shouldn't: no JIT, no unsigned plugin loading).
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -229,7 +229,7 @@ spctl -a -vvv --type exec build/Red.app   # "accepted" once notarized & stapled
 ```
 
 > `--timestamp` (secure timestamp) is mandatory for notarization. `spctl` will
-> say "rejected" until §5 staples the ticket — that's expected.
+> say "rejected" until §5 staples the ticket; that's expected.
 
 ---
 
@@ -253,7 +253,7 @@ xcrun stapler staple build/Red.app
 xcrun stapler validate build/Red.app
 ```
 
-If notarization fails, fetch the log — it pinpoints the offending binary/flag:
+If notarization fails, fetch the log; it pinpoints the offending binary/flag:
 
 ```sh
 xcrun notarytool log <submission-id> --key … --key-id … --issuer …
@@ -287,10 +287,9 @@ xcrun stapler staple build/Red-__VERSION__.dmg
 
 ## 7. CI automation — release on tag
 
-Add `.github/workflows/release.yml`. It fires on a `v*` tag (the existing release
-ritual in `CHANGELOG.md`: `git tag v0.1.0 && git push origin v0.1.0`), builds a
-universal `.app`, signs, notarizes, staples, packages, and uploads to a GitHub
-Release. The existing `ci.yml` (fmt/clippy/test) stays the gate for `main`/PRs;
+Add `.github/workflows/release.yml`. It fires on a `v*` tag (cut a release with
+`git tag vX.Y.Z && git push origin vX.Y.Z`), builds a universal `.app`, signs,
+notarizes, staples, packages, and uploads to a GitHub Release. The existing `ci.yml` (fmt/clippy/test) stays the gate for `main`/PRs;
 this is additive.
 
 ### Required repository secrets
@@ -451,9 +450,8 @@ Land it in small, verifiable steps rather than one big CI commit:
 
 ## Future / out of scope
 
-- **Auto-update** (Sparkle or a custom check against GitHub Releases) — see
-  `docs/plans/self-update.md` if it exists; a notarized appcast feed builds on
-  this pipeline.
-- **Homebrew Cask** — once `.dmg` releases are stable, a `cask` makes
+- **Auto-update** (Sparkle or a custom check against GitHub Releases); a
+  notarized appcast feed builds on this pipeline.
+- **Homebrew Cask**: once `.dmg` releases are stable, a `cask` makes
   `brew install --cask red` trivial and is low-maintenance.
-- **Windows / Linux packaging** — separate guides; this one is macOS-only.
+- **Windows / Linux packaging**: separate guides; this one is macOS-only.

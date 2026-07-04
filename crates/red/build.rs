@@ -1,5 +1,5 @@
-//! Build provenance baked into the binary at compile time. Emits two env vars —
-//! `RED_GIT_SHA` (short commit) and `RED_BUILD_DATE` (UTC `YYYY-MM-DD`) — that the
+//! Build provenance baked into the binary at compile time. Emits two env vars,
+//! `RED_GIT_SHA` (short commit) and `RED_BUILD_DATE` (UTC `YYYY-MM-DD`), that the
 //! About tab surfaces so a build is unambiguous in bug reports and update checks
 //! (Phase 2 of docs/plans/self-update.md). Best-effort: a source archive with no
 //! git degrades the SHA to "unknown" rather than failing the build.
@@ -23,13 +23,13 @@ fn main() {
     // chrono just for a build stamp).
     println!("cargo:rustc-env=RED_BUILD_DATE={}", build_date_utc());
 
-    // Re-run when HEAD moves so the SHA tracks the working commit. Best-effort —
+    // Re-run when HEAD moves so the SHA tracks the working commit. Best-effort;
     // a missing path (e.g. a git worktree or tarball) just means "always re-run".
     println!("cargo:rerun-if-changed=../../.git/HEAD");
 }
 
 /// Today's UTC date as `YYYY-MM-DD`. Converts the Unix day count to a civil date
-/// with Howard Hinnant's `days_from_civil` inverse — exact for any date and free
+/// with Howard Hinnant's `days_from_civil` inverse, exact for any date and free
 /// of leap-year edge cases. Falls back to "unknown" only if the clock predates
 /// the epoch (unreachable in practice).
 fn build_date_utc() -> String {

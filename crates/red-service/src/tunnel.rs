@@ -2,7 +2,7 @@
 //!
 //! When a [`ConnectionConfig`] carries an [`SshConfig`], the service opens one of
 //! these *before* the driver and points the driver at the tunnel's local port
-//! instead of the real host. The drivers stay SSH-unaware — they just dial a
+//! instead of the real host. The drivers stay SSH-unaware; they just dial a
 //! `127.0.0.1:<port>` DSN (see [`ConnectionConfig::local_dsn`]).
 //!
 //! The forward is **persistent**, not a single piped socket: a Postgres driver
@@ -11,8 +11,8 @@
 //! therefore bind a local listener and, on *each* inbound accept, open a fresh
 //! `direct-tcpip` channel to the database host as seen from the jump host.
 //!
-//! Lifetime: a [`Tunnel`] is owned by the session it serves and torn down with it
-//! — dropping it aborts the accept loop, which drops the SSH handle and closes the
+//! Lifetime: a [`Tunnel`] is owned by the session it serves and torn down with it.
+//! Dropping it aborts the accept loop, which drops the SSH handle and closes the
 //! session; in-flight forwarded sockets then error out and finish on their own.
 //!
 //! Host keys are verified against `~/.ssh/known_hosts`, fail-closed: an unknown
@@ -42,7 +42,7 @@ impl Drop for Tunnel {
     }
 }
 
-/// Why a server's host key was rejected — surfaced from the connect [`Handler`]
+/// Why a server's host key was rejected, surfaced from the connect [`Handler`]
 /// through `russh`'s `H::Error` channel so we can render a precise message.
 #[derive(Debug)]
 enum HandlerError {
@@ -56,7 +56,7 @@ enum HandlerError {
         fingerprint: String,
         key: String,
     },
-    /// The host *is* in `known_hosts` but the key differs — a possible MITM.
+    /// The host *is* in `known_hosts` but the key differs: a possible MITM.
     HostMismatch { host: String },
     /// `known_hosts` couldn't be read for some other reason.
     Other(String),
@@ -203,7 +203,7 @@ async fn authenticate_agent(
     user: &str,
 ) -> Result<bool> {
     // ssh-agent transport is platform-specific: a Unix socket via `$SSH_AUTH_SOCK`
-    // on Unix, the OpenSSH named pipe on Windows. Only the connect differs — the
+    // on Unix, the OpenSSH named pipe on Windows. Only the connect differs; the
     // identity walk below is generic over the agent's stream type.
     #[cfg(unix)]
     let mut agent = russh::keys::agent::client::AgentClient::connect_env()
@@ -258,13 +258,13 @@ fn map_handler_err(e: HandlerError) -> RedError {
             key,
         },
         HandlerError::HostMismatch { host } => RedError::Auth(format!(
-            "SSH host key for {host} does not match ~/.ssh/known_hosts — possible \
+            "SSH host key for {host} does not match ~/.ssh/known_hosts: possible \
              man-in-the-middle. Connection refused."
         )),
     }
 }
 
-/// Append a server's host key to `~/.ssh/known_hosts` — the "trust this host"
+/// Append a server's host key to `~/.ssh/known_hosts`: the "trust this host"
 /// action behind an unknown-host connect failure. `key` is the OpenSSH-encoded
 /// public key carried by [`RedError::SshHostUnknown`].
 pub(crate) fn trust_host(host: &str, port: u16, key: &str) -> Result<()> {
@@ -279,7 +279,7 @@ mod tests {
     use super::*;
 
     /// A throwaway Ed25519 host key for the in-process SSH server below. Generated
-    /// for tests only — never used anywhere real.
+    /// for tests only; never used anywhere real.
     const TEST_HOST_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
 QyNTUxOQAAACD8Wa/iX3qLQqdMR/aXzOAmutfnI1aLE/oUJYkLuqZZlAAAAJBjOv+EYzr/
@@ -427,7 +427,7 @@ AAAEAsgG66AZ1coZRS0N1OW3YSKfVp76vXarHs06agqv8p5/xZr+JfeotCp0xH9pfM4Ca6
 
     #[test]
     fn changed_host_key_is_a_fatal_auth_error() {
-        // A *changed* key is a hard stop (possible MITM) — fatal `Auth`, no trust.
+        // A *changed* key is a hard stop (possible MITM): fatal `Auth`, no trust.
         let mismatch = map_handler_err(HandlerError::HostMismatch {
             host: "bastion".into(),
         });

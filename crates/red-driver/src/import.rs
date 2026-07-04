@@ -1,4 +1,4 @@
-//! Streaming row readers for data import (CSV / JSONL) — the read-side mirror of
+//! Streaming row readers for data import (CSV / JSONL), the read-side mirror of
 //! `format.rs`'s [`ExportWriter`](crate::format::ExportWriter). Engine-independent:
 //! yields one row of raw *text* cells at a time, holding at most one record in
 //! memory, never the whole file. The dispatch import loop coerces each cell to a
@@ -114,7 +114,7 @@ impl<R: BufRead> ImportReader<R> {
 }
 
 /// A minimal RFC 4180 record reader. Reads whole lines and, when a line ends inside
-/// an open quote (odd number of `"` so far — doubled `""` escapes count as two and
+/// an open quote (odd number of `"` so far; doubled `""` escapes count as two and
 /// stay even), keeps appending lines until the quotes balance, so a field with an
 /// embedded newline isn't split across records.
 struct CsvReader<R: BufRead> {

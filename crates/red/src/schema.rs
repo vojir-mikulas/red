@@ -1,7 +1,7 @@
 //! The schema explorer: the left-sidebar tree of namespaces → tables/views →
 //! columns, plus the table preview rendered in the results pane.
 //!
-//! The generic, virtualized tree lives in Flint; the *domain* logic is here — the
+//! The generic, virtualized tree lives in Flint; the *domain* logic is here: the
 //! schema model fetched over `Command`/`Event`, lazy column loading on expand,
 //! the live name filter, and turning a double-clicked table into a read-only
 //! `SELECT` preview. State hangs off [`ActiveConn`] so it lives for the connection
@@ -99,7 +99,7 @@ enum RowContent {
 }
 
 /// One visible tree row: the structural `item` Flint's `Tree` draws, the content
-/// RED renders, the node's identity (for toggle/select), and — for an object —
+/// RED renders, the node's identity (for toggle/select), and (for an object)
 /// the `(schema, table)` a double-click previews.
 struct VisibleRow {
     item: TreeItem,
@@ -109,7 +109,7 @@ struct VisibleRow {
 }
 
 /// Walk the schema model in display order into the currently-visible rows,
-/// applying expansion and the name filter. Pure over the in-memory model — no
+/// applying expansion and the name filter. Pure over the in-memory model, no
 /// backend round-trip. When filtering, matched branches force open and only
 /// matching leaves show, so the filter reads as a live reveal.
 fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
@@ -319,7 +319,7 @@ fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
 /// quote. Embedded quote chars are doubled either way.
 ///
 /// ClickHouse also uses double quotes but, unlike SQLite/Postgres, honors backslash
-/// escapes inside them, so its backslashes are doubled too — otherwise a table name
+/// escapes inside them, so its backslashes are doubled too; otherwise a table name
 /// ending in `\` escapes the closing quote and breaks out.
 pub(crate) fn quote_ident(ident: &str, kind: DbKind) -> String {
     match kind {
@@ -468,7 +468,7 @@ impl AppState {
 
     /// Drive the schema tree from the keyboard (the focused sidebar's arrows +
     /// Enter). Recomputes the same flattened, filtered visible list the render
-    /// uses, then moves the selection, toggles expansion, or previews — reusing
+    /// uses, then moves the selection, toggles expansion, or previews, reusing
     /// the existing click/double-click handlers so keyboard and mouse stay in step.
     fn schema_nav(&mut self, nav: TreeNav, cx: &mut Context<Self>) {
         // Snapshot the visible rows (owned, so no borrow of `self` is held while
@@ -509,7 +509,7 @@ impl AppState {
                         self.schema_toggle(node, cx);
                     }
                 } else if row.item.expanded {
-                    // Already open — descend to the first child (next row down).
+                    // Already open: descend to the first child (next row down).
                     if let Some(ix) = next_navigable(&flat, sel, true) {
                         self.schema_focus_row(&flat, ix, cx);
                     }
@@ -523,7 +523,7 @@ impl AppState {
                         self.schema_toggle(node, cx);
                     }
                 } else if row.item.depth > 0 {
-                    // A leaf or collapsed node — jump to the parent (nearest row
+                    // A leaf or collapsed node: jump to the parent (nearest row
                     // above at a shallower depth).
                     if let Some(p) = (0..i).rev().find(|&j| flat[j].item.depth < row.item.depth) {
                         self.schema_focus_row(&flat, p, cx);
@@ -561,7 +561,7 @@ impl AppState {
     }
 
     /// Preview a table/view: open `SELECT * FROM schema.table` in a **new** query
-    /// tab so the user's current query and result are preserved. No `LIMIT` — the
+    /// tab so the user's current query and result are preserved. No `LIMIT`; the
     /// grid pages through it with flat memory. The new tab's editor is pre-filled.
     pub(crate) fn schema_preview(&mut self, schema: String, table: String, cx: &mut Context<Self>) {
         // Highlight the previewed object in the sidebar tree, then open it.
@@ -575,7 +575,7 @@ impl AppState {
     }
 
     /// Open `SELECT * FROM schema.table` (optionally pre-filtered) in a reused
-    /// pristine tab or a fresh one — the shared path for the sidebar preview and the
+    /// pristine tab or a fresh one: the shared path for the sidebar preview and the
     /// FK click-through (Track B7). The editor is pre-filled with the base SQL; a
     /// `filter` narrows the result without changing the shown query.
     pub(crate) fn open_table_browse(
@@ -614,7 +614,7 @@ impl AppState {
                 active.tab_scroll.scroll_to_item(from);
             }
         } else {
-            // No pristine tab to reuse (incl. the empty-strip case) — open one.
+            // No pristine tab to reuse (incl. the empty-strip case), so open one.
             let tab = crate::app::QueryTab::new(label.clone(), cx);
             self.push_tab(tab, cx);
         }

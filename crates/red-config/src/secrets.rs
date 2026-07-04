@@ -1,14 +1,14 @@
 //! Connection credentials live in the OS keychain, never in `connections.toml`.
 //!
 //! SECURITY: secrets handled here are *never* logged and *never* written to the
-//! config file — they live only in the platform secret store (Keychain on macOS,
+//! config file; they live only in the platform secret store (Keychain on macOS,
 //! Credential Manager on Windows, Secret Service on Linux), behind the [`keyring`]
 //! crate. The config file persists only a stable connection [`id`](super::config),
 //! which is the keychain *account*; the password is fetched by id on demand.
 //!
 //! These calls are sync and blocking, and on macOS each keychain *item* read can
 //! pop a system "allow" dialog. To keep that to **one prompt per connection per
-//! app run** (rather than one per connect — painful with reconnect-on-switch), a
+//! app run** (rather than one per connect, painful with reconnect-on-switch), a
 //! process-wide in-memory [`CACHE`] answers repeat reads: the keychain is hit on
 //! the first read of an id, and every later read of the same id is served from
 //! memory. RED accepts UI-thread reads here because the keychain is touched at
@@ -153,8 +153,8 @@ pub fn get_ai_key(provider: &str) -> Result<Option<String>> {
     read(&ai_key_account(provider))
 }
 
-/// Store (or replace) the AI provider's API key. Never written to `settings.toml`
-/// — it lives only in the OS keychain, like connection passwords.
+/// Store (or replace) the AI provider's API key. Never written to `settings.toml`;
+/// it lives only in the OS keychain, like connection passwords.
 pub fn set_ai_key(provider: &str, key: &str) -> Result<()> {
     write(&ai_key_account(provider), key)
 }
@@ -166,8 +166,8 @@ pub fn delete_ai_key(provider: &str) -> Result<()> {
     remove(&ai_key_account(provider))
 }
 
-/// Remove every secret filed under a connection id — DB password plus both SSH
-/// secrets — so deleting a connection never orphans a credential. Idempotent.
+/// Remove every secret filed under a connection id (DB password plus both SSH
+/// secrets) so deleting a connection never orphans a credential. Idempotent.
 pub fn delete_all(id: &str) -> Result<()> {
     remove(id)?;
     remove(&ssh_password_account(id))?;
@@ -179,7 +179,7 @@ pub fn delete_all(id: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Exercises the real OS keychain — ignored by default (CI has none, and on
+    /// Exercises the real OS keychain; ignored by default (CI has none, and on
     /// macOS it pops a system dialog). Run locally with `cargo test -- --ignored`.
     #[test]
     #[ignore = "touches the real OS keychain"]

@@ -1,4 +1,4 @@
-//! Shared domain types for RED. No UI, no async runtime, no driver knowledge —
+//! Shared domain types for RED. No UI, no async runtime, no driver knowledge:
 //! the protocol/service/UI layers all speak in these types. Mirrors the role of
 //! `nyx-core` in the Nyx codebase.
 
@@ -15,7 +15,7 @@ pub enum DbKind {
     #[default]
     Sqlite,
     Mysql,
-    /// ClickHouse — the OLAP engine, reached over its HTTP interface. A writable
+    /// ClickHouse: the OLAP engine, reached over its HTTP interface. A writable
     /// connection can be an INSERT / copy / migration *target*, but has no in-grid
     /// editing: `UPDATE`/`DELETE` are async `ALTER … UPDATE` mutations with no
     /// transaction/rollback over a non-unique sort key, so its driver refuses
@@ -25,7 +25,7 @@ pub enum DbKind {
 
 impl DbKind {
     /// Every engine, in the order the connection form lists them. Adding a driver
-    /// means adding a variant here and an arm to each accessor below — the form is
+    /// means adding a variant here and an arm to each accessor below; the form is
     /// data-driven off these, not a hand-maintained list.
     pub const fn all() -> &'static [DbKind] {
         &[
@@ -78,7 +78,7 @@ impl DbKind {
     /// connection's `read_only` flag (a read-only connection refuses every write
     /// regardless). Both the UI (which only holds a [`DbKind`] + `read_only`, never
     /// the driver) and the driver consult this so the affordances they offer and the
-    /// operations they'll actually run agree — replacing the scattered
+    /// operations they'll actually run agree, replacing the scattered
     /// `== DbKind::Clickhouse` checks that used to disagree with the read-only gate.
     pub const fn write_caps(self) -> WriteCaps {
         match self {
@@ -91,7 +91,7 @@ impl DbKind {
             },
             // ClickHouse (OLAP): a writable connection can be an INSERT / copy /
             // migration *target*, but has no transactional, exactly-one-row in-grid
-            // editing — its `UPDATE`/`DELETE` are asynchronous, non-atomic mutations
+            // editing; its `UPDATE`/`DELETE` are asynchronous, non-atomic mutations
             // over a non-unique sort key (a best-effort edit mode is a later phase).
             DbKind::Clickhouse => WriteCaps {
                 insert: true,
@@ -113,7 +113,7 @@ pub struct WriteCaps {
     /// relational edit contract) is possible.
     pub guarded_edit: bool,
     /// Best-effort, non-atomic in-grid `UPDATE`/`DELETE` (async mutations, no
-    /// rollback, no one-row guarantee) is possible — reserved for a later phase.
+    /// rollback, no one-row guarantee) is possible; reserved for a later phase.
     pub best_effort_edit: bool,
 }
 
@@ -130,8 +130,8 @@ impl fmt::Display for DbKind {
 
 /// How RED authenticates to an SSH jump host. Mirrors DataGrip's three modes: a
 /// running ssh-agent, a password, or an OpenSSH private-key file (optionally
-/// passphrase-protected). The secrets these need — the password, the key
-/// passphrase — are **never** serialized; like a connection's DB password they
+/// passphrase-protected). The secrets these need (the password, the key
+/// passphrase) are **never** serialized; like a connection's DB password they
 /// live in the OS keychain and are materialized only transiently.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -151,7 +151,7 @@ pub enum SshAuth {
 /// [`ConnectionConfig`] carries one of these, the service opens a local port
 /// forward and points the driver at it; the connection's `host`/`port` are the
 /// target as seen *from the jump host*. Secrets (`password`, `passphrase`) are
-/// keychain-backed and never persisted — hence the redacting `Debug` and the
+/// keychain-backed and never persisted, hence the redacting `Debug` and the
 /// `serde(skip)` on those fields.
 #[derive(Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -184,7 +184,7 @@ impl fmt::Debug for SshConfig {
 }
 
 /// How much of the connected database the AI assistant's tools may reach. The
-/// tier is enforced where the MCP tool catalog is *constructed* — a tool above
+/// tier is enforced where the MCP tool catalog is *constructed*: a tool above
 /// the tier simply isn't offered, so the model (on either the API-key or the
 /// subscription/ACP backend) can't call something the tier withholds. It is a
 /// least-privilege ladder: each rung adds to the one below.
@@ -195,7 +195,7 @@ impl fmt::Debug for SshConfig {
     serde(rename_all = "lowercase")
 )]
 pub enum AiTier {
-    /// No DB tools at all — the assistant chats without database grounding.
+    /// No DB tools at all; the assistant chats without database grounding.
     Off,
     /// Structure only: `list_schema` + `describe_table`. The model sees tables,
     /// columns, types, and keys but never reads a row of data.
@@ -208,7 +208,7 @@ pub enum AiTier {
     /// Read **plus** the gated write tool (`propose_write`): a single
     /// INSERT/UPDATE/DELETE that requires explicit, per-statement user approval and
     /// is blocked on a read-only connection and for destructive shapes (DDL,
-    /// unqualified UPDATE/DELETE). Opt-in only — set globally (`[ai] tier = "write"`)
+    /// unqualified UPDATE/DELETE). Opt-in only: set globally (`[ai] tier = "write"`)
     /// or per-connection (`ai_tier = "write"`); never a default.
     Write,
 }
@@ -245,7 +245,7 @@ impl AiTier {
     }
 
     /// Parse a settings string. Recognized tiers map directly; an **unrecognized**
-    /// value fails **closed** to [`AiTier::Off`] rather than to a permissive tier —
+    /// value fails **closed** to [`AiTier::Off`] rather than to a permissive tier;
     /// a typo like `"readonly"` or `"scema"` when locking the assistant down must
     /// not silently grant row-data (`read`) access. `write` is accepted both
     /// globally (`[ai] tier`) and per-connection (`ai_tier`); it only ever grants
@@ -261,7 +261,7 @@ impl AiTier {
     }
 }
 
-/// Resource guards on the `read` tier — defense in depth so neither backend can
+/// Resource guards on the `read` tier: defense in depth so neither backend can
 /// make the assistant read 1M rows by accident or hang the session thread. They
 /// are enforced server-side in the tool layer, mirroring the windowed-cursor and
 /// fat-cell caps the human-facing paths already carry.
@@ -297,12 +297,12 @@ impl Default for AiLimits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AiPolicy {
     /// The master switch. When `false` the assistant is a true no-op: no panel
-    /// entry, no tools, and — critically — no MCP server or agent process.
+    /// entry, no tools, and, critically, no MCP server or agent process.
     pub enabled: bool,
     pub tier: AiTier,
     pub limits: AiLimits,
     /// The connection's read-only posture, carried into the tool layer so the write
-    /// tool is withheld (and rejected, defense in depth) on a read-only connection —
+    /// tool is withheld (and rejected, defense in depth) on a read-only connection;
     /// the same guard the human write path is held to. Authoritative (set from the
     /// session), not the UI-supplied `AiContext.read_only`.
     pub read_only: bool,
@@ -322,7 +322,7 @@ impl Default for AiPolicy {
 impl AiPolicy {
     /// Layer a connection's optional overrides over this (global) policy. A set
     /// override tightens (or loosens) the field for that connection; an unset one
-    /// inherits the global value — so an unconfigured connection gets the global
+    /// inherits the global value, so an unconfigured connection gets the global
     /// default, and a sensitive one can be pinned `off`/`schema` without touching
     /// the global setting.
     pub fn with_overrides(self, enabled: Option<bool>, tier: Option<AiTier>) -> AiPolicy {
@@ -361,7 +361,7 @@ pub struct ConnectionConfig {
     pub color: u8,
     /// When unset (read/write), the connection allows writes: deliberate `UPDATE`s
     /// from the SQL editor and guarded, PK-keyed, previewed in-grid cell edits
-    /// (Track B5). Read-only is the safe default — the driver opens read-only and
+    /// (Track B5). Read-only is the safe default: the driver opens read-only and
     /// every write path is refused up front.
     #[cfg_attr(feature = "serde", serde(default))]
     pub read_only: bool,
@@ -380,7 +380,7 @@ pub struct ConnectionConfig {
     pub ssh: Option<SshConfig>,
 }
 
-/// Render a secret for `Debug`: `<unset>` when empty, `<redacted>` otherwise — so
+/// Render a secret for `Debug`: `<unset>` when empty, `<redacted>` otherwise, so
 /// a stray `{config:?}` can never spill a credential into the logs.
 fn redact(secret: &str) -> &'static str {
     if secret.is_empty() {
@@ -390,7 +390,7 @@ fn redact(secret: &str) -> &'static str {
     }
 }
 
-/// Hand-written so the password is **never** printed — a redacting `Debug` makes
+/// Hand-written so the password is **never** printed: a redacting `Debug` makes
 /// the "secrets stay out of logs" rule a compile-time guarantee rather than a
 /// convention a stray `{config:?}` could break. (`Serialize` for persistence goes
 /// through the password-free `WriteConnection`, so the disk path is already safe.)
@@ -445,7 +445,7 @@ impl ConnectionConfig {
     /// normal [`dsn`](Self::dsn) but with `host`/`port` swapped for the tunnel's
     /// local endpoint. Reuses `dsn`'s userinfo/database encoding and IPv6
     /// bracketing, so the only difference is where the driver dials. Meaningful
-    /// only for network engines — an SSH tunnel never fronts a file engine.
+    /// only for network engines; an SSH tunnel never fronts a file engine.
     pub fn local_dsn(&self, host: &str, port: u16) -> String {
         ConnectionConfig {
             host: host.to_string(),
@@ -456,8 +456,8 @@ impl ConnectionConfig {
         .dsn()
     }
 
-    /// A short human label for the connection's target — the file path, or
-    /// `user@host:port/database` — shown on cards and in the status bar.
+    /// A short human label for the connection's target (the file path, or
+    /// `user@host:port/database`), shown on cards and in the status bar.
     pub fn display_target(&self) -> String {
         if self.kind.is_file() {
             return self.database.clone();
@@ -481,7 +481,7 @@ impl ConnectionConfig {
 
     /// Decompose a pasted connection string into engine + fields, best-effort.
     /// Returns `None` if there's no recognizable `scheme://…`. Query strings and
-    /// fragments are ignored — RED keeps "roughly enough" of the URL to refill the
+    /// fragments are ignored; RED keeps "roughly enough" of the URL to refill the
     /// form, not every libpq option.
     pub fn parse_conn_str(input: &str) -> Option<ParsedDsn> {
         let input = input.trim();
@@ -586,7 +586,7 @@ fn bracket_host(host: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// Percent-encode the characters that would otherwise be parsed as URL syntax
-/// inside a userinfo/database component. Deliberately small — not a general
+/// inside a userinfo/database component. Deliberately small: not a general
 /// RFC 3986 encoder, just enough to keep credentials intact.
 fn encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -622,7 +622,7 @@ fn decode(s: &str) -> String {
 }
 
 /// One cell value in a result set. A deliberately small, render-friendly tagged
-/// union — drivers map their native types onto this; the UI formats per variant.
+/// union: drivers map their native types onto this; the UI formats per variant.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
@@ -632,7 +632,7 @@ pub enum Value {
     Blob(Vec<u8>),
     /// A cell the *display* fetch path capped: only a bounded prefix was read
     /// (over-cap text) or only the length (blob), so the full value was never
-    /// materialized. Produced solely by capped fetch paths — never by `export` or
+    /// materialized. Produced solely by capped fetch paths, never by `export` or
     /// a write path, where every cell is whole.
     Capped(CappedCell),
 }
@@ -642,19 +642,19 @@ pub enum Value {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CappedCell {
     /// The shown text: a char-boundary-safe prefix of over-cap text, or empty for
-    /// a blob (rendered as its `<len bytes>` summary). No ellipsis — that's added
+    /// a blob (rendered as its `<len bytes>` summary). No ellipsis; that's added
     /// at render time, so a copy path can tell the real head from the marker.
     pub head: String,
     /// True byte length of the source value (full text length, or blob size).
     pub len: usize,
-    /// Blob vs text — drives the `<N bytes>` summary and the grid's faint styling.
+    /// Blob vs text: drives the `<N bytes>` summary and the grid's faint styling.
     pub blob: bool,
 }
 
 impl Value {
     /// Build a display value from full text `s`, capping to `max_bytes`. Under the
     /// cap it's a whole [`Value::Text`]; over it, a [`Value::Capped`] holding only a
-    /// char-boundary-safe prefix plus the true length — the bytes past the cap are
+    /// char-boundary-safe prefix plus the true length; the bytes past the cap are
     /// never copied into the value, which is the point on the display fetch path.
     pub fn capped_text(s: &str, max_bytes: usize) -> Value {
         if s.len() <= max_bytes {
@@ -671,7 +671,7 @@ impl Value {
         })
     }
 
-    /// A blob reduced to its length for display — the bytes are never read. The
+    /// A blob reduced to its length for display; the bytes are never read. The
     /// grid only ever paints a blob as its `<N bytes>` summary; a copy/inspector
     /// re-fetches the real bytes on demand.
     pub fn capped_blob(len: usize) -> Value {
@@ -698,7 +698,7 @@ impl fmt::Display for Value {
 }
 
 /// Column metadata for a result set. `name` is always present; `decl_type` is the
-/// engine's declared type (best-effort — `None` for computed expressions) and
+/// engine's declared type (best-effort; `None` for computed expressions) and
 /// feeds type-aware cell rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
@@ -707,7 +707,7 @@ pub struct Column {
 }
 
 /// A one-column aggregate summary, all engine-computed by a single pushdown query
-/// (`SELECT count(*), count(col), … FROM (<the result's filtered SQL>) sub`) —
+/// (`SELECT count(*), count(col), … FROM (<the result's filtered SQL>) sub`),
 /// never by scanning the materialized window. `min`/`max`/`sum`/`avg` ride through
 /// as typed [`Value`]s so the UI formats them like grid cells; the counts are
 /// plain integers. See `DatabaseDriver::column_stats`.
@@ -715,19 +715,19 @@ pub struct Column {
 pub struct ColumnStats {
     /// `count(*)` over the (filtered) result.
     pub total: i64,
-    /// `count(col)` — the non-null rows. `nulls = total - non_null` (derived).
+    /// `count(col)`: the non-null rows. `nulls = total - non_null` (derived).
     pub non_null: i64,
-    /// `count(distinct col)` — `None` when not computed (the count-distinct guard
+    /// `count(distinct col)`; `None` when not computed (the count-distinct guard
     /// withheld it on a large result, recomputable on demand).
     pub distinct: Option<i64>,
-    /// `min(col)` — valid for text (lexicographic) and numbers.
+    /// `min(col)`, valid for text (lexicographic) and numbers.
     pub min: Value,
     /// `max(col)`.
     pub max: Value,
-    /// `sum(col)` — numeric columns only (`None` otherwise, or when every row is
+    /// `sum(col)`: numeric columns only (`None` otherwise, or when every row is
     /// null).
     pub sum: Option<Value>,
-    /// `avg(col)` — numeric columns only.
+    /// `avg(col)`, numeric columns only.
     pub avg: Option<Value>,
 }
 
@@ -740,22 +740,22 @@ pub fn is_numeric_type(decl_type: Option<&str>) -> bool {
 
 /// A result-narrowing filter pushed into the query (Track B2). The service wraps
 /// the open's base SQL in `SELECT * FROM (base) WHERE <predicate>` *before* the
-/// count / key-bounds probe, so the whole result — count, keyset seek, sort,
-/// export — operates on the filtered set without ever materializing it. Because
+/// count / key-bounds probe, so the whole result (count, keyset seek, sort,
+/// export) operates on the filtered set without ever materializing it. Because
 /// the wrap preserves `SELECT *`, the key column survives and keyset paging is
 /// unaffected.
 ///
 /// The UI stays driver-independent by sending this *semantic* filter, not SQL: the
 /// backend renders [`Contains`](Self::Contains) to a portable, escaped predicate
 /// per engine (see `DatabaseDriver::contains_predicate`) and wraps
-/// [`Where`](Self::Where) — power-user SQL, same trust level as the editor —
+/// [`Where`](Self::Where) (power-user SQL, same trust level as the editor)
 /// verbatim.
 ///
-/// (`Eq` carries [`ColumnValue`], whose [`Value`] is `PartialEq` but not `Eq` — so
+/// (`Eq` carries [`ColumnValue`], whose [`Value`] is `PartialEq` but not `Eq`, so
 /// this enum is `PartialEq` only.)
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResultFilter {
-    /// "Any text-representable column contains this term" — the portable quick
+    /// "Any text-representable column contains this term": the portable quick
     /// filter. Rendered per engine to a case-insensitive `LIKE`/`ILIKE` OR-chain
     /// over the non-blob columns, with the term escaped to match literally.
     Contains(String),
@@ -765,7 +765,7 @@ pub enum ResultFilter {
     /// A conjunction of `column = value` equalities (Track B7 foreign-key follow):
     /// one [`ColumnValue`] for a single-column FK, several for a composite. Rendered
     /// per engine to an escaped *literal* predicate (`DatabaseDriver::eq_predicate`)
-    /// AND-joined — comparison context coerces each literal to the column's type, so
+    /// AND-joined; comparison context coerces each literal to the column's type, so
     /// no cast is needed and the column stays index-usable. Built by the UI from an
     /// [`FkEdge`] + the followed row's values, never from raw SQL; NULL values are
     /// excluded by the caller (a null FK isn't followable).
@@ -773,7 +773,7 @@ pub enum ResultFilter {
 }
 
 /// A single guarded data edit (Track B5), keyed on a result's primary key. Built by
-/// the UI from the result's [`KeySpec`] + base table — a *semantic* edit carrying no
+/// the UI from the result's [`KeySpec`] + base table; a *semantic* edit carrying no
 /// SQL, so the UI stays engine-independent. The driver renders it to dialect SQL,
 /// **binds** every value (never interpolates), and asserts it touches exactly one
 /// row (rolling back otherwise). NULL values are emitted as the literal `NULL`
@@ -809,7 +809,7 @@ pub struct TableRef {
 /// One `column = value` pair of an [`EditOp`]. `decl_type` is the column's declared
 /// engine type (best-effort, `None` for a key/PK or where it isn't known): the
 /// driver needs it to bind correctly into a non-text column. A value the driver
-/// decoded to [`Value::Text`] — jsonb, timestamp, uuid, numeric, an enum — must be
+/// decoded to [`Value::Text`] (jsonb, timestamp, uuid, numeric, an enum) must be
 /// *cast* back to that column type on write, because Postgres has no implicit
 /// (assignment) cast from `text` to those, so a bare text bind is rejected. Keys
 /// (always int/text, see `PkKey`) bind fine without it, so they carry `None`.
@@ -831,7 +831,7 @@ impl EditOp {
     }
 
     /// A readable, **display-only** rendering of the statement, values inlined as
-    /// literals — what the confirm modal shows. This is *not* what executes: the
+    /// literals; what the confirm modal shows. This is *not* what executes: the
     /// driver renders dialect SQL and binds the values as parameters. Quoting is
     /// generic (double-quoted identifiers); the live statement uses the engine's.
     pub fn preview_sql(&self) -> String {
@@ -883,7 +883,7 @@ impl EditOp {
     }
 }
 
-/// Render a [`Value`] as a SQL literal for an [`EditOp`] **preview only** — quoting
+/// Render a [`Value`] as a SQL literal for an [`EditOp`] **preview only**, quoting
 /// text with embedded quotes doubled. Never used to build executed SQL (the driver
 /// binds values), so it's a readability helper, not an injection surface.
 fn literal(v: &Value) -> String {
@@ -927,10 +927,10 @@ pub fn coerce_edit_value(
     Ok(Value::Text(text.to_string()))
 }
 
-/// A query execution plan (Track B4 — EXPLAIN). A small, fully-materialized tree
-/// the driver builds from the engine's *native* EXPLAIN output — SQLite's
-/// `EXPLAIN QUERY PLAN` rows, Postgres's indented text plan, MySQL's `FORMAT=TREE`
-/// — so the UI renders it readably without any engine knowledge. A plan is
+/// A query execution plan (Track B4: EXPLAIN). A small, fully-materialized tree
+/// the driver builds from the engine's *native* EXPLAIN output (SQLite's
+/// `EXPLAIN QUERY PLAN` rows, Postgres's indented text plan, MySQL's `FORMAT=TREE`)
+/// so the UI renders it readably without any engine knowledge. A plan is
 /// inherently tiny and bounded, so unlike a result set it is held whole; the
 /// "never materialize" rule targets row data, not a fixed-size plan.
 ///
@@ -940,14 +940,14 @@ pub fn coerce_edit_value(
 /// cross-engine cost unit.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct QueryPlan {
-    /// The plan's root operations — usually one. A SQLite plan is a shallow tree
+    /// The plan's root operations, usually one. A SQLite plan is a shallow tree
     /// of steps; a Postgres/MySQL plan nests.
     pub nodes: Vec<PlanNode>,
-    /// The engine's verbatim EXPLAIN text — the "Copy plan" payload and the
+    /// The engine's verbatim EXPLAIN text: the "Copy plan" payload and the
     /// guaranteed fallback the UI shows when `nodes` is empty (an exotic plan the
     /// structural parse couldn't tree).
     pub raw: String,
-    /// `true` iff this came from `EXPLAIN ANALYZE` — actual-row/time metrics are
+    /// `true` iff this came from `EXPLAIN ANALYZE`; actual-row/time metrics are
     /// present and the UI may tint the costliest node. SQLite has no ANALYZE.
     pub analyzed: bool,
 }
@@ -967,7 +967,7 @@ pub struct PlanNode {
 }
 
 impl PlanNode {
-    /// A leaf node with just a label — the building block the parsers grow.
+    /// A leaf node with just a label: the building block the parsers grow.
     pub fn leaf(label: impl Into<String>) -> PlanNode {
         PlanNode {
             label: label.into(),
@@ -986,18 +986,18 @@ pub enum ObjectKind {
     View,
 }
 
-/// A namespace of objects — the top level of the schema tree. For SQLite this is
+/// A namespace of objects, the top level of the schema tree. For SQLite this is
 /// a database from `PRAGMA database_list` (`main` / `temp` / an attached DB); for
 /// Postgres it's a real schema. One level so both engines fit the same tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaMeta {
     pub name: String,
-    /// Names + kinds only — the cheap tree skeleton, loaded on connect. Column
+    /// Names + kinds only: the cheap tree skeleton, loaded on connect. Column
     /// detail is pulled per table via [`TableDetail`] on expand.
     pub objects: Vec<ObjectMeta>,
 }
 
-/// One table or view in a [`SchemaMeta`] — just enough to draw the tree node.
+/// One table or view in a [`SchemaMeta`], just enough to draw the tree node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMeta {
     pub name: String,
@@ -1044,8 +1044,8 @@ pub struct ForeignKeyMeta {
 /// the per-table [`ForeignKeyMeta`], this carries both endpoints' namespaces and is
 /// usable in either direction: *forward* (`from_table` points out) backs "go to the
 /// referenced row", *reverse* (`to_table` is pointed at) backs "show referencing
-/// rows". `columns` pairs each local column with its referenced column in key order
-/// — `len > 1` is a composite key. Loaded once per connection via
+/// rows". `columns` pairs each local column with its referenced column in key order;
+/// `len > 1` is a composite key. Loaded once per connection via
 /// [`DatabaseDriver::foreign_keys`](../red_driver/trait.DatabaseDriver.html) and
 /// indexed both ways by the UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1067,8 +1067,8 @@ pub const BASE_ALIAS: &str = "_red_base";
 /// One inline foreign-key *column expansion* (Track B7): a `LEFT JOIN` that pulls
 /// selected columns of a referenced table into a browse as extra, dotted-aliased
 /// columns. The service folds an ordered `Vec<FkJoin>` into the result's base SQL
-/// (see `join_wrap`), so each hop decorates the page without changing its row count
-/// — the join target is always a *unique* key, so a `LEFT JOIN` matches ≤1 row.
+/// (see `join_wrap`), so each hop decorates the page without changing its row count:
+/// the join target is always a *unique* key, so a `LEFT JOIN` matches ≤1 row.
 ///
 /// Joins are ordered outer→inner: a deeper hop's [`parent_alias`](Self::parent_alias)
 /// names an *earlier* join's [`alias`](Self::alias) (or the base, `_red_base`), so a
@@ -1079,13 +1079,13 @@ pub const BASE_ALIAS: &str = "_red_base";
 /// grid keys a joined cell back to its tree column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FkJoin {
-    /// This join's table alias — a simple, unique identifier (`_red_j0`, …).
+    /// This join's table alias: a simple, unique identifier (`_red_j0`, …).
     pub alias: String,
     /// The alias this join's `ON` reads its local columns from: an earlier join's
     /// [`alias`](Self::alias), or the base subquery alias (`_red_base`) for a first hop.
     pub parent_alias: String,
     /// `(parent_column, target_column)` equalities forming the `ON` clause, in key
-    /// order — usually one pair (a single-column FK), `len > 1` for a composite key.
+    /// order; usually one pair (a single-column FK), `len > 1` for a composite key.
     pub on: Vec<(String, String)>,
     /// The referenced table's namespace, when the engine qualifies by schema.
     pub to_schema: Option<String>,
@@ -1106,7 +1106,7 @@ pub struct IndexMeta {
 
 /// How a result's rows are keyed for seek (keyset) pagination: an ordered,
 /// effectively-unique tuple of columns. A plain table browse is a single key
-/// column (the PK / unique index — see [`KeySpec::from_detail`]); a header-click
+/// column (the PK / unique index, see [`KeySpec::from_detail`]); a header-click
 /// sorted browse is `(sort_col, pk)` with the PK as tiebreaker (see
 /// [`KeySpec::sorted`]). Arbitrary editor SQL has no key and pages by `OFFSET`.
 ///
@@ -1116,7 +1116,7 @@ pub struct IndexMeta {
 /// direction and a mixed-direction tuple never arises.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeySpec {
-    /// The lead key column's name, as it appears in the result set — the sort
+    /// The lead key column's name, as it appears in the result set: the sort
     /// column for a sorted browse, or the PK for a plain browse.
     pub column: String,
     /// The lead column's kind. Drives key-space interpolation (only the lead
@@ -1150,7 +1150,7 @@ pub enum KeyKind {
 }
 
 impl KeySpec {
-    /// A single-column, ascending key (a plain table browse — also the building
+    /// A single-column, ascending key (a plain table browse; also the building
     /// block the conformance battery seeds with).
     pub fn single(column: impl Into<String>, kind: KeyKind) -> KeySpec {
         KeySpec {
@@ -1169,7 +1169,7 @@ impl KeySpec {
         self
     }
 
-    /// The seek columns in order — the lead column then the tiebreaker, if any.
+    /// The seek columns in order: the lead column then the tiebreaker, if any.
     /// Drivers quote these for the `ORDER BY` and the row-value comparison.
     pub fn column_names(&self) -> Vec<&str> {
         let mut cols = vec![self.column.as_str()];
@@ -1179,8 +1179,8 @@ impl KeySpec {
         cols
     }
 
-    /// The seek columns' declared types, index-aligned with [`column_names`](Self::column_names)
-    /// — for a driver that casts the bound cursor back to each column's type.
+    /// The seek columns' declared types, index-aligned with [`column_names`](Self::column_names),
+    /// for a driver that casts the bound cursor back to each column's type.
     pub fn column_types(&self) -> Vec<Option<&str>> {
         let mut types = vec![self.column_type.as_deref()];
         if self.tiebreak.is_some() {
@@ -1224,7 +1224,7 @@ impl KeySpec {
                 descending,
             });
         }
-        // A nullable non-PK lead disqualifies keyset — same posture `from_detail`
+        // A nullable non-PK lead disqualifies keyset, the same posture `from_detail`
         // takes for nullable keys.
         let kind = key_kind(lead);
         (lead.not_null || kind == KeyKind::Int).then(|| KeySpec {
@@ -1270,7 +1270,7 @@ fn key_kind(column: &ColumnMeta) -> KeyKind {
 
 /// Whether a declared type names an integer column across the three engines
 /// (`INTEGER`, `bigint`, `int(11)`, `serial`, …). Deliberately a whitelist of
-/// the base token — `interval`/`point` must not match.
+/// the base token: `interval`/`point` must not match.
 fn is_int_type(type_name: &str) -> bool {
     let t = type_name.to_ascii_lowercase();
     let base = t.split(['(', ' ']).next().unwrap_or("");
@@ -1303,11 +1303,11 @@ fn is_real_type(type_name: &str) -> bool {
 }
 
 /// One bounded window of rows pulled from a streaming cursor. The streaming path
-/// never materializes a whole result — it yields these fixed-size windows.
+/// never materializes a whole result; it yields these fixed-size windows.
 #[derive(Debug, Clone, Default)]
 pub struct RowWindow {
     pub rows: Vec<Vec<Value>>,
-    /// `true` once this window reaches the end of the result — no more fetches.
+    /// `true` once this window reaches the end of the result (no more fetches).
     pub exhausted: bool,
 }
 
@@ -1327,18 +1327,18 @@ pub struct ResultPage {
 pub enum ExportFormat {
     Csv,
     Json,
-    /// A themed, self-contained HTML report — a standalone document (inline CSS,
+    /// A themed, self-contained HTML report: a standalone document (inline CSS,
     /// light/dark via `prefers-color-scheme`) opened in the system browser, not a
     /// data interchange file. Streamed row-by-row like the others.
     Html,
 }
 
-/// A streamed-import source format — the read-side mirror of [`ExportFormat`]. The
+/// A streamed-import source format, the read-side mirror of [`ExportFormat`]. The
 /// reader yields one row of raw text cells at a time, never materializing the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportFormat {
     Csv,
-    /// Newline-delimited JSON — one JSON object per line.
+    /// Newline-delimited JSON: one JSON object per line.
     Jsonl,
 }
 
@@ -1360,19 +1360,19 @@ pub struct QueryOptions {
     /// Max rows per fetched window. Read by the streaming cursor (`open_cursor`)
     /// to size its row channel.
     pub window: usize,
-    /// Abort a single streamed fetch that stalls longer than this — guards a
+    /// Abort a single streamed fetch that stalls longer than this; guards a
     /// runaway query that computes a huge intermediate before yielding row 1.
     /// Enforced by the *service*, not the driver: the dispatch loop races the
     /// cursor's `next_window` against this deadline and fires the engine cancel on
     /// expiry (see `drive_fetch`). The windowed `OpenResult` path uses the global
     /// `statement_timeout` instead. `None` = no cap.
     pub timeout: Option<std::time::Duration>,
-    /// Read every cell at **full fidelity** — never the display fat-cell cap. The
+    /// Read every cell at **full fidelity**, never the display fat-cell cap. The
     /// interactive cursor caps long text/blobs for paint performance
     /// (`Value::Capped`), which is right for the grid but **data loss** for a copy:
     /// the table-copy read sets this so a long `TEXT`/blob round-trips byte-exact
     /// into the target (the same invariant export holds via `PageCap::Full`). The
-    /// default is `false` — the grid's streaming path stays capped.
+    /// default is `false`; the grid's streaming path stays capped.
     pub full_fidelity: bool,
 }
 
@@ -1388,14 +1388,14 @@ impl Default for QueryOptions {
 
 /// How a table copy writes into its target ([`crate`]'s `CopyToTable`). Append is
 /// the default "add these rows"; `TruncateInsert` clears the target first (behind
-/// the destructive confirm) — "refresh this table from the source". Upsert/merge is
+/// the destructive confirm): "refresh this table from the source". Upsert/merge is
 /// deliberately **not** here: it needs a per-engine conflict-key seam and a key
 /// picker, which is the on-ramp to the sync machinery table-copy exists to avoid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyMode {
     /// Insert the source rows into the target as-is (the target keeps its rows).
     Append,
-    /// Clear the target (`DELETE FROM`) before inserting — a full refresh.
+    /// Clear the target (`DELETE FROM`) before inserting: a full refresh.
     TruncateInsert,
 }
 
@@ -1454,12 +1454,12 @@ pub enum UpdateState {
     /// A newer release is downloading/staging over the installed app. `pct` is a
     /// coarse 0–100 progress hint.
     Downloading { version: String, pct: u8 },
-    /// A newer build is fully staged — clicking the pill relaunches into it.
+    /// A newer build is fully staged; clicking the pill relaunches into it.
     ReadyToRestart { version: String },
     /// The check or staging failed; `reason` is user-facing.
     Failed { reason: String },
     /// A newer release exists but RED can't self-swap (not running from a
-    /// writable `/Applications/Red.app` — a dev build, Homebrew, a read-only
+    /// writable `/Applications/Red.app`: a dev build, Homebrew, a read-only
     /// volume). `url` links the GitHub release for a manual download.
     Unsupported { version: String, url: String },
 }
@@ -1553,7 +1553,7 @@ mod key_tests {
     #[test]
     fn key_carries_column_types_for_the_cursor_cast() {
         // A uuid PK: the key must carry "uuid" so the driver casts the keyset
-        // cursor back to it (`$1::text::"uuid"`) instead of binding bare text —
+        // cursor back to it (`$1::text::"uuid"`) instead of binding bare text;
         // otherwise `id > $1::text` is a 42883 "no operator" error on Postgres.
         let detail = TableDetail {
             columns: vec![
@@ -1567,7 +1567,7 @@ mod key_tests {
         assert_eq!(key.column_types(), vec![Some("uuid")]);
 
         // A header-click sort by a non-PK column leads with that column's type and
-        // appends the PK as a typed tiebreaker — both need their cast.
+        // appends the PK as a typed tiebreaker; both need their cast.
         let sorted = KeySpec::sorted(&detail, "created_at", true).unwrap();
         assert_eq!(sorted.column_type.as_deref(), Some("timestamptz"));
         assert_eq!(sorted.tiebreak.as_deref(), Some("id"));
@@ -1806,7 +1806,7 @@ mod ai_policy_tests {
         assert!(AiTier::Read.allows_tool("explain"));
         assert!(AiTier::Read.allows_tool("generate_report"));
         assert!(AiTier::Read.allows_tool("open_query"));
-        // The write tool is gated to the Write tier — and Write inherits the read
+        // The write tool is gated to the Write tier, and Write inherits the read
         // catalog on top of it.
         assert!(!AiTier::Read.allows_tool("propose_write"));
         assert!(AiTier::Write.allows_tool("propose_write"));
@@ -1822,7 +1822,7 @@ mod ai_policy_tests {
         assert_eq!(AiTier::parse(" Schema "), AiTier::Schema);
         assert_eq!(AiTier::parse("READ"), AiTier::Read);
         assert_eq!(AiTier::parse("write"), AiTier::Write);
-        // A typo or empty string fails CLOSED (Off), never to a permissive tier —
+        // A typo or empty string fails CLOSED (Off), never to a permissive tier:
         // locking the assistant down must not silently grant read access.
         assert_eq!(AiTier::parse("nonsense"), AiTier::Off);
         assert_eq!(AiTier::parse("readonly"), AiTier::Off);

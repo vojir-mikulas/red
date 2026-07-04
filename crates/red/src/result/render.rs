@@ -88,10 +88,10 @@ struct CellColors {
 }
 
 /// One grid cell, colored by its pre-classified [`CellKind`] (NULL italic-faint,
-/// numbers accented, UUIDs dimmed, JSON-ish text cyan — mirroring the design's
+/// numbers accented, UUIDs dimmed, JSON-ish text cyan, mirroring the design's
 /// typed cells). The display string and kind were computed once when the row
 /// landed in the buffer, so this only picks a color and clones a `SharedString`
-/// (an `Arc` bump) — no per-frame formatting, copying, or classification.
+/// (an `Arc` bump); no per-frame formatting, copying, or classification.
 fn render_cell(
     cell: &DisplayCell,
     c: CellColors,
@@ -107,7 +107,7 @@ fn render_cell(
         CellKind::Json => c.cyan,
     };
     // A foreign-key cell (Track B7) reads in the brand accent to signal it's a
-    // navigable reference — except NULL/blob, which keep their faint style cue.
+    // navigable reference, except NULL/blob, which keep their faint style cue.
     let color = if is_fk && !matches!(cell.kind, CellKind::Null | CellKind::Blob) {
         c.accent
     } else {
@@ -207,7 +207,7 @@ impl AppState {
         let elapsed = format_duration(grid.query_time());
 
         // A failed query gets a full-pane panel rather than the cramped toolbar
-        // status slot — syntax errors are multi-line and would otherwise clip.
+        // status slot: syntax errors are multi-line and would otherwise clip.
         if let Some(err) = &grid.error {
             return container.child(
                 div()
@@ -268,7 +268,7 @@ impl AppState {
                     .flex()
                     .items_center()
                     .gap_1()
-                    // "+ Row" appends a draft (insert) row — shown only on an
+                    // "+ Row" appends a draft (insert) row, shown only on an
                     // editable keyed browse of a writable connection (Track B6).
                     .when(self.editing_enabled() && grid.editable_browse(), |d| {
                         d.child(
@@ -279,7 +279,7 @@ impl AppState {
                         )
                     })
                     .child(
-                        // ⌘⇧F — toggle the filter bar. Reads as "filled" while a
+                        // ⌘⇧F: toggle the filter bar. Reads as "filled" while a
                         // filter is applied (Track B2).
                         Button::new("result-filter", "Filter")
                             .variant(if grid.filter.is_some() {
@@ -291,7 +291,7 @@ impl AppState {
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_filter_bar(cx))),
                     )
                     .when(self.editing_enabled() && grid.editable_browse(), |t| {
-                        // Import a CSV/JSONL file into this table — shown only on an
+                        // Import a CSV/JSONL file into this table. Shown only on an
                         // editable keyed browse of a writable connection, like "+ Row"
                         // (import is a bulk insert). The grid's columns are the target.
                         t.child(
@@ -307,7 +307,7 @@ impl AppState {
                         // CSV / JSON / HTML are grouped into one "Export" dropdown
                         // to keep the toolbar uncluttered; it opens a menu at the
                         // cursor (see `render_export_menu`). HTML is a plain themed
-                        // export alongside CSV/JSON — AI-authored *reports* are a
+                        // export alongside CSV/JSON; AI-authored *reports* are a
                         // separate, on-demand thing the assistant generates.
                         Button::new("result-export", "Export ▾")
                             .variant(if self.export_menu.is_some() {
@@ -371,7 +371,7 @@ impl AppState {
         let buffer_range = grid.buffer.clone();
         let buffer_row = grid.buffer.clone();
         // Forward-FK data columns (Track B7), snapshotted into the row closure so the
-        // paint path stays alloc-free — a membership test, computed off-frame.
+        // paint path stays alloc-free: a membership test, computed off-frame.
         let fk_cols = grid.fk_cols.clone();
         // Inline-expanded reference columns (Track B7), snapshotted for the cell-bg
         // hook so a faint wash marks them as derived, not base-table, data.
@@ -411,7 +411,7 @@ impl AppState {
         // the open find bar's term get a soft accent tint via the same `cell_bg`
         // hook. The focused match is *also* the grid selection, so the selection
         // highlight marks "current" on top of this. Keyed by `(ordinal, data col)`.
-        // Find/edit overlays belong to the focused half only — the find bar, the
+        // Find/edit overlays belong to the focused half only; the find bar, the
         // inline editor and the stats/draft chrome are single-instance app state.
         let find_hits: std::collections::HashSet<(usize, usize)> = is_focused
             .then_some(self.find_bar.as_ref())
@@ -431,7 +431,7 @@ impl AppState {
 
         // The focused cell, spoken aloud: the grid reports this as its accessible
         // name (a `Grid` landmark), so a screen reader announces "<column>:
-        // <value>, row N of M" each time the cell cursor moves — the one piece of
+        // <value>, row N of M" each time the cell cursor moves: the one piece of
         // state a blind user needs to read the data. `focus` is in absolute,
         // table-column coordinates (gutter included); a data column's index is
         // `table_col - gutter`. Falls back to the grid's name when there's no cursor.
@@ -493,7 +493,7 @@ impl AppState {
                     return Some(find_tint);
                 }
                 // A joined reference column (derived from a referenced table) gets a
-                // faint wash — lowest priority, so a find/edit/delete tint wins on top.
+                // faint wash: lowest priority, so a find/edit/delete tint wins on top.
                 if table_col >= gutter && joined_cols.contains(&(table_col - gutter)) {
                     return Some(joined_tint);
                 }
@@ -561,7 +561,7 @@ impl AppState {
                     .ok();
             })
             // Right-click selects the cell and opens its context menu (Inspect ·
-            // Copy) anchored at the cursor — the per-cell actions that used to live
+            // Copy) anchored at the cursor: the per-cell actions that used to live
             // in the toolbar.
             .on_cell_secondary(move |row, table_col, pos, window, cx| {
                 let abs_row = base + row;
@@ -618,8 +618,8 @@ impl AppState {
                 out
             });
 
-        // Footer: a strong row count, the column count, and the result's label —
-        // the design's "N rows · K columns" status strip under the grid.
+        // Footer: a strong row count, the column count, and the result's label
+        // (the design's "N rows · K columns" status strip under the grid).
         let footer = div()
             .flex_shrink_0()
             // Tall enough to seat the 24px Sm Submit/Revert buttons with breathing
@@ -640,7 +640,7 @@ impl AppState {
             .child(div().text_color(dim).child(format!("{ncols} columns")))
             .child(div().text_color(border_soft).child("·"))
             // Which paging mode this result got (keyset = seek key resolved;
-            // offset = the O(offset) fallback) — the at-a-glance diagnostic.
+            // offset = the O(offset) fallback); the at-a-glance diagnostic.
             .child(
                 div()
                     .text_color(dim)
@@ -1073,7 +1073,7 @@ impl AppState {
         )
     }
 
-    /// The result cell's right-click context menu — the per-cell actions (Inspect
+    /// The result cell's right-click context menu: the per-cell actions (Inspect
     /// · Copy) that used to sit in the toolbar, anchored at `pos` (the cursor).
     /// Both act on the cell the right-click just selected. A full-cover backdrop
     /// closes the menu on an outside click.
@@ -1241,7 +1241,7 @@ impl AppState {
             .child(floating(div().occlude().child(menu)).at(pos))
     }
 
-    /// The result toolbar's "Export" dropdown — CSV / JSON / HTML grouped into one
+    /// The result toolbar's "Export" dropdown: CSV / JSON / HTML grouped into one
     /// menu, anchored at `pos` (where the button was clicked). A full-cover backdrop
     /// dismisses it on an outside click, mirroring [`Self::render_cell_menu`].
     fn render_export_menu(&self, pos: Point<Pixels>, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1286,7 +1286,7 @@ impl AppState {
             .child(floating(div().occlude().child(menu)).at(pos))
     }
 
-    /// The result toolbar's "More" dropdown — the less-used actions (the Stats
+    /// The result toolbar's "More" dropdown; the less-used actions (the Stats
     /// toggle and "Copy to…") collected into one menu, anchored at `pos`. A
     /// full-cover backdrop dismisses it, mirroring [`Self::render_cell_menu`].
     fn render_more_menu(&self, pos: Point<Pixels>, cx: &mut Context<Self>) -> impl IntoElement {

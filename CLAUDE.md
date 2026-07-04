@@ -1,8 +1,8 @@
 # CLAUDE.md — RED
 
 > RED — Roughly Enough Data. A fast, simple, native database explorer in pure
-> Rust, built on GPUI the way Nyx is built. Priorities: speed, low memory, and
-> excellent behaviour on large result sets over feature-completeness.
+> Rust, built on GPUI. Priorities: speed, low memory, and excellent behaviour
+> on large result sets over feature-completeness.
 
 ## Architecture in 4 lines
 
@@ -10,7 +10,7 @@
   owns database sessions + the query lifecycle. They talk over channels
   (`Command` UI→service, `Event` service→UI). The UI never blocks on the backend.
 - Crate map: `red` (app binary) · `red-core` (shared domain types, no UI/runtime)
-  · `red-driver` (`DatabaseDriver` trait + SQLite impl) · `red-service` (backend
+  · `red-driver` (`DatabaseDriver` trait + engine impls) · `red-service` (backend
   thread + bridge).
 - UI components + theme come from **Flint** (`../flint`), the shared in-house
   GPUI library (also used by Nyx).
@@ -41,12 +41,12 @@ rules, and the safe-by-default behaviour. The load-bearing project invariants:
 
 ## Working with Flint
 
-When RED needs a new component, build it **gallery-first in Flint** with a generic
+When RED needs a new component, build it gallery-first in Flint with a generic
 (domain-free) API — but spike the usage in RED first so the API is right, then
-push it down into Flint. Open RED as the project root and add `../flint` as an
+push it down into Flint (see "Working on Flint and RED together" in
+`CONTRIBUTING.md`). Open RED as the project root and add `../flint` as an
 extra directory for that work.
 
 ## Plans
 
-The canonical RED roadmap and the Flint extraction history live in the Nyx repo:
-`docs/plans/red-db-explorer.md` and `docs/plans/plan-02-nyx-ui-flint.md`.
+Feature plans and the roadmap live in `docs/plans/` (local-only, gitignored).

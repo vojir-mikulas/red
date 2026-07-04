@@ -26,20 +26,20 @@ pub(crate) const DEFAULT_PAGE: usize = 200;
 const MARGIN_PAGES: usize = 2;
 
 /// Fling threshold (skip fetching while moving faster than this), as a multiple of
-/// the page — a flung scrollbar across a multi-million-row result would otherwise
+/// the page; a flung scrollbar across a multi-million-row result would otherwise
 /// spawn a deep-`OFFSET` page query every frame at a different offset, none of which
 /// the user ever dwells on. Fetching resumes once the scroll slows to near its
 /// resting position. A deliberate drag moves far fewer rows/frame than this.
 const FLING_PAGES: usize = 3;
 
 /// In keyed mode: a viewport landing this many pages beyond the resident run
-/// abandons run-extension (which would chain seeks across the gap) and jumps — one
+/// abandons run-extension (which would chain seeks across the gap) and jumps: one
 /// key-space interpolated seek that replaces the run.
 const JUMP_PAGES: usize = 2;
 
 /// Physical rows the list (`uniform_list`) is laid out over at once. GPUI places
 /// each row at `index * row_height` in `f32`, which is only exact up to 2^24
-/// (~16.7M) px; past that, positions quantize — rows overlap, double up, and the
+/// (~16.7M) px; past that, positions quantize: rows overlap, double up, and the
 /// wheel sticks. So the list never spans the whole result: it lays out at most
 /// `WINDOW` rows (a `WINDOW * row_height` canvas, well under the ceiling), and
 /// `window_base` slides that window across a result of any size (tens of
@@ -47,14 +47,14 @@ const JUMP_PAGES: usize = 2;
 /// scrolling re-centers the window near its edges (see `prepare_window`).
 pub(super) const WINDOW: usize = 100_000;
 
-/// When the viewport scrolls within this many rows of a window edge — and more
-/// result exists beyond that edge — the window re-centers on the viewport,
+/// When the viewport scrolls within this many rows of a window edge (and more
+/// result exists beyond that edge), the window re-centers on the viewport,
 /// compensating the list's pixel offset so the visible rows don't move.
 const REANCHOR_MARGIN: usize = 5_000;
 
 /// Monotonic id for each opened result. Tags `OpenResult`/`FetchPage` so the
 /// backend can drop stale page fetches and the grid can ignore late replies for
-/// a result it has already replaced (table switch / re-sort). Starts at 1 — `0`
+/// a result it has already replaced (table switch / re-sort). Starts at 1; `0`
 /// is the backend's "no live result" sentinel.
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
@@ -66,21 +66,21 @@ pub(super) fn next_epoch() -> u64 {
 /// enters the buffer (not per frame), so the hot paint path only picks a color.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum CellKind {
-    /// NULL or an absent value — italic, faint.
+    /// NULL or an absent value: italic, faint.
     Null,
-    /// Integer / real — accented (orange).
+    /// Integer / real: accented (orange).
     Num,
     /// Plain text.
     Text,
-    /// A canonical 8-4-4-4-12 hex UUID — dimmed like the design's id columns.
+    /// A canonical 8-4-4-4-12 hex UUID, dimmed like the design's id columns.
     Uuid,
-    /// JSON-ish text (starts with `{` or `[`) — cyan.
+    /// JSON-ish text (starts with `{` or `[`): cyan.
     Json,
-    /// A blob, rendered as its `<N bytes>` summary — faint.
+    /// A blob, rendered as its `<N bytes>` summary; faint.
     Blob,
 }
 
-/// A render-ready cell: the display string (cheap to clone — an `Arc` bump, not a
+/// A render-ready cell: the display string (cheap to clone, an `Arc` bump, not a
 /// heap copy) plus its [`CellKind`] color tag. Built once per cell when its row
 /// lands in the buffer, so a repaint never re-formats a number, re-clones a
 /// string, or re-runs UUID/JSON classification.
@@ -124,7 +124,7 @@ impl DisplayCell {
             },
             // A driver-capped cell: a blob renders as its `<N bytes>` summary; an
             // over-cap text shows its prefix plus an ellipsis, classified on the
-            // visible head (never a UUID — those are short and arrive whole).
+            // visible head (never a UUID; those are short and arrive whole).
             Value::Capped(c) if c.blob => DisplayCell {
                 text: format!("<{} bytes>", c.len).into(),
                 kind: CellKind::Blob,
@@ -145,7 +145,7 @@ impl DisplayCell {
     }
 }
 
-/// True for a canonical `8-4-4-4-12` hex UUID — dimmed like the design's id columns.
+/// True for a canonical `8-4-4-4-12` hex UUID, dimmed like the design's id columns.
 fn is_uuid(s: &str) -> bool {
     s.len() == 36
         && s.as_bytes().iter().enumerate().all(|(i, b)| match i {
@@ -164,15 +164,15 @@ pub(super) struct Row {
     /// cell: an over-cap text the driver clipped to a [`Value::Capped`] prefix.
     /// Empty for the common row (no allocation). A copy that touches one of these
     /// re-fetches the row in full rather than handing over the clipped text (see
-    /// `ResultGrid::copy_plan`). A capped *blob* is not listed — its `<N bytes>`
+    /// `ResultGrid::copy_plan`). A capped *blob* is not listed; its `<N bytes>`
     /// summary is the intended clipboard form, so no re-fetch is needed.
     pub(super) truncated: Vec<usize>,
 }
 
 impl Row {
     /// Build a resident row from the driver's cells, classifying each display once.
-    /// The driver has already applied the display cap — fat non-key cells arrive as
-    /// [`Value::Capped`] (the key column verbatim) — so this only records which
+    /// The driver has already applied the display cap: fat non-key cells arrive as
+    /// [`Value::Capped`] (the key column verbatim). So this only records which
     /// cells are clipped text, for the copy re-fetch path.
     fn new(values: Vec<Value>) -> Row {
         let display = values.iter().map(DisplayCell::from_value).collect();
@@ -189,7 +189,7 @@ impl Row {
         }
     }
 
-    /// The key tuple at `cols` (lead, then tiebreaker) — the keyset boundary of
+    /// The key tuple at `cols` (lead, then tiebreaker): the keyset boundary of
     /// this row, round-tripped to the backend as the next seek's bound.
     fn key_tuple(&self, cols: &[usize]) -> Vec<Value> {
         cols.iter()
@@ -206,11 +206,11 @@ impl Row {
 
 /// The row buffer behind the grid. Two modes, chosen per open result:
 ///
-/// - **Offset** (no seek key — editor SQL, sorted re-opens): a sparse map of
+/// - **Offset** (no seek key; editor SQL, sorted re-opens): a sparse map of
 ///   `(offset, limit)` pages. Deep pages are O(offset).
 /// - **Keyed** (a table browse with a resolved [`KeySpec`]): one contiguous
-///   *run* of rows extended from its boundary keys by indexed seeks — O(page)
-///   at any depth — and relocated by key-space jumps for far scrolls.
+///   *run* of rows extended from its boundary keys by indexed seeks (O(page)
+///   at any depth) and relocated by key-space jumps for far scrolls.
 ///
 /// Either way the buffer holds at most ~`2*MARGIN` rows; everything beyond the
 /// viewport margin is evicted each paint.
@@ -261,7 +261,7 @@ impl Default for BufferMode {
 pub(super) struct OffsetPages {
     rows: HashMap<usize, Row>,
     requested: HashSet<usize>,
-    /// Rows per page (the live `grid.page_size`) — the unit page boundaries and the
+    /// Rows per page (the live `grid.page_size`); the unit page boundaries and the
     /// `FetchPage` limit are computed in.
     page: usize,
 }
@@ -283,11 +283,11 @@ impl OffsetPages {
 }
 
 /// Keyed mode: one contiguous run of rows, `anchor..anchor + rows.len()` in
-/// ordinal space. Extension is run-relative — a forward fetch appends rows
+/// ordinal space. Extension is run-relative: a forward fetch appends rows
 /// strictly after the run's last key, a backward fetch prepends before its
-/// first — so ordinals are counted from the anchor, not refetched by offset.
+/// first, so ordinals are counted from the anchor, not refetched by offset.
 pub(super) struct KeyedRun {
-    /// Indices of the key columns within a row (lead, then tiebreaker) — for
+    /// Indices of the key columns within a row (lead, then tiebreaker), for
     /// reading a boundary's key tuple.
     key_cols: Vec<usize>,
     /// Rows per fetched run window (the live `grid.page_size`). The `short` end
@@ -310,7 +310,7 @@ pub(super) struct KeyedRun {
     seq: u64,
     pending: Option<u64>,
     /// Set when the in-flight fetch failed: hold off re-issuing (a
-    /// deterministic error would otherwise retry — and toast — every paint)
+    /// deterministic error would otherwise retry, and toast, every paint)
     /// until the viewport moves again.
     halted: bool,
 }
@@ -339,7 +339,7 @@ impl KeyedRun {
         self.rows.back().map(|r| r.key_tuple(&self.key_cols))
     }
 
-    /// Trim the run to `lo..hi`. Popping an end forfeits its `at_*` flag — the
+    /// Trim the run to `lo..hi`. Popping an end forfeits its `at_*` flag: the
     /// run no longer touches that end of the result.
     fn evict(&mut self, lo: usize, hi: usize) {
         while self.anchor < lo && !self.rows.is_empty() {
@@ -364,7 +364,7 @@ impl KeyedRun {
         });
     }
 
-    /// Relocate the run to *exactly* `ordinal` — the explicit "go to row N".
+    /// Relocate the run to *exactly* `ordinal`: the explicit "go to row N".
     /// Clears the run (so the next paint can't extend a now-stale boundary) and
     /// issues an **exact** jump that bypasses key-space interpolation, landing on
     /// the true row with non-estimated ordinals. The pending mark it sets stops
@@ -386,7 +386,7 @@ impl KeyedRun {
     }
 
     /// Issue (at most) one fetch toward covering `range` plus its margins. One
-    /// request in flight at a time — a seek's start is the previous reply's
+    /// request in flight at a time; a seek's start is the previous reply's
     /// boundary key, so they can't pipeline anyway.
     fn request(&mut self, range: Range<usize>, total: usize, epoch: u64, sender: &CommandSender) {
         if self.pending.is_some() || self.halted {
@@ -401,7 +401,7 @@ impl KeyedRun {
                 self.issue(RunFetch::Forward { after: None }, epoch, sender);
             } else if !self.at_end {
                 // `at_end` with no rows means a jump found nothing there (the
-                // data shrank under the estimate) — don't re-jump every paint.
+                // data shrank under the estimate); don't re-jump every paint.
                 self.issue(
                     RunFetch::Jump {
                         ordinal: range.start,
@@ -451,7 +451,7 @@ impl KeyedRun {
     }
 
     /// Land one `ResultRunLoaded` reply. The echoed `seq` must be the in-flight
-    /// one and (for extensions) the echoed boundary must still be the run's —
+    /// one and (for extensions) the echoed boundary must still be the run's;
     /// eviction may have moved it since the request, in which case the reply is
     /// dropped and the next paint re-requests from the new boundary.
     fn apply(
@@ -483,7 +483,7 @@ impl KeyedRun {
                 self.at_end = short;
                 if short {
                     // The run now touches the true last row, so its ordinals
-                    // count back from `total` — exact again.
+                    // count back from `total`, exact again.
                     self.anchor = total.saturating_sub(self.rows.len());
                     self.estimated = false;
                 }
@@ -552,7 +552,7 @@ impl GridBuffer {
 
     /// Resident cells whose display text contains `term` (already lower-cased),
     /// as `(absolute ordinal, data column)`, sorted row-major. Scans only the
-    /// rows held resident — find-in-result is deliberately a loaded-rows feature
+    /// rows held resident; find-in-result is deliberately a loaded-rows feature
     /// (the whole-set search is the filter bar, which pushes a SQL predicate).
     pub(super) fn find_matches(&self, term: &str) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
@@ -588,13 +588,13 @@ impl GridBuffer {
         }
     }
 
-    /// Whether this result pages by keyset runs (vs. `OFFSET`) — shown in the
+    /// Whether this result pages by keyset runs (vs. `OFFSET`), shown in the
     /// footer so the active paging mode is visible at a glance.
     pub(super) fn is_keyed(&self) -> bool {
         matches!(&self.mode, BufferMode::Keyed(_))
     }
 
-    /// Rows held resident right now — bounded by the window margin regardless of
+    /// Rows held resident right now, bounded by the window margin regardless of
     /// result size. For the dev perf HUD (see `dev_stats`).
     #[cfg(feature = "dev-stats")]
     pub(super) fn resident_rows(&self) -> usize {
@@ -604,7 +604,7 @@ impl GridBuffer {
         }
     }
 
-    /// `"keyed"` / `"offset"` — the active paging mode, for the HUD.
+    /// `"keyed"` / `"offset"`: the active paging mode, for the HUD.
     #[cfg(feature = "dev-stats")]
     pub(super) fn mode_label(&self) -> &'static str {
         match &self.mode {
@@ -613,7 +613,7 @@ impl GridBuffer {
         }
     }
 
-    /// Fetches in flight right now — keyed mode runs one at a time (0/1), offset
+    /// Fetches in flight right now: keyed mode runs one at a time (0/1), offset
     /// mode may have several pages queued. For the HUD.
     #[cfg(feature = "dev-stats")]
     pub(super) fn in_flight(&self) -> usize {
@@ -664,7 +664,7 @@ impl GridBuffer {
     /// about-to-render window, so the buffer tracks the viewport.
     ///
     /// Returns `false` when fetching was skipped because the viewport is flinging
-    /// (see `FLING_ROWS`) — the caller schedules another paint so the resting
+    /// (see `FLING_ROWS`); the caller schedules another paint so the resting
     /// window still loads once the scroll settles.
     pub(super) fn ensure(
         &mut self,
@@ -758,7 +758,7 @@ pub(super) struct WindowView {
 /// Pure window arithmetic, factored out of `ResultGrid::prepare_window` for
 /// testing. Given the result `total`, the current window `base`, the viewport's
 /// top row in list-local coordinates, and the viewport height in rows, returns
-/// the base to use this frame and — when it changed — the list-local row the
+/// the base to use this frame and, when it changed, the list-local row the
 /// pixel offset must be re-anchored onto so the visible rows don't move.
 ///
 /// The window re-centers on the viewport once it scrolls within
@@ -868,12 +868,12 @@ mod row_tests {
     use super::*;
 
     // The display cap now lives in the driver (it hands the buffer already-capped
-    // `Value::Capped` cells, the key column verbatim — see the driver conformance
+    // `Value::Capped` cells, the key column verbatim; see the driver conformance
     // battery). These tests cover what the buffer derives from those cells: the
     // `truncated` flag that drives the copy re-fetch, and the rendered display.
 
-    /// A capped text cell is flagged truncated — that flag is what sends a copy of
-    /// it back to the driver for the full value (see `copy_plan`) — and renders as
+    /// A capped text cell is flagged truncated (that flag is what sends a copy of
+    /// it back to the driver for the full value; see `copy_plan`) and renders as
     /// its head plus an ellipsis.
     #[test]
     fn capped_text_is_flagged_and_renders_with_ellipsis() {
@@ -931,7 +931,7 @@ mod keyed_run_tests {
         ids.into_iter().map(row).collect()
     }
 
-    /// The same rows as resident [`Row`]s — for seeding a run's buffer directly,
+    /// The same rows as resident [`Row`]s, for seeding a run's buffer directly,
     /// as an arrived page would after `Row::new`.
     fn run_rows(ids: impl IntoIterator<Item = i64>) -> VecDeque<Row> {
         ids.into_iter().map(|id| Row::new(row(id))).collect()
@@ -947,7 +947,7 @@ mod keyed_run_tests {
     const TOTAL: usize = 10_000;
 
     /// The `short = n < page` end detection keys off the run's *runtime* page, not
-    /// the default — so a custom `grid.page_size` pages correctly.
+    /// the default, so a custom `grid.page_size` pages correctly.
     #[test]
     fn short_detection_uses_the_run_page() {
         let mut run = pending(KeyedRun::new(vec![0], 5), 1);
@@ -1065,7 +1065,7 @@ mod keyed_run_tests {
     #[test]
     fn short_backward_pins_the_run_to_the_start() {
         let mut run = pending(KeyedRun::new(vec![0], DEFAULT_PAGE), 1);
-        run.anchor = 80; // estimate was high — only 3 rows actually precede
+        run.anchor = 80; // estimate was high; only 3 rows actually precede
         run.estimated = true;
         run.rows = run_rows(4..=10);
         run.apply(

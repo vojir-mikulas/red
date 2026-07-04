@@ -48,7 +48,7 @@ fn detect_dbeaver() -> Vec<Found> {
         if dir.join("data-sources.json").is_file() {
             let label = project
                 .file_name()
-                .map(|n| format!("DBeaver — {}", n.to_string_lossy()))
+                .map(|n| format!("DBeaver ({})", n.to_string_lossy()))
                 .unwrap_or_else(|| "DBeaver".to_string());
             out.push(Found {
                 source: ImportSource::DBeaver,
@@ -86,7 +86,7 @@ fn dbeaver_root() -> Option<PathBuf> {
     #[cfg(not(target_os = "macos"))]
     {
         // dirs::data_dir() is %APPDATA% on Windows and $XDG_DATA_HOME (~/.local/share)
-        // on Linux — both where DBeaver puts DBeaverData.
+        // on Linux, both where DBeaver puts DBeaverData.
         dirs::data_dir().map(|d| d.join("DBeaverData"))
     }
 }

@@ -1,11 +1,11 @@
-//! The settings panel — a Zed-style left category nav beside a scrolling content
+//! The settings panel: a Zed-style left category nav beside a scrolling content
 //! pane, ported from Nyx's `settings_modal`. Built as a custom scrim + card (not
 //! the shared `Modal`) so the nav stays fixed while only the page scrolls. Pure
 //! assembly over Flint components; the state + actions live on [`AppState`]
 //! (`app.rs`), persisted through [`crate::settings`].
 //!
 //! The panel is the convenience surface; the *file* (opened from the footer or the
-//! command palette) is the full, documented config — the Zed-spirit primary path.
+//! command palette) is the full, documented config, the Zed-spirit primary path.
 
 use flint::prelude::*;
 use flint::Theme;
@@ -124,7 +124,7 @@ impl AppState {
         // the window from behind the panel doesn't close it.
         //
         // Keyboard handling rides on the scrim (the ancestor of every control), so
-        // it fires whether the panel root or a focused child holds focus — Esc
+        // it fires whether the panel root or a focused child holds focus: Esc
         // closes, and Tab/Shift-Tab cycle the panel's controls (the `Modal` context
         // is shared with Flint's `Modal`; its bindings are registered once at
         // startup). The focus trap on `modal_focus` keeps Tab from escaping to the
@@ -147,7 +147,7 @@ impl AppState {
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 // While the keymap recorder is live it owns the keyboard (its
                 // interceptor ran first and stopped propagation, but this listener
-                // fires regardless), so stand down — Esc/Enter there cancel/confirm
+                // fires regardless), so stand down; Esc/Enter there cancel/confirm
                 // the capture, not close the panel.
                 if this.keymap_intercept.is_some() {
                     cx.stop_propagation();
@@ -161,7 +161,7 @@ impl AppState {
                     }
                     // Swallow a bare Enter so it can't fall through to a background
                     // action (e.g. the welcome screen's Enter-to-connect) or read as
-                    // a "confirm" that dismisses the panel — closing stays explicit.
+                    // a "confirm" that dismisses the panel; closing stays explicit.
                     // A focused control still activates on Enter (it handles the key
                     // first, before it bubbles here).
                     "enter" => cx.stop_propagation(),
@@ -257,7 +257,7 @@ fn settings_nav_item(
     let focus_ring = theme.accent;
     div()
         .id(SharedString::from(format!("settings-nav-{}", tab.label())))
-        // A category selector — expose it as a tab to assistive tech.
+        // A category selector; expose it as a tab to assistive tech.
         .role(gpui::Role::Tab)
         .aria_label(tab.label())
         .flex()
@@ -301,7 +301,7 @@ fn appearance_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     let theme = cx.theme().clone();
     let view = cx.entity();
 
-    // System / Light / Dark — how the theme tracks the OS appearance.
+    // System / Light / Dark: how the theme tracks the OS appearance.
     let mode_sel = match state.theme_mode() {
         ThemeMode::System => 0,
         ThemeMode::Light => 1,
@@ -348,13 +348,13 @@ fn appearance_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             .child(settings_header("Typography", &theme))
             .child(setting_row(
                 "Interface font",
-                "The sans font for chrome — toolbars, tabs, sidebars, status bar, menus.",
+                "The sans font for chrome: toolbars, tabs, sidebars, status bar, menus.",
                 font_picker(state, FontSelect::Ui),
                 &theme,
             ))
             .child(setting_row(
                 "Interface mono font",
-                "The font for in-UI data — result grid cells and schema identifiers. \
+                "The font for in-UI data: result grid cells and schema identifiers. \
                  Shares the interface font size; match it to the interface font for a \
                  uniform look.",
                 font_picker(state, FontSelect::UiMono),
@@ -372,7 +372,7 @@ fn appearance_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             ))
             .child(setting_row(
                 "Editor font",
-                "The SQL editor font — independent of the interface. A monospace face is \
+                "The SQL editor font, independent of the interface. A monospace face is \
                  recommended.",
                 font_picker(state, FontSelect::Editor),
                 &theme,
@@ -453,8 +453,8 @@ fn reveal_wrap(state: &AppState, target: RevealTarget, control: impl IntoElement
         .into_any_element()
 }
 
-/// The theme manager: an Import button, then every theme as a row — built-ins
-/// tagged by family, imported ones with a trash button to remove them.
+/// The theme manager: an Import button, then every theme as a row (built-ins
+/// tagged by family, imported ones with a trash button to remove them).
 fn theme_manager(state: &AppState, cx: &mut Context<AppState>) -> impl IntoElement {
     let theme = cx.theme().clone();
 
@@ -664,7 +664,7 @@ fn grid_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             ))
             .child(setting_row(
                 "Max cell size",
-                "Bytes of a single cell kept resident — the fat-cell memory rail. \
+                "Bytes of a single cell kept resident, the fat-cell memory rail. \
                  Over-cap cells are clipped for display only; export stays full.",
                 max_cell,
                 &theme,
@@ -738,7 +738,7 @@ fn query_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             ))
             .child(setting_row(
                 "Statement timeout",
-                "Abort a query — and its page/run fetches — that runs longer than this.",
+                "Abort a query (and its page/run fetches) that runs longer than this.",
                 statement_timeout,
                 &theme,
             ))
@@ -840,7 +840,7 @@ fn keymap_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                     .text_size(theme.scale(12.))
                     .text_color(theme.text_muted)
                     .child(
-                        "Rebind captures the next shortcut you press — even one already in use. \
+                        "Rebind captures the next shortcut you press, even one already in use. \
                          The SQL editor, text-field, and dialog keys stay fixed.",
                     ),
             )
@@ -852,7 +852,7 @@ fn keymap_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
 }
 
 /// One row of the Keymap tab: the action label + context on the left, and on the
-/// right one of three states — the idle chip with Rebind/Reset, the live
+/// right one of three states: the idle chip with Rebind/Reset, the live
 /// "press a shortcut" affordance, or the captured-chord confirm (with a conflict
 /// note when the chord is taken).
 fn keymap_row(
@@ -877,7 +877,7 @@ fn keymap_row(
     };
 
     // The context a binding lives in, as a faint sub-label so a user knows where
-    // it fires (globals show nothing — they fire everywhere).
+    // it fires (globals show nothing; they fire everywhere).
     let context_note = def.context.map(|c| match c {
         "RedRoot" => "App",
         "Table" => "Result grid",
@@ -1040,7 +1040,7 @@ fn capture_confirm(
                 .text_size(theme.scale(11.))
                 .text_color(theme.yellow)
                 .child(SharedString::from(format!(
-                    "Already bound to “{other}” — rebinding unbinds it."
+                    "Already bound to “{other}”; rebinding unbinds it."
                 )))
         }))
 }
@@ -1130,7 +1130,7 @@ fn behavior_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
 /// Everything here writes `[ai]` in `settings.toml` and is re-pushed to the
 /// backend live, so a tier change applies to the next turn and flipping the
 /// switch off removes the sidepanel immediately (see [`AppState::set_ai_enabled`]).
-/// Provider, model, and the agent command stay in the file — the convenience
+/// Provider, model, and the agent command stay in the file: the convenience
 /// surface holds the safety knobs, the file holds the plumbing.
 fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     let theme = cx.theme().clone();
@@ -1138,12 +1138,12 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     let ai = &state.settings.ai;
     let enabled = ai.enabled;
 
-    // The master switch. Off is a true kill switch — no panel, no MCP server, no
+    // The master switch. Off is a true kill switch: no panel, no MCP server, no
     // agent process. Flipping it off also closes any open panel.
     let switch = Toggle::new("set-ai-enabled", enabled)
         .on_change(cx.listener(|this, on: &bool, _, cx| this.set_ai_enabled(*on, cx)));
 
-    // Database access tier — the capability boundary. Out-of-tier tools are never
+    // Database access tier, the capability boundary. Out-of-tier tools are never
     // even offered to the model (M-S7), so this is the real "how much can it see".
     // Write adds the gated `propose_write` tool on top of the read catalog; every
     // write still needs per-statement approval and is blocked on a read-only
@@ -1298,7 +1298,7 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             .flex_col()
             .child(setting_row(
                 "Enable agent",
-                "The grounded chat sidepanel (⌘L). Off is a true kill switch — it \
+                "The grounded chat sidepanel (⌘L). Off is a true kill switch: it \
                  removes the panel, runs no agent, and starts no local server.",
                 switch,
                 &theme,
@@ -1307,7 +1307,7 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             .child(setting_row(
                 "Access tier",
                 "How much the agent's tools can see. Off: no database tools at \
-                 all. Schema: structure only (tables, columns, types — never row \
+                 all. Schema: structure only (tables, columns, types; never row \
                  data). Read: the full read catalog (run capped SELECTs and EXPLAIN). \
                  Write: adds INSERT/UPDATE/DELETE, each needing your per-statement \
                  approval. A tool above the tier is never offered to the model.",
@@ -1325,7 +1325,7 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                          every write still needs your explicit per-statement approval, is \
                          blocked on a read-only connection, and never runs DDL or an \
                          unqualified UPDATE/DELETE. A connection can override enabled/tier \
-                         in connections.toml (ai_enabled / ai_tier) — e.g. grant Write on \
+                         in connections.toml (ai_enabled / ai_tier), e.g. grant Write on \
                          one trusted connection while the global default stays Read, or \
                          flip it on per writable connection via “AI assistant → Allow \
                          writes” in the connection form.",
@@ -1354,7 +1354,7 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             ))
             .child(setting_row(
                 "Tool calls per chat",
-                "Bound a runaway agent loop — the cumulative tool-call budget for one \
+                "Bound a runaway agent loop: the cumulative tool-call budget for one \
                  conversation.",
                 max_calls,
                 &theme,
@@ -1382,12 +1382,12 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     .into_any_element()
 }
 
-/// The Agents list (Phase 5): every configured agent — the synthesized legacy
-/// built-ins, or an explicit `[[ai.agents]]` set. Click a row to make it the
+/// The Agents list (Phase 5): every configured agent (the synthesized legacy
+/// built-ins, or an explicit `[[ai.agents]]` set). Click a row to make it the
 /// default new chats start on; the filled dot marks the current default. An API
 /// agent shows whether its key is set (the keyring), an ACP agent is always ready.
 /// Add/remove agents and edit their fields (command / base_url / model / API keys)
-/// in the settings file — the "Edit in settings file" button opens it.
+/// in the settings file; the "Edit in settings file" button opens it.
 fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>) -> AnyElement {
     let view = cx.entity();
     let agents = state.settings.ai.resolved_agents();
@@ -1400,7 +1400,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
         let is_default = a.id == default_id;
         let is_acp = a.kind.eq_ignore_ascii_case("acp");
         // The subscription agent's last-known sign-in, once checked (the AI tab asks
-        // on open). API agents have no sign-in — they carry a key.
+        // on open). API agents have no sign-in; they carry a key.
         let acp_auth = is_acp.then(|| state.ai_auth.get(a.id.as_str())).flatten();
         let signed_in = acp_auth.is_some_and(|s| s.logged_in);
         // Status line: a subscription agent shows who's signed in (or that it isn't);
@@ -1464,7 +1464,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                     signin_view.update(cx, |this, cx| this.reauthenticate_agent(&id, cx));
                 })
         });
-        // Sign out — shown only once we know the ACP agent is signed in. (A second
+        // Sign out, shown only once we know the ACP agent is signed in. (A second
         // sign-in switches account without signing out first.)
         let signout = (is_acp && signed_in).then(|| {
             let signout_id = a.id.clone();
@@ -1546,7 +1546,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.bg_elevated))
                 .child(dot)
-                // Name on top, the status/identity line beneath it — so a long
+                // Name on top, the status/identity line beneath it, so a long
                 // sign-in identity (email · tier) never pushes the name into a wrap.
                 .child(
                     div()
@@ -1598,7 +1598,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
 
         // The inline key editor, shown under the row while this API agent is open.
         // Enter (or Save) stores the key; Esc (or Cancel) closes it; Remove clears a
-        // stored key. The field is the shared `ai_key_input` — only one row at a time.
+        // stored key. The field is the shared `ai_key_input`; only one row at a time.
         if editing {
             let id_remove = a.id.clone();
             list = list.child(
@@ -1645,8 +1645,8 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                 .child(
                     "Pick the agent new chats start on (click a row). Switch a chat's \
                      agent before its first message from the panel. An API agent needs a \
-                     key — use “Add key” (stored in the OS keyring, never in the file). A \
-                     subscription (ACP) agent signs in through your browser — use the key \
+                     key; use “Add key” (stored in the OS keyring, never in the file). A \
+                     subscription (ACP) agent signs in through your browser; use the key \
                      button to sign in or switch account, and “Sign out” to disconnect; the \
                      row shows who's signed in. Add or remove agents and edit their command \
                      / endpoint / model in the settings file.",
@@ -1692,7 +1692,7 @@ fn login_panel(
 ) -> AnyElement {
     let mut panel = div().flex().flex_col().gap_1p5().px_2().pt_1().pb_2();
     match &flow.url {
-        // The browser hasn't been pointed yet — the backend is starting the CLI.
+        // The browser hasn't been pointed yet; the backend is starting the CLI.
         None => {
             panel = panel.child(
                 div()
@@ -1709,7 +1709,7 @@ fn login_panel(
                         .text_size(theme.scale(11.5))
                         .text_color(theme.text_muted)
                         .child(
-                            "A browser window opened — authorize there to finish signing in. \
+                            "A browser window opened; authorize there to finish signing in. \
                              This closes on its own when you're done.",
                         ),
                 )
@@ -1798,7 +1798,7 @@ fn about_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                     .pb_2()
                     .text_size(theme.scale(14.))
                     .text_color(theme.text_muted)
-                    .child("Red — Roughly Enough Data, a fast, native database explorer."),
+                    .child("Red: Roughly Enough Data, a fast, native database explorer."),
             )
             .child(settings_header("Build", &theme))
             .child(setting_row(
@@ -1860,7 +1860,7 @@ fn update_status_row(
         UpdateState::UpToDate { .. } => "You're on the latest version.".to_string(),
         UpdateState::Downloading { version, .. } => format!("Downloading {version}…"),
         UpdateState::ReadyToRestart { version } => {
-            format!("{version} is staged — restart to apply.")
+            format!("{version} is staged; restart to apply.")
         }
         UpdateState::Failed { reason } => format!("Last check failed: {reason}"),
         UpdateState::Unsupported { version, .. } => {

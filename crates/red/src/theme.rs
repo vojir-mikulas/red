@@ -1,12 +1,12 @@
 //! RED's theme registry. Surfaces, text, and state colors come from Flint's stock
 //! themes (the cross-repo contract: same tokens Nyx uses), but RED has its own
-//! identity — a **blue** accent, not Flint's green: the Run button, the active tab
+//! identity (a **blue** accent, not Flint's green): the Run button, the active tab
 //! underline, the selected tree row, cell selection. So RED ships blue-accented
 //! built-in variants and installs the chosen one as the `Theme` global.
 //!
 //! On top of the built-ins, users can drop theme files into
-//! `<config>/red/themes/*.toml` — a small `base` (a built-in to start from) plus
-//! `#RRGGBB` token overrides — and import / remove them from the settings panel.
+//! `<config>/red/themes/*.toml`, a small `base` (a built-in to start from) plus
+//! `#RRGGBB` token overrides, and import / remove them from the settings panel.
 //! The [`ThemeRegistry`] resolves a [`ThemeSetting`] (a named theme, or a
 //! light/dark pair driven by OS appearance) to a concrete [`Theme`].
 
@@ -41,7 +41,7 @@ pub struct ThemeEntry {
     pub is_light: bool,
     /// `false` for built-ins (not removable); `true` for imported user themes.
     pub user: bool,
-    /// The backing file, for removal — `Some` only for user themes.
+    /// The backing file, for removal; `Some` only for user themes.
     pub path: Option<PathBuf>,
     theme: Theme,
 }
@@ -88,7 +88,7 @@ impl ThemeRegistry {
             .is_some_and(|e| e.is_light)
     }
 
-    /// Theme names of the given family, in registry order — for the pickers.
+    /// Theme names of the given family, in registry order, for the pickers.
     pub fn names(&self, light: bool) -> Vec<String> {
         self.entries
             .iter()
@@ -97,7 +97,7 @@ impl ThemeRegistry {
             .collect()
     }
 
-    /// The first theme of a family, or a built-in default — the seed for a pair.
+    /// The first theme of a family, or a built-in default: the seed for a pair.
     pub fn default_name(&self, light: bool) -> String {
         self.entries
             .iter()
@@ -127,7 +127,7 @@ impl ThemeRegistry {
             bail!("the theme file needs a `name`");
         }
         if is_builtin(&file.name) {
-            bail!("\"{}\" is a built-in theme name — rename it", file.name);
+            bail!("\"{}\" is a built-in theme name; rename it", file.name);
         }
         let dir = themes_dir().context("no config directory for themes")?;
         std::fs::create_dir_all(&dir).context("creating the themes directory")?;
@@ -228,7 +228,7 @@ fn builtin_entries() -> Vec<ThemeEntry> {
 }
 
 /// Read every `*.toml` in the themes dir into an entry, skipping (with a warning)
-/// any that won't parse — one bad file never blocks the others.
+/// any that won't parse, so one bad file never blocks the others.
 fn load_user_themes() -> Vec<ThemeEntry> {
     let Some(dir) = themes_dir() else {
         return Vec::new();
@@ -341,7 +341,7 @@ fn apply_token(theme: &mut Theme, key: &str, color: Hsla) {
 }
 
 /// Relative luminance of a color per WCAG 2.1 (sRGB → linear → weighted sum).
-/// Alpha is ignored — these are opaque token colors.
+/// Alpha is ignored; these are opaque token colors.
 fn relative_luminance(color: Hsla) -> f32 {
     let rgb = color.to_rgb();
     let lin = |c: f32| {
@@ -365,7 +365,7 @@ fn contrast_ratio(a: Hsla, b: Hsla) -> f32 {
 const AA_CONTRAST: f32 = 4.5;
 
 /// Warn (non-blocking) about token pairs in an imported theme that fall below the
-/// WCAG AA body-text threshold — a foreground that's hard to read on its surface.
+/// WCAG AA body-text threshold (a foreground that's hard to read on its surface).
 /// The theme still loads; this only flags it in the log so an author can tell why
 /// their colors look washed out. The pairs checked are the load-bearing ones: the
 /// text tones over the app/panel backgrounds, and the accent fill's own text.
@@ -435,7 +435,7 @@ pub fn github_dark() -> Theme {
     }
 }
 
-/// Ayu Dark carrying Red's brand accent (`#dc2626`) — the dark face of the app.
+/// Ayu Dark carrying Red's brand accent (`#dc2626`): the dark face of the app.
 /// `accent_hover` is the lighter red-500, white text sits atop the red.
 /// `bg_selected` is recoloured from Ayu's stock blue wash to a dark brand-red tint
 /// so selections read on-brand rather than blue.
@@ -447,7 +447,7 @@ pub fn github_dark() -> Theme {
 ///
 /// Flint's stock Ayu text and border tones are calibrated for its near-black
 /// surfaces; against RED's lighter bars/popovers (`bg_bar`/`bg_elevated` at
-/// `#2d2f33`) the dimmer tones collapse — `text_faint`/`text_dim` fell to
+/// `#2d2f33`) the dimmer tones collapse: `text_faint`/`text_dim` fell to
 /// ~1.8:1 and `border_soft`/`border_strong` sat *darker* than the surface they
 /// drew on. They're retuned here so secondary text clears WCAG AA on both the
 /// dark canvas and the raised chrome, and borders read as structure everywhere.
@@ -461,7 +461,7 @@ pub fn ayu_dark() -> Theme {
 
         // Secondary text, lifted to clear AA on the lighter bars (was tuned for
         // Ayu's near-black surfaces and washed out on RED's raised chrome).
-        text_muted: h(0x9ba0aa), // secondary labels — AA on canvas and bars
+        text_muted: h(0x9ba0aa), // secondary labels; AA on canvas and bars
         text_faint: h(0x777d88), // tertiary hints
         text_dim: h(0x61687a),   // disabled / placeholder
 
@@ -476,13 +476,13 @@ pub fn ayu_dark() -> Theme {
         bg_panel: h(0x1f2126),    // side panels
         bg_bar: h(0x2d2f33),      // toolbars / tab strip
         bg_elevated: h(0x2d2f33), // popovers / modals
-        bg_hover: h(0x1a1e26),    // row / control hover — a clear lift on canvas
+        bg_hover: h(0x1a1e26),    // row / control hover, a clear lift on canvas
         bg_active: h(0x232832),   // pressed / active row
         ..Theme::ayu_dark()
     }
 }
 
-/// Ayu Light carrying Red's brand accent (`#dc2626`) — the light counterpart for
+/// Ayu Light carrying Red's brand accent (`#dc2626`): the light counterpart for
 /// `mode = light` (or `mode = system` on a light OS). White text sits atop the red.
 /// `bg_selected` is recoloured from Ayu's stock blue wash to a soft brand-red tint
 /// so selections read on-brand rather than blue.
@@ -502,7 +502,7 @@ pub fn ayu_light() -> Theme {
 /// syntax colors. Every text/surface pair here exceeds the WCAG AA 4.5:1
 /// body-text threshold; the borders are deliberately loud so structure reads
 /// without relying on subtle fills. (RED ships no OS "increase contrast" bridge
-/// yet — this is the manual opt-in until that lands.)
+/// yet; this is the manual opt-in until that lands.)
 pub fn high_contrast() -> Theme {
     Theme {
         bg_app: h(0x000000),      // editor / results canvas

@@ -104,21 +104,21 @@ impl AppState {
         // horizontal split (see `render_work_body`).
         let inner = self.render_work_body(active, window, cx);
 
-        // Two independent left side-panels — History (leftmost) then Schema — each
+        // Two independent left side-panels, History (leftmost) then Schema, each
         // closable and separately resizable (Zed's multi-panel left dock). Each
         // wraps the rest in a leading-sized horizontal split; closed, it drops out
         // and the next pane fills the space. The status-bar toggles bring a panel
         // back, restoring its retained width. `workspace` is the bare, self-sizing
-        // (`size_full`) result — the `flex_1` fill wrapper is applied below, *after*
+        // (`size_full`) result; the `flex_1` fill wrapper is applied below, *after*
         // deciding whether the assistant dock wraps it. (Wrapping a `flex_1` element
-        // inside the dock's non-flex pane would collapse it — the pane stretches a
+        // inside the dock's non-flex pane would collapse it: the pane stretches a
         // `size_full` child but doesn't grow a `flex_1` one.)
         let show_history = active.history_open;
         let show_schema = !active.sidebar_collapsed;
         let show_columns = active.columns_open;
 
         // Innermost-left column boundary: Columns (inline FK expansion) | (editor /
-        // results) — closest to the work area, since it's contextual to the result.
+        // results), closest to the work area, since it's contextual to the result.
         let with_columns = if show_columns {
             let columns_pane = self.render_columns_panel(active, cx);
             let start = view.clone();
@@ -309,14 +309,14 @@ impl AppState {
         };
 
         // --- status bar: endpoint · db · read-only | rows · cols · UTF-8 · SQL ·
-        // engine — the design's information-dense bottom strip ---
+        // engine (the design's information-dense bottom strip) ---
         let counts = active.active_result().and_then(|g| g.status_counts());
 
         // Endpoint + connection name can be arbitrarily long (a deep SQLite path,
         // a verbose `user@host:port/database`). They sit in a `flex_1 min_w_0`
         // group and truncate with an ellipsis so the window can shrink without
         // shoving the right-hand status / assistant button off-screen. The dot and
-        // the read-only badge stay `flex_shrink_0` — only the text gives way.
+        // the read-only badge stay `flex_shrink_0`; only the text gives way.
         let status_left = div()
             .flex()
             .items_center()
@@ -433,7 +433,7 @@ impl AppState {
             ))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx)));
 
-        // Columns panel toggle (inline FK expansion) — accent-tinted while open.
+        // Columns panel toggle (inline FK expansion), accent-tinted while open.
         let columns_toggle = div()
             .id("toggle-columns")
             .mr_1()
@@ -462,7 +462,7 @@ impl AppState {
         // Assistant toggle, pinned to the far-right of the status bar (mirrors the
         // schema sidebar toggle on the left). Accent-tinted while the panel is open.
         // Hidden entirely when the assistant is disabled for this connection (the
-        // M-S7 kill switch) — no entry point, not just a no-op button.
+        // M-S7 kill switch): no entry point, not just a no-op button.
         let assistant_enabled = self.ai_enabled();
         let assistant_open = self.assistant.is_some();
         let assistant_toggle = div()
@@ -537,8 +537,8 @@ impl AppState {
             .child(statusbar)
     }
 
-    /// The work area right of the schema dock: a single editor/result pane, or —
-    /// when `active.split` is set — two halves in a resizable horizontal split. Each
+    /// The work area right of the schema dock: a single editor/result pane, or,
+    /// when `active.split` is set, two halves in a resizable horizontal split. Each
     /// half is a full editor-over-result pane for its own tab (see [`Self::render_half`]).
     fn render_work_body(
         &self,
@@ -547,7 +547,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let Some(s) = active.split.as_ref() else {
-            // Single pane — the ordinary layout, behaviourally unchanged.
+            // Single pane: the ordinary layout, behaviourally unchanged.
             return self.render_half(
                 active,
                 SplitHalf::Primary,
@@ -638,8 +638,8 @@ impl AppState {
     }
 
     /// One split half: the tab `tab_idx` rendered as the editor-over-result vertical
-    /// split, wrapped so a click anywhere in it focuses the half (`half`) and — while
-    /// split — an accent outline marks the focused one. The editor/result ratio is
+    /// split, wrapped so a click anywhere in it focuses the half (`half`) and, while
+    /// split, an accent outline marks the focused one. The editor/result ratio is
     /// shared between halves (both read `editor_h`).
     fn render_half(
         &self,
@@ -732,7 +732,7 @@ impl AppState {
     }
 
     /// The lower pane for tab `tab_idx`: its query plan (Track B4) when one is open,
-    /// else the result grid — both share the slot. Picks per-tab (not per-focus) so
+    /// else the result grid; both share the slot. Picks per-tab (not per-focus) so
     /// each half shows its own tab's view.
     fn render_results_slot(
         &self,

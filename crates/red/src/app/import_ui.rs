@@ -1,7 +1,7 @@
 //! Connection-import UI + commit (Phases 2–3 of `docs/plans/connection-import.md`).
 //!
 //! The parse/decrypt core lives in [`crate::import`]; this is the app-side glue:
-//! turning an [`ImportReport`] into a preview modal, and — on confirm — committing
+//! turning an [`ImportReport`] into a preview modal, and, on confirm, committing
 //! the imported connections into RED's store the same way a form save does
 //! (keychain-routed secrets, never the config file).
 
@@ -79,7 +79,7 @@ impl AppState {
                 duplicate += 1;
                 continue;
             }
-            // Split secrets off before the config is stored — they go to the OS
+            // Split secrets off before the config is stored: they go to the OS
             // keychain, never `connections.toml` (mirrors `save_form`).
             let password = std::mem::take(&mut config.password);
             let ssh_secrets = config.ssh.as_mut().map(|s| {
@@ -108,7 +108,7 @@ impl AppState {
         let (variant, msg) = match (added, duplicate) {
             (0, _) => (
                 ToastVariant::Info,
-                "Nothing imported — those connections already exist.".to_string(),
+                "Nothing imported; those connections already exist.".to_string(),
             ),
             (n, 0) => (
                 ToastVariant::Success,
@@ -185,7 +185,7 @@ impl AppState {
             list = list.child(row);
         }
 
-        // Skipped connections, each with its reason — the "nothing is dropped
+        // Skipped connections, each with its reason: the "nothing is dropped
         // silently" contract, made visible.
         if skip_count > 0 {
             list = list.child(
@@ -270,7 +270,7 @@ impl AppState {
     }
 }
 
-/// Two connections address the same target — the dedupe key for import. File
+/// Two connections address the same target; the dedupe key for import. File
 /// engines compare by path (host/port/user are empty); network engines by the
 /// full coordinate tuple.
 fn same_target(a: &ConnectionConfig, b: &ConnectionConfig) -> bool {

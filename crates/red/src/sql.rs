@@ -122,22 +122,22 @@ pub const FUNCTIONS: &[(&str, &str, &str)] = &[
 ];
 
 /// A one-line guide for a (lower-cased) SQL keyword, shown in the completion doc
-/// panel. `None` for keywords without a note — they still complete, just bare.
+/// panel. `None` for keywords without a note; they still complete, just bare.
 pub fn keyword_doc(kw: &str) -> Option<&'static str> {
     Some(match kw {
         "select" => "Columns or expressions to return.",
         "from" => "Source table, view, or subquery.",
         "where" => "Filter rows by a boolean predicate.",
-        "group" => "GROUP BY — collapse rows into groups.",
-        "order" => "ORDER BY — sort the result set.",
+        "group" => "GROUP BY: collapse rows into groups.",
+        "order" => "ORDER BY: sort the result set.",
         "by" => "Pairs with GROUP / ORDER.",
         "having" => "Filter groups after aggregation.",
         "limit" => "Cap the number of returned rows.",
         "offset" => "Skip N rows before returning.",
         "join" => "Combine rows from another table.",
-        "left" => "LEFT JOIN — keep unmatched left rows.",
-        "right" => "RIGHT JOIN — keep unmatched right rows.",
-        "inner" => "INNER JOIN — only matched rows.",
+        "left" => "LEFT JOIN: keep unmatched left rows.",
+        "right" => "RIGHT JOIN: keep unmatched right rows.",
+        "inner" => "INNER JOIN: only matched rows.",
         "outer" | "full" | "cross" => "Outer / cross join variant.",
         "on" => "Join predicate.",
         "using" => "Join on shared column names.",
@@ -222,7 +222,7 @@ pub fn tokenize(src: &str) -> Vec<(Range<usize>, TokenStyle)> {
         }
 
         // String / quoted literal (' or "). A doubled quote (`''`) is treated as
-        // close-then-reopen rather than an escaped inner quote — deliberately: it
+        // close-then-reopen rather than an escaped inner quote. Deliberately: it
         // keeps the lexer trivial, and since the content between the doubled quotes
         // stays "inside a string", a `;` there is still not a statement boundary, so
         // `classify`/`split_statements` (the destructive-query guard) stay correct.
@@ -294,24 +294,24 @@ pub fn tokenize(src: &str) -> Vec<(Range<usize>, TokenStyle)> {
     out
 }
 
-/// What kind of statement the editor is about to run — drives whether it streams
+/// What kind of statement the editor is about to run; drives whether it streams
 /// into the result grid, executes in a transaction, or first asks for confirmation.
 ///
 /// Variant order is the severity order (`Query` < `Write` < `Destructive`) so a
-/// batch's kind is the `max` of its statements' kinds — see [`classify`].
+/// batch's kind is the `max` of its statements' kinds; see [`classify`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StatementKind {
-    /// Row-returning — opens in the result grid.
+    /// Row-returning; opens in the result grid.
     Query,
     /// A write/DDL that's safe to run after a plain transaction (INSERT, CREATE…).
     Write,
-    /// A write that destroys or rewrites existing data — confirm before running.
+    /// A write that destroys or rewrites existing data: confirm before running.
     Destructive,
 }
 
 /// Classify a statement *batch* by its most-destructive statement. A paste like
 /// `SELECT 1; DROP TABLE users` must confirm, so each `;`-delimited statement is
-/// classified and the highest severity wins (`Destructive` > `Write` > `Query`) —
+/// classified and the highest severity wins (`Destructive` > `Write` > `Query`);
 /// classifying only the leading keyword would let a destructive tail slip past the
 /// confirm modal. A trailing empty statement (after the last `;`) is ignored.
 pub fn classify(sql: &str) -> StatementKind {
@@ -328,12 +328,12 @@ pub fn classify(sql: &str) -> StatementKind {
 /// must be a single SELECT/WITH/EXPLAIN/VALUES with no statement separator and no
 /// embedded write keyword or dangerous server-side function. Anything else is loaded
 /// into the tab but *not* run, so a model can never silently execute a write on a
-/// writable connection — closing the [`classify`]-only gate's hole where a
+/// writable connection, closing the [`classify`]-only gate's hole where a
 /// data-modifying CTE (`WITH x AS (DELETE … RETURNING …) SELECT …`) or a
 /// side-effecting function (`SELECT lo_export(…)`) leads with a read keyword.
 ///
 /// This is the UI twin of `red-service`'s `is_read_only_select`, and reasons the
-/// same way — over a noise-stripped copy (literals/quoted-identifiers/comments
+/// same way: over a noise-stripped copy (literals/quoted-identifiers/comments
 /// blanked) so a write word inside a string can't fool it and a quoted column named
 /// like one can't trip it. Keep the two token lists in sync. False positives are
 /// fine: a rejected read just doesn't auto-run; the user can still press Run.
@@ -356,7 +356,7 @@ pub fn is_read_only(sql: &str) -> bool {
     }
     // Whole-word write verbs (the data-modifying CTE verbs, `INTO` for
     // `SELECT … INTO`/`OUTFILE`, sequence advancers) and the well-known file/exec/
-    // remote-SQL functions — reserved or underscore-qualified names that can't be a
+    // remote-SQL functions: reserved or underscore-qualified names that can't be a
     // bare column in a real read (a column so named would be quoted, hence blanked).
     const WRITE_TOKENS: &[&str] = &[
         "insert", "update", "delete", "merge", "into", "nextval", "setval",
@@ -370,7 +370,7 @@ pub fn is_read_only(sql: &str) -> bool {
         "pg_stat_file",
         "pg_logical_emit_message",
         // `dblink`/`dblink_send_query` run arbitrary SQL on a remote (often the
-        // same loopback) server from inside a SELECT — a write channel that reads
+        // same loopback) server from inside a SELECT, a write channel that reads
         // as read-only. Block the bare and async forms, not just `dblink_exec`.
         "dblink",
         "dblink_exec",
@@ -405,7 +405,7 @@ fn strip_noise(sql: &str) -> String {
     String::from_utf8(bytes).unwrap_or_default()
 }
 
-/// Whether `word` occurs in `haystack` as a whole ASCII word — not as a fragment of
+/// Whether `word` occurs in `haystack` as a whole ASCII word, not as a fragment of
 /// a longer identifier (so `updated_at` doesn't match `update`). Both are lower-case.
 fn has_word(haystack: &str, word: &str) -> bool {
     let bytes = haystack.as_bytes();
@@ -424,8 +424,8 @@ fn has_word(haystack: &str, word: &str) -> bool {
 }
 
 /// The single `;`-delimited statement to run for a caret at `cursor`: the
-/// statement the caret sits in, or — when it sits in a blank/comment-only region
-/// (commonly just past the final `;`) — the nearest non-empty statement before it.
+/// statement the caret sits in, or, when it sits in a blank/comment-only region
+/// (commonly just past the final `;`), the nearest non-empty statement before it.
 /// The editor's "run" uses this so a buffer holding several statements runs just
 /// the one under the caret, not the whole buffer: the `SELECT * FROM (<sql>)`
 /// paging wrap can't accept a `;`-separated batch and would bounce back a bare
@@ -436,7 +436,7 @@ pub fn statement_at(content: &str, cursor: usize) -> &str {
     if !first_keyword(stmt).is_empty() {
         return stmt;
     }
-    // Caret in a blank region — fall back to the last non-empty statement before
+    // Caret in a blank region: fall back to the last non-empty statement before
     // it rather than running nothing.
     split_statements(&content[..bounds.start])
         .into_iter()
@@ -445,7 +445,7 @@ pub fn statement_at(content: &str, cursor: usize) -> &str {
         .unwrap_or(stmt)
 }
 
-/// True when `sql` holds nothing runnable — only whitespace, comments, and bare
+/// True when `sql` holds nothing runnable: only whitespace, comments, and bare
 /// `;` terminators. The editor's run skips these so an empty/comment-only buffer
 /// never reaches the engine, where the `SELECT * FROM (<sql>)` paging wrap would
 /// collapse to a bare `db error`. Reuses [`tokenize`]: every such input yields
@@ -529,7 +529,7 @@ fn split_statements(sql: &str) -> Vec<&str> {
 }
 
 /// Append `LIMIT n` to a bare row-returning `SELECT` that doesn't already limit
-/// itself, so a fat table can't flood the grid — RED's big-result safety rail.
+/// itself, so a fat table can't flood the grid (RED's big-result safety rail).
 /// Returns `None` (leave the SQL untouched) when `n` is 0, the statement isn't a
 /// plain `SELECT`, it already has a `LIMIT`, or it's a multi-statement batch.
 /// Deliberately conservative: anything it isn't sure about, it leaves alone.
@@ -541,7 +541,7 @@ pub fn auto_limit(sql: &str, n: u32) -> Option<String> {
         return None;
     }
     let trimmed = sql.trim_end().trim_end_matches(';').trim_end();
-    // A `;` left after stripping the trailing one means several statements — don't
+    // A `;` left after stripping the trailing one means several statements; don't
     // rewrite, since the `LIMIT` would bind only to the last one.
     if trimmed.contains(';') {
         return None;
@@ -550,26 +550,26 @@ pub fn auto_limit(sql: &str, n: u32) -> Option<String> {
 }
 
 /// The single physical table a hand-typed `SELECT * FROM <table>` reads, as an
-/// optional-schema + table name — so a browse typed into the editor gets the same
+/// optional-schema + table name, so a browse typed into the editor gets the same
 /// foreign-key affordances (in-grid accent, click-through, the reference-column
 /// tree) as one opened from the schema tree, which only fire when the result maps
 /// to one known base table (Track B7).
 ///
-/// Deliberately narrow — returns `None` for anything that isn't provably a
+/// Deliberately narrow: returns `None` for anything that isn't provably a
 /// single-table star select, because the FK machinery keys off the result's
 /// columns *being exactly that table's columns*:
 ///
 /// - only `SELECT *` (a projection could omit the PK the keyset pages on, or an FK
-///   column the reference-column join wraps on — both would break);
+///   column the reference-column join wraps on; both would break);
 /// - one table in `FROM`, no `JOIN`, no comma list, no `FROM (subquery)`;
 /// - no top-level set operation (`UNION`/`INTERSECT`/`EXCEPT`), whose shape differs.
 ///
-/// A trailing `WHERE`/`ORDER BY`/`LIMIT`/… and subqueries *inside* them are fine —
+/// A trailing `WHERE`/`ORDER BY`/`LIMIT`/… and subqueries *inside* them are fine;
 /// they don't change the column set. Scans a noise-stripped copy so keywords inside
 /// string literals / quoted identifiers / comments can't fool it. The bare table
 /// name still has to be resolved against the connection catalog by the caller.
 pub fn single_table_star(sql: &str) -> Option<(Option<String>, String)> {
-    // Lex the raw SQL — [`lex_simple`] skips string literals and comments and unwraps
+    // Lex the raw SQL: [`lex_simple`] skips string literals and comments and unwraps
     // quoted identifiers ("pg/sqlite" or `mysql`), so a quoted table name still parses
     // and a keyword inside a literal/comment can't fool the scan. A stray statement
     // separator surfaces as `Other`, which the parse below rejects.
@@ -578,7 +578,7 @@ pub fn single_table_star(sql: &str) -> Option<(Option<String>, String)> {
         return None;
     }
 
-    // A top-level set operation makes the result a union of shapes, not the table —
+    // A top-level set operation makes the result a union of shapes, not the table;
     // reject it wherever it appears at paren-depth 0 (nested in a subquery is fine).
     let mut depth = 0i32;
     for t in &toks {
@@ -596,7 +596,7 @@ pub fn single_table_star(sql: &str) -> Option<(Option<String>, String)> {
         Some(SimpleToken::Word(w)) if w.eq_ignore_ascii_case("select") => {}
         _ => return None,
     }
-    // exactly `*` — no projection, no `DISTINCT`/`ALL`/aggregate.
+    // exactly `*`: no projection, no `DISTINCT`/`ALL`/aggregate.
     if !matches!(it.next(), Some(SimpleToken::Star)) {
         return None;
     }
@@ -622,7 +622,7 @@ pub fn single_table_star(sql: &str) -> Option<(Option<String>, String)> {
     let table = parts.last().cloned()?;
     let schema = (parts.len() >= 2).then(|| parts[parts.len() - 2].clone());
 
-    // An optional alias — `AS x` or a bare `x` that isn't a clause keyword.
+    // An optional alias: `AS x` or a bare `x` that isn't a clause keyword.
     if let Some(SimpleToken::Word(w)) = it.peek() {
         if w.eq_ignore_ascii_case("as") {
             it.next();
@@ -635,7 +635,7 @@ pub fn single_table_star(sql: &str) -> Option<(Option<String>, String)> {
     }
 
     // Whatever follows the `FROM` item must be a shape-preserving tail clause or the
-    // end — a `JOIN`, a comma (second table), or another `(subquery)` disqualifies.
+    // end; a `JOIN`, a comma (second table), or another `(subquery)` disqualifies.
     match it.peek() {
         None => {}
         Some(SimpleToken::Word(w)) if is_tail_clause(w) => {}
@@ -677,7 +677,7 @@ fn is_setop(w: &str) -> bool {
     )
 }
 
-/// A coarse token for [`single_table_star`]'s FROM-clause parse — words (bare or
+/// A coarse token for [`single_table_star`]'s FROM-clause parse: words (bare or
 /// quoted identifiers) plus the punctuation that changes a query's shape (`*`, `,`,
 /// `.`, parens). Everything else (operators, numbers, `;`) collapses to `Other`,
 /// which the parse just rejects on.
@@ -720,7 +720,7 @@ fn lex_simple(s: &str) -> Vec<SimpleToken> {
             i = (i + 2).min(n);
             continue;
         }
-        // String literal — its content is data; a `SELECT *` never has one where a
+        // String literal: its content is data; a `SELECT *` never has one where a
         // token is expected, so emit `Other` to fail the parse if it appears.
         if c == b'\'' {
             i += 1;
@@ -765,8 +765,8 @@ fn lex_simple(s: &str) -> Vec<SimpleToken> {
     out
 }
 
-/// Replace non-ASCII Unicode whitespace — most commonly U+00A0, the non-breaking
-/// space macOS types for Option+Space — with a plain ASCII space, *outside* string
+/// Replace non-ASCII Unicode whitespace (most commonly U+00A0, the non-breaking
+/// space macOS types for Option+Space) with a plain ASCII space, *outside* string
 /// literals, quoted identifiers, and comments where such a character could be
 /// intentional. Engines reject a bare U+00A0 as an invalid token rather than
 /// treating it as whitespace, so one slipped into a query turns a valid-looking
@@ -871,7 +871,7 @@ pub fn first_keyword(sql: &str) -> String {
     s.chars().take_while(|c| c.is_ascii_alphabetic()).collect()
 }
 
-/// The identifier immediately before `cursor` (byte offset) — the token a
+/// The identifier immediately before `cursor` (byte offset): the token a
 /// completion replaces. Empty when the cursor isn't right after an identifier.
 pub fn word_prefix(content: &str, cursor: usize) -> &str {
     let end = cursor.min(content.len());
@@ -894,13 +894,13 @@ fn is_keyword(word: &str) -> bool {
 /// completion provider in `editor.rs` maps each variant onto schema candidates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompletionContext {
-    /// Right after `qualifier.` — suggest the columns of that table or alias.
+    /// Right after `qualifier.`: suggest the columns of that table or alias.
     Dot { qualifier: String },
-    /// After FROM/JOIN/INTO/UPDATE — suggest table names.
+    /// After FROM/JOIN/INTO/UPDATE: suggest table names.
     Table,
-    /// Inside an expression (SELECT/WHERE/ON/…) — suggest columns, then keywords.
+    /// Inside an expression (SELECT/WHERE/ON/…): suggest columns, then keywords.
     Column,
-    /// Statement start or anywhere else — suggest keywords, then tables.
+    /// Statement start or anywhere else: suggest keywords, then tables.
     Keyword,
 }
 
@@ -955,7 +955,7 @@ fn statement_bounds(content: &str, cursor: usize) -> Range<usize> {
     start..end
 }
 
-/// A coarse lexical atom used only by completion's clause parsing — finer than
+/// A coarse lexical atom used only by completion's clause parsing; finer than
 /// raw bytes, cruder than [`tokenize`]: identifiers/keywords collapse to `Word`,
 /// `.` and `,` are kept (they separate qualifiers and table lists), everything
 /// else is `Other`. Strings and comments are skipped entirely.
@@ -1093,7 +1093,7 @@ fn referenced_tables(stmt: &str) -> Vec<(String, String)> {
             continue;
         }
         i += 1;
-        // A comma-separated table list (FROM a, b) — JOIN/UPDATE/INTO carry one.
+        // A comma-separated table list (FROM a, b); JOIN/UPDATE/INTO carry one.
         loop {
             while i < n && matches!(atoms[i], Atom::Other) {
                 i += 1;
@@ -1104,7 +1104,7 @@ fn referenced_tables(stmt: &str) -> Vec<(String, String)> {
             if is_keyword(first) {
                 break;
             }
-            // `schema.table` — the trailing word is the table name.
+            // `schema.table`: the trailing word is the table name.
             let mut table = first.clone();
             i += 1;
             while matches!(atoms.get(i), Some(Atom::Dot)) {
@@ -1229,7 +1229,7 @@ mod tests {
         );
         assert_eq!(t("SELECT * FROM users ;"), Some((None, "users".into())));
         // Quoted identifiers (pg/sqlite `"…"`, MySQL backticks) resolve to the inner
-        // name — RED's own browse SQL is fully quoted, and users copy it.
+        // name; RED's own browse SQL is fully quoted, and users copy it.
         assert_eq!(t(r#"SELECT * FROM "users""#), Some((None, "users".into())));
         assert_eq!(
             t(r#"SELECT * FROM "public"."users""#),
@@ -1245,7 +1245,7 @@ mod tests {
     #[test]
     fn single_table_star_rejects_non_single_table_shapes() {
         let no = |s: &str| assert_eq!(single_table_star(s), None, "should reject: {s}");
-        // Projections — a missing PK/FK column would break keyset paging and the
+        // Projections: a missing PK/FK column would break keyset paging and the
         // reference-column join wrap, so only `SELECT *` qualifies.
         no("SELECT id, name FROM users");
         no("SELECT count(*) FROM users");
@@ -1281,7 +1281,7 @@ mod tests {
 
     #[test]
     fn normalize_spaces_preserves_nbsp_inside_literals_and_comments() {
-        // Inside a string literal an NBSP is data — keep it (and report no change).
+        // Inside a string literal an NBSP is data; keep it (and report no change).
         assert_eq!(normalize_spaces("SELECT 'a\u{a0}b' FROM t"), None);
         // Inside a quoted identifier likewise.
         assert_eq!(normalize_spaces("SELECT \"a\u{a0}b\" FROM t"), None);
@@ -1301,7 +1301,7 @@ mod tests {
         assert_eq!(classify("SELECT * FROM t"), StatementKind::Query);
         assert_eq!(classify("INSERT INTO t VALUES (1)"), StatementKind::Write);
         assert_eq!(classify("DROP TABLE t"), StatementKind::Destructive);
-        // A multi-statement paste confirms on the destructive tail — the bug this
+        // A multi-statement paste confirms on the destructive tail; the bug this
         // guards: a leading SELECT must not mask a trailing DROP.
         assert_eq!(
             classify("SELECT 1; DROP TABLE users"),
@@ -1373,7 +1373,7 @@ mod tests {
         // Caret just past the final `;` (blank tail) falls back to the last real one.
         let (c, cur) = at("SELECT 1;\nSELECT 2;\n|");
         assert_eq!(statement_at(&c, cur), "SELECT 2");
-        // A `;` inside a string isn't a boundary — the whole statement comes back.
+        // A `;` inside a string isn't a boundary; the whole statement comes back.
         let (c, cur) = at("SELECT 'a; b' AS |x");
         assert_eq!(statement_at(&c, cur), "SELECT 'a; b' AS x");
     }

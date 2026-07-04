@@ -14,7 +14,7 @@ use super::session::{ConnectFail, HostKeyPrompt};
 
 /// Cap on how long one connect attempt may run before the backend gives up and
 /// reports a timeout. Bounds a hung connect (a black-hole host) so the dispatch
-/// loop frees up for the next command — the UI drives retry/backoff and cancel
+/// loop frees up for the next command; the UI drives retry/backoff and cancel
 /// on top of this, but those only work if the loop isn't wedged awaiting a dial.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -65,7 +65,7 @@ fn classify_connect_err(e: RedError) -> ConnectFail {
 async fn connect(
     config: &ConnectionConfig,
 ) -> red_core::Result<(Arc<dyn DatabaseDriver>, Option<Tunnel>)> {
-    // SQLite is a local file — no network, so SSH never applies.
+    // SQLite is a local file (no network), so SSH never applies.
     if let DbKind::Sqlite = config.kind {
         let driver = SqliteDriver::new(config.dsn(), config.read_only);
         driver.ping().await?;
@@ -104,7 +104,7 @@ async fn connect(
         DbKind::Clickhouse => {
             // Like MySQL, a ClickHouse connection can see every database; scope the
             // tree to the chosen one. Read-only first (the driver refuses in-grid
-            // edits regardless — ClickHouse is OLAP).
+            // edits regardless, since ClickHouse is OLAP).
             Arc::new(
                 ClickhouseDriver::connect(&dsn, config.read_only)
                     .await?

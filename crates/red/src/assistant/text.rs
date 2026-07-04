@@ -1,7 +1,7 @@
 //! Pure domain helpers for the assistant panel: slash-command matching, config
 //! defaulting, the `/report` shortcut, title/transcript derivation, the bubble
 //! element key, SQL extraction, schema summarising, and the report-theme snapshot.
-//! These carry no `AppState` or rendering knowledge — just data in, data out — so
+//! These carry no `AppState` or rendering knowledge (just data in, data out), so
 //! they're unit-tested in isolation here.
 
 use gpui::SharedString;
@@ -42,7 +42,7 @@ pub(super) fn slash_candidates(
         start -= 1;
     }
     // The char before the name must be `/`, and that `/` must open the input or
-    // follow whitespace — so "and/or" or a file path never triggers the picker.
+    // follow whitespace, so "and/or" or a file path never triggers the picker.
     if start == 0 || bytes[start - 1] != b'/' {
         return Vec::new();
     }
@@ -142,7 +142,7 @@ pub(super) fn expand_slash_report(message: &str) -> Option<String> {
     };
     Some(format!(
         "{ask}\n\nRead the data you need with run_select, then call the generate_report tool with \
-         the report written as HTML — a heading and a short summary. Where a visual helps, add \
+         the report written as HTML: a heading and a short summary. Where a visual helps, add \
          interactive charts via the `charts` argument and reference them with \
          <div data-red-chart=\"INDEX\"></div> placeholders. If the user would benefit from \
          exploring the rows, put the data in the `data` argument as a named dataset and drop a \
@@ -172,8 +172,8 @@ pub(super) fn derive_title(message: &str) -> String {
 
 /// Render a saved transcript as a compact `You:` / `Assistant:` digest to seed a
 /// reopened chat's next turn (M-S5). Returns `None` for an empty transcript. The
-/// digest is capped to its tail ([`SEED_CAP`]) — the recent turns a follow-up
-/// actually depends on — so resuming a long chat stays within budget.
+/// digest is capped to its tail ([`SEED_CAP`]), the recent turns a follow-up
+/// actually depends on, so resuming a long chat stays within budget.
 pub(super) fn render_transcript(
     messages: &[crate::conversations::StoredMessage],
 ) -> Option<String> {
@@ -213,7 +213,7 @@ pub(super) fn render_transcript(
 
 /// A stable element key for a bubble: its index in the transcript. Bubbles are
 /// rendered in order and the panel rebuilds each frame, so the index is unique
-/// among the currently-shown bubbles — and, unlike a content-length hash, it never
+/// among the currently-shown bubbles; and, unlike a content-length hash, it never
 /// collides for equal-length messages (which would break per-bubble chip routing).
 pub(super) fn bubble_key(index: usize) -> usize {
     index

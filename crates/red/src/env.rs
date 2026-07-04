@@ -1,6 +1,6 @@
 //! Startup environment fix-ups. macOS apps launched from Finder/Dock (rather than
-//! a terminal) inherit a minimal `PATH` — roughly `/usr/bin:/bin:/usr/sbin:/sbin`
-//! — that omits Homebrew (`/opt/homebrew/bin`) and version-manager shims. The ACP
+//! a terminal) inherit a minimal `PATH` (roughly `/usr/bin:/bin:/usr/sbin:/sbin`)
+//! that omits Homebrew (`/opt/homebrew/bin`) and version-manager shims. The ACP
 //! agent is spawned as `npx …` (and the auth CLI likewise), so without this the
 //! subprocess fails to start with `No such file or directory (os error 2)`.
 //!
@@ -11,7 +11,7 @@
 /// Ensure `node`/`npx` are reachable on `PATH` for GUI-launched macOS builds.
 /// No-op off macOS (Windows/Linux GUI launches inherit a usable `PATH`).
 ///
-/// Must run before the backend thread spawns — mutating the process environment
+/// Must run before the backend thread spawns; mutating the process environment
 /// is only sound while the program is still single-threaded.
 #[cfg(target_os = "macos")]
 pub fn augment_path_for_gui_launch() {
@@ -74,7 +74,7 @@ fn resolves(dirs: &[String], program: &str) -> bool {
 
 /// Capture the `PATH` a user's interactive login shell sees (where nvm/fnm/asdf
 /// init lives). Best-effort: any failure returns `None` and we keep the PATH we
-/// have. Only stdout is trusted — the shell may chatter on stderr.
+/// have. Only stdout is trusted; the shell may chatter on stderr.
 #[cfg(target_os = "macos")]
 fn login_shell_path() -> Option<String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());

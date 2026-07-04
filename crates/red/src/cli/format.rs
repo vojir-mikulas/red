@@ -1,5 +1,5 @@
 //! Render a streamed query result to stdout in one of four shapes. The delimited
-//! and JSON writers are **streaming** — each row window is written as it arrives,
+//! and JSON writers are **streaming**: each row window is written as it arrives,
 //! so a huge result never materializes CLI-side. The aligned `table` writer is
 //! the exception: column widths need the whole result, so it buffers (use `csv`/
 //! `json` for results that don't fit in memory).
@@ -136,7 +136,7 @@ impl<W: Write> Writer<W> {
     }
 }
 
-/// A cell as plain text for `table`/`csv`/`tsv` — the `Value`'s own `Display`
+/// A cell as plain text for `table`/`csv`/`tsv`: the `Value`'s own `Display`
 /// (`NULL`, numbers verbatim, `<N bytes>` for a blob).
 fn cell_text(v: &Value) -> String {
     v.to_string()

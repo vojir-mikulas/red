@@ -25,10 +25,10 @@ use super::{
 
 /// Streaming reveal cadence: the assistant's answer types out at this tick rate
 /// (≈40fps), decoupling the on-screen reveal from the uneven network bursts the
-/// model's text actually arrives in — the ChatGPT-style steady stream.
+/// model's text actually arrives in (the ChatGPT-style steady stream).
 const REVEAL_TICK: Duration = Duration::from_millis(24);
 /// Reveal speed: each tick uncovers `remaining / DIVISOR` more characters (a
-/// natural ease-out — fast when far behind, slowing as it catches up), but never
+/// natural ease-out: fast when far behind, slowing as it catches up), but never
 /// fewer than `MIN_STEP`, so a big backlog drains quickly and the tail still moves.
 const REVEAL_DIVISOR: usize = 6;
 const REVEAL_MIN_STEP: usize = 2;
@@ -36,7 +36,7 @@ const REVEAL_MIN_STEP: usize = 2;
 impl AppState {
     /// Whether the AI assistant is enabled for the current context (M-S7): the
     /// active connection's `ai_enabled` override, falling back to the global
-    /// `[ai] enabled`. `false` is a true kill switch — the panel can't be opened,
+    /// `[ai] enabled`. `false` is a true kill switch: the panel can't be opened,
     /// its status-bar toggle is hidden, and the backend refuses turns and starts
     /// no agent. The tier (`off`/`schema`/`read`) is a separate, in-panel concern;
     /// this gate is purely on/off.
@@ -50,7 +50,7 @@ impl AppState {
 
     /// The AI access tier in effect for the current context (Feature B): the active
     /// connection's `ai_tier` override, falling back to the global `[ai] tier`.
-    /// Drives the "writes" safety badge — `Write` means the agent can propose
+    /// Drives the "writes" safety badge; `Write` means the agent can propose
     /// data changes (each one still gated by per-statement approval).
     pub(crate) fn ai_tier_effective(&self) -> red_core::AiTier {
         let global = red_core::AiTier::parse(&self.settings.ai.tier);
@@ -61,7 +61,7 @@ impl AppState {
     }
 
     /// Whether the agent `id` runs over ACP (an external agent that owns its own
-    /// auth — Claude subscription, Codex, a local agent). Resolved against the
+    /// auth: Claude subscription, Codex, a local agent). Resolved against the
     /// configured agents; an id no longer configured (a saved chat bound to a since-
     /// removed agent) falls back to the legacy `"subscription"` built-in convention.
     pub(crate) fn agent_is_acp(&self, id: &str) -> bool {
@@ -92,7 +92,7 @@ impl AppState {
             self.assistant = None;
             // Closing drops the panel's focused input; hand focus back to the root
             // so the ⌘L action keeps routing (otherwise focus is lost and the panel
-            // can't be reopened — the action's owner is no longer in the focus path).
+            // can't be reopened; the action's owner is no longer in the focus path).
             window.focus(&self.root_focus, cx);
         } else {
             let conversation_id = self.next_conversation_id;
@@ -116,7 +116,7 @@ impl AppState {
                         // scrolling horizontally.
                         .soft_wrap(true)
                         .a11y_label("Agent prompt")
-                        .placeholder("Message Claude Agent — / for commands")
+                        .placeholder("Message Claude Agent (/ for commands)")
                         // `/`-command picker: offer the agent's commands when the
                         // word under the cursor is a slash command (see
                         // `slash_candidates`); the popup shows each command's name
@@ -182,7 +182,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// The agent id a new chat starts on — the resolved default agent, falling back
+    /// The agent id a new chat starts on: the resolved default agent, falling back
     /// to the first usable agent when the default isn't usable (e.g. an API default
     /// with no key while an ACP agent is ready).
     fn default_ai_provider(&self) -> String {
@@ -218,7 +218,7 @@ impl AppState {
     }
 
     /// A one-tap context action (M-S4): "Explain error" / "Optimize query". Each is
-    /// just a canned prompt — `ai_context` already folds in the live error / editor
+    /// just a canned prompt; `ai_context` already folds in the live error / editor
     /// SQL, so the turn is grounded without the user retyping it. Shared by both
     /// providers (it rides the same `AiTurn` path).
     pub(crate) fn assistant_quick_action(&mut self, kind: QuickAction, cx: &mut Context<Self>) {
@@ -280,9 +280,9 @@ impl AppState {
                 chat.streaming = true;
                 // Fresh turn: the next assistant bubble reveals from the start.
                 chat.revealed = 0;
-                // It's no longer a draft — drop any preserved prompt text.
+                // It's no longer a draft, so drop any preserved prompt text.
                 chat.draft.clear();
-                // Sending is explicit — always jump to the new message + the reply.
+                // Sending is explicit: always jump to the new message + the reply.
                 chat.scroll.scroll_to_bottom();
                 true
             })
@@ -341,7 +341,7 @@ impl AppState {
         }
     }
 
-    /// Go to the panel's single draft — the one chat with nothing sent yet (the
+    /// Go to the panel's single draft: the one chat with nothing sent yet (the
     /// "prepared prompt"). Reuses the existing empty chat if there is one rather
     /// than spawning duplicates, so "new chat" always lands on the same draft.
     pub(crate) fn new_chat(&mut self, cx: &mut Context<Self>) {
@@ -438,7 +438,7 @@ impl AppState {
     }
 
     /// Close one open chat (the switcher's per-row ✕), persisting it first. Keeps
-    /// the open set bounded without deleting the saved file — it's still reopenable
+    /// the open set bounded without deleting the saved file; it's still reopenable
     /// from history. If it was the last chat, a fresh empty one takes its place so
     /// the panel always has an active conversation.
     pub(crate) fn close_chat(&mut self, conversation_id: u64, cx: &mut Context<Self>) {
@@ -476,7 +476,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// Set the active chat's provider, but only before its first message — the
+    /// Set the active chat's provider, but only before its first message; the
     /// binding is locked once a turn is sent (a backend conversation is bound to
     /// it). Drives the empty-chat provider picker (M-S6).
     pub(crate) fn set_active_chat_provider(&mut self, provider: String, cx: &mut Context<Self>) {
@@ -645,7 +645,7 @@ impl AppState {
     }
 
     /// Reveal the conversations directory in the OS file manager (the "Open
-    /// conversation storage" affordance). Files there are plain JSON — readable,
+    /// conversation storage" affordance). Files there are plain JSON: readable,
     /// hand-editable, deletable. Mirrors the saved-queries / settings reveal.
     pub(crate) fn reveal_conversation_storage(&mut self, cx: &mut Context<Self>) {
         let Some(dir) = crate::conversations::conversations_dir() else {
@@ -722,9 +722,9 @@ impl AppState {
     }
 
     /// Open `sql` in a fresh query tab in the workspace. Only a genuine read-only
-    /// query (see [`crate::sql::is_read_only`]) runs automatically; anything else —
-    /// including a data-modifying CTE or a side-effecting function that merely *leads*
-    /// with a read keyword — is loaded for the user to run by hand, so an agent (which
+    /// query (see [`crate::sql::is_read_only`]) runs automatically; anything else
+    /// (including a data-modifying CTE or a side-effecting function that merely *leads*
+    /// with a read keyword) is loaded for the user to run by hand, so an agent (which
     /// reaches this via `open_query`) can never silently execute a write on a writable
     /// connection. Shared by the assistant's "Open in a query tab" chip and the tool.
     pub(crate) fn open_query_in_tab(&mut self, sql: String, cx: &mut Context<Self>) {
@@ -772,7 +772,7 @@ impl AppState {
     }
 
     /// Store the agent's model / reasoning selectors on their chat, then apply the
-    /// central default (settings) once per fresh session — so a new chat opens on the
+    /// central default (settings) once per fresh session, so a new chat opens on the
     /// user's last-chosen model/reasoning without retroactively touching other chats.
     pub(crate) fn on_ai_config_options_available(
         &mut self,
@@ -873,7 +873,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// Send the backend a config change for one conversation (no settings write — the
+    /// Send the backend a config change for one conversation (no settings write; the
     /// callers decide whether this is a user choice or a default being applied).
     fn send_set_config_option(
         &mut self,
@@ -915,7 +915,7 @@ impl AppState {
         // Under a reduced-motion preference, skip the typewriter entirely: text
         // appears the instant it arrives.
         let reduce_motion = cx.reduce_motion();
-        // Route to whichever chat owns the turn — not just the active one, and
+        // Route to whichever chat owns the turn, not just the active one, and
         // across both surfaces (sidebar + agent tabs), so a background chat keeps
         // streaming while another is shown (M-S6).
         let grew_text = self.with_chat_mut(conversation_id, |chat| {
@@ -990,10 +990,10 @@ impl AppState {
     }
 
     /// One reveal step: uncover more of the streaming bubble and repaint. Returns
-    /// whether the ticker should fire again (false once it's caught up — a new burst
+    /// whether the ticker should fire again (false once it's caught up; a new burst
     /// will restart it via `ensure_reveal_ticker`).
     fn tick_reveal(&mut self, conversation_id: u64, cx: &mut Context<Self>) -> bool {
-        // Returns (advanced?, keep_going?) — `advanced` gates the repaint so a
+        // Returns (advanced?, keep_going?); `advanced` gates the repaint so a
         // no-op tick (chat gone, or already caught up) doesn't churn a frame.
         let (advanced, keep) = self
             .with_chat_mut(conversation_id, |chat| {
@@ -1068,7 +1068,7 @@ impl AppState {
             chat.streaming = false;
             chat.status = None;
             chat.error = Some(message.into());
-            // A prompt can't outlive its turn — drop any unanswered one, and deny it
+            // A prompt can't outlive its turn: drop any unanswered one, and deny it
             // on the backend so a parked agent decision sink isn't left blocking.
             chat.pending_permission.take().map(|p| p.request_id)
         });
@@ -1145,7 +1145,7 @@ impl AppState {
         let conversation_id = state.active().conversation_id;
         // Only consume the prompt once we know we can deliver the answer. If the
         // connection dropped while the buttons were on screen, the agent (and its
-        // parked decision sink) is already gone — just clear the stale prompt rather
+        // parked decision sink) is already gone; just clear the stale prompt rather
         // than `take()`-ing it and silently losing the click with nothing sent.
         let Phase::Connected(active) = &self.phase else {
             state.active_mut().pending_permission = None;
@@ -1215,7 +1215,7 @@ impl AppState {
                             .filter_map(|c| grid.column_meta(c).map(|(name, _)| name))
                             .collect();
                         s.push_str(&format!(
-                            " — showing a result of {rows} row(s) × {cols} column(s): {}",
+                            ", showing a result of {rows} row(s) × {cols} column(s): {}",
                             names.join(", ")
                         ));
                     }
@@ -1249,7 +1249,7 @@ impl AppState {
 }
 
 /// Keep the transcript pinned to the newest message *only while the user is already
-/// at (or within a line of) the bottom* — so streaming text follows the view, but a
+/// at (or within a line of) the bottom*, so streaming text follows the view, but a
 /// user who scrolled up to read history isn't yanked down. The offset/max are from
 /// the last paint (the user's current position); `scroll_to_bottom` applies on the
 /// next paint, after the new content has grown the transcript.
@@ -1266,7 +1266,7 @@ fn follow_if_at_bottom(chat: &ChatSession) {
 /// Persist one chat to its flat file (one JSON per conversation), titled from its
 /// first user message. Called after each finished turn and when a chat is closed. A
 /// chat with no real assistant reply yet (only a pending/aborted user turn) isn't
-/// saved — there's nothing worth keeping. Best-effort: a write failure is logged,
+/// saved; there's nothing worth keeping. Best-effort: a write failure is logged,
 /// never surfaced mid-turn.
 fn persist_chat(chat: &mut ChatSession) {
     // Need at least one assistant turn with content to be worth saving.

@@ -1,11 +1,11 @@
-//! Headless CLI mode — a second frontend onto the same `red-service` backend the
+//! Headless CLI mode: a second frontend onto the same `red-service` backend the
 //! GPUI app drives, for scripting and seeding dev/staging environments.
 //!
 //! [`run`] is called first thing in `main`: when argv names a CLI verb it runs
 //! the command headless and returns an exit code (so `main` never touches GPUI);
 //! otherwise it returns `None` and the desktop app opens as usual. Each verb is a
-//! thin request/response wrapper over the `Command`/`Event` protocol — connect,
-//! send, drain events until the terminal one — so it reuses the service's connect,
+//! thin request/response wrapper over the `Command`/`Event` protocol (connect,
+//! send, drain events until the terminal one), so it reuses the service's connect,
 //! streaming, and (Phase 2) copy/migrate paths verbatim, with no risk of drift
 //! from the GUI.
 
@@ -30,7 +30,7 @@ const PRIMARY: SessionId = SessionId(0);
 /// The target session for the two-connection verbs (copy, migrate).
 const TARGET: SessionId = SessionId(1);
 
-// Exit codes — a script can branch on the failure class:
+// Exit codes; a script can branch on the failure class:
 //   0  success
 //   2  usage / resolution error (bad args, unknown connection, no SQL)
 //   3  connect failure (auth, unreachable host, untrusted SSH, backend gone)
@@ -41,7 +41,7 @@ const EXIT_CONNECT: u8 = 3;
 const EXIT_QUERY: u8 = 4;
 
 /// `--quiet`: suppress progress and success summaries on stderr. Errors and the
-/// actual result (stdout) always print. Process-global — the CLI runs one command.
+/// actual result (stdout) always print. Process-global; the CLI runs one command.
 static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether `--quiet` was passed. Read by the [`note!`]/[`progress!`] macros.
@@ -50,7 +50,7 @@ fn quiet() -> bool {
 }
 
 /// Print an informational/summary line to stderr unless `--quiet`. Errors never
-/// route through this — they use `eprintln!` directly so they always show.
+/// route through this; they use `eprintln!` directly so they always show.
 macro_rules! note {
     ($($arg:tt)*) => {
         if !$crate::cli::quiet() {
@@ -81,7 +81,7 @@ type EventRx = UnboundedReceiver<(Option<SessionId>, Event)>;
     name = "red",
     bin_name = "red",
     version,
-    about = "RED — headless database CLI (a bare `red` opens the desktop app)"
+    about = "RED: headless database CLI (a bare `red` opens the desktop app)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -160,7 +160,7 @@ struct ExecArgs {
 pub fn run() -> Option<u8> {
     // Intercept only when the first *positional* arg is a recognised verb (so a
     // leading global flag like `--quiet` doesn't hide it), or a help/version flag
-    // is present. A bare launch — or a stray token like macOS's `-psn_…` — falls
+    // is present. A bare launch (or a stray token like macOS's `-psn_…`) falls
     // through to the GUI untouched.
     const VERBS: &[&str] = &["connections", "test", "query", "exec", "copy", "migrate"];
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -264,7 +264,7 @@ fn cmd_test(args: ConnArgs) -> u8 {
         }
     };
     let (svc, mut events) = start();
-    // `TestConnection` is session-less — it opens a throwaway session and replies
+    // `TestConnection` is session-less: it opens a throwaway session and replies
     // TestSucceeded/TestFailed.
     svc.send_global(Command::TestConnection(config));
     let code = loop {
@@ -465,7 +465,7 @@ fn wait_execute(events: &mut EventRx) -> Result<u64, String> {
     }
 }
 
-/// Ask the backend to shut down cleanly. Best-effort — the process is exiting.
+/// Ask the backend to shut down cleanly. Best-effort, as the process is exiting.
 fn shutdown(svc: &ServiceHandle) {
     svc.send_global(Command::Shutdown);
 }
@@ -544,8 +544,8 @@ fn hydrate_secrets(id: &str, config: &mut ConnectionConfig) {
 
 // ---- SQL input -------------------------------------------------------------
 
-/// Resolve the SQL text from an inline argument, a file (`-` = stdin), or — when
-/// neither is given — stdin. Erroring only when stdin is an interactive terminal
+/// Resolve the SQL text from an inline argument, a file (`-` = stdin), or, when
+/// neither is given, stdin. Erroring only when stdin is an interactive terminal
 /// (so `red exec conn` with nothing to run doesn't hang waiting for typing).
 fn read_sql(inline: Option<String>, file: Option<&Path>) -> Result<String, String> {
     if let Some(sql) = inline {

@@ -2,7 +2,7 @@
 //!
 //! Every engine's `Command::Execute` runs **one** statement (rusqlite `execute`,
 //! tokio-postgres `execute`, a single `query_drop`), so a multi-statement seed
-//! script — the whole point of `red exec -f seed.sql` — has to be split client
+//! script (the whole point of `red exec -f seed.sql`) has to be split client
 //! side and sent one statement at a time. This is a lexer, not a parser: it walks
 //! the bytes tracking whether it's inside a string literal, quoted identifier,
 //! line/block comment, or a Postgres dollar-quoted body, and only breaks on a `;`
@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn ignores_semicolons_in_comments() {
         // The `;`s inside the comments must not split; comment text is retained in
-        // the statement (harmless — the engine ignores it), so we assert the count
+        // the statement (harmless; the engine ignores it), so we assert the count
         // and that the trailing SQL survived rather than exact strings.
         let s = split_statements("SELECT 1; -- a; b\nSELECT 2; /* c; d */ SELECT 3");
         assert_eq!(s.len(), 3);

@@ -147,7 +147,7 @@ fn main() {
     });
 }
 
-/// macOS: seamless titlebar — hide the native bar and inset the traffic lights
+/// macOS: seamless titlebar: hide the native bar and inset the traffic lights
 /// into our top strip (which doubles as the drag region). The top bar's left
 /// inset clears them. Mirrors Nyx.
 #[cfg(target_os = "macos")]

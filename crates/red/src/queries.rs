@@ -1,16 +1,16 @@
-//! Saved queries — named SQL snippets persisted as plain `.sql` files (B3).
+//! Saved queries: named SQL snippets persisted as plain `.sql` files (B3).
 //!
 //! Query *history* (per-tab, ephemeral; see `editor.rs`) remembers what you ran;
 //! saved queries are what you choose to **keep**. Each lives as one file under
 //! `<config>/red/queries/*.sql`, beside `themes/`, `settings.toml`, and
-//! `connections.toml`. The file body **is** the query — greppable, editable in any
-//! editor with SQL highlighting, runnable verbatim — with optional metadata in a
+//! `connections.toml`. The file body **is** the query (greppable, editable in any
+//! editor with SQL highlighting, runnable verbatim), with optional metadata in a
 //! leading SQL-comment header (`-- name:` / `-- description:` / `-- tags:`) that
 //! keeps the file valid SQL.
 //!
 //! There is **no** database and no bespoke format: this module mirrors the
 //! user-themes loader in `theme.rs` (read the dir, skip a bad file with a warning,
-//! slug a name on save, write atomically). Nothing is read at startup — the picker
+//! slug a name on save, write atomically). Nothing is read at startup; the picker
 //! calls [`load`] on demand, so saved queries cost the budget nothing at idle.
 
 use std::path::PathBuf;
@@ -28,7 +28,7 @@ pub(crate) struct SavedQuery {
     /// The header `tags:` (comma-separated), retained for a future filter.
     #[allow(dead_code)]
     pub tags: Vec<String>,
-    /// The complete file contents — what drops into the editor, runnable as-is.
+    /// The complete file contents: what drops into the editor, runnable as-is.
     pub sql: String,
     /// The backing `.sql` file, for a future rename / delete.
     #[allow(dead_code)]
@@ -41,7 +41,7 @@ fn queries_dir() -> Option<PathBuf> {
 }
 
 /// Read every `*.sql` in the queries dir into a [`SavedQuery`], skipping (with a
-/// warning) any that won't read — one bad file never blocks the others. Sorted by
+/// warning) any that won't read, so one bad file never blocks the others. Sorted by
 /// name (case-insensitive) for a stable picker order. A missing dir is an empty
 /// list, never an error.
 pub(crate) fn load() -> Vec<SavedQuery> {
@@ -118,7 +118,7 @@ fn parse_saved_query(stem: &str, contents: &str, path: PathBuf) -> SavedQuery {
             continue;
         }
         let Some(comment) = trimmed.strip_prefix("--") else {
-            break; // first SQL line — header is done.
+            break; // first SQL line; header is done.
         };
         let comment = comment.trim();
         if let Some(v) = comment.strip_prefix("name:") {
@@ -150,7 +150,7 @@ fn parse_saved_query(stem: &str, contents: &str, path: PathBuf) -> SavedQuery {
 
 /// Drop the leading run of managed header lines (and the blank lines among them)
 /// so [`save`] can rewrite exactly one. Everything from the first non-managed line
-/// on is kept verbatim — a user's own leading comment survives.
+/// on is kept verbatim, so a user's own leading comment survives.
 fn strip_managed_header(sql: &str) -> String {
     let mut body = Vec::new();
     let mut in_header = true;
@@ -176,7 +176,7 @@ fn strip_managed_header(sql: &str) -> String {
     body.join("\n")
 }
 
-/// A filesystem-safe stem for a query name — lowercased, non-alphanumerics folded
+/// A filesystem-safe stem for a query name: lowercased, non-alphanumerics folded
 /// to `-`, edges trimmed. Mirrors `theme.rs`'s `slug`.
 fn slug(name: &str) -> String {
     let s: String = name
@@ -198,7 +198,7 @@ fn slug(name: &str) -> String {
 }
 
 /// Turn a filename stem back into a display name when the file has no `name:`
-/// header — `-`/`_` become spaces. Predictable, if not capitalization-perfect.
+/// header (`-`/`_` become spaces). Predictable, if not capitalization-perfect.
 fn unslug(stem: &str) -> String {
     let name: String = stem
         .chars()
@@ -229,7 +229,7 @@ mod tests {
         assert_eq!(q.name, "Active users");
         assert_eq!(q.description.as_deref(), Some("by region"));
         assert_eq!(q.tags, vec!["analytics", "users"]);
-        // The body stays runnable verbatim — header included.
+        // The body stays runnable verbatim, header included.
         assert!(q.sql.contains("SELECT 1;"));
     }
 

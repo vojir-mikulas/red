@@ -1,8 +1,8 @@
 //! A small Markdown renderer for assistant chat bubbles. The model answers in
 //! Markdown; rendering it (instead of showing the raw `**`/`#`/fences) makes the
-//! transcript readable. This is a pragmatic subset — paragraphs, ATX headings,
+//! transcript readable. This is a pragmatic subset (paragraphs, ATX headings,
 //! fenced code blocks, bullet/numbered lists, thematic breaks, and inline
-//! `**bold**` / `*italic*` / `` `code` `` — rendered with `StyledText` runs so
+//! `**bold**` / `*italic*` / `` `code` ``) rendered with `StyledText` runs so
 //! prose still wraps naturally. It is intentionally not a full CommonMark engine.
 
 use flint::Theme;
@@ -222,7 +222,7 @@ fn numbered_item(line: &str) -> Option<&str> {
         .map(str::trim)
 }
 
-/// Max source lines rendered for one code block — one element is built per line, so
+/// Max source lines rendered for one code block. One element is built per line, so
 /// an unbounded block (a model dumping a huge file) would build thousands of nodes
 /// every repaint. Past this a summary row stands in.
 const MAX_CODE_LINES: usize = 400;
@@ -339,7 +339,7 @@ fn render_block(block: &Block, theme: &Theme) -> AnyElement {
     }
 }
 
-/// One table row — equal-width cells, a bottom rule, and a subtle header tint.
+/// One table row: equal-width cells, a bottom rule, and a subtle header tint.
 fn table_row(cells: &[String], theme: &Theme, header: bool) -> AnyElement {
     let mut row = div()
         .flex()
@@ -389,7 +389,7 @@ fn inline(text: &str, theme: &Theme) -> AnyElement {
             len: seg.len(),
             font: f,
             color,
-            // A faint tint of the accent, not a solid surface — reads as a subtle
+            // A faint tint of the accent, not a solid surface; reads as a subtle
             // chip in every theme rather than a stark white/black box (the old
             // `bg_elevated` was pure white in Ayu Light).
             background_color: (span == Span::Code).then(|| theme.accent.opacity(0.12)),
@@ -439,7 +439,7 @@ fn parse_inline(text: &str) -> Vec<(String, Span)> {
 
     while i < chars.len() {
         let c = chars[i];
-        // Inline code — verbatim until the next backtick.
+        // Inline code: verbatim until the next backtick.
         if c == '`' {
             if let Some(end) = find(&chars, i + 1, '`') {
                 push_plain(&mut plain, &mut out);
@@ -448,7 +448,7 @@ fn parse_inline(text: &str) -> Vec<(String, Span)> {
                 continue;
             }
         }
-        // Bold — `**…**` (checked before single-`*` italic).
+        // Bold, `**…**` (checked before single-`*` italic).
         if c == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
             if let Some(end) = find_seq(&chars, i + 2, '*', '*') {
                 push_plain(&mut plain, &mut out);
@@ -457,7 +457,7 @@ fn parse_inline(text: &str) -> Vec<(String, Span)> {
                 continue;
             }
         }
-        // Italic — `*…*` or `_…_`.
+        // Italic: `*…*` or `_…_`.
         if c == '*' || c == '_' {
             if let Some(end) = find(&chars, i + 1, c) {
                 push_plain(&mut plain, &mut out);

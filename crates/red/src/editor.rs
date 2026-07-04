@@ -1,5 +1,5 @@
 //! The SQL editor pane: a toolbar (Run · history · read-only badge) over
-//! Flint's `CodeEditor`. RED owns the domain bits — the SQL highlighter, the
+//! Flint's `CodeEditor`. RED owns the domain bits: the SQL highlighter, the
 //! completion candidates fed into the editor's generic completion seam, running
 //! the current statement (or selection), and the query history. Results land in
 //! the result grid.
@@ -16,7 +16,7 @@ use crate::app::{ActiveConn, AppState, Phase};
 use crate::schema::SchemaState;
 use crate::sql::CompletionContext;
 
-/// How many candidates the popup ever shows — the editor renders at most 8, but
+/// How many candidates the popup ever shows; the editor renders at most 8, but
 /// we hand it a few more so prefix-narrowing has headroom.
 const MAX_CANDIDATES: usize = 20;
 
@@ -191,7 +191,7 @@ fn completion_provider(
             return Vec::new();
         }
 
-        // Candidate sources in priority order — earlier groups win ties. Each
+        // Candidate sources in priority order: earlier groups win ties. Each
         // carries a kind badge, a detail (type/signature), and a doc-panel guide.
         let mut ordered: Vec<CompletionItem> = Vec::new();
         match &context {
@@ -251,7 +251,7 @@ fn completion_provider(
     }
 }
 
-/// First non-empty, non-comment line of a query, truncated — the history label,
+/// First non-empty, non-comment line of a query, truncated: the history label,
 /// and the suggested name when saving a query (B3).
 pub(crate) fn history_label(sql: &str) -> String {
     let line = sql
@@ -379,12 +379,12 @@ impl AppState {
                 // Track the cursor across this tab to aim the drop gap at the
                 // nearer edge, then commit the reorder on release. GPUI fires
                 // this on *every* tab per mouse move (capture phase, no hover
-                // gate), so we ignore moves whose cursor isn't over this tab —
+                // gate), so we ignore moves whose cursor isn't over this tab;
                 // only the hovered tab gets to set the gap.
                 .on_drag_move::<TabDrag>(move |e, _window, cx| {
                     let b = e.bounds;
                     let p = e.event.position;
-                    // Must be over this tab in *both* axes — checking x alone
+                    // Must be over this tab in *both* axes, since checking x alone
                     // would keep re-setting the gap while dragging straight down
                     // off the strip, leaving a stale indicator.
                     if p.x < b.origin.x
@@ -547,8 +547,8 @@ impl AppState {
                     .child(crate::icons::icon("plus", theme.scale(13.), faint)),
             );
 
-        // No open tab (user closed the last one): keep the strip — its ＋ opens
-        // a new query — over an empty pane, and skip the editor/run/breadcrumb.
+        // No open tab (user closed the last one): keep the strip (its ＋ opens
+        // a new query) over an empty pane, and skip the editor/run/breadcrumb.
         let Some(tab) = active.tabs.get(tab_idx) else {
             let empty = div()
                 .flex_1()
@@ -558,7 +558,7 @@ impl AppState {
                 .justify_center()
                 .text_size(size_12)
                 .text_color(faint)
-                .child("No query tab open — press ＋ to start");
+                .child("No query tab open. Press ＋ to start");
             return div()
                 .relative()
                 .size_full()
@@ -589,7 +589,7 @@ impl AppState {
 
         // The editor's own typography, applied here: the `CodeEditor` shapes its
         // text with `window.text_style()` / `window.line_height()`, both inherited
-        // from this container — so setting them here drives the editor font without
+        // from this container, so setting them here drives the editor font without
         // it (or Flint) knowing about settings.
         let ed = &self.settings.editor;
         let surface = div()
@@ -685,7 +685,7 @@ impl AppState {
     }
 
     /// The base `(schema, table)` a hand-typed `SELECT * FROM <table>` browses, when
-    /// one can be resolved against the connection catalog — so the editor result
+    /// one can be resolved against the connection catalog, so that the editor result
     /// gets the schema-tree browse's FK affordances and keyset paging. `None` for any
     /// query that isn't a plain single-table star select ([`crate::sql::single_table_star`]),
     /// or whose table can't be pinned to exactly one namespace in the catalog.
@@ -694,7 +694,7 @@ impl AppState {
     /// use, so it's taken from the catalog (`SchemaMeta.name`) rather than a guess: a
     /// bare name resolves only when a single namespace holds it; an explicit
     /// qualifier must name a real object. An ambiguous bare name (same table in two
-    /// namespaces) stays `None` — the engine picks by search-path, which we don't
+    /// namespaces) stays `None`: the engine picks by search-path, which we don't
     /// track, so guessing could tag the wrong table.
     fn resolve_browse_table(&self, sql: &str) -> Option<(String, String)> {
         let (schema_hint, table) = crate::sql::single_table_star(sql)?;
@@ -717,7 +717,7 @@ impl AppState {
                 Some(tab) => {
                     let editor = tab.editor.read(cx);
                     // An explicit selection runs verbatim; otherwise run just the
-                    // statement under the caret, not the whole buffer — a buffer of
+                    // statement under the caret, not the whole buffer: a buffer of
                     // several statements can't open as one result (the paging wrap
                     // is a single subquery), so running the caret's statement is what
                     // the user means and avoids a cryptic engine error.
@@ -735,11 +735,11 @@ impl AppState {
         };
         let sql = sql.trim().to_string();
         // An editor can slip in a non-breaking space (macOS Option+Space) that the
-        // engine rejects as an invalid token rather than whitespace — scrub those to
+        // engine rejects as an invalid token rather than whitespace; scrub those to
         // plain spaces (outside literals/comments) so a valid-looking query runs
         // instead of bouncing back a cryptic `syntax error at or near " FROM"`.
         let sql = crate::sql::normalize_spaces(&sql).unwrap_or(sql);
-        // Nothing runnable (empty, or only comments/`;`) — skip it rather than let
+        // Nothing runnable (empty, or only comments/`;`), so skip it rather than let
         // the empty `SELECT * FROM (<sql>)` paging wrap bounce back a bare "db error".
         if crate::sql::is_blank(&sql) {
             return;
@@ -768,7 +768,7 @@ impl AppState {
         if read_only && !matches!(kind, crate::sql::StatementKind::Query) {
             self.notify(
                 ToastVariant::Error,
-                "Connection is read-only — write statements are disabled.",
+                "Connection is read-only; write statements are disabled.",
                 cx,
             );
             return;
@@ -776,7 +776,7 @@ impl AppState {
 
         match kind {
             crate::sql::StatementKind::Query => {
-                // A row-returning batch can't open as one result — the paging path
+                // A row-returning batch can't open as one result: the paging path
                 // wraps the SQL in a single `SELECT * FROM (<sql>) AS _red`, which a
                 // `;`-separated batch makes a syntax error. Only an explicit
                 // multi-statement selection reaches here (a no-selection run already
@@ -784,7 +784,8 @@ impl AppState {
                 if crate::sql::statement_count(&sql) > 1 {
                     self.notify(
                         ToastVariant::Error,
-                        "Select a single statement to run — a multi-statement query can't open as a result.",
+                        "Select a single statement to run; \
+                         a multi-statement query can't open as a result.",
                         cx,
                     );
                     return;
@@ -793,7 +794,7 @@ impl AppState {
                 // with that base table so it gets the same FK affordances (accent,
                 // click-through, reference-column tree) and keyset paging as a browse
                 // opened from the schema tree. Resolve before the auto-limit shadows
-                // `sql` — the sniffer accepts a trailing LIMIT either way.
+                // `sql` (the sniffer accepts a trailing LIMIT either way).
                 let table = self.resolve_browse_table(&sql);
                 // Guard a bare `SELECT *` against flooding the grid: append the
                 // configured `LIMIT` unless the user wrote their own.
@@ -818,13 +819,13 @@ impl AppState {
 
     /// Run a write/DDL statement in a transaction; refresh the schema tree after,
     /// since it may have created or dropped objects. The single seam through which
-    /// writes leave the UI — so it also enforces the read-only gate, catching any
+    /// writes leave the UI, so it also enforces the read-only gate, catching any
     /// caller that didn't pre-check (e.g. future inline-edit paths).
     pub(crate) fn execute_sql(&mut self, sql: String, cx: &mut Context<Self>) {
         if matches!(&self.phase, Phase::Connected(active) if active.config.read_only) {
             self.notify(
                 ToastVariant::Error,
-                "Connection is read-only — write statements are disabled.",
+                "Connection is read-only; write statements are disabled.",
                 cx,
             );
             return;
@@ -958,7 +959,7 @@ impl AppState {
 }
 
 /// Resolve a sniffed `(schema_hint, table)` against the connection's namespace
-/// catalog to the canonical `(schema, table)` — the pair the FK graph and browse
+/// catalog to the canonical `(schema, table)`: the pair the FK graph and browse
 /// paths key off. Split out from [`AppState::resolve_browse_table`] so the matching
 /// rules are unit-testable without a live connection.
 ///
@@ -1030,7 +1031,7 @@ mod tests {
     #[test]
     fn bare_name_in_two_namespaces_is_ambiguous() {
         let cat = [ns("public", &["users"]), ns("audit", &["users"])];
-        // Same name in two schemas — the engine would pick by search-path, so we don't.
+        // Same name in two schemas; the engine would pick by search-path, so we don't.
         assert_eq!(resolve_in_catalog(&cat, None, "users"), None);
     }
 

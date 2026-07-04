@@ -22,7 +22,7 @@ impl AppState {
     /// The connecting splash: an indeterminate progress bar while an attempt is
     /// in flight, the error plus a backoff countdown between transient retries, a
     /// terminal error with "Edit connection" on a fatal failure (bad credentials,
-    /// missing database), and always a Cancel button — plus "Retry now" while
+    /// missing database), and always a Cancel button, plus "Retry now" while
     /// backing off.
     fn render_connecting(
         &self,
@@ -69,7 +69,7 @@ impl AppState {
                         .child(format!("Retrying in {}s…", delay.as_secs())),
                 )
                 .child(ProgressBar::new("connect-progress", 0.0).indeterminate(true)),
-            // Terminal: no countdown, no progress bar — the user must fix the
+            // Terminal: no countdown, no progress bar; the user must fix the
             // connection. The red tint marks it as a stop, not a transient wait.
             ConnectStatus::Failed { error } => status
                 .child(
@@ -171,7 +171,7 @@ impl Render for AppState {
         }
 
         // A focus move requested from a Window-less spot (e.g. the editor's Esc
-        // event) — apply it now that the Window is in hand.
+        // event); apply it now that the Window is in hand.
         if let Some(pane) = self.pending_focus.take() {
             self.focus_pane(pane, window, cx);
         }
@@ -181,14 +181,14 @@ impl Render for AppState {
         // and aims run/export/filter there. No-op when not split.
         self.sync_split_focus(window, cx);
 
-        // The connection form just opened — focus its name field so the user can
+        // The connection form just opened; focus its name field so the user can
         // type immediately (and Tab onward through the fields).
         if self.focus_name_field {
             self.focus_name_field = false;
             window.focus(&self.name_input.focus_handle(cx), cx);
         }
 
-        // The history popover just opened — focus it so its arrow keys work.
+        // The history popover just opened: focus it so its arrow keys work.
         if self.focus_history {
             self.focus_history = false;
             if let Phase::Connected(active) = &self.phase {
@@ -196,7 +196,7 @@ impl Render for AppState {
             }
         }
 
-        // ⌘F / search command — on the welcome screen, focus the connection search
+        // ⌘F / search command: on the welcome screen, focus the connection search
         // box; in the connected shell, reveal the sidebar and focus the schema filter.
         if self.focus_search {
             self.focus_search = false;
@@ -207,7 +207,7 @@ impl Render for AppState {
             }
         }
 
-        // ⌘⇧F — the result filter bar just opened; focus its input to type at once.
+        // ⌘⇧F: the result filter bar just opened; focus its input to type at once.
         if self.focus_filter {
             self.focus_filter = false;
             if let Some(bar) = &self.filter_bar {
@@ -215,7 +215,7 @@ impl Render for AppState {
             }
         }
 
-        // ⌘F (grid) — the find bar just opened; focus its input to type at once.
+        // ⌘F (grid): the find bar just opened; focus its input to type at once.
         if self.focus_find {
             self.focus_find = false;
             if let Some(bar) = &self.find_bar {
@@ -223,7 +223,7 @@ impl Render for AppState {
             }
         }
 
-        // ⌘L — the assistant panel just opened; focus its prompt box.
+        // ⌘L: the assistant panel just opened; focus its prompt box.
         if self.focus_assistant {
             self.focus_assistant = false;
             if let Some(panel) = &self.assistant {
@@ -251,7 +251,7 @@ impl Render for AppState {
             window.focus(&self.ai_login_code.focus_handle(cx), cx);
         }
 
-        // An inline cell edit just opened in the inspector (Track B5) — focus its
+        // An inline cell edit just opened in the inspector (Track B5); focus its
         // field so the user types the new value immediately.
         if self.focus_inspector_edit {
             self.focus_inspector_edit = false;
@@ -260,7 +260,7 @@ impl Render for AppState {
             }
         }
 
-        // An inline cell edit just opened in the grid (Track B6) — focus its field.
+        // An inline cell edit just opened in the grid (Track B6); focus its field.
         if self.focus_grid_edit {
             self.focus_grid_edit = false;
             if let Some(handle) = self.grid_edit_focus(cx) {
@@ -269,7 +269,7 @@ impl Render for AppState {
         }
 
         // Commit-on-blur: while an inline editor is open, a focus-out listener on its
-        // field stages the edit when the user clicks away (like a spreadsheet) — the
+        // field stages the edit when the user clicks away (like a spreadsheet); the
         // cell then shows as dirty. Registered once when an editor opens, dropped when
         // it closes. Mirrors `modal_focus_trap`.
         if self.grid_edit.is_some() {
@@ -294,7 +294,7 @@ impl Render for AppState {
             self.grid_edit_blur = None;
         }
 
-        // The palette's "switch connection" command — open the switcher popover
+        // The palette's "switch connection" command: open the switcher popover
         // now that the `Window` its field-focus needs is in hand.
         if self.open_switcher {
             self.open_switcher = false;
@@ -302,7 +302,7 @@ impl Render for AppState {
         }
 
         // A keyboard-driven modal (a confirmation or the shortcuts overlay) just
-        // opened — focus it so Flint's `Modal` hears its Esc/Enter.
+        // opened. Focus it so Flint's `Modal` hears its Esc/Enter.
         if self.focus_modal {
             self.focus_modal = false;
             window.focus(&self.modal_focus.clone(), cx);
@@ -311,7 +311,7 @@ impl Render for AppState {
         // Focus trap: while a modal is open, a focus-out listener on `modal_focus`
         // pulls focus back inside if Tab would carry it to the backdrop. Registered
         // once when a modal opens (the modal's panel is a descendant of
-        // `modal_focus`), and dropped — unsubscribing — when it closes.
+        // `modal_focus`), and dropped (unsubscribing) when it closes.
         if self.any_modal_open() {
             if self.modal_focus_trap.is_none() {
                 let handle = self.modal_focus.clone();
@@ -416,7 +416,7 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &GoToRow, _, cx| this.open_goto_prompt(cx)))
             .on_action(cx.listener(|this, _: &CopyResult, _, cx| this.copy_result_selection(cx)))
             // ⌘I toggles the cell detail inspector; Esc dismisses the topmost
-            // transient overlay — an open dropdown / cell menu first, then the
+            // transient overlay: an open dropdown / cell menu first, then the
             // inspector (no-op when nothing is open).
             .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| this.toggle_inspector(cx)))
             .on_action(cx.listener(|this, _: &CloseInspector, _, cx| this.dismiss_overlay(cx)))
@@ -493,7 +493,7 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &AddRow, _, cx| this.add_draft_row(cx)))
             .on_action(cx.listener(|this, _: &SetNull, _, cx| this.set_cell_null(cx)))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.result_select_all(cx)))
-            // ⌘↵ runs the active tab's query from any pane — or tests the connection
+            // ⌘↵ runs the active tab's query from any pane, or tests the connection
             // while the form is open. ⌘N on the welcome screen adds a connection.
             .on_action(cx.listener(|this, _: &RunQuery, _, cx| {
                 if this.form.is_some() {
@@ -512,7 +512,7 @@ impl Render for AppState {
             // connects. Only acts on the disconnected screen with no form open.
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 // The command palette and connection switcher own the keyboard
-                // while open — their input has focus, so single-letter card
+                // while open: their input has focus, so single-letter card
                 // shortcuts (e/⌫) must not fire underneath them.
                 if !matches!(this.phase, Phase::Disconnected)
                     || this.form.is_some()
@@ -530,7 +530,7 @@ impl Render for AppState {
                     return;
                 }
                 // While the search box has focus, letters/backspace must edit the
-                // query — only the navigation keys act as card shortcuts there.
+                // query; only the navigation keys act as card shortcuts there.
                 let search_focused = this.connect_search.focus_handle(cx).is_focused(window);
                 let sel = this.connect_sel.min(n - 1);
                 match event.keystroke.key.as_str() {
@@ -548,7 +548,7 @@ impl Render for AppState {
                         cx.stop_propagation();
                         this.connect(visible[sel], cx);
                     }
-                    // E edits the highlighted connection, ⌫/⌦ asks to remove it —
+                    // E edits the highlighted connection, ⌫/⌦ asks to remove it;
                     // the keyboard mirrors the hover edit/trash buttons on each card.
                     "e" if !search_focused => {
                         cx.stop_propagation();
@@ -812,7 +812,7 @@ impl AppState {
         col
     }
 
-    /// The title of tab `index`, if it exists — for the close-confirm prompt.
+    /// The title of tab `index`, if it exists, for the close-confirm prompt.
     fn tab_title(&self, index: usize) -> Option<String> {
         match &self.phase {
             Phase::Connected(active) => active.tabs.get(index).map(|t| t.title.clone()),
@@ -947,7 +947,7 @@ impl AppState {
             .child(body)
     }
 
-    /// The destructive-statement confirmation modal — the write safety rail.
+    /// The destructive-statement confirmation modal: the write safety rail.
     fn render_confirm(
         &self,
         pending: crate::app::PendingWrite,
@@ -990,8 +990,8 @@ impl AppState {
                 ("Copy to table", prose.clone(), preview.clone(), "Append")
             }
         };
-        // A copy offers two actions — Append (keep the target's rows) and Replace all
-        // (truncate first, behind the danger styling) — rather than one run button.
+        // A copy offers two actions, Append (keep the target's rows) and Replace all
+        // (truncate first, behind the danger styling), rather than one run button.
         let is_copy = matches!(&pending, PendingWrite::Copy { .. });
         // The batch preview can be many statements; show more than a single edit's
         // one-liner but still cap it so a huge change-set can't blow up the modal.
@@ -1026,7 +1026,7 @@ impl AppState {
                         })),
                 )
                 .child(
-                    // Enter (the modal's confirm) also runs Append — the safe default.
+                    // Enter (the modal's confirm) also runs Append, the safe default.
                     Button::new("confirm-copy-append", run_label)
                         .variant(ButtonVariant::Primary)
                         .on_click(
@@ -1063,7 +1063,7 @@ impl AppState {
 impl AppState {
     /// The dev perf HUD overlay: a small bottom-right mono panel with the budget
     /// readouts (build time, allocs/frame, live + RSS bytes, the grid footprint).
-    /// `None` while toggled off. Kept deliberately trivial — building it allocates
+    /// `None` while toggled off. Kept deliberately trivial: building it allocates
     /// and takes time, so it lightly perturbs its own reading (see the plan).
     fn render_dev_panel(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.dev_stats.visible() {
@@ -1073,7 +1073,7 @@ impl AppState {
         let ds = &self.dev_stats;
         let mb = |bytes: usize| format!("{} MB", bytes / (1024 * 1024));
         let rss = ds.rss().map(&mb).unwrap_or_else(|| "—".into());
-        // `gap` is the interval between renders — the repaint cadence during
+        // `gap` is the interval between renders, the repaint cadence during
         // interaction. Idle is notify-gated (no frame stream), so a large gap at
         // rest is correct, not a stall (see the plan's fps caveat).
         let line1 = format!(

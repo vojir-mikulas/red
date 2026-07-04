@@ -1,13 +1,13 @@
 //! The vocabulary that crosses the `red-acp` seam. Mirrors `red-ai`'s delta
 //! shape (text / thinking / tool activity) so the service relay and the panel are
-//! reused unchanged — only the backend that produces them differs.
+//! reused unchanged; only the backend that produces them differs.
 
 use std::path::PathBuf;
 
 use tokio::sync::{mpsc, oneshot};
 
 /// The default agent: Claude Code in ACP mode, fetched on demand via npx. The
-/// agent owns the subscription `/login` and billing — Red never sees the tokens.
+/// agent owns the subscription `/login` and billing; Red never sees the tokens.
 pub const DEFAULT_AGENT_COMMAND: &str = "npx -y @agentclientprotocol/claude-agent-acp";
 
 /// One streamed increment of an assistant turn, mapped from an ACP
@@ -24,7 +24,7 @@ pub enum AcpDelta {
     ToolFinished { name: String, ok: bool },
 }
 
-/// One slash command the agent advertises (ACP `AvailableCommandsUpdate`) — e.g.
+/// One slash command the agent advertises (ACP `AvailableCommandsUpdate`), e.g.
 /// `login` / "Sign in to your account". The `name` carries no leading slash; the
 /// composer adds it. Surfaced so the UI can offer a `/`-triggered command picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,7 +93,7 @@ pub struct AcpTurnResult {
     pub stop: AcpStop,
 }
 
-/// A localhost MCP server to hand the agent in `session/new` — Red's read-only DB
+/// A localhost MCP server to hand the agent in `session/new`: Red's read-only DB
 /// tools. `token` is the bearer nonce sent as the `Authorization` header.
 #[derive(Debug, Clone)]
 pub struct McpGrounding {
@@ -104,7 +104,7 @@ pub struct McpGrounding {
 
 /// A tool-call permission the agent asked for that Red did **not** auto-allow
 /// (M-S2). The conversation forwards it out of band for a user decision and
-/// blocks the agent's tool call until the answer arrives on `decide` — sending
+/// blocks the agent's tool call until the answer arrives on `decide`: sending
 /// `true` runs the tool, `false` (or dropping the sender) denies it.
 #[derive(Debug)]
 pub struct AcpPermission {
@@ -130,7 +130,7 @@ pub struct AcpConfig {
     /// agent is already capability-restricted to no filesystem/terminal.
     pub allow_tools: Vec<String>,
     /// Where non-auto-allowed permission requests go for a user decision. `None`
-    /// means deny-by-default (no UI wired) — the safe choice.
+    /// means deny-by-default (no UI wired), the safe choice.
     pub permissions: Option<mpsc::UnboundedSender<AcpPermission>>,
     /// Where the agent's advertised slash commands are forwarded as they arrive
     /// (`AvailableCommandsUpdate`), for the `/`-command picker. Connection-lifetime,
@@ -143,12 +143,12 @@ pub struct AcpConfig {
     pub config: Option<mpsc::UnboundedSender<Vec<AcpConfigOption>>>,
 }
 
-/// Errors the ACP backend can raise. Kept coarse — the service maps them to an
+/// Errors the ACP backend can raise. Kept coarse: the service maps them to an
 /// `AiError` event; the panel shows the message.
 #[derive(Debug, thiserror::Error)]
 pub enum AcpError {
     /// The agent binary/command could not be launched (Node/Claude Code missing).
-    #[error("could not start the agent — is Node.js / Claude Code installed? ({0})")]
+    #[error("could not start the agent; is Node.js / Claude Code installed? ({0})")]
     Spawn(String),
     /// The agent reported an ACP-level failure.
     #[error("agent error: {0}")]

@@ -39,7 +39,7 @@ pub use sqlite::SqliteDriver;
 /// Default bytes of a non-key cell's content a *display* fetch keeps; past it,
 /// text is truncated to a [`Value::Capped`] prefix and a blob to its length only.
 /// The resident-cell budget that keeps the grid's RAM flat over fat `TEXT`/`BLOB`
-/// columns — the driver never materializes the over-cap bytes, so a page of huge
+/// columns: the driver never materializes the over-cap bytes, so a page of huge
 /// cells can't spike the channel. The live value is [`display_cell_cap`], driven
 /// by `grid.max_cell_chars` via [`set_display_cell_cap`].
 pub const DEFAULT_DISPLAY_CELL_CAP: usize = 4096;
@@ -70,12 +70,12 @@ pub enum PageCap {
     /// Cap non-key cells; `key` (when the result is keyed) rides through verbatim
     /// so its bytes round-trip as a seek bound.
     Display { key: Option<KeySpec> },
-    /// No cap — full-fidelity rows, for the clipboard re-fetch.
+    /// No cap: full-fidelity rows, for the clipboard re-fetch.
     Full,
 }
 
 /// The positional, per-extraction form of a display cap: the byte budget plus the
-/// result-column indices of the key columns (exempt — each rides back verbatim as
+/// result-column indices of the key columns (exempt; each rides back verbatim as
 /// a seek bound, so its value must round-trip exactly). A composite sort key has
 /// two exempt columns (lead + tiebreaker); a plain browse has one.
 /// `None` everywhere a fetch is full-fidelity (export / clipboard re-fetch).
@@ -177,12 +177,12 @@ pub(crate) fn seek_clauses(
     (where_clause, order_by)
 }
 
-/// Render an [`EditOp`] into `(sql, ordered bind values)` for one engine — the
+/// Render an [`EditOp`] into `(sql, ordered bind values)` for one engine: the
 /// shared half of every driver's `apply_edit`, so only quoting and placeholder
 /// syntax differ. `quote` quotes one identifier; `placeholder(i, cv)` renders the
 /// `i`-th (0-based) bind slot for the column=value pair `cv` (e.g. `?` or
-/// `$1::int8`, or — given `cv.decl_type` — a cast back to a non-text column type).
-/// A [`Value::Null`] is emitted as the literal `NULL` keyword and **not** bound — so
+/// `$1::int8`, or, given `cv.decl_type`, a cast back to a non-text column type).
+/// A [`Value::Null`] is emitted as the literal `NULL` keyword and **not** bound, so
 /// the per-engine value binders never see a null (and a typeless null bind, which
 /// Postgres can't infer, never arises). Identifiers are quoted, values are bound:
 /// no part of an edit is string-interpolated.
@@ -247,15 +247,15 @@ pub(crate) fn edit_sql<'a>(
     (sql, params)
 }
 
-/// Render a multi-row `INSERT` into `(sql, ordered bind values)` for one engine —
+/// Render a multi-row `INSERT` into `(sql, ordered bind values)` for one engine:
 /// the bulk sibling of [`edit_sql`], so only quoting and placeholder syntax differ.
 /// `quote` quotes one identifier; `placeholder(i, value, decl_type)` renders the
 /// `i`-th (0-based) **bind slot** for a non-null cell (e.g. `?`, or `$1::int8` /
-/// `$1::text::"uuid"` — a cast to the target column's type). A [`Value::Null`] is
+/// `$1::text::"uuid"`, a cast to the target column's type). A [`Value::Null`] is
 /// emitted as the literal `NULL` keyword and **not** bound, so the per-engine value
 /// binders never see a null and the bind index only advances for bound cells. Every
 /// row binds `columns` in order; `columns` carries each target column's name and
-/// best-effort `decl_type`. Identifiers are quoted, values are bound — no part of an
+/// best-effort `decl_type`. Identifiers are quoted, values are bound; no part of an
 /// insert is string-interpolated.
 pub(crate) fn insert_sql<'a>(
     table: &TableRef,
@@ -297,7 +297,7 @@ pub(crate) fn insert_sql<'a>(
 
 /// The largest number of rows to bind in one `INSERT` statement so the bound-
 /// parameter count (`rows × columns`) stays under an engine's placeholder cap
-/// (`param_cap`). At least 1 — a single row wider than the cap is left for the
+/// (`param_cap`). At least 1: a single row wider than the cap is left for the
 /// engine to reject rather than looping forever. Callers feed `rows.chunks(_)` so a
 /// big insert splits into several statements inside one transaction.
 pub(crate) fn insert_chunk_rows(columns: usize, param_cap: usize) -> usize {
@@ -305,7 +305,7 @@ pub(crate) fn insert_chunk_rows(columns: usize, param_cap: usize) -> usize {
 }
 
 /// Qualify and quote a table reference (`schema.name`, or just `name` when there's no
-/// schema) using `quote` — the shared body of every driver's [`quote_table`] and the
+/// schema) using `quote`: the shared body of every driver's [`quote_table`] and the
 /// `CREATE TABLE` builder. Identifiers are quoted, never interpolated raw.
 pub(crate) fn qualify_table(table: &TableRef, quote: impl Fn(&str) -> String) -> String {
     match &table.schema {
@@ -315,7 +315,7 @@ pub(crate) fn qualify_table(table: &TableRef, quote: impl Fn(&str) -> String) ->
 }
 
 /// Build a `CREATE TABLE IF NOT EXISTS` for `table` from `columns`, spelling each
-/// column's declared type into `kind`'s dialect via [`red_core::typemap`] — the
+/// column's declared type into `kind`'s dialect via [`red_core::typemap`], the
 /// shared body of every driver's [`create_table`](DatabaseDriver::create_table). A
 /// Postgres `int4`/`numeric(10,2)`/`jsonb`/`uuid` becomes a faithful column in the
 /// target engine instead of invalid DDL; a type the lattice can't classify falls
@@ -323,7 +323,7 @@ pub(crate) fn qualify_table(table: &TableRef, quote: impl Fn(&str) -> String) ->
 /// emitted, primary-key columns are gathered into a trailing `PRIMARY KEY (…)`, and an
 /// auto-increment column is re-spelled per dialect (SQLite `INTEGER PRIMARY KEY`,
 /// Postgres `serial`/`bigserial`, MySQL `… AUTO_INCREMENT`) so the migrated table keeps
-/// auto-numbering. Indexes and foreign keys are **not** emitted here — they ride a
+/// auto-numbering. Indexes and foreign keys are **not** emitted here; they ride a
 /// deferred pass after the data loads (`docs/plans/database-migration.md` Phase 3).
 /// Identifiers are quoted by `quote`; the only interpolated type text comes from the
 /// fixed per-engine spelling table, never raw user input.
@@ -387,7 +387,7 @@ pub(crate) fn create_table_sql(
     format!("CREATE TABLE IF NOT EXISTS {qualify} ({})", defs.join(", "))
 }
 
-/// Build a `CREATE [UNIQUE] INDEX` for `table` over `columns` in `kind`'s dialect — the
+/// Build a `CREATE [UNIQUE] INDEX` for `table` over `columns` in `kind`'s dialect: the
 /// shared body of every driver's [`create_index`](DatabaseDriver::create_index), run as
 /// the migration's deferred index pass. `IF NOT EXISTS` is used where the engine
 /// supports it (not MySQL). Identifiers are quoted by `quote`, never interpolated raw.
@@ -433,7 +433,7 @@ pub(crate) fn create_index_sql(
     }
 }
 
-/// Build an `ALTER TABLE … ADD FOREIGN KEY (…) REFERENCES … (…)` in `kind`'s dialect —
+/// Build an `ALTER TABLE … ADD FOREIGN KEY (…) REFERENCES … (…)` in `kind`'s dialect,
 /// the shared body of every (FK-capable) driver's [`add_foreign_key`]. No referential
 /// actions are emitted (`FkEdge` doesn't carry them). Identifiers are quoted, never
 /// interpolated raw. `kind` is currently unused (the syntax is the same on Postgres and
@@ -462,7 +462,7 @@ pub(crate) fn add_fk_sql(
     )
 }
 
-/// The error for an edit whose row count wasn't the expected one — surfaced to the
+/// The error for an edit whose row count wasn't the expected one, surfaced to the
 /// user in the result pane (not as a silent success). `affected = 0` means the row
 /// changed or vanished under us; `> 1` means the key was less unique than believed.
 /// Either way the driver rolled the statement back.
@@ -473,7 +473,7 @@ pub(crate) fn edit_count_err(op: &EditOp, affected: u64) -> RedError {
         EditOp::Insert { .. } => "insert",
     };
     RedError::Query(format!(
-        "{what} matched {affected} rows (expected 1) — nothing was changed"
+        "{what} matched {affected} rows (expected 1); nothing was changed"
     ))
 }
 
@@ -498,32 +498,32 @@ pub(crate) fn warn_rollback<E: std::fmt::Display>(
 /// Build a portable "any text-representable column contains `term`" predicate for
 /// the result-search filter ([`red_core::ResultFilter::Contains`]): an OR-chain of
 /// `<col-as-text> <like> '<escaped %term%>' ESCAPE '\'` over every non-blob column.
-/// Shared across the three drivers — only the identifier quoting, the text cast,
+/// Shared across the three drivers; only the identifier quoting, the text cast,
 /// and the match keyword differ. Returns `None` when nothing is searchable (all
 /// columns blob, or an empty column set); the service then applies no filter.
 ///
 /// Blob columns are skipped: casting binary to text is engine-specific noise
 /// (Postgres hex, etc.) and never what a text search means. The `term` is escaped
-/// to match **literally** — the `LIKE` metacharacters `\` `%` `_` are backslash-
-/// escaped and embedded quotes doubled — so it can never inject SQL or leak a
+/// to match **literally** (the `LIKE` metacharacters `\` `%` `_` are backslash-
+/// escaped and embedded quotes doubled), so it can never inject SQL or leak a
 /// wildcard.
 ///
 /// `quote` quotes one identifier; `as_text(quoted)` wraps a quoted column in the
 /// engine's text cast (`(c)::text`, `CAST(c AS TEXT)`, `CAST(c AS CHAR)`); `like_op`
-/// is the case-insensitive match keyword (`ILIKE` on Postgres, `LIKE` elsewhere —
+/// is the case-insensitive match keyword (`ILIKE` on Postgres, `LIKE` elsewhere;
 /// SQLite/MySQL `LIKE` is ASCII-case-insensitive by default).
 /// `backslash_escapes` must be `true` for engines that treat `\` as a string-
 /// literal escape (MySQL/MariaDB in the default mode, and ClickHouse), `false`
 /// where `\` is a plain literal byte (SQLite, and Postgres with
 /// `standard_conforming_strings`). It controls a second escaping layer so the
 /// backslashes the `LIKE` pattern uses survive the engine's *string-literal*
-/// parser intact — without it, a search for a literal `%`, `_`, or `\` silently
+/// parser intact; without it, a search for a literal `%`, `_`, or `\` silently
 /// misbehaves on MySQL.
 ///
 /// `escape_clause` controls the trailing `ESCAPE '…'`: the SQL-standard engines
 /// (Postgres/MySQL/SQLite) accept it and rely on it to name `\` as the pattern's
 /// escape char, but ClickHouse's `LIKE`/`ILIKE` has no `ESCAPE` clause (its escape
-/// char is always `\`), so it passes `false` to omit it — the `\`-escaped pattern
+/// char is always `\`), so it passes `false` to omit it; the `\`-escaped pattern
 /// still matches literally against ClickHouse's built-in backslash escaping.
 pub(crate) fn contains_clause(
     columns: &[ColumnMeta],
@@ -555,13 +555,13 @@ pub(crate) fn contains_clause(
 /// Render the AND-chain of `column = value` equalities behind every driver's
 /// [`eq_predicate`](DatabaseDriver::eq_predicate) (Track B7 FK follow): only the
 /// identifier `quote` differs per engine. Each value becomes a SQL *literal* (see
-/// [`sql_literal`]) compared with `=` — no column cast, so the comparison stays
+/// [`sql_literal`]) compared with `=`: no column cast, so the comparison stays
 /// index-usable and the engine coerces the untyped literal to the column's type.
 /// `pairs` is non-empty by contract (a follow always has at least one column).
 ///
 /// `backslash_escapes` must match the engine's string-literal rules: MySQL (default
 /// mode) and ClickHouse treat `\` as an escape inside `'…'`, so a value's backslashes
-/// must be doubled too, not just its quotes — see [`sql_literal`]. Postgres (with the
+/// must be doubled too, not just its quotes (see [`sql_literal`]). Postgres (with the
 /// default `standard_conforming_strings`) and SQLite treat `\` as a literal byte, so
 /// they pass `false`. Getting this wrong is a SQL-injection hole: an unescaped
 /// trailing `\` lets a value break out of the literal.
@@ -584,13 +584,13 @@ pub(crate) fn eq_clause(
 }
 
 /// Wrap `base` so each [`FkJoin`]'s selected columns ride **inline, next to the
-/// foreign-key column they expand from** — the shared half of every relational
+/// foreign-key column they expand from**: the shared half of every relational
 /// driver's [`fk_join_wrap`](DatabaseDriver::fk_join_wrap) (inline FK expansion,
 /// Track B7). Only the identifier `quote` differs per engine.
 ///
 /// `base_cols` is the base result's columns in their natural order (from
 /// `describe_table`). The projection emits each base column in turn and, right after
-/// a foreign-key column, the chosen columns of the table(s) it references — in
+/// a foreign-key column, the chosen columns of the table(s) it references, in
 /// depth-first order, so a nested chain (`tier → cascade → placement`) lands grouped
 /// under its anchor (dbgate's column layout). Each join contributes a
 /// `LEFT JOIN <ref> AS <alias>` plus its columns as `<alias>.<col> AS "<dotted path>"`;
@@ -598,7 +598,7 @@ pub(crate) fn eq_clause(
 /// full path orders siblings (a parent FK sorts before its descendants).
 ///
 /// A `LEFT JOIN` (never inner) keeps rows whose FK is NULL/orphaned, and the
-/// unique-target gate (caller-enforced — the UI only offers unique-key FKs) keeps the
+/// unique-target gate (caller-enforced; the UI only offers unique-key FKs) keeps the
 /// row count identical, so `count`, the keyset key, and paging over the wrapped result
 /// are all unaffected. Downstream code addresses columns by *name*, so reordering them
 /// is transparent to keyset/FK-accent/edit/stats.
@@ -606,7 +606,7 @@ pub(crate) fn eq_clause(
 /// `joins` is ordered outer→inner: each hop's [`parent_alias`](FkJoin::parent_alias)
 /// is an earlier join's alias or [`BASE_ALIAS`]. Empty `joins` returns `base`
 /// untouched; an empty `base_cols` (the base order is unknown) falls back to
-/// `_red_base.*` then the joined columns appended — correct, just not interleaved. A
+/// `_red_base.*` then the joined columns appended (correct, just not interleaved). A
 /// trailing `;`/whitespace is stripped so the subquery wrap stays well-formed.
 pub(crate) fn join_wrap(
     base: &str,
@@ -684,11 +684,11 @@ pub(crate) fn join_wrap(
 /// A [`Value`] as a SQL literal for an FK-follow equality (see [`eq_clause`]): an
 /// integer/real bare, text single-quoted with embedded quotes doubled. A NULL or a
 /// kind that can never be an FK key (blob / a display-capped cell) renders as the
-/// literal `NULL`, so `col = NULL` matches nothing — a safe no-op rather than an
+/// literal `NULL`, so `col = NULL` matches nothing: a safe no-op rather than an
 /// error, though the UI gates FK follow to non-null int/text values so it shouldn't
 /// arise. The text quoting is the injection guard; no value is interpolated raw.
 ///
-/// On an engine where `\` escapes inside a string literal (`backslash_escapes` —
+/// On an engine where `\` escapes inside a string literal (`backslash_escapes`:
 /// MySQL/ClickHouse), embedded backslashes are *also* doubled, exactly as
 /// [`like_pattern`] does; without this a value such as `\' OR 1=1 -- ` escapes the
 /// closing quote and injects SQL (the FK-follow value comes from a result cell, which
@@ -711,7 +711,7 @@ fn sql_literal(v: &Value, backslash_escapes: bool) -> String {
 
 /// Build the aggregate-summary `SELECT` for [`DatabaseDriver::column_stats`]: a
 /// pushdown that wraps the result's SQL in a subquery and aggregates `column`.
-/// Shared across the engines — only the identifier `quote` differs. The select
+/// Shared across the engines; only the identifier `quote` differs. The select
 /// list is assembled in a **fixed order** so [`parse_stats`] reads it positionally:
 /// `count(*)`, `count(col)`, then `count(distinct col)` (iff `distinct`), then
 /// `min(col)`, `max(col)`, then `sum(col)`, `avg(col)` (iff `numeric`). The column
@@ -748,7 +748,7 @@ pub(crate) fn stats_sql(
 /// (a NULL/absent cell → 0; a count returned as a numeric string is parsed);
 /// `min`/`max`/`sum`/`avg` ride through as typed [`Value`]s so the UI formats them
 /// like grid cells. A NULL `sum`/`avg` (every row null) collapses to `None` so the
-/// bar omits it. `nulls` isn't stored — the UI derives `total - non_null`.
+/// bar omits it. `nulls` isn't stored; the UI derives `total - non_null`.
 pub(crate) fn parse_stats(cells: &[Value], numeric: bool, distinct: bool) -> ColumnStats {
     let int_at = |i: usize| match cells.get(i) {
         Some(Value::Integer(n)) => *n,
@@ -857,7 +857,7 @@ fn like_pattern(term: &str, backslash_escapes: bool) -> String {
     format!("'{lit}'")
 }
 
-/// Whether a declared type names a binary/blob column across the three engines —
+/// Whether a declared type names a binary/blob column across the three engines,
 /// skipped by the contains-search cast (binary-to-text is engine-specific noise).
 fn is_blob_type(type_name: &str) -> bool {
     let t = type_name.to_ascii_lowercase();
@@ -872,20 +872,20 @@ fn is_blob_type(type_name: &str) -> bool {
 /// `Arc<dyn DatabaseDriver>` and swap engines behind it.
 #[async_trait]
 pub trait DatabaseDriver: Send + Sync {
-    /// Cheap liveness probe — opens/touches the underlying connection.
+    /// Cheap liveness probe: opens/touches the underlying connection.
     async fn ping(&self) -> Result<()>;
 
     /// Engine version string (e.g. `"3.46.0"`), for the status bar. Cheap and
-    /// synchronous — drivers report a compiled-in or already-known value.
+    /// synchronous; drivers report a compiled-in or already-known value.
     fn server_version(&self) -> String;
 
     /// Prepare `sql`, read column metadata, and return a live cursor. Cheap by
-    /// design: this does NOT step rows — the first (potentially expensive) step
+    /// design: this does NOT step rows; the first (potentially expensive) step
     /// happens on the first `next_window`, which is the cancellable path.
     async fn open_cursor(&self, sql: &str, opts: QueryOptions) -> Result<Box<dyn QueryCursor>>;
 
     /// The schema-tree skeleton: every namespace with its table/view names. Cheap
-    /// by contract — names + kinds only, no per-table `COUNT(*)` and no column
+    /// by contract: names + kinds only, no per-table `COUNT(*)` and no column
     /// walk (that's `describe_table`, pulled lazily on expand).
     async fn list_objects(&self) -> Result<Vec<SchemaMeta>>;
 
@@ -902,26 +902,26 @@ pub trait DatabaseDriver: Send + Sync {
     async fn foreign_keys(&self) -> Result<Vec<FkEdge>>;
 
     /// Render a conjunction of `column = value` equalities as an escaped *literal*
-    /// predicate for [`red_core::ResultFilter::Eq`] — the FK-follow filter. Each
+    /// predicate for [`red_core::ResultFilter::Eq`], the FK-follow filter. Each
     /// value is escaped to match literally with **no column cast** (unlike
     /// [`contains_predicate`](Self::contains_predicate)'s `(col)::text`, so an index
     /// on the column stays usable, and comparison context coerces the literal to the
     /// column type). Synchronous string building; identifiers are quoted, values are
-    /// rendered as literals — never raw UI SQL. NULL values are excluded by the
+    /// rendered as literals, never raw UI SQL. NULL values are excluded by the
     /// caller (a null FK isn't followable); `pairs` is non-empty. Each impl delegates
     /// to [`eq_clause`] with its own identifier quoting.
     fn eq_predicate(&self, pairs: &[ColumnValue]) -> String;
 
     /// Wrap `base` so each inline FK expansion (Track B7) `LEFT JOIN`s its referenced
     /// table and selects the chosen columns *inline, next to the FK column they expand
-    /// from* — the inline sibling of [`eq_predicate`](Self::eq_predicate). `base_cols`
+    /// from*, the inline sibling of [`eq_predicate`](Self::eq_predicate). `base_cols`
     /// is the base result's columns in order (so the projection can interleave). Returns
     /// `base` unchanged for an empty `joins` or an engine without relational FKs (the
     /// default impl, which ClickHouse keeps); the relational engines override it to
     /// delegate to [`join_wrap`] with their own identifier quoting. Synchronous string
     /// building; identifiers are quoted, never raw UI SQL. The unique-target gate is the
     /// caller's (the UI only offers unique-key FKs), so the join can't change the row
-    /// count — `count`, the keyset key, and paging stay correct over the wrapped result.
+    /// count; `count`, the keyset key, and paging stay correct over the wrapped result.
     fn fk_join_wrap(&self, base: &str, base_cols: &[String], joins: &[FkJoin]) -> String {
         let _ = base_cols;
         debug_assert!(
@@ -935,13 +935,13 @@ pub trait DatabaseDriver: Send + Sync {
     /// searchable columns of a result, for [`red_core::ResultFilter::Contains`].
     /// The service wraps `SELECT * FROM (base) WHERE <predicate>`; `columns` are the
     /// result's own (a browse passes the table's columns, an editor result its
-    /// probed columns). `None` when nothing is searchable (all-blob / empty) — the
+    /// probed columns). `None` when nothing is searchable (all-blob / empty); the
     /// service then applies no filter. `term` is escaped to match literally, never
     /// interpolated raw. Synchronous: pure string building, no engine round-trip.
     /// Each impl delegates to [`contains_clause`] with its own quoting/cast/keyword.
     fn contains_predicate(&self, columns: &[ColumnMeta], term: &str) -> Option<String>;
 
-    /// Total row count of `sql`'s result — one pass, no row materialization. Lets
+    /// Total row count of `sql`'s result: one pass, no row materialization. Lets
     /// the grid show a real scrollbar without holding every row. `abort` cancels
     /// the (potentially full-table) scan out-of-band when the result is superseded.
     async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64>;
@@ -949,7 +949,7 @@ pub trait DatabaseDriver: Send + Sync {
     /// An aggregate summary of `column` over `sql` (the result's already-filtered
     /// SQL), pushed to the engine: builds `SELECT count(*), count(col),
     /// [count(distinct col)], min(col), max(col), [sum(col), avg(col)] FROM (sql)
-    /// AS _red` and reads one row (see [`stats_sql`]/[`parse_stats`]) — never
+    /// AS _red` and reads one row (see [`stats_sql`]/[`parse_stats`]), never
     /// scanning the materialized window. `numeric` toggles the `sum`/`avg`
     /// aggregates (decided UI-side from the column's declared type), `distinct`
     /// toggles the potentially-expensive `count(distinct col)`. Cancellable via
@@ -967,7 +967,7 @@ pub trait DatabaseDriver: Send + Sync {
     /// A random-access `(offset, limit)` page of `sql`'s result. Backs the grid's
     /// load-on-scroll so memory stays flat: only the pages around the viewport are
     /// ever resident. `cap` chooses display capping (the common scroll path) or
-    /// full fidelity (the clipboard re-fetch) — see [`PageCap`]. `abort` cancels a
+    /// full fidelity (the clipboard re-fetch); see [`PageCap`]. `abort` cancels a
     /// superseded fetch (a flung scrollbar, a closed tab) at the engine.
     async fn fetch_page(
         &self,
@@ -980,14 +980,14 @@ pub trait DatabaseDriver: Send + Sync {
 
     /// One keyset (seek) page of `sql`'s result, ordered by `key`'s column tuple:
     /// the rows strictly after (`descending = false`) or strictly before
-    /// (`descending = true`, returned in reverse order — the caller flips)
+    /// (`descending = true`, returned in reverse order; the caller flips)
     /// `bound`; `None` starts from the result's first/last row. An indexed seek,
-    /// so it costs the same at row 200 or 46,000,000 — unlike `fetch_page`'s
+    /// so it costs the same at row 200 or 46,000,000, unlike `fetch_page`'s
     /// O(offset).
     ///
     /// `descending` is the *scroll* direction; it composes (XOR) with the key's
     /// own [`descending`](KeySpec::descending) sort direction. `bound` carries one
-    /// value per leading key column — the full tuple for a contiguous seek, or
+    /// value per leading key column: the full tuple for a contiguous seek, or
     /// just the lead value for a key-space interpolation jump (a prefix
     /// comparison). Each value is bound as a real parameter, never interpolated.
     async fn fetch_seek(
@@ -1004,7 +1004,7 @@ pub trait DatabaseDriver: Send + Sync {
     /// rows at or after `from` in the key's sort order, skipping `skip` then
     /// taking `limit`. `from = None` starts at the result's first row. The lower
     /// bound is an *indexed* seek, so the `OFFSET skip` only walks within the
-    /// post-seek window — O(skip), not O(offset-from-row-0). Backs exact "go to
+    /// post-seek window: O(skip), not O(offset-from-row-0). Backs exact "go to
     /// row N" jumps and the checkpoint-index build, which both seek to a known
     /// key and then step a bounded number of rows. `from` carries one value per
     /// leading key column, each bound as a real parameter.
@@ -1018,7 +1018,7 @@ pub trait DatabaseDriver: Send + Sync {
         abort: &AbortSignal,
     ) -> Result<ResultPage>;
 
-    /// `MIN`/`MAX` of `key` over `sql`'s result — one indexed probe, backing
+    /// `MIN`/`MAX` of `key` over `sql`'s result: one indexed probe, backing
     /// key-space interpolation for fraction jumps. `None` when the result is
     /// empty or the key isn't an integer (not interpolable). `abort` cancels the
     /// probe out-of-band when the open it belongs to is superseded.
@@ -1035,8 +1035,8 @@ pub trait DatabaseDriver: Send + Sync {
 
     /// Apply a batch of guarded, PK-keyed data edits (Track B6) **atomically** in a
     /// single transaction: render each `op` to dialect SQL with every value **bound**
-    /// (see [`edit_sql`]), run them in order, and assert each touches exactly one row
-    /// — rolling the *whole* batch back and returning [`edit_count_err`] (or the
+    /// (see [`edit_sql`]), run them in order, and assert each touches exactly one row,
+    /// rolling the *whole* batch back and returning [`edit_count_err`] (or the
     /// engine error) the moment any op fails or matches ≠1 row, so a multi-edit
     /// submit is all-or-nothing and a stale/non-unique key can't half-apply. A
     /// read-only driver rejects the writes at the engine (defense in depth behind the
@@ -1044,7 +1044,7 @@ pub trait DatabaseDriver: Send + Sync {
     /// success). An empty batch is a no-op returning 0 without opening a transaction.
     async fn apply_edits(&self, ops: &[EditOp]) -> Result<u64>;
 
-    /// Apply one guarded data edit — the single-row common case, delegating to the
+    /// Apply one guarded data edit: the single-row common case, delegating to the
     /// transactional [`apply_edits`](DatabaseDriver::apply_edits) batch path.
     async fn apply_edit(&self, op: &EditOp) -> Result<u64> {
         self.apply_edits(std::slice::from_ref(op)).await
@@ -1052,7 +1052,7 @@ pub trait DatabaseDriver: Send + Sync {
 
     /// Bulk-insert `rows` into `table` for `columns` (each a target column's name +
     /// best-effort `decl_type`), as multi-row, fully-bound `INSERT … VALUES
-    /// (…),(…),…` inside **one** transaction — the streaming sibling of
+    /// (…),(…),…` inside **one** transaction, the streaming sibling of
     /// [`apply_edits`](DatabaseDriver::apply_edits) for data import / table copy.
     /// Unlike the edit path it makes **no** 1-row assertion (an insert affects
     /// `rows.len()`) and issues one statement per sub-chunk rather than one per row.
@@ -1070,18 +1070,18 @@ pub trait DatabaseDriver: Send + Sync {
         rows: &[Vec<Value>],
     ) -> Result<u64>;
 
-    /// Empty `table` in one transaction — `DELETE FROM <table>` — returning the rows
+    /// Empty `table` in one transaction (`DELETE FROM <table>`), returning the rows
     /// removed. The `TruncateInsert` table-copy mode runs this before streaming the
     /// source in, so the target is refreshed rather than appended to. Identifier is
     /// quoted by the engine's own helper (never interpolated UI text); a read-only
     /// driver rejects it at the engine, like every other write seam. `DELETE` (not
-    /// `TRUNCATE`) is used for cross-engine uniformity and transactional safety —
+    /// `TRUNCATE`) is used for cross-engine uniformity and transactional safety;
     /// MySQL's `TRUNCATE` auto-commits and resets auto-increment, which a refresh
     /// shouldn't silently do.
     async fn clear_table(&self, table: &TableRef) -> Result<u64>;
 
     /// Create `table` with `columns` **if it doesn't already exist**, in this engine's
-    /// dialect — the keystone of "copy into a *new* table" / whole-database migration.
+    /// dialect: the keystone of "copy into a *new* table" / whole-database migration.
     /// Each column's declared type is mapped into this engine via
     /// [`red_core::typemap`] (so a cross-engine create produces faithful DDL, not a
     /// foreign type that fails at execute time), `NOT NULL` and a composite
@@ -1102,11 +1102,11 @@ pub trait DatabaseDriver: Send + Sync {
     fn quote_table(&self, table: &TableRef) -> String;
 
     /// Create a secondary index on `table` over `columns` (optionally `unique`) in this
-    /// engine's dialect — the migration's **deferred index pass**, run after the data
+    /// engine's dialect: the migration's **deferred index pass**, run after the data
     /// loads (shared body: [`create_index_sql`]). Built from the source table's
     /// [`IndexMeta`](red_core::IndexMeta); the primary-key-backing index is filtered out
     /// by the caller. A read-only driver (ClickHouse) rejects it. The migrate job treats
-    /// a failure as non-fatal (logs + continues — an index is decoration, the data is in).
+    /// a failure as non-fatal (logs + continues; an index is decoration, the data is in).
     async fn create_index(
         &self,
         table: &TableRef,
@@ -1116,7 +1116,7 @@ pub trait DatabaseDriver: Send + Sync {
     ) -> Result<u64>;
 
     /// Add a foreign key from `child(columns)` to `parent(ref_columns)` in this engine's
-    /// dialect — the migration's **deferred FK pass**, run after all tables exist + are
+    /// dialect: the migration's **deferred FK pass**, run after all tables exist + are
     /// filled (so dependency order can't block) (shared body: [`add_fk_sql`]).
     /// **SQLite can't `ALTER TABLE ADD CONSTRAINT`**, so its impl returns an error the
     /// migrate job treats as a logged skip; ClickHouse (read-only/OLAP) likewise. The
@@ -1131,20 +1131,20 @@ pub trait DatabaseDriver: Send + Sync {
 
     /// Run the engine's `EXPLAIN` for `sql` and return a normalized [`QueryPlan`]
     /// (Track B4). Plain `explain` (`analyze = false`) never executes the
-    /// statement — it's read-only-safe for any SQL. `analyze = true` runs
+    /// statement; it's read-only-safe for any SQL. `analyze = true` runs
     /// `EXPLAIN ANALYZE`, which *executes* the statement to gather actuals; the
     /// caller gates that to read queries (SQLite has no ANALYZE and ignores the
-    /// flag). Each driver reads its native textual/tabular plan and maps it — no
+    /// flag). Each driver reads its native textual/tabular plan and maps it; no
     /// `FORMAT JSON`, so no JSON parser enters the layer.
     async fn explain(&self, sql: &str, analyze: bool) -> Result<QueryPlan>;
 
-    /// Stream `sql`'s result straight to `path` in `format`, row-by-row — never
+    /// Stream `sql`'s result straight to `path` in `format`, row-by-row, never
     /// materializing the whole result. Returns the number of data rows written.
     ///
     /// `cancel` is checked per row: when it flips true the export bails early,
     /// removes the partial file, and returns [`RedError::Interrupted`]. `progress`
     /// receives the running row count, throttled (every N rows / ~50ms) so the
-    /// channel isn't flooded — the caller maps it to a progress event.
+    /// channel isn't flooded; the caller maps it to a progress event.
     async fn export(
         &self,
         sql: &str,
@@ -1156,8 +1156,8 @@ pub trait DatabaseDriver: Send + Sync {
 }
 
 /// A live, windowed result cursor. Object-safe; the service holds it as
-/// `Box<dyn QueryCursor>`. `next_window` takes `&self` — all mutable cursor state
-/// lives on the driver's blocking thread — so the returned future is
+/// `Box<dyn QueryCursor>`. `next_window` takes `&self` (all mutable cursor state
+/// lives on the driver's blocking thread), so the returned future is
 /// `Send + 'static` and can be raced against incoming commands for cancellation.
 #[async_trait]
 pub trait QueryCursor: Send {
@@ -1175,7 +1175,7 @@ pub trait QueryCursor: Send {
 
 /// Initial capacity to reserve for a `next_window(max)` row buffer.
 ///
-/// `max` is caller-supplied and can be enormous — the cancel-mid-fetch path asks
+/// `max` is caller-supplied and can be enormous; the cancel-mid-fetch path asks
 /// for a billion rows precisely so the fetch is still running when the abort
 /// fires. Reserving `max` up front would try to allocate ~24 GB before a single
 /// row is read and abort the process. Cap the reservation to one display page's
@@ -1204,14 +1204,14 @@ impl CancelToken {
 /// A caller-created abort handle for one in-flight one-shot fetch (`count`,
 /// `fetch_page`, `fetch_seek`, `fetch_seek_skip`, `key_bounds`). The service makes
 /// one per cancellable fetch, keeps a clone, and calls [`abort`](Self::abort) when
-/// that fetch is superseded — a flung scrollbar, a re-sort, a closed tab.
+/// that fetch is superseded: a flung scrollbar, a re-sort, a closed tab.
 ///
 /// Where [`CancelToken`] is produced *by* the driver (the streaming cursor hands
-/// one back), a one-shot `async fn` can't return a handle before it's awaited — so
+/// one back), a one-shot `async fn` can't return a handle before it's awaited, so
 /// this inverts it: the caller owns the handle and the driver [`arm`](Self::arm)s
 /// it with an engine [`CancelToken`] for the fetch's lifetime. The arm is dropped
-/// when the fetch returns ([`ArmGuard`]), so a late `abort` after completion — the
-/// connection already back in a pool and reused — is a harmless no-op.
+/// when the fetch returns ([`ArmGuard`]), so a late `abort` after completion (the
+/// connection already back in a pool and reused) is a harmless no-op.
 ///
 /// A single signal can be armed by several concurrent fetches (the open probe runs
 /// `count` + `fetch_page` + `key_bounds` together under one signal); `abort` fires
@@ -1245,7 +1245,7 @@ impl AbortSignal {
     }
 
     /// Whether [`abort`](Self::abort) has fired. Drivers check this right before the
-    /// engine call so a fetch superseded *before* it starts bails immediately —
+    /// engine call so a fetch superseded *before* it starts bails immediately;
     /// some engines no-op an out-of-band cancel with nothing yet running.
     pub fn is_aborted(&self) -> bool {
         self.0.aborted.load(Ordering::SeqCst)
@@ -1282,7 +1282,7 @@ impl Drop for ArmGuard {
     }
 }
 
-/// Lock a mutex, tolerating poison — the armed-list critical sections can't panic,
+/// Lock a mutex, tolerating poison: the armed-list critical sections can't panic,
 /// but recovering the guard keeps a stray panic elsewhere from wedging cancels.
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -1491,7 +1491,7 @@ mod tests {
 
     #[test]
     fn eq_clause_escapes_values_and_joins_with_and() {
-        // Identifiers quoted by the engine's `quote`; values rendered as literals —
+        // Identifiers quoted by the engine's `quote`; values rendered as literals:
         // integer bare, text single-quoted with the embedded quote doubled. The
         // composite case AND-joins the equalities.
         let pairs = vec![
@@ -1519,7 +1519,7 @@ mod tests {
         // Postgres/SQLite: only the quote is doubled (backslash is literal there).
         assert_eq!(sql_literal(&v, false), r"'\'' OR 1=1 -- '");
         // MySQL/ClickHouse: the backslash is doubled too, so the payload stays inside
-        // the string literal — `'\\'' OR 1=1 -- '` reads back as the literal text.
+        // the string literal; `'\\'' OR 1=1 -- '` reads back as the literal text.
         assert_eq!(sql_literal(&v, true), r"'\\'' OR 1=1 -- '");
         // The whole eq predicate carries the escaping through per-engine.
         let pairs = vec![ColumnValue {
@@ -1547,7 +1547,7 @@ mod tests {
     #[test]
     fn join_wrap_interleaves_joined_column_next_to_its_fk() {
         // One FK expansion: the chosen ref column lands *right after* its FK column
-        // (`tier_id`), not at the end — base columns before and after keep their slots.
+        // (`tier_id`), not at the end; base columns before and after keep their slots.
         // The trailing `;` on the base is stripped before the subquery wrap.
         let base_cols = vec!["id".into(), "tier_id".into(), "name".into()];
         let joins = vec![FkJoin {
@@ -1575,7 +1575,7 @@ mod tests {
     #[test]
     fn join_wrap_chains_hops_depth_first_under_the_anchor() {
         // A two-hop chain (tier → cascade): both joined columns anchor under the base
-        // `tier_id`, depth-first — the deeper `tier_id.cascade_id.name` sorts before
+        // `tier_id`, depth-first: the deeper `tier_id.cascade_id.name` sorts before
         // the shallower `tier_id.name` (segment-wise), so the cascade subtree stays
         // grouped. The second hop's `ON` references the first hop's alias.
         let base_cols = vec!["id".into(), "tier_id".into()];

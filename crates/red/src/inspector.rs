@@ -1,11 +1,11 @@
-//! The cell detail inspector — a focused, right-docked pane that shows the
+//! The cell detail inspector: a focused, right-docked pane that shows the
 //! *whole* value under the grid cursor (Track B1). The grid intentionally
 //! truncates: fat cells arrive as [`Value::Capped`] and even resident whole cells
 //! are bounded by the driver's display cap. The inspector is where you see a long
 //! `TEXT` wrapped, a JSON document pretty-printed, or a `BLOB` as a hex dump.
 //!
 //! It is **non-modal**: the grid keeps focus, so arrowing through cells updates
-//! the pane live. A small resident cell renders straight from the buffer — **no**
+//! the pane live. A small resident cell renders straight from the buffer; **no**
 //! backend work. Only a *capped* or *evicted* cell needs its full value, and that
 //! is fetched **on demand** behind an explicit "Load full value", reusing the
 //! existing full-fidelity `CopyRows` path (`PageCap::Full`); the bytes live only
@@ -26,7 +26,7 @@ use crate::app::{ActiveConn, AppState, EditContext, Phase};
 use crate::result::group_digits;
 
 /// Bytes of a blob rendered as hex before the dump is cut with a "more bytes"
-/// note — the *display* stays bounded even when a "Load full value" pulled a big
+/// note; the *display* stays bounded even when a "Load full value" pulled a big
 /// blob, so the pane never pays to lay out megabytes of hex.
 const HEX_MAX: usize = 4 * 1024;
 
@@ -43,14 +43,14 @@ pub(crate) struct InspectorState {
     /// arrival so a big value isn't re-formatted (or cloned) every frame. Cleared
     /// when the cursor moves to a different cell (see [`AppState::reconcile_inspector`]).
     full: Option<InspectedFull>,
-    /// The in-flight full-fetch, if any — its reply is matched by `id`.
+    /// The in-flight full-fetch, if any; its reply is matched by `id`.
     pending: Option<PendingInspect>,
     /// An open inline edit (Track B5): the value field + the cell it targets. The
-    /// inspector becomes the editor — type a new value and Save. Cleared when the
+    /// inspector becomes the editor: type a new value and Save. Cleared when the
     /// cursor moves off the cell, on Save (the confirm takes over), or on Cancel.
     editing: Option<InspectorEdit>,
     /// A read-only editor mirroring the displayed value body, so the pane's body is
-    /// *selectable* (drag / double-click word / ⌘C a portion) — not just whole-cell
+    /// *selectable* (drag / double-click word / ⌘C a portion), not just whole-cell
     /// Copy. Rebuilt only when [`PreviewKey`] changes (see
     /// [`AppState::reconcile_preview`]); absent while an edit is open.
     preview: Option<PreviewView>,
@@ -74,14 +74,14 @@ struct PreviewKey {
     epoch: u64,
     row: usize,
     col: usize,
-    /// The body's byte length — distinguishes a capped head from the loaded full
+    /// The body's byte length; distinguishes a capped head from the loaded full
     /// value (and a just-patched cell) at the same `(epoch, row, col)`.
     len: usize,
     wrap: bool,
 }
 
 /// An in-progress inline cell edit hosted in the inspector (Track B5). The editor
-/// is a multiline [`CodeEditor`] — not a single-line field — so the value is edited
+/// is a multiline [`CodeEditor`] (not a single-line field), so the value is edited
 /// *as the pane shows it*: a pretty-printed JSON document stays formatted and a long
 /// text keeps its line breaks. It's seeded with `prefill` (the displayed body), and
 /// a Save whose content still equals `prefill` is treated as a no-op (so merely
@@ -115,7 +115,7 @@ struct InspectedFull {
     epoch: u64,
     row: usize,
     col: usize,
-    /// The full value itself, kept so a capped/large cell can be *edited* — its
+    /// The full value itself, kept so a capped/large cell can be *edited*: its
     /// resident grid cell is display-clipped, so the edit must source the original
     /// from here. `view` is the formatted (cached) rendering of this same value.
     value: Value,
@@ -141,11 +141,11 @@ struct ValueView {
 
 /// What the focused cell resolves to right now.
 enum CellState {
-    /// A value ready to show — a small resident cell, or a loaded full value.
+    /// A value ready to show: a small resident cell, or a loaded full value.
     Ready(ValueView),
     /// Resident but display-capped: only a head/length is known until loaded.
     Capped(CappedCell),
-    /// Scrolled out of the resident window — load it to see anything.
+    /// Scrolled out of the resident window; load it to see anything.
     Evicted,
 }
 
@@ -167,7 +167,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// Open the inspector if it isn't already (the double-click-a-cell entry —
+    /// Open the inspector if it isn't already (the double-click-a-cell entry;
     /// double-click should reveal, never toggle-shut).
     pub(crate) fn open_inspector(&mut self, cx: &mut Context<Self>) {
         if self.inspector.is_none() {
@@ -247,7 +247,7 @@ impl AppState {
     /// Build/refresh/drop the read-only preview editor that makes the value body
     /// selectable. Done here (in a `&mut self` per-frame pass) because `render` is
     /// `&self` and can't create entities. Keyed by [`PreviewKey`] so the same value
-    /// keeps its editor — and thus its in-progress selection and scroll — across
+    /// keeps its editor (and thus its in-progress selection and scroll) across
     /// frames; a cursor move or a just-loaded full value rebuilds it. While an edit
     /// is open the editor owns the body, so there's no preview.
     fn reconcile_preview(&mut self, cx: &mut Context<Self>) {
@@ -264,7 +264,7 @@ impl AppState {
             Some(_) if editing => insp.preview = None,
             Some((key, body, wrap)) => {
                 if insp.preview.as_ref().map(|p| &p.key) == Some(&key) {
-                    return; // unchanged — keep the editor and its selection
+                    return; // unchanged; keep the editor and its selection
                 }
                 let editor = cx.new(|cx| {
                     let mut e = CodeEditor::new(cx)
@@ -291,7 +291,7 @@ impl AppState {
 
     /// The body to show in the selectable preview: a loaded full value, or a whole
     /// resident value. `None` for a capped (not-yet-loaded), evicted, or absent
-    /// cell — those render their own non-selectable stand-in with a Load button.
+    /// cell; those render their own non-selectable stand-in with a Load button.
     fn preview_target(&self) -> Option<(PreviewKey, String, bool)> {
         let Phase::Connected(active) = &self.phase else {
             return None;
@@ -299,7 +299,7 @@ impl AppState {
         let grid = active.active_result()?;
         let (row, col) = grid.cursor_cell(self.gutter())?;
         let epoch = grid.epoch;
-        // A loaded full value wins — it was formatted once at load.
+        // A loaded full value wins; it was formatted once at load.
         if let Some(full) = self.inspector.as_ref().and_then(|i| i.full.as_ref()) {
             if full.epoch == epoch && full.row == row && full.col == col {
                 let body = full.view.body.to_string();
@@ -333,7 +333,7 @@ impl AppState {
     }
 
     /// "Load full value": re-fetch the focused cell's row in full (reusing the
-    /// clipboard's `CopyRows` path — `PageCap::Full`) so a capped or evicted cell
+    /// clipboard's `CopyRows` path, `PageCap::Full`) so a capped or evicted cell
     /// can show its whole value. One row, on demand, behind an explicit click.
     pub(crate) fn load_inspector_full(&mut self, cx: &mut Context<Self>) {
         let Some((epoch, row, col)) = self.focused_cell() else {
@@ -352,7 +352,7 @@ impl AppState {
                 col,
             });
         }
-        // A single row at this ordinal, full fidelity — the driver's display cap
+        // A single row at this ordinal, full fidelity; the driver's display cap
         // doesn't apply to `CopyRows`, so the whole cell comes back.
         self.send_active(Command::CopyRows {
             offset: row,
@@ -411,7 +411,7 @@ impl AppState {
         self.active_edit_target()
     }
 
-    /// Whether the inspected cell can be edited — the cheap predicate behind the
+    /// Whether the inspected cell can be edited: the cheap predicate behind the
     /// footer "Edit" button, evaluated every frame. Unlike [`inspector_edit_context`]
     /// it never clones the (possibly large) full value.
     fn inspector_can_edit(&self) -> bool {
@@ -435,7 +435,7 @@ impl AppState {
 
     /// Begin an inline edit of the focused cell in the inspector (Track B5). No-op
     /// when the cell isn't editable (read-only / not edit-enabled connection, not a
-    /// single-table keyed browse, the PK column, or a blob cell — but a *large* text
+    /// single-table keyed browse, the PK column, or a blob cell; but a *large* text
     /// cell loaded in full is now editable; see [`Self::inspector_edit_context`]).
     /// The body turns into a multiline editor
     /// seeded with the value *as it was being shown* (pretty JSON stays pretty), so
@@ -447,8 +447,8 @@ impl AppState {
         if self.inspector.is_none() {
             return;
         }
-        // Seed the editor with the value *as the pane renders it* — a pretty-printed
-        // JSON document, a wrapped text — not the raw one-line `to_string`, so editing
+        // Seed the editor with the value *as the pane renders it* (a pretty-printed
+        // JSON document, a wrapped text), not the raw one-line `to_string`, so editing
         // doesn't first flatten the formatting the user was just reading. A NULL opens
         // empty (an empty save sets NULL back).
         let view = format_value(&ctx.original);
@@ -459,7 +459,7 @@ impl AppState {
         // A multiline surface that inherits the pane's mono typography (set on its
         // container at render time): no line-number gutter and no frame of its own, so
         // it reads as the value body becoming editable in place. Prose soft-wraps;
-        // structured content (JSON) scrolls horizontally to keep its shape — mirroring
+        // structured content (JSON) scrolls horizontally to keep its shape, mirroring
         // how the read-only body lays each out.
         let seed = prefill.clone();
         let wrap = view.wrap;
@@ -472,7 +472,7 @@ impl AppState {
                 .a11y_label("Cell value editor")
                 .with_content(seed)
         });
-        // ⌘↵ (Run) saves and Esc cancels — Enter inserts a newline, so multi-line JSON
+        // ⌘↵ (Run) saves and Esc cancels; Enter inserts a newline, so multi-line JSON
         // is editable. The footer carries the same Save / Cancel as buttons.
         let sub = cx.subscribe(
             &editor,
@@ -510,7 +510,7 @@ impl AppState {
         let Some(edit) = &insp.editing else { return };
         let text = edit.editor.read(cx).content();
         let ctx = edit.ctx.clone();
-        // Unchanged from what was seeded — including the case where the seed was a
+        // Unchanged from what was seeded, including the case where the seed was a
         // *reformatted* (pretty JSON) rendering of the stored value. Close without
         // staging so opening the editor and saving never rewrites a cell with only
         // cosmetic whitespace.
@@ -572,7 +572,7 @@ impl AppState {
         }
 
         // Otherwise read the resident window. Whole cells (under-cap, or the key
-        // column) format straight away — they're bounded, so this is cheap.
+        // column) format straight away; they're bounded, so this is cheap.
         let state = match grid.cell_value(row, col) {
             Some(Value::Capped(c)) => CellState::Capped(c),
             Some(v) => CellState::Ready(format_value(&v)),
@@ -664,12 +664,12 @@ impl AppState {
             );
 
         // While an inline edit is open (Track B5) the body *is* the value editor and
-        // the footer offers Save / Cancel — the inspector becomes the editor. The
+        // the footer offers Save / Cancel; the inspector becomes the editor. The
         // editor inherits the body's mono typography from its container, so the value
         // is edited in the very font/size it was just shown in.
         if let Some(edit) = self.inspector.as_ref().and_then(|i| i.editing.as_ref()) {
             let hint = crate::keymap::localize_hint(
-                "Editing — ⌘↵ to save, Esc to cancel. Enter inserts a line; an empty value sets NULL.",
+                "Editing: ⌘↵ to save, Esc to cancel. Enter inserts a line; an empty value sets NULL.",
             );
             let field = div()
                 .flex_1()
@@ -731,8 +731,8 @@ impl AppState {
                 .into_any_element();
         }
 
-        // Whether the focused cell is editable — drives the footer "Edit" button.
-        // (A large/capped text loaded in full is editable too — see
+        // Whether the focused cell is editable; drives the footer "Edit" button.
+        // (A large/capped text loaded in full is editable too, see
         // `inspector_can_edit`.)
         let editable = self.inspector_can_edit();
 
@@ -755,7 +755,7 @@ impl AppState {
             }
             Some(CellState::Capped(c)) => {
                 let note = if c.blob {
-                    format!("{} bytes — load to view as hex.", group_digits(c.len))
+                    format!("{} bytes. Load to view as hex.", group_digits(c.len))
                 } else {
                     format!(
                         "Showing the first {} bytes of {}.",
@@ -807,7 +807,7 @@ impl AppState {
                     .text_size(s12)
                     .text_color(faint)
                     .font_family(ui_family.clone())
-                    .child("This row scrolled out of view — load it to inspect.")
+                    .child("This row scrolled out of view; load it to inspect.")
                     .into_any_element(),
                 Some(self.load_button(cx)),
             ),
@@ -871,7 +871,7 @@ impl AppState {
             .into_any_element()
     }
 
-    /// The shared "Load full value" button — fetches the focused cell in full.
+    /// The shared "Load full value" button: fetches the focused cell in full.
     fn load_button(&self, cx: &mut Context<Self>) -> AnyElement {
         let pending = self.inspector.as_ref().is_some_and(|i| i.pending.is_some());
         Button::new(
@@ -890,9 +890,9 @@ impl AppState {
     }
 
     /// The Ready body: the read-only preview editor when it's built (so the value is
-    /// selectable — drag, double-click a word, ⌘C a portion), else the plain
+    /// selectable: drag, double-click a word, ⌘C a portion), else the plain
     /// non-selectable body as a fallback (a frame can render before `reconcile_preview`
-    /// has built the editor — in practice it runs first, so this is just a safety net).
+    /// has built the editor; in practice it runs first, so this is just a safety net).
     /// The editor inherits the body's mono typography from this container, exactly as
     /// the inline-edit field does, so read and edit look identical.
     fn inspector_ready_body(
@@ -954,7 +954,7 @@ impl AppState {
 }
 
 /// Format a value for the pane: the body text, a one-line summary, and whether it
-/// should soft-wrap. Pure and small — the RED-domain half of the inspector.
+/// should soft-wrap. Pure and small: the RED-domain half of the inspector.
 fn format_value(value: &Value) -> ValueView {
     match value {
         Value::Null => ValueView {
@@ -992,7 +992,7 @@ fn format_value(value: &Value) -> ValueView {
             summary: format!("{} bytes · blob", group_digits(b.len())),
             wrap: false,
         },
-        // A capped value only reaches here if formatted directly (defensive — the
+        // A capped value only reaches here if formatted directly (defensive; the
         // pane normally branches on `CellState::Capped` before formatting).
         Value::Capped(c) if c.blob => ValueView {
             body: format!("<{} bytes>", c.len).into(),

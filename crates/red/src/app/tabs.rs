@@ -87,7 +87,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// Move tab `from` into split half `half` and focus that half — the drop target
+    /// Move tab `from` into split half `half` and focus that half: the drop target
     /// for dragging a tab across the divider onto a half's body (no reorder). Lands
     /// the tab in `half`; `normalize_panes` collapses the split if it emptied the
     /// source half. No-op when not split or `from` is stale.
@@ -122,7 +122,7 @@ impl AppState {
     /// Eagerly describe every table once the skeleton lands, so column and
     /// `table.` completion covers the whole schema without the user expanding
     /// each node first. Details arrive as `TableDescribed` events that refresh the
-    /// completion index. Capped so a pathological schema can't flood the backend —
+    /// completion index. Capped so a pathological schema can't flood the backend;
     /// past the cap, tables still load lazily on tree expansion.
     pub(crate) fn prefetch_table_details(&mut self) {
         const MAX_PREFETCH: usize = 200;
@@ -229,7 +229,7 @@ impl AppState {
         false
     }
 
-    /// Close the focused tab (the ⌘W binding) — routes through the same
+    /// Close the focused tab (the ⌘W binding); routes through the same
     /// pristine-or-confirm path as the tab's × button. No-op with no open tab.
     pub(crate) fn close_active_tab(&mut self, cx: &mut Context<Self>) {
         let index = match &self.phase {
@@ -280,7 +280,7 @@ impl AppState {
         }
     }
 
-    /// Confirmation accepted — close the tab that was awaiting it.
+    /// Confirmation accepted: close the tab that was awaiting it.
     pub(crate) fn confirm_close(&mut self, cx: &mut Context<Self>) {
         if let Some(index) = self.confirm_close_tab.take() {
             self.close_tab(index, cx);
@@ -297,7 +297,7 @@ impl AppState {
 
     /// Drop tab `index`, freeing its backend result. Closing the *last* tab is
     /// allowed: the strip goes empty and the shell shows a placeholder pane (the
-    /// connection stays open — the strip's ＋ opens a fresh query).
+    /// connection stays open, and the strip's ＋ opens a fresh query).
     fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         self.confirm_close_tab = None;
         let free_epoch = match &mut self.phase {

@@ -12,26 +12,26 @@
 //! which has no equivalent, on a `.sha256` sidecar published with the release.
 //!
 //! Network and bundle operations shell out to the platform tools the release
-//! pipeline already relies on — `curl`, `hdiutil`, `rsync` — so the backend takes
+//! pipeline already relies on (`curl`, `hdiutil`, `rsync`), so the backend takes
 //! on no new HTTP dependency (just `serde_json` to read one API response). The
 //! task runs on the `red-service` Tokio thread but off the dispatch loop, and all
 //! blocking work is wrapped in `spawn_blocking`, so the UI never stalls.
 //!
 //! Integrity rests on notarization, not a checksum: the release pipeline staples
-//! the dmg, so Gatekeeper validates it on mount — a tampered or truncated
+//! the dmg, so Gatekeeper validates it on mount: a tampered or truncated
 //! download fails to attach. See the "checksum vs. notarization" decision in the
 //! plan.
 //!
 //! Authenticity is enforced on top of that integrity story: before the swap the
 //! mounted bundle is run through `codesign --verify --deep --strict` and
 //! `spctl --assess --type execute`, and its Team ID is required to match the
-//! *running* (already-Gatekeeper-validated) bundle's — so a compromised release
+//! *running* (already-Gatekeeper-validated) bundle's, so a compromised release
 //! serving some *other* notarized app can't be installed over Red. The download
 //! host is pinned to GitHub's asset hosts, and `curl` carries connect/total
 //! timeouts so a black-hole host can't tie up a blocking thread.
 //!
 //! The swap is staged, not in place: the new bundle is rsynced to a sibling
-//! `Red.app.new`, then swapped in with atomic renames (with rollback) — a failure
+//! `Red.app.new`, then swapped in with atomic renames (with rollback); a failure
 //! mid-copy never leaves a half-written, unrunnable `Red.app` behind.
 
 use std::path::Path;
@@ -48,7 +48,7 @@ type Events = futures::channel::mpsc::UnboundedSender<(Option<SessionId>, Event)
 
 /// Messages the dispatch loop forwards to the updater task.
 pub(crate) enum UpdateControl {
-    /// (Re)configure cadence + identity — sent at launch and on each settings
+    /// (Re)configure cadence + identity, sent at launch and on each settings
     /// reload. Toggling `enabled` or changing the interval re-arms the poll (and
     /// triggers an immediate check); a no-op config is ignored.
     Configure(UpdateConfig),
@@ -81,7 +81,7 @@ pub(crate) async fn run(events: Events, mut control: UnboundedReceiver<UpdateCon
 
         tokio::select! {
             msg = control.recv() => match msg {
-                None => break, // dispatch dropped the sender — service shutting down
+                None => break, // dispatch dropped the sender (service shutting down)
                 Some(UpdateControl::Configure(cfg)) => {
                     let cadence_changed = config
                         .as_ref()
@@ -116,8 +116,8 @@ pub(crate) async fn run(events: Events, mut control: UnboundedReceiver<UpdateCon
 }
 
 /// One full check → (maybe) download → swap cycle, emitting `UpdateState` at each
-/// transition. Blocking steps run on the blocking pool so the task — and the
-/// dispatch loop sharing this thread — stay responsive.
+/// transition. Blocking steps run on the blocking pool so the task, and the
+/// dispatch loop sharing this thread, stay responsive.
 async fn check(events: &Events, cfg: &UpdateConfig) {
     emit(events, UpdateState::Checking);
 
@@ -199,7 +199,7 @@ async fn check(events: &Events, cfg: &UpdateConfig) {
 
 /// The release-asset filename suffix this platform self-installs from: the macOS
 /// `.dmg` or the Linux `.AppImage`. On platforms with no in-place updater
-/// (Windows) `installed_app_root()` returns `None` first, so this is never used —
+/// (Windows) `installed_app_root()` returns `None` first, so this is never used;
 /// it just needs a value so the shared `fetch_latest_release` compiles.
 #[cfg(target_os = "macos")]
 const ASSET_SUFFIX: &str = ".dmg";
@@ -246,8 +246,8 @@ fn fetch_latest_release(repo: &str) -> Result<Release, String> {
         "User-Agent: red-updater",
         &url,
     ]);
-    // GUI-subsystem Windows builds would flash a console for each child process —
-    // including these background checks — so spawn curl headless.
+    // GUI-subsystem Windows builds would flash a console for each child process
+    // (including these background checks), so spawn curl headless.
     #[cfg(target_os = "windows")]
     no_window(&mut cmd);
     let out = cmd.output().map_err(|e| format!("launching curl: {e}"))?;
@@ -267,7 +267,7 @@ fn fetch_latest_release(repo: &str) -> Result<Release, String> {
     let html_url = json["html_url"].as_str().unwrap_or_default().to_string();
 
     // Pick this platform's self-install asset by filename suffix, plus its optional
-    // `.sha256` sidecar. Only accept a URL pointing at a GitHub asset host — the
+    // `.sha256` sidecar. Only accept a URL pointing at a GitHub asset host: the
     // bytes are fed straight to `curl`, so a release that named some other host (a
     // compromised API response) is treated as "no installable asset" and the UI
     // falls back to the manual-download link.
@@ -335,9 +335,9 @@ fn is_allowed_download_url(url: &str) -> bool {
 }
 
 /// `true` when `latest` is a strictly higher semver than `current`. A tag that
-/// doesn't parse is treated as not-newer — we never downgrade or sidegrade on a
+/// doesn't parse is treated as not-newer; we never downgrade or sidegrade on a
 /// tag we can't compare. Prerelease precedence follows semver: a release outranks
-/// its own prerelease (so `v0.2.0` *is* newer than `v0.2.0-rc1` — a user on an rc
+/// its own prerelease (so `v0.2.0` *is* newer than `v0.2.0-rc1`; a user on an rc
 /// is offered the final), and two prereleases of the same core compare by their
 /// identifier so `-rc2` > `-rc1`.
 fn is_newer(latest: &str, current: &str) -> bool {
@@ -354,7 +354,7 @@ type Semver = (u64, u64, u64, Option<String>);
 /// dropped (it has no precedence); the prerelease identifier is retained so
 /// release-vs-prerelease ordering is correct. Missing patch defaults to 0.
 fn parse_semver(tag: &str) -> Option<Semver> {
-    // Build metadata (`+…`) never affects precedence — strip it first.
+    // Build metadata (`+…`) never affects precedence, so strip it first.
     let body = tag.trim().trim_start_matches('v');
     let body = body.split('+').next().unwrap_or(body);
     let (core, pre) = match body.split_once('-') {
@@ -389,7 +389,7 @@ fn semver_cmp(l: &Semver, r: &Semver) -> std::cmp::Ordering {
 /// executable must live in `…/Red.app/Contents/MacOS/Red` under a writable
 /// `/Applications`. Anything else (a `cargo run` dev build, a Homebrew/read-only
 /// install) returns `None`, which the caller surfaces as `Unsupported` with a
-/// manual-download link — matching the plan's "don't fight the package manager".
+/// manual-download link, matching the plan's "don't fight the package manager".
 #[cfg(target_os = "macos")]
 fn installed_app_root() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
@@ -468,8 +468,8 @@ fn download_and_swap(
     }
 
     // A private, hard-to-pre-create temp dir: `create_dir` (not `_all`) fails if
-    // the path already exists — defeating a symlink planted at a predictable name
-    // — and a nanosecond-stamped name keeps two updates (or an attacker's guess)
+    // the path already exists (defeating a symlink planted at a predictable name),
+    // and a nanosecond-stamped name keeps two updates (or an attacker's guess)
     // from colliding. 0700 so only we can read the bytes mid-download.
     let tmp = std::env::temp_dir().join(format!(
         "red-update-{}-{}",
@@ -541,7 +541,7 @@ fn download_and_swap(
 /// Verify the mounted bundle is a genuine, Gatekeeper-acceptable Red build signed
 /// by the same Team ID as the *running* app. Three independent checks: a strict
 /// signature verification, a Gatekeeper assessment (notarization), and a Team ID
-/// match — so a compromised release serving a different (but notarized) app can't
+/// match, so a compromised release serving a different (but notarized) app can't
 /// be installed over Red.
 #[cfg(target_os = "macos")]
 fn verify_authentic(mounted_app: &Path, running_app: &Path) -> Result<(), String> {
@@ -552,10 +552,10 @@ fn verify_authentic(mounted_app: &Path, running_app: &Path) -> Result<(), String
         .map_err(|e| format!("downloaded bundle is not notarized/accepted: {e}"))?;
 
     let theirs = team_identifier(mounted_app)
-        .ok_or("downloaded bundle has no Team ID — refusing to install")?;
+        .ok_or("downloaded bundle has no Team ID; refusing to install")?;
     // The running app passed Gatekeeper at launch; if we can read its Team ID,
     // require a match. If we can't (an unsigned dev build, or a codesign-output
-    // change), the signature + spctl checks above still stand on their own — but
+    // change), the signature + spctl checks above still stand on their own, but
     // log it, since it's the anti-substitution control silently dropping out.
     match team_identifier(running_app) {
         Some(ours) if theirs != ours => {
@@ -589,7 +589,7 @@ fn team_identifier(app: &Path) -> Option<String> {
 
 /// Replace `app_root` with `staged` (a mounted `Red.app`) without ever leaving a
 /// half-written bundle on disk: rsync into a sibling `Red.app.new`, then swap it in
-/// with atomic renames — the running process keeps its already-mapped pages, so a
+/// with atomic renames; the running process keeps its already-mapped pages, so a
 /// live swap is safe. On a failed final rename the previous bundle is restored.
 #[cfg(target_os = "macos")]
 fn staged_swap(staged: &Path, app_root: &Path) -> Result<(), String> {
@@ -628,7 +628,7 @@ fn staged_swap(staged: &Path, app_root: &Path) -> Result<(), String> {
 
 /// A short, hard-to-guess suffix for the temp dir name, derived from the wall
 /// clock's nanoseconds. Not a security boundary on its own (the 0700 dir +
-/// `create_dir`-fails-if-exists are) — just makes the path unpredictable.
+/// `create_dir`-fails-if-exists are); it just makes the path unpredictable.
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn unique_suffix() -> u128 {
     std::time::SystemTime::now()
@@ -639,7 +639,7 @@ fn unique_suffix() -> u128 {
 
 /// Linux AppImage self-update: download the new `.AppImage` beside the running one,
 /// verify it against the release's `.sha256` sidecar (Linux builds aren't
-/// OS-notarized, so integrity rests on that checksum — fetched over TLS from a
+/// OS-notarized, so integrity rests on that checksum, fetched over TLS from a
 /// pinned GitHub host), mark it executable, then atomically rename it over the
 /// running `$APPIMAGE`. Replacing an open file is safe on Linux: the live process
 /// keeps its mapped inode and the next launch picks up the new file. Without a
@@ -655,7 +655,7 @@ fn download_and_swap(
         return Err("refusing to download from a non-GitHub host".into());
     }
     let checksum_url =
-        checksum_url.ok_or("release has no .sha256 sidecar — refusing to self-update")?;
+        checksum_url.ok_or("release has no .sha256 sidecar; refusing to self-update")?;
     if !is_allowed_download_url(checksum_url) {
         return Err("refusing to fetch checksum from a non-GitHub host".into());
     }
@@ -799,7 +799,7 @@ fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// Windows: spawn helper processes without flashing a console window — the release
+/// Windows: spawn helper processes without flashing a console window: the release
 /// build is a GUI-subsystem app, so a child console would pop up on every check.
 #[cfg(target_os = "windows")]
 fn no_window(cmd: &mut std::process::Command) -> &mut std::process::Command {
@@ -817,7 +817,7 @@ fn parse_sha256_hex(s: &str) -> Option<String> {
 }
 
 /// Windows portable self-update: download the new `Red.exe` beside the running one,
-/// verify it against the release's `.sha256` sidecar (no Authenticode check yet —
+/// verify it against the release's `.sha256` sidecar (no Authenticode check yet;
 /// integrity rests on the checksum, fetched over TLS from a pinned GitHub host),
 /// then replace-on-restart. A running `.exe` can't be deleted, but it *can* be
 /// renamed: move the live exe to `Red.exe.old`, move the new one into place
@@ -833,7 +833,7 @@ fn download_and_swap(
         return Err("refusing to download from a non-GitHub host".into());
     }
     let checksum_url =
-        checksum_url.ok_or("release has no .sha256 sidecar — refusing to self-update")?;
+        checksum_url.ok_or("release has no .sha256 sidecar; refusing to self-update")?;
     if !is_allowed_download_url(checksum_url) {
         return Err("refusing to fetch checksum from a non-GitHub host".into());
     }

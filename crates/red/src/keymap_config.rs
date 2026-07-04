@@ -1,9 +1,9 @@
-//! On-disk keymap overrides — the user's `keymap.toml`.
+//! On-disk keymap overrides: the user's `keymap.toml`.
 //!
 //! Keybindings ship as code-defined defaults (see [`crate::keymap`]); this module
 //! is the seam that lets a user *override* them from a hand-edited file beside
 //! `settings.toml`. The file is a list of context-scoped blocks, each mapping a
-//! keystroke to an action name — Zed's keymap shape, in TOML:
+//! keystroke to an action name (Zed's keymap shape, in TOML):
 //!
 //! ```toml
 //! [[keymap]]
@@ -12,7 +12,7 @@
 //! ```
 //!
 //! Reads **never** fail: a missing file means "no overrides", and a malformed file
-//! degrades to no overrides plus a warning — a bad keymap must never strip the
+//! degrades to no overrides plus a warning; a bad keymap must never strip the
 //! defaults or block launch. Parsing here is only TOML-shape validation; whether
 //! each keystroke and action name is *valid* is decided when the blocks are turned
 //! into bindings in [`crate::keymap::apply`], which collects its own warnings.
@@ -88,7 +88,7 @@ impl KeymapStore {
             Err(e) => KeymapLoadReport {
                 blocks: Vec::new(),
                 warnings: vec![format!(
-                    "keymap.toml isn't valid TOML ({e}) — keeping the default keybindings"
+                    "keymap.toml isn't valid TOML ({e}); keeping the default keybindings"
                 )],
             },
         }
@@ -108,7 +108,7 @@ impl KeymapStore {
         toml::to_string_pretty(&file).context("serializing the keymap")
     }
 
-    /// Write override blocks atomically — a sibling temp file, flushed, then
+    /// Write override blocks atomically: a sibling temp file, flushed, then
     /// renamed over `keymap.toml` so a crash can't leave a partial file. Mirrors
     /// [`crate::settings::FileSettingsStore::save`].
     pub fn save(&self, blocks: &[KeymapBlock]) -> Result<()> {

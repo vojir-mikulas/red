@@ -1,12 +1,12 @@
 //! The assistant's backend half: the agentic loop and the read-only tool catalog
-//! it stands on. Mirrors the export/updater pattern — a turn runs as a spawned
+//! it stands on. Mirrors the export/updater pattern: a turn runs as a spawned
 //! task off the dispatch loop, streams `AiDelta` events as tokens arrive, and
 //! drives the model → tool → model loop itself (the plain Messages API tool-use
 //! loop, on the service thread).
 //!
 //! Every tool is backed by a `DatabaseDriver` seam that already exists and
 //! inherits its guard: `list_schema`/`describe_table`/`explain` are always safe,
-//! and `run_select` is row-capped and rejects non-`SELECT` SQL — the model gets
+//! and `run_select` is row-capped and rejects non-`SELECT` SQL; the model gets
 //! the same windowed, never-materialized reads a human does, and (in M1) cannot
 //! mutate anything.
 
@@ -29,7 +29,7 @@ use crate::{Event, SessionId};
 
 /// A small, UI-agnostic announcer the `generate_report` tool uses to hand a
 /// freshly-written report file to the UI to open in the browser. The tool stays
-/// UI-free — it just announces a path; the caller turns it into an `AiReportReady`
+/// UI-free: it just announces a path; the caller turns it into an `AiReportReady`
 /// event. Both backends construct one from the `events`/`session`/`conversation_id`
 /// they hold; a `disabled()` sink (no channel) drops announcements (tests).
 #[derive(Clone)]
@@ -63,7 +63,7 @@ impl ReportSink {
         }
     }
 
-    /// A no-op sink — drops announcements. For tests and any path with no UI.
+    /// A no-op sink that drops announcements. For tests and any path with no UI.
     #[cfg(test)]
     pub(crate) fn disabled() -> Self {
         Self {
@@ -83,7 +83,7 @@ impl ReportSink {
     /// The directory a finished report should be written to: the user's configured
     /// folder when set and usable (created on demand), else the system temp dir. A
     /// configured folder that can't be created falls back to temp rather than failing
-    /// the report — the user still gets their report, just not where they asked.
+    /// the report; the user still gets their report, just not where they asked.
     fn output_dir(&self) -> PathBuf {
         if let Some(dir) = &self.report_dir {
             match std::fs::create_dir_all(dir) {
@@ -145,12 +145,12 @@ pub(crate) struct AiState {
     tool_calls: HashMap<u64, usize>,
     /// Write-tool approval prompts (Feature B) awaiting the user's Allow/Deny, keyed
     /// by request id. The turn task parks a decision sink here; `AiPermission` takes
-    /// it back out and fires it — the API-key analogue of the ACP path's
+    /// it back out and fires it, the API-key analogue of the ACP path's
     /// `AcpManager.pending`.
     pending_perms: HashMap<u64, oneshot::Sender<bool>>,
     /// Monotonic counter for the request ids handed out by [`Self::park_permission`].
     /// Handed-out ids are offset by [`AI_REQUEST_BASE`] so they never collide with
-    /// the ACP manager's (which counts up from 0) — `AiPermission` can then resolve
+    /// the ACP manager's (which counts up from 0); `AiPermission` can then resolve
     /// both sides unconditionally.
     next_request: u64,
 }
@@ -159,13 +159,13 @@ pub(crate) struct AiState {
 /// ACP manager's id space so a single `AiPermission` resolves exactly one prompt.
 const AI_REQUEST_BASE: u64 = 1 << 48;
 
-/// Cap on outstanding (un-answered) write-approval prompts on the API-key path —
+/// Cap on outstanding (un-answered) write-approval prompts on the API-key path;
 /// past it, deny rather than grow the map. Mirrors the ACP manager's cap.
 const MAX_PENDING_PERMS: usize = 32;
 
 /// Cap on the report payload a `generate_report` call may embed (body HTML plus the
 /// serialized charts/data/filters). The model assembles `data` from already-capped
-/// query results, but nothing else bounds what it can echo — and the renderer
+/// query results, but nothing else bounds what it can echo, and the renderer
 /// builds one DOM node per row with no virtualization, so an oversized payload makes
 /// a multi-MB document that's slow (or hostile) to open in the browser. Past this we
 /// refuse and tell the model to narrow the report rather than write the file.
@@ -191,7 +191,7 @@ impl AiState {
 
     /// Answer a parked write-approval prompt (the panel's Allow/Deny). A stale id
     /// (already resolved, or owned by the ACP path) is a no-op. Also used to forget a
-    /// prompt abandoned on cancel (`allow` is irrelevant then — the receiver is gone).
+    /// prompt abandoned on cancel (`allow` is irrelevant then; the receiver is gone).
     pub(crate) fn resolve_permission(&mut self, request_id: u64, allow: bool) {
         if let Some(decide) = self.pending_perms.remove(&request_id) {
             let _ = decide.send(allow);
@@ -205,8 +205,8 @@ impl AiState {
         }
     }
 
-    /// Drop all per-conversation state — history, cancel token, cumulative tool tally
-    /// — when the UI closes/deletes the conversation, so these maps stay bounded by
+    /// Drop all per-conversation state (history, cancel token, cumulative tool tally)
+    /// when the UI closes/deletes the conversation, so these maps stay bounded by
     /// what's open rather than every conversation ever touched this session. Cancels
     /// any in-flight turn first so its task winds down. (A turn still racing to its
     /// final history write can re-insert one entry; that's bounded, unlike the prior
@@ -347,7 +347,7 @@ pub(crate) async fn run_turn(
             };
             // Charge the conversation's cumulative tool-call budget (M-S7). When it
             // is exhausted, hand the model an error result instead of running the
-            // tool — it can wrap up its answer, but it can't keep looping.
+            // tool: it can wrap up its answer, but it can't keep looping.
             if !lock(&state).charge_tool_call(conversation_id, policy.limits.max_tool_calls) {
                 results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
@@ -385,7 +385,7 @@ pub(crate) async fn run_turn(
                     if !allowed {
                         results.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
-                            content: "the user denied this write — do not retry it; explain it or \
+                            content: "the user denied this write. Do not retry it; explain it or \
                                 propose an alternative"
                                 .into(),
                             is_error: true,
@@ -423,7 +423,7 @@ pub(crate) async fn run_turn(
         }
 
         if results.is_empty() {
-            // Model claimed tool_use but emitted no tool block — bail rather than spin.
+            // Model claimed tool_use but emitted no tool block; bail rather than spin.
             break;
         }
         messages.push(Message {
@@ -459,7 +459,7 @@ pub(crate) async fn run_turn(
     }
 }
 
-/// Surface a write-approval prompt and block this turn until the user answers it —
+/// Surface a write-approval prompt and block this turn until the user answers it,
 /// the API-key path's analogue of the ACP permission flow (Feature B). Parks a
 /// decision sink in [`AiState`], emits an `AiPermissionRequest` carrying the exact
 /// SQL, then awaits the answer while polling the turn's cancel token (a cancelled
@@ -505,7 +505,7 @@ async fn await_write_approval(
 /// The read-only tool catalog, filtered to the policy's access tier (M-S7). Each
 /// tool is backed by a `DatabaseDriver` method and auto-runs; none can mutate.
 /// Filtering happens *here*, at construction, so a tool above the tier is never
-/// offered — the model can't call what isn't in the catalog. Shared with the MCP
+/// offered; the model can't call what isn't in the catalog. Shared with the MCP
 /// server, so the API-key and subscription/ACP paths expose the identical set.
 pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
     let max_rows = policy.limits.max_rows;
@@ -538,7 +538,7 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             description: format!(
                 "Run a read-only SELECT (or WITH ... SELECT) query and return up to {max_rows} \
                 rows. Non-SELECT statements are rejected. Results are row- and cell-capped and \
-                subject to a statement timeout — use LIMIT and targeted columns. This is the only \
+                subject to a statement timeout; use LIMIT and targeted columns. This is the only \
                 way to read actual data."
             ),
             input_schema: json!({
@@ -572,24 +572,24 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             name: "generate_report".into(),
             description: "Write a custom HTML report for the user and open it in their browser. \
                 YOU author the report: first read the data with run_select, then call this with \
-                `html` set to the report's body — headings, prose/summary, one or more <table>s, \
+                `html` set to the report's body: headings, prose/summary, one or more <table>s, \
                 even an inline <svg> chart. Use semantic HTML and inline `style=\"…\"` for any \
                 styling; a base stylesheet (light/dark) is already applied. Scripts and remote/\
                 external resources (other domains, <script>, remote <img>/CSS) are stripped or \
                 blocked for safety, so keep everything self-contained (data URIs for images). \
-                For INTERACTIVE charts (hover tooltips, legends), pass `charts` — an array of \
-                Chart.js v4 config objects — and reference each one from the body with an empty \
+                For INTERACTIVE charts (hover tooltips, legends), pass `charts` (an array of \
+                Chart.js v4 config objects) and reference each one from the body with an empty \
                 <div data-red-chart=\"INDEX\"></div> placeholder (INDEX is the chart's position \
                 in the array). The charts are rendered by a trusted built-in Chart.js; you supply \
-                DATA only (no JavaScript/function callbacks — they are ignored). \
-                For INTERACTIVE TABLES the user can search/sort/filter, pass `data` — named \
-                datasets of {columns, rows} — and drop a <div data-red-table=\"NAME\"></div> \
+                DATA only (no JavaScript/function callbacks; they are ignored). \
+                For INTERACTIVE TABLES the user can search/sort/filter, pass `data` (named \
+                datasets of {columns, rows}) and drop a <div data-red-table=\"NAME\"></div> \
                 placeholder; the user gets a live filter box, click-to-sort headers, and per-column \
-                filters. A chart can BIND to a dataset instead of carrying inline data — give it \
-                {\"dataset\":\"NAME\",\"type\":\"bar\",\"x\":\"colName\",\"y\":[\"colA\"]} — and it \
+                filters. A chart can BIND to a dataset instead of carrying inline data: give it \
+                {\"dataset\":\"NAME\",\"type\":\"bar\",\"x\":\"colName\",\"y\":[\"colA\"]}, and it \
                 re-draws automatically when the user filters that dataset's table. \
                 For DASHBOARD-style controls (like Grafana variables) that drive EVERY table and \
-                bound chart at once, pass `filters` — e.g. a multi-select to show only chosen \
+                bound chart at once, pass `filters`, e.g. a multi-select to show only chosen \
                 regions: {\"column\":\"Region\",\"type\":\"multiselect\"}. They render as a control \
                 bar at the top of the report. Prefer this (data + bound charts + a table + \
                 filters) when the user wants to explore/slice the data; prefer inline-data charts \
@@ -599,11 +599,11 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "html": { "type": "string", "description": "The report BODY as self-contained HTML (no <html>/<head>/<body> wrapper — that's added). Reference charts with <div data-red-chart=\"INDEX\"></div> and interactive tables with <div data-red-table=\"NAME\"></div> placeholders." },
+                    "html": { "type": "string", "description": "The report BODY as self-contained HTML (no <html>/<head>/<body> wrapper; that's added). Reference charts with <div data-red-chart=\"INDEX\"></div> and interactive tables with <div data-red-table=\"NAME\"></div> placeholders." },
                     "title": { "type": "string", "description": "Report title (browser tab + heading)." },
                     "charts": {
                         "type": "array",
-                        "description": "Optional interactive charts. Each item is EITHER a full Chart.js v4 config with inline data, e.g. {\"type\":\"bar\",\"data\":{\"labels\":[…],\"datasets\":[{\"label\":\"Revenue\",\"data\":[…]}]},\"options\":{…}}, OR a dataset binding {\"dataset\":\"NAME\",\"type\":\"bar\",\"x\":\"colName\",\"y\":[\"col1\",\"col2\"],\"aggregate\":\"sum\",\"options\":{…}} that derives its data from a named `data` dataset and follows that table's filters. type is one of bar, line, pie, doughnut, radar, polarArea, scatter, bubble. aggregate (sum/avg/min/max/count/none, default none) groups rows sharing an x value. Data only — no functions/callbacks. Place a <div data-red-chart=\"INDEX\"></div> in the body for each.",
+                        "description": "Optional interactive charts. Each item is EITHER a full Chart.js v4 config with inline data, e.g. {\"type\":\"bar\",\"data\":{\"labels\":[…],\"datasets\":[{\"label\":\"Revenue\",\"data\":[…]}]},\"options\":{…}}, OR a dataset binding {\"dataset\":\"NAME\",\"type\":\"bar\",\"x\":\"colName\",\"y\":[\"col1\",\"col2\"],\"aggregate\":\"sum\",\"options\":{…}} that derives its data from a named `data` dataset and follows that table's filters. type is one of bar, line, pie, doughnut, radar, polarArea, scatter, bubble. aggregate (sum/avg/min/max/count/none, default none) groups rows sharing an x value. Data only; no functions/callbacks. Place a <div data-red-chart=\"INDEX\"></div> in the body for each.",
                         "items": { "type": "object" },
                     },
                     "data": {
@@ -613,7 +613,7 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
                     },
                     "filters": {
                         "type": "array",
-                        "description": "Optional report-wide filter controls (Grafana-style variables) that filter EVERY table and bound chart. Each is {\"column\":\"Region\",\"type\":\"multiselect\",\"label\":\"Region\",\"dataset\":\"sales\",\"default\":[…]}. type: multiselect (checkbox dropdown — pick which values to show; this is the 'show only selected regions' control), select (single value), range (numeric min/max), or search (substring). column must exist in the dataset(s); omit `dataset` to apply to all datasets that have that column. `default` pre-selects values (multiselect/select). They appear in a bar at the top; no body placeholder needed (optionally place <div data-red-filters></div> to position it).",
+                        "description": "Optional report-wide filter controls (Grafana-style variables) that filter EVERY table and bound chart. Each is {\"column\":\"Region\",\"type\":\"multiselect\",\"label\":\"Region\",\"dataset\":\"sales\",\"default\":[…]}. type: multiselect (checkbox dropdown: pick which values to show; this is the 'show only selected regions' control), select (single value), range (numeric min/max), or search (substring). column must exist in the dataset(s); omit `dataset` to apply to all datasets that have that column. `default` pre-selects values (multiselect/select). They appear in a bar at the top; no body placeholder needed (optionally place <div data-red-filters></div> to position it).",
                         "items": { "type": "object" },
                     },
                 },
@@ -626,7 +626,7 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             description: "Open a SQL query in a new editor tab in the user's workspace so they have \
                 it in the grid. A read-only SELECT runs automatically; anything else is just loaded \
                 for the user to run themselves. Use this to hand the user a query to explore or \
-                build on — it does NOT return rows to you (use run_select for that)."
+                build on; it does NOT return rows to you (use run_select for that)."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -640,10 +640,10 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
         ToolDef {
             name: "propose_write".into(),
             description: "Execute a SINGLE data-modifying statement: INSERT, UPDATE, or DELETE. \
-                EVERY call requires explicit per-statement approval — the user sees the exact SQL \
+                EVERY call requires explicit per-statement approval: the user sees the exact SQL \
                 and must Allow it before it runs; assume it may be denied. UPDATE and DELETE MUST \
                 include a WHERE clause. DDL (DROP/TRUNCATE/ALTER/CREATE) and any multi-statement \
-                input are rejected — tell the user to run those by hand. Use this only when the \
+                input are rejected; tell the user to run those by hand. Use this only when the \
                 user has asked you to change data; otherwise read with run_select."
                 .into(),
             input_schema: json!({
@@ -671,7 +671,7 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
 /// subscription paths run identical, guarded tools.
 ///
 /// Two layers of guard apply here, both server-side so neither backend can slip
-/// past them: the tier is re-checked (defense in depth — the catalog already
+/// past them: the tier is re-checked (defense in depth; the catalog already
 /// withholds out-of-tier tools, but a misbehaving agent could still *name* one),
 /// and the [`AiLimits`](red_core::AiLimits) clamp rows, time-box the query, and
 /// cap the result bytes handed back to the model.
@@ -716,8 +716,8 @@ pub(crate) async fn run_tool(
                     false,
                 );
             }
-            // Clamp the requested LIMIT to the hard row cap — the model browses, it
-            // doesn't bulk-export — and remember whether we clamped so the result
+            // Clamp the requested LIMIT to the hard row cap (the model browses, it
+            // doesn't bulk-export) and remember whether we clamped so the result
             // can tell the model it's partial.
             let max_rows = limits.max_rows.max(1);
             let requested = input
@@ -738,14 +738,14 @@ pub(crate) async fn run_tool(
                     let mut out = format_page(&page);
                     if truncated {
                         out.push_str(&format!(
-                            "\n(truncated to {limit} rows — the result may have more; add LIMIT or \
+                            "\n(truncated to {limit} rows: the result may have more; add LIMIT or \
                             a WHERE clause to narrow it)"
                         ));
                     }
                     (out, true)
                 }
                 Err(RedError::Timeout) => (
-                    "error: the query exceeded the agent's statement timeout — it was \
+                    "error: the query exceeded the agent's statement timeout, so it was \
                     cancelled. Narrow it (add WHERE/LIMIT) or inspect the plan with explain."
                         .into(),
                     false,
@@ -761,7 +761,7 @@ pub(crate) async fn run_tool(
             // Bound the wait like run_select. `explain(analyze=false)` only *plans*
             // (it never executes the statement), and the trait gives it no abort
             // seam, so on timeout we hand the model a clean error while the engine's
-            // plan call winds down on its own — it's plan-only, so it can't run away
+            // plan call winds down on its own; it's plan-only, so it can't run away
             // with data, only take a moment on a pathological statement.
             let explain = driver.explain(sql, false);
             let result = match limits.statement_timeout_ms {
@@ -773,7 +773,7 @@ pub(crate) async fn run_tool(
             match result {
                 Ok(plan) => (format_plan(&plan), true),
                 Err(RedError::Timeout) => (
-                    "error: the EXPLAIN exceeded the agent's statement timeout — \
+                    "error: the EXPLAIN exceeded the agent's statement timeout; \
                      simplify the statement."
                         .into(),
                     false,
@@ -789,7 +789,7 @@ pub(crate) async fn run_tool(
                 .trim();
             if body.is_empty() {
                 return (
-                    "error: generate_report needs `html` — the report body you authored".into(),
+                    "error: generate_report needs `html` (the report body you authored)".into(),
                     false,
                 );
             }
@@ -885,7 +885,7 @@ pub(crate) async fn run_tool(
                         crate::audit::record_write(&sql, affected);
                         (
                             format!(
-                                "Executed the write — {affected} row(s) affected. Verify with a \
+                                "Executed the write: {affected} row(s) affected. Verify with a \
                                  SELECT if it matters."
                             ),
                             true,
@@ -951,7 +951,7 @@ fn cap_result_bytes(mut content: String, max: usize) -> String {
         cut -= 1;
     }
     content.truncate(cut);
-    content.push_str("\n…(result truncated — it exceeded the size cap; narrow the query)");
+    content.push_str("\n…(result truncated: it exceeded the size cap; narrow the query)");
     content
 }
 
@@ -959,18 +959,18 @@ fn cap_result_bytes(mut content: String, max: usize) -> String {
 /// that resolves to a SELECT, with no statement separator and no embedded write.
 ///
 /// `run_select` runs on the *user's* connection, which is writable unless the
-/// connection itself was opened read-only — so this gate, not the engine, is what
+/// connection itself was opened read-only, so this gate, not the engine, is what
 /// keeps a read-tier agent from mutating data. A naive "starts with SELECT/WITH"
 /// check is not enough: Postgres executes **data-modifying CTEs**
 /// (`WITH x AS (DELETE … RETURNING …) SELECT * FROM x`), and `SELECT … INTO` /
 /// `INTO OUTFILE` and sequence-advancing functions also write while leading with
 /// SELECT. So, like [`write_shape`], we reason about a **noise-stripped** copy
 /// (literals/quoted-identifiers/comments blanked) and reject any surviving write
-/// keyword — sharing `strip_sql_noise`/`has_word` so the read and write gates can't
+/// keyword, sharing `strip_sql_noise`/`has_word` so the read and write gates can't
 /// drift. False positives (a rejected legitimate read) are acceptable: the user can
 /// always run such a query by hand in a query tab. (Defense in depth: opening the
 /// AI's reads on an engine-level read-only connection would make this belt-and-
-/// suspenders — a worthwhile follow-up, but it needs a per-call driver seam.)
+/// suspenders: a worthwhile follow-up, but it needs a per-call driver seam.)
 fn is_read_only_select(sql: &str) -> bool {
     let stripped = strip_sql_noise(sql);
     let trimmed = stripped.trim().trim_end_matches(';').trim();
@@ -992,12 +992,12 @@ fn is_read_only_select(sql: &str) -> bool {
     // are reserved words, so they can't be bare column names in a real read; a
     // column legitimately named one of them would be quoted, and quoting blanks it
     // out before this check. (`FOR UPDATE` locking reads trip `update` and are
-    // rejected too — fine, the assistant browses, it doesn't lock.)
+    // rejected too; fine, the assistant browses, it doesn't lock.)
     const WRITE_TOKENS: &[&str] = &[
         "insert", "update", "delete", "merge", "into", "nextval", "setval",
     ];
     // Server-side functions callable from inside a SELECT that write/read files,
-    // manipulate large objects, execute remote SQL, or emit WAL — all beyond a read
+    // manipulate large objects, execute remote SQL, or emit WAL, all beyond a read
     // tier's intent (e.g. `SELECT lo_import('/etc/passwd')`, `SELECT load_file(…)`,
     // `SELECT dblink_exec('…','DELETE …')`). This is a denylist of the well-known
     // dangerous ones; the *complete* guarantee is engine-level read-only (see the
@@ -1013,7 +1013,7 @@ fn is_read_only_select(sql: &str) -> bool {
         "pg_stat_file",
         "pg_logical_emit_message",
         // `dblink`/`dblink_send_query` run arbitrary SQL on a remote (often the
-        // same loopback) server from inside a SELECT — a write channel that reads
+        // same loopback) server from inside a SELECT: a write channel that reads
         // as read-only here. `dblink_exec` is the obvious one; the bare and async
         // forms are the same hole under a different name.
         "dblink",
@@ -1037,7 +1037,7 @@ fn is_read_only_select(sql: &str) -> bool {
 /// The tools that never mutate data and so may run on any backend without the
 /// per-call write gate. This is an allowlist on purpose: anything *not* named here
 /// is treated as a write, so a future tool fails *closed* (gated, withheld from the
-/// MCP/ACP path) until it's explicitly vetted and added — rather than slipping
+/// MCP/ACP path) until it's explicitly vetted and added, rather than slipping
 /// through a denylist someone forgot to extend.
 pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "list_schema",
@@ -1045,11 +1045,11 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "run_select",
     "explain",
     "generate_report",
-    // Hands the user a SQL query to open in a tab — no DB mutation of its own.
+    // Hands the user a SQL query to open in a tab; no DB mutation of its own.
     "open_query",
 ];
 
-/// Whether `name` is a mutating tool — it never auto-runs and never auto-allows;
+/// Whether `name` is a mutating tool: it never auto-runs and never auto-allows;
 /// it rides the per-call approval gate on both backends (Feature B). Defined as the
 /// complement of [`READ_ONLY_TOOLS`] so a new, unlisted tool is treated as a write.
 pub(crate) fn is_write_tool(name: &str) -> bool {
@@ -1061,12 +1061,12 @@ pub(crate) fn is_write_tool(name: &str) -> bool {
 /// by `run_tool` (to re-validate before executing). Keeping it in one place means
 /// the gate the user sees and the gate the write rides can't drift apart.
 pub(crate) enum WriteAssessment {
-    /// Not a write tool — run it normally (no approval).
+    /// Not a write tool; run it normally (no approval).
     NotWrite,
     /// Blocked outright (wrong tier, read-only connection, or a destructive shape):
     /// report this to the model without prompting the user.
     Reject(String),
-    /// An allowed single INSERT/UPDATE/DELETE — prompt the user with this exact SQL,
+    /// An allowed single INSERT/UPDATE/DELETE: prompt the user with this exact SQL,
     /// and only run it on Allow.
     NeedsApproval { sql: String },
 }
@@ -1085,7 +1085,7 @@ pub(crate) fn assess_write(name: &str, input: &Json, policy: &AiPolicy) -> Write
     }
     if policy.read_only {
         return WriteAssessment::Reject(
-            "this connection is read-only — writes are disabled. Tell the user; do not retry."
+            "this connection is read-only: writes are disabled. Tell the user; do not retry."
                 .into(),
         );
     }
@@ -1095,7 +1095,7 @@ pub(crate) fn assess_write(name: &str, input: &Json, policy: &AiPolicy) -> Write
             sql: sql.to_string(),
         },
         WriteShape::NotWrite => WriteAssessment::Reject(
-            "propose_write is only for INSERT/UPDATE/DELETE — use run_select to read".into(),
+            "propose_write is only for INSERT/UPDATE/DELETE; use run_select to read".into(),
         ),
         WriteShape::Blocked(why) => WriteAssessment::Reject(why.into()),
     }
@@ -1103,7 +1103,7 @@ pub(crate) fn assess_write(name: &str, input: &Json, policy: &AiPolicy) -> Write
 
 /// The shape verdict for a candidate write statement.
 enum WriteShape {
-    /// A single, qualified INSERT/UPDATE/DELETE — eligible (still needs approval).
+    /// A single, qualified INSERT/UPDATE/DELETE: eligible (still needs approval).
     Ok,
     /// Not a write at all (SELECT/WITH/empty).
     NotWrite,
@@ -1111,15 +1111,15 @@ enum WriteShape {
     Blocked(&'static str),
 }
 
-/// Classify a candidate write conservatively (Feature B). The hard blocks — DDL and
-/// privilege statements, an unqualified UPDATE/DELETE (no WHERE), and any chained
-/// statement — are the cases per-call approval alone shouldn't be trusted to catch
+/// Classify a candidate write conservatively (Feature B). The hard blocks (DDL and
+/// privilege statements, an unqualified UPDATE/DELETE with no WHERE, and any chained
+/// statement) are the cases per-call approval alone shouldn't be trusted to catch
 /// (a rubber-stamped `DELETE` with no WHERE is catastrophic). False negatives are
 /// fine: the user can always run those by hand in a query tab.
 ///
 /// Classification runs on a **noise-stripped** copy (string literals, quoted
 /// identifiers, and comments blanked) so a keyword or `;` *inside a literal* can't
-/// fool the gate — e.g. `UPDATE t SET note = 'see where'` (no real WHERE) is still
+/// fool the gate; e.g. `UPDATE t SET note = 'see where'` (no real WHERE) is still
 /// blocked, and a `;` inside a string isn't read as statement chaining.
 fn write_shape(sql: &str) -> WriteShape {
     let stripped = strip_sql_noise(sql);
@@ -1127,10 +1127,10 @@ fn write_shape(sql: &str) -> WriteShape {
     if trimmed.is_empty() {
         return WriteShape::Blocked("the statement is empty");
     }
-    // No embedded terminator — a real `;` chains a second statement past the keyword
+    // No embedded terminator: a real `;` chains a second statement past the keyword
     // check (and past the user's eyes).
     if trimmed.contains(';') {
-        return WriteShape::Blocked("multiple statements are not allowed — submit one at a time");
+        return WriteShape::Blocked("multiple statements are not allowed; submit one at a time");
     }
     let lower = trimmed.to_ascii_lowercase();
     let first = lower.split_whitespace().next().unwrap_or("");
@@ -1144,23 +1144,23 @@ fn write_shape(sql: &str) -> WriteShape {
                 WriteShape::Ok
             } else {
                 WriteShape::Blocked(
-                    "an UPDATE/DELETE without a WHERE clause is blocked — add a WHERE, or run a \
+                    "an UPDATE/DELETE without a WHERE clause is blocked; add a WHERE, or run a \
                      full-table change yourself in a query tab",
                 )
             }
         }
-        // DROP / TRUNCATE / ALTER / CREATE / RENAME / GRANT / REVOKE / … — DDL and
+        // DROP / TRUNCATE / ALTER / CREATE / RENAME / GRANT / REVOKE / …: DDL and
         // privilege changes are never run through the assistant.
         _ => WriteShape::Blocked(
-            "only INSERT/UPDATE/DELETE are allowed here — DDL (DROP/TRUNCATE/ALTER/…) must be run \
+            "only INSERT/UPDATE/DELETE are allowed here; DDL (DROP/TRUNCATE/ALTER/…) must be run \
              manually in a query tab",
         ),
     }
 }
 
-/// Blank out the parts of `sql` that aren't structure — single-quoted strings
+/// Blank out the parts of `sql` that aren't structure: single-quoted strings
 /// (with `''` escapes), double-quoted / backtick-quoted identifiers, and `--` line
-/// and `/* */` block comments — replacing each run with spaces so positions and the
+/// and `/* */` block comments. Each run is replaced with spaces so positions and the
 /// surrounding keywords are preserved. Used so the write classifier reasons about
 /// real SQL keywords, never text that merely *looks* like one inside a literal.
 fn strip_sql_noise(sql: &str) -> String {
@@ -1168,7 +1168,7 @@ fn strip_sql_noise(sql: &str) -> String {
     let mut chars = sql.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            // String literal / quoted identifier — consume to the matching close,
+            // String literal / quoted identifier: consume to the matching close,
             // honoring the doubled-quote escape (`''`, `""`).
             '\'' | '"' | '`' => {
                 out.push(' ');
@@ -1227,7 +1227,7 @@ fn has_word(haystack: &str, word: &str) -> bool {
         .any(|tok| tok == word)
 }
 
-/// The report shell's inline stylesheet — a neutral, light/dark base the model's
+/// The report shell's inline stylesheet: a neutral, light/dark base the model's
 /// `style="…"` can build on. No external fonts/assets (the CSP forbids them).
 const REPORT_STYLE: &str = concat!(
     "<style>",
@@ -1304,7 +1304,7 @@ fn report_theme_json(theme: Option<&ReportTheme>) -> Json {
 
 /// Write a finished report to `path`, owner-readable only (`0600` on Unix). A
 /// report can carry real query data, and on a shared temp dir (Linux `/tmp`) a
-/// world-readable file would let another local user read it — so restrict it at
+/// world-readable file would let another local user read it, so restrict it at
 /// creation rather than writing world-readable and tightening after.
 fn write_report_file(path: &Path, html: &str) -> std::io::Result<()> {
     use std::io::Write;
@@ -1320,8 +1320,8 @@ fn write_report_file(path: &Path, html: &str) -> std::io::Result<()> {
 }
 
 /// The trusted in-report chart bundle: Chart.js v4 (UMD, minified) + our renderer
-/// (`assets/report-renderer.js`). This is the ONLY code allowed to run in a report
-/// — it is injected behind a per-report CSP nonce, so the model's HTML and the
+/// (`assets/report-renderer.js`). This is the ONLY code allowed to run in a report;
+/// it is injected behind a per-report CSP nonce, so the model's HTML and the
 /// chart specs (which never carry the nonce) cannot execute. See `assets/README.md`
 /// to regenerate after a Chart.js bump.
 const REPORT_CHARTS_JS: &str = include_str!("../assets/report-charts.js");
@@ -1343,7 +1343,7 @@ const REPORT_CHARTS_JS: &str = include_str!("../assets/report-charts.js");
 /// table and bound chart at once. The CSP keeps the hole tight: scripts run only with the nonce
 /// (so the model cannot inject runnable code), and `connect-src 'none'` denies all
 /// network egress (so even the trusted bundle cannot exfiltrate the data, and all
-/// filtering happens client-side over what's already embedded — never a callback
+/// filtering happens client-side over what's already embedded, never a callback
 /// to the database). The payload is pure data; the bundle never evals it and
 /// writes every table cell via `textContent`.
 fn wrap_report_html(
@@ -1360,7 +1360,7 @@ fn wrap_report_html(
         .unwrap_or("Red — report");
     let t = red_driver::html_escape(title);
     let safe_body = strip_scripts(body);
-    // The base document style — Red's active theme if the UI supplied one, else
+    // The base document style: Red's active theme if the UI supplied one, else
     // the built-in light/dark (follows the OS).
     let style = report_style(theme);
 
@@ -1377,7 +1377,7 @@ fn wrap_report_html(
         );
     }
 
-    // Unguessable per-report nonce — only our bundle carries it, so a `<script>`
+    // Unguessable per-report nonce: only our bundle carries it, so a `<script>`
     // smuggled through the body or a spec value has no valid nonce and won't run.
     let nonce = uuid::Uuid::new_v4().simple().to_string();
     let payload = json!({
@@ -1403,7 +1403,7 @@ fn wrap_report_html(
 }
 
 /// Remove `<script>…</script>` blocks (case-insensitive) from `html`. Defensive
-/// only — the report's CSP already forbids script execution; this just keeps the
+/// only (the report's CSP already forbids script execution); this just keeps the
 /// rendered document clean. An unterminated `<script` drops the remainder.
 fn strip_scripts(html: &str) -> String {
     let lower = html.to_ascii_lowercase();
@@ -1430,26 +1430,26 @@ fn strip_scripts(html: &str) -> String {
 /// with the ACP path, which folds it into the agent's first prompt (ACP
 /// `session/prompt` has no system role). The tier line keeps the model's
 /// expectations in step with the catalog it actually receives, but the *catalog*
-/// is the real gate — the prompt is just courtesy.
+/// is the real gate; the prompt is just courtesy.
 pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
     let tools_line = match policy.tier {
         AiTier::Off => {
-            "You have NO database tools available — answer from the schema overview and the \
+            "You have NO database tools available; answer from the schema overview and the \
              conversation alone, and tell the user you cannot read the live database."
         }
         AiTier::Schema => {
             "You have schema-only tools: list_schema and describe_table. You can inspect \
-             structure (tables, columns, types, keys) but you CANNOT read row data — there is no \
+             structure (tables, columns, types, keys) but you CANNOT read row data; there is no \
              query tool, so do not promise to run one."
         }
         AiTier::Read => {
             "You have read-only tools: list_schema, describe_table, run_select (capped SELECTs), \
-             explain, open_query (open a SQL query in a new editor tab in the user's workspace — a \
+             explain, open_query (open a SQL query in a new editor tab in the user's workspace; a \
              read-only SELECT runs automatically), and generate_report (you author an HTML report \
-             from data you've read — with optional interactive Chart.js charts — and it opens in \
+             from data you've read, with optional interactive Chart.js charts, and it opens in \
              the user's browser; use it when the user asks for a report). Use them to ground every \
              answer in the live database rather than \
-             guessing — discover objects with list_schema, inspect structure with describe_table, \
+             guessing: discover objects with list_schema, inspect structure with describe_table, \
              and read data with run_select. Use open_query to hand the user a query to explore in \
              the grid. Prefer small, targeted queries with explicit columns and LIMIT."
         }
@@ -1457,9 +1457,9 @@ pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
             "You have the read tools (list_schema, describe_table, run_select, explain, open_query, \
              generate_report) AND a gated write tool, propose_write, for a SINGLE \
              INSERT/UPDATE/DELETE. Every propose_write call requires the user's explicit Allow on \
-             the exact SQL — assume it may be denied, and never batch or chain statements. \
+             the exact SQL; assume it may be denied, and never batch or chain statements. \
              UPDATE/DELETE must have a WHERE clause; DDL (DROP/TRUNCATE/ALTER/CREATE) is not \
-             available — tell the user to run those by hand. Only write when the user has asked you \
+             available; tell the user to run those by hand. Only write when the user has asked you \
              to change data; read first to get it right, and verify after."
         }
     };
@@ -1596,7 +1596,7 @@ fn format_page(page: &red_core::ResultPage) -> String {
 
 fn render_cell(v: &Value) -> String {
     // `Value`'s Display already renders NULL, capped text (`head…`), and blobs
-    // (`<N bytes>`) — exactly the compact form we want for the model.
+    // (`<N bytes>`), exactly the compact form we want for the model.
     v.to_string()
 }
 
@@ -1768,7 +1768,7 @@ mod tests {
     async fn generate_report_wraps_ai_html_and_announces_it() {
         use futures::StreamExt;
 
-        // generate_report renders model-authored HTML — no DB call. A no-op driver is
+        // generate_report renders model-authored HTML (no DB call). A no-op driver is
         // enough (the tool never touches it).
         let db = std::env::temp_dir().join(format!("red-gr-{}.db", uuid::Uuid::new_v4().simple()));
         let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
@@ -2036,12 +2036,12 @@ mod tests {
         assert!(rejected("UPDATE t SET a=1 WHERE id=1; DROP TABLE t"));
         // A read query isn't a write.
         assert!(rejected("SELECT * FROM t"));
-        // A `where` inside a string literal or comment is NOT a real WHERE — the
+        // A `where` inside a string literal or comment is NOT a real WHERE; the
         // statement is still an unqualified mutation and must be blocked.
         assert!(rejected("UPDATE t SET note = 'see where you go'"));
         assert!(rejected("DELETE FROM t -- delete where id = 1"));
         // Conversely, a real WHERE with a `;` inside a string literal is a single,
-        // qualified statement — allowed (the `;` isn't statement chaining).
+        // qualified statement: allowed (the `;` isn't statement chaining).
         assert!(allowed("UPDATE t SET note = 'a;b' WHERE id = 1"));
     }
 
@@ -2215,9 +2215,9 @@ mod tests {
         ));
 
         // The first thing the user sees is the write-approval prompt, carrying the
-        // exact SQL — the write has NOT run yet.
+        // exact SQL; the write has NOT run yet.
         let request_id = tokio::time::timeout(Duration::from_secs(5), async {
-            // The very first event must be the approval prompt — nothing runs first.
+            // The very first event must be the approval prompt; nothing runs first.
             match rx.next().await.expect("an event").1 {
                 Event::AiPermissionRequest {
                     request_id, detail, ..

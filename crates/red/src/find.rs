@@ -1,5 +1,5 @@
 //! Find (Track B2, Tier 1): a small strip that highlights and steps through
-//! matches of a substring, in whichever pane is focused — the **result grid**
+//! matches of a substring, in whichever pane is focused: the **result grid**
 //! (loaded rows) or the **query editor** (its text). Distinct from the filter bar
 //! (⌘⇧F), which re-opens the result with a SQL predicate over the *whole* set:
 //! find never touches the backend.
@@ -103,7 +103,7 @@ impl AppState {
             grid_matches: Vec::new(),
             editor_matches: Vec::new(),
         });
-        // The Window isn't in hand on the next render path — focus the input then.
+        // The Window isn't in hand on the next render path; focus the input then.
         self.focus_find = true;
         cx.notify();
     }
@@ -208,7 +208,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// The find-bar editing strip, rendered above the pane it targets — so it's
+    /// The find-bar editing strip, rendered above the pane it targets, so it's
     /// drawn by `result::render` for [`FindTarget::Grid`] and by `editor` for
     /// [`FindTarget::Editor`], each passing the surface it owns. Returns `None`
     /// when the bar is closed or targets the *other* pane.

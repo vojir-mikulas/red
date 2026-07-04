@@ -35,7 +35,7 @@ fn counting_sql(n: i64) -> String {
         )
 }
 
-/// Connect, run a windowed query, and drain it — proving the start → rows →
+/// Connect, run a windowed query, and drain it, proving the start → rows →
 /// finished lifecycle and that windows stay bounded (memory flat: only one
 /// window is ever resident).
 #[tokio::test]
@@ -186,7 +186,7 @@ async fn disconnect_drops_session() {
     send(&handle, Command::Shutdown);
 }
 
-/// Connect, load the skeleton, then describe a table — the schema-explorer
+/// Connect, load the skeleton, then describe a table: the schema-explorer
 /// round-trip the sidebar drives.
 #[tokio::test]
 async fn loads_and_describes_schema() {
@@ -376,7 +376,7 @@ async fn applies_a_data_edit() {
     std::fs::remove_file(&path).ok();
 }
 
-/// Open a result and page through it — the grid's load-on-scroll path.
+/// Open a result and page through it: the grid's load-on-scroll path.
 #[tokio::test]
 async fn opens_and_pages_result() {
     let mut handle = spawn();
@@ -498,8 +498,8 @@ async fn computes_column_stats_for_open_result() {
 }
 
 /// Inline FK expansion (Track B7): an `OpenResult` carrying a `LEFT JOIN` spec
-/// decorates a table browse with the referenced table's columns — reported *inline,
-/// right after the FK column they expand from* — without changing the row count (the
+/// decorates a table browse with the referenced table's columns, reported *inline,
+/// right after the FK column they expand from*, without changing the row count (the
 /// orphan-FK row survives with NULL joined cells) or the keyset key. `channel`'s FK
 /// sits in the middle (`id, tier_id, name`), so the joined column landing at index 2
 /// proves the interleaving (not an append-at-end).
@@ -556,12 +556,12 @@ async fn fk_join_expands_referenced_columns_inline() {
             ..
         }) => {
             // The joined column is interleaved right after its FK column (`tier_id`),
-            // not appended at the end — `name` stays last.
+            // not appended at the end; `name` stays last.
             assert_eq!(
                 columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
                 vec!["id", "tier_id", "tier_id.name", "name"]
             );
-            // The unique-target LEFT JOIN preserves cardinality — count is unchanged.
+            // The unique-target LEFT JOIN preserves cardinality: count is unchanged.
             assert_eq!(total, 3);
             // The base PK is still the seek key (joins don't disturb it).
             assert_eq!(key.expect("PK key").column, "id");
@@ -830,7 +830,7 @@ async fn resolves_key_and_serves_runs() {
         other => panic!("expected ResultRunLoaded, got {other:?}"),
     }
 
-    // A jump to ordinal 0 seeks from the true start — exact, not estimated.
+    // A jump to ordinal 0 seeks from the true start (exact, not estimated).
     send(
         &handle,
         Command::FetchRun {
@@ -859,7 +859,7 @@ async fn resolves_key_and_serves_runs() {
 
 /// The full app flow against a live MariaDB/MySQL (`RED_TEST_MYSQL_URL`,
 /// skipped without one): open a 1M-row table browse, resolve the PK as the
-/// seek key, then deep-seek and jump — each fetch must come back fast
+/// seek key, then deep-seek and jump; each fetch must come back fast
 /// (indexed), proving the derived-table wrapper merges on the server.
 #[tokio::test]
 async fn mariadb_keyset_end_to_end() {
@@ -938,7 +938,7 @@ async fn mariadb_keyset_end_to_end() {
         other => panic!("expected ResultReady, got {other:?}"),
     }
 
-    // Deep forward seek near the bottom — must be indexed-fast.
+    // Deep forward seek near the bottom; it must be indexed-fast.
     let started = Instant::now();
     send(
         &handle,
@@ -961,10 +961,10 @@ async fn mariadb_keyset_end_to_end() {
     let elapsed = started.elapsed();
     assert!(
         elapsed < Duration::from_secs(2),
-        "deep seek took {elapsed:?} — the derived-table wrapper isn't merging"
+        "deep seek took {elapsed:?}; the derived-table wrapper isn't merging"
     );
 
-    // Interpolated jump to ~50% — fast but approximate, flagged estimated.
+    // Interpolated jump to ~50%: fast but approximate, flagged estimated.
     send(
         &handle,
         Command::FetchRun {
@@ -1126,7 +1126,7 @@ async fn connect_and_query_roundtrip() {
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
     // Connect dials off the dispatch loop, so a session-bound command is only
-    // valid once `Connected` lands — exactly how the UI sequences it.
+    // valid once `Connected` lands, which is exactly how the UI sequences it.
     send(&handle, Command::Connect(sqlite(":memory:", false)));
     assert!(matches!(
         next(&mut events).await,
@@ -1178,7 +1178,7 @@ async fn keeps_two_sessions_warm() {
         Some((Some(s), Event::Connected { .. })) if s == b
     ));
 
-    // Same epoch in each session — epochs are per-session, not global.
+    // Same epoch in each session: epochs are per-session, not global.
     handle.send_to(
         a,
         Command::OpenResult {
@@ -1202,7 +1202,7 @@ async fn keeps_two_sessions_warm() {
         },
     );
 
-    // The two opens probe off the loop, so their replies can interleave — route
+    // The two opens probe off the loop, so their replies can interleave; route
     // each by its session tag and assert it landed on the right one.
     let mut totals = std::collections::HashMap::new();
     while totals.len() < 2 {
@@ -1217,7 +1217,7 @@ async fn keeps_two_sessions_warm() {
     assert_eq!(totals[&a], 100);
     assert_eq!(totals[&b], 200);
 
-    // Dropping session A leaves B warm and serving — no reconnect.
+    // Dropping session A leaves B warm and serving (no reconnect).
     handle.send_to(a, Command::Disconnect);
     assert!(matches!(
         events.next().await,
@@ -1396,7 +1396,7 @@ async fn copies_result_into_table() {
 
 /// "Copy into a *new* table": with `create: Some(columns)` the target is created from
 /// the source's column shape (types spelled into the target dialect via
-/// `red_core::typemap`) before the rows stream in — the keystone of database
+/// `red_core::typemap`) before the rows stream in, the keystone of database
 /// migration. The `created` table does not exist beforehand.
 #[tokio::test]
 async fn copies_result_into_a_new_table() {
@@ -1433,7 +1433,7 @@ async fn copies_result_into_a_new_table() {
         })
     ));
 
-    // Target `created` does not exist — `create` carries the column shape to build it.
+    // Target `created` does not exist; `create` carries the column shape to build it.
     send(
         &handle,
         Command::CopyToTable {
@@ -1592,7 +1592,7 @@ async fn copy_truncate_insert_refreshes_target() {
         other => panic!("expected CopyFinished, got {other:?}"),
     }
 
-    // Exactly the 3 source rows remain — the stale row (id 99) was truncated.
+    // Exactly the 3 source rows remain; the stale row (id 99) was truncated.
     send(
         &handle,
         Command::OpenResult {
@@ -1613,7 +1613,7 @@ async fn copy_truncate_insert_refreshes_target() {
 }
 
 /// Gap 2 (correctness invariant): a copy reads at **full fidelity**, never the
-/// display fat-cell cap — a long `TEXT` value copies byte-exact, not truncated.
+/// display fat-cell cap: a long `TEXT` value copies byte-exact, not truncated.
 #[tokio::test]
 async fn copy_is_byte_exact_for_long_values() {
     use red_core::{ColumnMap, CopyMode, TableRef};
@@ -1724,7 +1724,7 @@ async fn copy_is_byte_exact_for_long_values() {
     std::fs::remove_file(&path).ok();
 }
 
-/// Cross-connection copy (Phase 2): source in session A, target in session B — the
+/// Cross-connection copy (Phase 2): source in session A, target in session B; the
 /// backend bridges A's cursor to B's `insert_rows` with both ends pinned. Two
 /// separate DBs prove the rows really cross the connection boundary.
 #[tokio::test]
@@ -1833,7 +1833,7 @@ async fn copies_across_connections() {
 }
 
 /// Phase 2: migrate *many* tables from one connection into another (empty) one in a
-/// single job — each table is created on the target from the source's shape and its
+/// single job: each table is created on the target from the source's shape and its
 /// rows streamed in. The source is listed `child` before `parent`, but the FK
 /// `child → parent` orders `parent` first.
 #[tokio::test]
@@ -1854,7 +1854,7 @@ async fn migrates_all_tables_into_another_connection() {
              CREATE INDEX ix_child_parent ON child(parent_id);",
         )
         .unwrap();
-        // dst: an empty database (no tables) — migrate creates them.
+        // dst: an empty database (no tables); migrate creates them.
         rusqlite::Connection::open(&dst_path).unwrap();
     }
     let mut handle = spawn();
@@ -1998,7 +1998,7 @@ fn panic_message_recovers_common_payloads() {
 
 /// The agent registry resolves a turn's `agent` id: an unknown id (e.g. a saved
 /// chat bound to a since-removed agent) fails with a clear error naming it, and a
-/// configured API agent with no key reports "add an API key" — both *before*
+/// configured API agent with no key reports "add an API key", both *before*
 /// anything spawns, so neither launches an agent process.
 #[tokio::test]
 async fn ai_turn_resolves_agent_id_with_clear_errors() {

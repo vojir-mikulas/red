@@ -46,8 +46,8 @@ pub(crate) type Events = UnboundedSender<(Option<SessionId>, Event)>;
 const MAX_CONCURRENT_PAGE_FETCHES: usize = 6;
 
 /// How many exports may stream at once across all sessions. Each holds a driver
-/// connection for the file's lifetime, so this bounds connection pinning. Generous
-/// — exports are user-initiated (one per toast) — but no longer unbounded.
+/// connection for the file's lifetime, so this bounds connection pinning. Generous,
+/// since exports are user-initiated (one per toast), but no longer unbounded.
 const MAX_CONCURRENT_EXPORTS: usize = 4;
 
 /// How many imports may stream at once across all sessions. Writes are heavier than
@@ -56,7 +56,7 @@ const MAX_CONCURRENT_IMPORTS: usize = 2;
 
 /// How many table copies may stream at once across all sessions. A copy pins a
 /// connection on *each* end (source read + target write) for its whole lifetime, so
-/// this is kept as tight as imports — a couple of millions-of-rows transfers can run
+/// this is kept as tight as imports: a couple of millions-of-rows transfers can run
 /// together without fanning out an unbounded number of pinned connections.
 const MAX_CONCURRENT_COPIES: usize = 2;
 
@@ -77,7 +77,7 @@ const EVICT_SWEEP: Duration = Duration::from_secs(30);
 
 /// One configured AI agent in the dispatch registry, built once per `ConfigureAi`
 /// from an [`AiAgentProfile`](crate::protocol::AiAgentProfile). An `Api` agent
-/// holds its pre-built provider (`None` when it has no key — a turn then reports
+/// holds its pre-built provider (`None` when it has no key; a turn then reports
 /// "not configured") and resolved model; an `Acp` agent holds its resolved launch
 /// command. A turn names an id, the loop looks it up here and routes accordingly.
 enum AiProfileRuntime {
@@ -93,7 +93,7 @@ enum AiProfileRuntime {
 /// Lock a mutex, tolerating poison. A detached page-fetch task can panic while
 /// holding `results`; recovering the guard keeps one bad task from bricking the
 /// whole backend. The worst case is a half-written entry, which dispatch already
-/// tolerates — a fetch for an epoch absent or stale in the map is dropped.
+/// tolerates: a fetch for an epoch absent or stale in the map is dropped.
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -103,7 +103,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
     // can switch between connections instantly (no reconnect); each owns its
     // driver, cursor, open-result map, in-flight handles, and exports. `Connect`
     // inserts, `Disconnect`/`CloseSession`/eviction remove. Per-epoch fetch state
-    // lives inside each session — UI epochs start at 1, so an empty result map
+    // lives inside each session; UI epochs start at 1, so an empty result map
     // means "no live result" for that session.
     let mut sessions: HashMap<SessionId, SessionState> = HashMap::new();
     // Which session the UI currently shows (`SetActiveSession`). Exempt from idle
@@ -114,7 +114,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
     // and on each settings reload, captured into each spawned fetch task.
     let mut statement_timeout: Option<Duration> = None;
     // Bounds how many page fetches hit servers concurrently across *all* sessions
-    // (see the const) — a shared backstop, so a flung scrollbar on one connection
+    // (see the const), a shared backstop, so a flung scrollbar on one connection
     // can't fan out dozens of deep scans. A busy session can briefly delay
     // another's page fetches; acceptable for a backstop.
     let page_fetch_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_PAGE_FETCHES));
@@ -146,7 +146,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
     };
 
     // The AI assistant's configured agents (built from `ConfigureAi.agents`), keyed
-    // by id — an API agent carries its pre-built provider (None until a key is set)
+    // by id: an API agent carries its pre-built provider (None until a key is set)
     // and model; an ACP agent carries its resolved launch command. *Which* agent a
     // turn uses is decided per-turn by `AiTurn.agent` (M-S6), so several
     // conversations on different agents run concurrently. A turn runs as a spawned
@@ -169,7 +169,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
         let (session_id, command) = tokio::select! {
             maybe = commands.recv() => match maybe {
                 Some(envelope) => envelope,
-                None => break, // UI dropped the sender — window closed
+                None => break, // UI dropped the sender (window closed)
             },
             _ = sweep.tick() => {
                 evict_idle(&mut sessions, foreground, &events);
@@ -203,7 +203,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 if let Some(mut old) = sessions.remove(&id) {
                     old.teardown();
                     // The new driver replaces the old one, so any subscription
-                    // agent bound to the old session must go too (M-S3) — the next
+                    // agent bound to the old session must go too (M-S3); the next
                     // turn lazily rebinds a fresh agent to the new driver.
                     let manager = ai_acp.clone();
                     tokio::spawn(async move { manager.lock().await.evict_session(Some(id)) });
@@ -262,7 +262,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 };
                 ai_default_agent = cfg.default_agent;
                 // Build each configured agent's runtime. An API agent with an empty
-                // key gets a `None` provider — a turn on it replies with a clear
+                // key gets a `None` provider; a turn on it replies with a clear
                 // AiError rather than a failed network call; an ACP agent needs no
                 // key (it owns its own auth). A custom `base_url` retargets the
                 // Anthropic-wire provider (e.g. a local endpoint).
@@ -283,7 +283,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                     let mut p = red_ai::AnthropicProvider::new(a.api_key);
                                     if !a.base_url.is_empty() {
                                         // A custom endpoint is fine, but never send the
-                                        // API key to an arbitrary cleartext host — only
+                                        // API key to an arbitrary cleartext host: only
                                         // HTTPS (or loopback http). Reject and keep the
                                         // default rather than exfiltrate the credential.
                                         if red_ai::is_safe_base_url(&a.base_url) {
@@ -338,7 +338,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
 
                 // Resolve the effective AI policy (M-S7): the session's per-connection
                 // overrides layered over the global one. The master switch is checked
-                // here, before anything spawns — a disabled assistant starts no MCP
+                // here, before anything spawns; a disabled assistant starts no MCP
                 // server and no agent process, it just reports the refusal.
                 let ai_override = session_id
                     .and_then(|id| sessions.get(&id))
@@ -365,8 +365,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 }
 
                 // Resolve which agent this turn runs on: the named id, or the default
-                // when empty. An id that names no configured agent — e.g. a saved
-                // chat bound to a profile the user has since deleted — fails with a
+                // when empty. An id that names no configured agent (e.g. a saved
+                // chat bound to a profile the user has since deleted) fails with a
                 // clear error rather than silently running a different backend.
                 let agent_id = if agent.trim().is_empty() {
                     ai_default_agent.clone()
@@ -380,7 +380,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         Event::AiError {
                             conversation_id,
                             message: format!(
-                                "AI agent '{agent_id}' is not configured — pick another in the \
+                                "AI agent '{agent_id}' is not configured; pick another in the \
                                  panel, or add it in Settings."
                             ),
                         },
@@ -397,7 +397,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                 Event::AiError {
                                     conversation_id,
                                     message:
-                                        "AI agent is not configured — add an API key in Settings."
+                                        "AI agent is not configured; add an API key in Settings."
                                             .into(),
                                 },
                             );
@@ -450,7 +450,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::AiForget { conversation_id } => {
-                // The conversation was closed/deleted in the UI — drop its backend
+                // The conversation was closed/deleted in the UI, so drop its backend
                 // state on both paths so the maps stay bounded. The API-key forget is
                 // a quick sync lock; the ACP one awaits, so it runs off the loop.
                 lock(&ai_state).forget(conversation_id);
@@ -467,7 +467,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // backend: the subscription path's ACP manager (M-S2 tool prompts) or
                 // the API-key path's AiState (Feature B write prompts). Their request-
                 // id spaces are disjoint (AiState offsets its ids), so resolving both
-                // is safe — only the owning side has the id. The API-key resolve is a
+                // is safe: only the owning side has the id. The API-key resolve is a
                 // quick sync lock; the ACP one awaits, so it runs off the loop.
                 lock(&ai_state).resolve_permission(request_id, allow);
                 let manager = ai_acp.clone();
@@ -494,7 +494,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
 
             Command::AiSubmitLoginCode { agent_id, code } => {
                 // Deliver the pasted OAuth code to the in-flight sign-in. Off the
-                // loop — taking the manager lock awaits.
+                // loop; taking the manager lock awaits.
                 let manager = ai_acp.clone();
                 tokio::spawn(
                     async move { manager.lock().await.submit_login_code(&agent_id, code) },
@@ -536,7 +536,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 value,
             } => {
                 // Change a model / reasoning selector on the subscription path. Off
-                // the loop — it awaits the agent's reply, then emits the refreshed set.
+                // the loop; it awaits the agent's reply, then emits the refreshed set.
                 tokio::spawn(crate::acp::set_config_option(
                     ai_acp.clone(),
                     events.clone(),
@@ -549,7 +549,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
 
             Command::TestConnection(config) => {
                 // A throwaway probe: connect, report, and let the driver drop. No
-                // session is created or disturbed — it's session-less (`None`).
+                // session is created or disturbed; it's session-less (`None`).
                 // Spawned off the loop like `Connect`, so probing a dead host
                 // doesn't stall every warm session.
                 let tx = connect_tx.clone();
@@ -559,7 +559,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     let result = attempt_connect(&config)
                         .await
                         // The probe drops the driver (and any tunnel) right after
-                        // reading the version — it's throwaway.
+                        // reading the version (it's throwaway).
                         .map(|(driver, _tunnel)| driver.server_version())
                         .map_err(|f| f.message);
                     let _ = tx.send(ConnectOutcome::Test { result });
@@ -570,7 +570,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // Append the host key to ~/.ssh/known_hosts, on the loop (a quick
                 // file write). The UI re-sends `Connect` right after; processed in
                 // order on this single loop, so the retry sees the new entry. A
-                // failure is logged — the retry will just re-prompt.
+                // failure is logged; the retry will just re-prompt.
                 if let Err(e) = crate::tunnel::trust_host(&host, port, &key) {
                     tracing::warn!("failed to trust SSH host {host}: {e}");
                 }
@@ -581,7 +581,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 if let Some(mut state) = sessions.remove(&id) {
                     state.teardown();
                 }
-                // Tear down any subscription agent grounded in this session — its
+                // Tear down any subscription agent grounded in this session: its
                 // MCP server holds a now-dead driver clone (M-S3).
                 let manager = ai_acp.clone();
                 tokio::spawn(async move { manager.lock().await.evict_session(Some(id)) });
@@ -747,7 +747,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     // introspected detail: a sorted browse gets the composite
                     // `(sort_col, pk)` key, an unsorted one the plain PK. A
                     // resolution failure just means the `OFFSET` fallback (never
-                    // an error). The detail is kept around — a `Contains` filter
+                    // an error). The detail is kept around; a `Contains` filter
                     // searches the table's columns.
                     let detail = match &table {
                         Some((schema, table)) => match driver.describe_table(schema, table).await {
@@ -771,7 +771,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                     descending = k.descending, "keyset key resolved"
                                 ),
                                 None => tracing::info!(
-                                    "no usable key (composite/nullable/no PK) — OFFSET paging"
+                                    "no usable key (composite/nullable/no PK); OFFSET paging"
                                 ),
                             }
                             key
@@ -782,7 +782,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     // referenced columns, interleaved next to the FK column they expand
                     // from (the base column order comes from `detail`). The join runs
                     // *before* the filter so a `WHERE` can reference the expanded
-                    // (dotted-alias) columns, not just base columns — the unique-target
+                    // (dotted-alias) columns, not just base columns; the unique-target
                     // gate keeps the row count identical, so the join is transparent to
                     // keyset. Empty `joins` (or a no-FK engine) leaves `sql` untouched.
                     let base_cols: Vec<String> = detail
@@ -792,7 +792,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     let joined_sql = driver.fk_join_wrap(&sql, &base_cols, &joins);
                     // Build the filter predicate, then wrap it *around* the joined query
                     // (`SELECT * FROM (joined) WHERE <pred>`) so count, bounds, and
-                    // paging all see the filtered set — and a `Where`/`Eq` predicate can
+                    // paging all see the filtered set, and a `Where`/`Eq` predicate can
                     // name any output column, including an expanded reference column
                     // (`"tier_id.name"`). The wrap keeps `SELECT *`, so the key column
                     // survives and keyset is unaffected. A `Contains` searches the base
@@ -843,8 +843,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     };
                     // `LIMIT 0` reads column metadata without stepping rows;
                     // counting and the key-bounds probe run concurrently with it.
-                    // Count / bounds run on `probe_sql` — the unjoined base when there's
-                    // no filter, else the joined+filtered query — so the total and
+                    // Count / bounds run on `probe_sql` (the unjoined base when there's
+                    // no filter, else the joined+filtered query), so the total and
                     // bounds reflect the filter; ordering never changes either.
                     let bounds = async {
                         match &key {
@@ -946,7 +946,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 entry.page = Some(abort.clone());
                 // Pages fetch concurrently (the driver pools connections) and off
                 // the dispatch loop, so a deep-`OFFSET` page never blocks the next
-                // command or another page — but no more than `page_fetch_limit` at
+                // command or another page, but no more than `page_fetch_limit` at
                 // once, so a burst can't saturate the server.
                 let events = events.clone();
                 let limit_src = page_fetch_limit.clone();
@@ -963,7 +963,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     if abort.is_aborted() {
                         return;
                     }
-                    // Offset-mode display page — cap fat cells; no seek key to exempt.
+                    // Offset-mode display page: cap fat cells; no seek key to exempt.
                     let fetch = driver.fetch_page(
                         &sql,
                         offset,
@@ -981,7 +981,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                 epoch,
                             },
                         ),
-                        // Superseded mid-flight — a clean cancel, not an error toast.
+                        // Superseded mid-flight: a clean cancel, not an error toast.
                         Err(RedError::Interrupted) => {}
                         Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
                     }
@@ -1000,14 +1000,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
                 let driver = state.driver.clone();
-                // Stale epoch (tab closed / re-sorted) — drop, like `FetchPage`.
+                // Stale epoch (tab closed / re-sorted); drop, like `FetchPage`.
                 let Some(spec) = lock(&state.results).get(&epoch).cloned() else {
                     continue;
                 };
                 let Some(key) = spec.key.clone() else {
                     continue; // a keyless result never gets `FetchRun`s
                 };
-                // A newer run (higher `seq`) supersedes the last one — a scrollbar
+                // A newer run (higher `seq`) supersedes the last one; a scrollbar
                 // fling emits a stream of runs and only the latest matters. Cancel
                 // the previous in-flight run so its seek stops at the engine. `seq`
                 // is monotonic over the ordered command stream, so the guard against
@@ -1069,7 +1069,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                 seq,
                             },
                         ),
-                        // Superseded mid-flight — the newer run will deliver; stay
+                        // Superseded mid-flight: the newer run will deliver; stay
                         // silent rather than marking this seq failed or toasting.
                         Err(RedError::Interrupted) => {}
                         Err(e) => {
@@ -1093,7 +1093,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
                 let driver = state.driver.clone();
-                // Stale epoch (tab closed / re-sorted) — drop, like `FetchPage`.
+                // Stale epoch (tab closed / re-sorted); drop, like `FetchPage`.
                 let Some(sql) = lock(&state.results).get(&epoch).map(|s| s.sql.clone()) else {
                     continue;
                 };
@@ -1198,7 +1198,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                 stats,
                             },
                         ),
-                        // Superseded mid-flight (the selection moved) — stay silent;
+                        // Superseded mid-flight (the selection moved): stay silent;
                         // the newer request delivers.
                         Err(RedError::Interrupted) => {}
                         // Pane-scoped failure (shown in the bar), not a global toast.
@@ -1225,7 +1225,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 match driver.execute(&sql).await {
                     Ok(affected) => {
                         // A write may have shifted rows under any open result, so
-                        // drop the checkpoint indexes — they rebuild lazily on the
+                        // drop the checkpoint indexes; they rebuild lazily on the
                         // next deep jump rather than serving from stale keys.
                         for spec in lock(&results).values() {
                             let mut idx = lock(&spec.checkpoints);
@@ -1289,7 +1289,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
                 let driver = state.driver.clone();
-                // A plan is one bounded round-trip — no cursor, no windowing. The
+                // A plan is one bounded round-trip: no cursor, no windowing. The
                 // failure is pane-local (`PlanFailed`), not a global error toast.
                 match driver.explain(&sql, analyze).await {
                     Ok(plan) => emit(&events, session_id, Event::PlanReady { epoch, plan }),
@@ -1786,7 +1786,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
     ai_acp.lock().await.clear();
 }
 
-/// The UI may have dropped its receiver (window closed) — a failed send is the
+/// The UI may have dropped its receiver (window closed); a failed send is the
 /// expected shutdown path, not an error. `session` tags the event so the UI
 /// routes it to the right workspace (`None` for the session-less probe replies).
 pub(crate) fn emit(events: &Events, session: Option<SessionId>, event: Event) {
@@ -1797,11 +1797,11 @@ pub(crate) fn emit(events: &Events, session: Option<SessionId>, event: Event) {
 /// `Value` per its mapped target column ([`coerce_edit_value`]) and inserting in
 /// chunks of `chunk_size` rows. Runs on a blocking thread (file IO); each chunk's
 /// async [`insert_rows`](DatabaseDriver::insert_rows) is driven with
-/// `handle.block_on`. Holds at most one chunk in memory — never the whole file.
+/// `handle.block_on`. Holds at most one chunk in memory, never the whole file.
 ///
 /// Inserts **commit per chunk** (v1), so the returned committed count is meaningful
 /// even on error/cancel: a mid-file failure leaves earlier chunks committed (atomic
-/// whole-file import is a future option — see `docs/plans/data-import.md`). `cancel`
+/// whole-file import is a future option; see `docs/plans/data-import.md`). `cancel`
 /// is checked between rows. Returns `(rows committed, error-or-None)`.
 #[allow(clippy::too_many_arguments)]
 fn run_import_blocking(
@@ -1899,9 +1899,9 @@ fn run_import_blocking(
 }
 
 /// Stream an open result (`source_sql`, already filtered/sorted/wrapped) from `src`
-/// straight into `target` on `dst` — the table-copy job. Reuses the read seam
+/// straight into `target` on `dst`: the table-copy job. Reuses the read seam
 /// (`open_cursor`/`next_window`, **full fidelity** so a long TEXT/blob copies
-/// byte-exact, never the display cap — `data-import.md`'s Gap 2) and the write seam
+/// byte-exact, never the display cap; `data-import.md`'s Gap 2) and the write seam
 /// (`insert_rows`); `src` and `dst` may be the same driver (same-connection copy) or
 /// two different engines (cross-connection). One window is resident at a time, so
 /// memory is bounded by [`COPY_CHUNK_ROWS`], not row count.
@@ -1993,7 +1993,7 @@ async fn copy_job(
 /// Stream `source_sql` from `src` into `target` on `dst`: open a full-fidelity forward
 /// cursor (each source row seen exactly once, never `Value::Capped`), project each row
 /// into target-column order by the source index `mapping` carries, and `insert_rows` in
-/// chunks — committing per chunk so the returned count is meaningful on error/cancel.
+/// chunks, committing per chunk so the returned count is meaningful on error/cancel.
 /// `on_progress(total)` is called after each committed chunk with `base` plus the rows
 /// committed so far, so a single copy reports its own running count and a multi-table
 /// migrate reports a *cumulative* count across tables. `cancel` is checked between
@@ -2055,8 +2055,8 @@ async fn stream_into(
     (committed, None)
 }
 
-/// Order `tables` so a table's foreign-key parents come **before** it (children last)
-/// — Kahn's algorithm over the FK edges restricted to the migrated set, ties broken by
+/// Order `tables` so a table's foreign-key parents come **before** it (children last):
+/// Kahn's algorithm over the FK edges restricted to the migrated set, ties broken by
 /// input order, cycles broken by emitting the next remaining table. Only edges whose
 /// *both* endpoints are in `tables` (and, when `schema` is given, in that namespace)
 /// constrain the order; self-references are ignored. With v1 not yet recreating FKs the
@@ -2120,7 +2120,7 @@ fn order_by_fk(tables: &[String], schema: Option<&str>, fks: &[FkEdge]) -> Vec<S
     out
 }
 
-/// Migrate many tables from `src` into `dst` in one job — the whole-database move.
+/// Migrate many tables from `src` into `dst` in one job: the whole-database move.
 /// Orders the tables FK-parents-first ([`order_by_fk`]), skips any that already exist
 /// on the target (migrate populates a *fresh* database, never appends into an existing
 /// table), and for each: `describe_table` → `create_table` (column shape mapped into
@@ -2238,7 +2238,7 @@ async fn migrate_job(
 
     // Deferred index pass: recreate secondary indexes after the data loads, skipping
     // the primary-key-backing / engine-auto index (already created with the table).
-    // Best-effort — a failed index is logged, not fatal (the data is already in).
+    // Best-effort; a failed index is logged, not fatal (the data is already in).
     for (table, detail) in &migrated {
         if cancel.load(Ordering::Relaxed) {
             return (committed, Some(RedError::Interrupted));
@@ -2274,7 +2274,7 @@ async fn migrate_job(
     }
 
     // Deferred FK pass: recreate foreign keys among the migrated set now that every
-    // table exists + is filled (so dependency order can't block). Best-effort — logged,
+    // table exists + is filled (so dependency order can't block). Best-effort: logged,
     // not fatal, and a no-op on engines that can't `ALTER … ADD a foreign key (SQLite).
     let migrated_set: std::collections::HashSet<String> = migrated
         .iter()
@@ -2290,7 +2290,7 @@ async fn migrate_job(
             return (committed, Some(RedError::Interrupted));
         }
         // Only FKs whose both endpoints were migrated (and, when scoped, in the source
-        // schema) — mirrors `order_by_fk`'s in-scope rule.
+        // schema), mirroring `order_by_fk`'s in-scope rule.
         if !migrated_set.contains(&fk.from_table.to_ascii_lowercase())
             || !migrated_set.contains(&fk.to_table.to_ascii_lowercase())
             || !in_scope(&fk.from_schema)

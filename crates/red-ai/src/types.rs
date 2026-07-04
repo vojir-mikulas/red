@@ -1,5 +1,5 @@
 //! Provider-agnostic conversation, tool, and streaming types. These are the only
-//! types that cross the [`AiProvider`](crate::AiProvider) seam — no vendor wire
+//! types that cross the [`AiProvider`](crate::AiProvider) seam: no vendor wire
 //! format leaks above it, the same way `DatabaseDriver` is the only seam to
 //! database engines. A second provider (OpenAI, a local Ollama endpoint) maps its
 //! own wire format to and from these.
@@ -27,7 +27,7 @@ pub enum Role {
 
 /// One content block of a message. The agentic loop appends the model's
 /// `Assistant` turn (text + any `ToolUse` blocks) verbatim, then a `User` turn
-/// carrying one `ToolResult` per `ToolUse`, and re-asks — the standard Messages
+/// carrying one `ToolResult` per `ToolUse`, and re-asks: the standard Messages
 /// API tool-use loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -35,7 +35,7 @@ pub enum ContentBlock {
     /// Model- or user-authored prose.
     Text { text: String },
     /// A summarized-thinking block. Carried so the assistant turn round-trips
-    /// unchanged on the next loop iteration — the Messages API rejects a tool-use
+    /// unchanged on the next loop iteration; the Messages API rejects a tool-use
     /// follow-up whose thinking blocks were dropped or edited. `signature` is the
     /// opaque attestation echoed back verbatim.
     Thinking { text: String, signature: String },
@@ -98,7 +98,7 @@ pub enum Delta {
     ToolUseStarted { id: String, name: String },
 }
 
-/// Why a turn ended — drives the agentic loop.
+/// Why a turn ended. Drives the agentic loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     /// The model finished its answer; the loop ends.
@@ -130,7 +130,7 @@ pub struct TurnOutcome {
     pub usage: Usage,
 }
 
-/// Errors a provider can raise. Kept coarse — the UI shows the message; the
+/// Errors a provider can raise. Kept coarse: the UI shows the message; the
 /// service maps it to an `AiError` event.
 #[derive(Debug, thiserror::Error)]
 pub enum AiError {

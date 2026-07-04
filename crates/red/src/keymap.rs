@@ -1,4 +1,4 @@
-//! The central keymap — the single place every global `actions!` declaration and
+//! The central keymap: the single place every global `actions!` declaration and
 //! `KeyBinding` registration lives, grouped by context behind one [`apply`]. It is
 //! one source of truth for "what is bound", and the seam for the user-configurable
 //! keymap: [`apply`] installs the [`DEFAULTS`] table, then layers the overrides a
@@ -12,8 +12,8 @@
 //! and never collide with the editing keys that Flint's `TextInput` / `CodeEditor`
 //! / `Palette` contexts swallow deeper in the focus path:
 //!
-//! - no context — true globals that work from any phase (`⌘K`, `⌘Q`, …);
-//! - `RedRoot` — app-chrome actions (tabs, sidebar, copy) that should fire from
+//! - no context: true globals that work from any phase (`⌘K`, `⌘Q`, …);
+//! - `RedRoot`: app-chrome actions (tabs, sidebar, copy) that should fire from
 //!   any focus *within* the app, since `RedRoot` is an ancestor of every pane.
 //!
 //! The table is written in canonical `cmd-*` form, but [`platform_chord`] rewrites
@@ -22,7 +22,7 @@
 //!
 //! **Re-applying.** [`apply`] is total: it `clear_key_bindings`, re-installs the
 //! Flint component keymaps, the defaults, and the overrides, every time. That is
-//! how a live `keymap.toml` edit takes effect with no restart — and why the
+//! how a live `keymap.toml` edit takes effect with no restart, and why the
 //! Flint keymaps must be re-bound here, not once at startup: a clear wipes them.
 
 use std::collections::BTreeMap;
@@ -68,10 +68,10 @@ actions!(
         CycleFocusPrev,
         /// Open the keyboard-shortcuts reference overlay.
         ShowShortcuts,
-        /// Open the "What's New" changelog overlay. No default binding — reached
+        /// Open the "What's New" changelog overlay. No default binding; reached
         /// from the Help menu and the `help: what's new` palette command.
         ShowChangelog,
-        /// ⌘↵ from anywhere: run the active tab's query — or, while the connection
+        /// ⌘↵ from anywhere: run the active tab's query; or, while the connection
         /// form is open, test the connection.
         RunQuery,
         /// Open a new-connection form (the disconnected screen's ⌘N).
@@ -81,7 +81,7 @@ actions!(
         /// Open the settings panel on its About tab (RED → About RED in the menu).
         About,
         /// Open the GitHub issue tracker in the browser (Help → Report a Bug…).
-        /// Menu-only, like `About` — no default shortcut, so it's absent from
+        /// Menu-only, like `About`: no default shortcut, so it's absent from
         /// `DEFAULTS`/the keymap editor.
         ReportBug,
         /// Open the connection switcher popover (⌘P).
@@ -91,35 +91,35 @@ actions!(
         SwitchToPreviousConnection,
         /// Open or close the cell detail inspector (⌘I).
         ToggleInspector,
-        /// Close the cell detail inspector (Esc) — a no-op when it's shut.
+        /// Close the cell detail inspector (Esc); a no-op when it's shut.
         CloseInspector,
         /// Open or close the AI assistant chat panel (⌘L).
         ToggleAssistant,
-        /// Open or close the result filter bar (⌘⇧F) — Track B2.
+        /// Open or close the result filter bar (⌘⇧F). Track B2.
         ToggleFilter,
-        /// Open or close the find-in-result bar (⌘F when the grid is focused) —
+        /// Open or close the find-in-result bar (⌘F when the grid is focused).
         /// Track B2, Tier 1.
         FindInResult,
-        /// Save the active tab's query as a named snippet (⇧⌘S) — Track B3.
+        /// Save the active tab's query as a named snippet (⇧⌘S). Track B3.
         SaveQuery,
-        /// Open the saved-query picker (⇧⌘O) — Track B3.
+        /// Open the saved-query picker (⇧⌘O); Track B3.
         OpenSavedQueries,
-        /// Explain the active tab's query — open the plan view (⇧⌘E) — Track B4.
+        /// Explain the active tab's query: open the plan view (⇧⌘E). Track B4.
         Explain,
-        /// Begin editing the focused result cell in place (Enter / F2) — Track B6.
+        /// Begin editing the focused result cell in place (Enter / F2). Track B6.
         BeginEdit,
-        /// Submit the staged grid edits as one batch (⌘↵ in the grid) — Track B6.
+        /// Submit the staged grid edits as one batch (⌘↵ in the grid); Track B6.
         /// Falls back to running the query when nothing is staged.
         SubmitChanges,
-        /// Discard the staged grid edits (⌘⌥Z) — Track B6.
+        /// Discard the staged grid edits (⌘⌥Z). Track B6.
         RevertChanges,
-        /// Toggle deletion of the selected result row(s) (⌘⌫) — Track B6.
+        /// Toggle deletion of the selected result row(s) (⌘⌫); Track B6.
         DeleteRow,
-        /// Append a new draft (insert) row to the result (⌘⌥N) — Track B6.
+        /// Append a new draft (insert) row to the result (⌘⌥N). Track B6.
         AddRow,
-        /// Set the focused result cell to NULL (⌘⌥0) — Track B6.
+        /// Set the focused result cell to NULL (⌘⌥0); Track B6.
         SetNull,
-        /// Select the whole result — every row and data column (⌘A in the grid).
+        /// Select the whole result: every row and data column (⌘A in the grid).
         SelectAll,
         /// Toggle the side-by-side split (⌘\): open a second query pane to the right
         /// of the active one, or collapse the split back to one pane.
@@ -240,11 +240,11 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
 
 /// Rewrite RED's canonical `cmd-*` chords onto the key GPUI actually matches per
 /// platform. `cmd` is the primary modifier (the Cmd key) only on macOS; on
-/// Windows/Linux a bare `cmd` token binds the Win/Super key, which the OS owns —
+/// Windows/Linux a bare `cmd` token binds the Win/Super key, which the OS owns,
 /// so every default would be dead there. GPUI's `secondary` token resolves to
 /// Cmd on macOS and Ctrl elsewhere, so swapping the `cmd` component for it makes
 /// the bindings fire as the user expects on every platform. `ctrl`, `alt`,
-/// `shift` and literal-`ctrl` chords (`ctrl-tab`, `ctrl-g`) are left alone — they
+/// `shift` and literal-`ctrl` chords (`ctrl-tab`, `ctrl-g`) are left alone; they
 /// mean the same physical key everywhere. Applied at the single bind chokepoint
 /// ([`bind_named`]) so defaults *and* `keymap.toml` overrides get the same
 /// treatment; the canonical `cmd-*` form is what the editor and file still use.
@@ -272,7 +272,7 @@ fn platform_chord(chord: &str) -> String {
 /// glyphs (`Ctrl`/`Alt`/`Shift`, with the `⌘` primary folded onto `Ctrl` to match
 /// what [`platform_chord`] binds) and `+`-joins them, e.g. `⌘⇧F` → `Ctrl+Shift+F`.
 /// Non-modifier glyphs (arrows, `↵`) and plain text pass through unchanged, so it
-/// is safe to run over any hint string — including ones with no shortcut at all.
+/// is safe to run over any hint string, including ones with no shortcut at all.
 pub(crate) fn localize_hint(hint: &str) -> String {
     if cfg!(target_os = "macos") {
         return hint.to_string();
@@ -320,16 +320,16 @@ fn localize_token(token: &str) -> String {
 
 /// One default binding and the metadata the keymap editor needs to present it.
 /// `action` is the short name a user writes in `keymap.toml`, so this table
-/// doubles as the bindable-action allowlist — every name here is one
+/// doubles as the bindable-action allowlist: every name here is one
 /// [`bind_named`] resolves; `label` is the human title the editor shows.
 /// `context = None` is a true global; `Some("RedRoot")` is app chrome (see the
 /// module doc for why each lives where it does). An action with two default keys
-/// (e.g. `BeginEdit`: Enter and F2) appears once per key — the editor lists each
+/// (e.g. `BeginEdit`: Enter and F2) appears once per key; the editor lists each
 /// as its own rebindable row.
 pub(crate) struct ActionDef {
     /// The default keystroke, in `keymap.toml`'s canonical form (`cmd-shift-f`).
     pub keystroke: &'static str,
-    /// The action name — the allowlist key and what `keymap.toml` writes.
+    /// The action name: the allowlist key and what `keymap.toml` writes.
     pub action: &'static str,
     /// The human label the editor shows for this row.
     pub label: &'static str,
@@ -337,7 +337,7 @@ pub(crate) struct ActionDef {
     pub context: Option<&'static str>,
 }
 
-/// The full bindable-action registry — RED's built-in keybindings and the source
+/// The full bindable-action registry: RED's built-in keybindings and the source
 /// of truth a user's `keymap.toml` overlays. One row per default binding; read by
 /// [`apply`] (to install the defaults) and by the keymap editor (to list every
 /// rebindable action). Grouped to mirror the keyboard reference; the per-binding
@@ -365,7 +365,7 @@ const DEFAULTS: &[ActionDef] = &[
     // focus path and wins); it only reaches here when neither is focused.
     def("cmd-c", "CopyResult", "Copy selection", Some("RedRoot")),
     // ⌘I toggles the cell detail inspector; Esc closes it. `RedRoot`-scoped so the
-    // editor / a field / a modal (deeper contexts) keep their own ⌘I / Esc — this
+    // editor / a field / a modal (deeper contexts) keep their own ⌘I / Esc; this
     // fires only from the grid, schema, or root, where Esc was otherwise unbound.
     def(
         "cmd-i",
@@ -408,7 +408,7 @@ const DEFAULTS: &[ActionDef] = &[
     // is palette / run-bar only (it executes the statement).
     def("cmd-shift-e", "Explain", "Explain query", Some("RedRoot")),
     // Tab management. `RedRoot` is an ancestor of the editor, so these still fire
-    // while it's focused — none collide with the editor's keys (it binds plain
+    // while it's focused; none collide with the editor's keys (it binds plain
     // `tab`, not `ctrl-tab`).
     def("cmd-t", "NewTab", "New tab", Some("RedRoot")),
     def("cmd-w", "CloseTab", "Close tab", Some("RedRoot")),
@@ -454,7 +454,7 @@ const DEFAULTS: &[ActionDef] = &[
         Some("RedRoot"),
     ),
     // Discoverability. `⌘/` (not `?`) so typing `?` into the editor or a field
-    // still inserts the character — a global `?` binding would swallow it.
+    // still inserts the character (a global `?` binding would swallow it).
     def(
         "cmd-/",
         "ShowShortcuts",
@@ -463,14 +463,14 @@ const DEFAULTS: &[ActionDef] = &[
     ),
     // ⌘↵ runs the active tab's query from any pane. The editor's deeper
     // `CodeEditor` context keeps its own ⌘↵ (so a focused editor runs through its
-    // Run event); this covers every other focus — grid, schema, root — and tests
+    // Run event); this covers every other focus (grid, schema, root) and tests
     // the connection while the form is open.
     def("cmd-enter", "RunQuery", "Run query", Some("RedRoot")),
     // ⌘N opens a new-connection form on the welcome screen (no-op elsewhere).
     def("cmd-n", "NewConnection", "New connection", Some("RedRoot")),
     // Settings. `⌘,` is the macOS-standard binding; the menu's RED → Settings…
     // item displays this accelerator by looking the action up here. About has no
-    // shortcut — it's reachable only from the menu.
+    // shortcut; it's reachable only from the menu.
     def("cmd-,", "Settings", "Settings", Some("RedRoot")),
     // Side-by-side split: ⌘\ toggles a second query pane (the Zed idiom); ⌥⌘\ jumps
     // focus to the other half. `RedRoot`-scoped so they fire from any pane's focus.
@@ -515,12 +515,12 @@ const DEFAULTS: &[ActionDef] = &[
     def("cmd-alt-n", "AddRow", "Add row", Some("Table")),
     def("cmd-alt-0", "SetNull", "Set cell to NULL", Some("Table")),
     // ⌘A selects the whole result. `Table`-scoped so it fires only with the grid
-    // focused — a focused text field / SQL editor (deeper contexts) keeps its own
+    // focused; a focused text field / SQL editor (deeper contexts) keeps its own
     // ⌘A (select all text).
     def("cmd-a", "SelectAll", "Select all", Some("Table")),
     // ⌘F finds within the focused pane: loaded rows in the grid, text in the SQL
     // editor. Bound in `Table` and `CodeEditor` (both below `RedRoot`), so it wins
-    // over `RedRoot`'s `SearchSchema` only while one of those is focused —
+    // over `RedRoot`'s `SearchSchema` only while one of those is focused;
     // elsewhere ⌘F still focuses the schema filter. The single `FindInResult`
     // handler picks the target from which pane holds focus.
     def("cmd-f", "FindInResult", "Find", Some("Table")),
@@ -528,7 +528,7 @@ const DEFAULTS: &[ActionDef] = &[
 ];
 
 /// A `const fn` shorthand so [`DEFAULTS`] reads as a compact table rather than a
-/// wall of struct-literal field names — every row is one `def(key, action, label,
+/// wall of struct-literal field names; every row is one `def(key, action, label,
 /// context)`.
 const fn def(
     keystroke: &'static str,
@@ -544,7 +544,7 @@ const fn def(
     }
 }
 
-/// The bindable-action registry — every default binding, for the keymap editor to
+/// The bindable-action registry: every default binding, for the keymap editor to
 /// list and rebind. One row per default keystroke (an action with two default
 /// keys appears twice).
 pub(crate) fn action_defs() -> &'static [ActionDef] {
@@ -553,13 +553,13 @@ pub(crate) fn action_defs() -> &'static [ActionDef] {
 
 /// The editor's per-row "effective keystroke" model: a slot for each [`ActionDef`]
 /// (same length and order as [`action_defs`]), holding the keystroke that row is
-/// currently bound to — `Some(k)` bound, `None` unbound. The pure bridge between
+/// currently bound to: `Some(k)` bound, `None` unbound. The pure bridge between
 /// the per-keystroke `keymap.toml` and the per-action editor; [`effective_slots`]
 /// reads it, [`diff_blocks`] writes it back.
 pub(crate) type Slots = Vec<Option<String>>;
 
 /// Build the effective per-row keystrokes by overlaying a user's override blocks
-/// on the defaults — the editor's read model. Each row starts at its default
+/// on the defaults; the editor's read model. Each row starts at its default
 /// keystroke; an `keystroke = action` override moves that action's row onto the
 /// keystroke, and an `"unbind"`/`"none"` clears whichever row currently sits on
 /// the keystroke. Mirrors GPUI's own last-wins resolution closely enough for the
@@ -611,13 +611,13 @@ pub(crate) fn effective_slots(blocks: &[KeymapBlock]) -> Slots {
 }
 
 /// Translate the editor's per-row model back into the *minimal* `keymap.toml`
-/// override blocks — the inverse of [`effective_slots`]. A row still on its
+/// override blocks, the inverse of [`effective_slots`]. A row still on its
 /// default emits nothing; a moved row emits its new `keystroke = action`; and a
 /// default keystroke that no row occupies any more is emitted as `"unbind"` so the
 /// freed default stops firing its old action. This minimality is what keeps a
 /// GUI-written file small and interchangeable with a hand-edited one.
 pub(crate) fn diff_blocks(slots: &Slots) -> Vec<KeymapBlock> {
-    // Every keystroke a row currently occupies, per context — used to decide
+    // Every keystroke a row currently occupies, per context, used to decide
     // whether a freed default needs an explicit unbind (it doesn't if another
     // action's override already shadows it).
     let occupied: Vec<Option<&str>> = slots.iter().map(Option::as_deref).collect();
@@ -632,16 +632,16 @@ pub(crate) fn diff_blocks(slots: &Slots) -> Vec<KeymapBlock> {
     for (i, d) in DEFAULTS.iter().enumerate() {
         let ctx_owned = d.context.map(str::to_string);
         match slots[i].as_deref() {
-            // On its default — nothing to emit.
+            // On its default: nothing to emit.
             Some(k) if k == d.keystroke => {}
-            // Moved to a new key — bind it; the freed default is handled below.
+            // Moved to a new key: bind it; the freed default is handled below.
             Some(k) => {
                 by_ctx
                     .entry(ctx_owned)
                     .or_default()
                     .insert(k.to_string(), d.action.to_string());
             }
-            // Unbound — nothing positive to emit; the freed default is handled below.
+            // Unbound: nothing positive to emit; the freed default is handled below.
             None => {}
         }
         // The row left its default key. If no other row took that key, the default
@@ -660,7 +660,7 @@ pub(crate) fn diff_blocks(slots: &Slots) -> Vec<KeymapBlock> {
         .collect()
 }
 
-/// The row, if any, that already binds `keystroke` in the same context as `row` —
+/// The row, if any, that already binds `keystroke` in the same context as `row`,
 /// i.e. a collision a rebind to `keystroke` would create. The editor surfaces this
 /// before committing so a duplicate is never a silent shadow.
 pub(crate) fn conflict_for(slots: &Slots, row: usize, keystroke: &str) -> Option<usize> {
@@ -685,8 +685,8 @@ pub(crate) fn apply(cx: &mut App, overrides: &[KeymapBlock]) -> Vec<String> {
     bind_components(cx);
     cx.bind_keys(default_bindings());
     // ⌘1–⌘9 jump to the first nine connections in the switcher's order. Bound here
-    // (not in DEFAULTS) so the nine slots stay out of the rebind editor — like the
-    // OS-shortcut Alt+F4 below — and as true globals (no context) so they fire from
+    // (not in DEFAULTS) so the nine slots stay out of the rebind editor (like the
+    // OS-shortcut Alt+F4 below), and as true globals (no context) so they fire from
     // any focus. `platform_chord` makes them Cmd on macOS / Ctrl elsewhere.
     cx.bind_keys((1..=9u8).map(|n| {
         KeyBinding::new(
@@ -695,7 +695,7 @@ pub(crate) fn apply(cx: &mut App, overrides: &[KeymapBlock]) -> Vec<String> {
             None,
         )
     }));
-    // Alt+F4 closes the window — the Windows and (most) Linux convention. It
+    // Alt+F4 closes the window, the Windows and (most) Linux convention. It
     // usually arrives from the OS / compositor, but not every Wayland compositor
     // binds it, so wire it explicitly. Bound here rather than in `DEFAULTS` so it
     // stays out of the rebind editor (it's an OS shortcut, not app chrome), and
@@ -751,7 +751,7 @@ fn default_bindings() -> Vec<KeyBinding> {
 
 /// Compile a user's override blocks into bindings, pushing a warning for each
 /// entry it has to skip (bad context, bad keystroke, unknown action) so one typo
-/// never drops the rest — mirroring how `settings.toml` degrades per section.
+/// never drops the rest, mirroring how `settings.toml` degrades per section.
 fn user_bindings(blocks: &[KeymapBlock], warnings: &mut Vec<String>) -> Vec<KeyBinding> {
     let mut out = Vec::new();
     for block in blocks {
@@ -761,7 +761,7 @@ fn user_bindings(blocks: &[KeymapBlock], warnings: &mut Vec<String>) -> Vec<KeyB
         if let Some(c) = context {
             if let Err(e) = KeyBindingContextPredicate::parse(c) {
                 warnings.push(format!(
-                    "keymap.toml: bad context “{c}” ({e}) — skipping its bindings"
+                    "keymap.toml: bad context “{c}” ({e}); skipping its bindings"
                 ));
                 continue;
             }
@@ -785,11 +785,11 @@ fn make_binding(
     context: Option<&str>,
 ) -> Result<KeyBinding, String> {
     if keystroke.split_whitespace().next().is_none() {
-        return Err("empty keystroke — skipping".to_string());
+        return Err("empty keystroke; skipping".to_string());
     }
     for token in keystroke.split_whitespace() {
         Keystroke::parse(token)
-            .map_err(|e| format!("can't parse keystroke “{keystroke}” ({e}) — skipping"))?;
+            .map_err(|e| format!("can't parse keystroke “{keystroke}” ({e}); skipping"))?;
     }
     bind_named(keystroke, action, context)
 }
@@ -853,7 +853,7 @@ fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<Ke
         "SelectAll" => kb!(SelectAll),
         "ToggleSplit" => kb!(ToggleSplit),
         "FocusOtherHalf" => kb!(FocusOtherHalf),
-        other => return Err(format!("unknown action “{other}” — skipping")),
+        other => return Err(format!("unknown action “{other}”; skipping")),
     })
 }
 
@@ -905,7 +905,7 @@ mod tests {
         assert_eq!(localize_token("⇧⌘E"), "Ctrl+Shift+E");
         assert_eq!(localize_token("⌃Tab"), "Ctrl+Tab");
         assert_eq!(localize_token("⌘↵"), "Ctrl+↵");
-        // No leading modifier — plain text and arrows are returned verbatim.
+        // No leading modifier: plain text and arrows are returned verbatim.
         assert_eq!(localize_token("Settings"), "Settings");
         assert_eq!(localize_token("→"), "→");
         assert_eq!(localize_token("/"), "/");
@@ -931,7 +931,7 @@ mod tests {
         let mut warnings = Vec::new();
         let block = KeymapBlock {
             // A trailing key component after the key is a structural parse error
-            // (the same one `KeyBinding::new` would panic on — caught here instead).
+            // (the same one `KeyBinding::new` would panic on, caught here instead).
             context: None,
             bindings: [("cmd-a-b".to_string(), "Quit".to_string())]
                 .into_iter()
@@ -1041,7 +1041,7 @@ mod tests {
             block.bindings.get("cmd-t").map(String::as_str),
             Some("CloseTab")
         );
-        // No stray unbinds — both defaults are still occupied (by the other action).
+        // No stray unbinds; both defaults are still occupied (by the other action).
         assert!(!block.bindings.values().any(|v| v == "unbind"));
         assert_eq!(effective_slots(&out), slots, "swap round-trips");
     }

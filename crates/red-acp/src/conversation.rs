@@ -37,7 +37,7 @@ type SinkCell = Arc<Mutex<Option<mpsc::UnboundedSender<AcpDelta>>>>;
 /// Lock a cell, recovering from poisoning instead of panicking. These cells hold
 /// a turn's sink and running usage; the streaming notification handler and the
 /// turn loop share them, so a panic on one side must not cascade into a poisoned
-/// `unwrap()` that takes down the whole turn task — the inner value is always a
+/// `unwrap()` that takes down the whole turn task; the inner value is always a
 /// valid (if stale) snapshot to keep working from.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -87,7 +87,7 @@ impl AcpConversation {
         tokio::spawn(run_connection(config, cmd_rx, ready_tx));
         match ready_rx.await {
             Ok(result) => result.map(|()| Self { cmd_tx }),
-            // The task ended before signalling readiness — treat as a spawn failure.
+            // The task ended before signalling readiness; treat as a spawn failure.
             Err(_) => Err(AcpError::Closed),
         }
     }
@@ -135,7 +135,7 @@ impl AcpConversation {
     }
 
     /// Whether the connection task is still running. A closed command channel
-    /// means the connection ended — the agent exited or crashed — so the next
+    /// means the connection ended (the agent exited or crashed), so the next
     /// prompt would only ever return [`AcpError::Closed`]. The service checks
     /// this to drop a dead conversation and start a fresh one instead of
     /// prompting a corpse.
@@ -167,7 +167,7 @@ async fn run_connection(
     let sink_handler = active_sink.clone();
     let usage_handler = usage_cell.clone();
     // The agent's advertised slash commands go out of band (connection-lifetime),
-    // not through the active turn's sink — they arrive right after the session opens.
+    // not through the active turn's sink; they arrive right after the session opens.
     let commands_handler = config.commands.clone();
     // Session config selectors (model / reasoning): one clone updates the notification
     // handler on `ConfigOptionUpdate`, the other ships the initial set from `session/new`.
@@ -235,11 +235,11 @@ async fn run_connection(
         .await;
 
     if let Err(e) = result {
-        // If readiness hadn't fired yet, the agent never came up — the subprocess
+        // If readiness hadn't fired yet, the agent never came up: the subprocess
         // failed to spawn (Node/Claude Code missing or unreachable) or the
         // transport died mid-handshake. Surface the friendly "is Node.js
         // installed?" hint, keeping the raw cause in the detail. If readiness had
-        // already fired, this is a later teardown — just trace it.
+        // already fired, this is a later teardown; just trace it.
         if !signal(&ready, Err(AcpError::Spawn(e.to_string()))) {
             tracing::debug!("ACP connection ended: {e}");
         }
@@ -263,7 +263,7 @@ async fn start_session(
         .block_task()
         .await?;
 
-    // If the agent advertises an auth method, run the first one — for Claude
+    // If the agent advertises an auth method, run the first one; for Claude
     // Code's subscription this triggers its own browser `/login`. Red never sees
     // the tokens. (When already logged in, no methods are advertised.)
     if let Some(method) = init.auth_methods.first() {
@@ -321,7 +321,7 @@ async fn run_turns(
     while let Some(cmd) = cmd_rx.recv().await {
         let (text, sink, done) = match cmd {
             Cmd::Prompt { text, sink, done } => (text, sink, done),
-            // A Cancel with no active turn — nothing to do.
+            // A Cancel with no active turn; nothing to do.
             Cmd::Cancel => continue,
             // Config changes (model / reasoning) happen between turns: issue the
             // request and reply with the refreshed option set.
@@ -539,7 +539,7 @@ fn text_of(block: &ContentBlock) -> String {
     }
 }
 
-/// No filesystem, no terminal — the agent is corralled to the MCP DB tools.
+/// No filesystem, no terminal: the agent is corralled to the MCP DB tools.
 fn restricted_capabilities() -> ClientCapabilities {
     ClientCapabilities::default()
         .fs(FileSystemCapabilities::new()
@@ -578,7 +578,7 @@ async fn decide_permission(
 
 /// Whether a tool call is one of Red's known read-only DB tools and so may run
 /// without prompting. A mutating tool kind is never auto-allowed even if its
-/// title matches — the gate for a future write tool stays closed by default.
+/// title matches; the gate for a future write tool stays closed by default.
 fn is_auto_allowed(tool_call: &ToolCallUpdate, allow_tools: &[String]) -> bool {
     if matches!(
         tool_call.fields.kind,
@@ -594,12 +594,12 @@ fn is_auto_allowed(tool_call: &ToolCallUpdate, allow_tools: &[String]) -> bool {
 
 /// Whether `title` *is* the tool `tool`, not merely mentions it. ACP doesn't carry
 /// the structured MCP tool name into the permission request, so we fall back to the
-/// call's title — but the MCP convention is that the title IS the tool name,
+/// call's title. But the MCP convention is that the title IS the tool name,
 /// optionally server-qualified: `run_select`, `red-db: run_select`, or
 /// `mcp__red-db__run_select`. We reduce the title to that trailing identifier and
 /// require it to equal the tool name exactly. That keeps the legitimate forms while
 /// refusing to auto-allow a tool whose title merely *contains* our name inside a
-/// longer human sentence (e.g. an unrelated `"fetch run_select docs"` Read tool) —
+/// longer human sentence (e.g. an unrelated `"fetch run_select docs"` Read tool);
 /// a bare-token match would wrongly green-light it. (Residual: a malicious agent
 /// can still title its own tool exactly `run_select`; the non-write `ToolKind`
 /// guard in `is_auto_allowed` and deny-default elsewhere are the backstop.)
@@ -607,7 +607,7 @@ fn title_names_tool(title: &str, tool: &str) -> bool {
     let tool = tool.to_ascii_lowercase();
     let lower = title.to_ascii_lowercase();
     // Strip a `server:`/path qualifier, then an `mcp__server__` prefix, leaving the
-    // bare tool identifier — which must match the tool name in full.
+    // bare tool identifier, which must match the tool name in full.
     let ident = lower
         .rsplit([':', '/'])
         .next()
@@ -681,7 +681,7 @@ fn map_stop(stop: StopReason) -> AcpStop {
 
 /// Fire the take-once readiness signal (idempotent; later calls are no-ops).
 /// Fire the take-once readiness signal. Returns `true` if this call delivered the
-/// result (the signal was still pending — startup hadn't completed), `false` if
+/// result (the signal was still pending: startup hadn't completed), `false` if
 /// readiness had already fired (so this is a later teardown).
 fn signal(ready: &ReadyCell, result: Result<(), AcpError>) -> bool {
     if let Some(tx) = lock(ready).take() {
@@ -728,7 +728,7 @@ mod tests {
     #[test]
     fn auto_allow_requires_a_whole_token_not_a_substring() {
         let tools = db_tools();
-        // A look-alike that merely *contains* a known tool name is NOT auto-allowed —
+        // A look-alike that merely *contains* a known tool name is NOT auto-allowed;
         // a loose substring match would wrongly wave these through.
         assert!(!is_auto_allowed(
             &call("run_select_then_drop", None),
@@ -741,7 +741,7 @@ mod tests {
     fn auto_allow_requires_the_title_to_be_the_tool_not_to_mention_it() {
         let tools = db_tools();
         // A non-DB tool whose title merely *mentions* our tool name inside a longer
-        // human sentence must NOT auto-allow — only the bare (optionally
+        // human sentence must NOT auto-allow; only the bare (optionally
         // server-qualified) identifier counts.
         assert!(!is_auto_allowed(
             &call("fetch run_select docs from the web", Some(ToolKind::Read)),

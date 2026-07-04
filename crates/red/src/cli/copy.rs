@@ -1,4 +1,4 @@
-//! `copy` and `migrate` — the two-connection verbs that seed a dev/staging
+//! `copy` and `migrate`: the two-connection verbs that seed a dev/staging
 //! database. Both open a **source** and a **target** session and send the exact
 //! `Command` the GUI sends (`CopyToTable` / `MigrateTables`), so the streamed,
 //! FK-ordered, per-chunk-committed jobs in `red-service` run verbatim.
@@ -7,7 +7,7 @@
 //!   target from the source's columns first). It opens the source as a result to
 //!   get an epoch + columns, name-maps onto the target, then fires `CopyToTable`.
 //! - `migrate` moves **many** tables create-fresh (skipping any that already
-//!   exist on the target), FK-ordered — the whole-schema headline. It just needs
+//!   exist on the target), FK-ordered (the whole-schema headline). It just needs
 //!   the table names + both sessions.
 
 use std::collections::HashSet;
@@ -105,7 +105,7 @@ pub fn cmd_copy(args: CopyArgs) -> u8 {
     let source_kind = source.kind;
     // The target's schema/database is needed to address the target table (SQLite's
     // describe/insert reject an empty schema). Default it per engine when
-    // `--target-schema` is absent — the same namespace the GUI's picker supplies.
+    // `--target-schema` is absent; the same namespace the GUI's picker supplies.
     let target_schema = args
         .target_schema
         .clone()
@@ -311,7 +311,7 @@ pub fn cmd_migrate(args: MigrateArgs) -> u8 {
 // ---- source result ---------------------------------------------------------
 
 /// Split `schema.table` into `(Some(schema), table)`, or `(None, table)` for a
-/// bare name. Only the first dot separates — a dotted table name is unusual and
+/// bare name. Only the first dot separates; a dotted table name is unusual and
 /// out of scope.
 fn split_table(table: &str) -> (Option<String>, String) {
     match table.split_once('.') {
@@ -380,7 +380,7 @@ fn open_source(
 /// The `--create` spec: a plain, nullable target column per source column (their
 /// types are mapped into the target dialect by `create_table`), plus the identity
 /// mapping. A query result carries no PK / not-null / default, so the new table's
-/// columns are plain — matching the GUI's "new table" copy.
+/// columns are plain, matching the GUI's "new table" copy.
 fn create_spec(source_cols: &[Column]) -> (Vec<ColumnMeta>, Vec<ColumnMap>) {
     let create = source_cols
         .iter()
@@ -426,7 +426,7 @@ fn auto_map(source_cols: &[Column], target_cols: &[Column]) -> Vec<ColumnMap> {
 }
 
 /// Describe the target table's columns (on the target session) for name-mapping.
-/// A describe failure comes back as `CopyFailed` — meaning the table doesn't exist
+/// A describe failure comes back as `CopyFailed`, meaning the table doesn't exist
 /// (use `--create`) or isn't reachable.
 fn describe_target(
     svc: &red_service::ServiceHandle,

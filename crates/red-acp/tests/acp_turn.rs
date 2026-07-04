@@ -1,5 +1,5 @@
 //! Drives the real ACP client (`AcpConversation`) against the canned fake agent
-//! (`src/bin/red-acp-fake-agent.rs`) over stdio — no subscription, no network.
+//! (`src/bin/red-acp-fake-agent.rs`) over stdio: no subscription, no network.
 //! Asserts the handshake + session come up, a turn streams text and finishes, and
 //! cancel stops an in-flight turn.
 
@@ -66,7 +66,7 @@ async fn cancel_stops_an_inflight_turn() {
     // "HANG" makes the fake agent wait for session/cancel before finishing.
     let done = conv.prompt("please HANG".to_string(), sink);
 
-    // Once any streamed delta lands, the turn is in flight — cancel it.
+    // Once any streamed delta lands, the turn is in flight; cancel it.
     let _ = deltas.recv().await;
     conv.cancel();
 

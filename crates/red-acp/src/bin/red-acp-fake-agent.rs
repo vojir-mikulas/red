@@ -1,4 +1,4 @@
-//! A canned ACP **agent** used only by `red-acp`'s integration test — it lets the
+//! A canned ACP **agent** used only by `red-acp`'s integration test; it lets the
 //! real client (`AcpConversation`) be driven end-to-end over stdio without a
 //! subscription or network. It speaks the agent side of ACP with the same SDK:
 //!
@@ -6,15 +6,15 @@
 //! - `session/new` → returns a fixed session id.
 //! - `session/prompt` → streams a thought + two text chunks, then ends the turn.
 //!   If the prompt text contains `HANG`, it instead waits for `session/cancel`
-//!   and reports `Cancelled` — so the cancel path is testable. If it contains
+//!   and reports `Cancelled`, so the cancel path is testable. If it contains
 //!   `PERMIT`, it first asks the client for tool permission (a `run_select`-named
 //!   tool unless the text also contains `UNKNOWN`) and streams `GRANTED`/`DENIED`
-//!   reflecting the client's decision — so the M-S2 permission path is testable.
+//!   reflecting the client's decision, so the M-S2 permission path is testable.
 //!   If it contains `EXIT`, it exits non-zero mid-turn (simulating a crash) so the
 //!   client's death detection (M-S3 restart-on-crash) is testable.
 //!
 //! (The MCP tool round-trip is covered separately by `red-service`'s MCP server
-//! tests, so this fixture stays dependency-free — just the ACP SDK.)
+//! tests, so this fixture stays dependency-free: just the ACP SDK.)
 
 use std::sync::Arc;
 
@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
                         );
                     }
                     if text.contains("HANG") {
-                        // Wait for `session/cancel` to respond — but do it OFF the
+                        // Wait for `session/cancel` to respond, but do it OFF the
                         // message loop (via `cx.spawn`) so the loop stays free to
                         // dispatch that very notification. Awaiting here would
                         // deadlock the connection.
@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
                             ],
                         );
                         // Send the request and respond to the prompt once the
-                        // client answers — the idiomatic way for an agent to call
+                        // client answers: the idiomatic way for an agent to call
                         // back mid-turn (keeps the message loop free).
                         let reply_cx = cx.clone();
                         let reply_sid = sid.clone();

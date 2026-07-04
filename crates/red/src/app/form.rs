@@ -79,7 +79,7 @@ impl AppState {
         self.form = Some(FormState {
             kind,
             color: 3,
-            // Read-only by default — RED's safe-by-default posture.
+            // Read-only by default, RED's safe-by-default posture.
             read_only: true,
             editing: None,
             submitted: false,
@@ -100,8 +100,8 @@ impl AppState {
         let mut config = stored.config.clone();
         // Materialize the stored password from the keychain so the form shows it
         // (and the Test/Save paths, which read the input, reuse it). A genuine miss
-        // (`Ok(None)`) leaves the field blank silently; a read *error* — most often
-        // the OS keychain prompt being denied — is surfaced, so a blank field is
+        // (`Ok(None)`) leaves the field blank silently; a read *error* (most often
+        // the OS keychain prompt being denied) is surfaced, so a blank field is
         // explained rather than mistaken for "no password saved".
         let mut keychain_err = None;
         if config.password.is_empty() && !config.kind.is_file() {
@@ -139,7 +139,7 @@ impl AppState {
         if keychain_err.is_some() {
             self.notify(
                 ToastVariant::Error,
-                "Couldn't read a saved secret from the keychain — re-enter it to update it.",
+                "Couldn't read a saved secret from the keychain; re-enter it to update it.",
                 cx,
             );
         }
@@ -184,7 +184,7 @@ impl AppState {
                 port: if ssh_port == 0 { 22 } else { ssh_port },
                 user: read(&self.ssh_user_input),
                 auth,
-                // Secrets keep any surrounding spaces — don't trim.
+                // Secrets keep any surrounding spaces; don't trim.
                 password: self.ssh_password_input.read(cx).content().to_string(),
                 passphrase: self.ssh_passphrase_input.read(cx).content().to_string(),
             }
@@ -192,7 +192,7 @@ impl AppState {
         // Per-connection AI overrides (M-S7). `ai_enabled` and a stricter
         // `off`/`schema` tier are still hand-set in connections.toml; carry the
         // editing connection's values through so a save doesn't drop them. The
-        // **write** opt-in (Feature B) IS surfaced — the form checkbox sets
+        // **write** opt-in (Feature B) IS surfaced; the form checkbox sets
         // `ai_tier = "write"`, and clearing it reverts to inherit (unless a hand-set
         // off/schema is present, which is preserved).
         let prior = form
@@ -213,7 +213,7 @@ impl AppState {
             host: read(&self.host_input),
             port: if form.kind.is_file() { None } else { port },
             user: read(&self.user_input),
-            // Passwords may legitimately contain leading/trailing spaces — don't trim.
+            // Passwords may legitimately contain leading/trailing spaces; don't trim.
             password: self.password_input.read(cx).content().to_string(),
             database: read(&self.database_input),
             color: form.color,
@@ -227,7 +227,7 @@ impl AppState {
     /// Every unmet requirement for `config`, each tagged with the field it belongs
     /// to so the form can render the message beneath that input. Empty when the
     /// form is ready to save. A file engine needs only a path; a server needs a
-    /// host (and Postgres a database, since it connects to one — MySQL can browse
+    /// host (and Postgres a database, since it connects to one; MySQL can browse
     /// the whole server, so its database is optional).
     pub(crate) fn form_errors(config: &ConnectionConfig) -> Vec<(FormField, &'static str)> {
         let mut errors = Vec::new();
@@ -263,7 +263,7 @@ impl AppState {
         errors
     }
 
-    /// Enter pressed in a form field — submit the connection form via its primary
+    /// Enter pressed in a form field: submit the connection form via its primary
     /// action (Save & connect). No-op when the form isn't open; `save_form` itself
     /// validates and keeps the modal up with a toast on a miss.
     pub(crate) fn submit_form(&mut self, cx: &mut Context<Self>) {
@@ -350,7 +350,7 @@ impl AppState {
                 tracing::warn!("failed to store credential in keychain: {e}");
                 self.notify(
                     ToastVariant::Error,
-                    "Couldn't save the password to the OS keychain — it won't be remembered.",
+                    "Couldn't save the password to the OS keychain, so it won't be remembered.",
                     cx,
                 );
                 self.connections[index].config.password = password.to_string();
@@ -361,7 +361,7 @@ impl AppState {
     }
 
     /// Route the SSH secrets to the keychain, keyed by connection id. `secrets` is
-    /// `None` when the tunnel is off — which clears both SSH entries. A non-empty
+    /// `None` when the tunnel is off, which clears both SSH entries. A non-empty
     /// secret is stored; an empty one clears its entry (e.g. agent auth, which has
     /// no secret). A keychain write failure warns but doesn't block the save.
     ///
@@ -410,7 +410,7 @@ impl AppState {
             tracing::warn!("failed to store SSH secret in keychain: {e}");
             self.notify(
                 ToastVariant::Error,
-                "Couldn't save an SSH secret to the OS keychain — it won't be remembered.",
+                "Couldn't save an SSH secret to the OS keychain, so it won't be remembered.",
                 cx,
             );
         }
@@ -520,7 +520,7 @@ impl AppState {
         let Some(config) = self.form_config(cx) else {
             return;
         };
-        // A probe needs the connection coordinates but not a name — reveal any
+        // A probe needs the connection coordinates but not a name; reveal any
         // missing-field messages inline, yet still allow testing a yet-unnamed
         // connection once host/database are filled.
         if Self::form_errors(&config)

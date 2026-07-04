@@ -1,7 +1,7 @@
 //! The bundled "Sample database" preview.
 //!
 //! A tiny read-only SQLite database ships with Red so a first-time user can open
-//! the app and immediately browse real data — schema, joins, a view, filtering —
+//! the app and immediately browse real data (schema, joins, a view, filtering)
 //! without configuring a connection first. The database bytes are embedded at
 //! build time and written out to the app data directory on the very first launch,
 //! then seeded as a normal (read-only) saved connection so the existing welcome
@@ -22,7 +22,7 @@ const SAMPLE_NAME: &str = "Sample database";
 
 /// Write the embedded database to `<data_dir>/red/sample.db` if it isn't already
 /// there, returning its path. `None` when the platform has no data directory or
-/// the write fails — the caller then simply skips the preview.
+/// the write fails; the caller then simply skips the preview.
 fn materialize() -> Option<PathBuf> {
     let dir = dirs::data_dir()?.join("red");
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -72,7 +72,7 @@ mod tests {
             SAMPLE_DB.starts_with(b"SQLite format 3\0"),
             "embedded sample.db is not a SQLite database"
         );
-        // A non-trivial database — guards against an accidentally-empty fixture.
+        // A non-trivial database; guards against an accidentally-empty fixture.
         assert!(
             SAMPLE_DB.len() > 16 * 1024,
             "sample.db looks suspiciously small"

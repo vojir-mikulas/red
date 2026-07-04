@@ -6,7 +6,7 @@
 //! user reads in-app match the ones published everywhere else.
 //!
 //! [`section_for`] pulls one `## [label]` section out of that file; [`current`]
-//! picks the section to show — this build's version once the changelog is cut for
+//! picks the section to show: this build's version once the changelog is cut for
 //! it, the in-progress `[Unreleased]` section before then, or the whole file as a
 //! last resort. The panel renders the result through [`crate::markdown`].
 
@@ -16,7 +16,7 @@ use gpui::{prelude::*, px, Context};
 use crate::app::AppState;
 use crate::assets::CHANGELOG;
 
-/// This build's version (`CARGO_PKG_VERSION`) — the heading we look for in the
+/// This build's version (`CARGO_PKG_VERSION`): the heading we look for in the
 /// changelog, and what `local_state` records as "last seen".
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -112,7 +112,7 @@ Older release.
         let s = slice("0.12.0").expect("section present");
         assert!(s.starts_with("## [0.12.0] - 2026-06-30"));
         assert!(s.contains("Old bug."));
-        // Stops before the previous section's neighbour — here there's nothing
+        // Stops before the previous section's neighbour; here there's nothing
         // after, but the unreleased intro must not leak in.
         assert!(!s.contains("New thing."));
     }
@@ -131,7 +131,7 @@ Older release.
         assert!(slice("9.9.9").is_none());
     }
 
-    /// The real bundled changelog always yields *some* current notes — the panel
+    /// The real bundled changelog always yields *some* current notes; the panel
     /// must never render empty.
     #[test]
     fn current_notes_are_never_empty() {

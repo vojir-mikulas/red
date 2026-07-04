@@ -45,7 +45,7 @@ impl AppState {
                             .update(cx, |this, cx| this.reload_settings(cx))
                             .is_err()
                         {
-                            break; // view dropped — window closed
+                            break; // view dropped (window closed)
                         }
                     }
                 })
@@ -63,7 +63,7 @@ impl AppState {
                 cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
                     while rx.next().await.is_some() {
                         if this.update(cx, |this, cx| this.reload_keymap(cx)).is_err() {
-                            break; // view dropped — window closed
+                            break; // view dropped (window closed)
                         }
                     }
                 })
@@ -73,7 +73,7 @@ impl AppState {
 
         // A third watcher over `connections.toml`, so editing the saved-connection
         // file by hand (the welcome screen's "Edit file" affordance) re-reads the
-        // list live — the same debounce + self-write suppression as the others.
+        // list live; the same debounce + self-write suppression as the others.
         if let Some(path) = crate::config::config_path() {
             if let Some((watcher, mut rx)) = crate::settings_watch::SettingsWatcher::start(path) {
                 self.connections_watcher = Some(watcher);
@@ -83,7 +83,7 @@ impl AppState {
                             .update(cx, |this, cx| this.reload_connections(cx))
                             .is_err()
                         {
-                            break; // view dropped — window closed
+                            break; // view dropped (window closed)
                         }
                     }
                 })
@@ -125,7 +125,7 @@ impl AppState {
             .update(cx, |n, cx| n.set_value(ui_size, cx));
         self.editor_font_size_input
             .update(cx, |n, cx| n.set_value(editor_size, cx));
-        // A hand-edit of the file changes these too — re-push to the backend.
+        // A hand-edit of the file changes these too, so re-push to the backend.
         self.service
             .send_global(Command::SetStatementTimeout(self.settings.query.timeout()));
         self.service.send_global(Command::SetDisplayCellCap(
@@ -152,7 +152,7 @@ impl AppState {
 
     /// Re-read `keymap.toml` after an external edit and re-apply the whole keymap
     /// (defaults + overrides). Reuses [`crate::keymap::apply`], so a removed or
-    /// fixed override reverts cleanly to the default — no stale binding lingers.
+    /// fixed override reverts cleanly to the default: no stale binding lingers.
     pub(crate) fn reload_keymap(&mut self, cx: &mut Context<Self>) {
         let Some(store) = &self.keymap_store else {
             return;
@@ -165,7 +165,7 @@ impl AppState {
     }
 
     /// Re-read `connections.toml` after an external edit and swap in the new list.
-    /// Only the saved-connection roster changes — live/parked sessions are keyed by
+    /// Only the saved-connection roster changes; live/parked sessions are keyed by
     /// `SessionId`, not list index, so a connected workspace is untouched. The
     /// welcome-screen selection is clamped in case the edit shortened the list.
     pub(crate) fn reload_connections(&mut self, cx: &mut Context<Self>) {
@@ -176,15 +176,15 @@ impl AppState {
     }
 
     /// Force an update check now ("Check for updates" in the About tab). A no-op
-    /// in effect when `auto_update = false` — the backend ignores `CheckNow`
-    /// while disabled — so the button is only offered when updates are on.
+    /// in effect when `auto_update = false` (the backend ignores `CheckNow`
+    /// while disabled), so the button is only offered when updates are on.
     pub(crate) fn check_for_updates(&mut self, cx: &mut Context<Self>) {
         self.service.send_global(Command::CheckForUpdate);
         cx.notify();
     }
 
     /// Relaunch into the freshly-staged build (Phase 4). The new bundle is already
-    /// swapped over `/Applications/Red.app`, so this just spawns it and exits —
+    /// swapped over `/Applications/Red.app`, so this just spawns it and exits;
     /// macOS replaces the running process with the new version.
     #[cfg(target_os = "macos")]
     pub(crate) fn restart_for_update(&mut self, _cx: &mut Context<Self>) {
@@ -233,7 +233,7 @@ impl AppState {
 
     /// Store the updater's latest state and, when a build has finished staging,
     /// surface a one-off toast so the user notices the pill. Other transitions
-    /// (checking, up-to-date, background failures) stay quiet — they're visible
+    /// (checking, up-to-date, background failures) stay quiet; they're visible
     /// in the About tab without nagging.
     pub(crate) fn on_update_state(&mut self, state: UpdateState, cx: &mut Context<Self>) {
         let became_ready = matches!(state, UpdateState::ReadyToRestart { .. })
@@ -242,7 +242,7 @@ impl AppState {
         if became_ready {
             self.notify(
                 ToastVariant::Success,
-                "An update is ready — restart to apply it.",
+                "An update is ready. Restart to apply it.",
                 cx,
             );
         }
@@ -304,7 +304,7 @@ impl AppState {
         self.reveal_path(&path, cx);
     }
 
-    /// Open `connections.toml` in the user's editor — the file-first counterpart to
+    /// Open `connections.toml` in the user's editor, the file-first counterpart to
     /// the welcome screen's connection cards. The file is written from the current
     /// in-memory list first ([`Self::persist`] announces the write to the watcher,
     /// so it doesn't echo back as a reload) so there's always real content to edit,
@@ -322,7 +322,7 @@ impl AppState {
         self.reveal_path(&path, cx);
     }
 
-    /// Open the bundled, fully-commented reference defaults — RED's settings docs.
+    /// Open the bundled, fully-commented reference defaults: RED's settings docs.
     pub(crate) fn open_default_settings(&mut self, cx: &mut Context<Self>) {
         let path = std::env::temp_dir().join("red-default-settings.toml");
         if let Err(e) = std::fs::write(&path, crate::assets::DEFAULT_SETTINGS) {
@@ -378,7 +378,7 @@ impl AppState {
     /// Fill the five Appearance dropdowns with the current themes + installed fonts
     /// and mark the active option. Called when the settings panel opens and after
     /// the theme registry changes (import/remove). The font list is read from the
-    /// warmed cache (see [`Self::open_settings`]) — never re-enumerated here.
+    /// warmed cache (see [`Self::open_settings`]), never re-enumerated here.
     pub(crate) fn rebuild_settings_pickers(&mut self, cx: &mut Context<Self>) {
         for (light, combo) in [
             (true, self.theme_combo_light.clone()),
@@ -414,7 +414,7 @@ impl AppState {
         }
     }
 
-    /// Open the settings panel on its About tab — the RED → About RED menu item.
+    /// Open the settings panel on its About tab (the RED → About RED menu item).
     /// There's no standalone About modal yet; the panel's About tab is it.
     pub(crate) fn open_about(&mut self, cx: &mut Context<Self>) {
         self.open_settings(cx);
@@ -428,7 +428,7 @@ impl AppState {
 
     pub(crate) fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = false;
-        // Tear down the keymap recorder if a capture was mid-flight — a leaked
+        // Tear down the keymap recorder if a capture was mid-flight; a leaked
         // keystroke interceptor would otherwise eat every keypress app-wide.
         self.keymap_recording = None;
         self.keymap_intercept = None;
@@ -440,7 +440,7 @@ impl AppState {
 
     pub(crate) fn set_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
         self.settings_tab = tab;
-        // Entering the AI tab: learn who is signed in on each ACP agent (lazy — only
+        // Entering the AI tab: learn who is signed in on each ACP agent (lazy: only
         // agents not yet checked), so the rows can show identity.
         if tab == SettingsTab::Ai {
             self.refresh_acp_auth(false);
@@ -485,11 +485,11 @@ impl AppState {
     }
 
     /// On each settings render, scroll the content pane the minimal amount to bring
-    /// the focused reveal-able control fully into view — only when it's actually
+    /// the focused reveal-able control fully into view, only when it's actually
     /// off-screen, so tabbing between already-visible controls never jumps. The
     /// focused control tags its window-space bounds via a canvas overlay (see
     /// [`crate::settings_ui`]'s `reveal_wrap`); we read the previous frame's capture
-    /// and act a frame after focus lands — the `target` tag rejects a stale box left
+    /// and act a frame after focus lands; the `target` tag rejects a stale box left
     /// by the control we just moved off.
     pub(crate) fn update_settings_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.settings_open {
@@ -525,10 +525,10 @@ impl AppState {
                 new_y += vp.origin.y - rb.origin.y;
             }
         } else if rb.origin.y < vp.origin.y {
-            // Above the fold — bring its top into view.
+            // Above the fold: bring its top into view.
             new_y += vp.origin.y - rb.origin.y + pad;
         } else if rb.origin.y + rb.size.height > vp.origin.y + vp.size.height {
-            // Below the fold — bring its bottom into view.
+            // Below the fold: bring its bottom into view.
             new_y -= rb.origin.y + rb.size.height - (vp.origin.y + vp.size.height) + pad;
         }
         // Clamp into the valid scroll range ([-max, 0]).
@@ -569,12 +569,12 @@ impl AppState {
         }
     }
 
-    /// The active appearance mode (System / Light / Dark) — drives the segmented.
+    /// The active appearance mode (System / Light / Dark); drives the segmented.
     pub(crate) fn theme_mode(&self) -> ThemeMode {
         self.theme_decompose().0
     }
 
-    /// The currently-selected theme name for a family — drives the pickers.
+    /// The currently-selected theme name for a family, which drives the pickers.
     pub(crate) fn selected_theme(&self, light: bool) -> String {
         let (_, l, d) = self.theme_decompose();
         if light {
@@ -598,7 +598,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// Switch how the theme tracks the OS — `System` follows the OS light/dark,
+    /// Switch how the theme tracks the OS: `System` follows the OS light/dark,
     /// `Light`/`Dark` pin that family. The pair carries across so the user's two
     /// choices survive a mode flip.
     pub(crate) fn set_theme_mode(&mut self, mode: ThemeMode, cx: &mut Context<Self>) {
@@ -663,7 +663,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// Delete a user theme, reload the registry, and re-apply — a removed active
+    /// Delete a user theme, reload the registry, and re-apply; a removed active
     /// theme falls back to the default rather than leaving a dangling reference.
     pub(crate) fn remove_theme(&mut self, name: &str, cx: &mut Context<Self>) {
         if let Err(e) = self.themes.remove(name) {
@@ -748,7 +748,7 @@ impl AppState {
     }
 
     /// Toggle the leading row-number gutter. The gutter is column `0` in the grid's
-    /// coordinate system, so flipping it shifts the data-column offset — clear the
+    /// coordinate system, so flipping it shifts the data-column offset; clear the
     /// active selection (stored in table-column coords) so it can't point off by one.
     pub(crate) fn set_row_numbers(&mut self, on: bool, cx: &mut Context<Self>) {
         self.settings.grid.row_numbers = on;
@@ -906,7 +906,7 @@ impl AppState {
         });
         self.notify(
             ToastVariant::Info,
-            "Starting sign-in — a browser window will open.",
+            "Starting sign-in. A browser window will open.",
             cx,
         );
         cx.notify();
@@ -1069,7 +1069,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// Pick the folder generated reports are written to (Settings → AI agent). Async —
+    /// Pick the folder generated reports are written to (Settings → AI agent). Async:
     /// the native directory dialog runs off-thread; the choice is persisted on return.
     /// Not pushed to the backend: the report folder rides in each turn's `AiContext`,
     /// so the next report already picks it up (a subscription chat already running
@@ -1103,7 +1103,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// Toggle background self-updates. Re-arms the backend updater immediately —
+    /// Toggle background self-updates. Re-arms the backend updater immediately:
     /// turning it on kicks off a check; turning it off parks the timer + network.
     pub(crate) fn set_auto_update(&mut self, on: bool, cx: &mut Context<Self>) {
         self.settings.update.auto_update = on;
@@ -1162,14 +1162,14 @@ impl AppState {
     }
 
     /// Dismiss the settings-warning banner until the next problematic load. Clears
-    /// both settings and keymap warnings — they share one banner.
+    /// both settings and keymap warnings (they share one banner).
     pub(crate) fn dismiss_settings_warnings(&mut self, cx: &mut Context<Self>) {
         self.settings_warnings.clear();
         self.keymap_warnings.clear();
         cx.notify();
     }
 
-    /// Persist the current preferences. A write failure is logged, not surfaced —
+    /// Persist the current preferences. A write failure is logged, not surfaced:
     /// preferences are convenience, and the in-memory value already took effect.
     /// The bytes are announced to the watcher first so the reload this write
     /// triggers is suppressed (no self-inflicted reload storm).

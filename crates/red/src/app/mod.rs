@@ -1,7 +1,7 @@
 //! The root view and app state machine. `AppState` owns the backend handle, the
 //! persisted connection list, and the current `Phase` (disconnected connect
 //! screen ↔ connecting ↔ connected shell). Backend events are drained on a
-//! foreground `cx.spawn` task into [`AppState::on_event`] — the one place where
+//! foreground `cx.spawn` task into [`AppState::on_event`], the one place where
 //! the service drives UI state. Screen rendering lives in `crate::connect` /
 //! `crate::shell`.
 //!
@@ -54,7 +54,7 @@ use crate::theme::ThemeRegistry;
 type RevealBox = std::rc::Rc<std::cell::RefCell<Option<(RevealTarget, gpui::Bounds<Pixels>)>>>;
 
 /// Which font-family picker (UI sans / UI mono / editor) a settings action refers
-/// to — routes a choice to the matching setter and the matching combo box.
+/// to; routes a choice to the matching setter and the matching combo box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FontSelect {
     Ui,
@@ -73,7 +73,7 @@ pub(crate) enum Pane {
 }
 
 /// Which half of a side-by-side split (see [`SplitState`]) the run/export/filter
-/// actions target — the focused half. `Primary` is the left pane (`active_tab`);
+/// actions target: the focused half. `Primary` is the left pane (`active_tab`);
 /// `Secondary` is the right pane (`SplitState::secondary`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SplitHalf {
@@ -82,7 +82,7 @@ pub(crate) enum SplitHalf {
 }
 
 impl SplitHalf {
-    /// The other half — used by "focus other half" and the strip's swap logic.
+    /// The other half, used by "focus other half" and the strip's swap logic.
     fn other(self) -> SplitHalf {
         match self {
             SplitHalf::Primary => SplitHalf::Secondary,
@@ -120,7 +120,7 @@ pub(crate) enum ConnectSortField {
 }
 
 /// How the welcome screen's saved-connection list is ordered: a key plus a
-/// direction. `ascending` is the key's natural order — A→Z for `Name`, oldest
+/// direction. `ascending` is the key's natural order: A→Z for `Name`, oldest
 /// (and never-used) first for `Recent`. Each toolbar button selects its field;
 /// clicking the active field again flips the direction. Default is `Recent`
 /// descending (most-recently-used first), matching the on-load order.
@@ -137,7 +137,7 @@ impl ConnectSort {
         matches!(field, ConnectSortField::Name)
     }
 
-    /// Select `field`, or — if it's already active — flip the direction. The
+    /// Select `field`, or (if it's already active) flip the direction. The
     /// welcome screen's sort buttons drive this.
     pub(crate) fn toggle(&mut self, field: ConnectSortField) {
         if self.field == field {
@@ -164,7 +164,7 @@ pub(crate) enum Phase {
 /// out a backoff before the next retry. Drives the connecting splash (progress
 /// bar / error / retry / cancel). See [`AppState::start_connect`].
 pub(crate) struct Connecting {
-    /// The session this connect is opening — minted UI-side so retries reuse it.
+    /// The session this connect is opening, minted UI-side so retries reuse it.
     pub session: SessionId,
     /// Stable id of the saved connection being opened ([`StoredConnection::id`]),
     /// so warm/foreground lookups match on identity rather than the display name
@@ -181,7 +181,7 @@ pub(crate) struct Connecting {
 
 /// Where a [`Connecting`] is in its attempt/backoff cycle.
 pub(crate) enum ConnectStatus {
-    /// An attempt is in flight — the indeterminate progress bar sweeps.
+    /// An attempt is in flight; the indeterminate progress bar sweeps.
     InProgress,
     /// The last attempt failed; we're waiting `delay` before the next retry,
     /// showing the error. `delay` is the wait we scheduled (shown to the user).
@@ -190,7 +190,7 @@ pub(crate) enum ConnectStatus {
         delay: Duration,
     },
     /// The attempt failed for a user-correctable reason (bad credentials, missing
-    /// database) — terminal, no retry. The splash shows the error and offers an
+    /// database): terminal, no retry. The splash shows the error and offers an
     /// "Edit connection" action instead of a countdown. See [`Event::ConnectFailed`].
     Failed { error: SharedString },
     /// The SSH jump host's key isn't trusted yet. The splash shows the fingerprint
@@ -224,8 +224,8 @@ pub(crate) struct FormState {
     pub read_only: bool,
     /// `Some(index)` when editing an existing connection, `None` when adding.
     pub editing: Option<usize>,
-    /// Set once the user tries to Save/Connect (or Test) with missing fields —
-    /// the gate for showing the inline per-field validation messages, so a fresh
+    /// Set once the user tries to Save/Connect (or Test) with missing fields.
+    /// This is the gate for showing the inline per-field validation messages, so a fresh
     /// empty form isn't pre-littered with errors.
     pub submitted: bool,
     pub test: TestState,
@@ -242,7 +242,7 @@ pub(crate) struct FormState {
 }
 
 /// The SSH authentication method picked in the form. Mirrors `red_core::SshAuth`
-/// but carries no data — the key path / secrets live in the form's inputs.
+/// but carries no data; the key path / secrets live in the form's inputs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SshAuthMode {
     Agent,
@@ -313,7 +313,7 @@ pub(crate) enum PendingWrite {
         target_session: SessionId,
         mapping: Vec<ColumnMap>,
         mode: CopyMode,
-        /// `Some` for "copy into a *new* table" — the column shape to `create_table`
+        /// `Some` for "copy into a *new* table": the column shape to `create_table`
         /// the target from before streaming (types mapped into the target dialect).
         /// `None` for a copy into an existing table (the original same-shape path).
         create: Option<Vec<ColumnMeta>>,
@@ -360,7 +360,7 @@ pub(crate) struct PendingCopyPeek {
 /// A distinct writable namespace (a connection's schema/database) offered in the
 /// "Copy to…" picker as a **"new table"** target. Selecting one prompts for a table
 /// name; the source's column shape then creates it (`create_table`, types mapped into
-/// the target dialect) before the rows stream in — the "copy into a *new* table" /
+/// the target dialect) before the rows stream in; the "copy into a *new* table" /
 /// migration path. Mirrors [`CopyTargetCandidate`] but addresses a namespace, not an
 /// existing table, so an *empty* database can be a target.
 #[derive(Clone)]
@@ -404,11 +404,11 @@ pub(crate) struct EditContext {
 
 /// The referenced-table target for editing an inline-expanded foreign-key column
 /// (Track B7). A joined column shows a value from a *referenced* table, so writing
-/// it back is an `UPDATE <ref> SET <col> = ? WHERE <ref key> = <fk value>` — a
+/// it back is an `UPDATE <ref> SET <col> = ? WHERE <ref key> = <fk value>`, a
 /// different table and row than the base browse's PK edit. Resolved single-hop only
 /// (the referenced row is identified by the FK value resident in the base row);
 /// multi-hop / composite-key expansions stay read-only. Note the referenced row may
-/// be shared by several base rows, so the edit changes all of them — the confirm
+/// be shared by several base rows, so the edit changes all of them; the confirm
 /// preview shows the literal `UPDATE`, and the batch reloads afterwards so the
 /// denormalized view re-resolves.
 #[derive(Clone)]
@@ -416,20 +416,20 @@ pub(crate) struct ForeignEdit {
     /// The referenced table being updated.
     pub table: red_core::TableRef,
     /// The referenced table's unique key column the foreign key points at (the
-    /// join's target column) — the `WHERE` predicate.
+    /// join's target column); this is the `WHERE` predicate.
     pub key_column: String,
     /// The foreign-key value from the base row, identifying the referenced row.
     pub key_value: red_core::Value,
     /// The base foreign-key column's declared type, so the `WHERE` bind casts back
     /// to the key column's type (a uuid/text key needs the cast on Postgres).
     pub key_type: Option<String>,
-    /// The referenced column being set — the join leaf (`name`), not the dotted
+    /// The referenced column being set: the join leaf (`name`), not the dotted
     /// output alias (`tier_id.name`) the result column carries.
     pub set_column: String,
 }
 
 /// How long a transient (info / success) toast stays up before it auto-dismisses.
-/// Errors and warnings (and a live export) have no timer — they persist until the
+/// Errors and warnings (and a live export) have no timer; they persist until the
 /// user closes them or the operation resolves.
 const TOAST_AUTO_DISMISS: Duration = Duration::from_secs(4);
 
@@ -442,11 +442,11 @@ const MAX_PARKED_SESSIONS: usize = 8;
 
 /// Most persistent (error / warning) notifications retained at once. Transient
 /// info/success toasts self-dismiss; persistent ones are removed only by a user
-/// click, so a burst of query errors is capped here — the oldest persistent toast
+/// click, so a burst of query errors is capped here: the oldest persistent toast
 /// is dropped past this. Visible toasts are already capped lower in the renderer.
 const MAX_NOTIFICATIONS: usize = 50;
 
-/// Which streamed transfer a progress toast tracks — selects the right cancel
+/// Which streamed transfer a progress toast tracks; selects the right cancel
 /// command for the toast's `✕` and the verb in its messages.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransferKind {
@@ -460,7 +460,7 @@ pub(crate) enum TransferKind {
 }
 
 impl TransferKind {
-    /// The (gerund, past, noun) verbs for the copy-family toasts — `Copy` and
+    /// The (gerund, past, noun) verbs for the copy-family toasts: `Copy` and
     /// `Migrate` share the streaming backend and `Copy*` events but read differently.
     /// `Export`/`Import` have their own toasts and never call this.
     pub(crate) fn copy_verbs(self) -> (&'static str, &'static str, &'static str) {
@@ -488,8 +488,8 @@ pub(crate) struct ExportProgress {
 /// closed); `export` is set only on the export-progress toast.
 ///
 /// `message` is the title; `detail` is an optional secondary body. When `detail`
-/// is set we also build a `detail_label` — a selectable, copyable view of that
-/// text — so the user can highlight part of a long message and ⌘/Ctrl+C it.
+/// is set we also build a `detail_label` (a selectable, copyable view of that
+/// text) so the user can highlight part of a long message and ⌘/Ctrl+C it.
 /// `expanded` toggles the collapse of a long body; `hovered` pauses the
 /// auto-dismiss timer while the pointer is over the toast (`dismiss_gen` makes a
 /// re-armed timer cancel any stale one).
@@ -509,7 +509,7 @@ pub(crate) struct Notification {
     pub action: Option<NotificationAction>,
 }
 
-/// The call-to-action a toast can offer beyond copy/close — rendered as a trailing
+/// The call-to-action a toast can offer beyond copy/close, rendered as a trailing
 /// accent button in `render_notifications`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NotificationAction {
@@ -518,7 +518,7 @@ pub(crate) enum NotificationAction {
 }
 
 /// The default editor text a fresh query tab opens with. A tab still holding
-/// exactly this (and no result) is "pristine" — closing it needs no confirmation.
+/// exactly this (and no result) is "pristine"; closing it needs no confirmation.
 #[cfg(target_os = "macos")]
 pub(crate) const EMPTY_QUERY: &str = "-- Write SQL, ⌘↵ to run\n";
 #[cfg(not(target_os = "macos"))]
@@ -533,7 +533,7 @@ pub(crate) struct QueryTab {
     pub editor: Entity<CodeEditor>,
     /// The open result browsed in the grid: a table preview or an editor run.
     pub result: Option<ResultGrid>,
-    /// The query plan (Track B4 — EXPLAIN), when one is open. Occupies the result
+    /// The query plan (Track B4, EXPLAIN), when one is open. Occupies the result
     /// pane in place of the grid; running a query clears it. `None` is the grid.
     pub plan: Option<crate::plan::PlanView>,
     /// Which split half owns this tab (Zed-style): each pane's tab strip shows only
@@ -579,7 +579,7 @@ impl QueryTab {
         }
     }
 
-    /// A blank tab the user hasn't touched — no result and the default text still
+    /// A blank tab the user hasn't touched: no result and the default text still
     /// in the editor. Closing one of these doesn't warrant a confirmation.
     pub(crate) fn is_pristine(&self, cx: &Context<AppState>) -> bool {
         self.result.is_none() && self.editor.read(cx).content() == EMPTY_QUERY
@@ -594,7 +594,7 @@ pub(crate) struct ActiveConn {
     /// switch back is instant; binds this conn's `CommandSender`.
     pub session: SessionId,
     /// Stable id of the saved connection this workspace belongs to
-    /// ([`StoredConnection::id`]) — the switcher matches warm/foreground sessions
+    /// ([`StoredConnection::id`]); the switcher matches warm/foreground sessions
     /// by this, not by `config.name` (names aren't unique).
     pub conn_id: String,
     pub config: ConnectionConfig,
@@ -623,7 +623,7 @@ pub(crate) struct ActiveConn {
     /// Monotonic counter for naming blank tabs ("query 1", "query 2", …).
     pub query_seq: usize,
     /// While a tab is being dragged, the gap (insertion index `0..=tabs.len()`)
-    /// where it would land — drives the drop indicator. Only meaningful when a
+    /// where it would land; drives the drop indicator. Only meaningful when a
     /// drag is active; the strip gates rendering on `has_active_drag`.
     pub tab_drop_target: Option<usize>,
     /// Horizontal scroll position of the tab strip, so a crowded strip scrolls
@@ -638,7 +638,7 @@ pub(crate) struct ActiveConn {
     /// area is split. The primary half keeps `grid_focus`; giving the second grid
     /// its own handle keeps keyboard focus unambiguous between the two grids.
     pub secondary_grid_focus: FocusHandle,
-    /// Which pane currently holds focus — drives focus cycling and the pane ring.
+    /// Which pane currently holds focus; drives focus cycling and the pane ring.
     pub active_pane: Pane,
     /// When `Some`, the work area is split into two side-by-side query panes. See
     /// [`SplitState`]; `None` is the single-pane layout.
@@ -656,14 +656,15 @@ pub(crate) struct ActiveConn {
     pub history_w: Pixels,
     pub history_drag: Option<DragAnchor>,
     /// Whether the Columns panel (inline FK expansion, Track B7) is shown in the left
-    /// dock — the recursive tree that picks referenced columns into the active browse.
+    /// dock, i.e. the recursive tree that picks referenced columns into the active
+    /// browse.
     /// Per-connection UI state; the picked columns live on the result grid.
     pub columns_open: bool,
     pub columns_w: Pixels,
     pub columns_drag: Option<DragAnchor>,
     /// Recency stamp: bumped from [`AppState::next_active_seq`] each time this
     /// workspace is parked (it was foreground until that moment). Drives LRU
-    /// eviction when [`MAX_PARKED_SESSIONS`] is exceeded — the lowest stamp is the
+    /// eviction when [`MAX_PARKED_SESSIONS`] is exceeded: the lowest stamp is the
     /// least-recently-foregrounded parked session.
     pub last_active_seq: u64,
 }
@@ -725,7 +726,7 @@ impl ActiveConn {
     }
 
     /// Point the focused half at tab `i` (a global index that already belongs to that
-    /// half — each strip shows only its own tabs, so a strip click never crosses).
+    /// half; each strip shows only its own tabs, so a strip click never crosses).
     pub(crate) fn set_focused_tab(&mut self, i: usize) {
         let half = self.focused_half();
         self.set_pane_active(half, i);
@@ -772,7 +773,7 @@ impl ActiveConn {
         }
     }
 
-    /// Which half currently receives focus — the split's focused half, or `Primary`
+    /// Which half currently receives focus: the split's focused half, or `Primary`
     /// in the single-pane layout.
     pub(crate) fn focused_half(&self) -> SplitHalf {
         self.split
@@ -781,7 +782,7 @@ impl ActiveConn {
             .unwrap_or(SplitHalf::Primary)
     }
 
-    /// The focus handle for the result grid in `half` — the second half has its own
+    /// The focus handle for the result grid in `half`; the second half has its own
     /// so keyboard focus never lands on both grids at once.
     pub(crate) fn grid_focus_for(&self, half: SplitHalf) -> &FocusHandle {
         match half {
@@ -791,7 +792,7 @@ impl ActiveConn {
     }
 
     /// The focused tab, or `None` when the strip is empty (the user closed the
-    /// last tab — the shell then shows an empty pane instead of a query editor).
+    /// last tab; the shell then shows an empty pane instead of a query editor).
     pub(crate) fn active(&self) -> Option<&QueryTab> {
         self.tabs.get(self.focused_tab_index())
     }
@@ -802,7 +803,7 @@ impl ActiveConn {
     }
 
     /// The focused tab's open result, if any. Folds together "no tab" and "tab
-    /// with no result" — the common shape at most result call sites.
+    /// with no result", the common shape at most result call sites.
     pub(crate) fn active_result(&self) -> Option<&ResultGrid> {
         self.active().and_then(|t| t.result.as_ref())
     }
@@ -811,7 +812,7 @@ impl ActiveConn {
         self.active_mut().and_then(|t| t.result.as_mut())
     }
 
-    /// Find the open result whose grid carries `epoch`, across all tabs — result
+    /// Find the open result whose grid carries `epoch`, across all tabs; result
     /// events route by epoch so a background tab's query still populates.
     pub(crate) fn result_by_epoch(&mut self, epoch: u64) -> Option<&mut ResultGrid> {
         self.tabs
@@ -821,7 +822,7 @@ impl ActiveConn {
     }
 
     /// Restore the pane invariants after any tab mutation: collapse the split when a
-    /// half has emptied (its last tab closed or dragged away — everything folds back
+    /// half has emptied (its last tab closed or dragged away; everything folds back
     /// to one pane), and re-point each pane's active index at a tab it actually owns.
     /// The single safety net every add / close / move / reorder ends on.
     pub(crate) fn normalize_panes(&mut self) {
@@ -834,7 +835,7 @@ impl ActiveConn {
             let has_primary = self.tabs.iter().any(|t| t.pane == SplitHalf::Primary);
             let has_secondary = self.tabs.iter().any(|t| t.pane == SplitHalf::Secondary);
             if !has_primary || !has_secondary {
-                // A half emptied — collapse, keeping the surviving half's tab on screen.
+                // A half emptied: collapse, keeping the surviving half's tab on screen.
                 let survivor = if has_primary {
                     SplitHalf::Primary
                 } else {
@@ -848,7 +849,7 @@ impl ActiveConn {
                 self.active_tab = keep.min(self.tabs.len() - 1);
                 return;
             }
-            // Both halves populated — clamp each active index into its own pane.
+            // Both halves populated: clamp each active index into its own pane.
             if let Some(p) = self.pane_active(SplitHalf::Primary) {
                 self.active_tab = p;
             }
@@ -868,7 +869,7 @@ impl ActiveConn {
         }
     }
 
-    /// Find the open plan carrying `epoch`, across all tabs — `PlanReady`/
+    /// Find the open plan carrying `epoch`, across all tabs; `PlanReady`/
     /// `PlanFailed` route by epoch like result events.
     pub(crate) fn plan_by_epoch(&mut self, epoch: u64) -> Option<&mut crate::plan::PlanView> {
         self.tabs
@@ -948,8 +949,8 @@ pub struct AppState {
     /// The target namespaces backing the open "Migrate to…" picker, indexed by
     /// `Cmd::MigrateTarget(usize)`.
     pub(crate) migrate_targets: Vec<CopyNamespace>,
-    /// The source of a pending whole-schema migrate — `(source session, source schema,
-    /// table names)` — held while the user picks a target namespace from the picker.
+    /// The source of a pending whole-schema migrate, `(source session, source schema,
+    /// table names)`, held while the user picks a target namespace from the picker.
     pub(crate) pending_migrate: Option<(SessionId, String, Vec<String>)>,
     /// An in-flight FK click-through (Track B7), waiting on its single-row
     /// `CopyRows` re-fetch to read the typed key value before opening the target
@@ -970,11 +971,11 @@ pub struct AppState {
     /// restores it. Resizable via the shell split.
     pub(crate) assistant_w: Pixels,
     pub(crate) assistant_drag: Option<DragAnchor>,
-    /// Whether the assistant is usable at all — at least one configured agent is
+    /// Whether the assistant is usable at all: at least one configured agent is
     /// ready (an ACP agent, which needs no key, or an API agent with a key). Drives
     /// the panel's setup-vs-chat view. Recomputed at launch and on settings reload.
     pub(crate) ai_configured: bool,
-    /// The usable agents in config order — the source for the panel's agent
+    /// The usable agents in config order, the source for the panel's agent
     /// selector and the per-chat default. An API agent appears only once it has a
     /// key; an ACP agent always. Recomputed with `ai_configured`.
     pub(crate) usable_agents: Vec<AgentInfo>,
@@ -990,8 +991,8 @@ pub struct AppState {
     /// Last-known subscription sign-in identity per ACP agent id, shown in Settings →
     /// AI. Filled by `AiAgentAuthStatus`; absent until the agent is first checked.
     pub(crate) ai_auth: HashMap<String, AiAuthStatus>,
-    /// The in-flight interactive subscription sign-in (paste-code), if any — one at a
-    /// time. The pasted code lives in the shared `ai_login_code` field.
+    /// The in-flight interactive subscription sign-in (paste-code), if any; one at
+    /// a time. The pasted code lives in the shared `ai_login_code` field.
     pub(crate) ai_login: Option<AiLoginFlow>,
     /// Shared field for the pasted OAuth code during an ACP sign-in (mirrors
     /// `ai_key_input`). Enter submits the code; Esc cancels the sign-in.
@@ -1037,7 +1038,7 @@ pub struct AppState {
     pub(crate) focus_grid_edit: bool,
     /// Focus-out listener on the open inline editor: clicking away commits (stages)
     /// the edit, like a spreadsheet. Held while an editor is open, dropped when it
-    /// closes — mirrors `modal_focus_trap`.
+    /// closes (mirrors `modal_focus_trap`).
     pub(crate) grid_edit_blur: Option<gpui::Subscription>,
     /// A non-pristine query tab the user asked to close, awaiting confirmation.
     pub(crate) confirm_close_tab: Option<usize>,
@@ -1049,7 +1050,7 @@ pub struct AppState {
     pub(crate) settings_open: bool,
     pub(crate) settings_tab: SettingsTab,
     /// Non-fatal problems from the last settings load (an unreadable section, a
-    /// bad value) — surfaced as a dismissible banner so a hand-edit gets feedback
+    /// bad value), surfaced as a dismissible banner so a hand-edit gets feedback
     /// instead of a silent reset.
     pub(crate) settings_warnings: Vec<String>,
     /// Scroll state of the settings content pane, tracked so a control reached by
@@ -1080,7 +1081,7 @@ pub struct AppState {
     /// as the settings watcher so a UI-driven save never echoes back as a reload.
     pub(crate) connections_watcher: Option<crate::settings_watch::SettingsWatcher>,
     /// Non-fatal problems from the last keymap load (a bad keystroke, an unknown
-    /// action) — shown in the same banner as [`Self::settings_warnings`].
+    /// action), shown in the same banner as [`Self::settings_warnings`].
     pub(crate) keymap_warnings: Vec<String>,
     /// The Keymap tab's search box, filtering the bindable-action list by label or
     /// keystroke.
@@ -1090,7 +1091,7 @@ pub struct AppState {
     pub(crate) keymap_recording: Option<usize>,
     /// The live keystroke interceptor for the recorder. Held exactly as long as
     /// [`Self::keymap_recording`] is `Some`; dropping it (on capture, cancel, tab
-    /// switch, or panel close) ends capture so normal shortcuts resume — a leaked
+    /// switch, or panel close) ends capture so normal shortcuts resume; a leaked
     /// interceptor would eat every keystroke app-wide.
     pub(crate) keymap_intercept: Option<gpui::Subscription>,
     /// A captured chord awaiting the user's Confirm / Cancel (see [`KeymapCapture`]).
@@ -1112,7 +1113,7 @@ pub struct AppState {
     pub(crate) font_combo_ui_mono: Entity<ComboBox>,
     pub(crate) font_combo_editor: Entity<ComboBox>,
     /// Installed font families, sorted + deduped. Enumerating these hits the OS
-    /// text system (a CoreText scan of hundreds of faces) — far too slow to do
+    /// text system (a CoreText scan of hundreds of faces), far too slow to do
     /// per render, so the Appearance panel reads this cache. Filled lazily when
     /// the settings panel first opens; fonts don't change during a session.
     pub(crate) font_names_cache: Option<Vec<String>>,
@@ -1133,7 +1134,7 @@ pub struct AppState {
     pub(crate) focus_modal: bool,
     /// Active while a modal is open: a focus-out listener on `modal_focus` that
     /// pulls focus back inside if Tab would carry it to the backdrop (the focus
-    /// trap). Dropped — unsubscribing — when the modal closes.
+    /// trap). Dropped (unsubscribing) when the modal closes.
     pub(crate) modal_focus_trap: Option<gpui::Subscription>,
     /// The command palette overlay, when open, plus the `id → Cmd` map for the
     /// commands it's currently showing (so an activation routes to the right one).
@@ -1147,7 +1148,7 @@ pub struct AppState {
     /// a submit routes to the right handler. Only meaningful in prompt mode.
     pub(crate) palette_prompt: PromptKind,
     /// The saved queries shown by the open picker, held only while it's open so an
-    /// activation can resolve its index. Loaded on demand — never at startup.
+    /// activation can resolve its index. Loaded on demand, never at startup.
     pub(crate) saved_queries: Vec<crate::queries::SavedQuery>,
     /// The saved conversations shown by the open history picker (M-S5), held only
     /// while it's open so an activation can resolve its index. Loaded on demand.
@@ -1163,10 +1164,10 @@ pub struct AppState {
     /// Warm background connections, kept live so switching back is instant (no
     /// reconnect). The foreground connection lives in `phase` (`Phase::Connected`);
     /// these are the ones the user switched away from. Keyed by their backend
-    /// session. An idle one is evicted backend-side after 10 min — its
+    /// session. An idle one is evicted backend-side after 10 min; its
     /// `Disconnected` event drops it here and demotes it to a plain recent.
     pub(crate) parked: HashMap<SessionId, Box<ActiveConn>>,
-    /// The session the window currently shows — the `phase`'s session (connecting
+    /// The session the window currently shows: the `phase`'s session (connecting
     /// or connected), or `None` on the welcome screen. Mirrored to the backend via
     /// `SetActiveSession` so it's exempt from idle eviction.
     pub(crate) foreground_session: Option<SessionId>,
@@ -1180,8 +1181,10 @@ pub struct AppState {
     /// so the global ⌘K keeps dispatching (see `close_palette`).
     pub(crate) refocus_root: bool,
     /// Armed on mouse-down in the titlebar/drag strip; the first drag motion
-    /// then starts a compositor window-move (client-side decorations only — see
+    /// then starts a compositor window-move (client-side decorations only; see
     /// `window_chrome::draggable`). A plain click clears it without moving.
+    /// Never armed on Windows, which drives window-move through the native caption.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) titlebar_drag: bool,
     /// Whether the keyboard-shortcuts reference overlay (`⌘/`) is showing.
     pub(crate) shortcuts_open: bool,
@@ -1238,7 +1241,7 @@ pub struct AppState {
     /// status line (Phases 3–4 of docs/plans/self-update.md). Updated only by
     /// `Event::UpdateState`; `Unknown` until the first check completes.
     pub(crate) update: UpdateState,
-    /// Dev-only perf HUD collector — brackets `render` to read build time and
+    /// Dev-only perf HUD collector; brackets `render` to read build time and
     /// allocation churn. Compiled only under the `dev-stats` feature.
     #[cfg(feature = "dev-stats")]
     pub(crate) dev_stats: crate::dev_stats::DevStats,
@@ -1247,7 +1250,7 @@ pub struct AppState {
 /// The GitHub `owner/repo` the self-updater polls (see docs/plans/self-update.md).
 pub(crate) const UPDATE_REPO: &str = "vojir-mikulas/red";
 
-/// Where the "report a bug" links point — the project's GitHub issue tracker.
+/// Where the "report a bug" links point: the project's GitHub issue tracker.
 /// Shared by the welcome-screen footer, the About tab, and the Help menu so the
 /// three never drift.
 pub(crate) const ISSUES_URL: &str = "https://github.com/vojir-mikulas/red/issues";
@@ -1336,7 +1339,7 @@ pub(crate) struct AiLoginFlow {
     pub agent_id: String,
     /// The browser authorize URL, once known (the agent CLI also opens it itself).
     pub url: Option<String>,
-    /// True after a code was submitted — disables the field until it resolves.
+    /// True after a code was submitted; disables the field until it resolves.
     pub submitting: bool,
     /// A failure from a prior submit (wrong/expired code), shown inline.
     pub error: Option<String>,
@@ -1389,7 +1392,7 @@ impl AppState {
                     .update(cx, |state, cx| state.on_event(session, event, cx))
                     .is_err()
                 {
-                    break; // view dropped — window closed
+                    break; // view dropped, window closed
                 }
             }
         })
@@ -1420,7 +1423,7 @@ impl AppState {
         // empty key leaves it off until one is set.
         service.send_global(Command::ConfigureAi(ai_config(&settings)));
         // Arm the self-updater (Phase 3): an initial check at launch, then on the
-        // configured cadence — unless `auto_update = false`, which sends a disabled
+        // configured cadence, unless `auto_update = false`, which sends a disabled
         // config so the backend keeps the timer (and network) parked.
         service.send_global(Command::ConfigureUpdates(update_config(&settings)));
 
@@ -1463,7 +1466,7 @@ impl AppState {
         let ssh_user_input = cx.new(|cx| TextInput::new(cx).with_placeholder("ubuntu"));
         let ssh_key_path_input =
             cx.new(|cx| TextInput::new(cx).with_placeholder("~/.ssh/id_ed25519"));
-        // SSH secrets are obscured — unlike the DB password they're not echoed in
+        // SSH secrets are obscured; unlike the DB password they're not echoed in
         // the connection-string mirror, so masking them costs nothing.
         let ssh_password_input = cx.new(|cx| TextInput::new(cx).obscured());
         let ssh_passphrase_input = cx.new(|cx| TextInput::new(cx).obscured());
@@ -1510,7 +1513,7 @@ impl AppState {
 
         // Font-size steppers, seeded from the loaded settings. A `Change` (typing,
         // stepping, or Enter) writes straight through to the matching setter, which
-        // re-clamps, persists, and re-themes — a live preview as the user edits.
+        // re-clamps, persists, and re-themes: a live preview as the user edits.
         let font_size_input = |size: f32, cx: &mut Context<Self>| {
             cx.new(|cx| {
                 let mut n = NumberInput::new("font-size", cx)
@@ -1674,7 +1677,7 @@ impl AppState {
 
         // The five Appearance-panel dropdowns (searchable combo boxes). They start
         // empty: their options are filled lazily by `rebuild_settings_pickers` when
-        // the panel first opens — the installed-font list is a slow OS scan we keep
+        // the panel first opens; the installed-font list is a slow OS scan we keep
         // off the startup path. Each routes its chosen label to its setter.
         let new_combo = |cx: &mut Context<Self>, id: &'static str, search: &'static str| {
             cx.new(|cx| {
@@ -1970,7 +1973,7 @@ impl AppState {
     }
 
     /// Like [`notify`](Self::notify), but with a secondary `detail` body. The
-    /// detail becomes a selectable, copyable, collapsible block — use it for the
+    /// detail becomes a selectable, copyable, collapsible block. Use it for the
     /// long, copy-worthy text (a query error, a driver message) while `title`
     /// stays a short headline.
     pub(crate) fn notify_detail(
@@ -2002,7 +2005,7 @@ impl AppState {
         )
     }
 
-    /// Assign `notification` a fresh id, push it, and — for a transient toast —
+    /// Assign `notification` a fresh id, push it, and, for a transient toast,
     /// arm a `cx.spawn` timer that removes it by id once `auto_dismiss` elapses.
     /// Returns the assigned id so callers (the export toast) can update it later.
     pub(crate) fn push_notification(
@@ -2109,7 +2112,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// The notification's `✕`: dismiss a plain toast, or — for the export toast —
+    /// The notification's `✕`: dismiss a plain toast, or, for the export toast,
     /// abort the backend stream. The toast stays (now "Cancelling…") until the
     /// `ExportCancelled` event swaps it for a transient one.
     pub(crate) fn close_notification(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -2220,7 +2223,7 @@ impl AppState {
                 }
             }
             Event::ForeignKeysLoaded { graph } => {
-                // Cache the graph and (re)mark FK columns on any already-open grids —
+                // Cache the graph and (re)mark FK columns on any already-open grids,
                 // a result may have opened before the prefetch landed.
                 if let Some(active) = self.conn_mut(session) {
                     active.fk_graph = graph;
@@ -2274,7 +2277,7 @@ impl AppState {
                     format!("{affected} row(s) affected"),
                     cx,
                 );
-                // A write may have changed the schema (CREATE/DROP) — refresh the
+                // A write may have changed the schema (CREATE/DROP); refresh the
                 // tree of the session that ran it.
                 if let Some(id) = session {
                     self.service.send_to(id, Command::LoadObjects);
@@ -2376,7 +2379,7 @@ impl AppState {
         }
     }
 
-    /// Run the pending write the user confirmed — a destructive editor statement
+    /// Run the pending write the user confirmed: a destructive editor statement
     /// or a guarded grid edit (Track B5).
     pub(crate) fn confirm_destructive(&mut self, cx: &mut Context<Self>) {
         match self.confirm_exec.take() {
@@ -2413,12 +2416,12 @@ impl AppState {
             ),
             None => {}
         }
-        // The modal is closing — return focus to the root for the next ⌘K etc.
+        // The modal is closing; return focus to the root for the next ⌘K etc.
         self.refocus_root = true;
         cx.notify();
     }
 
-    /// Confirm a pending copy with an explicit `mode` — the copy dialog's two action
+    /// Confirm a pending copy with an explicit `mode`, the copy dialog's two action
     /// buttons (Append / Replace all). Overrides the stored mode so "Replace all"
     /// truncates first; "Append" keeps the target's rows.
     pub(crate) fn confirm_copy(&mut self, mode: CopyMode, cx: &mut Context<Self>) {
@@ -2650,7 +2653,7 @@ impl AppState {
             });
             active.normalize_panes();
         }
-        // The new half is now focused — seed its editor's completions and focus it.
+        // The new half is now focused; seed its editor's completions and focus it.
         self.refresh_completions(cx);
         self.pending_focus = Some(Pane::Editor);
         cx.notify();
@@ -2717,7 +2720,7 @@ impl AppState {
     /// Reconcile the split's focused half with where keyboard focus actually sits,
     /// so clicking into either half's editor or grid lights it as active (and aims
     /// run/export/filter there). Called at the top of `render`; no-op when not split
-    /// or when focus is elsewhere (schema, assistant, a modal) — the last half stays.
+    /// or when focus is elsewhere (schema, assistant, a modal); the last half stays.
     pub(crate) fn sync_split_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let detected = match &self.phase {
             Phase::Connected(active) => match &active.split {
@@ -2756,7 +2759,7 @@ impl AppState {
     }
 }
 
-/// Open `path` with the OS's default handler — the file-first "open in editor"
+/// Open `path` with the OS's default handler: the file-first "open in editor"
 /// seam. Platform shell-out lives at the app edge. Uses `spawn` (fire-and-forget),
 /// never `status`: callers run on the GPUI main thread, and waiting on the OS
 /// opener to exit (a slow `xdg-open`/`cmd start` handler) would freeze the window.

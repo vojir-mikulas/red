@@ -1,4 +1,4 @@
-//! The AI assistant provider seam — `red-ai` is to language models what
+//! The AI assistant provider seam. `red-ai` is to language models what
 //! `red-driver` is to database engines: one object-safe trait, one impl per
 //! backend, and no vendor wire format above the seam. The service holds a
 //! provider as `Arc<dyn AiProvider>` and drives a single model turn at a time;

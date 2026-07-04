@@ -6,7 +6,7 @@
 //! Both channels carry their payload in an **envelope** `(Option<SessionId>, _)`
 //! so a message routes to one of several keep-alive sessions without threading a
 //! `session` field through every variant (see [`SessionId`]). `None` is for the
-//! genuinely session-less messages — a `TestConnection` probe, `Shutdown`, and
+//! genuinely session-less messages: a `TestConnection` probe, `Shutdown`, and
 //! the `TestSucceeded`/`TestFailed` replies.
 
 use std::path::PathBuf;
@@ -35,7 +35,7 @@ pub enum Command {
     /// Open a throwaway session to validate a config, then drop it. Reports back
     /// via `TestSucceeded`/`TestFailed` without disturbing the active session.
     TestConnection(ConnectionConfig),
-    /// Append an SSH jump host's key to `~/.ssh/known_hosts` — the "trust this
+    /// Append an SSH jump host's key to `~/.ssh/known_hosts`: the "trust this
     /// host" action behind an [`Event::SshHostUnknown`] failure. Session-less; the
     /// UI re-sends `Connect` after this so the retry verifies against the new entry.
     TrustSshHost {
@@ -55,7 +55,7 @@ pub enum Command {
     },
     /// Load the schema-tree skeleton (namespaces + object names) for the sidebar.
     LoadObjects,
-    /// Describe one object's columns / FKs / indexes — sent lazily on tree expand.
+    /// Describe one object's columns / FKs / indexes; sent lazily on tree expand.
     DescribeTable {
         schema: String,
         table: String,
@@ -63,11 +63,11 @@ pub enum Command {
     /// Load the connection-wide foreign-key graph (Track B7) for FK click-through
     /// and inline FK column expansion. Sent once after connect; replied with
     /// `ForeignKeysLoaded`. A failure is swallowed (the feature degrades to absent),
-    /// never surfaced as a toast — FK navigation is an optional enhancement.
+    /// never surfaced as a toast; FK navigation is an optional enhancement.
     LoadForeignKeys,
     /// Open `sql` as a grid result: count its rows and report column metadata +
-    /// the total. The result is then browsed page-by-page via `FetchPage`, or —
-    /// when a seek key resolves — run-by-run via `FetchRun`.
+    /// the total. The result is then browsed page-by-page via `FetchPage`, or,
+    /// when a seek key resolves, run-by-run via `FetchRun`.
     ///
     /// `epoch` identifies this open result. Several results can be open at once
     /// (one per query tab), each keyed by its epoch; a page or export names the
@@ -161,8 +161,8 @@ pub enum Command {
     },
     /// Apply a batch of guarded, PK-keyed data edits (Track B6) **atomically** on the
     /// active session. The driver renders each `op` to dialect SQL, binds every
-    /// value, runs them in one transaction, and asserts each touches exactly one row
-    /// — all-or-nothing. `epoch` is the active result's epoch so a reply for a
+    /// value, runs them in one transaction, and asserts each touches exactly one
+    /// row (all-or-nothing). `epoch` is the active result's epoch so a reply for a
     /// superseded result (tab switched / re-run) is dropped. Replied with
     /// `BatchApplied` (then the UI patches/refetches) or `BatchFailed` (scoped to the
     /// result pane), never a global error toast.
@@ -173,7 +173,7 @@ pub enum Command {
     /// Run `EXPLAIN` (or `EXPLAIN ANALYZE` when `analyze`) for `sql` and report a
     /// normalized plan (Track B4). `epoch` is the active tab's result epoch so a
     /// stale reply (tab switched / query re-run) is dropped. Plain explain never
-    /// executes the statement; `analyze` does — the UI gates it to read queries.
+    /// executes the statement; `analyze` does (the UI gates it to read queries).
     Explain {
         sql: String,
         analyze: bool,
@@ -199,7 +199,7 @@ pub enum Command {
     /// rows. `id` identifies the import so progress / completion events and a
     /// `CancelImport` route to it. Runs off the dispatch loop (file IO on a blocking
     /// thread), holding at most one chunk in memory. Inserts **commit per chunk**
-    /// (v1), so a mid-file failure leaves the earlier rows committed — reported in the
+    /// (v1), so a mid-file failure leaves the earlier rows committed, reported in the
     /// `ImportFailed` event's `rows`.
     Import {
         path: PathBuf,
@@ -215,7 +215,7 @@ pub enum Command {
         id: u64,
     },
     /// Describe a copy **target** table's columns (name + declared type) so the UI
-    /// can auto-map a source result's columns onto it by name before any write —
+    /// can auto-map a source result's columns onto it by name before any write,
     /// the copy's equivalent of `ImportColumns`' file-header peek. The envelope's
     /// [`SessionId`] is the **target** connection (which may differ from the source
     /// for a cross-connection copy). `id` correlates the `CopyTargetColumns` reply;
@@ -224,10 +224,10 @@ pub enum Command {
         id: u64,
         target: TableRef,
     },
-    /// Stream a (filtered/sorted) open result straight into another table — the
+    /// Stream a (filtered/sorted) open result straight into another table: the
     /// table-copy headline. The envelope's [`SessionId`] is the **source** session;
     /// `source_epoch` selects its open result, whose already-wrapped SQL is re-read
-    /// at **full fidelity** (never the display cap) through a fresh cursor — so the
+    /// at **full fidelity** (never the display cap) through a fresh cursor, so the
     /// copy is byte-exact and includes any `⌘⇧F` filter / sort. `target_session` is
     /// where `target` lives (equal to the source for a same-connection copy, another
     /// open connection for a cross-connection one); both ends are pinned against idle
@@ -238,7 +238,7 @@ pub enum Command {
     ///
     /// When `create` is `Some`, the target table is **created first** from that column
     /// shape (types mapped into the target dialect via `red_core::typemap`), before the
-    /// rows stream in — this is "copy into a *new* table" / database migration. The
+    /// rows stream in; this is "copy into a *new* table" / database migration. The
     /// `create` columns mirror the source result's columns; `IF NOT EXISTS` makes it a
     /// no-op if the table already exists. `None` requires the target to pre-exist (the
     /// original same-shape copy).
@@ -256,11 +256,11 @@ pub enum Command {
     CancelCopy {
         id: u64,
     },
-    /// Migrate **many** tables in one job — the whole-database headline. The
+    /// Migrate **many** tables in one job: the whole-database headline. The
     /// envelope's [`SessionId`] is the **source** session; `source_schema` names the
     /// namespace they live in and `tables` the table names to move. Each is created
     /// on `target_session` under `target_schema` (from the source's column shape, types
-    /// mapped into the target dialect) and its rows streamed in — FK-ordered, skipping
+    /// mapped into the target dialect) and its rows streamed in, FK-ordered, skipping
     /// any table that already exists on the target (migrate populates a *fresh*
     /// database, never appends into an existing table). Both ends are pinned for the
     /// job's lifetime; it reuses the `Copy*` progress/terminal events and a
@@ -276,7 +276,7 @@ pub enum Command {
     /// object's keys) without importing, so the UI can build a name-based column
     /// mapping against the target table and preview it before any write. `id`
     /// correlates the reply. Replies `ImportColumns` on success, `ImportFailed` on a
-    /// read error. Pure file IO — no session needed.
+    /// read error. Pure file IO; no session needed.
     ImportColumns {
         path: PathBuf,
         format: ImportFormat,
@@ -287,18 +287,18 @@ pub enum Command {
     /// Drop the envelope's session and any cursor; the window returns to a
     /// disconnected state. Other warm sessions are untouched.
     Disconnect,
-    /// Drop the envelope's session — the user removed/closed a *background*
+    /// Drop the envelope's session: the user removed/closed a *background*
     /// connection (vs `Disconnect`, the window's active one going away). Same
     /// effect on the backend; kept distinct so the UI's intent stays legible.
     CloseSession,
     /// Tell the backend which session is foregrounded (`None` = the welcome
-    /// screen). The foreground session is exempt from idle eviction — a user can
+    /// screen). The foreground session is exempt from idle eviction; a user can
     /// stare at a result without scrolling and it must stay warm. Global (the
     /// payload, not the envelope, carries the id).
     SetActiveSession(Option<SessionId>),
     /// Set the statement timeout applied to every query and its page/run fetches
-    /// (`query.statement_timeout`). `None` disables it. Global — sent at launch and
-    /// on each settings reload — so it isn't threaded through every fetch command.
+    /// (`query.statement_timeout`). `None` disables it. Global (sent at launch and
+    /// on each settings reload) so it isn't threaded through every fetch command.
     SetStatementTimeout(Option<Duration>),
     /// Set the driver's display fat-cell cap (`grid.max_cell_chars`), in bytes.
     /// Global; applies to every subsequent display fetch. Export stays full-fidelity.
@@ -310,7 +310,7 @@ pub enum Command {
     /// Force an immediate update check ("Check for updates" in the About tab).
     /// Global.
     CheckForUpdate,
-    /// (Re)configure the AI assistant provider. Global — sent at launch and on
+    /// (Re)configure the AI assistant provider. Global; sent at launch and on
     /// each settings reload, like the other tuning knobs. An empty `api_key`
     /// leaves the assistant unconfigured (a turn then replies with `AiError`).
     /// The key never touches `settings.toml`; the UI reads it from the OS keyring
@@ -321,7 +321,7 @@ pub enum Command {
     /// row-capped) and streams `AiDelta` events, ending with `AiTurnFinished` or
     /// `AiError`. `conversation_id` lets the UI route deltas to the right thread
     /// and cancel a specific turn. `agent` is the id of the agent profile *this*
-    /// conversation is bound to (M-S6) — turns carry it so several chats on
+    /// conversation is bound to (M-S6); turns carry it so several chats on
     /// different agents (API-key, subscription, Codex, local) can run concurrently,
     /// rather than every turn following one global provider. An empty or unknown id
     /// resolves to the default agent / a clear `AiError`.
@@ -357,7 +357,7 @@ pub enum Command {
     /// `AiLoginPrompt`), the user authorizes there, then submits the code the
     /// browser shows via [`Command::AiSubmitLoginCode`]. Ends with `AiLoginFinished`.
     /// A no-op for an API agent (those carry a key, not a login). Red never sees the
-    /// OAuth tokens — the CLI owns them.
+    /// OAuth tokens; the CLI owns them.
     AiReauthenticateAgent {
         agent_id: String,
     },
@@ -379,7 +379,7 @@ pub enum Command {
     AiSignOutAgent {
         agent_id: String,
     },
-    /// Ask who is signed in on an ACP agent — answered with `AiAgentAuthStatus`.
+    /// Ask who is signed in on an ACP agent; answered with `AiAgentAuthStatus`.
     /// Sent when Settings → AI opens and after a sign-in/out. A no-op for an API
     /// agent.
     AiCheckAuthStatus {
@@ -400,7 +400,7 @@ pub enum Command {
 /// service → UI. Streamed into the UI's async loop, tagged by the channel
 /// envelope with the [`SessionId`] it belongs to (`None` for the session-less
 /// `TestSucceeded`/`TestFailed` probe replies) so the UI routes it to the right
-/// workspace — including a backgrounded one whose query is still populating.
+/// workspace, including a backgrounded one whose query is still populating.
 #[derive(Debug)]
 pub enum Event {
     /// A session opened. `version` is the engine version for the status bar.
@@ -470,7 +470,7 @@ pub enum Event {
     /// A result opened: its columns and total row count (for `OpenResult`).
     /// Echoes the open `epoch` so the grid can ignore a late reply for a result
     /// it has already replaced. `key` is the seek key the backend resolved for
-    /// a table browse — present, the grid pages by keyset runs (`FetchRun`)
+    /// a table browse: present, the grid pages by keyset runs (`FetchRun`)
     /// instead of `OFFSET`.
     ResultReady {
         columns: Vec<Column>,
@@ -489,7 +489,7 @@ pub enum Event {
     /// One run window of a keyset result, in response to `FetchRun`. Echoes the
     /// request (`fetch`, `seq`) so the grid can match it against its in-flight
     /// state. `estimated` is `true` when a `Jump` landed by key-space
-    /// interpolation — its ordinals are approximate until the run touches a
+    /// interpolation; its ordinals are approximate until the run touches a
     /// true end of the result.
     ResultRunLoaded {
         epoch: u64,
@@ -505,7 +505,7 @@ pub enum Event {
         rows: Vec<Vec<red_core::Value>>,
     },
     /// A `FetchRun` failed (the error itself is also surfaced via `Error`).
-    /// Echoed so the grid can free its in-flight slot — without this a single
+    /// Echoed so the grid can free its in-flight slot; without this a single
     /// failed seek would wedge the run buffer and freeze all further fetching.
     ResultRunFailed {
         epoch: u64,
@@ -519,7 +519,7 @@ pub enum Event {
         column: String,
         stats: ColumnStats,
     },
-    /// A `ColumnStats` request failed — scoped to the stats bar (shown as "stats
+    /// A `ColumnStats` request failed; scoped to the stats bar (shown as "stats
     /// unavailable") rather than a global error toast, like `PlanFailed`.
     ColumnStatsFailed {
         epoch: u64,
@@ -537,10 +537,10 @@ pub enum Event {
         applied: u64,
     },
     /// A guarded edit batch failed (engine error, or an op touched ≠1 row) and the
-    /// whole transaction rolled back — nothing changed. `failed_index` is the 0-based
+    /// whole transaction rolled back; nothing changed. `failed_index` is the 0-based
     /// position of the offending op when known, so the UI can point at the staged
-    /// change. Scoped to the result pane by `epoch` — shown there, not as a global
-    /// toast — like `PlanFailed`.
+    /// change. Scoped to the result pane by `epoch` (shown there, not as a global
+    /// toast), like `PlanFailed`.
     BatchFailed {
         epoch: u64,
         failed_index: Option<usize>,
@@ -553,7 +553,7 @@ pub enum Event {
         plan: QueryPlan,
     },
     /// An `Explain` failed (bad SQL, unsupported statement). Scoped to the plan
-    /// pane by `epoch` — shown there rather than as a global error toast.
+    /// pane by `epoch`; shown there rather than as a global error toast.
     PlanFailed {
         epoch: u64,
         message: String,
@@ -639,7 +639,7 @@ pub enum Event {
         id: u64,
         rows: usize,
     },
-    /// The self-updater's state changed (Phases 3–4). Global (`None` session) —
+    /// The self-updater's state changed (Phases 3–4). Global (`None` session);
     /// the UI stores it and renders the titlebar pill + About-tab status from it.
     UpdateState(UpdateState),
     /// A streamed increment of an assistant turn. Echoes `conversation_id` so the
@@ -693,7 +693,7 @@ pub enum Event {
         conversation_id: u64,
         commands: Vec<AiCommand>,
     },
-    /// The subscription agent advertised (or updated) its session config selectors —
+    /// The subscription agent advertised (or updated) its session config selectors:
     /// model / reasoning dropdowns. Scoped to the conversation; the panel renders
     /// them next to the Send button. The latest list replaces the previous.
     AiConfigOptionsAvailable {
@@ -702,7 +702,7 @@ pub enum Event {
     },
     /// An interactive subscription sign-in opened the browser to `url` (paste-code
     /// flow). The UI shows it so the user can open it manually if needed, then enter
-    /// the code. Scoped to the agent, not a conversation — sign-in lives in Settings.
+    /// the code. Scoped to the agent, not a conversation; sign-in lives in Settings.
     AiLoginPrompt {
         agent_id: String,
         url: String,
@@ -725,7 +725,7 @@ pub enum Event {
 
 /// Which backend executes an agent profile's turns. `Api` is the Claude Messages
 /// API path (`red-ai`, optionally at a custom base URL); `Acp` drives an external
-/// agent over ACP (`red-acp`) — Claude Code on a subscription, Codex, a local agent.
+/// agent over ACP (`red-acp`): Claude Code on a subscription, Codex, a local agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AiAgentKind {
     #[default]
@@ -739,7 +739,7 @@ pub enum AiAgentKind {
 /// registry by [`id`](Self::id); a turn names that id.
 #[derive(Clone, PartialEq)]
 pub struct AiAgentProfile {
-    /// Stable id — the per-turn selector and keyring account (`ai-key:<id>`).
+    /// Stable id: the per-turn selector and keyring account (`ai-key:<id>`).
     pub id: String,
     /// Display name (echoed back to the UI for the selector/header; not used by the
     /// service itself).
@@ -758,7 +758,7 @@ pub struct AiAgentProfile {
     pub api_key: String,
 }
 
-/// Hand-written so the API key is **never** printed — matching the redacting `Debug`
+/// Hand-written so the API key is **never** printed, matching the redacting `Debug`
 /// on `ConnectionConfig`/`SshConfig`, so a stray `{profile:?}` (or a debug-log of the
 /// command stream carrying an `AiConfig`) can't spill the key into the logs.
 impl std::fmt::Debug for AiAgentProfile {
@@ -786,7 +786,7 @@ impl std::fmt::Debug for AiAgentProfile {
 /// from `settings.toml` (`[ai]`) plus per-agent API keys read from the OS keyring.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AiConfig {
-    /// The configured agents (always at least one — the legacy built-ins are
+    /// The configured agents (always at least one; the legacy built-ins are
     /// synthesized when none are defined). Keyed by id in the service registry.
     pub agents: Vec<AiAgentProfile>,
     /// The id a turn falls back to when it names an empty/unknown agent.
@@ -794,7 +794,7 @@ pub struct AiConfig {
     /// Surface a summarized "thinking…" affordance (adaptive thinking).
     pub show_thinking: bool,
     /// The global AI master switch (`[ai] enabled`, M-S7). When `false`, the
-    /// service refuses turns and never starts an MCP server or agent — a true kill
+    /// service refuses turns and never starts an MCP server or agent: a true kill
     /// switch. A connection's `ai_enabled` override can flip it per session.
     pub enabled: bool,
     /// The global access tier (`[ai] tier`, M-S7) deciding which DB tools the model
@@ -815,7 +815,7 @@ pub struct AiContext {
     /// small even for large databases.
     pub schema_summary: String,
     /// The currently-viewed tab, so the user can refer to it ("this tab", "the
-    /// current query/result"): its name and — at `read` tier — a one-line shape of
+    /// current query/result"): its name and, at `read` tier, a one-line shape of
     /// the result on screen (row/column counts + column names). The SQL itself rides
     /// in `editor_sql`.
     pub current_tab: Option<String>,
@@ -828,12 +828,12 @@ pub struct AiContext {
     /// A rendered digest of an earlier, persisted conversation (M-S5), set only on
     /// the first turn after a saved chat is reopened. The backend starts a fresh
     /// session (the agent/history isn't restored), so this folds the prior exchange
-    /// back into the prompt as context — the conversation continues coherently
+    /// back into the prompt as context; the conversation continues coherently
     /// across app restarts on both the API-key and subscription paths.
     pub prior_transcript: Option<String>,
     /// `kind` + database name, for the system prompt's grounding line.
     pub connection: String,
-    /// Whether this connection forbids writes — folded into the prompt so the
+    /// Whether this connection forbids writes, folded into the prompt so the
     /// model doesn't propose edits it can't run.
     pub read_only: bool,
     /// The active Red/Flint theme's colors, so an AI-generated report can match
@@ -852,7 +852,7 @@ pub struct AiContext {
 
 /// A snapshot of the active theme's colors as CSS color strings, handed to the
 /// report generator so the standalone HTML report (page, tables, charts, filter
-/// controls) is painted in Red's current palette. UI-agnostic on this side — the
+/// controls) is painted in Red's current palette. UI-agnostic on this side: the
 /// UI converts its `Hsla` tokens to CSS; the report shell + chart/table renderer
 /// just substitute them.
 #[derive(Debug, Clone)]
@@ -895,7 +895,7 @@ pub enum AiDelta {
 }
 
 /// One slash command the assistant backend advertises (the `AiCommandsAvailable`
-/// payload). Subscription (ACP) only — the agent lists them after its session opens;
+/// payload). Subscription (ACP) only: the agent lists them after its session opens;
 /// the composer offers them through a `/`-triggered picker. `name` carries no
 /// leading slash.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -904,7 +904,7 @@ pub struct AiCommand {
     pub description: String,
 }
 
-/// Who (if anyone) is signed in on a subscription (ACP) agent — the
+/// Who (if anyone) is signed in on a subscription (ACP) agent, the
 /// `AiAgentAuthStatus` payload, surfaced in Settings → AI. Resolved by asking the
 /// agent's bundled CLI; Red never sees the OAuth tokens, only this summary.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -919,7 +919,7 @@ pub struct AiAuthStatus {
 }
 
 /// One session config selector the subscription agent advertises (the
-/// `AiConfigOptionsAvailable` payload) — a model or reasoning-level dropdown. The
+/// `AiConfigOptionsAvailable` payload): a model or reasoning-level dropdown. The
 /// `id`/`value` strings are opaque agent identifiers round-tripped via
 /// `Command::AiSetConfigOption`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -940,7 +940,7 @@ pub struct AiConfigChoice {
     pub description: Option<String>,
 }
 
-/// What an [`AiConfigOption`] controls — drives where the composer places it.
+/// What an [`AiConfigOption`] controls; it drives where the composer places it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiConfigCategory {
     Model,
@@ -968,7 +968,7 @@ pub struct AiUsage {
 /// app knows its own version; the service doesn't).
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateConfig {
-    /// `false` (`auto_update = false`) short-circuits the updater entirely — no
+    /// `false` (`auto_update = false`) short-circuits the updater entirely: no
     /// timer, no network.
     pub enabled: bool,
     /// The GitHub `owner/repo` to poll, e.g. `vojir-mikulas/red`.
@@ -983,7 +983,7 @@ pub struct UpdateConfig {
 /// backend can resolve a composite keyset key (or wrap for the `OFFSET` fallback).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SortKey {
-    /// 1-based output position of the sort column — used for the `OFFSET`-fallback
+    /// 1-based output position of the sort column, used for the `OFFSET`-fallback
     /// `ORDER BY <position>` wrap, which orders by position to dodge identifier
     /// quoting (engine-agnostic).
     pub position: usize,
@@ -994,7 +994,7 @@ pub struct SortKey {
 
 /// One `FetchRun` shape: how to extend or relocate the grid's resident run of
 /// a keyset-keyed result. A boundary is the key *tuple* of one row (lead column,
-/// then tiebreaker) — one element for a plain browse, two for a sorted browse.
+/// then tiebreaker): one element for a plain browse, two for a sorted browse.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunFetch {
     /// Rows strictly after `after`, in sort order. `None` starts from the result's
@@ -1005,9 +1005,9 @@ pub enum RunFetch {
     Backward { before: Vec<Value> },
     /// Replace the run near row `ordinal`. When `exact` is `false` (scroll /
     /// scrollbar relocations), an integer key with known bounds is served by a
-    /// key-space interpolated seek (`estimated` reply) — fast but approximate.
+    /// key-space interpolated seek (`estimated` reply), which is fast but approximate.
     /// When `exact` is `true` ("go to row N"), interpolation is skipped and the
-    /// row is served precisely (one `OFFSET` page — O(ordinal), but the reply's
+    /// row is served precisely (one `OFFSET` page; O(ordinal), but the reply's
     /// ordinals are exact), so the gutter shows the true row number.
     Jump { ordinal: usize, exact: bool },
 }

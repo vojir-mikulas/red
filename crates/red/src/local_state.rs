@@ -1,4 +1,4 @@
-//! Small, app-managed local state that isn't a user *preference* — it lives apart
+//! Small, app-managed local state that isn't a user *preference*; it lives apart
 //! from `settings.toml` (which the user edits) in `<config>/red/state.json`.
 //!
 //! Today it holds one fact: the last app version we showed the user. Comparing it
@@ -21,7 +21,7 @@ fn state_path() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("red").join("state.json"))
 }
 
-/// The on-disk shape — a wrapper object (not a bare value) so new fields can be
+/// The on-disk shape: a wrapper object (not a bare value) so new fields can be
 /// added later without breaking older files.
 #[derive(Default, Serialize, Deserialize)]
 struct StateFile {
@@ -50,7 +50,7 @@ impl LocalState {
                     None
                 }
             },
-            // Missing file or unreadable dir — empty state, not an error.
+            // Missing file or unreadable dir means empty state, not an error.
             _ => None,
         };
         Self {
@@ -146,7 +146,7 @@ mod tests {
     }
 
     /// An older/empty file (no `last_seen_version` key) loads as absent, not an
-    /// error — the forward-compat guarantee of the wrapper shape.
+    /// error; the forward-compat guarantee of the wrapper shape.
     #[test]
     fn missing_field_loads_as_absent() {
         let back: StateFile = serde_json::from_str("{}").unwrap();

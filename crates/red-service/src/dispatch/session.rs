@@ -19,17 +19,17 @@ use super::{emit, lock, Events};
 
 /// Backstop cap on open results retained per session. The UI evicts a superseded
 /// result (re-sort / filter / tab-close) by sending `CloseResult`, so the live
-/// count tracks the user's open tabs — well under this. The cap is defense in
+/// count tracks the user's open tabs, well under this. The cap is defense in
 /// depth: if a future UI path ever opens a result without closing its predecessor,
 /// the lowest-epoch (oldest) entries are reaped here instead of growing for the
 /// session's life. Epochs are process-global and monotonic, so "lowest epoch" is
-/// "oldest opened" — but it can belong to any tab, so the cap is set far above any
+/// "oldest opened"; but it can belong to any tab, so the cap is set far above any
 /// realistic open-tab count to never reap a live result in normal use.
 pub(crate) const MAX_OPEN_RESULTS: usize = 256;
 
 /// How long a non-foreground session may sit untouched before it's evicted: its
 /// driver is dropped (connection released) and any in-flight work aborted. The
-/// foreground session (per `SetActiveSession`) is exempt — it must stay warm
+/// foreground session (per `SetActiveSession`) is exempt: it must stay warm
 /// however long the user studies a result without scrolling.
 pub(crate) const IDLE_EVICT: Duration = Duration::from_secs(600);
 
@@ -37,7 +37,7 @@ pub(crate) const IDLE_EVICT: Duration = Duration::from_secs(600);
 /// an [`AbortSignal`]; when a newer one supersedes it (a flung scrollbar, a new
 /// page, a closed tab) the old signal is [`abort`](AbortSignal::abort)ed so the
 /// engine stops the doomed query instead of running it to completion. Held only on
-/// the dispatch loop (single-threaded), so no extra lock — the spawned task keeps
+/// the dispatch loop (single-threaded), so no extra lock; the spawned task keeps
 /// its own clone and the driver disarms it on completion, making a late abort a
 /// no-op.
 #[derive(Default)]
@@ -88,7 +88,7 @@ pub(crate) struct ActiveQuery {
 /// streaming cursor (the legacy `Query` path), the open-result map, the per-epoch
 /// abort handles, the in-flight export flags, and when it was last touched (for
 /// idle eviction). Several of these stay warm at once, keyed by [`SessionId`], so
-/// switching between connections is instant — no reconnect, no schema reload.
+/// switching between connections is instant: no reconnect, no schema reload.
 pub(crate) struct SessionState {
     pub(crate) driver: Arc<dyn DatabaseDriver>,
     /// This connection's optional AI policy overrides (M-S7), captured at connect
@@ -99,7 +99,7 @@ pub(crate) struct SessionState {
     pub(crate) ai_override: AiOverride,
     /// The connection's read-only posture, captured at connect. Carried into the AI
     /// policy so the write tool (`AiTier::Write`) is withheld on a read-only
-    /// connection — the same guard the human write path is held to.
+    /// connection, the same guard the human write path is held to.
     pub(crate) read_only: bool,
     /// The SSH tunnel this connection rides, if any. Held only to keep it alive
     /// for the session's lifetime: dropping it (on teardown/eviction) closes the
@@ -114,7 +114,7 @@ pub(crate) struct SessionState {
     /// In-use pin against idle eviction: the number of background jobs currently
     /// reading from or writing to this session. A table copy reads from a session
     /// that is, by definition, *not* the foreground (you copy A→B; at most one side
-    /// is on-screen) and may run for many minutes with no commands — so without a
+    /// is on-screen) and may run for many minutes with no commands, so without a
     /// pin its source could be evicted mid-copy (tunnel dropped, connection broken),
     /// since only *commands* bump `last_used`. The copy job increments this on both
     /// ends via a [`PinGuard`] and `evict_idle` skips any session that is foreground
@@ -129,7 +129,7 @@ pub(crate) struct SessionState {
 
 /// RAII pin holding a session's [`busy`](SessionState::busy) counter up while a
 /// background job (a table copy) uses it. Increments on construction, decrements on
-/// drop — so the pin unwinds correctly on normal finish, cancel, or panic, and a
+/// drop, so the pin unwinds correctly on normal finish, cancel, or panic, and a
 /// session can never be left pinned by a job that died. A copy holds one of these
 /// per end (source + target).
 pub(crate) struct PinGuard(Arc<AtomicUsize>);
@@ -177,7 +177,7 @@ impl SessionState {
         }
     }
 
-    /// Stop everything in flight at the engine and forget every open result —
+    /// Stop everything in flight at the engine and forget every open result;
     /// the session is being dropped (disconnect / close / eviction).
     pub(crate) fn teardown(&mut self) {
         abort_all_inflight(&mut self.inflight);
@@ -191,7 +191,7 @@ impl SessionState {
     }
 
     /// Backstop GC: if open results exceed [`MAX_OPEN_RESULTS`], reap the
-    /// lowest-epoch (oldest-opened) ones — aborting their in-flight fetches — until
+    /// lowest-epoch (oldest-opened) ones, aborting their in-flight fetches, until
     /// back under the cap. A no-op in normal use (the UI closes superseded results);
     /// this only bites if a caller leaks epochs, turning unbounded growth into a
     /// bounded, logged drop. Never touches `keep` (the just-opened epoch).
@@ -215,7 +215,7 @@ impl SessionState {
 
 /// The result of a spawned connect/probe, delivered back to the dispatch loop so
 /// the (single-threaded) loop owns every mutation of `sessions`. Dialing runs off
-/// the loop — see `CONNECT_TIMEOUT` and the `Connect` arm — so one slow connect
+/// the loop (see `CONNECT_TIMEOUT` and the `Connect` arm), so one slow connect
 /// to a black-hole host can't freeze every other warm session's commands.
 pub(crate) enum ConnectOutcome {
     /// A `Connect` finished. `gen` is the connect generation captured when it was
@@ -231,13 +231,13 @@ pub(crate) enum ConnectOutcome {
         read_only: bool,
         result: Result<(Arc<dyn DatabaseDriver>, Option<Tunnel>), ConnectFail>,
     },
-    /// A session-less `TestConnection` finished — carries the server version on
+    /// A session-less `TestConnection` finished; carries the server version on
     /// success, the error message otherwise.
     Test { result: Result<String, String> },
 }
 
 /// A failed connect attempt: the user-facing message plus whether it's `fatal`
-/// (user-correctable — bad credentials, missing database) and so should stop the
+/// (user-correctable: bad credentials, missing database) and so should stop the
 /// UI's backoff loop rather than schedule another retry. `host_key`, when set,
 /// turns the failure into a trustable unknown-SSH-host prompt instead.
 pub(crate) struct ConnectFail {
@@ -273,7 +273,7 @@ pub(crate) fn apply_connect_outcome(
             result,
         } => {
             // A newer `Connect` on this id superseded the one that produced this
-            // result — drop it so a slow dial can't clobber a fresh session.
+            // result; drop it so a slow dial can't clobber a fresh session.
             if connect_gen.get(&id).copied() != Some(generation) {
                 return;
             }
@@ -288,7 +288,7 @@ pub(crate) fn apply_connect_outcome(
                     // the prior connection's driver. The reconnect already fired an
                     // eviction, but an AI turn spawned just before the reconnect could
                     // insert its conversation *after* that eviction ran (the dial has
-                    // since completed, so it has — closing that orphan-on-reconnect
+                    // since completed, so it has, closing that orphan-on-reconnect
                     // race). A first connect has no such conversation, so this no-ops.
                     let manager = ai_acp.clone();
                     tokio::spawn(async move { manager.lock().await.evict_session(Some(id)) });
@@ -352,7 +352,7 @@ pub(crate) fn evict_idle(
     }
 }
 
-/// Abort every in-flight fetch across all open results and clear the registry —
+/// Abort every in-flight fetch across all open results and clear the registry:
 /// the connection is being dropped or replaced, so all of it is doomed work.
 pub(crate) fn abort_all_inflight(inflight: &mut HashMap<u64, InFlight>) {
     for (_, f) in inflight.drain() {

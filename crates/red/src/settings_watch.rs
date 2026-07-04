@@ -3,7 +3,7 @@
 //! A background [`notify`] watcher forwards debounced change notifications to the
 //! UI over an async channel the app drains on its foreground executor (mirroring
 //! how backend `Event`s are drained). Editing the file in any editor re-applies
-//! within a frame — no restart.
+//! within a frame; no restart.
 //!
 //! **Trailing-edge debounce.** Editors fire several filesystem events per save
 //! (and some save non-atomically: truncate, then write). A dedicated debounce
@@ -40,8 +40,8 @@ pub(crate) struct SettingsWatcher {
 impl SettingsWatcher {
     /// Start watching `path`'s parent directory (watching the file directly misses
     /// the atomic-rename replace on most platforms). Returns the watcher plus the
-    /// receiver the app drains; `None` if the platform watcher can't start —
-    /// live reload is a convenience, never load-bearing.
+    /// receiver the app drains; `None` if the platform watcher can't start
+    /// (live reload is a convenience, never load-bearing).
     pub(crate) fn start(path: PathBuf) -> Option<(Self, UnboundedReceiver<()>)> {
         let dir = path.parent()?.to_path_buf();
         // The config dir may not exist on a fresh install; create it so the
@@ -83,7 +83,7 @@ impl SettingsWatcher {
 }
 
 /// The watcher-thread side: filters events to our file and pings the debounce
-/// thread. Deliberately does no file IO — reading happens after the burst settles.
+/// thread. Deliberately does no file IO; reading happens after the burst settles.
 struct ReloadHandler {
     path: PathBuf,
     ping_tx: mpsc::Sender<()>,
@@ -136,7 +136,7 @@ fn spawn_debounce(
                 }
             }
             if tx.unbounded_send(()).is_err() {
-                return; // UI gone — stop watching.
+                return; // UI gone; stop watching.
             }
         }
     });

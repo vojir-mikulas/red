@@ -2,7 +2,7 @@
 //! normalized [`red_core::QueryPlan`] tree (Track B4). No JSON: SQLite returns
 //! tabular `(id, parent, detail)` rows, Postgres an indented text plan, MySQL a
 //! `FORMAT=TREE` text tree, and older MySQL / MariaDB a tabular `EXPLAIN`. Every
-//! parser also keeps the engine's verbatim text in [`QueryPlan::raw`] — the UI's
+//! parser also keeps the engine's verbatim text in [`QueryPlan::raw`], the UI's
 //! "Copy plan" payload and its fallback when the structural parse yields nothing.
 //!
 //! Pure functions (text in, tree out), so the shapes are unit-tested without a
@@ -106,7 +106,7 @@ pub(crate) fn from_text_tree(raw: &str, analyzed: bool) -> QueryPlan {
     }
 }
 
-/// Parse an indentation-nested text plan with **no node markers** — ClickHouse's
+/// Parse an indentation-nested text plan with **no node markers**: ClickHouse's
 /// `EXPLAIN`, where each step is a line whose nesting is purely its leading-space
 /// indent (no `->` prefix like Postgres/MySQL). Every non-empty line is a node at
 /// its indentation; a deeper-indented line nests under the previous shallower one.
@@ -145,7 +145,7 @@ pub(crate) fn from_indent_tree(raw: &str) -> QueryPlan {
 
 /// Build a flat plan from a tabular `EXPLAIN` (older MySQL / MariaDB, which lack
 /// `FORMAT=TREE`): one node per row, its non-empty columns folded into metrics,
-/// labelled by the `table` column when present. Not nested — honestly flat — but
+/// labelled by the `table` column when present. Not nested (honestly flat), but
 /// readable, and `raw` carries the rendered table.
 pub(crate) fn from_table(columns: Vec<String>, rows: Vec<Vec<String>>) -> QueryPlan {
     let table_col = columns.iter().position(|c| c.eq_ignore_ascii_case("table"));
@@ -188,7 +188,7 @@ fn attach(stack: &mut [(usize, PlanNode)], roots: &mut Vec<PlanNode>, node: Plan
 }
 
 /// Push a node at `indent`, first closing every open node at an equal-or-deeper
-/// indent (they're complete — a shallower or equal sibling has arrived).
+/// indent (they're complete; a shallower or equal sibling has arrived).
 fn push_node(
     stack: &mut Vec<(usize, PlanNode)>,
     roots: &mut Vec<PlanNode>,
@@ -221,7 +221,7 @@ fn append_detail(node: &mut PlanNode, line: &str) {
 /// `(key=value …)` group(s). A group is a metric group only if it contains `=`
 /// (so a parenthesised filter like `(age > 30)` stays part of the label); the
 /// label is the text before the first metric group. Keys may carry a space prefix
-/// — Postgres's `(actual time=… rows=… loops=…)` becomes `actual time`, `rows`,
+/// (Postgres's `(actual time=… rows=… loops=…)` becomes `actual time`, `rows`,
 /// `loops`.
 fn split_paren_metrics(content: &str) -> (String, Vec<(String, String)>) {
     let bytes = content.as_bytes();
@@ -286,7 +286,7 @@ fn parse_metric_tokens(inner: &str, out: &mut Vec<(String, String)>) {
     }
 }
 
-/// Render a node tree as an indented outline — SQLite's `raw` and the copy text.
+/// Render a node tree as an indented outline: SQLite's `raw` and the copy text.
 fn render_outline(nodes: &[PlanNode]) -> String {
     fn walk(out: &mut String, node: &PlanNode, depth: usize) {
         for _ in 0..depth {

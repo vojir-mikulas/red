@@ -1,4 +1,4 @@
-//! MySQL / MariaDB driver — the third source of `DatabaseDriver`, proving the
+//! MySQL / MariaDB driver, the third source of `DatabaseDriver`, proving the
 //! abstraction across a second network engine. Built on `mysql_async`: a pooled
 //! async connection, a streaming cursor, and **out-of-band cancel** via
 //! `KILL QUERY <conn_id>` issued on a separate pooled connection (MySQL has no
@@ -7,10 +7,10 @@
 //! Streaming note: `mysql_async`'s `QueryResult` borrows the `Conn`, so a
 //! self-owned stream behind a `Mutex` (the `PgCursor` shape) fights lifetimes.
 //! Instead a task owns the connection for the cursor's life and pumps rows over a
-//! bounded channel — capacity provides natural backpressure, so memory stays flat
+//! bounded channel: capacity provides natural backpressure, so memory stays flat
 //! over a large result and `next_window(&self)` simply drains the receiver.
 //!
-//! Value mapping covers the common scalar types — int/float/text/blob — with
+//! Value mapping covers the common scalar types (int/float/text/blob) with
 //! date/time/decimal/json/enum/set rendered as text. Read-only sets
 //! `SESSION TRANSACTION READ ONLY` on every pooled connection.
 
@@ -48,10 +48,10 @@ pub struct MysqlDriver {
     version: String,
     /// Read-only posture. Every write transaction is opened with `START
     /// TRANSACTION READ ONLY` (not a bare `BEGIN`) so the engine rejects writes
-    /// per-transaction — the session-level `SET SESSION TRANSACTION READ ONLY`
+    /// per-transaction; the session-level `SET SESSION TRANSACTION READ ONLY`
     /// from `init` does not survive a pooled connection being reset on reclaim.
     read_only: bool,
-    /// When set, the schema tree is restricted to this one database — the
+    /// When set, the schema tree is restricted to this one database: the
     /// connection's chosen `database`. `None` lists every non-system database on
     /// the server (a MySQL connection can see them all). See [`Self::with_scope`].
     scope: Option<String>,
@@ -65,7 +65,7 @@ impl MysqlDriver {
         // `CLIENT_FOUND_ROWS`: report *matched* rows from `affected_rows`, like
         // Postgres and SQLite. Without it a no-op `UPDATE` (PK matched, value
         // unchanged) reports 0 and `apply_edit`'s `affected != 1` check would roll
-        // an otherwise-valid edit back — a cross-driver behaviour difference.
+        // an otherwise-valid edit back, a cross-driver behaviour difference.
         let mut builder = OptsBuilder::from_opts(opts).client_found_rows(true);
         if read_only {
             // Runs on each new pooled connection, so writes are rejected at the
@@ -91,7 +91,7 @@ impl MysqlDriver {
 
     /// The statement that opens a write transaction. On a read-only connection it
     /// is `START TRANSACTION READ ONLY` so the engine rejects any write in the
-    /// batch per-transaction — robust even when a pooled connection's session-level
+    /// batch per-transaction, robust even when a pooled connection's session-level
     /// read-only posture was wiped by a reset on reclaim. See the `read_only` field.
     fn begin_stmt(&self) -> &'static str {
         if self.read_only {
@@ -109,7 +109,7 @@ impl MysqlDriver {
     }
 
     /// An out-of-band cancel that `KILL QUERY <conn_id>`s on a *separate* pooled
-    /// connection — MySQL has no in-band cancel-request protocol. Shared by the
+    /// connection; MySQL has no in-band cancel-request protocol. Shared by the
     /// streaming cursor and the one-shot fetches.
     ///
     /// `alive` guards the connection-reuse race: MySQL thread ids are recycled, so
@@ -126,7 +126,7 @@ impl MysqlDriver {
             let alive = alive.clone();
             tokio::spawn(async move {
                 // Cheap pre-check, then a second check once we hold the kill
-                // connection — narrowing the window between "is our query still
+                // connection, narrowing the window between "is our query still
                 // running?" and issuing the KILL to acquiring that connection.
                 if !alive.load(Ordering::SeqCst) {
                     return;
@@ -140,8 +140,8 @@ impl MysqlDriver {
         })
     }
 
-    /// Arm `abort` with a `KILL QUERY` for `conn_id`, returning a guard that — on
-    /// drop at fetch completion — both disarms the signal *and* marks the fetch
+    /// Arm `abort` with a `KILL QUERY` for `conn_id`, returning a guard that (on
+    /// drop at fetch completion) both disarms the signal *and* marks the fetch
     /// finished (so a concurrently-spawned `KILL` skips the now-recycled id). The
     /// guard is declared after the `Conn` at every call site, so it drops (and
     /// flips `alive`) before the connection returns to the pool. See [`kill_token`].
@@ -195,7 +195,7 @@ impl DatabaseDriver for MysqlDriver {
     async fn open_cursor(&self, sql: &str, opts: QueryOptions) -> Result<Box<dyn QueryCursor>> {
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
         let conn_id = conn.id();
-        // Prepare to read columns up front without stepping rows — cheap, as the
+        // Prepare to read columns up front without stepping rows: cheap, as the
         // contract requires; the (possibly expensive) execute happens in the task.
         let stmt = conn.prep(sql).await.map_err(map_my_err)?;
         let columns: Vec<Column> = stmt.columns().iter().map(col_meta).collect();
@@ -218,7 +218,7 @@ impl DatabaseDriver for MysqlDriver {
                     return;
                 }
             };
-            // Offset-mode display stream (editor run) — cap every cell, no exempt key.
+            // Offset-mode display stream (editor run): cap every cell, no exempt key.
             // A full-fidelity reader (the table copy) reads byte-exact instead.
             let cap = if full {
                 None
@@ -229,7 +229,7 @@ impl DatabaseDriver for MysqlDriver {
                 match result.next().await {
                     Ok(Some(row)) => {
                         if tx.send(Ok(my_row(&row, cap))).await.is_err() {
-                            break; // cursor dropped — stop pumping.
+                            break; // cursor dropped; stop pumping.
                         }
                     }
                     Ok(None) => break,
@@ -414,7 +414,7 @@ impl DatabaseDriver for MysqlDriver {
 
     fn contains_predicate(&self, columns: &[ColumnMeta], term: &str) -> Option<String> {
         // MySQL/MariaDB treat `\` as a string-literal escape in the default mode,
-        // so the pattern's backslashes need a second doubling — `true` here.
+        // so the pattern's backslashes need a second doubling: `true` here.
         crate::contains_clause(
             columns,
             term,
@@ -603,7 +603,7 @@ impl DatabaseDriver for MysqlDriver {
         let mut total = 0u64;
         for op in ops {
             // MySQL auto-coerces a bound string into a JSON column (it validates and
-            // stores), so no per-type cast is needed — `decl_type` is ignored here.
+            // stores), so no per-type cast is needed; `decl_type` is ignored here.
             let (sql, params) = crate::edit_sql(
                 op,
                 |id| format!("`{}`", escape_ident(id)),
@@ -612,7 +612,7 @@ impl DatabaseDriver for MysqlDriver {
             let bound: Vec<MyValue> = params.iter().map(|v| to_my(v)).collect();
             // With `CLIENT_FOUND_ROWS` set at connect, `affected_rows` reports
             // *matched* rows (like Postgres/SQLite), so a PK-matched edit reports 1
-            // even when the value is unchanged — the `affected != 1` guard stays
+            // even when the value is unchanged; the `affected != 1` guard stays
             // consistent.
             let result = if bound.is_empty() {
                 conn.exec_drop(sql.as_str(), ()).await
@@ -655,7 +655,7 @@ impl DatabaseDriver for MysqlDriver {
         let mut total = 0u64;
         for chunk in rows.chunks(max) {
             // MySQL auto-coerces a bound string into the column type (incl. JSON),
-            // so no per-type cast is needed — `decl_type` is ignored.
+            // so no per-type cast is needed; `decl_type` is ignored.
             let (sql, params) = crate::insert_sql(
                 table,
                 columns,
@@ -797,7 +797,7 @@ impl DatabaseDriver for MysqlDriver {
         let mut throttle = ProgressThrottle::new(progress);
 
         // Bail on cancel: drop the writer, remove the partial file, and report
-        // interruption — never leave a truncated CSV/JSON behind.
+        // interruption; never leave a truncated CSV/JSON behind.
         macro_rules! bail_if_cancelled {
             () => {
                 if cancel.load(Ordering::Relaxed) {
@@ -819,8 +819,8 @@ impl DatabaseDriver for MysqlDriver {
 }
 
 /// Holds a one-shot fetch's `KILL` arm for the fetch's lifetime. On drop (fetch
-/// done) it marks the fetch finished — *before* the connection returns to the pool
-/// — then the wrapped [`ArmGuard`] disarms the signal. See [`MysqlDriver::arm_kill`].
+/// done) it marks the fetch finished (*before* the connection returns to the pool),
+/// then the wrapped [`ArmGuard`] disarms the signal. See [`MysqlDriver::arm_kill`].
 struct KillGuard {
     _arm: ArmGuard,
     alive: Arc<AtomicBool>,
@@ -883,7 +883,7 @@ fn col_meta(col: &MyColumn) -> Column {
 }
 
 /// Map a row's cells to [`Value`]s, branching `Bytes` on the column charset. With a
-/// display `cap`, over-cap non-key text/blob cells come back [`Value::Capped`] —
+/// display `cap`, over-cap non-key text/blob cells come back [`Value::Capped`];
 /// the bytes past the cap (and a blob's whole payload) never reach a `Value`.
 fn my_row(row: &Row, cap: Option<CellCap>) -> Vec<Value> {
     let cols = row.columns_ref();
@@ -927,7 +927,7 @@ fn plan_from_table(rows: &[Row]) -> QueryPlan {
     crate::plan::from_table(columns, table_rows)
 }
 
-/// One tabular-`EXPLAIN` cell as a plain display string (no capping — plan cells
+/// One tabular-`EXPLAIN` cell as a plain display string (no capping; plan cells
 /// are tiny). Binary/temporal cells fall back to their debug form; they don't
 /// appear in `EXPLAIN` output in practice.
 fn my_cell_string(value: Option<&MyValue>) -> String {
@@ -969,7 +969,7 @@ fn my_value(value: Option<&MyValue>, col: &MyColumn, max: Option<usize>) -> Valu
 /// `TEXT` and `BLOB` share type codes and differ only by charset: the binary
 /// charset (`63`) marks genuine binary. `JSON` reports the binary charset but is
 /// UTF-8 text, so it's the one exception that stays `Text`. With a display cap
-/// (`max`), a non-key blob keeps only its length and over-cap text its prefix —
+/// (`max`), a non-key blob keeps only its length and over-cap text its prefix;
 /// `mysql_async` already owns the row's bytes, but capping keeps a *page* of fat
 /// cells from accumulating (and skips the second copy into the `Value`).
 fn bytes_value(bytes: &[u8], col: &MyColumn, max: Option<usize>) -> Value {
@@ -1080,7 +1080,7 @@ fn escape_ident(s: &str) -> String {
 
 /// Map a failed dial to a *fatal* [`RedError::Auth`] (a credential/target the
 /// user must fix) or a transient [`RedError::Connect`]. 1045 = access denied,
-/// 1044 = access denied to database, 1049 = unknown database — none retry away.
+/// 1044 = access denied to database, 1049 = unknown database; none retry away.
 /// Anything else (refused/unreachable host) stays a retryable `Connect`.
 fn map_connect_err(e: MyError) -> RedError {
     if let MyError::Server(ref se) = e {
@@ -1390,7 +1390,7 @@ mod tests {
             .await
             .unwrap();
 
-        // FORMAT=TREE on MySQL 8, the tabular fallback on MariaDB — either way the
+        // FORMAT=TREE on MySQL 8, the tabular fallback on MariaDB; either way the
         // plan parses to ≥1 node and names the table in `raw`.
         battery::explains_query(&driver, &format!("SELECT * FROM `{t}`"), &t).await;
 
@@ -1474,7 +1474,7 @@ mod tests {
         driver.execute(&format!("DROP TABLE `{t}`")).await.unwrap();
     }
 
-    /// The connection's current database — fixtures live here, so introspection
+    /// The connection's current database: fixtures live here, so introspection
     /// filters to it.
     async fn current_schema(driver: &MysqlDriver) -> String {
         let mut conn = driver.pool.get_conn().await.unwrap();
@@ -1513,7 +1513,7 @@ mod tests {
             .with_scope(Some("red_no_such_db_xyz".into()));
         assert!(missing.list_objects().await.unwrap().is_empty());
 
-        // An empty scope clears it — the current database is visible again.
+        // An empty scope clears it; the current database is visible again.
         let cleared = MysqlDriver::connect(&url, false)
             .await
             .unwrap()

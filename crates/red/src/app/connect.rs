@@ -15,7 +15,7 @@ impl AppState {
         SessionId(self.next_session_id)
     }
 
-    /// The live `ActiveConn` for `session` — the foreground one (in `phase`) or a
+    /// The live `ActiveConn` for `session`: the foreground one (in `phase`) or a
     /// parked warm one. Used to route a backend event to its workspace even when
     /// that workspace is backgrounded (its query is still populating).
     pub(crate) fn conn_mut(&mut self, session: Option<SessionId>) -> Option<&mut ActiveConn> {
@@ -28,7 +28,7 @@ impl AppState {
         self.parked.get_mut(&id).map(|b| b.as_mut())
     }
 
-    /// The most-recently-foregrounded warm parked session, if any — the
+    /// The most-recently-foregrounded warm parked session, if any: the
     /// "previous connection" the ⌘⇧P toggle returns to, and the fall-back when the
     /// foreground session disconnects. (`parked` is a `HashMap`, so this picks by
     /// `last_active_seq` rather than iteration order.)
@@ -48,7 +48,7 @@ impl AppState {
     }
 
     /// Move the foreground live connection (if any) into the warm-session map so
-    /// switching back to it is instant. Leaves `phase` `Disconnected` — the caller
+    /// switching back to it is instant. Leaves `phase` `Disconnected`; the caller
     /// installs the next phase. A connecting/disconnected foreground parks nothing.
     pub(crate) fn park_foreground(&mut self) -> Option<SessionId> {
         if matches!(self.phase, Phase::Connected(_)) {
@@ -58,7 +58,7 @@ impl AppState {
                 let id = active.session;
                 // Stamp the just-foregrounded conn as the most-recently-used, then
                 // make room: if parking would exceed the cap, evict the LRU parked
-                // session first (never this one — it has the freshest stamp).
+                // session first (never this one; it has the freshest stamp).
                 self.next_active_seq += 1;
                 active.last_active_seq = self.next_active_seq;
                 self.evict_lru_parked();
@@ -72,7 +72,7 @@ impl AppState {
     /// Drop parked warm sessions until the map has room for one more, evicting the
     /// least-recently-foregrounded each time. The evicted workspace's heavy
     /// `ActiveConn` is freed immediately; `CloseSession` tells the backend to tear
-    /// down its driver (its later `Disconnected` is a no-op — already gone here).
+    /// down its driver (its later `Disconnected` is a no-op, already gone here).
     fn evict_lru_parked(&mut self) {
         while self.parked.len() >= MAX_PARKED_SESSIONS {
             let Some(lru) = self
@@ -88,7 +88,7 @@ impl AppState {
         }
     }
 
-    /// Bring a parked warm session to the foreground — the instant-switch payoff:
+    /// Bring a parked warm session to the foreground, the instant-switch payoff:
     /// no reconnect, the grid/tabs/scroll exactly as left. Tells the backend it's
     /// now active (eviction-exempt).
     pub(crate) fn foreground_parked(&mut self, id: SessionId, cx: &mut Context<Self>) -> bool {
@@ -115,7 +115,7 @@ impl AppState {
         let Some(id) = session else { return };
         let promote = matches!(&self.phase, Phase::Connecting(c) if c.session == id);
         if !promote {
-            // We've moved on (switched away / cancelled) — drop the stray session.
+            // We've moved on (switched away / cancelled); drop the stray session.
             self.service.send_to(id, Command::CloseSession);
             return;
         }
@@ -147,7 +147,7 @@ impl AppState {
         self.parked.remove(&id);
         if self.foreground_session == Some(id) {
             self.foreground_session = None;
-            // Prefer an already-warm connection over the welcome screen — the most
+            // Prefer an already-warm connection over the welcome screen: the most
             // recently foregrounded one (`parked` is a HashMap, so an arbitrary
             // pick would drop the user into a random session).
             if let Some(other) = self.parked_mru() {
@@ -167,18 +167,18 @@ impl AppState {
 
     /// Arm the delete-confirmation modal for connection `index`. Deletion is
     /// destructive (drops the keychain credential too), so we never remove a
-    /// connection on a single click — the modal's `confirm_delete` does the work.
+    /// connection on a single click; the modal's `confirm_delete` does the work.
     pub(crate) fn request_delete_connection(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.connections.len() {
             self.confirm_delete_conn = Some(index);
-            // Focus the modal so its Enter/Esc handling is heard — and so focus
-            // doesn't fall to the close ✕ — matching the other confirmations.
+            // Focus the modal so its Enter/Esc handling is heard (and so focus
+            // doesn't fall to the close ✕), matching the other confirmations.
             self.focus_modal = true;
             cx.notify();
         }
     }
 
-    /// Confirmation accepted — remove the connection that was awaiting it.
+    /// Confirmation accepted: remove the connection that was awaiting it.
     pub(crate) fn confirm_delete_connection(&mut self, cx: &mut Context<Self>) {
         if let Some(index) = self.confirm_delete_conn.take() {
             self.delete_connection(index, cx);
@@ -240,7 +240,7 @@ impl AppState {
             }
         }
         // SSH secrets live in the keychain too (the saved config carries them empty),
-        // so hydrate the tunnel's secret for the active auth mode before dialing —
+        // so hydrate the tunnel's secret for the active auth mode before dialing;
         // otherwise a saved connection authenticates with a blank password/passphrase
         // and fails, even though the Test probe (which reads the form) succeeded.
         if let Some(ssh) = config.ssh.as_mut() {
@@ -303,7 +303,7 @@ impl AppState {
     }
 
     /// A connect attempt failed. A `fatal` failure (bad credentials, missing
-    /// database) is terminal — show the error and an Edit affordance, no retry. A
+    /// database) is terminal: show the error and an Edit affordance, no retry. A
     /// transient one records the error and schedules a backoff retry. No-op if
     /// we've left the connecting phase meanwhile.
     pub(crate) fn on_connect_failed(
@@ -337,7 +337,7 @@ impl AppState {
     }
 
     /// The in-flight connect hit an untrusted SSH jump host. Show the fingerprint
-    /// and offer to trust it — terminal until the user acts, so (like a fatal
+    /// and offer to trust it: terminal until the user acts, so (like a fatal
     /// failure) bump the generation to cancel any pending backoff timer.
     pub(crate) fn on_ssh_host_unknown(
         &mut self,
@@ -360,7 +360,7 @@ impl AppState {
     }
 
     /// "Trust & connect": append the jump host's key to `~/.ssh/known_hosts` (via
-    /// the service) and retry the same connection — the retry verifies against the
+    /// the service) and retry the same connection; the retry verifies against the
     /// freshly written entry and proceeds.
     pub(crate) fn trust_host_and_retry(&mut self, cx: &mut Context<Self>) {
         let trust = match &self.phase {
@@ -409,7 +409,7 @@ impl AppState {
         .detach();
     }
 
-    /// A backoff timer fired — start the next attempt if its generation is still
+    /// A backoff timer fired: start the next attempt if its generation is still
     /// current (i.e. not cancelled or already retried via "Retry now").
     pub(crate) fn retry_connect(&mut self, generation: u64, cx: &mut Context<Self>) {
         if generation == self.connect_gen {
@@ -417,7 +417,7 @@ impl AppState {
         }
     }
 
-    /// "Retry now" on the splash — skip the remaining backoff wait.
+    /// "Retry now" on the splash: skip the remaining backoff wait.
     pub(crate) fn retry_now(&mut self, cx: &mut Context<Self>) {
         if matches!(self.phase, Phase::Connecting(_)) {
             self.begin_attempt(cx);
@@ -467,7 +467,7 @@ impl AppState {
     }
 
     /// Leave the connected view for the manager (welcome) screen: drop the
-    /// foreground connection *and* every warm parked one — "Manage connections…"
+    /// foreground connection *and* every warm parked one; "Manage connections…"
     /// means a clean slate, not a pile of orphaned warm sessions the welcome
     /// screen can't reach.
     pub(crate) fn disconnect(&mut self, cx: &mut Context<Self>) {

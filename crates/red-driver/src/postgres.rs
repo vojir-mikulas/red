@@ -1,11 +1,11 @@
-//! PostgreSQL driver — the second source of `DatabaseDriver`, proving the
+//! PostgreSQL driver: the second source of `DatabaseDriver`, proving the
 //! abstraction on a real network engine. Built on `tokio-postgres`: a live
 //! `Client` (its connection driven by a background task), a streaming cursor over
 //! `query_raw`, and **out-of-band cancel** via `tokio-postgres`'s `CancelToken`
 //! (a separate cancel-request connection, not a dropped future).
 //!
 //! Caveats for v0.1: connections are `NoTls` (TLS is the next hardening step).
-//! Value mapping covers the common scalar types — bool/int/float/text/bytea —
+//! Value mapping covers the common scalar types, bool/int/float/text/bytea,
 //! plus the richer ones a first-time visitor expects to *see* rather than as empty
 //! NULLs: numeric, timestamp(tz), date, time(tz), uuid, and json(b) are rendered
 //! from their binary wire form by [`crate::pg_text`] (dependency-free). Anything
@@ -49,18 +49,18 @@ const FETCH_POOL_CAP: usize = 4;
 
 /// A live PostgreSQL session. Holds the shared `Client` (cursor, introspection,
 /// `execute`) plus a small lazily-grown pool of warm connections the cancellable
-/// one-shot fetches borrow — see [`FETCH_POOL_CAP`].
+/// one-shot fetches borrow; see [`FETCH_POOL_CAP`].
 pub struct PostgresDriver {
     client: Arc<Client>,
     version: String,
     dsn: String,
     read_only: bool,
     /// Idle fetch connections, returned after each one-shot fetch. A free list, not
-    /// a semaphore — `acquire` opens a fresh connection when it's empty.
+    /// a semaphore: `acquire` opens a fresh connection when it's empty.
     pool: StdMutex<Vec<Arc<Client>>>,
 }
 
-/// No bind parameters — `query_raw` needs a typed iterator, so spell out the kind.
+/// No bind parameters; `query_raw` needs a typed iterator, so spell out the kind.
 fn no_params() -> Vec<&'static (dyn ToSql + Sync)> {
     Vec::new()
 }
@@ -86,7 +86,7 @@ fn pg_cancel_token(client: &Client) -> CancelToken {
 /// Prepare `sql` on `client` and read its column metadata (works for an empty result).
 async fn prepare_columns(client: &Client, sql: &str) -> Result<(Statement, Vec<Column>)> {
     // Postgres validates SQL at prepare time, so a user's bad custom query
-    // surfaces here — map through `map_pg_err` to keep the server's message
+    // surfaces here; map through `map_pg_err` to keep the server's message
     // instead of the bare `"db error"` that `tokio_postgres::Error` renders.
     let stmt = client.prepare(sql).await.map_err(map_pg_err)?;
     let columns = stmt
@@ -141,7 +141,7 @@ impl PostgresDriver {
             let pooled = lock(&self.pool).pop();
             match pooled {
                 Some(c) if !c.is_closed() => return Ok(c),
-                Some(_) => continue, // closed — drop it and try the next
+                Some(_) => continue, // closed: drop it and try the next
                 None => break,
             }
         }
@@ -423,7 +423,7 @@ impl DatabaseDriver for PostgresDriver {
     }
 
     fn contains_predicate(&self, columns: &[ColumnMeta], term: &str) -> Option<String> {
-        // Postgres standard strings treat `\` literally — no extra literal escaping.
+        // Postgres standard strings treat `\` literally, so no extra literal escaping.
         crate::contains_clause(
             columns,
             term,
@@ -627,7 +627,7 @@ impl DatabaseDriver for PostgresDriver {
             return Ok(0);
         }
         // Borrow a pool connection so the batch's transaction never shares the
-        // cursor's connection — see `execute`.
+        // cursor's connection; see `execute`.
         let client = self.acquire().await?;
         let result = async {
             client.batch_execute("BEGIN").await.map_err(driver_err)?;
@@ -680,7 +680,7 @@ impl DatabaseDriver for PostgresDriver {
             return Ok(0);
         }
         // Borrow a pool connection so the transaction never shares the cursor's
-        // connection — see `execute`/`apply_edits`.
+        // connection; see `execute`/`apply_edits`.
         let client = self.acquire().await?;
         let result = async {
             client.batch_execute("BEGIN").await.map_err(driver_err)?;
@@ -771,7 +771,7 @@ impl DatabaseDriver for PostgresDriver {
     }
 
     async fn explain(&self, sql: &str, analyze: bool) -> Result<QueryPlan> {
-        // Default `FORMAT TEXT` — the most stable parse target, and avoids the
+        // Default `FORMAT TEXT`: the most stable parse target, and avoids the
         // JSON dependency. Plain `EXPLAIN` never executes the statement;
         // `EXPLAIN ANALYZE` does (the caller gates it to read queries, and a
         // read-only connection rejects an underlying write at the engine anyway).
@@ -815,7 +815,7 @@ impl DatabaseDriver for PostgresDriver {
         let mut throttle = ProgressThrottle::new(progress);
 
         // Bail on cancel: drop the writer, remove the partial file, and report
-        // interruption — never leave a truncated CSV/JSON behind.
+        // interruption; never leave a truncated CSV/JSON behind.
         macro_rules! bail_if_cancelled {
             () => {
                 if cancel.load(Ordering::Relaxed) {
@@ -844,7 +844,7 @@ struct PgCursor {
     stream: Mutex<Pin<Box<RowStream>>>,
     cancel: CancelToken,
     /// Read cells at full fidelity (the table-copy read) rather than the display
-    /// fat-cell cap — see [`QueryOptions::full_fidelity`](red_core::QueryOptions).
+    /// fat-cell cap; see [`QueryOptions::full_fidelity`](red_core::QueryOptions).
     full: bool,
 }
 
@@ -855,7 +855,7 @@ impl QueryCursor for PgCursor {
     }
 
     async fn next_window(&self, max: usize) -> Result<RowWindow> {
-        // Offset-mode display stream (editor run) — cap every cell, no key exempt.
+        // Offset-mode display stream (editor run): cap every cell, no key exempt.
         // A full-fidelity reader (the table copy) reads byte-exact instead.
         let cap = if self.full {
             None
@@ -902,10 +902,10 @@ const PG_PARAM_CAP: usize = 60_000;
 ///
 /// A [`Value::Text`] is special on **write**: it binds as `text` (the only form
 /// `String` encodes), but the target column may be jsonb/json/timestamp/uuid/numeric
-/// /an enum — types with no implicit (assignment) cast *from* text (the post-8.3
+/// /an enum: types with no implicit (assignment) cast *from* text (the post-8.3
 /// rule), so `SET jsonb_col = $1::text` is rejected with "column is of type jsonb
 /// but expression is of type text". When `decl_type` names such a column we add a
-/// second, *explicit* cast — `$1::text::"jsonb"` — which type-checks. Plain
+/// second, *explicit* cast, `$1::text::"jsonb"`, which type-checks. Plain
 /// text-family columns (and an unknown / absent type, e.g. a key bind) keep `::text`.
 fn pg_cast(value: &Value, decl_type: Option<&str>) -> String {
     match value {
@@ -921,7 +921,7 @@ fn pg_cast(value: &Value, decl_type: Option<&str>) -> String {
 }
 
 /// Whether a Postgres column type (the `typname` we store as `decl_type`) is a
-/// text-family type a `text` bind assigns to directly — so it needs no second cast
+/// text-family type a `text` bind assigns to directly, so it needs no second cast
 /// on write. Everything else (jsonb, timestamp, uuid, numeric, an enum, …) does.
 fn is_pg_text_type(name: &str) -> bool {
     matches!(
@@ -1004,7 +1004,7 @@ fn pg_value(row: &Row, i: usize, max: Option<usize>) -> Value {
                 .map(Value::Blob)
                 .unwrap_or(Value::Null),
         },
-        // text / varchar / name / bpchar / unknown — and a best-effort for the rest.
+        // text / varchar / name / bpchar / unknown, and a best-effort for the rest.
         // `&str` and `String` accept the same types, so capping doesn't change which
         // columns decode (only how much of an over-cap one is kept).
         //
@@ -1012,7 +1012,7 @@ fn pg_value(row: &Row, i: usize, max: Option<usize>) -> Value {
         // *rejects* the column type (its `accepts` said no). The former is a genuine
         // `Null`; the latter is an unmapped type the string decode declined (enum,
         // inet, interval, array, …), and rather than collapse it to a silent NULL we
-        // fall back to its raw wire bytes as lossy UTF-8 — correct for the text-shaped
+        // fall back to its raw wire bytes as lossy UTF-8: correct for the text-shaped
         // wire forms (enum labels, citext-likes) and a visible cell for the rest.
         _ => match row.try_get::<_, Option<&str>>(i) {
             Ok(None) => Value::Null,
@@ -1028,7 +1028,7 @@ fn pg_value(row: &Row, i: usize, max: Option<usize>) -> Value {
 /// Decode a scalar cell of type `T` and map it with `f`. A SQL NULL is
 /// [`Value::Null`]; a decode *error* (the column isn't the `T` we expected) falls
 /// back to the raw wire bytes as text via [`raw_text_fallback`] rather than
-/// collapsing to a silent NULL — the same safety the text `_` arm relies on.
+/// collapsing to a silent NULL, the same safety the text `_` arm relies on.
 fn scalar<'a, T>(row: &'a Row, i: usize, max: Option<usize>, f: impl FnOnce(T) -> Value) -> Value
 where
     T: tokio_postgres::types::FromSql<'a>,
@@ -1042,7 +1042,7 @@ where
 
 /// Captures a column's raw binary wire bytes verbatim, so the driver can render the
 /// types `tokio-postgres` declines to decode itself (see [`crate::pg_text`]).
-/// `accepts` is unconditional — it's only ever asked for via the explicit type
+/// `accepts` is unconditional: it's only ever asked for via the explicit type
 /// arms in [`pg_value`].
 struct RawBytes(Vec<u8>);
 
@@ -1083,7 +1083,7 @@ fn decode_raw(
 /// that the string decode rejected (its `accepts` said no): take the raw wire bytes
 /// and render them as lossy UTF-8. Correct for the text-shaped binary forms (enum
 /// labels, `citext`-likes, domains over text) and at worst a visible cell for the
-/// others — anything but the silent NULL the bare string decode would have produced.
+/// others: anything but the silent NULL the bare string decode would have produced.
 /// A fetch error or genuine SQL NULL still collapses to [`Value::Null`].
 fn raw_text_fallback(row: &Row, i: usize, max: Option<usize>) -> Value {
     decode_raw(row, i, max, |b| {
@@ -1104,7 +1104,7 @@ fn be_i32(b: &[u8]) -> Option<i32> {
 /// credentials (28xxx) and a missing database (3D000) are user-correctable; a
 /// refused/unreachable host has no server `DbError` and stays a retryable
 /// `Connect`. The server's own message is surfaced (its `Display` is a bare
-/// `"db error"` — the text lives only in the attached `DbError`).
+/// `"db error"`; the text lives only in the attached `DbError`).
 fn map_connect_err(e: tokio_postgres::Error) -> RedError {
     if let Some(db) = e.as_db_error() {
         let class = &db.code().code()[..2];
@@ -1121,7 +1121,7 @@ fn map_connect_err(e: tokio_postgres::Error) -> RedError {
 /// Map a cancel (SQLSTATE 57014) to the distinct `Interrupted`, else a driver
 /// error. A database-side failure (bad SQL, missing relation, type mismatch) is
 /// the common case, and `tokio_postgres::Error`'s own `Display` renders it as a
-/// bare `"db error"` — the useful text lives only in the attached `DbError`. So
+/// bare `"db error"`; the useful text lives only in the attached `DbError`. So
 /// surface the server's message (with SQLSTATE and any hint) rather than letting
 /// the round-trip bounce back as the cryptic `"db error"`.
 fn map_pg_err(e: tokio_postgres::Error) -> RedError {
@@ -1199,7 +1199,7 @@ mod tests {
     /// the wire type from its Rust value; a text value bound into a non-text column
     /// (jsonb, timestamp, an enum) gets the second explicit cast that lets the
     /// assignment type-check, while a plain text column (or an unknown / key bind)
-    /// stays a bare `::text`. No DB needed — pure string rendering.
+    /// stays a bare `::text`. No DB needed: pure string rendering.
     #[test]
     fn pg_cast_casts_text_into_non_text_columns() {
         // Scalars: cast follows the Rust value, column type is irrelevant.
@@ -1220,7 +1220,7 @@ mod tests {
         );
         assert_eq!(pg_cast(&text, Some("uuid")), "::text::\"uuid\"");
         assert_eq!(pg_cast(&text, Some("mood")), "::text::\"mood\"");
-        // Plain text-family columns assign directly — no second cast.
+        // Plain text-family columns assign directly; no second cast.
         assert_eq!(pg_cast(&text, Some("text")), "::text");
         assert_eq!(pg_cast(&text, Some("VARCHAR")), "::text");
         assert_eq!(pg_cast(&text, Some("bpchar")), "::text");
@@ -1228,7 +1228,7 @@ mod tests {
         assert_eq!(pg_cast(&text, None), "::text");
     }
 
-    /// The connection's current schema — unqualified fixtures land here, so
+    /// The connection's current schema: unqualified fixtures land here, so
     /// introspection filters to it. Read through the public API rather than the
     /// private client.
     async fn current_schema(driver: &PostgresDriver) -> String {
@@ -1297,7 +1297,7 @@ mod tests {
     /// Types neither the scalar arms nor `pg_text` name, and that the string decode
     /// *rejects* (its `accepts` says no): inet, interval, and an array all flow
     /// through the raw-bytes fallback. The contract under test is "visible text, not
-    /// a silent NULL" — the exact bytes are server-version dependent, so assert only
+    /// a silent NULL"; the exact bytes are server-version dependent, so assert only
     /// that each cell is non-empty text.
     #[tokio::test]
     async fn unmapped_types_fall_back_to_text_not_null() {
@@ -1324,7 +1324,7 @@ mod tests {
     async fn streams_in_bounded_windows() {
         let url = url_or_skip!();
         let driver = PostgresDriver::connect(&url, true).await.unwrap();
-        // `generate_series` is a server-side streaming row source — no fixture, and
+        // `generate_series` is a server-side streaming row source: no fixture, and
         // it never materializes server-side, mirroring the windowed read.
         battery::streams_in_bounded_windows(&driver, "SELECT generate_series(1, 100000)", 100_000)
             .await;
@@ -1639,7 +1639,7 @@ mod tests {
     }
 
     /// Editing a column whose value decodes to [`Value::Text`] but whose real type
-    /// has no assignment cast *from* text — jsonb, timestamptz, uuid — must succeed:
+    /// has no assignment cast *from* text (jsonb, timestamptz, uuid) must succeed:
     /// the write-side `::text::"type"` cast (driven by `ColumnValue::decl_type`) lets
     /// the bound text type-check into the column. A bare `::text` would be rejected
     /// ("column is of type jsonb but expression is of type text"); this is the
@@ -1668,7 +1668,7 @@ mod tests {
             schema: Some(schema),
             name: t.clone(),
         };
-        // One UPDATE setting every typed column at once — each `set` carries the
+        // One UPDATE setting every typed column at once; each `set` carries the
         // column's `decl_type`, the key carries none (an int PK binds bare).
         let set = |column: &str, value: &str, decl: &str| red_core::ColumnValue {
             column: column.into(),

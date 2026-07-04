@@ -1,9 +1,9 @@
 //! DBGate connection import.
 //!
 //! DBGate stores connections in `~/.dbgate/`:
-//! - `connections.jsonl` — one JSON object per line (folders are lines too,
+//! - `connections.jsonl`: one JSON object per line (folders are lines too,
 //!   distinguished by carrying no `engine`).
-//! - `.key` — the per-install encryption key, itself encrypted with a hardcoded
+//! - `.key`: the per-install encryption key, itself encrypted with a hardcoded
 //!   default key.
 //!
 //! Secrets use node's `simple-encryptor`: for a key string `K`,
@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 
 use super::{ImportReport, ImportedConnection};
 
-/// DBGate's hardcoded default key — used *only* to decrypt the `.key` file, which
+/// DBGate's hardcoded default key, used *only* to decrypt the `.key` file, which
 /// holds the real per-install key. Public knowledge (compiled into the app).
 const DBGATE_DEFAULT_KEY: &str = "mQAUaXhavRGJDxDTXSCg7Ej0xMmGCrx6OKA07DIMBiDcYYkvkaXjTAzPUEHEHEf9";
 
@@ -66,7 +66,7 @@ pub fn import(dir: &Path) -> Result<ImportReport> {
                 continue;
             }
         };
-        // Folder / group rows carry no engine — not connections.
+        // Folder / group rows carry no engine, not connections.
         if conn.engine.trim().is_empty() {
             continue;
         }
@@ -266,7 +266,7 @@ fn json_port(v: &JsonValue, kind: DbKind) -> Option<u16> {
     }
 }
 
-/// SSH port (string or number), defaulting to 22 — never an engine DB port.
+/// SSH port (string or number), defaulting to 22, never an engine DB port.
 fn ssh_port(v: &JsonValue) -> u16 {
     match v {
         JsonValue::String(s) => s.trim().parse().unwrap_or(22),

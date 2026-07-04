@@ -2,7 +2,7 @@
 //!
 //! Both tools store their connections in local, documented, locally-decryptable
 //! formats, so importing is a pure parse + decrypt + map into RED's
-//! [`ConnectionConfig`] — no external process, no network. This is Phase 1: the
+//! [`ConnectionConfig`] (no external process, no network). This is Phase 1: the
 //! parsers and credential decryptors behind [`ImportReport`], with **no UI and no
 //! writes to RED's store** (Phase 2 commits a report; Phase 3 wires the UI).
 //!
@@ -65,7 +65,7 @@ pub struct ImportedConnection {
 }
 
 /// The outcome of an import pass: what mapped cleanly and what was skipped, each
-/// skip paired with a reason. A caller renders both halves — the skip list is a
+/// skip paired with a reason. A caller renders both halves; the skip list is a
 /// feature, not an error channel.
 #[derive(Debug, Clone, Default)]
 pub struct ImportReport {
@@ -76,7 +76,7 @@ pub struct ImportReport {
 
 impl ImportReport {
     /// Merge another report into this one (used when a tool exposes several source
-    /// files — e.g. DBeaver's multiple workspace projects).
+    /// files, e.g. DBeaver's multiple workspace projects).
     pub fn extend(&mut self, other: ImportReport) {
         self.imported.extend(other.imported);
         self.skipped.extend(other.skipped);

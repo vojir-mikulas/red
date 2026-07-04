@@ -1,13 +1,13 @@
 # Keyboard reference
 
-RED is operable almost entirely from the keyboard. **Every discrete action lives
-in the command palette (`⌘K`)** — the complete, searchable list, phase-aware so it
-only offers what's actionable — and the common ones also have the direct bindings
-below. Press `⌘/` in-app for the shortcut reference as an overlay.
+RED is operable almost entirely from the keyboard. Every discrete action lives
+in the command palette (`⌘K`), a complete, searchable list that is phase-aware
+and only offers what's actionable; the common actions also have the direct
+bindings below. Press `⌘/` in-app for the shortcut reference as an overlay.
 
-(Continuous navigation — the grid cell cursor, the tree selection, modal `Esc`/
-`Enter` — isn't in the palette: those are cursor movement and dialog responses,
-not commands.)
+(Continuous navigation, like the grid cell cursor, the tree selection, and modal
+`Esc`/`Enter`, isn't in the palette: those are cursor movement and dialog
+responses, not commands.)
 
 Bindings are registered centrally in `crates/red/src/keymap.rs`. The `⌘/` overlay
 is generated from `keymap::shortcuts()`; keep this doc in sync with it.
@@ -39,7 +39,7 @@ is generated from `keymap::shortcuts()`; keep this doc in sync with it.
 | `⌘T` | New tab |
 | `⌘W` | Close tab (confirms if it holds unsaved work) |
 | `⌃Tab` / `⌃⇧Tab` | Next / previous tab |
-| `⌘↵` | Run the active tab's query (or selection) — works from any pane, not just the editor |
+| `⌘↵` | Run the active tab's query (or selection); works from any pane, not just the editor |
 | `Esc` | Leave the editor for the result grid (when no completion is open) |
 
 The history popover (toggle from the palette or the History button) is keyboard
@@ -72,7 +72,7 @@ Focus the sidebar (`⌥⌘1`), then:
 | `↑` / `↓` | Move the selection |
 | `←` / `→` | Collapse / expand (or jump to parent / first child) |
 | `↵` | Open a table/view preview, or toggle a namespace |
-| `⌘F` | Search the schema — reveals the sidebar and focuses its filter field |
+| `⌘F` | Search the schema (reveals the sidebar and focuses its filter field) |
 | `⌘R` | Refresh the schema |
 
 `⌘F` works from anywhere (it reveals a collapsed sidebar first); type to filter the
@@ -102,7 +102,7 @@ on open).
 
 ## Implementation notes
 
-The generic, domain-free keyboard navigation now lives in Flint, per the
+The generic, domain-free keyboard navigation lives in Flint, per the
 gallery-first rule: `Table` and `Tree` own a `FocusHandle` and emit
 `TableNav`/`TreeNav` move-selection intents (RED keeps the selection state and
 windowing); `Modal` owns `Esc`/`on_confirm` plus `Tab`/`⇧Tab` cycling with a

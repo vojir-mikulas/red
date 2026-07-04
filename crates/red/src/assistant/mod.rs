@@ -1,4 +1,4 @@
-//! The AI assistant panel — a right-docked, grounded chat sidebar (the AI-assistant
+//! The AI assistant panel: a right-docked, grounded chat sidebar (the AI-assistant
 //! M1 slice). It streams a conversation with a model that knows about the connected
 //! database and can read it through Red's existing safe seams: the panel never
 //! speaks HTTP, it sends `Command::AiTurn` and drains `Event::AiDelta` like every
@@ -11,7 +11,7 @@
 //! it cannot mutate anything.
 //!
 //! The panel hosts **several conversations at once** (M-S6): each [`ChatSession`]
-//! carries its own transcript, streaming state, and **provider binding** — so one
+//! carries its own transcript, streaming state, and **provider binding**, so one
 //! chat can run on the Claude subscription (ACP) while another runs on the API-key
 //! backend, live simultaneously. The composer/transcript show the *active* chat;
 //! background chats keep streaming (events route by `conversation_id` to whichever
@@ -72,7 +72,7 @@ pub(crate) struct ChatMessage {
     pub(crate) text: String,
     pub(crate) thinking: String,
     /// Frame-stable render artifacts (parsed Markdown + first SQL block), filled
-    /// lazily and reused while `text` is unchanged — see [`ChatMessage::markdown`].
+    /// lazily and reused while `text` is unchanged; see [`ChatMessage::markdown`].
     cache: RefCell<MessageCache>,
 }
 
@@ -161,11 +161,11 @@ pub(crate) struct ChatSession {
     /// The most recent finished turn's token/cost accounting (M-S4), shown as a
     /// compact footer. `None` until the first turn completes.
     pub(crate) last_usage: Option<red_service::AiUsage>,
-    /// Which agent this chat runs on — the agent profile's id (`"subscription"`,
+    /// Which agent this chat runs on: the agent profile's id (`"subscription"`,
     /// `"anthropic"`, `"codex"`, …). Chosen at creation (defaulting to the resolved
     /// default agent) and persisted as the conversation's binding (M-S5); turns carry
     /// it so the right backend handles them (M-S6). Locked once the first message is
-    /// sent. (Field name kept as `provider` — it's the serialized key saved chats
+    /// sent. (Field name kept as `provider`; it's the serialized key saved chats
     /// already use.)
     pub(crate) provider: String,
     /// The chat's title, derived from its first user message; the saved file's
@@ -174,7 +174,7 @@ pub(crate) struct ChatSession {
     /// The backing file's stem once this chat has been saved (M-S5), so later turns
     /// overwrite the same file. `None` for a never-saved chat.
     pub(crate) file_stem: Option<String>,
-    /// Unix seconds this chat was first saved — kept stable across re-saves.
+    /// Unix seconds this chat was first saved, kept stable across re-saves.
     pub(crate) created_unix: Option<u64>,
     /// A reopened conversation's prior transcript, folded into the *next* turn's
     /// context so the model resumes where it left off (M-S5). Taken (cleared) when
@@ -192,14 +192,14 @@ pub(crate) struct ChatSession {
     /// Whether a reveal ticker is currently scheduled for this chat (so deltas don't
     /// spawn a second one). See `ensure_reveal_ticker`.
     pub(crate) revealing: bool,
-    /// Whether a background chat finished a turn the user hasn't looked at yet —
+    /// Whether a background chat finished a turn the user hasn't looked at yet;
     /// drives the history sidebar's unread dot. Set when a turn finishes on a chat
     /// that isn't the active one, cleared the moment it's switched to. In-memory
     /// only; a fresh session starts everything read.
     pub(crate) unread: bool,
     /// The agent's advertised slash commands (subscription path only), driving the
     /// composer's `/`-command picker. Populated by `AiCommandsAvailable` once the
-    /// agent's session opens — so empty until this chat sends its first turn, and
+    /// agent's session opens, so empty until this chat sends its first turn, and
     /// always empty on the API-key path. In-memory only.
     pub(crate) commands: Vec<red_service::AiCommand>,
     /// The agent's model / reasoning selectors (subscription path only), driving the
@@ -247,12 +247,12 @@ impl ChatSession {
         }
     }
 
-    /// Whether this chat has nothing sent yet — the panel's single editable draft.
+    /// Whether this chat has nothing sent yet: the panel's single editable draft.
     pub(super) fn is_draft(&self) -> bool {
         self.messages.is_empty()
     }
 
-    /// Whether this chat needs the user's attention while it isn't shown — a parked
+    /// Whether this chat needs the user's attention while it isn't shown: a parked
     /// permission prompt the agent is blocked on. Drives the switcher's dot.
     pub(super) fn needs_attention(&self) -> bool {
         self.pending_permission.is_some()
@@ -271,7 +271,7 @@ impl ChatSession {
     }
 }
 
-/// Which conversation a history-sidebar row refers to — an open chat (by its
+/// Which conversation a history-sidebar row refers to: an open chat (by its
 /// stable id) or a saved-but-closed conversation (by its file stem). Used to
 /// target rename/delete without threading indices around.
 #[derive(Clone, PartialEq)]
@@ -289,21 +289,21 @@ pub(crate) struct Rename {
     pub(super) sub: gpui::Subscription,
 }
 
-/// The lifecycle state a history row reflects through its leading dot — replacing
+/// The lifecycle state a history row reflects through its leading dot, replacing
 /// the provider glyph (which now lives in the subtitle text). See [`render::status_dot`].
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum RowStatus {
-    /// The single never-sent chat — a hollow circle.
+    /// The single never-sent chat: a hollow circle.
     Draft,
-    /// A turn is streaming right now — a pulsing dot.
+    /// A turn is streaming right now: a pulsing dot.
     Streaming,
-    /// A background turn finished that the user hasn't switched to — a filled dot.
+    /// A background turn finished that the user hasn't switched to: a filled dot.
     Unread,
-    /// Nothing pending — a quiet muted dot.
+    /// Nothing pending: a quiet muted dot.
     Idle,
 }
 
-/// One flattened row of the merged history sidebar — an open chat (the draft, or a
+/// One flattened row of the merged history sidebar: an open chat (the draft, or a
 /// sent one) or a saved-but-closed conversation. Built fresh each render.
 pub(super) struct HistoryRow {
     pub(super) key: RowKey,
@@ -316,13 +316,13 @@ pub(super) struct HistoryRow {
     pub(super) status: RowStatus,
     pub(super) active: bool,
     pub(super) attention: bool,
-    /// The single editable draft — no rename/delete affordances; named live.
+    /// The single editable draft: no rename/delete affordances; named live.
     pub(super) draft: bool,
 }
 
 /// All the assistant panel's state. Present iff the panel is open.
 pub(crate) struct AssistantState {
-    /// The prompt box — a multiline composer. Enter sends a turn on the active
+    /// The prompt box, a multiline composer. Enter sends a turn on the active
     /// chat; Shift+Enter inserts a newline (see Flint `CodeEditor::submit_on_enter`).
     pub(crate) input: Entity<CodeEditor>,
     /// The API-key box, shown in the setup view when no key is configured.
@@ -339,7 +339,7 @@ pub(crate) struct AssistantState {
     pub(super) search_sub: gpui::Subscription,
     /// The open conversations (M-S6). Never empty while the panel is open.
     pub(crate) chats: Vec<ChatSession>,
-    /// Index of the active chat in `chats` — the one the composer/transcript show.
+    /// Index of the active chat in `chats`: the one the composer/transcript show.
     pub(crate) active: usize,
     /// Whether the history sidebar (open chats + saved conversations) is shown in
     /// place of the active transcript.

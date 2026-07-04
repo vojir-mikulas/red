@@ -1,4 +1,4 @@
-//! The command palette — RED's ⌘K overlay. The generic chrome (search field,
+//! The command palette, RED's ⌘K overlay. The generic chrome (search field,
 //! fuzzy filter, keyboard navigation, styled rows) lives in Flint as
 //! [`flint::Palette`]; this module owns the *domain* half: which commands exist
 //! in the current [`Phase`], and what each one does.
@@ -6,7 +6,7 @@
 //! Flow: `toggle_palette` builds a phase-appropriate command list, hands the
 //! labels/hints to a fresh `Palette` entity, and remembers the `id → Cmd`
 //! mapping. When the palette emits [`PaletteEvent::Activate`], we look the id
-//! back up and run the matching `AppState` method — the same one the equivalent
+//! back up and run the matching `AppState` method, the same one the equivalent
 //! button calls.
 
 use flint::{Palette, PaletteEvent, PaletteItem, ToastVariant};
@@ -57,7 +57,7 @@ pub(crate) enum Cmd {
     /// Detect DBeaver/DBGate installs and start a connection import (disconnected
     /// phase). Opens a source picker, or imports directly when there's just one.
     ImportConnections,
-    /// Import from the detected source at this index — the source-picker activation.
+    /// Import from the detected source at this index (the source-picker activation).
     ImportFrom(usize),
     /// Open the "go to row…" prompt (only when a result is open).
     GoToRow,
@@ -67,28 +67,28 @@ pub(crate) enum Cmd {
     SaveQuery,
     /// Open the saved-query picker.
     OpenSavedQueries,
-    /// Open the saved query at this index (into a new tab) — picker activation.
+    /// Open the saved query at this index (into a new tab); picker activation.
     OpenSavedQuery(usize),
     /// Open the "Copy to…" target picker for the current result.
     CopyToTable,
-    /// Copy the current result into the candidate table at this index — the
+    /// Copy the current result into the candidate table at this index, the
     /// "Copy to…" target-picker activation.
     CopyTarget(usize),
     /// Copy the current result into a *new* table in the writable namespace at this
-    /// index — the "✦ New table…" rows of the "Copy to…" picker. Opens a name prompt,
+    /// index: the "✦ New table…" rows of the "Copy to…" picker. Opens a name prompt,
     /// then creates the table from the source's column shape before streaming.
     CopyNewTable(usize),
     /// Open the "Migrate schema to…" picker for the foreground connection's selected
     /// schema (all its tables → another database).
     MigrateSchema,
-    /// Migrate the pending source schema into the target namespace at this index — the
+    /// Migrate the pending source schema into the target namespace at this index; the
     /// "Migrate to…" picker activation.
     MigrateTarget(usize),
     /// EXPLAIN the active tab's query and open the plan view (B4).
     Explain,
-    /// EXPLAIN ANALYZE the active tab's query (runs it — read queries only).
+    /// EXPLAIN ANALYZE the active tab's query (runs it; read queries only).
     ExplainAnalyze,
-    /// Submit the staged grid edits as one batch (Track B6) — opens the confirm.
+    /// Submit the staged grid edits as one batch (Track B6). Opens the confirm.
     SubmitChanges,
     /// Discard the staged grid edits (Track B6).
     RevertChanges,
@@ -112,7 +112,7 @@ pub(crate) enum Cmd {
 
 /// Which free-text prompt the single palette slot is currently serving, so a
 /// [`PaletteEvent::Submit`] routes to the right handler. Command-list palettes
-/// (the default and the saved-query picker) ignore this — they emit `Activate`.
+/// (the default and the saved-query picker) ignore this; they emit `Activate`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptKind {
     GoToRow,
@@ -150,7 +150,7 @@ impl AppState {
     }
 
     /// ⌃G (or the "go to row…" command): open a prompt for a row number. No-op
-    /// when no result is open — there's nothing to navigate.
+    /// when no result is open, since there's nothing to navigate.
     pub(crate) fn open_goto_prompt(&mut self, cx: &mut Context<Self>) {
         let Some(total) = self.active_result_total() else {
             return;
@@ -204,7 +204,7 @@ impl AppState {
                     self.run_command(cmd, cx);
                 }
             }
-            // Prompt mode submits free text — route by which prompt is open.
+            // Prompt mode submits free text; route by which prompt is open.
             PaletteEvent::Submit(text) => {
                 let kind = self.palette_prompt;
                 self.close_palette();
@@ -350,7 +350,7 @@ impl AppState {
     /// Whether guarded in-grid editing is enabled for the active connection (Track
     /// B5): a writable (non-read-only) connection whose engine supports the
     /// transactional, exactly-one-row edit contract. Read-only is the safe default,
-    /// and an OLAP engine (ClickHouse) is excluded even when writable — its async,
+    /// and an OLAP engine (ClickHouse) is excluded even when writable: its async,
     /// non-atomic mutations can't honor the guarded-edit guarantees.
     pub(crate) fn editing_enabled(&self) -> bool {
         matches!(
@@ -362,7 +362,7 @@ impl AppState {
 
     /// The focused result cell's edit target, when editing is enabled and the cell
     /// is editable (a single-table keyed browse, non-PK, non-clipped). `None`
-    /// otherwise — the entry point and palette gate both consult this.
+    /// otherwise; the entry point and palette gate both consult this.
     pub(crate) fn active_edit_target(&self) -> Option<crate::app::EditContext> {
         if !self.editing_enabled() {
             return None;
@@ -390,7 +390,7 @@ impl AppState {
                     PaletteItem::new("cmd:new-tab", "query: new tab").hint("⌘T"),
                     Cmd::NewTab,
                 ));
-                // Tab management — close needs an open tab; switching needs two.
+                // Tab management: close needs an open tab; switching needs two.
                 if active.active().is_some() {
                     out.push((
                         PaletteItem::new("cmd:close-tab", "query: close tab").hint("⌘W"),
@@ -424,7 +424,7 @@ impl AppState {
                         Cmd::SplitRight,
                     ));
                 }
-                // Whole-schema migration — offered only when the selected/only schema
+                // Whole-schema migration, offered only when the selected/only schema
                 // has tables to move (the handler picks the target database).
                 if self.migrate_source().is_some() {
                     out.push((
@@ -447,7 +447,7 @@ impl AppState {
                         Cmd::CopyToTable,
                     ));
                 }
-                // Staged data editing (B6) — offered on a writable, edit-enabled
+                // Staged data editing (B6), offered on a writable, edit-enabled
                 // connection browsing an editable (single-table keyed) result. Add
                 // row is always available there; submit/revert only with changes.
                 if self.editing_enabled()
@@ -478,7 +478,7 @@ impl AppState {
                     PaletteItem::new("cmd:clear-history", "query: clear history"),
                     Cmd::ClearHistory,
                 ));
-                // Saved queries (B3) — save needs an open tab to save *from*; the
+                // Saved queries (B3): save needs an open tab to save *from*; the
                 // picker is always offered (it reports "none yet" when empty).
                 if active.active().is_some() {
                     out.push((
@@ -490,7 +490,7 @@ impl AppState {
                     PaletteItem::new("cmd:open-saved", "query: open saved…").hint("⇧⌘O"),
                     Cmd::OpenSavedQueries,
                 ));
-                // EXPLAIN (B4) — explain needs a query to explain; analyze runs the
+                // EXPLAIN (B4): explain needs a query to explain; analyze runs the
                 // statement and is offered only on engines that support it (not
                 // SQLite, which has no ANALYZE).
                 if active.active().is_some() {
@@ -538,7 +538,7 @@ impl AppState {
                     PaletteItem::new("cmd:disconnect", "connection: disconnect"),
                     Cmd::Disconnect,
                 ));
-                // Assistant conversation history (M-S5) — only with the panel open.
+                // Assistant conversation history (M-S5), only with the panel open.
                 if self.assistant.is_some() {
                     out.push((
                         PaletteItem::new("cmd:ai-new-chat", "agent: new chat"),
@@ -630,7 +630,7 @@ impl AppState {
         if sql.trim().is_empty() {
             self.notify(
                 ToastVariant::Error,
-                "Nothing to save — the editor is empty.",
+                "Nothing to save: the editor is empty.",
                 cx,
             );
             return;
@@ -684,7 +684,7 @@ impl AppState {
     }
 
     /// ⇧⌘O / "query: open saved…": load the saved-query files and open a picker
-    /// over them. Enumerating happens here, on demand — never at startup — so saved
+    /// over them. Enumerating happens here, on demand (never at startup), so saved
     /// queries cost nothing at idle and external edits show up on each open.
     pub(crate) fn open_saved_picker(&mut self, cx: &mut Context<Self>) {
         if !matches!(self.phase, Phase::Connected(_)) {
@@ -694,7 +694,7 @@ impl AppState {
         if queries.is_empty() {
             self.notify(
                 ToastVariant::Info,
-                "No saved queries yet — save one with ⇧⌘S.",
+                "No saved queries yet. Save one with ⇧⌘S.",
                 cx,
             );
             return;
@@ -752,7 +752,7 @@ impl AppState {
 
     /// "Copy to…" (the result toolbar): open a picker over every writable table in
     /// every open connection (the foreground + parked live sessions), so the user
-    /// names a target for the copy. The source is *implicit* — the focused result
+    /// names a target for the copy. The source is *implicit*: the focused result
     /// (filter included). No-op (with a hint) when nothing's open to copy from / into.
     pub(crate) fn open_copy_picker(&mut self, cx: &mut Context<Self>) {
         // Source must be an open result (the thing you're looking at).
@@ -769,13 +769,13 @@ impl AppState {
         if candidates.is_empty() && namespaces.is_empty() {
             self.notify(
                 ToastVariant::Info,
-                "No writable connection to copy into — open one first",
+                "No writable connection to copy into; open one first",
                 cx,
             );
             return;
         }
         let mut entries: Vec<(PaletteItem, Cmd)> = Vec::new();
-        // "✦ New table…" rows first — create a fresh table in any writable namespace
+        // "✦ New table…" rows first: create a fresh table in any writable namespace
         // (same connection's other schema/database, or another open connection).
         for (i, ns) in namespaces.iter().enumerate() {
             let id = ElementId::from(SharedString::from(format!("copy-new:{i}")));
@@ -915,7 +915,7 @@ impl AppState {
             self.notify(
                 ToastVariant::Error,
                 format!(
-                    "“{name}” already exists in {} · {} — use Copy to… to copy into it",
+                    "“{name}” already exists in {} · {}; use Copy to… to copy into it",
                     pending.conn_name, pending.schema
                 ),
                 cx,
@@ -995,7 +995,7 @@ impl AppState {
         if targets.is_empty() {
             self.notify(
                 ToastVariant::Info,
-                "No other writable database to migrate into — open one first",
+                "No other writable database to migrate into. Open one first",
                 cx,
             );
             return;
