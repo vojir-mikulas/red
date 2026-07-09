@@ -9,4 +9,4 @@ Terminal=false
 Categories=Development;Database;Utility;
 Keywords=database;sql;sqlite;postgres;mysql;explorer;
 StartupNotify=true
-StartupWMClass=Red
+StartupWMClass=red

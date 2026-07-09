@@ -33,11 +33,11 @@ use crate::app::AppState;
 /// Width of the invisible resize border / drop-shadow margin around a
 /// client-decorated window. Matches GPUI's `window_shadow` reference.
 const SHADOW: f32 = 10.0;
-/// Corner rounding applied to a client-decorated window.
-const ROUNDING: f32 = 10.0;
 
 /// Wrap the application root so a client-decorated window gets its resize
-/// borders, corner rounding, and drop shadow. On server-decorated windows
+/// borders and drop shadow. The corners are kept square (native-looking on
+/// Linux/Windows, where rounded app-drawn corners read as out of place). On
+/// server-decorated windows
 /// (macOS/Windows, and Linux compositors that draw their own frame) the content
 /// is returned untouched.
 pub(crate) fn frame(
@@ -54,7 +54,6 @@ pub(crate) fn frame(
     window.set_client_inset(px(SHADOW));
 
     let shadow = px(SHADOW);
-    let rounding = px(ROUNDING);
     let border = px(1.0);
 
     div()
@@ -84,10 +83,7 @@ pub(crate) fn frame(
             .size_full()
             .absolute(),
         )
-        // Reserve the shadow margin on every non-tiled side, and round the top
-        // corners that aren't snapped to a screen edge.
-        .when(!(tiling.top || tiling.right), |d| d.rounded_tr(rounding))
-        .when(!(tiling.top || tiling.left), |d| d.rounded_tl(rounding))
+        // Reserve the shadow margin on every non-tiled side.
         .when(!tiling.top, |d| d.pt(shadow))
         .when(!tiling.bottom, |d| d.pb(shadow))
         .when(!tiling.left, |d| d.pl(shadow))
@@ -100,17 +96,12 @@ pub(crate) fn frame(
                 window.start_window_resize(edge);
             }
         })
-        // The actual app surface: bordered, rounded, shadowed, and clipped so
-        // its square content doesn't poke past the rounded corners.
+        // The actual app surface: bordered and shadowed, with square corners.
         .child(
             div()
                 .size_full()
                 .overflow_hidden()
                 .border_color(border_color)
-                .when(!(tiling.top || tiling.right), |d| d.rounded_tr(rounding))
-                .when(!(tiling.top || tiling.left), |d| d.rounded_tl(rounding))
-                .when(!(tiling.bottom || tiling.right), |d| d.rounded_br(rounding))
-                .when(!(tiling.bottom || tiling.left), |d| d.rounded_bl(rounding))
                 .when(!tiling.top, |d| d.border_t(border))
                 .when(!tiling.bottom, |d| d.border_b(border))
                 .when(!tiling.left, |d| d.border_l(border))

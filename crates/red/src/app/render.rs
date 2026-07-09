@@ -384,10 +384,10 @@ impl Render for AppState {
 
         let whats_new = self.whats_new_open.then(|| self.render_whats_new(cx));
 
-        let import_preview = self
-            .import_preview
+        let import_wizard = self
+            .import_wizard
             .as_ref()
-            .map(|p| self.render_import_preview(p, cx));
+            .map(|w| self.render_import_wizard(w, cx));
 
         let theme = cx.theme();
         // Copied out now (Hsla is Copy) so the client-decoration frame at the end
@@ -576,13 +576,21 @@ impl Render for AppState {
             .children(settings)
             .children(shortcuts)
             .children(whats_new)
-            .children(import_preview)
+            .children(import_wizard)
             // The connection form modal is rendered at the root so it works in any
             // phase (the welcome screen *and* the connected shell, e.g. opened from
             // the switcher's "New connection…").
             .children(self.form.as_ref().map(|f| self.render_form(f, cx)))
             // The palette renders its own full-screen overlay; last = on top.
-            .children(self.palette.as_ref().map(|(p, _)| p.clone()));
+            .children(self.palette.as_ref().map(|(p, _)| p.clone()))
+            // The result-grid dropdowns (cell / export / more) mount here, above
+            // every other overlay, each carrying a window-wide dismiss backdrop.
+            // Rooting them at the window (not the result pane) is what lets a click
+            // anywhere outside close them, and keeps them from lingering over a
+            // modal — the backdrop's `inset_0` now spans the whole window.
+            .children(self.cell_menu.map(|pos| self.render_cell_menu(pos, cx)))
+            .children(self.export_menu.map(|pos| self.render_export_menu(pos, cx)))
+            .children(self.more_menu.map(|pos| self.render_more_menu(pos, cx)));
 
         // Dev perf HUD: register its toggle, overlay the panel last (on top), and
         // close the frame so the rings capture this render's cost.

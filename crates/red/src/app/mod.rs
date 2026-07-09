@@ -1191,13 +1191,10 @@ pub struct AppState {
     /// Whether the "What's New" changelog overlay is showing (Help menu /
     /// `help: what's new` palette command / the post-update toast).
     pub(crate) whats_new_open: bool,
-    /// A pending connection import awaiting confirmation: the parsed/decrypted
-    /// report plus a title, rendered as the import preview modal. `None` when no
-    /// import is in flight (see [`import_ui`]).
-    pub(crate) import_preview: Option<import_ui::ImportPreview>,
-    /// Detected import sources (DBeaver/DBGate installs) backing the source
-    /// picker; indexed by [`crate::palette::Cmd::ImportFrom`].
-    pub(crate) import_candidates: Vec<crate::import::discover::Found>,
+    /// The connection-import wizard while it's open: pick a source (DBeaver/
+    /// DBGate), scan, then choose which discovered connections to import. `None`
+    /// when no import is in flight (see [`import_ui`]).
+    pub(crate) import_wizard: Option<import_ui::ImportWizard>,
     /// Set in [`Self::new`] when this build's version differs from the last one
     /// recorded: the version to announce in a one-shot "RED updated to X" toast,
     /// raised on the first render. `None` on a first-ever launch or an unchanged
@@ -1670,7 +1667,7 @@ impl AppState {
             );
             s.set_trigger(label, dot, cx);
             s.set_sections(sections, cx);
-            s.set_footer(switcher_footer(), cx);
+            s.set_footer(switcher_footer(false), cx);
             s
         });
         cx.subscribe(&switcher, Self::on_switcher_event).detach();
@@ -1870,8 +1867,7 @@ impl AppState {
             titlebar_drag: false,
             shortcuts_open: false,
             whats_new_open: false,
-            import_preview: None,
-            import_candidates: Vec::new(),
+            import_wizard: None,
             pending_update,
             connect_sel: 0,
             connect_search,
@@ -2468,7 +2464,7 @@ impl AppState {
             || self.whats_new_open
             || self.settings_open
             || self.form.is_some()
-            || self.import_preview.is_some()
+            || self.import_wizard.is_some()
     }
 
     /// Open or close the keyboard-shortcuts overlay (`⌘/` / palette command).

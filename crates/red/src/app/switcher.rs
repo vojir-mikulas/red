@@ -11,10 +11,20 @@ impl AppState {
     pub(crate) fn rebuild_switcher(&mut self, cx: &mut Context<Self>) {
         let (label, dot, sections) =
             switcher_sections(&self.connections, &self.phase, &self.parked, cx.theme());
+        // Offer "Edit current connection…" only when the foreground connection is a
+        // saved one we can open the form for (not an unsaved/ad-hoc session).
+        let has_active = self.active_connection_index().is_some();
         self.switcher.update(cx, |s, cx| {
             s.set_trigger(label, dot, cx);
             s.set_sections(sections, cx);
+            s.set_footer(switcher_footer(has_active), cx);
         });
+    }
+
+    /// The `connections` index of the foreground connection, if it's a saved one.
+    /// Backs the switcher's "Edit current connection…" action.
+    fn active_connection_index(&self) -> Option<usize> {
+        switcher_buckets(&self.connections, &self.phase, &self.parked).active
     }
 
     /// Toggle the connection switcher popover (⌘P, or a click on its topbar
@@ -64,6 +74,10 @@ impl AppState {
         };
         if name.as_ref() == "action:new" {
             self.open_new_form(cx);
+        } else if name.as_ref() == "action:edit-current" {
+            if let Some(index) = self.active_connection_index() {
+                self.open_edit_form(index, cx);
+            }
         } else if name.as_ref() == "action:manage" {
             // The full manager *is* the disconnected landing screen.
             if !matches!(self.phase, Phase::Disconnected) {
@@ -345,11 +359,18 @@ pub(super) fn switcher_sections(
     (label.into(), dot, sections)
 }
 
-/// The switcher's pinned footer actions, always visible beneath the
-/// scrollable connection list.
-pub(super) fn switcher_footer() -> Vec<SwitcherItem> {
-    vec![
-        SwitcherItem::new("action:new", "New connection…"),
-        SwitcherItem::new("action:manage", "Manage connections…"),
-    ]
+/// The switcher's pinned footer actions, always visible beneath the scrollable
+/// connection list. `has_active` adds an "Edit current connection…" row when the
+/// foreground connection is a saved one whose form can be opened.
+pub(super) fn switcher_footer(has_active: bool) -> Vec<SwitcherItem> {
+    let mut items = Vec::with_capacity(3);
+    if has_active {
+        items.push(SwitcherItem::new(
+            "action:edit-current",
+            "Edit current connection…",
+        ));
+    }
+    items.push(SwitcherItem::new("action:new", "New connection…"));
+    items.push(SwitcherItem::new("action:manage", "Manage connections…"));
+    items
 }

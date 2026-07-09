@@ -59,6 +59,18 @@ pub(crate) fn new_epoch() -> u64 {
 pub(in crate::result) const DATA_COL_WIDTH: f32 = 180.0;
 pub(in crate::result) const GUTTER_WIDTH: f32 = 56.0;
 
+/// Width for the row-number gutter, sized to fit the widest ordinal it shows:
+/// the grouped last-row number (`1,000,000`) plus a possible `≈` estimate
+/// prefix, so large row numbers never clip. Never narrower than
+/// [`GUTTER_WIDTH`]. Shared by the renderer and the cursor's horizontal scroll
+/// math so both agree on the gutter's extent.
+pub(in crate::result) fn gutter_width(total: usize) -> f32 {
+    // `≈` + grouped digits of the last ordinal, at roughly a mono glyph's
+    // advance, plus the cell's horizontal padding (`px_2p5` each side).
+    let glyphs = group_digits(total.max(1)).chars().count() + 1;
+    (glyphs as f32 * 8.0 + 20.0).max(GUTTER_WIDTH)
+}
+
 /// One inline-expanded reference column (Track B7): a dotted path from the base
 /// table down through single-column FKs to a leaf column, e.g.
 /// `["tier_id", "cascade_id", "name"]`, shown and aliased as
@@ -1020,7 +1032,7 @@ impl ResultGrid {
         if viewport_w <= 0.0 {
             return; // not laid out yet
         }
-        let gutter_w = gutter as f32 * GUTTER_WIDTH;
+        let gutter_w = gutter as f32 * gutter_width(self.total);
         let data_col = table_col.saturating_sub(gutter);
         let col_left = gutter_w + data_col as f32 * DATA_COL_WIDTH;
         let col_right = col_left + DATA_COL_WIDTH;

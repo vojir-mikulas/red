@@ -205,6 +205,60 @@ impl AppState {
         }
     }
 
+    /// Duplicate saved connection `index`: append a clone under a "… copy" name
+    /// with a fresh id, copying its keychain secrets (DB password, SSH secrets)
+    /// across to the new id so the copy is a full working duplicate. The copy
+    /// starts unpinned and never-accessed, like a fresh save.
+    pub(crate) fn duplicate_connection(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(stored) = self.connections.get(index) else {
+            return;
+        };
+        let source_id = stored.id.clone();
+        let mut config = stored.config.clone();
+        config.name = format!("{} copy", config.name);
+        let is_file = config.kind.is_file();
+
+        // Secrets live in the keychain keyed by the *source* id (the config carries
+        // them empty), so hydrate them here to re-store under the new id.
+        let mut password = config.password.clone();
+        if password.is_empty() && !is_file {
+            if let Ok(Some(pw)) = crate::secrets::get_password(&source_id) {
+                password = pw;
+            }
+        }
+        let ssh_secrets = config.ssh.as_ref().map(|ssh| {
+            let mut pw = ssh.password.clone();
+            let mut passphrase = ssh.passphrase.clone();
+            match &ssh.auth {
+                SshAuth::Password if pw.is_empty() => {
+                    if let Ok(Some(s)) = crate::secrets::get_ssh_password(&source_id) {
+                        pw = s;
+                    }
+                }
+                SshAuth::Key { .. } if passphrase.is_empty() => {
+                    if let Ok(Some(s)) = crate::secrets::get_ssh_passphrase(&source_id) {
+                        passphrase = s;
+                    }
+                }
+                _ => {}
+            }
+            (pw, passphrase)
+        });
+
+        self.connections.push(StoredConnection {
+            id: crate::config::new_id(),
+            config,
+            last_accessed: None,
+            pinned: false,
+        });
+        let new_index = self.connections.len() - 1;
+        self.store_credential(new_index, &password, is_file, cx);
+        self.store_ssh_credentials(new_index, ssh_secrets, cx);
+        self.persist(cx);
+        self.rebuild_switcher(cx);
+        cx.notify();
+    }
+
     pub(crate) fn delete_connection(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.connections.len() {
             let removed = self.connections.remove(index);

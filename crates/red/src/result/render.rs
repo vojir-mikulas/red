@@ -13,7 +13,7 @@ use red_core::ExportFormat;
 
 use super::buffer::{CellKind, DisplayCell};
 use super::edit::EditSlot;
-use super::{DATA_COL_WIDTH, GUTTER_WIDTH};
+use super::{gutter_width, DATA_COL_WIDTH};
 use crate::app::{ActiveConn, AppState, Pane, Phase};
 
 /// Group a number's digits in threes (`1234567` → `1,234,567`) so large row
@@ -352,7 +352,11 @@ impl AppState {
         let gutter = show_gutter as usize;
         let mut columns: Vec<Column> = Vec::with_capacity(grid.columns.len() + gutter);
         if show_gutter {
-            columns.push(Column::new("#").width(px(GUTTER_WIDTH)).align_end());
+            columns.push(
+                Column::new("#")
+                    .width(px(gutter_width(grid.total)))
+                    .align_end(),
+            );
         }
         for c in &grid.columns {
             let mut col = Column::new(c.name.clone())
@@ -732,22 +736,12 @@ impl AppState {
             .when(is_focused && self.stats_bar, |c| {
                 c.child(self.render_stats_bar(grid, cx))
             })
-            .child(footer)
-            // The cell right-click menu floats above the pane, anchored at the
-            // cursor; a full-cover backdrop dismisses it on an outside click.
-            .when_some(is_focused.then_some(self.cell_menu).flatten(), |c, pos| {
-                c.child(self.render_cell_menu(pos, cx))
-            })
-            // The toolbar "Export" dropdown floats the same way, anchored at the
-            // cursor where its button was clicked.
-            .when_some(
-                is_focused.then_some(self.export_menu).flatten(),
-                |c, pos| c.child(self.render_export_menu(pos, cx)),
-            )
-            // The toolbar "More" dropdown (Stats · Copy to…), likewise.
-            .when_some(is_focused.then_some(self.more_menu).flatten(), |c, pos| {
-                c.child(self.render_more_menu(pos, cx))
-            });
+            .child(footer);
+        // NB: the cell / export / more dropdowns are *not* mounted here. Their
+        // dismiss backdrop must cover the whole window (so a click anywhere outside
+        // closes them, and they can't linger alongside a modal), which a pane-local
+        // `inset_0` can't do — so they're mounted at the app root instead (see
+        // `app::render`), on top of every other overlay.
 
         // With the detail inspector open, dock it to the right of the grid via a
         // resizable split: the grid flexes, the inspector carries the user-set
@@ -952,7 +946,8 @@ impl AppState {
         let mono_family = theme.mono_family.clone();
         let cell_size = theme.font_size;
         let show_gutter = self.settings.grid.row_numbers;
-        let gutter_w = if show_gutter { GUTTER_WIDTH } else { 0.0 };
+        let gutter_px = gutter_width(grid.total);
+        let gutter_w = if show_gutter { gutter_px } else { 0.0 };
         let ncols = grid.columns.len();
         let content_w = gutter_w + ncols as f32 * DATA_COL_WIDTH;
         // The cell of an open editor that targets a draft row.
@@ -968,7 +963,7 @@ impl AppState {
             if show_gutter {
                 cells.push(
                     div()
-                        .w(px(GUTTER_WIDTH))
+                        .w(px(gutter_px))
                         .flex_shrink_0()
                         .h_full()
                         .flex()
@@ -1077,7 +1072,11 @@ impl AppState {
     /// · Copy) that used to sit in the toolbar, anchored at `pos` (the cursor).
     /// Both act on the cell the right-click just selected. A full-cover backdrop
     /// closes the menu on an outside click.
-    fn render_cell_menu(&self, pos: Point<Pixels>, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_cell_menu(
+        &self,
+        pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // Editing entries (Track B6) appear only when the focused cell / row is
         // editable on a writable connection's keyed browse.
         let editable_cell = self.active_edit_target().is_some();
@@ -1244,7 +1243,11 @@ impl AppState {
     /// The result toolbar's "Export" dropdown: CSV / JSON / HTML grouped into one
     /// menu, anchored at `pos` (where the button was clicked). A full-cover backdrop
     /// dismisses it on an outside click, mirroring [`Self::render_cell_menu`].
-    fn render_export_menu(&self, pos: Point<Pixels>, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_export_menu(
+        &self,
+        pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let menu = ContextMenu::new("result-export-menu")
             .item(
                 ContextMenuItem::new("export-csv", "CSV").on_click(cx.listener(
@@ -1289,7 +1292,11 @@ impl AppState {
     /// The result toolbar's "More" dropdown; the less-used actions (the Stats
     /// toggle and "Copy to…") collected into one menu, anchored at `pos`. A
     /// full-cover backdrop dismisses it, mirroring [`Self::render_cell_menu`].
-    fn render_more_menu(&self, pos: Point<Pixels>, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_more_menu(
+        &self,
+        pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // "Copy to…" needs a ready result as its source; the Stats toggle is
         // always available and carries a leading check while its bar is on.
         let ready = matches!(&self.phase, Phase::Connected(a) if a.active_result().is_some_and(|g| g.ready));

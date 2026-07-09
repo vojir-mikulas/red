@@ -123,6 +123,11 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(gpui::size(gpui::px(720.), gpui::px(480.))),
                 titlebar: Some(titlebar_options()),
+                // The Wayland app_id (and X11 WM_CLASS) GNOME matches against a
+                // `.desktop` file to pick the alt-tab / taskbar icon. Must equal
+                // our desktop file's basename (`red.desktop`, `Icon=red`) and its
+                // `StartupWMClass`, or the running window shows no icon.
+                app_id: Some("red".into()),
                 // On Linux (GNOME/Wayland in particular) the compositor draws no
                 // titlebar, so we ask for client-side decorations and paint our
                 // own controls + resize borders (see `window_chrome`). macOS and

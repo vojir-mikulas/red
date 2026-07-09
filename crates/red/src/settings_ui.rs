@@ -81,6 +81,11 @@ impl AppState {
             .p_2()
             .gap_0p5()
             .bg(theme.bg_panel)
+            // The nav's own fill spans the card's rounded left edge; round its
+            // left corners to match, or its square corners paint through them
+            // (the card's `overflow_hidden` clips content, not child bg corners).
+            .rounded_tl(px(10.))
+            .rounded_bl(px(10.))
             .border_r_1()
             .border_color(theme.border_soft)
             .child(
@@ -212,6 +217,9 @@ fn settings_banner(
         .px_4()
         .py_2()
         .bg(theme.yellow.opacity(0.1))
+        // Sits at the card's top-right (the nav covers the top-left); round it so
+        // its tinted fill doesn't square off that corner.
+        .rounded_tr(px(10.))
         .border_b_1()
         .border_color(theme.border_soft)
         .child(crate::icons::icon("lock", theme.scale(13.), theme.yellow))
@@ -1930,6 +1938,9 @@ fn settings_footer(cx: &mut Context<AppState>) -> impl IntoElement {
         .border_t_1()
         .border_color(theme.border_soft)
         .bg(theme.bg_bar)
+        // Match the card's rounded bottom-right so the bar's fill doesn't paint a
+        // sharp corner into it (the nav rounds the bottom-left).
+        .rounded_br(px(10.))
         .child(
             Button::new("set-open-file", "Open settings file")
                 .variant(ButtonVariant::Ghost)

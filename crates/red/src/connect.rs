@@ -160,7 +160,7 @@ impl AppState {
             .text_color(footer_theme.text_faint)
             .child(
                 footer_link("connect-import", "Import from DBeaver or DBGate")
-                    .on_click(cx.listener(|this, _, _, cx| this.open_import_picker(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.open_import_wizard(cx))),
             )
             .child("·")
             .child(footer_link("connect-report-bug", "Report a bug").on_click(
@@ -514,10 +514,11 @@ impl AppState {
             .rounded(theme.radius)
             .bg(theme.bg_elevated)
             .border_1()
-            // The keyboard-highlighted card (↑/↓ on the welcome screen) gets the
-            // accent border; the rest sit on the neutral border until hovered.
+            // The keyboard-highlighted card (↑/↓ on the welcome screen) gets a
+            // border in the connection's own label colour; the rest sit on the
+            // neutral border until hovered.
             .border_color(if display_ix == self.connect_sel {
-                theme.accent
+                accent
             } else {
                 theme.border
             })
@@ -658,6 +659,20 @@ impl AppState {
                                     move |this, _, _, cx| {
                                         cx.stop_propagation();
                                         this.open_edit_form(orig_ix, cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                IconButton::new(
+                                    SharedString::from(format!("duplicate-{orig_ix}")),
+                                    crate::icons::icon("copy", theme.scale(14.), theme.text_muted),
+                                )
+                                .size(IconButtonSize::Sm)
+                                .tooltip("Duplicate connection")
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.duplicate_connection(orig_ix, cx);
                                     },
                                 )),
                             )
@@ -1051,17 +1066,38 @@ impl AppState {
             labeled_field("AI agent", theme).child(
                 div()
                     .flex()
-                    .items_center()
-                    .gap_2()
-                    .h(px(32.))
+                    .flex_col()
+                    .gap_1p5()
                     .child(
-                        Toggle::new("ai-allow-writes", form.ai_allow_writes)
-                            .label("Allow writes")
-                            .on_change(cx.listener(|this, checked: &bool, _, cx| {
-                                this.set_form_ai_allow_writes(*checked, cx)
-                            })),
+                        // Toggle + a short visible caption, matching the Read-only
+                        // row; the flint `Toggle` label is a11y-only and paints
+                        // nothing, so the caption is what the user actually reads.
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .h(px(24.))
+                            .child(
+                                Toggle::new("ai-allow-writes", form.ai_allow_writes)
+                                    .label("Allow writes")
+                                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                        this.set_form_ai_allow_writes(*checked, cx)
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_size(theme.scale(12.5))
+                                    .text_color(if form.ai_allow_writes {
+                                        theme.accent
+                                    } else {
+                                        theme.text_muted
+                                    })
+                                    .child("Allow writes"),
+                            ),
                     )
                     .child(
+                        // The explanation wraps freely on its own line instead of
+                        // being crammed next to the switch.
                         div()
                             .text_size(theme.scale(11.5))
                             .text_color(theme.text_muted)
