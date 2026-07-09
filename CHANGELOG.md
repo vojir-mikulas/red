@@ -6,14 +6,34 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-09
+
+### Added
+- Duplicate a saved connection from the welcome screen.
+- Edit the connection you're currently using straight from the connection
+  switcher.
+- A scrollbar for the SQL editor.
+
 ### Changed
 - A more compact welcome screen: smaller header, tighter spacing, and the
   import / bug-report links folded into one footer line.
+- Importing connections from DBeaver or DBGate is now a wizard: pick the source
+  and choose exactly which connections to bring in. Installs kept inside a
+  Flatpak sandbox are found too.
+- The selected connection on the welcome screen is outlined in its own colour.
 
 ### Fixed
 - Windows: clicks on the toolbar controls (the Settings gear, the connection
   switcher) no longer get swallowed by window dragging. Dragging the window
   works as before.
+- Autocomplete suggestions scroll now: arrow past the ones on screen, or use
+  the mouse wheel to preview the rest.
+- Wide values in the row-number column are no longer clipped.
+- Right-click menus in the result grid close when you click anywhere outside
+  them, instead of lingering over other windows.
+- Square corners no longer show inside the settings panel's rounded frame.
+- Linux: the app shows its icon in the GNOME app switcher and dock.
+- Linux: the window no longer draws its own rounded corners.
 
 ## [0.13.0] - 2026-07-03
 
