@@ -305,9 +305,9 @@ pub(super) fn switcher_sections(
         item
     };
 
-    // Layer the state cues onto a row (the active checkmark + warm/connecting
-    // badge, a warm badge + target for an open session, else a recency line) so a
-    // pinned row reads the same as it would under This window / Open / Recent.
+    // Layer the state cues onto a row (a warm/connecting badge + target for the
+    // active session, a warm badge + target for an open session, else a recency
+    // line) so a pinned row reads the same as under This window / Open / Recent.
     let decorate = |index: usize| -> SwitcherItem {
         let item = row(index);
         if buckets.active == Some(index) {
@@ -317,7 +317,6 @@ pub(super) fn switcher_sections(
                 } else {
                     warm_badge.clone()
                 })
-                .checked(true)
         } else if warm_ids.contains(connections[index].id.as_str()) {
             item.detail(connections[index].config.display_target())
                 .badge(warm_badge.clone())

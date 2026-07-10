@@ -340,6 +340,15 @@ impl DatabaseDriver for SqliteDriver {
             .map_err(driver_err)?
     }
 
+    async fn execute_batch(&self, statements: &[String]) -> Result<Vec<u64>> {
+        let path = self.path.clone();
+        let read_only = self.read_only;
+        let statements = statements.to_vec();
+        tokio::task::spawn_blocking(move || execute_batch_blocking(&path, read_only, &statements))
+            .await
+            .map_err(driver_err)?
+    }
+
     async fn apply_edits(&self, ops: &[EditOp]) -> Result<u64> {
         let path = self.path.clone();
         let read_only = self.read_only;
@@ -494,6 +503,29 @@ fn execute_blocking(path: &Path, read_only: bool, sql: &str) -> Result<u64> {
             Err(map_step_err(e))
         }
     }
+}
+
+/// Run several statements in one transaction: commit on success, roll the whole
+/// batch back on the first error. Returns per-statement affected counts. An empty
+/// batch opens no transaction.
+fn execute_batch_blocking(path: &Path, read_only: bool, statements: &[String]) -> Result<Vec<u64>> {
+    if statements.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = SqliteDriver::open(path, read_only)?;
+    conn.execute_batch("BEGIN").map_err(driver_err)?;
+    let mut affected = Vec::with_capacity(statements.len());
+    for sql in statements {
+        match conn.execute(sql, []) {
+            Ok(n) => affected.push(n as u64),
+            Err(e) => {
+                crate::warn_rollback(conn.execute_batch("ROLLBACK"), "execute_batch");
+                return Err(map_step_err(e));
+            }
+        }
+    }
+    conn.execute_batch("COMMIT").map_err(driver_err)?;
+    Ok(affected)
 }
 
 /// Render and run a batch of [`EditOp`]s in one transaction, asserting each touches

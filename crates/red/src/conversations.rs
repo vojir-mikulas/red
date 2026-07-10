@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 /// One persisted turn: who spoke, the visible text, and (assistant turns only) any
 /// summarized thinking. Mirrors the panel's `ChatMessage` without depending on it.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct StoredMessage {
     /// `"user"` or `"assistant"`.
     pub role: String,
@@ -30,6 +30,13 @@ pub(crate) struct StoredMessage {
     pub text: String,
     #[serde(default)]
     pub thinking: String,
+    /// The turn's activity timeline (tool calls, subagents, writes). Defaulted so
+    /// conversations saved before the timeline existed still load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activity: Vec<red_core::ActivityNode>,
+    /// The turn's plan checklist, if the agent published one. Defaulted for old files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan: Vec<red_core::PlanStep>,
 }
 
 /// A saved conversation: its transcript, a display title, the provider binding it
@@ -236,11 +243,13 @@ mod tests {
                     role: "user".into(),
                     text: "how many users?".into(),
                     thinking: String::new(),
+                    ..Default::default()
                 },
                 StoredMessage {
                     role: "assistant".into(),
                     text: "1,234".into(),
                     thinking: "counting".into(),
+                    ..Default::default()
                 },
             ],
             path: PathBuf::new(),

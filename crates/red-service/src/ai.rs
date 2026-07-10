@@ -18,7 +18,9 @@ use std::time::Duration;
 use red_ai::{
     AiProvider, CancelToken, ContentBlock, Message, Role, StopReason, ToolDef, TurnRequest,
 };
-use red_core::{AiPolicy, AiTier, RedError, Value};
+use red_core::{
+    ActivityKind, ActivityStatus, AiLimits, AiPolicy, AiTier, RedError, TableRef, Value,
+};
 use red_driver::{AbortSignal, DatabaseDriver, PageCap};
 use serde_json::{json, Value as Json};
 use tokio::sync::oneshot;
@@ -28,10 +30,11 @@ use crate::protocol::{AiContext, AiDelta, AiUsage, ReportTheme};
 use crate::{Event, SessionId};
 
 /// A small, UI-agnostic announcer the `generate_report` tool uses to hand a
-/// freshly-written report file to the UI to open in the browser. The tool stays
-/// UI-free: it just announces a path; the caller turns it into an `AiReportReady`
-/// event. Both backends construct one from the `events`/`session`/`conversation_id`
-/// they hold; a `disabled()` sink (no channel) drops announcements (tests).
+/// freshly-written report file to the UI, which surfaces it as a card the user can
+/// open. The tool stays UI-free: it just announces a path; the caller turns it into
+/// an `AiReportReady` event. Both backends construct one from the
+/// `events`/`session`/`conversation_id` they hold; a `disabled()` sink (no channel)
+/// drops announcements (tests).
 #[derive(Clone)]
 pub(crate) struct ReportSink {
     events: Option<Events>,
@@ -97,8 +100,8 @@ impl ReportSink {
         std::env::temp_dir()
     }
 
-    /// Announce a freshly-written report so the UI opens it.
-    fn announce(&self, path: &Path) {
+    /// Announce a freshly-written report so the UI surfaces it as a card.
+    fn announce(&self, path: &Path, title: Option<&str>) {
         if let Some(events) = &self.events {
             emit(
                 events,
@@ -106,6 +109,7 @@ impl ReportSink {
                 Event::AiReportReady {
                     conversation_id: self.conversation_id,
                     path: path.display().to_string(),
+                    title: title.map(str::to_string),
                 },
             );
         }
@@ -119,6 +123,21 @@ impl ReportSink {
                 self.session,
                 Event::AiOpenQuery {
                     conversation_id: self.conversation_id,
+                    sql: sql.to_string(),
+                },
+            );
+        }
+    }
+
+    fn announce_save_query(&self, name: &str, description: Option<&str>, sql: &str) {
+        if let Some(events) = &self.events {
+            emit(
+                events,
+                self.session,
+                Event::AiSaveQuery {
+                    conversation_id: self.conversation_id,
+                    name: name.to_string(),
+                    description: description.map(str::to_string),
                     sql: sql.to_string(),
                 },
             );
@@ -301,10 +320,13 @@ pub(crate) async fn run_turn(
             let events = events.clone();
             tokio::spawn(async move {
                 while let Some(d) = drx.recv().await {
+                    // Tool calls become activity nodes at the execution site below,
+                    // where the arguments are known; the streamed `ToolUseStarted`
+                    // is only an early hint, so it is dropped here.
                     let delta = match d {
                         red_ai::Delta::Thinking(t) => AiDelta::Thinking(t),
                         red_ai::Delta::Text(t) => AiDelta::Text(t),
-                        red_ai::Delta::ToolUseStarted { name, .. } => AiDelta::ToolStarted { name },
+                        red_ai::Delta::ToolUseStarted { .. } => continue,
                     };
                     emit(
                         &events,
@@ -358,6 +380,79 @@ pub(crate) async fn run_turn(
                 });
                 continue;
             }
+            // Delegation (Phase 1c): run a bounded, read-only child agent and feed
+            // its report back as this call's result. Intercepted before the write
+            // gate / `run_tool` because it drives a nested turn, not a driver call.
+            // The child's own tool calls stream in as children of this node, so the
+            // delegation is visible in the timeline rather than opaque.
+            if name == "spawn_subagent" {
+                let task = input
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if task.is_empty() {
+                    results.push(ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: "error: spawn_subagent requires a non-empty `task`".into(),
+                        is_error: true,
+                    });
+                    continue;
+                }
+                emit(
+                    &events,
+                    session,
+                    Event::AiDelta {
+                        conversation_id,
+                        delta: AiDelta::ActivityStarted {
+                            id: id.clone(),
+                            parent: None,
+                            kind: ActivityKind::Subagent {
+                                task: truncate_summary(&task, 120),
+                            },
+                            status: ActivityStatus::Running,
+                        },
+                    },
+                );
+                let (content, ok) = run_subagent(
+                    &provider,
+                    &driver,
+                    &events,
+                    &state,
+                    session,
+                    conversation_id,
+                    &model,
+                    &policy,
+                    &report,
+                    id,
+                    &task,
+                    &cancel,
+                )
+                .await;
+                emit(
+                    &events,
+                    session,
+                    Event::AiDelta {
+                        conversation_id,
+                        delta: AiDelta::ActivityUpdated {
+                            id: id.clone(),
+                            status: Some(if ok {
+                                ActivityStatus::Ok
+                            } else {
+                                ActivityStatus::Failed
+                            }),
+                            detail: activity_detail(name, ok, &content),
+                        },
+                    },
+                );
+                results.push(ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content,
+                    is_error: !ok,
+                });
+                continue;
+            }
             // Gate a mutating tool behind explicit per-call user approval (Feature
             // B). A blocked shape (wrong tier, read-only, DDL, unqualified
             // UPDATE/DELETE) is reported to the model without ever prompting; an
@@ -383,6 +478,21 @@ pub(crate) async fn run_turn(
                     )
                     .await;
                     if !allowed {
+                        // Record the denied write in the timeline as a terminal node
+                        // so the audit trail shows what was proposed and refused.
+                        emit(
+                            &events,
+                            session,
+                            Event::AiDelta {
+                                conversation_id,
+                                delta: AiDelta::ActivityStarted {
+                                    id: id.clone(),
+                                    parent: None,
+                                    kind: ActivityKind::Write { sql: sql.clone() },
+                                    status: ActivityStatus::Denied,
+                                },
+                            },
+                        );
                         results.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
                             content: "the user denied this write. Do not retry it; explain it or \
@@ -400,7 +510,15 @@ pub(crate) async fn run_turn(
                 session,
                 Event::AiDelta {
                     conversation_id,
-                    delta: AiDelta::ToolStarted { name: name.clone() },
+                    delta: AiDelta::ActivityStarted {
+                        id: id.clone(),
+                        parent: None,
+                        kind: ActivityKind::Tool {
+                            name: name.clone(),
+                            args_summary: summarize_tool_args(name, input),
+                        },
+                        status: ActivityStatus::Running,
+                    },
                 },
             );
             let (content, ok) = run_tool(&driver, name, input, &policy, &cancel, &report).await;
@@ -409,9 +527,14 @@ pub(crate) async fn run_turn(
                 session,
                 Event::AiDelta {
                     conversation_id,
-                    delta: AiDelta::ToolFinished {
-                        name: name.clone(),
-                        ok,
+                    delta: AiDelta::ActivityUpdated {
+                        id: id.clone(),
+                        status: Some(if ok {
+                            ActivityStatus::Ok
+                        } else {
+                            ActivityStatus::Failed
+                        }),
+                        detail: activity_detail(name, ok, &content),
                     },
                 },
             );
@@ -457,6 +580,167 @@ pub(crate) async fn run_turn(
             },
         ),
     }
+}
+
+/// How many model→tool rounds a delegated subagent may take before it must report
+/// back. Deliberately smaller than the parent's [`MAX_TOOL_STEPS`]: a subagent is a
+/// focused, bounded errand, and the shared tool-call budget caps it further.
+const SUBAGENT_MAX_STEPS: usize = 6;
+
+/// Run a bounded, read-only subagent turn for `spawn_subagent` (Phase 1c). The
+/// child gets the parent's tools minus writes and minus `spawn_subagent` (so it can
+/// neither mutate nor recurse), **shares** the conversation's tool-call budget (so
+/// it can't blow the parent's cap), and streams its own tool calls into the
+/// timeline as children of `parent_id`. Its prose is not shown; only its final
+/// report text returns to the parent as the tool result.
+#[allow(clippy::too_many_arguments)]
+async fn run_subagent(
+    provider: &Arc<dyn AiProvider>,
+    driver: &Arc<dyn DatabaseDriver>,
+    events: &Events,
+    state: &Arc<Mutex<AiState>>,
+    session: Option<SessionId>,
+    conversation_id: u64,
+    model: &str,
+    policy: &AiPolicy,
+    report: &ReportSink,
+    parent_id: &str,
+    task: &str,
+    cancel: &CancelToken,
+) -> (String, bool) {
+    let tools = subagent_catalog(policy);
+    let system = subagent_system_prompt(task);
+    let mut messages = vec![Message::user_text(task.to_string())];
+    let mut answer = String::new();
+
+    for _ in 0..SUBAGENT_MAX_STEPS {
+        if cancel.is_cancelled() {
+            return ("the subagent was cancelled".into(), false);
+        }
+        let req = TurnRequest {
+            model: model.to_string(),
+            max_tokens: 4096,
+            show_thinking: false,
+            system: system.clone(),
+            tools: tools.clone(),
+            messages: messages.clone(),
+        };
+        // Drain the child's streamed deltas without surfacing its prose; only its
+        // tool activity is shown, emitted below as children of the parent node.
+        let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel::<red_ai::Delta>();
+        let drain = tokio::spawn(async move { while drx.recv().await.is_some() {} });
+        let outcome = provider.stream_turn(&req, &dtx, cancel).await;
+        drop(dtx);
+        let _ = drain.await;
+
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(e) => return (format!("the subagent failed: {e}"), false),
+        };
+        messages.push(outcome.message.clone());
+        for block in &outcome.message.content {
+            if let ContentBlock::Text { text } = block {
+                answer.push_str(text);
+            }
+        }
+        if outcome.stop_reason != StopReason::ToolUse {
+            break;
+        }
+
+        let mut results = Vec::new();
+        for block in &outcome.message.content {
+            let ContentBlock::ToolUse { id, name, input } = block else {
+                continue;
+            };
+            if !lock(state).charge_tool_call(conversation_id, policy.limits.max_tool_calls) {
+                results.push(ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: "error: the shared tool-call budget is exhausted; stop and report \
+                        what you have"
+                        .into(),
+                    is_error: true,
+                });
+                continue;
+            }
+            emit(
+                events,
+                session,
+                Event::AiDelta {
+                    conversation_id,
+                    delta: AiDelta::ActivityStarted {
+                        id: id.clone(),
+                        parent: Some(parent_id.to_string()),
+                        kind: ActivityKind::Tool {
+                            name: name.clone(),
+                            args_summary: summarize_tool_args(name, input),
+                        },
+                        status: ActivityStatus::Running,
+                    },
+                },
+            );
+            let (content, ok) = run_tool(driver, name, input, policy, cancel, report).await;
+            emit(
+                events,
+                session,
+                Event::AiDelta {
+                    conversation_id,
+                    delta: AiDelta::ActivityUpdated {
+                        id: id.clone(),
+                        status: Some(if ok {
+                            ActivityStatus::Ok
+                        } else {
+                            ActivityStatus::Failed
+                        }),
+                        detail: activity_detail(name, ok, &content),
+                    },
+                },
+            );
+            results.push(ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content,
+                is_error: !ok,
+            });
+        }
+        if results.is_empty() {
+            break;
+        }
+        messages.push(Message {
+            role: Role::User,
+            content: results,
+        });
+    }
+
+    let answer = answer.trim();
+    if answer.is_empty() {
+        (
+            "the subagent finished without producing a report".into(),
+            true,
+        )
+    } else {
+        (answer.to_string(), true)
+    }
+}
+
+/// The tool subset a delegated subagent may use: the parent's catalog minus every
+/// write tool and minus `spawn_subagent` itself, so a subagent can neither mutate
+/// data nor recurse. Narrows (never widens) the parent's tier — even a Write-tier
+/// parent yields a read-only child.
+fn subagent_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
+    tool_catalog(policy)
+        .into_iter()
+        .filter(|t| t.name != "spawn_subagent" && !is_write_tool(&t.name))
+        .collect()
+}
+
+/// The subagent's system prompt: a focused, read-only worker that reports back.
+fn subagent_system_prompt(task: &str) -> String {
+    format!(
+        "You are a focused sub-investigator working for a parent AI agent on ONE task. You have \
+         read-only database tools (schema inspection and capped SELECTs); you cannot write data \
+         or delegate further. Do the task, then reply with a concise report of your findings — \
+         the key facts, figures, and any caveats — that the parent can use directly. Do not ask \
+         questions; you cannot receive answers.\n\nTask: {task}"
+    )
 }
 
 /// Surface a write-approval prompt and block this turn until the user answers it,
@@ -534,6 +818,25 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "profile_table".into(),
+            description: "Profile one table's data: per-column null counts and ratios, distinct \
+                counts (with unique-key and constant-column hints), and min/max (plus sum/avg for \
+                numeric columns), followed by its foreign-key relationships (outgoing and \
+                incoming). One pushed-down aggregate pass per column — it never returns raw rows — \
+                so use it to understand a table's shape and data quality before querying, instead \
+                of hand-writing count/distinct/min/max SELECTs."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "schema": { "type": "string", "description": "Schema/namespace name (e.g. \"main\" or \"public\"); as reported by list_schema." },
+                    "table": { "type": "string", "description": "The table to profile." },
+                },
+                "required": ["schema", "table"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
             name: "run_select".into(),
             description: format!(
                 "Run a read-only SELECT (or WITH ... SELECT) query and return up to {max_rows} \
@@ -570,7 +873,9 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "generate_report".into(),
-            description: "Write a custom HTML report for the user and open it in their browser. \
+            description: "Write a custom HTML report for the user. It appears as a card in the \
+                chat with an \"Open\" button; the user opens it in their browser when they choose \
+                (it is NOT opened automatically). \
                 YOU author the report: first read the data with run_select, then call this with \
                 `html` set to the report's body: headings, prose/summary, one or more <table>s, \
                 even an inline <svg> chart. Use semantic HTML and inline `style=\"…\"` for any \
@@ -638,6 +943,46 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "save_query".into(),
+            description: "Save a REUSABLE SQL query to the user's saved-queries library under a \
+                short name, so they can reopen and rerun it later (⇧⌘O). Use this when the user \
+                asks for a report/query they'll want again — e.g. \"monthly revenue\" — rather \
+                than open_query (which is a one-off tab). For a parametrized query, leave named \
+                `:placeholders` in the SQL (e.g. `WHERE month = :month`) and explain them in the \
+                description; the user fills them in when they run it. Nothing executes."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "A short, human-readable name (e.g. \"Monthly revenue\")." },
+                    "sql": { "type": "string", "description": "The SQL to save, runnable as-is (named :placeholders allowed for parameters)." },
+                    "description": { "type": "string", "description": "One line on what it does and any placeholders to fill in; shown in the picker." },
+                },
+                "required": ["name", "sql"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "spawn_subagent".into(),
+            description: "Delegate a self-contained READ-ONLY sub-investigation to a subagent and \
+                get back its findings as a short written report. The subagent has the same \
+                schema/query tools you do (read-only: it cannot write or spawn further subagents) \
+                and works in its own context, so use this to parallelize or offload a focused \
+                chunk of work — e.g. \"profile the orders table\" or \"find which tables reference \
+                users\" — without cluttering your own context. Give it ONE clear, bounded task and \
+                everything it needs to know; it cannot ask you follow-ups. It returns only its \
+                final summary (not raw rows)."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string", "description": "A single, self-contained read-only task for the subagent, with all needed context." },
+                },
+                "required": ["task"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
             name: "propose_write".into(),
             description: "Execute a SINGLE data-modifying statement: INSERT, UPDATE, or DELETE. \
                 EVERY call requires explicit per-statement approval: the user sees the exact SQL \
@@ -655,6 +1000,33 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
                 "additionalProperties": false,
             }),
         },
+        ToolDef {
+            name: "propose_changeset".into(),
+            description: "Execute SEVERAL data-modifying statements as ONE atomic transaction: \
+                they all commit together, or if any fails the whole set is rolled back (nothing \
+                changes). Use this for a related multi-step change — e.g. insert a parent row then \
+                its children, or update several rows in lockstep — where a half-applied result \
+                would be wrong. EVERY call requires explicit approval: the user sees the full list \
+                of statements and must Allow it before anything runs; assume it may be denied. Each \
+                statement must be a single INSERT/UPDATE/DELETE (UPDATE/DELETE need a WHERE); DDL \
+                and chained statements are rejected — tell the user to run those by hand. For a \
+                single change use propose_write instead."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "statements": {
+                        "type": "array",
+                        "description": "The INSERT/UPDATE/DELETE statements to run in order, in one transaction. Each is a single statement (UPDATE/DELETE need a WHERE).",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                    },
+                    "description": { "type": "string", "description": "One line on what this changeset does, shown to the user with the approval prompt." },
+                },
+                "required": ["statements"],
+                "additionalProperties": false,
+            }),
+        },
     ];
     all.into_iter()
         // The tier gates membership; additionally, the write tool is withheld on a
@@ -663,6 +1035,69 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             policy.tier.allows_tool(&t.name) && !(policy.read_only && is_write_tool(&t.name))
         })
         .collect()
+}
+
+/// A one-line summary of a tool call's arguments for the activity timeline: the
+/// SQL's first line for query/write tools, the table name for `describe_table`.
+/// Kept short so the trace reads without expanding a node. `None` when there's no
+/// salient argument.
+fn summarize_tool_args(name: &str, input: &Json) -> Option<String> {
+    if name == "propose_changeset" {
+        let n = input
+            .get("statements")
+            .and_then(Json::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0);
+        return Some(format!("{n} statement{}", if n == 1 { "" } else { "s" }));
+    }
+    let salient = match name {
+        "run_select" | "explain" | "propose_write" => input.get("sql")?.as_str()?,
+        "describe_table" | "profile_table" => input.get("table").and_then(Json::as_str)?,
+        "save_query" => input.get("name").and_then(Json::as_str)?,
+        _ => return None,
+    };
+    let line = salient.split('\n').find(|l| !l.trim().is_empty())?.trim();
+    Some(truncate_summary(line, 80))
+}
+
+/// A one-line result summary for a finished tool node: on failure, the error's
+/// first line; on success, a short per-tool signal (row count, rows affected) so the
+/// trace reads at a glance. `None` when there's nothing concise to show.
+fn activity_detail(name: &str, ok: bool, content: &str) -> Option<String> {
+    if !ok {
+        let line = content.split('\n').find(|l| !l.trim().is_empty())?.trim();
+        return Some(truncate_summary(line, 120));
+    }
+    let summary = match name {
+        // The write tools return a single summary sentence; surface it verbatim.
+        "propose_write" | "propose_changeset" => content.split('\n').next()?.trim().to_string(),
+        // `format_page` ends with a `(N rows)` line; skip the `(truncated …)` note.
+        "run_select" => content
+            .lines()
+            .rev()
+            .find(|l| {
+                let t = l.trim_start();
+                t.starts_with('(') && t[1..].chars().next().is_some_and(|c| c.is_ascii_digit())
+            })
+            .map(|l| l.trim().trim_matches(['(', ')']).to_string())?,
+        // `profile_table`'s report opens with `Profile of X — N rows`.
+        "profile_table" => content
+            .lines()
+            .next()
+            .and_then(|l| l.split('—').nth(1))
+            .map(|s| s.trim().to_string())?,
+        _ => return None,
+    };
+    (!summary.is_empty()).then(|| truncate_summary(&summary, 120))
+}
+
+/// Truncate to `max` chars on a char boundary, appending an ellipsis when cut.
+fn truncate_summary(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{cut}…")
 }
 
 /// Execute one tool call against the driver, under the access policy (M-S7).
@@ -707,6 +1142,14 @@ pub(crate) async fn run_tool(
                 Ok(detail) => (format_table_detail(schema, table, &detail), true),
                 Err(e) => (format!("error: {e}"), false),
             }
+        }
+        "profile_table" => {
+            let schema = input.get("schema").and_then(Json::as_str).unwrap_or("");
+            let table = input.get("table").and_then(Json::as_str).unwrap_or("");
+            if table.is_empty() {
+                return ("error: `table` is required".into(), false);
+            }
+            profile_table(driver, schema, table, limits).await
         }
         "run_select" => {
             let sql = input.get("sql").and_then(Json::as_str).unwrap_or("").trim();
@@ -842,15 +1285,16 @@ pub(crate) async fn run_tool(
                 .join(format!("red-report-{}.html", uuid::Uuid::new_v4().simple()));
             match write_report_file(&path, &html) {
                 Ok(()) => {
-                    // Hand the path to the UI so it opens the file in the browser.
-                    report.announce(&path);
-                    let label = title
-                        .map(str::trim)
-                        .filter(|t| !t.is_empty())
-                        .map(|t| format!(" “{t}”"))
-                        .unwrap_or_default();
+                    // Hand the path to the UI, which surfaces it as a card the user can
+                    // open. Nothing is opened automatically.
+                    let clean_title = title.map(str::trim).filter(|t| !t.is_empty());
+                    report.announce(&path, clean_title);
+                    let label = clean_title.map(|t| format!(" “{t}”")).unwrap_or_default();
                     (
-                        format!("Generated the report{label} and opened it in the user's browser."),
+                        format!(
+                            "Generated the report{label}. It's now available as a card in the \
+                             chat for the user to open."
+                        ),
                         true,
                     )
                 }
@@ -870,6 +1314,32 @@ pub(crate) async fn run_tool(
             report.announce_open_query(sql);
             (
                 "Opened the query in a new editor tab in the user's workspace.".into(),
+                true,
+            )
+        }
+        "save_query" => {
+            let name = input
+                .get("name")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .trim();
+            let sql = input.get("sql").and_then(Json::as_str).unwrap_or("").trim();
+            if name.is_empty() || sql.is_empty() {
+                return (
+                    "error: save_query needs a non-empty `name` and `sql`".into(),
+                    false,
+                );
+            }
+            let description = input
+                .get("description")
+                .and_then(Json::as_str)
+                .map(str::trim)
+                .filter(|d| !d.is_empty());
+            // Hand it to the UI, which writes the `.sql` file into the saved-queries
+            // library. Nothing executes here.
+            report.announce_save_query(name, description, sql);
+            (
+                format!("Saved the query as “{name}” to the user's saved-queries library."),
                 true,
             )
         }
@@ -896,6 +1366,44 @@ pub(crate) async fn run_tool(
                 WriteAssessment::Reject(why) => (format!("error: {why}"), false),
                 WriteAssessment::NotWrite => (
                     "error: propose_write needs an INSERT/UPDATE/DELETE statement".into(),
+                    false,
+                ),
+            }
+        }
+        "propose_changeset" => {
+            // Re-vet at execution (defense in depth), then run the whole set in one
+            // transaction: all commit or none do. Approval was already granted above.
+            match assess_write(name, input, policy) {
+                WriteAssessment::NeedsApproval { .. } => {
+                    let statements = changeset_statements(input);
+                    match driver.execute_batch(&statements).await {
+                        Ok(affected) => {
+                            // Audit each executed statement with its own row count.
+                            for (stmt, rows) in statements.iter().zip(&affected) {
+                                crate::audit::record_write(stmt, *rows);
+                            }
+                            let total: u64 = affected.iter().sum();
+                            (
+                                format!(
+                                    "Executed the changeset in one transaction: {} statement(s), \
+                                     {total} row(s) affected. Verify with a SELECT if it matters.",
+                                    statements.len()
+                                ),
+                                true,
+                            )
+                        }
+                        Err(e) => (
+                            format!(
+                                "error: the changeset failed and was rolled back (nothing \
+                                     changed): {e}"
+                            ),
+                            false,
+                        ),
+                    }
+                }
+                WriteAssessment::Reject(why) => (format!("error: {why}"), false),
+                WriteAssessment::NotWrite => (
+                    "error: propose_changeset needs a `statements` array".into(),
                     false,
                 ),
             }
@@ -1042,11 +1550,14 @@ fn is_read_only_select(sql: &str) -> bool {
 pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "list_schema",
     "describe_table",
+    "profile_table",
     "run_select",
     "explain",
     "generate_report",
     // Hands the user a SQL query to open in a tab; no DB mutation of its own.
     "open_query",
+    // Writes a `.sql` file to the user's saved-queries library; no DB mutation.
+    "save_query",
 ];
 
 /// Whether `name` is a mutating tool: it never auto-runs and never auto-allows;
@@ -1089,6 +1600,9 @@ pub(crate) fn assess_write(name: &str, input: &Json, policy: &AiPolicy) -> Write
                 .into(),
         );
     }
+    if name == "propose_changeset" {
+        return assess_changeset(input);
+    }
     let sql = input.get("sql").and_then(Json::as_str).unwrap_or("").trim();
     match write_shape(sql) {
         WriteShape::Ok => WriteAssessment::NeedsApproval {
@@ -1099,6 +1613,61 @@ pub(crate) fn assess_write(name: &str, input: &Json, policy: &AiPolicy) -> Write
         ),
         WriteShape::Blocked(why) => WriteAssessment::Reject(why.into()),
     }
+}
+
+/// The statements of a `propose_changeset` call: the non-empty, trimmed entries of
+/// its `statements` array, in order.
+fn changeset_statements(input: &Json) -> Vec<String> {
+    input
+        .get("statements")
+        .and_then(Json::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Vet a `propose_changeset`: every statement must pass the same shape gate as a
+/// single write (DML only, WHERE required, no DDL, no chaining). Any failure rejects
+/// the *whole* changeset — it's atomic, so a bad statement means nothing runs. On
+/// success the approval prompt shows the numbered statements as one reviewable unit.
+fn assess_changeset(input: &Json) -> WriteAssessment {
+    let statements = changeset_statements(input);
+    if statements.is_empty() {
+        return WriteAssessment::Reject(
+            "propose_changeset needs a non-empty `statements` array of INSERT/UPDATE/DELETE \
+             statements"
+                .into(),
+        );
+    }
+    for (i, stmt) in statements.iter().enumerate() {
+        match write_shape(stmt) {
+            WriteShape::Ok => {}
+            WriteShape::NotWrite => {
+                return WriteAssessment::Reject(format!(
+                    "statement {} is not an INSERT/UPDATE/DELETE; a changeset only modifies data",
+                    i + 1
+                ));
+            }
+            WriteShape::Blocked(why) => {
+                return WriteAssessment::Reject(format!("statement {}: {why}", i + 1));
+            }
+        }
+    }
+    // Numbered, one per line: the exact set the user approves as a unit.
+    let body = statements
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{}. {s}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    WriteAssessment::NeedsApproval { sql: body }
 }
 
 /// The shape verdict for a candidate write statement.
@@ -1446,8 +2015,9 @@ pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
             "You have read-only tools: list_schema, describe_table, run_select (capped SELECTs), \
              explain, open_query (open a SQL query in a new editor tab in the user's workspace; a \
              read-only SELECT runs automatically), and generate_report (you author an HTML report \
-             from data you've read, with optional interactive Chart.js charts, and it opens in \
-             the user's browser; use it when the user asks for a report). Use them to ground every \
+             from data you've read, with optional interactive Chart.js charts; it appears as a \
+             card in the chat the user can open; use it when the user asks for a report). Use them \
+             to ground every \
              answer in the live database rather than \
              guessing: discover objects with list_schema, inspect structure with describe_table, \
              and read data with run_select. Use open_query to hand the user a query to explore in \
@@ -1523,6 +2093,166 @@ pub(crate) fn user_turn(message: &str, ctx: &AiContext) -> String {
     }
     s.push_str(message);
     s
+}
+
+/// Cap on columns profiled in one `profile_table` call: each column is one
+/// pushed-down aggregate query, so a very wide table is truncated (and says so) to
+/// keep the tool bounded.
+const MAX_PROFILE_COLUMNS: usize = 40;
+
+/// Above this row count, skip the potentially-expensive per-column `count(distinct)`
+/// (reported as "not computed"), mirroring the grid's own distinct guard.
+const PROFILE_DISTINCT_MAX_ROWS: i64 = 1_000_000;
+
+/// Implement the `profile_table` tool: describe the table, push down a per-column
+/// aggregate profile (nulls, distinct, min/max, sum/avg), and summarize its
+/// foreign-key relationships. Read-only; returns a compact text report, never rows.
+async fn profile_table(
+    driver: &Arc<dyn DatabaseDriver>,
+    schema: &str,
+    table: &str,
+    limits: &AiLimits,
+) -> (String, bool) {
+    use std::fmt::Write;
+
+    let detail = match driver.describe_table(schema, table).await {
+        Ok(d) => d,
+        Err(e) => return (format!("error: {e}"), false),
+    };
+    let table_ref = TableRef {
+        schema: (!schema.is_empty()).then(|| schema.to_string()),
+        name: table.to_string(),
+    };
+    let base_sql = format!("SELECT * FROM {}", driver.quote_table(&table_ref));
+
+    // Count once up front so we can decide whether per-column count(distinct) is
+    // affordable, and report the table's size.
+    let abort = AbortSignal::new();
+    let total = match guard_timeout(
+        limits.statement_timeout_ms,
+        &abort,
+        driver.count(&base_sql, &abort),
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(RedError::Timeout) => {
+            return (
+                "error: counting the table exceeded the agent's statement timeout; it may be \
+                 very large. Profile a narrower view or use run_select with aggregates."
+                    .into(),
+                false,
+            );
+        }
+        Err(e) => return (format!("error: {e}"), false),
+    };
+    let want_distinct = (0..=PROFILE_DISTINCT_MAX_ROWS).contains(&total);
+
+    let qualified = if schema.is_empty() {
+        table.to_string()
+    } else {
+        format!("{schema}.{table}")
+    };
+    let mut out = String::new();
+    let _ = writeln!(out, "Profile of {qualified} — {total} rows\n");
+    let _ = writeln!(out, "Columns:");
+
+    let total_cols = detail.columns.len();
+    for col in detail.columns.iter().take(MAX_PROFILE_COLUMNS) {
+        let numeric = red_core::is_numeric_type(col.type_name.as_deref());
+        let ty = col.type_name.as_deref().unwrap_or("?");
+        let mut tags = Vec::new();
+        if col.primary_key {
+            tags.push("pk");
+        }
+        if col.not_null {
+            tags.push("not null");
+        }
+        let tagstr = if tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", tags.join(", "))
+        };
+        let _ = writeln!(out, "  {} {ty}{tagstr}", col.name);
+
+        let abort = AbortSignal::new();
+        let stats = guard_timeout(
+            limits.statement_timeout_ms,
+            &abort,
+            driver.column_stats(&base_sql, &col.name, numeric, want_distinct, &abort),
+        )
+        .await;
+        match stats {
+            Ok(s) => {
+                let nulls = s.total - s.non_null;
+                let null_pct = if s.total > 0 {
+                    nulls as f64 * 100.0 / s.total as f64
+                } else {
+                    0.0
+                };
+                let mut line = format!("    nulls: {nulls} ({null_pct:.1}%)");
+                match s.distinct {
+                    Some(d) => {
+                        // Free data-quality hints straight from the counts.
+                        let note = if s.total > 0 && nulls == 0 && d == s.total {
+                            " (unique)"
+                        } else if d == 1 {
+                            " (constant)"
+                        } else {
+                            ""
+                        };
+                        let _ = write!(line, "  distinct: {d}{note}");
+                    }
+                    None => {
+                        let _ = write!(line, "  distinct: not computed (table over the row guard)");
+                    }
+                }
+                if s.non_null > 0 {
+                    let _ = write!(line, "  min: {}  max: {}", s.min, s.max);
+                    if let (Some(sum), Some(avg)) = (&s.sum, &s.avg) {
+                        let _ = write!(line, "  sum: {sum}  avg: {avg}");
+                    }
+                }
+                let _ = writeln!(out, "{line}");
+            }
+            Err(RedError::Timeout) => {
+                let _ = writeln!(out, "    (stats timed out for this column)");
+            }
+            Err(e) => {
+                let _ = writeln!(out, "    (stats unavailable: {e})");
+            }
+        }
+    }
+    if total_cols > MAX_PROFILE_COLUMNS {
+        let _ = writeln!(
+            out,
+            "  (profiled the first {MAX_PROFILE_COLUMNS} of {total_cols} columns)"
+        );
+    }
+
+    // Foreign-key relationships from the connection-wide graph (best-effort; an
+    // engine without relational FKs simply reports none).
+    let fks = driver.foreign_keys().await.unwrap_or_default();
+    let outgoing: Vec<_> = fks.iter().filter(|e| e.from_table == table).collect();
+    let incoming: Vec<_> = fks.iter().filter(|e| e.to_table == table).collect();
+    if !outgoing.is_empty() {
+        let _ = writeln!(out, "\nForeign keys (this table references):");
+        for e in &outgoing {
+            for (from, to) in &e.columns {
+                let _ = writeln!(out, "  {from} → {}.{to}", e.to_table);
+            }
+        }
+    }
+    if !incoming.is_empty() {
+        let _ = writeln!(out, "\nReferenced by (tables pointing here):");
+        for e in &incoming {
+            for (from, to) in &e.columns {
+                let _ = writeln!(out, "  {}.{from} → {to}", e.from_table);
+            }
+        }
+    }
+
+    (out, true)
 }
 
 fn format_schema(schemas: &[red_core::SchemaMeta]) -> String {
@@ -1637,6 +2367,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tool_args_summary_pulls_the_salient_scalar() {
+        assert_eq!(
+            summarize_tool_args("run_select", &json!({ "sql": "SELECT 1\nFROM t" })),
+            Some("SELECT 1".to_string())
+        );
+        assert_eq!(
+            summarize_tool_args("describe_table", &json!({ "table": "public.users" })),
+            Some("public.users".to_string())
+        );
+        // Leading blank lines are skipped; the first non-empty line wins.
+        assert_eq!(
+            summarize_tool_args("propose_write", &json!({ "sql": "\n  UPDATE t SET x=1" })),
+            Some("UPDATE t SET x=1".to_string())
+        );
+        // A tool with no salient scalar (or a missing field) summarizes to nothing.
+        assert_eq!(summarize_tool_args("list_schema", &json!({})), None);
+        assert_eq!(summarize_tool_args("run_select", &json!({})), None);
+    }
+
+    #[test]
+    fn activity_detail_summarizes_success_and_surfaces_errors() {
+        // Failure: the error's first line, for any tool.
+        assert_eq!(
+            activity_detail(
+                "run_select",
+                false,
+                "error: relation \"t\" does not exist\nctx…"
+            ),
+            Some("error: relation \"t\" does not exist".to_string())
+        );
+        // run_select success → the trailing "(N rows)" count, ignoring a truncation note.
+        assert_eq!(
+            activity_detail(
+                "run_select",
+                true,
+                "a | b\n1 | 2\n(3 rows)\n(truncated to 3 rows)"
+            ),
+            Some("3 rows".to_string())
+        );
+        // profile_table success → the header's "N rows".
+        assert_eq!(
+            activity_detail(
+                "profile_table",
+                true,
+                "Profile of main.t — 42 rows\n\nColumns:"
+            ),
+            Some("42 rows".to_string())
+        );
+        // A write tool's one-line summary is surfaced verbatim.
+        assert_eq!(
+            activity_detail(
+                "propose_write",
+                true,
+                "Executed the write: 2 row(s) affected."
+            ),
+            Some("Executed the write: 2 row(s) affected.".to_string())
+        );
+        // A tool with no concise success signal shows nothing (the ✓ glyph suffices).
+        assert_eq!(activity_detail("list_schema", true, "schemas…"), None);
+    }
+
+    #[test]
+    fn summary_truncation_is_char_safe_and_marked() {
+        let long = "x".repeat(200);
+        let out = truncate_summary(&long, 80);
+        assert_eq!(out.chars().count(), 80);
+        assert!(out.ends_with('…'));
+        // Multibyte input never splits a codepoint.
+        let emoji = "😀".repeat(100);
+        let out = truncate_summary(&emoji, 10);
+        assert_eq!(out.chars().count(), 10);
+    }
+
+    #[test]
     fn read_only_gate_rejects_writes_and_chains() {
         assert!(is_read_only_select("SELECT 1"));
         assert!(is_read_only_select(
@@ -1709,12 +2513,32 @@ mod tests {
             [
                 "list_schema",
                 "describe_table",
+                "profile_table",
                 "run_select",
                 "explain",
                 "generate_report",
-                "open_query"
+                "open_query",
+                "save_query",
+                "spawn_subagent"
             ]
         );
+    }
+
+    #[test]
+    fn subagent_catalog_is_read_only_and_non_recursive() {
+        use red_core::{AiPolicy, AiTier};
+        // Even from a Write-tier parent, the child gets no write tool and cannot
+        // spawn further subagents.
+        let names: Vec<String> = subagent_catalog(&AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        })
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+        assert!(!names.iter().any(|n| n == "propose_write"));
+        assert!(!names.iter().any(|n| n == "spawn_subagent"));
+        assert!(names.iter().any(|n| n == "run_select"));
     }
 
     #[test]
@@ -1756,12 +2580,254 @@ mod tests {
             [
                 "list_schema",
                 "describe_table",
+                "profile_table",
                 "run_select",
                 "explain",
                 "generate_report",
-                "open_query"
+                "open_query",
+                "save_query",
+                "spawn_subagent"
             ]
         );
+    }
+
+    #[test]
+    fn changeset_assessment_gates_shape_tier_and_read_only() {
+        let write = AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        };
+        let ok = json!({ "statements": [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1 WHERE id = 1",
+        ] });
+
+        // A valid set at the Write tier needs approval; the prompt body numbers each.
+        match assess_write("propose_changeset", &ok, &write) {
+            WriteAssessment::NeedsApproval { sql } => {
+                assert!(sql.contains("1. INSERT"), "got: {sql}");
+                assert!(sql.contains("2. UPDATE"), "got: {sql}");
+            }
+            _ => panic!("expected NeedsApproval for a valid changeset"),
+        }
+
+        // Below the Write tier the whole tool is refused.
+        assert!(matches!(
+            assess_write("propose_changeset", &ok, &AiPolicy::default()),
+            WriteAssessment::Reject(_)
+        ));
+        // A read-only connection refuses even at the Write tier.
+        let read_only = AiPolicy {
+            tier: AiTier::Write,
+            read_only: true,
+            ..AiPolicy::default()
+        };
+        assert!(matches!(
+            assess_write("propose_changeset", &ok, &read_only),
+            WriteAssessment::Reject(_)
+        ));
+        // One bad statement (DDL) rejects the whole set — it's atomic.
+        let ddl = json!({ "statements": ["INSERT INTO t VALUES (1)", "DROP TABLE t"] });
+        assert!(matches!(
+            assess_write("propose_changeset", &ddl, &write),
+            WriteAssessment::Reject(_)
+        ));
+        // An unqualified UPDATE/DELETE is blocked.
+        let nowhere = json!({ "statements": ["DELETE FROM t"] });
+        assert!(matches!(
+            assess_write("propose_changeset", &nowhere, &write),
+            WriteAssessment::Reject(_)
+        ));
+        // An empty set is refused.
+        let empty = json!({ "statements": [] });
+        assert!(matches!(
+            assess_write("propose_changeset", &empty, &write),
+            WriteAssessment::Reject(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn changeset_runs_atomically_and_rolls_back_on_error() {
+        let db = std::env::temp_dir().join(format!("red-cs-{}.db", uuid::Uuid::new_v4().simple()));
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER);
+                 INSERT INTO t VALUES (1, 10);",
+            )
+            .unwrap();
+        }
+        let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, false));
+        let policy = AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        };
+        let read_n = |driver: Arc<dyn DatabaseDriver>| async move {
+            let abort = AbortSignal::new();
+            let page = driver
+                .fetch_page(
+                    "SELECT n FROM t WHERE id = 1",
+                    0,
+                    1,
+                    PageCap::Display { key: None },
+                    &abort,
+                )
+                .await
+                .unwrap();
+            page.rows[0][0].to_string()
+        };
+
+        // Success: both statements commit together.
+        let (content, ok) = run_tool(
+            &driver,
+            "propose_changeset",
+            &json!({ "statements": [
+                "UPDATE t SET n = 20 WHERE id = 1",
+                "INSERT INTO t VALUES (2, 30)",
+            ] }),
+            &policy,
+            &CancelToken::new(),
+            &ReportSink::disabled(),
+        )
+        .await;
+        assert!(ok, "expected success, got: {content}");
+        assert_eq!(read_n(driver.clone()).await, "20");
+
+        // Failure: the second statement conflicts on the PK, so the whole batch rolls
+        // back — the first UPDATE must NOT stick (n stays 20, not 99).
+        let (content, ok) = run_tool(
+            &driver,
+            "propose_changeset",
+            &json!({ "statements": [
+                "UPDATE t SET n = 99 WHERE id = 1",
+                "INSERT INTO t VALUES (2, 40)",
+            ] }),
+            &policy,
+            &CancelToken::new(),
+            &ReportSink::disabled(),
+        )
+        .await;
+        assert!(!ok, "expected failure, got: {content}");
+        assert!(content.contains("rolled back"), "got: {content}");
+        assert_eq!(
+            read_n(driver.clone()).await,
+            "20",
+            "the batch must be atomic"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_table_reports_nulls_distinct_aggregates_and_fks() {
+        let db =
+            std::env::temp_dir().join(format!("red-prof-{}.db", uuid::Uuid::new_v4().simple()));
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT);
+                 CREATE TABLE child (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER REFERENCES parent(id),
+                    tag TEXT,
+                    score INTEGER
+                 );
+                 INSERT INTO parent VALUES (1, 'a'), (2, 'b');
+                 INSERT INTO child VALUES (1, 1, 'x', 10), (2, 1, 'x', 20), (3, NULL, 'x', NULL);",
+            )
+            .unwrap();
+        }
+        let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
+        let (content, ok) = run_tool(
+            &driver,
+            "profile_table",
+            &json!({ "schema": "main", "table": "child" }),
+            &AiPolicy::default(),
+            &CancelToken::new(),
+            &ReportSink::disabled(),
+        )
+        .await;
+        assert!(ok, "profile failed: {content}");
+        assert!(content.contains("3 rows"), "row count missing: {content}");
+        // The PK is all-distinct and non-null → flagged unique.
+        assert!(
+            content.contains("(unique)"),
+            "unique hint missing: {content}"
+        );
+        // `tag` is 'x' in every row → flagged constant.
+        assert!(
+            content.contains("(constant)"),
+            "constant hint missing: {content}"
+        );
+        // `parent_id` and `score` each have one null row.
+        assert!(
+            content.contains("nulls: 1"),
+            "null count missing: {content}"
+        );
+        // Numeric `score` reports sum/avg.
+        assert!(
+            content.contains("sum:"),
+            "numeric aggregates missing: {content}"
+        );
+        // The outgoing FK to `parent` is surfaced.
+        assert!(
+            content.contains("parent_id → parent.id"),
+            "FK relationship missing: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_query_announces_a_save_with_name_and_description() {
+        use futures::StreamExt;
+
+        // save_query never touches the DB (it hands the file write to the UI); a
+        // throwaway driver is enough.
+        let db = std::env::temp_dir().join(format!("red-sq-{}.db", uuid::Uuid::new_v4().simple()));
+        let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let sink = ReportSink::new(tx, None, 42, None, None);
+
+        let (content, ok) = run_tool(
+            &driver,
+            "save_query",
+            &json!({
+                "name": "Monthly revenue",
+                "sql": "SELECT month, sum(amount) FROM sales WHERE month = :month GROUP BY month",
+                "description": "Revenue for a given :month",
+            }),
+            &AiPolicy::default(),
+            &CancelToken::new(),
+            &sink,
+        )
+        .await;
+        assert!(ok, "expected success, got: {content}");
+        assert!(content.contains("Monthly revenue"));
+
+        let (_session, event) = rx.next().await.expect("an AiSaveQuery event");
+        let Event::AiSaveQuery {
+            conversation_id,
+            name,
+            description,
+            sql,
+        } = event
+        else {
+            panic!("expected AiSaveQuery, got {event:?}");
+        };
+        assert_eq!(conversation_id, 42);
+        assert_eq!(name, "Monthly revenue");
+        assert_eq!(description.as_deref(), Some("Revenue for a given :month"));
+        assert!(sql.contains(":month"));
+
+        // Missing name or sql is refused, and nothing is announced.
+        let (_content, ok) = run_tool(
+            &driver,
+            "save_query",
+            &json!({ "name": "", "sql": "SELECT 1" }),
+            &AiPolicy::default(),
+            &CancelToken::new(),
+            &sink,
+        )
+        .await;
+        assert!(!ok);
+        assert!(rx.try_recv().is_err(), "a refused save must not announce");
     }
 
     #[tokio::test]
@@ -1795,6 +2861,7 @@ mod tests {
         let Event::AiReportReady {
             conversation_id,
             path,
+            ..
         } = event
         else {
             panic!("expected AiReportReady");

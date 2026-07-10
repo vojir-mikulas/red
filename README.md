@@ -1,14 +1,12 @@
-# Red — Roughly Enough Data
+# Red - Roughly Enough Data
 
 A fast, native database explorer built in Rust.
 
-Red helps you inspect schemas, browse large tables, run SQL queries, and export data without the complexity of heavyweight IDE-style database tools.
+Red is for inspecting schemas, browsing large tables, running SQL, and exporting data. The name is the goal: show roughly enough data to make a decision quickly, without the weight of a full IDE-style database tool.
 
-> **Roughly Enough Data.** Show enough to make decisions quickly.
+It's built on GPUI and renders on the GPU, so there's no Electron or embedded browser.
 
-Built with GPUI and rendered natively on the GPU. No Electron, no browser runtime, no web stack.
-
-> **Status: MVP.** Core workflows are functional, but APIs and UI are still evolving. Expect rough edges and breaking changes before the first stable release.
+> **Status: MVP.** The core workflows are functional, but the UI and APIs are still moving. Expect rough edges and breaking changes before the first stable release.
 
 ## Databases
 
@@ -32,7 +30,7 @@ Built with GPUI and rendered natively on the GPU. No Electron, no browser runtim
 * AI assistant sidebar with grounded chat over your schema, via the Claude API or a Claude subscription
 * SSH tunneling through a jump host
 * Themes (Ayu Dark / Light, High Contrast) and a fully customizable keymap
-* Production-safe inspection workflows
+* Read-only connections and destructive-query confirmations for working against production
 
 ## Install
 

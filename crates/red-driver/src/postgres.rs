@@ -622,6 +622,34 @@ impl DatabaseDriver for PostgresDriver {
         result
     }
 
+    async fn execute_batch(&self, statements: &[String]) -> Result<Vec<u64>> {
+        if statements.is_empty() {
+            return Ok(Vec::new());
+        }
+        let client = self.acquire().await?;
+        let result = async {
+            client.batch_execute("BEGIN").await.map_err(driver_err)?;
+            let mut affected = Vec::with_capacity(statements.len());
+            for sql in statements {
+                match client.execute(sql.as_str(), &[]).await {
+                    Ok(n) => affected.push(n),
+                    Err(e) => {
+                        crate::warn_rollback(
+                            client.batch_execute("ROLLBACK").await,
+                            "execute_batch",
+                        );
+                        return Err(map_pg_err(e));
+                    }
+                }
+            }
+            client.batch_execute("COMMIT").await.map_err(driver_err)?;
+            Ok(affected)
+        }
+        .await;
+        self.release(client);
+        result
+    }
+
     async fn apply_edits(&self, ops: &[EditOp]) -> Result<u64> {
         if ops.is_empty() {
             return Ok(0);

@@ -10,9 +10,9 @@ use gpui::{div, prelude::*, px, Axis, Context, MouseButton, Window};
 /// the connection switcher; elsewhere the native caption bar is separate, so
 /// only normal padding is needed. Mirrors Nyx.
 #[cfg(target_os = "macos")]
-const TITLEBAR_LEFT_INSET: f32 = 88.;
+pub(crate) const TITLEBAR_LEFT_INSET: f32 = 88.;
 #[cfg(not(target_os = "macos"))]
-const TITLEBAR_LEFT_INSET: f32 = 12.;
+pub(crate) const TITLEBAR_LEFT_INSET: f32 = 12.;
 
 use crate::app::{ActiveConn, AppState, Phase, SplitHalf};
 

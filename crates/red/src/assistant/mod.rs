@@ -71,9 +71,31 @@ pub(crate) struct ChatMessage {
     pub(crate) role: ChatRole,
     pub(crate) text: String,
     pub(crate) thinking: String,
+    /// The turn's activity timeline (assistant only): tool calls, subagents, and
+    /// proposed writes, in call order, each resolved by id as updates stream. Drawn
+    /// inline above the answer text and persisted with the conversation so a
+    /// reopened chat shows what the agent *did*, not just what it said.
+    pub(crate) activity: Vec<red_core::ActivityNode>,
+    /// The agent's plan checklist for this turn (assistant only), shown at the top
+    /// of the bubble and ticked off as the agent works. Empty when the agent
+    /// published no plan (always empty on the API-key path today).
+    pub(crate) plan: Vec<red_core::PlanStep>,
     /// Frame-stable render artifacts (parsed Markdown + first SQL block), filled
     /// lazily and reused while `text` is unchanged; see [`ChatMessage::markdown`].
     cache: RefCell<MessageCache>,
+    /// Selectable, copyable text leaves for a *settled* bubble: one
+    /// [`flint::SelectableLabel`] per Markdown text leaf (paragraph / heading / list
+    /// item / table cell) in document order, or the single label for a user turn.
+    /// Empty while the turn streams (the live bubble uses plain, non-selectable
+    /// `StyledText`); built once the turn settles or a saved chat is restored (see
+    /// [`crate::app::AppState::build_chat_selectables`]). The transcript is repainted
+    /// every frame, so these persist to hold selection state and avoid per-frame
+    /// entity churn.
+    selectables: Vec<Entity<flint::SelectableLabel>>,
+    /// The theme (`theme.text`) the assistant leaves' run colors were baked for, so a
+    /// theme switch rebuilds them rather than showing stale colors. `None` for a
+    /// never-built or plain (color-inherited) message. See [`ChatMessage::selectables_for`].
+    selectable_theme: Option<gpui::Hsla>,
 }
 
 /// Cached, frame-stable derivations of a bubble's `text`. A transcript repaint (e.g.
@@ -94,8 +116,39 @@ impl ChatMessage {
             role,
             text,
             thinking,
+            activity: Vec::new(),
+            plan: Vec::new(),
             cache: RefCell::new(MessageCache::default()),
+            selectables: Vec::new(),
+            selectable_theme: None,
         }
+    }
+
+    /// The prebuilt selectable leaves for this bubble, but only if they're current
+    /// for `theme_key` (an assistant bubble bakes theme colors into its runs, so a
+    /// theme switch invalidates them). `None` means "render plain, non-selectable"
+    /// — nothing built yet, empty text, or a stale theme.
+    pub(super) fn selectables_for(&self, theme_key: gpui::Hsla) -> Option<&[Entity<flint::SelectableLabel>]> {
+        if self.selectables.is_empty() || self.selectable_theme != Some(theme_key) {
+            return None;
+        }
+        Some(&self.selectables)
+    }
+
+    /// Whether this bubble's selectable leaves are already built for `theme_key`
+    /// (so [`crate::app::AppState::build_chat_selectables`] can skip it).
+    pub(super) fn selectables_current(&self, theme_key: gpui::Hsla) -> bool {
+        !self.selectables.is_empty() && self.selectable_theme == Some(theme_key)
+    }
+
+    /// Store freshly-built selectable leaves and the theme they were built for.
+    pub(super) fn set_selectables(
+        &mut self,
+        leaves: Vec<Entity<flint::SelectableLabel>>,
+        theme_key: gpui::Hsla,
+    ) {
+        self.selectables = leaves;
+        self.selectable_theme = Some(theme_key);
     }
 
     /// Reparse/rescan only when `text` changed since the last fill. `blocks` being
@@ -353,13 +406,26 @@ pub(crate) struct AssistantState {
     /// Which config selector's dropdown is currently open (its `config_id`), if any.
     /// `flint::Select` is stateless, so the open state lives here.
     pub(crate) open_config: Option<String>,
-    /// The most recent subscription session's advertised selectors (model / reasoning
-    /// / mode). An agent only advertises these once its session opens (on the first
-    /// turn), so a brand-new chat has none yet; the composer renders this cache as a
-    /// provisional set so the dropdowns show *before* the chat sends its first turn.
-    /// Replaced by the chat's own live options once its session opens. Empty until the
-    /// first subscription session of the process has run.
-    pub(crate) last_config_options: Vec<red_service::AiConfigOption>,
+    /// Each agent's most recent advertised selectors (model / reasoning / mode),
+    /// keyed by agent id. An agent only advertises these once its session opens (on
+    /// the first turn), so a brand-new chat has none yet; the composer renders the
+    /// cache for the chat's agent as a provisional set so the dropdowns show *before*
+    /// the chat sends its first turn. Seeded from `state.json` on open (so a returning
+    /// user sees them immediately) and replaced by a chat's own live options once its
+    /// session opens. Empty for an agent whose session has never run on this machine.
+    pub(crate) provider_config_options:
+        std::collections::HashMap<String, Vec<red_service::AiConfigOption>>,
+    /// User overrides for subagent-card collapse, keyed by the subagent's activity
+    /// id. Absent means the default (expanded while running, collapsed once done);
+    /// present pins the user's explicit choice. In-memory only, panel-lifetime.
+    pub(crate) subagent_collapse: std::collections::HashMap<SharedString, bool>,
+    /// Shared "who owns the live selection" cell across every transcript
+    /// [`flint::SelectableLabel`], so highlighting text in one block clears the
+    /// highlight in the others — a single selection at a time across the whole chat.
+    pub(crate) selection_group: flint::SelectionGroup,
+    /// Monotonic id handed to each selectable leaf as it's built, unique within the
+    /// panel so [`selection_group`](Self::selection_group) can tell them apart.
+    pub(crate) next_selection_id: u64,
 }
 
 impl AssistantState {

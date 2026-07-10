@@ -226,11 +226,20 @@ impl AiTier {
                     | "describe_table"
                     | "run_select"
                     | "explain"
+                    | "profile_table"
                     | "generate_report"
                     | "open_query"
+                    | "save_query"
+                    // Delegation grants no new capability — a subagent runs a
+                    // read-only subset of this same tier — so it rides with Read.
+                    | "spawn_subagent"
             ),
-            // Write inherits the full read catalog and adds the gated write tool.
-            AiTier::Write => tool == "propose_write" || AiTier::Read.allows_tool(tool),
+            // Write inherits the full read catalog and adds the gated write tools
+            // (a single statement, or a multi-statement transactional changeset).
+            AiTier::Write => {
+                matches!(tool, "propose_write" | "propose_changeset")
+                    || AiTier::Read.allows_tool(tool)
+            }
         }
     }
 
@@ -333,6 +342,110 @@ impl AiPolicy {
             read_only: self.read_only,
         }
     }
+}
+
+/// A stable id for a node in an assistant turn's activity timeline. On the
+/// direct-provider path it is the provider's `tool_use` id; on the ACP path it is
+/// the agent's `tool_call_id`. Opaque; only used to correlate a node's start with
+/// its later status updates and to attach children to their parent.
+pub type ActivityId = String;
+
+/// What one [`ActivityNode`] represents. The agent's work is a tree of these:
+/// tool calls, delegated subagents, and proposed writes. New kinds extend the
+/// agent's legible surface without touching the delta plumbing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(tag = "kind", rename_all = "snake_case"))]
+pub enum ActivityKind {
+    /// A tool call: the tool `name` plus a one-line summary of its arguments (the
+    /// SQL's first line, the table name), shown so the trace reads without expanding.
+    Tool {
+        name: String,
+        #[cfg_attr(feature = "serde", serde(default))]
+        args_summary: Option<String>,
+    },
+    /// A delegated subagent working on `task`; its own tool calls are this node's
+    /// `children` (Phase 1). Kept flat until the ACP path nests them.
+    Subagent { task: String },
+    /// A proposed or executed write statement, surfaced verbatim for review.
+    Write { sql: String },
+    /// A standalone HTML report the `generate_report` tool wrote to `path`. Rendered
+    /// as a card with an "Open" button rather than auto-opened, so the report stays
+    /// in the transcript and the user chooses when to open it in their browser.
+    Report {
+        path: String,
+        #[cfg_attr(feature = "serde", serde(default))]
+        title: Option<String>,
+    },
+}
+
+/// The lifecycle of an [`ActivityNode`]. Drives the status glyph and whether a
+/// spinner shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum ActivityStatus {
+    /// Created but not yet running (e.g. a write awaiting approval).
+    Pending,
+    /// Executing now.
+    Running,
+    /// Finished successfully.
+    Ok,
+    /// Finished with an error (`detail` carries the message).
+    Failed,
+    /// The user denied it; it never ran.
+    Denied,
+}
+
+/// One node in an assistant turn's activity timeline — a tool call, a subagent, or
+/// a proposed write. Nodes nest via `children`: a subagent's inner tool calls are
+/// its children, which is what lets the panel draw a delegation as one collapsible
+/// card rather than a flat run of unrelated tool lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ActivityNode {
+    pub id: ActivityId,
+    pub kind: ActivityKind,
+    pub status: ActivityStatus,
+    /// A one-line result summary once known: a row count, a byte size, or the
+    /// error message on failure. `None` until the node completes.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub detail: Option<String>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub children: Vec<ActivityNode>,
+}
+
+impl ActivityNode {
+    /// A fresh `Running` node with no result and no children.
+    pub fn running(id: impl Into<ActivityId>, kind: ActivityKind) -> Self {
+        ActivityNode {
+            id: id.into(),
+            kind,
+            status: ActivityStatus::Running,
+            detail: None,
+            children: Vec::new(),
+        }
+    }
+}
+
+/// Where one plan step stands, mirrored from the agent's own checklist (ACP
+/// `PlanEntryStatus`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum PlanStepStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// One entry in the agent's plan checklist, shown at the top of the turn so the
+/// user sees the intended steps and watches them tick off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PlanStep {
+    pub title: String,
+    pub status: PlanStepStatus,
 }
 
 /// A saved connection target. Stored as structured fields rather than one opaque

@@ -2581,7 +2581,6 @@ dependencies = [
 [[package]]
 name = "flint"
 version = "0.1.0"
-source = "git+https://github.com/vojir-mikulas/flint?rev=8a5a7e98efc87d99dfb4b63f264460ade51459af#8a5a7e98efc87d99dfb4b63f264460ade51459af"
 dependencies = [
  "gpui",
  "unicode-segmentation",
@@ -6354,6 +6353,7 @@ name = "red-acp"
 version = "0.15.0"
 dependencies = [
  "agent-client-protocol",
+ "red-core",
  "serde",
  "serde_json",
  "shell-words",

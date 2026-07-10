@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use red_acp::{
-    AcpCommand, AcpConfig, AcpConfigCategory, AcpConfigOption, AcpConversation, AcpDelta,
+    AcpCommand, AcpConfig, AcpConfigCategory, AcpConfigOption, AcpConversation, AcpDelta, AcpError,
     AcpPermission, AcpStop, McpGrounding,
 };
 use red_core::AiPolicy;
@@ -361,8 +361,21 @@ pub(crate) async fn run_turn(
                 let delta = match delta {
                     AcpDelta::Text(t) => AiDelta::Text(t),
                     AcpDelta::Thinking(t) => AiDelta::Thinking(t),
-                    AcpDelta::ToolStarted { name } => AiDelta::ToolStarted { name },
-                    AcpDelta::ToolFinished { name, ok } => AiDelta::ToolFinished { name, ok },
+                    AcpDelta::ActivityStarted {
+                        id,
+                        parent,
+                        kind,
+                        status,
+                    } => AiDelta::ActivityStarted {
+                        id,
+                        parent,
+                        kind,
+                        status,
+                    },
+                    AcpDelta::ActivityUpdated { id, status, detail } => {
+                        AiDelta::ActivityUpdated { id, status, detail }
+                    }
+                    AcpDelta::PlanUpdated { steps } => AiDelta::PlanUpdated { steps },
                 };
                 emit(
                     &events,
@@ -388,6 +401,14 @@ pub(crate) async fn run_turn(
 
     match outcome {
         Ok(Ok(result)) => {
+            // The agent drives its own turn over ACP; log why it ended so a turn that
+            // stops after delegating (e.g. `EndTurn` right after spawning subagents,
+            // with no final synthesis) is diagnosable rather than a silent mystery.
+            tracing::debug!(
+                conversation_id,
+                stop = ?result.stop,
+                "acp: turn ended"
+            );
             // A refusal/cancel is still a "finished" turn from the panel's view.
             if result.stop == AcpStop::Refusal {
                 emit(
@@ -770,6 +791,11 @@ pub(crate) async fn set_config_option(
                 options: options.iter().map(map_config_option).collect(),
             },
         ),
+        // A benign mid-turn race (a fresh session's selectors arrive during the first
+        // turn): the change simply couldn't apply now. Ignore it quietly — the UI
+        // re-applies deferred defaults once the turn ends — rather than showing the
+        // user a spurious "a turn is already in progress" error.
+        Ok(Err(AcpError::Busy)) => {}
         Ok(Err(e)) => emit(
             &events,
             session,

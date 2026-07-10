@@ -3,9 +3,11 @@
 //! completion provider uses. SQL-dialect knowledge stays here, behind the
 //! highlighter seam, so Flint stays domain-free.
 
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use flint::TokenStyle;
+use red_core::DbKind;
 
 /// SQL keywords, lowercase. Drives both highlighting and (upper-cased) completion.
 pub const KEYWORDS: &[&str] = &[
@@ -119,7 +121,170 @@ pub const FUNCTIONS: &[(&str, &str, &str)] = &[
         "date_trunc(unit, ts)",
         "Truncate a timestamp to a unit.",
     ),
+    // --- strings ---
+    ("concat", "concat(a, b, …) → text", "Concatenate strings."),
+    (
+        "concat_ws",
+        "concat_ws(sep, a, b, …) → text",
+        "Concatenate strings with a separator, skipping nulls.",
+    ),
+    (
+        "substring",
+        "substring(text, from, len) → text",
+        "Extract a substring by position and length.",
+    ),
+    (
+        "trim",
+        "trim(text) → text",
+        "Strip leading and trailing spaces.",
+    ),
+    ("ltrim", "ltrim(text) → text", "Strip leading spaces."),
+    ("rtrim", "rtrim(text) → text", "Strip trailing spaces."),
+    (
+        "replace",
+        "replace(text, from, to) → text",
+        "Replace every occurrence of a substring.",
+    ),
+    ("left", "left(text, n) → text", "The first n characters."),
+    ("right", "right(text, n) → text", "The last n characters."),
+    (
+        "lpad",
+        "lpad(text, len, fill) → text",
+        "Left-pad a string to a length.",
+    ),
+    (
+        "rpad",
+        "rpad(text, len, fill) → text",
+        "Right-pad a string to a length.",
+    ),
+    ("reverse", "reverse(text) → text", "Reverse a string."),
+    (
+        "split_part",
+        "split_part(text, sep, n) → text",
+        "The nth field, splitting on a separator.",
+    ),
+    // --- numbers ---
+    ("abs", "abs(num) → num", "Absolute value."),
+    (
+        "ceil",
+        "ceil(num) → num",
+        "Round up to the nearest integer.",
+    ),
+    (
+        "floor",
+        "floor(num) → num",
+        "Round down to the nearest integer.",
+    ),
+    ("mod", "mod(a, b) → num", "Remainder of a divided by b."),
+    (
+        "power",
+        "power(base, exp) → num",
+        "base raised to the power exp.",
+    ),
+    ("sqrt", "sqrt(num) → num", "Square root."),
+    ("sign", "sign(num) → int", "Sign of a number: -1, 0, or 1."),
+    (
+        "trunc",
+        "trunc(num, digits) → num",
+        "Truncate toward zero to N decimals.",
+    ),
+    // --- dates ---
+    ("current_date", "current_date → date", "Today's date."),
+    (
+        "current_timestamp",
+        "current_timestamp → timestamptz",
+        "The current date and time.",
+    ),
+    (
+        "extract",
+        "extract(field FROM ts) → num",
+        "Pull a field (year, month, …) from a timestamp.",
+    ),
+    (
+        "date_part",
+        "date_part(field, ts) → num",
+        "Get a field from a timestamp.",
+    ),
+    // --- conditional / null ---
+    ("nullif", "nullif(a, b)", "NULL when a equals b, else a."),
+    ("ifnull", "ifnull(a, b)", "b when a is NULL (MySQL/SQLite)."),
+    (
+        "greatest",
+        "greatest(a, b, …)",
+        "The largest of the arguments.",
+    ),
+    ("least", "least(a, b, …)", "The smallest of the arguments."),
+    // --- aggregates ---
+    (
+        "string_agg",
+        "string_agg(expr, sep) → text",
+        "Concatenate values across a group.",
+    ),
+    (
+        "group_concat",
+        "group_concat(expr) → text",
+        "Concatenate values across a group (MySQL/SQLite).",
+    ),
+    (
+        "array_agg",
+        "array_agg(expr)",
+        "Collect values across a group into an array.",
+    ),
 ];
+
+// Engine bits for the function availability matrix below.
+const PG: u8 = 1; // Postgres
+const MY: u8 = 2; // MySQL
+const SL: u8 = 4; // SQLite
+const CH: u8 = 8; // ClickHouse
+const ALL: u8 = PG | MY | SL | CH;
+
+/// Which engines a [`FUNCTIONS`] entry is available on, by name. Absent → `ALL`.
+///
+/// Best-effort and deliberately *conservative*: when a function's presence (or its
+/// spelling) on an engine is doubtful, it's left out, so completion/hover under-offer
+/// rather than suggest something the connected engine rejects. Names that differ per
+/// engine (`trunc` vs MySQL `truncate`, `ifnull` vs Postgres `coalesce`,
+/// `string_agg` vs MySQL `group_concat`) are scoped to where that exact spelling works.
+fn function_engines(name: &str) -> u8 {
+    match name {
+        // Postgres-only spellings.
+        "split_part" | "date_part" | "string_agg" | "array_agg" => PG,
+        // Postgres + MySQL.
+        "lpad" | "rpad" | "extract" => PG | MY,
+        // Postgres + MySQL + ClickHouse (no SQLite equivalent by this name).
+        "now" | "left" | "right" | "reverse" | "greatest" | "least" | "substring" => PG | MY | CH,
+        // Postgres + MySQL + SQLite (ClickHouse spells these differently).
+        "ltrim" | "rtrim" | "replace" | "mod" => PG | MY | SL,
+        // Postgres + SQLite + ClickHouse (MySQL uses `truncate`).
+        "trunc" => PG | SL | CH,
+        // Postgres + ClickHouse.
+        "date_trunc" => PG | CH,
+        // MySQL + SQLite + ClickHouse (Postgres uses `coalesce`).
+        "ifnull" => MY | SL | CH,
+        // MySQL + SQLite.
+        "group_concat" => MY | SL,
+        // Everything else is broadly portable.
+        _ => ALL,
+    }
+}
+
+/// The functions available on `kind`, for completion + signature hover — [`FUNCTIONS`]
+/// filtered by the [`function_engines`] matrix so a MySQL connection is never offered
+/// `string_agg`, nor a Postgres one `group_concat`.
+pub fn functions_for(kind: DbKind) -> Vec<(&'static str, &'static str, &'static str)> {
+    let bit = match kind {
+        DbKind::Postgres => PG,
+        DbKind::Mysql => MY,
+        DbKind::Sqlite => SL,
+        DbKind::Clickhouse => CH,
+    };
+    FUNCTIONS
+        .iter()
+        .filter(|(name, _, _)| function_engines(name) & bit != 0)
+        .copied()
+        .collect()
+}
 
 /// A one-line guide for a (lower-cased) SQL keyword, shown in the completion doc
 /// panel. `None` for keywords without a note; they still complete, just bare.
@@ -238,6 +403,26 @@ pub fn tokenize(src: &str) -> Vec<(Range<usize>, TokenStyle)> {
                 i += 1; // closing quote
             }
             out.push((start..i, TokenStyle::String));
+            continue;
+        }
+
+        // Backtick-quoted identifier (MySQL). The inner name is always an identifier,
+        // even if it collides with a keyword or is followed by `(`; emit one span for
+        // the inner text (backticks excluded) so highlighting and the schema-aware
+        // checks treat `` `select` `` / `` `table` `` as the identifier they are.
+        if c == b'`' {
+            let start = i + 1;
+            i += 1;
+            while i < n && b[i] != b'`' {
+                i += 1;
+            }
+            let end = i;
+            if i < n {
+                i += 1; // closing backtick
+            }
+            if end > start {
+                out.push((start..end, TokenStyle::Identifier));
+            }
             continue;
         }
 
@@ -896,8 +1081,12 @@ fn is_keyword(word: &str) -> bool {
 pub enum CompletionContext {
     /// Right after `qualifier.`: suggest the columns of that table or alias.
     Dot { qualifier: String },
-    /// After FROM/JOIN/INTO/UPDATE: suggest table names.
+    /// After FROM/INTO/UPDATE: suggest table names.
     Table,
+    /// After JOIN: suggest table names, but lead with auto-`JOIN` completions
+    /// (`table alias ON …`) synthesised from the connection's foreign-key graph
+    /// for tables related to one already in the statement. See `editor::join_items`.
+    Join,
     /// Inside an expression (SELECT/WHERE/ON/…): suggest columns, then keywords.
     Column,
     /// Statement start or anywhere else: suggest keywords, then tables.
@@ -956,11 +1145,12 @@ fn statement_bounds(content: &str, cursor: usize) -> Range<usize> {
 }
 
 /// A coarse lexical atom used only by completion's clause parsing; finer than
-/// raw bytes, cruder than [`tokenize`]: identifiers/keywords collapse to `Word`,
+/// raw bytes, cruder than [`tokenize`]: identifiers/keywords collapse to `Word`
+/// (carrying their byte range, so diagnostics can point at the exact token),
 /// `.` and `,` are kept (they separate qualifiers and table lists), everything
 /// else is `Other`. Strings and comments are skipped entirely.
 enum Atom {
-    Word(String),
+    Word(String, Range<usize>),
     Dot,
     Comma,
     Other,
@@ -997,12 +1187,28 @@ fn atomize(s: &str) -> Vec<Atom> {
             out.push(Atom::Other);
             continue;
         }
+        // Backtick-quoted identifier (MySQL): keep the inner name as a `Word` (with
+        // its inner range) so `` `schema`.`table` `` parses as a qualified name — the
+        // backticks aren't tokens that could break the schema/table detection.
+        if c == b'`' {
+            let start = i + 1;
+            i += 1;
+            while i < n && b[i] != b'`' {
+                i += 1;
+            }
+            let end = i;
+            i = (i + 1).min(n);
+            if end > start {
+                out.push(Atom::Word(s[start..end].to_string(), start..end));
+            }
+            continue;
+        }
         if is_ident_start(c) {
             let start = i;
             while i < n && is_ident_continue(b[i]) {
                 i += 1;
             }
-            out.push(Atom::Word(s[start..i].to_string()));
+            out.push(Atom::Word(s[start..i].to_string(), start..i));
             continue;
         }
         match c {
@@ -1065,7 +1271,8 @@ pub fn analyze(content: &str, cursor: usize) -> CompletionContext {
         });
 
     match last_clause.as_deref() {
-        Some("from" | "join" | "into" | "update" | "table") => CompletionContext::Table,
+        Some("join") => CompletionContext::Join,
+        Some("from" | "into" | "update" | "table") => CompletionContext::Table,
         Some(_) => CompletionContext::Column,
         None => CompletionContext::Keyword,
     }
@@ -1081,12 +1288,23 @@ pub fn referenced_tables_at(content: &str, cursor: usize) -> Vec<(String, String
 }
 
 fn referenced_tables(stmt: &str) -> Vec<(String, String)> {
+    referenced_tables_ranged(stmt)
+        .into_iter()
+        .map(|(alias, _, table, _)| (alias, table))
+        .collect()
+}
+
+/// Like [`referenced_tables`], but each entry also carries the schema qualifier (the
+/// segment before the table in `schema.table`, `None` when unqualified) and the byte
+/// range of the table-name token. Backs the diagnostics pass, which underlines an
+/// unknown table at exactly that span and skips one qualified by an unknown schema.
+fn referenced_tables_ranged(stmt: &str) -> Vec<(String, Option<String>, String, Range<usize>)> {
     let atoms = atomize(stmt);
     let n = atoms.len();
     let mut out = Vec::new();
     let mut i = 0;
     while i < n {
-        let introduces = matches!(&atoms[i], Atom::Word(w)
+        let introduces = matches!(&atoms[i], Atom::Word(w, _)
             if matches!(w.to_ascii_lowercase().as_str(), "from" | "join" | "into" | "update" | "table"));
         if !introduces {
             i += 1;
@@ -1098,18 +1316,23 @@ fn referenced_tables(stmt: &str) -> Vec<(String, String)> {
             while i < n && matches!(atoms[i], Atom::Other) {
                 i += 1;
             }
-            let Some(Atom::Word(first)) = atoms.get(i) else {
+            let Some(Atom::Word(first, first_range)) = atoms.get(i) else {
                 break;
             };
             if is_keyword(first) {
                 break;
             }
-            // `schema.table`: the trailing word is the table name.
+            // `schema.table`: the trailing word is the table name (and its range);
+            // the segment before it is the schema qualifier.
             let mut table = first.clone();
+            let mut table_range = first_range.clone();
+            let mut schema: Option<String> = None;
             i += 1;
             while matches!(atoms.get(i), Some(Atom::Dot)) {
-                if let Some(Atom::Word(part)) = atoms.get(i + 1) {
+                if let Some(Atom::Word(part, part_range)) = atoms.get(i + 1) {
+                    schema = Some(table.clone());
                     table = part.clone();
+                    table_range = part_range.clone();
                     i += 2;
                 } else {
                     break;
@@ -1117,19 +1340,19 @@ fn referenced_tables(stmt: &str) -> Vec<(String, String)> {
             }
             // Optional alias: `AS x` or a bare following identifier.
             let mut alias = None;
-            if let Some(Atom::Word(w)) = atoms.get(i) {
+            if let Some(Atom::Word(w, _)) = atoms.get(i) {
                 if w.eq_ignore_ascii_case("as") {
                     i += 1;
                 }
             }
-            if let Some(Atom::Word(w)) = atoms.get(i) {
+            if let Some(Atom::Word(w, _)) = atoms.get(i) {
                 if !is_keyword(w) {
                     alias = Some(w.clone());
                     i += 1;
                 }
             }
             let key = alias.unwrap_or_else(|| table.clone()).to_lowercase();
-            out.push((key, table));
+            out.push((key, schema, table, table_range));
             if matches!(atoms.get(i), Some(Atom::Comma)) {
                 i += 1;
                 continue;
@@ -1138,6 +1361,267 @@ fn referenced_tables(stmt: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+// --- schema-aware diagnostics ---
+
+/// A read-only view of the connection's catalog, supplied by the UI so the
+/// diagnostics pass stays domain-agnostic (it never touches `red-core` or the
+/// completion index directly). Names are compared lower-cased.
+pub trait SchemaView {
+    /// Whether a table/view named `table_lower` exists in the catalog skeleton
+    /// (always loaded, so a miss is a genuine "unknown table", not a lazy gap).
+    fn has_table(&self, table_lower: &str) -> bool;
+    /// The lower-cased column names of `table_lower` once its detail is loaded, or
+    /// `None` when it isn't — in which case column checks for that table are skipped
+    /// (a not-yet-expanded table must never read as "unknown column").
+    fn columns(&self, table_lower: &str) -> Option<&HashSet<String>>;
+    /// Whether `schema_lower` is a known namespace (database/schema). A table
+    /// qualified by an *unknown* schema (a cross-database reference we haven't
+    /// loaded) is left unvalidated rather than flagged as unknown.
+    fn has_schema(&self, schema_lower: &str) -> bool;
+}
+
+/// One editor diagnostic: the byte range to underline and the message to show on
+/// hover. Byte offsets are absolute into the whole editor buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub range: Range<usize>,
+    pub message: String,
+}
+
+/// Validate every statement in `content` against `schema`, returning a diagnostic
+/// per unknown table or column. Conservative by design — it only flags what it can
+/// resolve unambiguously, so a false "unknown" never fires:
+///
+/// * an unknown table in a FROM/JOIN/INTO/UPDATE position (CTE names excluded);
+/// * an unknown *qualified* column `alias.col` when the alias resolves to a table
+///   whose columns are loaded;
+/// * an unknown *unqualified* column, but only when the statement references exactly
+///   one table (so there's no ambiguity about which table owns it) and that table's
+///   columns are loaded.
+pub fn diagnostics(content: &str, schema: &dyn SchemaView) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for srange in statement_ranges(content) {
+        diagnose_statement(&content[srange.clone()], srange.start, schema, &mut out);
+    }
+    out
+}
+
+/// The 0-based line of each non-empty statement's first line — the editor's gutter
+/// run markers. A whitespace/comment-only statement gets none; leading blank lines
+/// are skipped so the marker sits on the line that actually holds SQL.
+pub fn statement_start_lines(content: &str) -> Vec<usize> {
+    statement_ranges(content)
+        .into_iter()
+        .filter(|r| !is_blank(&content[r.clone()]))
+        .map(|r| {
+            let stmt = &content[r.clone()];
+            let lead = stmt.len() - stmt.trim_start().len();
+            let start = r.start + lead;
+            content[..start].bytes().filter(|&b| b == b'\n').count()
+        })
+        .collect()
+}
+
+/// The byte offset at the start of 0-based `line` in `content` (clamped to the
+/// end). Backs "run the statement whose gutter marker was clicked".
+pub fn line_start_offset(content: &str, line: usize) -> usize {
+    if line == 0 {
+        return 0;
+    }
+    let mut seen = 0;
+    for (i, b) in content.bytes().enumerate() {
+        if b == b'\n' {
+            seen += 1;
+            if seen == line {
+                return i + 1;
+            }
+        }
+    }
+    content.len()
+}
+
+/// The byte ranges of the `;`-delimited statements in `content`, using the same
+/// string/comment-aware boundary rules as [`statement_bounds`].
+fn statement_ranges(content: &str) -> Vec<Range<usize>> {
+    let b = content.as_bytes();
+    let n = b.len();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < n {
+        let c = b[i];
+        if c == b'-' && i + 1 < n && b[i + 1] == b'-' {
+            i += 2;
+            while i < n && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(n);
+            continue;
+        }
+        if c == b'\'' || c == b'"' {
+            let quote = c;
+            i += 1;
+            while i < n && b[i] != quote {
+                i += 1;
+            }
+            i = (i + 1).min(n);
+            continue;
+        }
+        if c == b';' {
+            out.push(start..i);
+            start = i + 1;
+        }
+        i += 1;
+    }
+    out.push(start..n);
+    out
+}
+
+/// The lower-cased names of the CTEs a statement defines (`WITH name AS ( … )`,
+/// including the comma-separated tail). Collected so a reference to a CTE isn't
+/// flagged as an unknown table. Over-collecting only suppresses diagnostics, so the
+/// loose `Word AS (` match is safe.
+fn cte_names(stmt: &str) -> HashSet<String> {
+    let atoms = atomize(stmt);
+    let mut names = HashSet::new();
+    for w in atoms.windows(2) {
+        if let (Atom::Word(name, _), Atom::Word(kw, _)) = (&w[0], &w[1]) {
+            // `name AS` where `name` isn't itself a keyword: a CTE (or table alias)
+            // binding. Cheap and safe to treat both the same here.
+            if kw.eq_ignore_ascii_case("as") && !is_keyword(name) {
+                names.insert(name.to_lowercase());
+            }
+        }
+    }
+    names
+}
+
+/// Whether the gap `stmt[from..to]` between two identifier tokens is a member-access
+/// `.` — how the token-level column check spots `qualifier.column` without the
+/// tokenizer emitting a dot token. Tolerates the backticks around a quoted qualifier
+/// (`` `a`.`b` ``), whose tokens exclude the quotes, so the gap is `` `.` ``.
+fn gap_is_dot(stmt: &str, from: usize, to: usize) -> bool {
+    from <= to
+        && stmt
+            .get(from..to)
+            .map(|g| g.trim_matches(|c: char| c.is_whitespace() || c == '`'))
+            == Some(".")
+}
+
+fn diagnose_statement(stmt: &str, base: usize, schema: &dyn SchemaView, out: &mut Vec<Diagnostic>) {
+    let ctes = cte_names(stmt);
+    let refs = referenced_tables_ranged(stmt);
+
+    // 1. Unknown tables in FROM/JOIN/INTO/UPDATE positions.
+    for (_, qualifier, table, range) in &refs {
+        let low = table.to_lowercase();
+        if ctes.contains(&low) || schema.has_table(&low) {
+            continue;
+        }
+        // Qualified by a schema we don't know (a cross-database reference we haven't
+        // loaded) → can't validate the table, so leave it alone rather than flag it.
+        if let Some(q) = qualifier {
+            if !schema.has_schema(&q.to_lowercase()) {
+                continue;
+            }
+        }
+        out.push(Diagnostic {
+            range: base + range.start..base + range.end,
+            message: format!("Unknown table \u{201c}{table}\u{201d}"),
+        });
+    }
+
+    // Alias/name → table (lower-cased), for resolving qualified columns.
+    let alias_map: HashMap<String, String> = refs
+        .iter()
+        .map(|(alias, _, table, _)| (alias.clone(), table.to_lowercase()))
+        .collect();
+    // The single referenced table, and only if its columns are loaded: the gate for
+    // checking *unqualified* columns without ambiguity.
+    let single_table = match refs.as_slice() {
+        [(_, _, table, _)] => {
+            let low = table.to_lowercase();
+            schema.columns(&low).is_some().then_some(low)
+        }
+        _ => None,
+    };
+
+    // 2/3. Column checks, walking the statement's identifier tokens (which carry
+    // ranges) and reading the tiny gaps around them to spot `qualifier.column`.
+    let toks = tokenize(stmt);
+    for (idx, (range, style)) in toks.iter().enumerate() {
+        if *style != TokenStyle::Identifier {
+            continue;
+        }
+        let word = &stmt[range.clone()];
+        let prev = idx.checked_sub(1).and_then(|j| toks.get(j));
+        let next = toks.get(idx + 1);
+        let qualified = prev.is_some_and(|(pr, ps)| {
+            *ps == TokenStyle::Identifier && gap_is_dot(stmt, pr.end, range.start)
+        });
+        let is_qualifier = next.is_some_and(|(nr, ns)| {
+            *ns == TokenStyle::Identifier && gap_is_dot(stmt, range.end, nr.start)
+        });
+        if is_qualifier {
+            continue; // the left side of `x.y` — a table/alias, not a column
+        }
+
+        if qualified {
+            // `qualifier.word`: resolve the qualifier to a table, check the column.
+            let (pr, _) = prev.expect("qualified implies a previous token");
+            let q = stmt[pr.clone()].to_lowercase();
+            let table = alias_map
+                .get(&q)
+                .cloned()
+                .or_else(|| schema.has_table(&q).then(|| q.clone()));
+            if let Some(table) = table {
+                if let Some(cols) = schema.columns(&table) {
+                    if !cols.contains(&word.to_lowercase()) {
+                        out.push(Diagnostic {
+                            range: base + range.start..base + range.end,
+                            message: format!(
+                                "No column \u{201c}{word}\u{201d} on \u{201c}{table}\u{201d}"
+                            ),
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Unqualified column, only in the unambiguous single-table case.
+        if let Some(table) = &single_table {
+            let low = word.to_lowercase();
+            // Skip the table's own name/alias, reserved words, and an `AS`-defined
+            // output alias (`SELECT expr AS foo`).
+            if is_keyword(word) || alias_map.contains_key(&low) || schema.has_table(&low) {
+                continue;
+            }
+            if prev.is_some_and(|(pr, ps)| {
+                *ps == TokenStyle::Keyword && stmt[pr.clone()].eq_ignore_ascii_case("as")
+            }) {
+                continue;
+            }
+            let cols = schema
+                .columns(table)
+                .expect("single_table implies loaded columns");
+            if !cols.contains(&low) {
+                out.push(Diagnostic {
+                    range: base + range.start..base + range.end,
+                    message: format!("Unknown column \u{201c}{word}\u{201d}"),
+                });
+            }
+        }
+    }
 }
 
 /// Beautify a SQL string for the editor's Format action: re-indent (2 spaces),
@@ -1467,6 +1951,15 @@ mod tests {
                 qualifier: "b".into()
             }
         );
+        // A bare post-JOIN position is its own context (auto-JOIN completions),
+        // distinct from a plain FROM table position.
+        assert_eq!(ctx("SELECT * FROM a JOIN |"), CompletionContext::Join);
+        assert_eq!(ctx("SELECT * FROM a JOIN cu|"), CompletionContext::Join);
+        // Past the ON keyword it's an expression again, not a table position.
+        assert_eq!(
+            ctx("SELECT * FROM a JOIN b ON |"),
+            CompletionContext::Column
+        );
     }
 
     #[test]
@@ -1524,5 +2017,219 @@ mod tests {
             referenced_tables_at(&content, cursor),
             vec![("users".into(), "users".into())]
         );
+    }
+
+    // --- schema-aware diagnostics (Phase B) ---
+
+    /// A test catalog: `users(id, name, email)` + `orders(id, customer_id)`, both
+    /// with columns loaded. Any other table is unknown; a table added via
+    /// `with_unloaded` exists but has no columns (detail not loaded yet).
+    struct TestSchema {
+        tables: HashSet<String>,
+        schemas: HashSet<String>,
+        columns: HashMap<String, HashSet<String>>,
+    }
+
+    impl TestSchema {
+        fn new() -> Self {
+            let cols = |names: &[&str]| names.iter().map(|s| s.to_string()).collect();
+            let mut columns = HashMap::new();
+            columns.insert("users".to_string(), cols(&["id", "name", "email"]));
+            columns.insert("orders".to_string(), cols(&["id", "customer_id"]));
+            Self {
+                tables: ["users", "orders"].iter().map(|s| s.to_string()).collect(),
+                schemas: ["main"].iter().map(|s| s.to_string()).collect(),
+                columns,
+            }
+        }
+        /// Add a table whose detail isn't loaded (exists, but no column info).
+        fn with_unloaded(mut self, table: &str) -> Self {
+            self.tables.insert(table.to_string());
+            self
+        }
+    }
+
+    impl SchemaView for TestSchema {
+        fn has_table(&self, table_lower: &str) -> bool {
+            self.tables.contains(table_lower)
+        }
+        fn columns(&self, table_lower: &str) -> Option<&HashSet<String>> {
+            self.columns.get(table_lower)
+        }
+        fn has_schema(&self, schema_lower: &str) -> bool {
+            self.schemas.contains(schema_lower)
+        }
+    }
+
+    /// The `(underlined text, message)` pairs a diagnostics pass produces.
+    fn diag_pairs(content: &str, schema: &dyn SchemaView) -> Vec<(String, String)> {
+        diagnostics(content, schema)
+            .into_iter()
+            .map(|d| (content[d.range].to_string(), d.message))
+            .collect()
+    }
+
+    #[test]
+    fn flags_unknown_table_only() {
+        let s = TestSchema::new();
+        assert!(diag_pairs("SELECT * FROM users", &s).is_empty());
+        let d = diag_pairs("SELECT * FROM userz", &s);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].0, "userz");
+        assert!(d[0].1.contains("Unknown table"), "{}", d[0].1);
+    }
+
+    #[test]
+    fn flags_unknown_table_in_join_using_its_own_range() {
+        let s = TestSchema::new();
+        // Only the bad table underlines; the good one and the aliases are clean.
+        let d = diag_pairs(
+            "SELECT * FROM users u JOIN ordrs o ON u.id = o.customer_id",
+            &s,
+        );
+        assert_eq!(
+            d.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+            ["ordrs"]
+        );
+    }
+
+    #[test]
+    fn flags_unknown_qualified_column() {
+        let s = TestSchema::new();
+        assert!(diag_pairs("SELECT u.email FROM users u", &s).is_empty());
+        let d = diag_pairs("SELECT u.emial FROM users u", &s);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].0, "emial");
+        assert!(d[0].1.contains("No column"), "{}", d[0].1);
+    }
+
+    #[test]
+    fn flags_unknown_unqualified_column_single_table_only() {
+        let s = TestSchema::new();
+        // Single table: an unknown bare column is flagged, a real one is not.
+        let d = diag_pairs("SELECT emial FROM users", &s);
+        assert_eq!(
+            d.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+            ["emial"]
+        );
+        assert!(diag_pairs("SELECT email FROM users", &s).is_empty());
+        // Two tables: bare columns are ambiguous, so none are flagged (no false
+        // positives) — only the qualified path and table existence still apply.
+        assert!(diag_pairs("SELECT emial FROM users, orders", &s).is_empty());
+    }
+
+    #[test]
+    fn unqualified_check_excludes_aliases_keywords_and_functions() {
+        let s = TestSchema::new();
+        // The table alias, an AS-defined output alias, a keyword, and a function
+        // call must never read as unknown columns.
+        assert!(diag_pairs("SELECT u.id FROM users u", &s).is_empty());
+        assert!(diag_pairs("SELECT email AS addr FROM users", &s).is_empty());
+        assert!(diag_pairs("SELECT count(email) FROM users", &s).is_empty());
+    }
+
+    #[test]
+    fn skips_column_checks_when_detail_not_loaded() {
+        // `events` exists but its columns aren't loaded: no column may be flagged,
+        // and the table itself is not "unknown".
+        let s = TestSchema::new().with_unloaded("events");
+        assert!(diag_pairs("SELECT anything FROM events", &s).is_empty());
+        assert!(diag_pairs("SELECT e.whatever FROM events e", &s).is_empty());
+    }
+
+    #[test]
+    fn cte_name_is_not_an_unknown_table() {
+        let s = TestSchema::new();
+        // The CTE `recent` is defined in-statement, so a reference to it is fine.
+        let sql = "WITH recent AS (SELECT * FROM orders) SELECT * FROM recent";
+        assert!(diag_pairs(sql, &s).is_empty());
+    }
+
+    #[test]
+    fn backtick_quoted_identifiers_resolve() {
+        let s = TestSchema::new();
+        // MySQL `` `schema`.`table` `` must resolve — the database name was being
+        // mis-read as the table (an "unknown table" under the backticked db).
+        assert!(diag_pairs("SELECT * FROM `orders`", &s).is_empty());
+        assert!(diag_pairs("SELECT * FROM `main`.`orders`", &s).is_empty());
+        // A qualified column through backticks resolves too (no false unknown column).
+        assert!(diag_pairs("SELECT `o`.`customer_id` FROM `orders` `o`", &s).is_empty());
+        // A genuinely unknown backticked table still flags — on its inner name only.
+        let d = diag_pairs("SELECT * FROM `main`.`ghost`", &s);
+        assert_eq!(
+            d.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+            ["ghost"]
+        );
+    }
+
+    #[test]
+    fn table_in_unknown_schema_is_not_flagged() {
+        let s = TestSchema::new();
+        // `main` is a known namespace, so an unknown table there is flagged…
+        assert_eq!(
+            diag_pairs("SELECT * FROM main.ghost", &s)
+                .iter()
+                .map(|(t, _)| t.as_str())
+                .collect::<Vec<_>>(),
+            ["ghost"]
+        );
+        // …but a table in a database we haven't loaded is left alone (can't validate).
+        assert!(diag_pairs("SELECT * FROM other_db.ghost", &s).is_empty());
+        assert!(diag_pairs("SELECT * FROM `other_db`.`ghost`", &s).is_empty());
+    }
+
+    #[test]
+    fn diagnostics_are_scoped_per_statement() {
+        let s = TestSchema::new();
+        // The unknown table in the second statement gets its absolute range.
+        let d = diag_pairs("SELECT * FROM users;\nSELECT * FROM ghost", &s);
+        assert_eq!(
+            d.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+            ["ghost"]
+        );
+    }
+
+    // --- gutter run markers (Phase D) ---
+
+    #[test]
+    fn statement_start_lines_marks_each_statements_first_code_line() {
+        // Two statements: markers land on line 0 and the SELECT after the `;`.
+        assert_eq!(statement_start_lines("SELECT 1;\nSELECT 2"), vec![0, 1]);
+        // A leading blank line is skipped so the marker sits on the SQL line.
+        assert_eq!(statement_start_lines("\n\nSELECT 1"), vec![2]);
+        // A blank/comment-only trailing statement contributes no marker.
+        assert_eq!(statement_start_lines("SELECT 1;\n-- tail"), vec![0]);
+        assert_eq!(statement_start_lines("   \n"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn functions_are_engine_scoped() {
+        let pg = functions_for(DbKind::Postgres);
+        let my = functions_for(DbKind::Mysql);
+        let sl = functions_for(DbKind::Sqlite);
+        let has = |list: &[(&str, &str, &str)], name: &str| list.iter().any(|(n, _, _)| *n == name);
+
+        // Postgres-only aggregate vs MySQL/SQLite-only aggregate — never crossed.
+        assert!(has(&pg, "string_agg") && !has(&pg, "group_concat"));
+        assert!(has(&my, "group_concat") && !has(&my, "string_agg"));
+        assert!(has(&sl, "group_concat") && !has(&sl, "string_agg"));
+        // `ifnull` is MySQL/SQLite/ClickHouse; Postgres uses `coalesce`.
+        assert!(!has(&pg, "ifnull") && has(&my, "ifnull"));
+        // Portable functions are on every engine.
+        for list in [&pg, &my, &sl] {
+            assert!(has(list, "concat") && has(list, "coalesce") && has(list, "count"));
+        }
+        // SQLite has no `left`/`lpad`/`reverse` by those names.
+        assert!(!has(&sl, "left") && !has(&sl, "lpad") && !has(&sl, "reverse"));
+    }
+
+    #[test]
+    fn line_start_offset_locates_line_starts() {
+        let content = "abc\ndef\nghi";
+        assert_eq!(line_start_offset(content, 0), 0);
+        assert_eq!(line_start_offset(content, 1), 4);
+        assert_eq!(line_start_offset(content, 2), 8);
+        // Past the end clamps to the buffer length.
+        assert_eq!(line_start_offset(content, 9), content.len());
     }
 }

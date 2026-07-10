@@ -4,6 +4,7 @@
 //! caret, the status dot, the usage footer, character slicing) live alongside. The
 //! behavior these buttons fire lives in `state`; the pure helpers in `text`.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use flint::prelude::*;
@@ -30,13 +31,16 @@ impl AppState {
     ) -> AnyElement {
         let streaming = chat.streaming;
         let open = state.open_config.clone();
+        let theme = cx.theme().clone();
         // Before this chat opens its own session it has no advertised selectors yet;
-        // fall back to the last subscription session's set so the dropdowns still
-        // show. A pre-session pick persists via settings and applies on session open.
+        // fall back to this agent's cached set (seeded from disk on open, or from an
+        // earlier session this run) so the dropdowns still show. A pre-session pick
+        // persists via settings and applies on session open.
+        let cached = state.provider_config_options.get(&chat.provider);
         let options = if chat.config_options.is_empty() && self.agent_is_acp(&chat.provider) {
-            &state.last_config_options
+            cached.map(Vec::as_slice).unwrap_or(&[])
         } else {
-            &chat.config_options
+            chat.config_options.as_slice()
         };
         let mut row = div().flex().items_center().gap_1p5().min_w(px(0.));
         let mut any = false;
@@ -66,6 +70,9 @@ impl AppState {
                 // Neutral, not accent-colored: these toolbar dropdowns shouldn't
                 // compete with the Send button for emphasis.
                 .accent(false)
+                // Lucide disclosure + check glyphs, matching the app's other dropdowns.
+                .chevron(crate::icons::icon("chevron-down", theme.scale(14.), theme.text_dim))
+                .check(crate::icons::icon("check", theme.scale(13.), theme.text))
                 .placeholder("Default");
             for choice in &opt.choices {
                 select = select.option(SharedString::from(choice.name.clone()));
@@ -367,12 +374,20 @@ impl AppState {
                 .on_click(cx.listener(|this, _, _, cx| this.new_chat(cx)))
         });
 
+        // Copy the whole conversation as Markdown (pastes styled into Notion etc.);
+        // only meaningful once the chat has content.
+        let copy_chat = (self.ai_configured && !state.active().messages.is_empty()).then(|| {
+            icon_btn("assistant-copy-chat", "copy", "Copy chat as Markdown")
+                .on_click(cx.listener(|this, _, _, cx| this.copy_conversation(cx)))
+        });
+
         // Deletion lives only in the history sidebar (each row's trash); the chat
         // view never deletes the conversation it's showing.
         let header_actions = div()
             .flex()
             .items_center()
             .gap_1()
+            .when_some(copy_chat, |row, c| row.child(c))
             .when_some(list_btn, |row, l| row.child(l))
             .when_some(new_chat, |row, n| row.child(n));
 
@@ -1066,6 +1081,12 @@ impl AppState {
         }
         let mut bubble = div().flex().flex_col().gap_1().child(label_row);
 
+        // The agent's plan checklist (assistant only), at the top of the turn so the
+        // intended steps are visible and tick off as it works.
+        if msg.role == ChatRole::Assistant && !msg.plan.is_empty() {
+            bubble = bubble.child(render_plan(&msg.plan, theme));
+        }
+
         // Summarized thinking (assistant only), dim and above the answer.
         if !msg.thinking.trim().is_empty() {
             let mut think = div()
@@ -1079,15 +1100,45 @@ impl AppState {
             bubble = bubble.child(think);
         }
 
+        // The turn's activity timeline (assistant only): tool calls, subagents, and
+        // proposed writes, in call order, each with a live status glyph.
+        if msg.role == ChatRole::Assistant && !msg.activity.is_empty() {
+            let empty = HashMap::new();
+            let collapse = self
+                .assistant
+                .as_ref()
+                .map(|s| &s.subagent_collapse)
+                .unwrap_or(&empty);
+            bubble = bubble.child(render_activity(&msg.activity, collapse, theme, 0, cx));
+        }
+
         // Answer text. Assistant turns are Markdown, so render them (on the revealed
         // prefix while typing); user turns are plain.
         if msg.role == ChatRole::Assistant {
             if !shown.is_empty() {
-                // A settled bubble renders from its cached parse (frame-stable); the
-                // live one still parses its revealed prefix fresh each tick, but
-                // that's a single message, not the whole transcript.
+                // A settled bubble renders from its cached parse (frame-stable) and,
+                // when its selectable leaves are built, routes each text leaf through
+                // a pooled `SelectableLabel` so prose can be highlighted and copied.
+                // The live one still parses its revealed prefix fresh each tick as
+                // plain text (not yet final), but that's a single message.
                 let md = if live {
                     crate::markdown::render(shown, theme)
+                } else if let Some(leaves) = msg.selectables_for(theme.text) {
+                    let blocks = msg.markdown();
+                    let mut it = leaves.iter();
+                    crate::markdown::render_blocks_with(&blocks, theme, &mut |text, runs| {
+                        if text.is_empty() {
+                            return div().into_any_element();
+                        }
+                        // Consume the prebuilt leaves in document order (the build pass
+                        // walked the same blocks). A drift falls back to plain text.
+                        match it.next() {
+                            Some(e) => e.clone().into_any_element(),
+                            None => gpui::StyledText::new(SharedString::from(text))
+                                .with_runs(runs)
+                                .into_any_element(),
+                        }
+                    })
                 } else {
                     crate::markdown::render_blocks(&msg.markdown(), theme)
                 };
@@ -1099,12 +1150,14 @@ impl AppState {
                 bubble = bubble.child(stream_caret(theme, cx.reduce_motion()));
             }
         } else {
-            bubble = bubble.child(
-                div()
-                    .text_size(theme.scale(12.5))
-                    .text_color(theme.text)
-                    .child(msg.text.clone()),
-            );
+            // A user turn is plain text; render its pooled selectable label when built
+            // (color inherited from this div), else the plain string.
+            let body = div().text_size(theme.scale(12.5)).text_color(theme.text);
+            let body = match msg.selectables_for(theme.text).and_then(|l| l.first()) {
+                Some(e) => body.child(e.clone()),
+                None => body.child(msg.text.clone()),
+            };
+            bubble = bubble.child(body);
         }
 
         // SQL affordances for the first fenced SQL block in a *settled* assistant
@@ -1179,6 +1232,420 @@ fn take_chars(s: &str, n: usize) -> &str {
         Some((i, _)) => &s[..i],
         None => s,
     }
+}
+
+/// The agent's plan checklist for a turn: a bordered box of steps, each with a
+/// status glyph, completed steps dimmed. Shown at the top of the assistant bubble.
+fn render_plan(steps: &[red_core::PlanStep], theme: &flint::Theme) -> AnyElement {
+    use red_core::PlanStepStatus::*;
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .p(px(8.))
+        .rounded(theme.radius_sm)
+        .border_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .text_size(theme.scale(10.))
+                .text_color(theme.text_muted)
+                .child("Plan"),
+        );
+    for step in steps {
+        // Lucide status glyphs: a dashed ring for not-started, a spinner arc while
+        // running, a checked ring when done.
+        let (icon_name, color) = match step.status {
+            Pending => ("circle-dashed", theme.text_muted),
+            InProgress => ("loader-circle", theme.accent),
+            Completed => ("circle-check", theme.green),
+        };
+        let title_color = if step.status == Completed {
+            theme.text_muted
+        } else {
+            theme.text
+        };
+        col = col.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(theme.scale(11.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .child(crate::icons::icon(icon_name, theme.scale(12.), color)),
+                )
+                .child(div().text_color(title_color).child(step.title.clone())),
+        );
+    }
+    col.into_any_element()
+}
+
+/// The status glyph + color for an activity node, shared by the row and the
+/// subagent card so a delegate and its children read on the same scale.
+fn activity_glyph(
+    status: red_core::ActivityStatus,
+    theme: &flint::Theme,
+) -> (&'static str, gpui::Hsla) {
+    use red_core::ActivityStatus::*;
+    match status {
+        Pending => ("○", theme.text_muted),
+        Running => ("▸", theme.accent),
+        Ok => ("✓", theme.green),
+        Failed => ("✕", theme.red),
+        Denied => ("⊘", theme.yellow),
+    }
+}
+
+/// The turn's activity timeline: one row per node (tool call / write), with a
+/// subagent drawn as a bordered, collapsible card wrapping its own delegated
+/// children, so a delegation is unmistakably visible in the chat rather than a flat
+/// run of rows. `collapse` carries the user's per-subagent expand/collapse overrides.
+fn render_activity(
+    nodes: &[red_core::ActivityNode],
+    collapse: &HashMap<SharedString, bool>,
+    theme: &flint::Theme,
+    depth: usize,
+    cx: &mut Context<AppState>,
+) -> AnyElement {
+    let mut col = div().flex().flex_col().gap(px(2.));
+    for node in nodes {
+        if let red_core::ActivityKind::Subagent { task } = &node.kind {
+            // Every subagent is a bordered, collapsible card: it carries either its
+            // delegated children (direct-provider path) or its live streamed progress
+            // (the ACP path), so it reads as a distinct unit of work, never an empty
+            // box. Parallel subagents are siblings here (see the ACP relay).
+            col = col.child(render_subagent_card(node, task, collapse, theme, depth, cx));
+            continue;
+        }
+        if let red_core::ActivityKind::Report { path, title } = &node.kind {
+            // A generated report is a bordered card with an "Open" button, so it stays
+            // in the transcript and the user opens it on demand rather than it flashing
+            // open in the browser.
+            col = col.child(render_report_card(&node.id, path, title.as_deref(), theme, depth, cx));
+            continue;
+        }
+        col = col.child(render_activity_row(node, theme, depth));
+        if !node.children.is_empty() {
+            col = col.child(render_activity(
+                &node.children,
+                collapse,
+                theme,
+                depth + 1,
+                cx,
+            ));
+        }
+    }
+    col.into_any_element()
+}
+
+/// A subagent's task text for display, or `None` when it's just the generic tool
+/// name ("Task") — so the label reads "Subagent" rather than "Subagent Task".
+fn subagent_task_label(task: &str) -> Option<&str> {
+    let t = task.trim();
+    (!t.is_empty() && !t.eq_ignore_ascii_case("task")).then_some(t)
+}
+
+/// A small pulsing accent dot that reads as "still working", for a running
+/// subagent's status slot. Rests solid under a reduced-motion preference.
+fn running_dot(node_id: &str, theme: &flint::Theme, reduce_motion: bool) -> AnyElement {
+    let dot = div().size(px(7.)).rounded_full().bg(theme.accent);
+    if reduce_motion {
+        return dot.into_any_element();
+    }
+    dot.with_animation(
+        SharedString::from(format!("subagent-pulse-{node_id}")),
+        Animation::new(Duration::from_millis(1100)).repeat(),
+        |dot, delta| {
+            let o = 0.25 + 0.75 * (0.5 + 0.5 * (delta * std::f32::consts::TAU).cos());
+            dot.opacity(o)
+        },
+    )
+    .into_any_element()
+}
+
+/// A delegated subagent: a bordered, elevated, collapsible card. The header carries
+/// the sparkle mark, its task, and a status slot — a **pulsing dot while it works**,
+/// then ✓/✗ when it finishes. The body (shown while expanded) carries either its
+/// delegated children (direct-provider path) or its **live streamed progress** (the
+/// ACP path, which is all that protocol exposes), with a "Working…" hint until the
+/// first line arrives. Expanded while running so ongoing work stays visible; auto-
+/// collapses once done to keep the transcript tidy. This is the "clearly still
+/// working, with its current progress" surface.
+fn render_subagent_card(
+    node: &red_core::ActivityNode,
+    task: &str,
+    collapse: &HashMap<SharedString, bool>,
+    theme: &flint::Theme,
+    depth: usize,
+    cx: &mut Context<AppState>,
+) -> AnyElement {
+    use red_core::ActivityStatus::{Denied, Failed, Ok as StatusOk, Pending, Running};
+    let id = SharedString::from(node.id.clone());
+    let done = matches!(node.status, StatusOk | Failed | Denied);
+    let running = matches!(node.status, Running | Pending);
+    // Default: expanded while working (so its progress shows), collapsed once done;
+    // a stored override wins.
+    let collapsed = collapse.get(&id).copied().unwrap_or(done);
+    let chevron = if collapsed { "chevron" } else { "chevron-down" };
+
+    // Status slot: a pulsing dot while working, else the terminal glyph.
+    let status_slot = if running {
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(13.))
+            .child(running_dot(&node.id, theme, cx.reduce_motion()))
+            .into_any_element()
+    } else {
+        let (glyph, glyph_color) = activity_glyph(node.status, theme);
+        div()
+            .flex_none()
+            .text_color(glyph_color)
+            .child(glyph)
+            .into_any_element()
+    };
+
+    let mut header = div()
+        .id(SharedString::from(format!("subagent-{}", node.id)))
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .cursor_pointer()
+        .text_size(theme.scale(11.))
+        .child(crate::icons::icon(
+            chevron,
+            theme.scale(11.),
+            theme.text_muted,
+        ))
+        .child(crate::icons::icon(
+            "sparkles",
+            theme.scale(11.),
+            theme.accent,
+        ))
+        .child(div().flex_none().text_color(theme.accent).child("Subagent"));
+    if let Some(label) = subagent_task_label(task) {
+        header = header.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(theme.text_muted)
+                .child(label.to_string()),
+        );
+    } else {
+        // No real task label: still push the status slot to the right.
+        header = header.child(div().flex_1());
+    }
+    // A "working" word beside the pulse makes the running state unmistakable.
+    if running {
+        header = header.child(
+            div()
+                .flex_none()
+                .text_color(theme.text_muted)
+                .child("working"),
+        );
+    } else if collapsed && !node.children.is_empty() {
+        let n = node.children.len();
+        header = header.child(
+            div()
+                .flex_none()
+                .text_color(theme.text_muted)
+                .child(format!("{n} step{}", if n == 1 { "" } else { "s" })),
+        );
+    }
+    header = header.child(status_slot);
+    let toggle = id.clone();
+    header = header.on_click(cx.listener(move |this, _, _, cx| {
+        this.set_subagent_collapsed(toggle.clone(), !collapsed, cx)
+    }));
+
+    let mut card = div()
+        .ml(px(depth as f32 * 14.))
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .p(px(8.))
+        .rounded(theme.radius_sm)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.bg_elevated)
+        .child(header);
+
+    if !collapsed {
+        // The delegate's own tool calls (direct path), nested inside the card.
+        if !node.children.is_empty() {
+            card = card.child(render_activity(&node.children, collapse, theme, 0, cx));
+        }
+        // Its current progress / result line (the ACP path's ongoing-work signal),
+        // or a "Working…" hint while running before the first line arrives.
+        if let Some(detail) = &node.detail {
+            card = card.child(
+                div()
+                    .text_size(theme.scale(11.))
+                    .text_color(if node.status == Failed {
+                        theme.red
+                    } else {
+                        theme.text_muted
+                    })
+                    .font_family(theme.mono_family.clone())
+                    .child(detail.clone()),
+            );
+        } else if running && node.children.is_empty() {
+            card = card.child(
+                div()
+                    .text_size(theme.scale(11.))
+                    .text_color(theme.text_muted)
+                    .child("Working…"),
+            );
+        }
+    }
+    card.into_any_element()
+}
+
+/// A generated report: a bordered card carrying a document icon, the report's title
+/// (or a generic label), and an accent "Open" button that hands the HTML file to the
+/// system browser. Unlike the old behaviour, the report never opens itself — it stays
+/// in the transcript so the user can open it whenever they like, and it persists with
+/// the conversation.
+fn render_report_card(
+    node_id: &str,
+    path: &str,
+    title: Option<&str>,
+    theme: &flint::Theme,
+    depth: usize,
+    cx: &mut Context<AppState>,
+) -> AnyElement {
+    let label = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or("Report")
+        .to_string();
+    let open_path = path.to_string();
+    let open = div()
+        .id(SharedString::from(format!("report-open-{node_id}")))
+        .flex_none()
+        .px_2()
+        .h(px(22.))
+        .flex()
+        .items_center()
+        .gap_1()
+        .rounded(px(5.))
+        .bg(theme.accent)
+        .text_size(theme.scale(11.))
+        .text_color(theme.on_accent)
+        .cursor_pointer()
+        .hover(|s| s.opacity(0.9))
+        .child(crate::icons::icon(
+            "external-link",
+            theme.scale(11.),
+            theme.on_accent,
+        ))
+        .child("Open")
+        .on_click(cx.listener(move |this, _, _, cx| this.open_report(open_path.clone(), cx)));
+
+    div()
+        .ml(px(depth as f32 * 14.))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .p(px(8.))
+        .rounded(theme.radius_sm)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.bg_elevated)
+        .text_size(theme.scale(11.))
+        .child(crate::icons::icon(
+            "file-text",
+            theme.scale(13.),
+            theme.accent,
+        ))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .truncate()
+                        .text_color(theme.text)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_size(theme.scale(10.))
+                        .text_color(theme.text_muted)
+                        .child("HTML report"),
+                ),
+        )
+        .child(open)
+        .into_any_element()
+}
+
+/// One activity row: a status glyph, the node's label, its argument summary, and a
+/// trailing detail (row count / error) once known — all muted so the trace sits
+/// quietly beneath the answer.
+fn render_activity_row(
+    node: &red_core::ActivityNode,
+    theme: &flint::Theme,
+    depth: usize,
+) -> AnyElement {
+    use red_core::ActivityStatus::Failed;
+    let (glyph, glyph_color) = activity_glyph(node.status, theme);
+    let (primary, secondary) = match &node.kind {
+        red_core::ActivityKind::Tool { name, args_summary } => (name.clone(), args_summary.clone()),
+        red_core::ActivityKind::Subagent { task } => ("Subagent".to_string(), Some(task.clone())),
+        red_core::ActivityKind::Write { sql } => (
+            "Write".to_string(),
+            sql.lines()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| l.trim().to_string()),
+        ),
+        // Reports render as a card in `render_activity`; this is only a defensive
+        // fallback so the match stays exhaustive.
+        red_core::ActivityKind::Report { title, .. } => (
+            "Report".to_string(),
+            title.clone(),
+        ),
+    };
+
+    let mut row = div()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .pl(px(depth as f32 * 14.))
+        .text_size(theme.scale(11.))
+        .child(div().w(px(10.)).text_color(glyph_color).child(glyph))
+        .child(div().text_color(theme.text).child(primary));
+    if let Some(secondary) = secondary {
+        row = row.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(theme.text_muted)
+                .font_family(theme.mono_family.clone())
+                .child(secondary),
+        );
+    }
+    if let Some(detail) = &node.detail {
+        row = row.child(
+            div()
+                .text_color(if node.status == Failed {
+                    theme.red
+                } else {
+                    theme.text_muted
+                })
+                .child(detail.clone()),
+        );
+    }
+    row.into_any_element()
 }
 
 /// A history row's leading status dot, sized to the old provider glyph's footprint

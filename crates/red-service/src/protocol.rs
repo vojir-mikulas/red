@@ -13,9 +13,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use red_core::{
-    AiLimits, AiTier, Column, ColumnMap, ColumnMeta, ColumnStats, ConnectionConfig, CopyMode,
-    EditOp, ExportFormat, FkEdge, FkJoin, ImportFormat, KeySpec, QueryOptions, QueryPlan,
-    ResultFilter, RowWindow, SchemaMeta, TableDetail, TableRef, UpdateState, Value,
+    ActivityId, ActivityKind, ActivityStatus, AiLimits, AiTier, Column, ColumnMap, ColumnMeta,
+    ColumnStats, ConnectionConfig, CopyMode, EditOp, ExportFormat, FkEdge, FkJoin, ImportFormat,
+    KeySpec, PlanStep, QueryOptions, QueryPlan, ResultFilter, RowWindow, SchemaMeta, TableDetail,
+    TableRef, UpdateState, Value,
 };
 
 /// Identifies one keep-alive backend session. Minted UI-side at connect start so
@@ -671,11 +672,12 @@ pub enum Event {
         detail: Option<String>,
     },
     /// A `generate_report` tool produced a standalone HTML report at `path`; the UI
-    /// opens it in the system browser. Scoped to its conversation so the originating
-    /// chat (sidebar or agent tab) could also note it.
+    /// surfaces it as a card in the originating conversation (with an "Open" button)
+    /// rather than auto-opening it. `title` is the model's report title, if any.
     AiReportReady {
         conversation_id: u64,
         path: String,
+        title: Option<String>,
     },
     /// The agent asked to open `sql` in a new query tab (so the user has it in the
     /// editor/grid). The UI opens a fresh tab with the SQL loaded and runs it if it's
@@ -683,6 +685,15 @@ pub enum Event {
     /// path's own confirmation still applies).
     AiOpenQuery {
         conversation_id: u64,
+        sql: String,
+    },
+    /// The agent asked to persist `sql` as a reusable saved query under `name` (with
+    /// an optional `description`). The UI writes it to the saved-queries directory so
+    /// the user can reopen it later (⇧⌘O); nothing executes.
+    AiSaveQuery {
+        conversation_id: u64,
+        name: String,
+        description: Option<String>,
         sql: String,
     },
     /// The subscription agent advertised its slash commands (after its session
@@ -882,16 +893,34 @@ pub struct ReportTheme {
 }
 
 /// One streamed increment of an assistant turn (the `Event::AiDelta` payload).
+/// Text and thinking append to the bubble; the activity variants build and update
+/// the turn's persisted activity timeline (tool calls, subagents, writes) by id.
 #[derive(Debug, Clone)]
 pub enum AiDelta {
     /// A chunk of summarized thinking text.
     Thinking(String),
     /// A chunk of visible answer text.
     Text(String),
-    /// The model began running a read-only tool (shown as a transient status).
-    ToolStarted { name: String },
-    /// A tool finished; `ok` is false when it errored.
-    ToolFinished { name: String, ok: bool },
+    /// A new activity node opened (a tool call, subagent, or write). `parent` nests
+    /// it under an existing node — a subagent's inner tool calls carry the
+    /// subagent's id — or is `None` for a top-level node. The node arrives in
+    /// `Running`/`Pending` and is later resolved by `ActivityUpdated`.
+    ActivityStarted {
+        id: ActivityId,
+        parent: Option<ActivityId>,
+        kind: ActivityKind,
+        status: ActivityStatus,
+    },
+    /// An open activity node changed state and/or gained a one-line result summary,
+    /// matched by `id` anywhere in the tree. `status` is `None` for a detail-only
+    /// refresh (e.g. streamed subagent progress) that shouldn't change the lifecycle.
+    ActivityUpdated {
+        id: ActivityId,
+        status: Option<ActivityStatus>,
+        detail: Option<String>,
+    },
+    /// The agent (re)published its plan checklist; replaces the turn's steps.
+    PlanUpdated { steps: Vec<PlanStep> },
 }
 
 /// One slash command the assistant backend advertises (the `AiCommandsAvailable`

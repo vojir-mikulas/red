@@ -360,7 +360,11 @@ impl AppState {
             .flex_shrink_0()
             .items_center()
             .justify_between()
-            .px_3()
+            // The overlay covers the whole window, so the header's top-left sits under
+            // the macOS traffic lights; inset the left edge to clear them (same as the
+            // main top bar).
+            .pl(px(crate::shell::TITLEBAR_LEFT_INSET))
+            .pr_3()
             .py_2()
             .bg(theme.bg_panel)
             .border_b_1()
@@ -463,22 +467,18 @@ impl AppState {
                 .details
                 .get(&(node.schema.clone(), node.table.clone()));
 
-            let mut inner = div()
-                .flex()
-                .flex_col()
-                .size_full()
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .px_1p5()
-                        .py_1()
-                        .bg(theme.bg_panel_2)
-                        .text_size(header_size)
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(theme.text)
-                        .overflow_hidden()
-                        .child(node.table.clone()),
-                );
+            let mut inner = div().flex().flex_col().size_full().child(
+                div()
+                    .flex_shrink_0()
+                    .px_1p5()
+                    .py_1()
+                    .bg(theme.bg_panel_2)
+                    .text_size(header_size)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .overflow_hidden()
+                    .child(node.table.clone()),
+            );
 
             if show_cols {
                 if let Some(detail) = detail {
@@ -662,29 +662,27 @@ impl AppState {
                     }
                 }),
             )
+            // Scroll zooms around the cursor (scroll up / away = zoom in); panning is
+            // by dragging the background. Exponential so pixel-precise trackpad deltas
+            // feel smooth and coarse mouse-wheel notches still move meaningfully.
             .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
                 let p = pos_of(ev.position);
                 if let Some(er) = this.er_mut() {
-                    let (dx, dy) = match ev.delta {
-                        ScrollDelta::Pixels(d) => (f32::from(d.x), f32::from(d.y)),
-                        ScrollDelta::Lines(d) => (d.x * 20., d.y * 20.),
+                    let dy = match ev.delta {
+                        ScrollDelta::Pixels(d) => f32::from(d.y),
+                        ScrollDelta::Lines(d) => d.y * 20.,
                     };
-                    // ⌘/Ctrl + wheel (and trackpad pinch, which arrives as ctrl+wheel)
-                    // zooms around the cursor; a plain wheel pans.
-                    if ev.modifiers.control || ev.modifiers.platform {
-                        let anchor = match *er.viewport.borrow() {
-                            Some(r) => Vec2 {
-                                x: p.x - r.x,
-                                y: p.y - r.y,
-                            },
-                            None => er.center(),
-                        };
-                        let factor = if dy > 0. { 1.06 } else { 0.94 };
-                        er.zoom_at(factor, anchor);
-                    } else {
-                        er.pan.x += dx;
-                        er.pan.y += dy;
+                    if dy == 0. {
+                        return;
                     }
+                    let anchor = match *er.viewport.borrow() {
+                        Some(r) => Vec2 {
+                            x: p.x - r.x,
+                            y: p.y - r.y,
+                        },
+                        None => er.center(),
+                    };
+                    er.zoom_at(1.0015f32.powf(dy), anchor);
                     cx.notify();
                 }
             }));

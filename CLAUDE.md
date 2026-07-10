@@ -13,7 +13,7 @@
   · `red-driver` (`DatabaseDriver` trait + engine impls) · `red-service` (backend
   thread + bridge).
 - UI components + theme come from **Flint** (`../flint`), the shared in-house
-  GPUI library (also used by Nyx).
+  GPUI library.
 - `red-core` holds types with no UI/runtime knowledge; the driver/service run on
   the Tokio thread; the UI observes events via `cx.spawn`.
 
@@ -34,7 +34,7 @@ rules, and the safe-by-default behaviour. The load-bearing project invariants:
 
 - **UI independent from drivers.** The UI speaks `red-core` types and Commands/
   Events, never driver internals. `DatabaseDriver` is the only seam to engines.
-- **Single gpui**, pinned to the same Zed rev as Flint and Nyx — a cross-repo
+- **Single gpui**, pinned to the same Zed rev as Flint, a cross-repo
   contract, never bumped casually.
 - **Never materialize a whole result by default** — stream through a windowed
   cursor behind `DatabaseDriver`.

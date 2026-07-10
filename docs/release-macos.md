@@ -94,7 +94,7 @@ Red.app/
       Red.icns       ← app icon
 ```
 
-### 3a. Icon — generate `Red.icns`
+### 3a. Icon - generate `Red.icns`
 
 We have `assets/red.svg` (the brand mark). Produce a 1024px master PNG, then an
 `.iconset`, then the `.icns`. Add this as a committed helper at
@@ -285,7 +285,7 @@ xcrun stapler staple build/Red-__VERSION__.dmg
 
 ---
 
-## 7. CI automation — release on tag
+## 7. CI automation - release on tag
 
 Add `.github/workflows/release.yml`. It fires on a `v*` tag (cut a release with
 `git tag vX.Y.Z && git push origin vX.Y.Z`), builds a universal `.app`, signs,

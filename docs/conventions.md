@@ -1,4 +1,4 @@
-# RED — Engineering conventions
+# RED - Engineering conventions
 
 The canonical guide for working in this repository. These conventions prioritise
 the project's core values: speed, low memory, and clear behaviour on large
@@ -50,8 +50,8 @@ in `Cargo.toml`.
   semantic theme tokens (`cx.theme().bg_app`) rather than raw colors. New shared
   components are built gallery-first in Flint with a domain-free API (see the
   Flint section in `CONTRIBUTING.md`).
-- **Resolve a single `gpui`,** pinned to the same revision as Flint and Nyx. This
-  is a cross-repository contract; coordinate any bump across all three.
+- **Resolve a single `gpui`,** pinned to the same revision as Flint. This is a
+  cross-repository contract; coordinate any bump across both repos.
 
 ## Behaviour defaults
 

@@ -1,13 +1,13 @@
 # Contributing to RED
 
 Thanks for your interest in RED (*Roughly Enough Data*), a fast, native database
-explorer in pure Rust on GPUI. This guide gets you from a clone to a green build
-to a reviewable pull request.
+explorer in pure Rust on GPUI. This guide covers setup, the checks a change has
+to pass, and how to open a pull request.
 
 ## Project values
 
-RED prioritises **speed, low memory, and good behaviour on large result sets**
-over feature-completeness. Changes are weighed against those values first. The
+RED prioritises speed, low memory, and good behaviour on large result sets over
+feature-completeness. Changes are weighed against those values first. The
 canonical coding guide is [`docs/conventions.md`](docs/conventions.md); read it
 before your first change.
 
@@ -71,10 +71,10 @@ down into Flint (`just gallery` runs Flint's component gallery).
 
 ### The single-`gpui` contract
 
-RED, Flint, and Nyx all pin **gpui to the same Zed revision**. Cargo unifies two
-git deps only at a matching URL+rev, so a mismatch silently pulls in a second,
+RED and Flint both pin `gpui` to the same Zed revision. Cargo only unifies two
+git deps when their URL and rev match, so a mismatch silently pulls in a second,
 incompatible `gpui`. Bumping the rev (or the Flint pin) is a coordinated change
-across all three repos, never done casually in a feature PR.
+across both repos, not something to do casually in a feature PR.
 
 ## Architecture in brief
 

@@ -212,7 +212,8 @@ impl<R: BufRead> JsonArrayReader<R> {
         }
         let bytes = read_json_value_bytes(&mut self.reader)?;
         self.first_element = false;
-        let text = std::str::from_utf8(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Ok(Some(parse_json_object(text)?))
     }
 }
@@ -543,10 +544,20 @@ mod tests {
         assert_eq!(cols, vec!["id", "meta", "note"]);
         assert_eq!(
             data[0],
-            vec!["1".to_string(), "{\"a\":1,\"b\":[2,3]}".to_string(), "x, }y".to_string()]
+            vec![
+                "1".to_string(),
+                "{\"a\":1,\"b\":[2,3]}".to_string(),
+                "x, }y".to_string()
+            ]
         );
-        assert_eq!(data[1], vec!["2".to_string(), "".to_string(), "".to_string()]);
-        assert_eq!(data[2], vec!["3".to_string(), "".to_string(), "".to_string()]);
+        assert_eq!(
+            data[1],
+            vec!["2".to_string(), "".to_string(), "".to_string()]
+        );
+        assert_eq!(
+            data[2],
+            vec!["3".to_string(), "".to_string(), "".to_string()]
+        );
     }
 
     #[test]

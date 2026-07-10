@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use red_core::{ActivityId, ActivityKind, ActivityStatus, PlanStep};
 use tokio::sync::{mpsc, oneshot};
 
 /// The default agent: Claude Code in ACP mode, fetched on demand via npx. The
@@ -11,17 +12,32 @@ use tokio::sync::{mpsc, oneshot};
 pub const DEFAULT_AGENT_COMMAND: &str = "npx -y @agentclientprotocol/claude-agent-acp";
 
 /// One streamed increment of an assistant turn, mapped from an ACP
-/// `session/update`. Same categories `red-ai` already streams.
+/// `session/update`. Text and thinking append; the activity/plan variants feed the
+/// same agent-activity timeline the direct-provider path builds, keyed by the
+/// agent's `tool_call_id`, so the panel renders both backends identically.
 #[derive(Debug, Clone)]
 pub enum AcpDelta {
     /// A chunk of visible answer text (`AgentMessageChunk`).
     Text(String),
     /// A chunk of the agent's reasoning (`AgentThoughtChunk`).
     Thinking(String),
-    /// The agent began a tool call (`ToolCall`).
-    ToolStarted { name: String },
-    /// A tool call reached a terminal state (`ToolCallUpdate`); `ok` is false on failure.
-    ToolFinished { name: String, ok: bool },
+    /// A tool call opened (`ToolCall`); `id` is its `tool_call_id`, `parent` nests
+    /// it under a subagent node (Phase 1) or is `None` at top level.
+    ActivityStarted {
+        id: ActivityId,
+        parent: Option<ActivityId>,
+        kind: ActivityKind,
+        status: ActivityStatus,
+    },
+    /// A tool call changed state and/or streamed progress (`ToolCallUpdate`), matched
+    /// by `id`. `status` is `None` for a detail-only refresh.
+    ActivityUpdated {
+        id: ActivityId,
+        status: Option<ActivityStatus>,
+        detail: Option<String>,
+    },
+    /// The agent (re)published its plan checklist (`Plan`).
+    PlanUpdated { steps: Vec<PlanStep> },
 }
 
 /// One slash command the agent advertises (ACP `AvailableCommandsUpdate`), e.g.
@@ -153,6 +169,11 @@ pub enum AcpError {
     /// The agent reported an ACP-level failure.
     #[error("agent error: {0}")]
     Protocol(String),
+    /// A prompt / config change arrived while a turn was already running. A benign,
+    /// expected race (the UI serializes turns and disables selectors mid-turn); it
+    /// should be handled quietly, never surfaced to the user as an error.
+    #[error("a turn is already in progress")]
+    Busy,
     /// The conversation's connection has ended (agent exited / was torn down).
     #[error("the agent connection has ended")]
     Closed,

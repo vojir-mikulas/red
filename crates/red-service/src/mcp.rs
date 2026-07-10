@@ -367,15 +367,19 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
+        // Read-only tools only: the write tools (propose_write / propose_changeset)
+        // and the direct-path-only spawn_subagent are withheld over MCP.
         assert_eq!(
             names,
             [
                 "list_schema",
                 "describe_table",
+                "profile_table",
                 "run_select",
                 "explain",
                 "generate_report",
-                "open_query"
+                "open_query",
+                "save_query"
             ]
         );
     }

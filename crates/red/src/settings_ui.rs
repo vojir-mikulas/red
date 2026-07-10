@@ -1176,8 +1176,10 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
         });
 
     // Resource guards on the `read` tier. Each is a preset segmented; a hand-edited
-    // off-preset value shows no selection (usize::MAX) rather than snapping.
-    const ROW_PRESETS: [usize; 4] = [100, 500, 1000, 5000];
+    // off-preset value shows no selection (usize::MAX) rather than snapping. The
+    // top segment on each row is a deliberately risky choice (well above the safe
+    // default, or an outright-disabled cap); selecting it flags a red warning.
+    const ROW_PRESETS: [usize; 5] = [100, 500, 1000, 5000, 50_000];
     let rows_sel = ROW_PRESETS
         .iter()
         .position(|&n| n == ai.limits.max_rows)
@@ -1188,11 +1190,21 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
         .segment("500")
         .segment("1000")
         .segment("5000")
+        .segment("50000")
         .selected(rows_sel)
         .on_select(move |ix, _, cx| {
             let n = ROW_PRESETS[ix.min(ROW_PRESETS.len() - 1)];
             rows_view.update(cx, |this, cx| this.set_ai_max_rows(n, cx));
         });
+    // Risky once the ceiling climbs past the old safe top preset: the agent can
+    // then pull very large result sets in a single tool call.
+    let rows_warn = (ai.limits.max_rows > 5000).then(|| {
+        SharedString::from(
+            "Above the safe default (5000 rows). The agent can pull very large result \
+             sets in one tool call — slower queries, far more tokens, higher cost. \
+             Use at your own risk.",
+        )
+    });
 
     // Statement timeout, in milliseconds (0 = off).
     const TIMEOUT_PRESETS: [u64; 4] = [0, 5_000, 15_000, 30_000];
@@ -1212,8 +1224,8 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             timeout_view.update(cx, |this, cx| this.set_ai_timeout(n, cx));
         });
 
-    // Result byte cap (0 = off).
-    const BYTE_PRESETS: [usize; 3] = [64 * 1024, 256 * 1024, 1024 * 1024];
+    // Result byte cap (0 = off). The last two segments (5 MB, Off) are risky.
+    const BYTE_PRESETS: [usize; 5] = [64 * 1024, 256 * 1024, 1024 * 1024, 5 * 1024 * 1024, 0];
     let bytes_sel = BYTE_PRESETS
         .iter()
         .position(|&n| n == ai.limits.max_result_bytes)
@@ -1223,14 +1235,25 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
         .segment("64 KB")
         .segment("256 KB")
         .segment("1 MB")
+        .segment("5 MB")
+        .segment("Off")
         .selected(bytes_sel)
         .on_select(move |ix, _, cx| {
             let n = BYTE_PRESETS[ix.min(BYTE_PRESETS.len() - 1)];
             bytes_view.update(cx, |this, cx| this.set_ai_max_bytes(n, cx));
         });
+    // Risky past the old safe top preset, or with the cap disabled entirely.
+    let bytes_warn = (ai.limits.max_result_bytes == 0 || ai.limits.max_result_bytes > 1024 * 1024)
+        .then(|| {
+            SharedString::from(
+                "Above the safe cap (1 MB). Large tool results can flood the model's \
+                 context and drive up cost; “Off” removes the cap entirely. Use at \
+                 your own risk.",
+            )
+        });
 
-    // Tool-call budget per conversation (0 = off).
-    const CALL_PRESETS: [usize; 4] = [25, 50, 100, 200];
+    // Tool-call budget per conversation (0 = off). The last two segments are risky.
+    const CALL_PRESETS: [usize; 6] = [25, 50, 100, 200, 500, 0];
     let calls_sel = CALL_PRESETS
         .iter()
         .position(|&n| n == ai.limits.max_tool_calls)
@@ -1241,11 +1264,21 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
         .segment("50")
         .segment("100")
         .segment("200")
+        .segment("500")
+        .segment("Off")
         .selected(calls_sel)
         .on_select(move |ix, _, cx| {
             let n = CALL_PRESETS[ix.min(CALL_PRESETS.len() - 1)];
             calls_view.update(cx, |this, cx| this.set_ai_max_calls(n, cx));
         });
+    // Risky past the old safe top preset, or with the budget disabled entirely.
+    let calls_warn = (ai.limits.max_tool_calls == 0 || ai.limits.max_tool_calls > 200).then(|| {
+        SharedString::from(
+            "Above the safe budget (200 calls). A high or disabled cap lets a runaway \
+             agent loop rack up many tool calls and cost; “Off” removes the cap. Use \
+             at your own risk.",
+        )
+    });
 
     let show_thinking = Toggle::new("set-ai-thinking", ai.show_thinking)
         .on_change(cx.listener(|this, on: &bool, _, cx| this.set_ai_show_thinking(*on, cx)));
@@ -1344,7 +1377,7 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 "Max rows per query",
                 "Hard ceiling on rows one tool SELECT returns; a larger LIMIT is \
                  clamped down to this.",
-                max_rows,
+                risky_control("ai-max-rows-warn", rows_warn, max_rows, &theme),
                 &theme,
             ))
             .child(setting_row(
@@ -1357,14 +1390,14 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 "Result size cap",
                 "Trim a tool result larger than this before it's handed back to the \
                  model, so a wide row set can't blow up the context.",
-                max_bytes,
+                risky_control("ai-max-bytes-warn", bytes_warn, max_bytes, &theme),
                 &theme,
             ))
             .child(setting_row(
                 "Tool calls per chat",
                 "Bound a runaway agent loop: the cumulative tool-call budget for one \
                  conversation.",
-                max_calls,
+                risky_control("ai-max-calls-warn", calls_warn, max_calls, &theme),
                 &theme,
             ))
             .child(settings_header("Display", &theme))
@@ -2002,6 +2035,36 @@ fn setting_block(
         .border_color(theme.border_soft)
         .child(setting_label(title, description, theme))
         .child(body)
+}
+
+/// A settings control paired with an optional "at your own risk" warning. When
+/// `warn` is `Some`, a red ⚠ sits left of the control and hovering it shows a
+/// danger tooltip; when `None`, just the control. Used by the AI resource guards
+/// so a value above the safe default (or an outright-disabled cap) is flagged
+/// without cluttering the common, safe case.
+fn risky_control(
+    id: &'static str,
+    warn: Option<SharedString>,
+    control: impl IntoElement,
+    theme: &Theme,
+) -> AnyElement {
+    let row = div().flex().items_center().gap_2();
+    match warn {
+        Some(msg) => row
+            .child(
+                div()
+                    .id(id)
+                    .flex_none()
+                    .text_size(theme.scale(13.))
+                    .text_color(theme.red)
+                    .cursor_default()
+                    .tooltip(flint::Tooltip::danger(msg))
+                    .child("⚠"),
+            )
+            .child(control)
+            .into_any_element(),
+        None => row.child(control).into_any_element(),
+    }
 }
 
 /// The stacked title + description used by both settings-row shapes.

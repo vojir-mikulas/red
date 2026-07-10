@@ -16,13 +16,15 @@ use agent_client_protocol::schema::{
     AuthenticateRequest, CancelNotification, ClientCapabilities, ContentBlock,
     FileSystemCapabilities, HttpHeader, Implementation, InitializeRequest, McpServer,
     McpServerHttp, NewSessionRequest, PermissionOption, PermissionOptionId, PermissionOptionKind,
-    PromptRequest, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectOptions, SessionId, SessionNotification,
-    SessionUpdate, SetSessionConfigOptionRequest, StopReason, TextContent, ToolCallStatus,
-    ToolCallUpdate, ToolKind,
+    PlanEntry, PlanEntryStatus, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigSelectOptions, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, StopReason, TextContent, ToolCall, ToolCallContent,
+    ToolCallStatus, ToolCallUpdate, ToolKind,
 };
 use agent_client_protocol::{AcpAgent, Agent, ConnectionTo};
+use red_core::{ActivityKind, ActivityStatus, PlanStep, PlanStepStatus};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::types::{
@@ -366,17 +368,14 @@ async fn run_turns(
                     }
                     Some(Cmd::Prompt { done, .. }) => {
                         // The UI serializes turns; reject a concurrent one rather
-                        // than interleave it into the running prompt.
-                        let _ = done.send(Err(AcpError::Protocol(
-                            "a turn is already in progress".into(),
-                        )));
+                        // than interleave it into the running prompt. `Busy` marks it
+                        // as the benign race it is (not surfaced as a user error).
+                        let _ = done.send(Err(AcpError::Busy));
                     }
                     // The UI disables the selectors mid-turn, but reject defensively
                     // rather than mutate config while a prompt is streaming.
                     Some(Cmd::SetConfig { done, .. }) => {
-                        let _ = done.send(Err(AcpError::Protocol(
-                            "a turn is already in progress".into(),
-                        )));
+                        let _ = done.send(Err(AcpError::Busy));
                     }
                 },
             }
@@ -397,7 +396,7 @@ async fn run_turns(
 
 /// Map one streamed update onto an [`AcpDelta`] (and record usage), and forward the
 /// agent's advertised slash commands out of band. Returns without sending for
-/// updates we don't surface (plans, modes).
+/// updates we don't surface (e.g. mode changes).
 fn handle_update(
     update: &SessionUpdate,
     active_sink: &SinkCell,
@@ -446,20 +445,42 @@ fn handle_update(
         SessionUpdate::AgentThoughtChunk(chunk) => {
             Some(AcpDelta::Thinking(text_of(&chunk.content)))
         }
-        SessionUpdate::ToolCall(call) => Some(AcpDelta::ToolStarted {
-            name: call.title.clone(),
+        SessionUpdate::ToolCall(call) => {
+            // Every ACP tool call is top-level. We do NOT nest calls under a running
+            // subagent: the agent runs subagents in *parallel* (and doesn't surface
+            // their inner calls to us), so a temporal "what's open now" guess wrongly
+            // nested independent subagents under each other. Delegations render as
+            // sibling nodes; only the direct-provider path, which sets `parent`
+            // explicitly, ever nests.
+            let kind = match subagent_task(call) {
+                Some(task) => ActivityKind::Subagent { task },
+                None => ActivityKind::Tool {
+                    name: call.title.clone(),
+                    args_summary: acp_args_summary(&call.raw_input),
+                },
+            };
+            Some(AcpDelta::ActivityStarted {
+                id: call.tool_call_id.0.to_string(),
+                parent: None,
+                kind,
+                status: map_tool_status(&call.status),
+            })
+        }
+        // Forward status changes and/or streamed progress. A status-less update
+        // carries progress content (the node's latest line of work), which refreshes
+        // the detail without touching the lifecycle.
+        SessionUpdate::ToolCallUpdate(update) => {
+            let status = update.fields.status.as_ref().map(map_tool_status);
+            let detail = acp_progress_detail(&update.fields.content);
+            (status.is_some() || detail.is_some()).then(|| AcpDelta::ActivityUpdated {
+                id: update.tool_call_id.0.to_string(),
+                status,
+                detail,
+            })
+        }
+        SessionUpdate::Plan(plan) => Some(AcpDelta::PlanUpdated {
+            steps: plan.entries.iter().map(map_plan_entry).collect(),
         }),
-        SessionUpdate::ToolCallUpdate(update) => match &update.fields.status {
-            Some(ToolCallStatus::Completed) => Some(AcpDelta::ToolFinished {
-                name: tool_name(update),
-                ok: true,
-            }),
-            Some(ToolCallStatus::Failed) => Some(AcpDelta::ToolFinished {
-                name: tool_name(update),
-                ok: false,
-            }),
-            _ => None,
-        },
         SessionUpdate::UsageUpdate(usage) => {
             *lock(usage_cell) = AcpUsage {
                 used_tokens: usage.used,
@@ -477,12 +498,100 @@ fn handle_update(
     }
 }
 
-fn tool_name(update: &ToolCallUpdate) -> String {
-    update
-        .fields
-        .title
-        .clone()
-        .unwrap_or_else(|| "tool".to_string())
+/// Map an ACP tool-call status onto the shared activity lifecycle. A just-opened
+/// or in-progress call reads as `Running` in the timeline; `Pending` (awaiting
+/// approval / streaming input) shows as `Pending`.
+fn map_tool_status(status: &ToolCallStatus) -> ActivityStatus {
+    match status {
+        ToolCallStatus::Pending => ActivityStatus::Pending,
+        ToolCallStatus::InProgress => ActivityStatus::Running,
+        ToolCallStatus::Completed => ActivityStatus::Ok,
+        ToolCallStatus::Failed => ActivityStatus::Failed,
+        _ => ActivityStatus::Running,
+    }
+}
+
+/// A one-line summary of a tool call's raw input for the timeline: the SQL's first
+/// line or the table name, matching the direct-provider path. `None` when there's
+/// no salient scalar argument.
+fn acp_args_summary(raw_input: &Option<serde_json::Value>) -> Option<String> {
+    let input = raw_input.as_ref()?;
+    let salient = input
+        .get("sql")
+        .or_else(|| input.get("table"))
+        .and_then(|v| v.as_str())?;
+    let line = salient.split('\n').find(|l| !l.trim().is_empty())?.trim();
+    Some(clip(line, 79))
+}
+
+/// A one-line progress summary from a tool-call update's streamed content: the first
+/// non-empty line of its latest text block. This is the closest thing ACP gives us to
+/// a subagent's "ongoing work" (it doesn't forward a delegate's inner tool calls), so
+/// it surfaces as the node's live detail. `None` when the update carries no text.
+fn acp_progress_detail(content: &Option<Vec<ToolCallContent>>) -> Option<String> {
+    let blocks = content.as_ref()?;
+    // The freshest text block, read back-to-front.
+    let text = blocks.iter().rev().find_map(|c| match c {
+        ToolCallContent::Content(inner) => {
+            let t = text_of(&inner.content);
+            (!t.trim().is_empty()).then_some(t)
+        }
+        _ => None,
+    })?;
+    let line = text.split('\n').find(|l| !l.trim().is_empty())?.trim();
+    Some(clip(line, 100))
+}
+
+/// If this tool call is a delegated subagent (Claude Code's `Task` tool), return a
+/// short description of its task; otherwise `None`. ACP carries no subagent tool
+/// *kind*, so we key off the Task tool's signature: a `subagent_type` in the raw
+/// input, or a bare `Task` title. Heuristic and centralized so it's easy to tune as
+/// agents' conventions shift; a false negative just renders a plain tool row.
+fn subagent_task(call: &ToolCall) -> Option<String> {
+    let raw = call.raw_input.as_ref();
+    let has_subagent_type = raw.and_then(|v| v.get("subagent_type")).is_some();
+    let title = call.title.trim();
+    let title_is_task = {
+        let lower = title.to_ascii_lowercase();
+        lower == "task" || lower.starts_with("task(") || lower.starts_with("task ")
+    };
+    if !has_subagent_type && !title_is_task {
+        return None;
+    }
+    // Prefer a human description, then the subagent type, then the title itself.
+    let field = |key: &str| {
+        raw.and_then(|v| v.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let task = field("description")
+        .or_else(|| field("prompt"))
+        .or_else(|| field("subagent_type"))
+        .unwrap_or(title);
+    Some(clip(task, 120))
+}
+
+/// Truncate to `max` chars on a char boundary, appending an ellipsis when cut.
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}…")
+}
+
+/// Map an ACP plan entry onto a [`PlanStep`] for the turn's checklist.
+fn map_plan_entry(entry: &PlanEntry) -> PlanStep {
+    PlanStep {
+        title: entry.content.clone(),
+        status: match entry.status {
+            PlanEntryStatus::Pending => PlanStepStatus::Pending,
+            PlanEntryStatus::InProgress => PlanStepStatus::InProgress,
+            PlanEntryStatus::Completed => PlanStepStatus::Completed,
+            _ => PlanStepStatus::Pending,
+        },
+    }
 }
 
 /// Map ACP `config_options` to Red's [`AcpConfigOption`], keeping only single-select
@@ -709,6 +818,75 @@ mod tests {
             .into_iter()
             .map(String::from)
             .collect()
+    }
+
+    #[test]
+    fn tool_status_maps_onto_the_activity_lifecycle() {
+        assert_eq!(
+            map_tool_status(&ToolCallStatus::Pending),
+            ActivityStatus::Pending
+        );
+        assert_eq!(
+            map_tool_status(&ToolCallStatus::InProgress),
+            ActivityStatus::Running
+        );
+        assert_eq!(
+            map_tool_status(&ToolCallStatus::Completed),
+            ActivityStatus::Ok
+        );
+        assert_eq!(
+            map_tool_status(&ToolCallStatus::Failed),
+            ActivityStatus::Failed
+        );
+    }
+
+    #[test]
+    fn args_summary_extracts_sql_or_table_first_line() {
+        assert_eq!(
+            acp_args_summary(&Some(json!({ "sql": "SELECT 1\nFROM t" }))),
+            Some("SELECT 1".to_string())
+        );
+        assert_eq!(
+            acp_args_summary(&Some(json!({ "table": "public.users" }))),
+            Some("public.users".to_string())
+        );
+        assert_eq!(acp_args_summary(&Some(json!({ "other": 1 }))), None);
+        assert_eq!(acp_args_summary(&None), None);
+    }
+
+    #[test]
+    fn detects_subagents_by_type_or_task_title() {
+        use agent_client_protocol::schema::ToolCall;
+        // A Task tool call carrying a subagent_type is a subagent; the description
+        // becomes its label.
+        let mut task = ToolCall::new(ToolCallId::new("t1"), "Task");
+        task.raw_input = Some(json!({
+            "subagent_type": "explorer",
+            "description": "Map the schema",
+        }));
+        assert_eq!(subagent_task(&task).as_deref(), Some("Map the schema"));
+
+        // A bare "Task" title with no input still counts; falls back to the title.
+        let bare = ToolCall::new(ToolCallId::new("t2"), "Task");
+        assert_eq!(subagent_task(&bare).as_deref(), Some("Task"));
+
+        // An ordinary DB tool is not a subagent.
+        let mut run = ToolCall::new(ToolCallId::new("t3"), "run_select");
+        run.raw_input = Some(json!({ "sql": "SELECT 1" }));
+        assert_eq!(subagent_task(&run), None);
+    }
+
+    #[test]
+    fn plan_entry_maps_content_and_status() {
+        use agent_client_protocol::schema::PlanEntryPriority;
+        let entry = PlanEntry::new(
+            "Count the users",
+            PlanEntryPriority::Medium,
+            PlanEntryStatus::InProgress,
+        );
+        let step = map_plan_entry(&entry);
+        assert_eq!(step.title, "Count the users");
+        assert_eq!(step.status, PlanStepStatus::InProgress);
     }
 
     #[test]

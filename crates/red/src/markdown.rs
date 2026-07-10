@@ -22,9 +22,27 @@ pub(crate) fn parse(src: &str) -> Vec<Block> {
 
 /// Render already-parsed `blocks` as a column of block elements.
 pub(crate) fn render_blocks(blocks: &[Block], theme: &Theme) -> AnyElement {
+    render_blocks_with(blocks, theme, &mut |text, runs| styled(text, runs))
+}
+
+/// A factory for a text leaf: given the plain text and its styled runs, produce the
+/// element that renders it. The default ([`render_blocks`]) makes a non-interactive
+/// `StyledText`; the assistant panel passes one that pulls a pooled, *selectable*
+/// `SelectableLabel` so settled chat prose can be highlighted and copied. Called once
+/// per text leaf (paragraphs, headings, list items, table cells) in document order,
+/// so a caller can index a prebuilt pool by call count. Code blocks and rules carry
+/// no leaf (they keep their own layout / affordances).
+pub(crate) type TextLeaf<'a> = dyn FnMut(String, Vec<TextRun>) -> AnyElement + 'a;
+
+/// Render `blocks` routing every text leaf through `leaf` (see [`TextLeaf`]).
+pub(crate) fn render_blocks_with(
+    blocks: &[Block],
+    theme: &Theme,
+    leaf: &mut TextLeaf,
+) -> AnyElement {
     let mut col = div().flex().flex_col().gap_1p5();
     for block in blocks {
-        col = col.child(render_block(block, theme));
+        col = col.child(render_block(block, theme, leaf));
     }
     col.into_any_element()
 }
@@ -231,11 +249,11 @@ const MAX_CODE_LINES: usize = 400;
 /// large result sets; a chat table is a summary, so cap it and note the remainder.
 const MAX_TABLE_ROWS: usize = 200;
 
-fn render_block(block: &Block, theme: &Theme) -> AnyElement {
+fn render_block(block: &Block, theme: &Theme, leaf: &mut TextLeaf) -> AnyElement {
     match block {
         Block::Paragraph(text) => div()
             .text_size(theme.scale(12.5))
-            .child(inline(text, theme))
+            .child(inline(text, theme, leaf))
             .into_any_element(),
         Block::Heading(level, text) => {
             let size = match level {
@@ -245,7 +263,7 @@ fn render_block(block: &Block, theme: &Theme) -> AnyElement {
             };
             div()
                 .text_size(theme.scale(size))
-                .child(inline_bold(text, theme))
+                .child(inline_bold(text, theme, leaf))
                 .into_any_element()
         }
         Block::Code(code) => {
@@ -281,7 +299,7 @@ fn render_block(block: &Block, theme: &Theme) -> AnyElement {
                         .gap_1p5()
                         .text_size(theme.scale(12.5))
                         .child(div().text_color(theme.text_muted).child("•"))
-                        .child(div().flex_1().child(inline(item, theme))),
+                        .child(div().flex_1().child(inline(item, theme, leaf))),
                 );
             }
             list.into_any_element()
@@ -299,7 +317,7 @@ fn render_block(block: &Block, theme: &Theme) -> AnyElement {
                                 .text_color(theme.text_muted)
                                 .child(format!("{}.", i + 1)),
                         )
-                        .child(div().flex_1().child(inline(item, theme))),
+                        .child(div().flex_1().child(inline(item, theme, leaf))),
                 );
             }
             list.into_any_element()
@@ -313,7 +331,7 @@ fn render_block(block: &Block, theme: &Theme) -> AnyElement {
                 .border_color(theme.border)
                 .overflow_hidden()
                 .text_size(theme.scale(11.5));
-            table = table.child(table_row(headers, theme, true));
+            table = table.child(table_row(headers, theme, true, leaf));
             // Normalize every body row to the header's column count so a ragged row
             // (more/fewer cells than the header) can't skew the grid, and cap the
             // number of rows rendered.
@@ -322,7 +340,7 @@ fn render_block(block: &Block, theme: &Theme) -> AnyElement {
                 let cells: Vec<String> = (0..cols)
                     .map(|i| row.get(i).cloned().unwrap_or_default())
                     .collect();
-                table = table.child(table_row(&cells, theme, false));
+                table = table.child(table_row(&cells, theme, false, leaf));
             }
             if rows.len() > MAX_TABLE_ROWS {
                 table = table.child(
@@ -340,7 +358,7 @@ fn render_block(block: &Block, theme: &Theme) -> AnyElement {
 }
 
 /// One table row: equal-width cells, a bottom rule, and a subtle header tint.
-fn table_row(cells: &[String], theme: &Theme, header: bool) -> AnyElement {
+fn table_row(cells: &[String], theme: &Theme, header: bool, leaf: &mut TextLeaf) -> AnyElement {
     let mut row = div()
         .flex()
         .border_b_1()
@@ -348,9 +366,9 @@ fn table_row(cells: &[String], theme: &Theme, header: bool) -> AnyElement {
         .when(header, |r| r.bg(theme.bg_elevated));
     for cell in cells {
         let body = if header {
-            inline_bold(cell, theme)
+            inline_bold(cell, theme, leaf)
         } else {
-            inline(cell, theme)
+            inline(cell, theme, leaf)
         };
         row = row.child(div().flex_1().min_w(px(0.)).px_2().py_1().child(body));
     }
@@ -367,9 +385,9 @@ enum Span {
 }
 
 /// Render inline Markdown (`**bold**`, `*italic*`, `` `code` ``) as wrapping
-/// styled text. The wrapping div must set the text size (runs carry only family /
-/// weight / style / color).
-fn inline(text: &str, theme: &Theme) -> AnyElement {
+/// styled text via `leaf`. The wrapping div must set the text size (runs carry only
+/// family / weight / style / color).
+fn inline(text: &str, theme: &Theme, leaf: &mut TextLeaf) -> AnyElement {
     let segments = parse_inline(text);
     let mut s = String::new();
     let mut runs = Vec::new();
@@ -398,11 +416,11 @@ fn inline(text: &str, theme: &Theme) -> AnyElement {
         });
         s.push_str(&seg);
     }
-    styled(s, runs)
+    leaf(s, runs)
 }
 
 /// A whole-string bold variant for headings.
-fn inline_bold(text: &str, theme: &Theme) -> AnyElement {
+fn inline_bold(text: &str, theme: &Theme, leaf: &mut TextLeaf) -> AnyElement {
     let run = TextRun {
         len: text.len(),
         font: font(theme.font_family.clone()).bold(),
@@ -411,7 +429,7 @@ fn inline_bold(text: &str, theme: &Theme) -> AnyElement {
         underline: None,
         strikethrough: None,
     };
-    styled(text.to_string(), vec![run])
+    leaf(text.to_string(), vec![run])
 }
 
 fn styled(text: String, runs: Vec<TextRun>) -> AnyElement {

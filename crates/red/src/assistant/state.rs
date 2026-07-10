@@ -138,6 +138,8 @@ impl AppState {
                 // (a no-op when nothing is streaming).
                 CodeEditorEvent::Submit | CodeEditorEvent::Run => this.submit_assistant(cx),
                 CodeEditorEvent::Escape => this.cancel_assistant(cx),
+                // The composer has no gutter markers, so this never fires.
+                CodeEditorEvent::RunLine(_) => {}
             });
             let key_input = cx.new(|cx| TextInput::new(cx).obscured().with_placeholder("sk-ant-…"));
             let key_sub = cx.subscribe(&key_input, |this, _, e: &TextInputEvent, cx| {
@@ -162,6 +164,15 @@ impl AppState {
                 }
             });
             let provider = self.default_ai_provider();
+            // Seed the per-agent config cache from disk, so the composer can draw the
+            // model/reasoning dropdowns for a returning user *before* the first turn
+            // opens a live session (Feature: preselect a model without chatting first).
+            let provider_config_options = self
+                .local_state
+                .ai_config_all()
+                .iter()
+                .map(|(agent, opts)| (agent.clone(), super::text::from_stored(opts)))
+                .collect();
             self.assistant = Some(AssistantState {
                 input,
                 key_input,
@@ -175,7 +186,10 @@ impl AppState {
                 renaming: None,
                 completion_commands,
                 open_config: None,
-                last_config_options: Vec::new(),
+                provider_config_options,
+                subagent_collapse: std::collections::HashMap::new(),
+                selection_group: Rc::new(std::cell::Cell::new(0)),
+                next_selection_id: 1,
             });
             self.focus_assistant = true;
         }
@@ -299,6 +313,8 @@ impl AppState {
                 context,
             },
         );
+        // Make the just-recorded user turn selectable right away (its text is final).
+        self.build_chat_selectables(conversation_id, cx);
         cx.notify();
     }
 
@@ -525,7 +541,10 @@ impl AppState {
                     } else {
                         ChatRole::User
                     };
-                    ChatMessage::new(role, m.text.clone(), m.thinking.clone())
+                    let mut msg = ChatMessage::new(role, m.text.clone(), m.thinking.clone());
+                    msg.activity = m.activity.clone();
+                    msg.plan = m.plan.clone();
+                    msg
                 })
                 .collect();
             chat.title = Some(conv.title.clone());
@@ -540,6 +559,8 @@ impl AppState {
         // A restored chat is sent, so the composer starts empty.
         self.sync_command_completions();
         self.load_composer(String::new(), cx);
+        // Make the restored transcript's text selectable/copyable.
+        self.build_chat_selectables(id, cx);
         self.focus_assistant = true;
         cx.notify();
     }
@@ -754,6 +775,31 @@ impl AppState {
         self.open_query_in_tab(sql, cx);
     }
 
+    /// Persist the agent's `save_query` request to the saved-queries library, then
+    /// toast the outcome so the user knows it landed (they reopen it with ⇧⌘O).
+    pub(crate) fn on_ai_save_query(
+        &mut self,
+        _conversation_id: u64,
+        name: String,
+        description: Option<String>,
+        sql: String,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = match crate::queries::save(&name, description.as_deref(), &sql) {
+            Ok(_) => self.notify(
+                flint::ToastVariant::Success,
+                format!("Saved query “{name}” to your library."),
+                cx,
+            ),
+            Err(e) => self.notify(
+                flint::ToastVariant::Error,
+                format!("Couldn't save query “{name}”: {e}"),
+                cx,
+            ),
+        };
+        cx.notify();
+    }
+
     /// Store the agent's advertised slash commands on their chat (M-S4). Refreshes
     /// the composer's command mirror if it's the active chat, so `/` offers them.
     pub(crate) fn on_ai_commands_available(
@@ -780,10 +826,22 @@ impl AppState {
         options: Vec<red_service::AiConfigOption>,
         cx: &mut Context<Self>,
     ) {
-        // Cache the live set so the next brand-new chat can render these selectors
-        // before it has opened its own session (see `last_config_options`).
-        if let Some(state) = self.assistant.as_mut() {
-            state.last_config_options = options.clone();
+        // Which agent advertised these? Cache the live set under it so a brand-new
+        // chat on the same agent can render the selectors before opening its own
+        // session, and persist it so the dropdowns show on the next launch too.
+        let agent = self
+            .assistant
+            .as_ref()
+            .and_then(|s| s.chats.iter().find(|c| c.conversation_id == conversation_id))
+            .map(|c| c.provider.clone());
+        if let (Some(agent), Some(state)) = (agent.as_ref(), self.assistant.as_mut()) {
+            state
+                .provider_config_options
+                .insert(agent.clone(), options.clone());
+        }
+        if let Some(agent) = agent.as_ref() {
+            self.local_state
+                .set_ai_config(agent, super::text::to_stored(&options));
         }
         let updated = self
             .with_chat_mut(conversation_id, |chat| chat.config_options = options)
@@ -814,6 +872,15 @@ impl AppState {
         if chat.config_defaults_applied {
             return;
         }
+        // A fresh session opens *during* the first turn, so its config selectors
+        // arrive mid-turn. Applying a selector change then is both pointless (the
+        // running turn's model is already fixed) and rejected by the backend as
+        // "a turn is already in progress". Defer until the turn ends; `on_ai_finished`
+        // re-invokes this once streaming stops. `config_defaults_applied` stays false
+        // so the deferred apply still fires.
+        if chat.streaming {
+            return;
+        }
         chat.config_defaults_applied = true;
         let to_apply = default_config_changes(&chat.config_options, &model, &reasoning, &mode);
         for (config_id, value) in to_apply {
@@ -835,6 +902,7 @@ impl AppState {
         };
         state.open_config = None;
         let conversation_id = state.active().conversation_id;
+        let agent = state.active().provider.clone();
         let chat = state.active_mut();
         // Optimistic local update + remember the category for the settings write.
         let mut category = None;
@@ -844,13 +912,16 @@ impl AppState {
                 category = Some(opt.category);
             }
         }
-        // Mirror the pick into the pre-session cache too, so a pick made before this
-        // chat opens its session (rendered from the cache) shows immediately and the
-        // category is still found when the chat has no live options yet.
-        for opt in &mut state.last_config_options {
-            if opt.id == config_id {
-                opt.current_value = value.clone();
-                category = category.or(Some(opt.category));
+        // Mirror the pick into the pre-session cache for this agent too, so a pick
+        // made before the chat opens its session (rendered from the cache) shows
+        // immediately and the category is still found when the chat has no live
+        // options yet.
+        if let Some(cached) = state.provider_config_options.get_mut(&agent) {
+            for opt in cached {
+                if opt.id == config_id {
+                    opt.current_value = value.clone();
+                    category = category.or(Some(opt.category));
+                }
             }
         }
         // Persist as the central default for new chats (not retroactive).
@@ -904,6 +975,128 @@ impl AppState {
         *state.completion_commands.borrow_mut() = state.active().commands.clone();
     }
 
+    /// Copy the whole active chat to the clipboard as Markdown, so it pastes into a
+    /// notes app (Notion, Obsidian, …) as styled blocks — headings, lists, code, and
+    /// GFM tables intact. The OS clipboard here carries plain text only (no rich/HTML
+    /// flavor), but Markdown is what those apps re-style on paste, so this is the
+    /// reliable "copy the styled stuff" path for a whole conversation.
+    pub(crate) fn copy_conversation(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.assistant.as_ref() else {
+            return;
+        };
+        let mut out = String::new();
+        for msg in &state.active().messages {
+            let text = msg.text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let who = match msg.role {
+                ChatRole::User => "You",
+                ChatRole::Assistant => "Agent",
+            };
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            // Bold role label, then the turn verbatim (assistant turns are already
+            // Markdown; user turns are plain text, which is valid Markdown too).
+            out.push_str("**");
+            out.push_str(who);
+            out.push_str(":**\n\n");
+            out.push_str(text);
+        }
+        if out.trim().is_empty() {
+            self.notify(
+                flint::ToastVariant::Info,
+                "This chat has nothing to copy yet.",
+                cx,
+            );
+            return;
+        }
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(out));
+        self.notify(
+            flint::ToastVariant::Success,
+            "Copied the chat as Markdown.",
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Build the selectable, copyable text leaves for a chat's *settled* messages
+    /// (Feature: highlight and copy transcript text). One [`flint::SelectableLabel`]
+    /// per Markdown text leaf for an assistant turn, or a single plain label for a
+    /// user turn. Idempotent: a message already built for the current theme is
+    /// skipped, and an empty/streaming bubble is left alone (the live bubble renders
+    /// as plain `StyledText`). Called when a turn settles and when a chat is restored.
+    fn build_chat_selectables(&mut self, conversation_id: u64, cx: &mut Context<Self>) {
+        let theme = cx.theme().clone();
+        let theme_key = theme.text;
+        let Some(state) = self.assistant.as_mut() else {
+            return;
+        };
+        // All of a chat's leaves share one selection group so only one shows a
+        // highlight at a time; each gets a unique id from the panel's counter.
+        let group = state.selection_group.clone();
+        let mut next_id = state.next_selection_id;
+        {
+            let Some(chat) = state
+                .chats
+                .iter_mut()
+                .find(|c| c.conversation_id == conversation_id)
+            else {
+                return;
+            };
+            // The live (still-streaming) trailing assistant bubble isn't settled yet;
+            // don't freeze selectables for it — it repaints as plain text until it ends.
+            let last = chat.messages.len().saturating_sub(1);
+            for (i, msg) in chat.messages.iter_mut().enumerate() {
+                if msg.text.trim().is_empty() || msg.selectables_current(theme_key) {
+                    continue;
+                }
+                if i == last && msg.role == ChatRole::Assistant && chat.streaming {
+                    continue;
+                }
+                let leaves = match msg.role {
+                    // A user turn is plain text; one label, color inherited from the
+                    // parent (so it survives a theme switch without a rebuild).
+                    ChatRole::User => {
+                        let id = next_id;
+                        next_id += 1;
+                        vec![cx.new(|cx| {
+                            flint::SelectableLabel::new(msg.text.clone(), cx)
+                                .selection_group(group.clone(), id)
+                        })]
+                    }
+                    // An assistant turn is Markdown; walk it the same way the transcript
+                    // renders it, minting one selectable label per text leaf in order.
+                    ChatRole::Assistant => {
+                        let blocks = msg.markdown();
+                        let mut leaves = Vec::new();
+                        let _ =
+                            crate::markdown::render_blocks_with(&blocks, &theme, &mut |text, runs| {
+                                if !text.is_empty() {
+                                    let id = next_id;
+                                    next_id += 1;
+                                    leaves.push(cx.new(|cx| {
+                                        flint::SelectableLabel::new(text, cx)
+                                            .with_runs(runs)
+                                            .selection_group(group.clone(), id)
+                                    }));
+                                }
+                                gpui::div().into_any_element()
+                            });
+                        leaves
+                    }
+                };
+                msg.set_selectables(leaves, theme_key);
+            }
+        }
+        // Persist the advanced counter so later builds keep minting fresh ids.
+        if let Some(state) = self.assistant.as_mut() {
+            state.next_selection_id = next_id;
+        }
+        cx.notify();
+    }
+
     // --- event sinks (driven from `on_event`) --------------------------------
 
     pub(crate) fn on_ai_delta(
@@ -926,18 +1119,43 @@ impl AppState {
                     grew = true;
                 }
                 red_service::AiDelta::Thinking(t) => chat.assistant_bubble().thinking.push_str(&t),
-                red_service::AiDelta::ToolStarted { name } => {
-                    chat.status = Some(format!("Running {name}…").into());
+                red_service::AiDelta::ActivityStarted {
+                    id,
+                    parent,
+                    kind,
+                    status,
+                } => {
+                    let node = red_core::ActivityNode {
+                        id,
+                        kind,
+                        status,
+                        detail: None,
+                        children: Vec::new(),
+                    };
+                    let bubble = chat.assistant_bubble();
+                    match parent
+                        .as_deref()
+                        .and_then(|p| find_activity_mut(&mut bubble.activity, p))
+                    {
+                        Some(parent_node) => parent_node.children.push(node),
+                        None => bubble.activity.push(node),
+                    }
                 }
-                red_service::AiDelta::ToolFinished { name, ok } => {
-                    chat.status = Some(
-                        if ok {
-                            format!("{name} ✓")
-                        } else {
-                            format!("{name} failed")
+                red_service::AiDelta::ActivityUpdated { id, status, detail } => {
+                    if let Some(node) =
+                        find_activity_mut(&mut chat.assistant_bubble().activity, &id)
+                    {
+                        // `status` is `None` for a detail-only refresh (streamed progress).
+                        if let Some(status) = status {
+                            node.status = status;
                         }
-                        .into(),
-                    );
+                        if detail.is_some() {
+                            node.detail = detail;
+                        }
+                    }
+                }
+                red_service::AiDelta::PlanUpdated { steps } => {
+                    chat.assistant_bubble().plan = steps;
                 }
             }
             // Reduced motion reveals everything at once; otherwise the ticker walks
@@ -1043,6 +1261,12 @@ impl AppState {
             if usage != red_service::AiUsage::default() {
                 chat.last_usage = Some(usage);
             }
+            // The turn is over: settle any still-running activity node (e.g. a
+            // subagent the agent never sent a terminal update for before ending its
+            // turn) so it stops showing a live "working" pulse.
+            for m in &mut chat.messages {
+                settle_running_nodes(&mut m.activity);
+            }
             // Persist the now-complete exchange so it survives a restart (M-S5).
             persist_chat(chat);
             follow_if_at_bottom(chat);
@@ -1052,6 +1276,12 @@ impl AppState {
             if let Some(request_id) = stranded {
                 self.deny_stranded_permission(conversation_id, request_id);
             }
+            // Apply any config defaults deferred because they arrived mid-turn (a
+            // fresh session opens during the first turn); now streaming has stopped,
+            // the set will land instead of being rejected as "turn in progress".
+            self.apply_default_config(conversation_id, cx);
+            // The answer text is final: build its selectable, copyable leaves.
+            self.build_chat_selectables(conversation_id, cx);
             cx.notify();
             // Drain any still-hidden tail now that no more text is coming.
             self.ensure_reveal_ticker(conversation_id, cx);
@@ -1068,6 +1298,10 @@ impl AppState {
             chat.streaming = false;
             chat.status = None;
             chat.error = Some(message.into());
+            // Stop any live "working" pulse now the turn has ended.
+            for m in &mut chat.messages {
+                settle_running_nodes(&mut m.activity);
+            }
             // A prompt can't outlive its turn: drop any unanswered one, and deny it
             // on the backend so a parked agent decision sink isn't left blocking.
             chat.pending_permission.take().map(|p| p.request_id)
@@ -1076,6 +1310,8 @@ impl AppState {
             if let Some(request_id) = stranded {
                 self.deny_stranded_permission(conversation_id, request_id);
             }
+            // Whatever answer arrived before the error is final: make it selectable.
+            self.build_chat_selectables(conversation_id, cx);
             cx.notify();
         }
     }
@@ -1104,40 +1340,70 @@ impl AppState {
         }
     }
 
-    /// A `generate_report` tool wrote a standalone HTML report (Feature C): open it
-    /// in the system browser and note it on the owning chat. The file was produced
-    /// service-side; the UI owns the OS hand-off, mirroring export.
+    /// A `generate_report` tool wrote a standalone HTML report (Feature C): surface it
+    /// as a card in the owning chat's transcript, with an "Open" button, rather than
+    /// auto-opening it in the browser. The card is a `Report` activity node on the
+    /// turn's bubble, so it persists with the conversation; the user opens it on demand
+    /// via [`open_report`](Self::open_report).
     pub(crate) fn on_ai_report_ready(
         &mut self,
         conversation_id: u64,
         path: String,
+        title: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        match crate::app::open_in_os(std::path::Path::new(&path)) {
-            Ok(()) => {
-                self.with_chat_mut(conversation_id, |chat| {
-                    chat.status = Some("Report opened in your browser.".into());
+        let attached = self
+            .with_chat_mut(conversation_id, |chat| {
+                let bubble = chat.assistant_bubble();
+                bubble.activity.push(red_core::ActivityNode {
+                    id: format!("report-{path}"),
+                    kind: red_core::ActivityKind::Report {
+                        path: path.clone(),
+                        title,
+                    },
+                    status: red_core::ActivityStatus::Ok,
+                    detail: None,
+                    children: Vec::new(),
                 });
-                self.notify(
-                    flint::ToastVariant::Success,
-                    "Opened report in your browser",
-                    cx,
-                );
-            }
-            Err(e) => {
-                self.notify(
-                    flint::ToastVariant::Error,
-                    format!("Report saved to {path}, but couldn't open it: {e}"),
-                    cx,
-                );
-            }
+            })
+            .is_some();
+        // A report for a chat that's gone (evicted) can't be shown as a card; fall back
+        // to opening it so the work isn't silently lost.
+        if !attached {
+            let _ = crate::app::open_in_os(std::path::Path::new(&path));
         }
         cx.notify();
+    }
+
+    /// Open a report card's HTML file in the system browser (the card's "Open"
+    /// button). The file was written service-side; the UI owns the OS hand-off.
+    pub(crate) fn open_report(&mut self, path: String, cx: &mut Context<Self>) {
+        if let Err(e) = crate::app::open_in_os(std::path::Path::new(&path)) {
+            self.notify(
+                flint::ToastVariant::Error,
+                format!("Couldn't open the report: {e}"),
+                cx,
+            );
+        }
     }
 
     /// Answer the active chat's pending tool-permission prompt (its Allow/Deny
     /// buttons). The agent is blocked on this; denying is the safe default if it's
     /// dismissed.
+    /// Toggle a subagent card between expanded and collapsed, pinning the user's
+    /// choice by the subagent's activity id (overriding the status-based default).
+    pub(crate) fn set_subagent_collapsed(
+        &mut self,
+        id: SharedString,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.assistant.as_mut() {
+            state.subagent_collapse.insert(id, collapsed);
+            cx.notify();
+        }
+    }
+
     pub(crate) fn answer_permission(&mut self, allow: bool, cx: &mut Context<Self>) {
         let Some(state) = self.assistant.as_mut() else {
             return;
@@ -1263,6 +1529,39 @@ fn follow_if_at_bottom(chat: &ChatSession) {
     }
 }
 
+/// Find an activity node by id anywhere in a timeline (depth-first), so a status
+/// update resolves the right node whether it's top-level or nested under a
+/// subagent. Ids are unique within a turn, so the first match is the one.
+fn find_activity_mut<'a>(
+    nodes: &'a mut [red_core::ActivityNode],
+    id: &str,
+) -> Option<&'a mut red_core::ActivityNode> {
+    for node in nodes {
+        if node.id == id {
+            return Some(node);
+        }
+        if let Some(found) = find_activity_mut(&mut node.children, id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Flip any still-`Running`/`Pending` activity node to `Ok` (recursively), used when
+/// a turn ends: an unresolved node — e.g. a subagent the agent never sent a terminal
+/// update for before ending its turn — would otherwise show a live "working" pulse
+/// forever. `Ok` is the least-bad settle (it ran; we have no per-node failure signal,
+/// and the turn-level error, if any, is surfaced separately).
+fn settle_running_nodes(nodes: &mut [red_core::ActivityNode]) {
+    use red_core::ActivityStatus::{Ok as StatusOk, Pending, Running};
+    for node in nodes {
+        if matches!(node.status, Running | Pending) {
+            node.status = StatusOk;
+        }
+        settle_running_nodes(&mut node.children);
+    }
+}
+
 /// Persist one chat to its flat file (one JSON per conversation), titled from its
 /// first user message. Called after each finished turn and when a chat is closed. A
 /// chat with no real assistant reply yet (only a pending/aborted user turn) isn't
@@ -1304,6 +1603,8 @@ fn persist_chat(chat: &mut ChatSession) {
                 },
                 text: m.text.clone(),
                 thinking: m.thinking.clone(),
+                activity: m.activity.clone(),
+                plan: m.plan.clone(),
             })
             .collect(),
         path: Default::default(),

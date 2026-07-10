@@ -7,13 +7,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- ER diagram: a read-only, pannable/zoomable map of the schema — every table a
+- ER diagram: a read-only, pannable/zoomable map of the schema - every table a
   box (columns marked PK/FK), every foreign key a connector. Open it from the
   schema panel's diagram button, the Query menu, or the command palette
   (`schema: ER diagram`). Drag boxes to arrange, scroll to pan, ⌘/Ctrl+scroll to
   zoom, Fit to frame it all; double-click a table to browse it.
 - Format SQL: beautify the editor's query in place (⌥⌘F, the Query menu, or the
-  command palette) — re-indents, upper-cases keywords, and puts each clause on
+  command palette) - re-indents, upper-cases keywords, and puts each clause on
   its own line.
 - Export a result as SQL `INSERT` statements (Export ▸ SQL). The table name comes
   from the file you save to.
@@ -35,6 +35,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and choose exactly which connections to bring in. Installs kept inside a
   Flatpak sandbox are found too.
 - The selected connection on the welcome screen is outlined in its own colour.
+- Reports the AI assistant generates now stay in the chat as a card with an
+  "Open" button, instead of flashing open in your browser on their own. Open
+  them when you want; the card persists with the conversation.
 
 ### Fixed
 - Windows: clicks on the toolbar controls (the Settings gear, the connection
@@ -62,7 +65,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Column stats at a glance: count, distinct, nulls, min/max, sum/avg for the
   selected column.
 - Split view: work in two query tabs side by side (⌘\).
-- Copy a result or table into another table — in the same database or across
+- Copy a result or table into another table - in the same database or across
   connections.
 - Migrate tables into a new database, with foreign keys, indexes, and
   auto-increment settings carried over.
@@ -82,7 +85,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in Settings.
 
 ### Fixed
-- Linux: the window now has a proper titlebar — move, resize, minimize, and
+- Linux: the window now has a proper titlebar - move, resize, minimize, and
   close work on desktops that don't draw one themselves.
 - Editing JSON and other typed cells now works reliably, and inline editing in
   the inspector is seamless.
@@ -120,7 +123,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - AI assistant (⌘L): chat about your schema and data using the Claude API or
   your Claude subscription. You approve every tool it uses, conversations are
   saved, and it can draw chart reports.
-- Optionally let the assistant change data on a specific connection — every
+- Optionally let the assistant change data on a specific connection - every
   statement still needs your approval.
 - Connecting through an unknown SSH host now shows its fingerprint and offers
   "Trust & retry".
@@ -205,7 +208,7 @@ The first release: explore a schema, run SQL, browse large tables, and export.
 - Connect to SQLite, PostgreSQL, and MySQL/MariaDB; passwords live in your
   system keychain, never in a plain file.
 - Schema explorer, SQL editor with schema-aware completion, and query tabs.
-- Browse huge tables smoothly — rows stream in as you scroll, so even
+- Browse huge tables smoothly - rows stream in as you scroll, so even
   million-row results stay fast and light on memory.
 - Export results to CSV or JSON.
 - Safety rails: read-only connections, query timeouts, cancellable queries,

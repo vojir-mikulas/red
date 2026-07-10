@@ -69,12 +69,13 @@ pub(crate) fn load() -> Vec<SavedQuery> {
     out
 }
 
-/// Save `sql` under `name`, returning the file written. Writes a single managed
-/// `-- name:` header (stripping any the body already carries, so re-saving an
-/// opened query doesn't stack headers) over the body, atomically (temp file +
-/// rename) so a crash can't leave a partial file. The file stem is a slug of the
-/// name, so re-saving the same name overwrites in place.
-pub(crate) fn save(name: &str, sql: &str) -> Result<PathBuf> {
+/// Save `sql` under `name` (with an optional `description`), returning the file
+/// written. Writes the managed `-- name:` / `-- description:` header (stripping any
+/// the body already carries, so re-saving an opened query doesn't stack headers)
+/// over the body, atomically (temp file + rename) so a crash can't leave a partial
+/// file. The file stem is a slug of the name, so re-saving the same name overwrites
+/// in place.
+pub(crate) fn save(name: &str, description: Option<&str>, sql: &str) -> Result<PathBuf> {
     use std::io::Write;
 
     let dir = queries_dir().context("no config directory for saved queries")?;
@@ -82,7 +83,11 @@ pub(crate) fn save(name: &str, sql: &str) -> Result<PathBuf> {
     let dest = dir.join(format!("{}.sql", slug(name)));
 
     let body = strip_managed_header(sql);
-    let contents = format!("-- name: {}\n\n{}\n", name.trim(), body.trim_end());
+    let header = match description.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(desc) => format!("-- name: {}\n-- description: {desc}\n\n", name.trim()),
+        None => format!("-- name: {}\n\n", name.trim()),
+    };
+    let contents = format!("{header}{}\n", body.trim_end());
 
     let tmp = dest.with_extension(format!("sql.tmp.{}", std::process::id()));
     // Owner-only on Unix: a saved snippet can embed literal credentials or PII in a

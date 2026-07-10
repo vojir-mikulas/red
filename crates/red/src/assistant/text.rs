@@ -58,6 +58,77 @@ pub(super) fn slash_candidates(
         .collect()
 }
 
+/// Map a `red_service::AiConfigCategory` to/from the lowercase string persisted in
+/// `state.json`, so a future category doesn't break older files (unknown → `Other`).
+fn category_to_str(cat: red_service::AiConfigCategory) -> &'static str {
+    match cat {
+        red_service::AiConfigCategory::Model => "model",
+        red_service::AiConfigCategory::Reasoning => "reasoning",
+        red_service::AiConfigCategory::Mode => "mode",
+        red_service::AiConfigCategory::Other => "other",
+    }
+}
+
+fn category_from_str(s: &str) -> red_service::AiConfigCategory {
+    match s {
+        "model" => red_service::AiConfigCategory::Model,
+        "reasoning" => red_service::AiConfigCategory::Reasoning,
+        "mode" => red_service::AiConfigCategory::Mode,
+        _ => red_service::AiConfigCategory::Other,
+    }
+}
+
+/// A live config-option set as the serde-friendly shape persisted per agent, so the
+/// composer can redraw the model/reasoning dropdowns on the next launch before a
+/// chat opens its session.
+pub(super) fn to_stored(
+    options: &[red_service::AiConfigOption],
+) -> Vec<crate::local_state::StoredConfigOption> {
+    options
+        .iter()
+        .map(|o| crate::local_state::StoredConfigOption {
+            id: o.id.clone(),
+            name: o.name.clone(),
+            category: category_to_str(o.category).to_string(),
+            current_value: o.current_value.clone(),
+            choices: o
+                .choices
+                .iter()
+                .map(|c| crate::local_state::StoredConfigChoice {
+                    value: c.value.clone(),
+                    name: c.name.clone(),
+                    description: c.description.clone(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// The inverse of [`to_stored`]: a persisted config-option set back into the live
+/// `red_service` shape the composer renders.
+pub(super) fn from_stored(
+    options: &[crate::local_state::StoredConfigOption],
+) -> Vec<red_service::AiConfigOption> {
+    options
+        .iter()
+        .map(|o| red_service::AiConfigOption {
+            id: o.id.clone(),
+            name: o.name.clone(),
+            category: category_from_str(&o.category),
+            current_value: o.current_value.clone(),
+            choices: o
+                .choices
+                .iter()
+                .map(|c| red_service::AiConfigChoice {
+                    value: c.value.clone(),
+                    name: c.name.clone(),
+                    description: c.description.clone(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// Which config selectors a fresh session should switch to honor the central
 /// defaults: for each Model/Reasoning option whose stored default is non-empty, an
 /// advertised choice, and not already current, the `(config_id, value)` to apply.
@@ -381,16 +452,19 @@ mod tests {
                 role: "user".into(),
                 text: "hi".into(),
                 thinking: String::new(),
+                ..Default::default()
             },
             crate::conversations::StoredMessage {
                 role: "assistant".into(),
                 text: "hello".into(),
                 thinking: "ignored".into(),
+                ..Default::default()
             },
             crate::conversations::StoredMessage {
                 role: "assistant".into(),
                 text: "   ".into(),
                 thinking: String::new(),
+                ..Default::default()
             },
         ];
         let seed = render_transcript(&msgs).expect("non-empty");

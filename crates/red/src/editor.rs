@@ -9,11 +9,10 @@ use std::rc::Rc;
 
 use flint::prelude::*;
 use gpui::{div, prelude::*, px, Context, Hsla, Pixels, Point, SharedString, Window};
-use red_core::ObjectKind;
+use red_core::{DbKind, FkEdge, ObjectKind, SchemaMeta, TableDetail};
 use red_service::Command;
 
 use crate::app::{ActiveConn, AppState, Phase};
-use crate::schema::SchemaState;
 use crate::sql::CompletionContext;
 
 /// How many candidates the popup ever shows; the editor renders at most 8, but
@@ -76,6 +75,17 @@ struct TableCand {
     is_view: bool,
 }
 
+/// One join relationship available from a table: the `other` table it connects
+/// to and the `(this_col, other_col)` pairs, oriented from *this* table's side so
+/// the completion can spell `this.this_col = other.other_col`. Both directions of
+/// every FK edge are recorded (a table finds relations whether it holds the key or
+/// is pointed at); a composite key carries more than one pair.
+#[derive(Clone)]
+struct JoinRel {
+    other: SharedString,
+    pairs: Vec<(SharedString, SharedString)>,
+}
+
 /// The completion candidates derived from the loaded schema, grouped so the
 /// provider can rank them by the cursor's context. Rebuilt as the schema grows.
 struct CompletionIndex {
@@ -85,13 +95,46 @@ struct CompletionIndex {
     columns_by_table: HashMap<String, Vec<ColumnCand>>,
     /// Every column across the schema, sorted + deduped by name.
     all_columns: Vec<ColumnCand>,
+    /// Join relations keyed by lower-cased table name, from the connection's FK
+    /// graph. Drives auto-`JOIN` completions and column relationship hints.
+    joins_by_table: HashMap<String, Vec<JoinRel>>,
+    /// Lower-cased names of every table/view — the always-loaded skeleton the
+    /// diagnostics pass checks table existence against.
+    table_names: HashSet<String>,
+    /// Lower-cased names of every namespace (database/schema), so a table qualified
+    /// by an unknown schema (a cross-database ref) is left unvalidated, not flagged.
+    schema_names: HashSet<String>,
+    /// Lower-cased column-name sets keyed by lower-cased table name, for tables
+    /// whose detail is loaded. An absent entry means "not loaded yet", so column
+    /// diagnostics for that table are skipped rather than firing false unknowns.
+    columns_lower: HashMap<String, HashSet<String>>,
+    /// The SQL functions available on *this connection's engine* (name, signature,
+    /// guide), for completion + hover — already filtered by `DbKind`.
+    functions: Vec<(&'static str, &'static str, &'static str)>,
     /// The upper-cased SQL keywords.
     keywords: Vec<SharedString>,
 }
 
-fn build_index(schema: &SchemaState) -> CompletionIndex {
+impl crate::sql::SchemaView for CompletionIndex {
+    fn has_table(&self, table_lower: &str) -> bool {
+        self.table_names.contains(table_lower)
+    }
+    fn columns(&self, table_lower: &str) -> Option<&HashSet<String>> {
+        self.columns_lower.get(table_lower)
+    }
+    fn has_schema(&self, schema_lower: &str) -> bool {
+        self.schema_names.contains(schema_lower)
+    }
+}
+
+fn build_index(
+    schemas: &[SchemaMeta],
+    details: &HashMap<(String, String), TableDetail>,
+    fks: &[FkEdge],
+    kind: DbKind,
+) -> CompletionIndex {
     let mut tables: Vec<TableCand> = Vec::new();
-    for sc in &schema.schemas {
+    for sc in schemas {
         for obj in &sc.objects {
             tables.push(TableCand {
                 name: obj.name.clone().into(),
@@ -102,7 +145,7 @@ fn build_index(schema: &SchemaState) -> CompletionIndex {
 
     let mut columns_by_table: HashMap<String, Vec<ColumnCand>> = HashMap::new();
     let mut all_columns: Vec<ColumnCand> = Vec::new();
-    for ((_, table), detail) in &schema.details {
+    for ((_, table), detail) in details {
         let entry = columns_by_table.entry(table.to_lowercase()).or_default();
         for col in &detail.columns {
             let cand = ColumnCand {
@@ -112,6 +155,34 @@ fn build_index(schema: &SchemaState) -> CompletionIndex {
             entry.push(cand.clone());
             all_columns.push(cand);
         }
+    }
+
+    // Index every FK edge under both endpoints, orienting the column pairs from
+    // that endpoint's side so `join_items` can spell the `ON` clause directly.
+    let mut joins_by_table: HashMap<String, Vec<JoinRel>> = HashMap::new();
+    for edge in fks {
+        joins_by_table
+            .entry(edge.from_table.to_lowercase())
+            .or_default()
+            .push(JoinRel {
+                other: edge.to_table.clone().into(),
+                pairs: edge
+                    .columns
+                    .iter()
+                    .map(|(f, t)| (f.clone().into(), t.clone().into()))
+                    .collect(),
+            });
+        joins_by_table
+            .entry(edge.to_table.to_lowercase())
+            .or_default()
+            .push(JoinRel {
+                other: edge.from_table.clone().into(),
+                pairs: edge
+                    .columns
+                    .iter()
+                    .map(|(f, t)| (t.clone().into(), f.clone().into()))
+                    .collect(),
+            });
     }
 
     tables.sort_by(|a, b| a.name.cmp(&b.name));
@@ -128,11 +199,131 @@ fn build_index(schema: &SchemaState) -> CompletionIndex {
         .map(|kw| SharedString::from(kw.to_uppercase()))
         .collect();
 
+    // Diagnostics lookups: the table skeleton (always loaded) and per-loaded-table
+    // column-name sets, both lower-cased for case-insensitive checks.
+    let table_names: HashSet<String> = tables.iter().map(|t| t.name.to_lowercase()).collect();
+    let schema_names: HashSet<String> = schemas.iter().map(|s| s.name.to_lowercase()).collect();
+    let columns_lower: HashMap<String, HashSet<String>> = columns_by_table
+        .iter()
+        .map(|(table, cols)| {
+            (
+                table.clone(),
+                cols.iter().map(|c| c.name.to_lowercase()).collect(),
+            )
+        })
+        .collect();
+
     CompletionIndex {
         tables,
         columns_by_table,
         all_columns,
+        joins_by_table,
+        table_names,
+        schema_names,
+        columns_lower,
+        functions: crate::sql::functions_for(kind),
         keywords,
+    }
+}
+
+/// The diagnostics provider handed to the editor's decoration seam: it runs the
+/// schema-aware [`crate::sql::diagnostics`] pass against the live buffer each paint
+/// and maps each finding to an error-styled wavy underline.
+fn decoration_provider(
+    index: Rc<CompletionIndex>,
+) -> impl Fn(&str) -> Vec<flint::Decoration> + 'static {
+    move |content| {
+        crate::sql::diagnostics(content, index.as_ref())
+            .into_iter()
+            .map(|d| flint::Decoration {
+                range: d.range,
+                style: flint::DecorationStyle::Error,
+            })
+            .collect()
+    }
+}
+
+/// The token covering byte `offset`: its text and style — the thing a hover peeks
+/// at. `None` when the offset sits in whitespace or punctuation.
+fn token_at(content: &str, offset: usize) -> Option<(String, flint::TokenStyle)> {
+    crate::sql::tokenize(content)
+        .into_iter()
+        .find_map(|(r, style)| {
+            r.contains(&offset)
+                .then(|| (content[r.clone()].to_string(), style))
+        })
+}
+
+/// The hover-peek provider: hovering an error shows its message; a function shows
+/// its signature; a table shows its columns; a column of a referenced table shows
+/// its type. Reuses the resident schema + function catalog — no fetch.
+fn hover_provider(
+    index: Rc<CompletionIndex>,
+) -> impl Fn(&str, usize) -> Option<SharedString> + 'static {
+    move |content, offset| {
+        // A diagnostic under the pointer wins — surface its message.
+        if let Some(d) = crate::sql::diagnostics(content, index.as_ref())
+            .into_iter()
+            .find(|d| d.range.contains(&offset))
+        {
+            return Some(SharedString::from(d.message));
+        }
+
+        let (word, style) = token_at(content, offset)?;
+        let wl = word.to_lowercase();
+
+        // A function call → its signature and one-line guide (known functions only,
+        // so an engine-specific or user-defined function simply shows nothing).
+        if style == flint::TokenStyle::Function {
+            return index
+                .functions
+                .iter()
+                .find(|(name, _, _)| *name == wl)
+                .map(|(_, sig, doc)| SharedString::from(format!("{sig}\n{doc}")));
+        }
+        if style != flint::TokenStyle::Identifier {
+            return None;
+        }
+
+        // A table name → its column list (with types when the detail is loaded).
+        if index.table_names.contains(&wl) {
+            let mut peek = word.clone();
+            match index.columns_by_table.get(&wl) {
+                Some(cols) => {
+                    for c in cols.iter().take(14) {
+                        peek.push('\n');
+                        if c.ty.is_empty() {
+                            peek.push_str(&format!("  {}", c.name));
+                        } else {
+                            peek.push_str(&format!("  {}  {}", c.name, c.ty));
+                        }
+                    }
+                    if cols.len() > 14 {
+                        peek.push_str(&format!("\n  … {} more", cols.len() - 14));
+                    }
+                }
+                None => peek.push_str("\n  (columns not loaded)"),
+            }
+            return Some(SharedString::from(peek));
+        }
+
+        // A column of a table the statement references → its type.
+        for (_, table) in crate::sql::referenced_tables_at(content, offset) {
+            if let Some(cols) = index.columns_by_table.get(&table.to_lowercase()) {
+                if let Some(c) = cols.iter().find(|c| c.name.to_lowercase() == wl) {
+                    let ty = if c.ty.is_empty() {
+                        "column".to_string()
+                    } else {
+                        c.ty.to_string()
+                    };
+                    return Some(SharedString::from(format!(
+                        "{}  {}\nin {}",
+                        c.name, ty, table
+                    )));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -175,6 +366,94 @@ fn function_item(name: &str, sig: &str, doc: &str) -> CompletionItem {
         .documentation(SharedString::from(doc))
 }
 
+/// A column completion enriched, when the column is a foreign key into a table
+/// referenced by the statement, with a `→ target.col` relationship hint in place
+/// of the generic doc line — so a join key reads as one at a glance.
+fn column_item_hinted(col: &ColumnCand, rel: Option<&String>) -> CompletionItem {
+    match rel {
+        Some(target) => {
+            let item = CompletionItem::new(col.name.clone(), CompletionKind::Field)
+                .documentation(SharedString::from(format!("→ {target}")));
+            if col.ty.is_empty() {
+                item
+            } else {
+                item.detail(col.ty.clone())
+            }
+        }
+        None => column_item(col),
+    }
+}
+
+/// A short alias for a table in a synthesised JOIN: its first letter, or the whole
+/// (lower-cased) name when that letter is already taken by another table in the
+/// statement, so the `ON` clause never references an ambiguous alias.
+fn suggest_alias(table: &str, taken: &HashSet<String>) -> String {
+    if let Some(c) = table.chars().find(|c| c.is_ascii_alphabetic()) {
+        let a = c.to_ascii_lowercase().to_string();
+        if !taken.contains(&a) {
+            return a;
+        }
+    }
+    table.to_lowercase()
+}
+
+/// For a table referenced by the statement, map each of its foreign-key columns
+/// (lower-cased) to a `target_table.target_col` string, so column completions can
+/// show where the key points.
+fn fk_hints(index: &CompletionIndex, table_key: &str) -> HashMap<String, String> {
+    let mut hints = HashMap::new();
+    if let Some(rels) = index.joins_by_table.get(table_key) {
+        for rel in rels {
+            for (mine, theirs) in &rel.pairs {
+                hints
+                    .entry(mine.to_lowercase())
+                    .or_insert_with(|| format!("{}.{}", rel.other, theirs));
+            }
+        }
+    }
+    hints
+}
+
+/// The auto-`JOIN` completions for a post-`JOIN` cursor: for each schema table
+/// related (by the FK graph) to a table already in the statement, one completion
+/// that inserts `<table> <alias> ON <a>.<col> = <b>.<col>`, pre-filled from the
+/// relation. Composite keys join their pairs with `AND`. Tables with no relation
+/// to the current statement contribute nothing here (the caller still appends the
+/// plain table list as a fallback).
+fn join_items(index: &CompletionIndex, content: &str, cursor: usize) -> Vec<CompletionItem> {
+    let referenced = crate::sql::referenced_tables_at(content, cursor);
+    let taken: HashSet<String> = referenced.iter().map(|(a, _)| a.clone()).collect();
+    let mut out = Vec::new();
+    for t in &index.tables {
+        let Some(rels) = index.joins_by_table.get(&t.name.to_lowercase()) else {
+            continue;
+        };
+        for rel in rels {
+            // The other endpoint must already be in the statement; use its alias.
+            let Some((base_alias, _)) = referenced
+                .iter()
+                .find(|(_, tbl)| tbl.eq_ignore_ascii_case(&rel.other))
+            else {
+                continue;
+            };
+            let alias = suggest_alias(&t.name, &taken);
+            let on = rel
+                .pairs
+                .iter()
+                .map(|(mine, theirs)| format!("{alias}.{mine} = {base_alias}.{theirs}"))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let label = format!("{} {} ON {}", t.name, alias, on);
+            out.push(
+                CompletionItem::new(SharedString::from(label), CompletionKind::Object)
+                    .detail("join")
+                    .documentation(SharedString::from(format!("joins {}", rel.other))),
+            );
+        }
+    }
+    out
+}
+
 /// The provider closure handed to the editor's completion seam. It reads the
 /// cursor's context (member access, a table position, a column expression, or a
 /// statement start) and offers the matching candidates, most-relevant first.
@@ -213,17 +492,29 @@ fn completion_provider(
                 }
             }
             CompletionContext::Table => ordered.extend(index.tables.iter().map(table_item)),
+            CompletionContext::Join => {
+                // Auto-JOIN completions (relation-aware) lead; the plain table
+                // list follows so an unrelated table is still reachable here.
+                ordered.extend(join_items(&index, content, cursor));
+                ordered.extend(index.tables.iter().map(table_item));
+            }
             CompletionContext::Column => {
                 // Columns of the tables this statement actually references rank
                 // first, then the rest of the schema, then functions, tables, keywords.
                 for (_, table) in crate::sql::referenced_tables_at(content, cursor) {
-                    if let Some(cols) = index.columns_by_table.get(&table.to_lowercase()) {
-                        ordered.extend(cols.iter().map(column_item));
+                    let key = table.to_lowercase();
+                    let hints = fk_hints(&index, &key);
+                    if let Some(cols) = index.columns_by_table.get(&key) {
+                        ordered.extend(
+                            cols.iter()
+                                .map(|c| column_item_hinted(c, hints.get(&c.name.to_lowercase()))),
+                        );
                     }
                 }
                 ordered.extend(index.all_columns.iter().map(column_item));
                 ordered.extend(
-                    crate::sql::FUNCTIONS
+                    index
+                        .functions
                         .iter()
                         .map(|(n, sig, doc)| function_item(n, sig, doc)),
                 );
@@ -712,21 +1003,50 @@ impl AppState {
     /// Run the selection if any, else the statement under the caret. Pushes to
     /// history and streams the first window into the results pane.
     pub(crate) fn run_editor_query(&mut self, cx: &mut Context<Self>) {
+        self.run_editor_query_impl(None, cx);
+    }
+
+    /// Run the statement whose gutter run marker (▶) on 0-based `line` was clicked
+    /// (Phase D). Resolves the marker's byte offset in the active tab, then runs the
+    /// statement there through the same path as ⌘↵.
+    pub(crate) fn run_editor_line(&mut self, line: usize, cx: &mut Context<Self>) {
+        let offset = match &self.phase {
+            Phase::Connected(active) => match active.active() {
+                Some(tab) => {
+                    let content = tab.editor.read(cx).content();
+                    crate::sql::line_start_offset(&content, line)
+                }
+                None => return,
+            },
+            _ => return,
+        };
+        self.run_editor_query_impl(Some(offset), cx);
+    }
+
+    fn run_editor_query_impl(&mut self, force_offset: Option<usize>, cx: &mut Context<Self>) {
         let sql = match &self.phase {
             Phase::Connected(active) => match active.active() {
                 Some(tab) => {
                     let editor = tab.editor.read(cx);
-                    // An explicit selection runs verbatim; otherwise run just the
-                    // statement under the caret, not the whole buffer: a buffer of
-                    // several statements can't open as one result (the paging wrap
-                    // is a single subquery), so running the caret's statement is what
-                    // the user means and avoids a cryptic engine error.
-                    match editor.selected_text() {
-                        Some(sel) => sel,
-                        None => {
+                    match force_offset {
+                        // A clicked gutter marker runs exactly its statement.
+                        Some(off) => {
                             let content = editor.content();
-                            crate::sql::statement_at(&content, editor.cursor_offset()).to_string()
+                            crate::sql::statement_at(&content, off).to_string()
                         }
+                        // An explicit selection runs verbatim; otherwise run just the
+                        // statement under the caret, not the whole buffer: a buffer of
+                        // several statements can't open as one result (the paging wrap
+                        // is a single subquery), so running the caret's statement is
+                        // what the user means and avoids a cryptic engine error.
+                        None => match editor.selected_text() {
+                            Some(sel) => sel,
+                            None => {
+                                let content = editor.content();
+                                crate::sql::statement_at(&content, editor.cursor_offset())
+                                    .to_string()
+                            }
+                        },
                     }
                 }
                 None => return,
@@ -968,14 +1288,21 @@ impl AppState {
                     .iter()
                     .map(|t| t.editor.clone())
                     .collect::<Vec<_>>(),
-                Rc::new(build_index(&active.schema)),
+                Rc::new(build_index(
+                    &active.schema.schemas,
+                    &active.schema.details,
+                    &active.fk_graph,
+                    active.config.kind,
+                )),
             ),
             _ => return,
         };
         for editor in editors {
             let index = index.clone();
             editor.update(cx, |editor, cx| {
-                editor.set_rich_completions(completion_provider(index), cx)
+                editor.set_rich_completions(completion_provider(index.clone()), cx);
+                editor.set_hover(hover_provider(index.clone()), cx);
+                editor.set_decorations(decoration_provider(index), cx);
             });
         }
     }
@@ -1019,8 +1346,13 @@ fn resolve_in_catalog(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_in_catalog;
-    use red_core::{ObjectKind, ObjectMeta, SchemaMeta};
+    use super::{
+        build_index, completion_provider, hover_provider, join_items, resolve_in_catalog,
+        CompletionIndex,
+    };
+    use red_core::{ColumnMeta, DbKind, FkEdge, ObjectKind, ObjectMeta, SchemaMeta, TableDetail};
+    use std::collections::HashMap;
+    use std::rc::Rc;
 
     fn ns(name: &str, objects: &[&str]) -> SchemaMeta {
         SchemaMeta {
@@ -1074,5 +1406,142 @@ mod tests {
         // A qualifier naming a table the schema doesn't hold → no tag.
         assert_eq!(resolve_in_catalog(&cat, Some("public"), "events"), None);
         assert_eq!(resolve_in_catalog(&cat, Some("nope"), "users"), None);
+    }
+
+    // --- FK-aware completion (Phase A) ---
+
+    fn col(name: &str) -> ColumnMeta {
+        ColumnMeta {
+            name: name.into(),
+            type_name: Some("int".into()),
+            not_null: false,
+            primary_key: false,
+            default: None,
+            auto_increment: false,
+        }
+    }
+
+    /// Two tables with `orders.customer_id → customers.id`.
+    fn fk_fixture() -> CompletionIndex {
+        let schemas = vec![SchemaMeta {
+            name: "main".into(),
+            objects: vec![
+                ObjectMeta {
+                    name: "customers".into(),
+                    kind: ObjectKind::Table,
+                },
+                ObjectMeta {
+                    name: "orders".into(),
+                    kind: ObjectKind::Table,
+                },
+            ],
+        }];
+        let mut details = HashMap::new();
+        details.insert(
+            ("main".into(), "customers".into()),
+            TableDetail {
+                columns: vec![col("id"), col("name")],
+                ..Default::default()
+            },
+        );
+        details.insert(
+            ("main".into(), "orders".into()),
+            TableDetail {
+                columns: vec![col("id"), col("customer_id")],
+                ..Default::default()
+            },
+        );
+        let fks = vec![FkEdge {
+            from_schema: Some("main".into()),
+            from_table: "orders".into(),
+            to_schema: Some("main".into()),
+            to_table: "customers".into(),
+            columns: vec![("customer_id".into(), "id".into())],
+        }];
+        build_index(&schemas, &details, &fks, DbKind::Postgres)
+    }
+
+    /// Split a `|`-marked string into (content, cursor byte offset).
+    fn at(s: &str) -> (String, usize) {
+        let cursor = s.find('|').expect("cursor marker");
+        (s.replace('|', ""), cursor)
+    }
+
+    fn pairs_of(rel: &super::JoinRel) -> Vec<(String, String)> {
+        rel.pairs
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn build_index_records_both_fk_directions() {
+        let index = fk_fixture();
+        let from_orders = &index.joins_by_table["orders"][0];
+        assert_eq!(from_orders.other, "customers");
+        assert_eq!(
+            pairs_of(from_orders),
+            vec![("customer_id".into(), "id".into())]
+        );
+        // The pointed-at side records the same edge with reversed orientation.
+        let from_customers = &index.joins_by_table["customers"][0];
+        assert_eq!(from_customers.other, "orders");
+        assert_eq!(
+            pairs_of(from_customers),
+            vec![("id".into(), "customer_id".into())]
+        );
+    }
+
+    #[test]
+    fn join_completion_prefilled_from_fk() {
+        let index = fk_fixture();
+        let (content, cursor) = at("SELECT * FROM orders o JOIN cu|");
+        let items = join_items(&index, &content, cursor);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "customers c ON c.id = o.customer_id");
+        assert_eq!(items[0].detail.as_deref(), Some("join"));
+    }
+
+    #[test]
+    fn join_completion_falls_back_to_table_name_without_alias() {
+        let index = fk_fixture();
+        let (content, cursor) = at("SELECT * FROM orders JOIN cu|");
+        let items = join_items(&index, &content, cursor);
+        assert_eq!(items[0].label, "customers c ON c.id = orders.customer_id");
+    }
+
+    #[test]
+    fn provider_leads_with_join_then_plain_table() {
+        let provider = completion_provider(Rc::new(fk_fixture()));
+        let (content, cursor) = at("SELECT * FROM orders o JOIN cu|");
+        let items = provider(&content, cursor);
+        assert_eq!(items[0].label, "customers c ON c.id = o.customer_id");
+        // The plain "customers" table is still offered as a fallback.
+        assert!(items.iter().any(|i| i.label == "customers"));
+    }
+
+    #[test]
+    fn column_completion_hints_fk_target() {
+        let provider = completion_provider(Rc::new(fk_fixture()));
+        let (content, cursor) = at("SELECT customer| FROM orders o");
+        let items = provider(&content, cursor);
+        let fk_col = items
+            .iter()
+            .find(|i| i.label == "customer_id")
+            .expect("customer_id column offered");
+        assert_eq!(fk_col.documentation.as_deref(), Some("→ customers.id"));
+    }
+
+    #[test]
+    fn hover_shows_function_signature() {
+        let provider = hover_provider(Rc::new(fk_fixture()));
+        // Hovering a known function call surfaces its signature + guide.
+        let (content, cursor) = at("SELECT conc|at(name, id) FROM customers");
+        let text = provider(&content, cursor).expect("function peek");
+        assert!(text.contains("concat("), "{text}");
+        // An unknown (engine-specific / user-defined) function shows nothing —
+        // recognised as a function by shape, but never falsely annotated.
+        let (content, cursor) = at("SELECT zz|zz(name) FROM customers");
+        assert_eq!(provider(&content, cursor), None);
     }
 }

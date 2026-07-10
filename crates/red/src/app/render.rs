@@ -10,13 +10,11 @@ use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::keymap::{
     About, AddRow, BeginEdit, CloseInspector, CloseTab, CycleFocusNext, CycleFocusPrev, DeleteRow,
     Explain, FindInResult, FocusEditor, FocusGrid, FocusOtherHalf, FocusSchema, FormatSql,
-    NewConnection,
-    NewTab, NextTab, OpenSavedQueries, PrevTab, RefreshSchema, ReportBug, RevertChanges, RunQuery,
-    SaveQuery, SearchSchema, SelectAll, SetNull, Settings, ShowChangelog, ShowErDiagram,
-    ShowShortcuts,
-    SubmitChanges, SwitchConnection, SwitchToConnectionSlot, SwitchToPreviousConnection,
-    ToggleAssistant, ToggleColumnsPanel, ToggleFilter, ToggleHistory, ToggleInspector,
-    ToggleSidebar, ToggleSplit,
+    NewConnection, NewTab, NextTab, OpenSavedQueries, PrevTab, RefreshSchema, ReportBug,
+    RevertChanges, RunQuery, SaveQuery, SearchSchema, SelectAll, SetNull, Settings, ShowChangelog,
+    ShowErDiagram, ShowShortcuts, SubmitChanges, SwitchConnection, SwitchToConnectionSlot,
+    SwitchToPreviousConnection, ToggleAssistant, ToggleColumnsPanel, ToggleFilter, ToggleHistory,
+    ToggleInspector, ToggleSidebar, ToggleSplit,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 

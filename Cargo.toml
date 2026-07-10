@@ -135,3 +135,7 @@ opt-level = 2
 #   [patch."https://github.com/vojir-mikulas/flint"]
 #   flint = { path = "../flint" }
 
+# DO NOT COMMIT: local Flint dev patch (editor decoration seam, Phase B).
+[patch."https://github.com/vojir-mikulas/flint"]
+flint = { path = "../flint" }
+

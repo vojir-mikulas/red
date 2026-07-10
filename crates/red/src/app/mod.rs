@@ -547,6 +547,8 @@ impl QueryTab {
         let editor = cx.new(|cx| {
             CodeEditor::new(cx)
                 .highlighter(crate::sql::tokenize)
+                // A ▶ run marker in the gutter on each statement's first line.
+                .gutter_markers(crate::sql::statement_start_lines)
                 .corner_radius(px(0.))
                 .resting_border(false)
                 .a11y_label("Query editor")
@@ -558,6 +560,7 @@ impl QueryTab {
             &editor,
             |this, _editor, event: &CodeEditorEvent, cx| match event {
                 CodeEditorEvent::Run => this.run_editor_query(cx),
+                CodeEditorEvent::RunLine(line) => this.run_editor_line(*line, cx),
                 CodeEditorEvent::Escape => {
                     this.pending_focus = Some(Pane::Grid);
                     cx.notify();
@@ -1161,6 +1164,10 @@ pub struct AppState {
     /// loaded once at startup. Each entry is connection-scoped; the run-bar
     /// popover filters to the active connection's `conn_id`.
     pub(crate) query_history: crate::history::QueryHistory,
+    /// App-managed local state (`state.json`): the last-seen version (for the
+    /// update toast) and the per-agent config-selector cache that lets the
+    /// assistant show its model/reasoning dropdowns before a chat opens a session.
+    pub(crate) local_state: crate::local_state::LocalState,
     /// The connection switcher (⌘P): an always-mounted topbar trigger that opens a
     /// searchable, sectioned popover of the active + recent connections. Its
     /// sections are rebuilt from `connections` + `phase` via [`Self::rebuild_switcher`].
@@ -1760,6 +1767,8 @@ impl AppState {
             .is_some_and(|seen| seen != current_version);
         local_state.mark_seen(current_version);
         let pending_update = is_update.then(|| SharedString::from(current_version));
+        // Kept in the struct so the assistant can persist each agent's advertised
+        // config selectors as they arrive (used to pre-fill the model dropdowns).
 
         Self {
             service,
@@ -1861,6 +1870,7 @@ impl AppState {
             saved_queries: Vec::new(),
             loaded_conversations: Vec::new(),
             query_history: crate::history::QueryHistory::load(),
+            local_state,
             switcher,
             parked: HashMap::new(),
             foreground_session: None,
@@ -2338,11 +2348,18 @@ impl AppState {
             Event::AiReportReady {
                 conversation_id,
                 path,
-            } => self.on_ai_report_ready(conversation_id, path, cx),
+                title,
+            } => self.on_ai_report_ready(conversation_id, path, title, cx),
             Event::AiOpenQuery {
                 conversation_id,
                 sql,
             } => self.on_ai_open_query(conversation_id, sql, cx),
+            Event::AiSaveQuery {
+                conversation_id,
+                name,
+                description,
+                sql,
+            } => self.on_ai_save_query(conversation_id, name, description, sql, cx),
             Event::AiCommandsAvailable {
                 conversation_id,
                 commands,

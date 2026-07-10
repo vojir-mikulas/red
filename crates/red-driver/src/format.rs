@@ -348,7 +348,13 @@ pub(crate) fn sql_table_name(path: &Path) -> String {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     let sanitized: String = stem
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let trimmed = sanitized.trim_matches('_');
     if trimmed.is_empty() || trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) {

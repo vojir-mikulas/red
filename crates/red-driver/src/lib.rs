@@ -1033,6 +1033,17 @@ pub trait DatabaseDriver: Send + Sync {
     /// number of rows affected. A read-only driver rejects the write at the engine.
     async fn execute(&self, sql: &str) -> Result<u64>;
 
+    /// Run several data-modifying statements as ONE atomic transaction: BEGIN, run
+    /// each in order, COMMIT; on any error ROLLBACK the whole batch and return the
+    /// error, so the set lands all-or-nothing. Returns the per-statement affected
+    /// counts (same length/order as `statements`). Backs the assistant's approved
+    /// multi-statement changeset (Feature B): the model proposes N statements, the
+    /// user approves them as a unit, and they commit together or not at all. An empty
+    /// batch is a no-op returning an empty vec without opening a transaction. A
+    /// read-only driver rejects the writes at the engine. (An engine without
+    /// multi-statement transactions runs them sequentially; it documents that.)
+    async fn execute_batch(&self, statements: &[String]) -> Result<Vec<u64>>;
+
     /// Apply a batch of guarded, PK-keyed data edits (Track B6) **atomically** in a
     /// single transaction: render each `op` to dialect SQL with every value **bound**
     /// (see [`edit_sql`]), run them in order, and assert each touches exactly one row,

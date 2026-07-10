@@ -645,6 +645,18 @@ impl DatabaseDriver for ClickhouseDriver {
         Ok(summary.as_deref().and_then(parse_written_rows).unwrap_or(0))
     }
 
+    async fn execute_batch(&self, statements: &[String]) -> Result<Vec<u64>> {
+        // ClickHouse has no multi-statement transactions, so this is NOT atomic: the
+        // statements run in order and a failure leaves earlier ones applied (the error
+        // stops the rest). Acceptable because ClickHouse is a rarely-written OLAP
+        // target here; the SQL engines above wrap the same call in a real transaction.
+        let mut affected = Vec::with_capacity(statements.len());
+        for sql in statements {
+            affected.push(self.execute(sql).await?);
+        }
+        Ok(affected)
+    }
+
     async fn apply_edits(&self, ops: &[EditOp]) -> Result<u64> {
         // An empty batch is a no-op (matching the trait contract) so a stray submit
         // doesn't error. Otherwise: ClickHouse is OLAP, so `UPDATE`/`DELETE` are

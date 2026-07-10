@@ -639,7 +639,7 @@ impl AppState {
             self.notify(ToastVariant::Error, "Give the query a name.", cx);
             return;
         }
-        match crate::queries::save(&name, &sql) {
+        match crate::queries::save(&name, None, &sql) {
             Ok(_) => {
                 self.notify(ToastVariant::Success, format!("Saved query “{name}”."), cx);
             }

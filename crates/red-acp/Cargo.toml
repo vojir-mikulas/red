@@ -13,6 +13,9 @@ authors.workspace = true
 # the rev Zed pins, and unlocks auth methods, MCP-over-ACP, and end-of-turn token
 # usage. Independent of the gpui pin, so the cross-repo gpui contract is untouched.
 agent-client-protocol = { workspace = true, features = ["unstable"] }
+# Shared domain vocabulary for the agent-activity timeline (ActivityKind/Status,
+# PlanStep). Pure data, no gpui/runtime, so the cross-repo gpui pin is untouched.
+red-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 # `process`/`io-util`/`time` drive the agent's bundled CLI for subscription auth

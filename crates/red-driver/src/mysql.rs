@@ -592,6 +592,28 @@ impl DatabaseDriver for MysqlDriver {
         }
     }
 
+    async fn execute_batch(&self, statements: &[String]) -> Result<Vec<u64>> {
+        if statements.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        conn.query_drop(self.begin_stmt())
+            .await
+            .map_err(map_my_err)?;
+        let mut affected = Vec::with_capacity(statements.len());
+        for sql in statements {
+            match conn.query_drop(sql).await {
+                Ok(()) => affected.push(conn.affected_rows()),
+                Err(e) => {
+                    crate::warn_rollback(conn.query_drop("ROLLBACK").await, "execute_batch");
+                    return Err(map_my_err(e));
+                }
+            }
+        }
+        conn.query_drop("COMMIT").await.map_err(map_my_err)?;
+        Ok(affected)
+    }
+
     async fn apply_edits(&self, ops: &[EditOp]) -> Result<u64> {
         if ops.is_empty() {
             return Ok(0);
