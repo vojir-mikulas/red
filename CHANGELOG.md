@@ -21,6 +21,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   newline-delimited JSON.
 - Added Herobrine
 
+### Changed
+- Schema tree: a single click now acts on the row. 
+- Query history: click an entry to open it in a new query tab; ⌘/Ctrl-click to
+  replace the current tab's editor instead. Nothing runs until you do, so a past
+  write is never re-executed by a click.
+
+### Fixed
+- Result grid: a cell holding multi-line text (embedded newlines, tabs, or other
+  control characters) now shows its beginning on a single line, instead of a
+  vertically-centered slice from the middle of the value. The full text is still
+  available by copying the cell or opening it in the detail inspector.
+
 ## [0.15.0] - 2026-07-09
 
 ### Added

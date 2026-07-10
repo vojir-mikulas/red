@@ -604,7 +604,7 @@ impl Render for AppState {
             .children(self.more_menu.map(|pos| self.render_more_menu(pos, cx)))
             // The in-cell FK suggestion dropdown (Track B8) anchors to the editor
             // cell but mounts here so it paints above the grid and escapes its clip.
-            .children(self.render_cell_suggest(cx));
+            .children(self.render_cell_suggest(window, cx));
 
         // Dev perf HUD: register its toggle, overlay the panel last (on top), and
         // close the frame so the rings capture this render's cost.

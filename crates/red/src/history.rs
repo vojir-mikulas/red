@@ -368,10 +368,13 @@ impl AppState {
                                 .flex_col()
                                 .gap_0p5()
                                 .cursor_pointer()
-                                .on_click(move |_, _, cx| {
+                                .on_click(move |event, _, cx| {
+                                    // Plain click opens the entry in a new tab;
+                                    // ⌘/Ctrl-click replaces the current tab instead.
+                                    let replace = event.modifiers().secondary();
                                     let sql = sql.clone();
                                     load_view
-                                        .update(cx, |this, cx| this.load_history(sql, cx))
+                                        .update(cx, |this, cx| this.open_history(sql, replace, cx))
                                         .ok();
                                 })
                                 .child(

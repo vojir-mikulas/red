@@ -394,7 +394,8 @@ impl AppState {
         });
         let sub = cx.subscribe(&input, |this, _, event: &TextInputEvent, cx| match event {
             TextInputEvent::Submit => this.commit_grid_edit(cx),
-            TextInputEvent::Cancel => this.cancel_grid_edit(cx),
+            // Esc closes an open suggestion list first, then cancels the edit.
+            TextInputEvent::Cancel => this.suggest_escape_or_cancel(cx),
             TextInputEvent::Tab => this.advance_grid_edit(true, cx),
             TextInputEvent::BackTab => this.advance_grid_edit(false, cx),
             // Drive the FK picker (Track B8) when one is open; otherwise no-op.
@@ -689,13 +690,24 @@ impl AppState {
         }
     }
 
-    /// Stage a value into a draft (insert) row's cell.
+    /// Stage a value into a draft (insert) row's cell. An emptied cell (`Value::Null`,
+    /// what `coerce_edit_value` returns for blank text) is *unset* rather than stored,
+    /// so the column falls back to the engine default (rendered as a faint "default")
+    /// instead of inserting an explicit `NULL` — clearing a draft cell means "leave it
+    /// to the default", matching DataGrip's new-row behaviour.
     fn stage_draft_value(&mut self, epoch: u64, index: usize, data_col: usize, value: Value) {
         if let Phase::Connected(active) = &mut self.phase {
             if let Some(grid) = active.active_result_mut() {
                 if grid.epoch == epoch {
                     if let Some(draft) = grid.pending.inserts.get_mut(index) {
-                        draft.cells.insert(data_col, value);
+                        match value {
+                            Value::Null => {
+                                draft.cells.remove(&data_col);
+                            }
+                            v => {
+                                draft.cells.insert(data_col, v);
+                            }
+                        }
                     }
                 }
             }

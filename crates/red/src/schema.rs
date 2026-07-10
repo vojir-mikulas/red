@@ -408,10 +408,27 @@ impl AppState {
                     tv.update(cx, |this, cx| this.schema_toggle(node, cx)).ok();
                 }
             })
+            // A single body click acts on the row: a table/view opens in a query
+            // tab, a namespace folder expands/collapses, a column just highlights.
+            // (The chevron owns expansion for tables, so revealing a table's
+            // columns doesn't open it — see the Flint `Tree` chevron hit target.)
             .on_select(move |ix, _event, _window, cx| {
-                if let Some(node) = rows_select[ix].node.clone() {
-                    sv.update(cx, |this, cx| this.schema_select(node, cx)).ok();
-                }
+                let node = rows_select[ix].node.clone();
+                let preview = rows_select[ix].preview.clone();
+                sv.update(cx, |this, cx| match node {
+                    Some(NodeId::Object { .. }) => {
+                        if let Some((schema, table)) = preview {
+                            this.schema_preview(schema, table, cx);
+                        }
+                    }
+                    Some(node @ NodeId::Schema(_)) => {
+                        this.schema_select(node.clone(), cx);
+                        this.schema_toggle(node, cx);
+                    }
+                    Some(node) => this.schema_select(node, cx),
+                    None => {}
+                })
+                .ok();
             })
             .on_activate(move |ix, _window, cx| {
                 if let Some((schema, table)) = rows_activate[ix].preview.clone() {
@@ -612,9 +629,13 @@ impl AppState {
             }
             _ => return,
         };
-        // Reuse the focused tab only if it's untouched; otherwise open a new one
-        // so the user's current query and result are preserved.
-        let reuse = matches!(&self.phase, Phase::Connected(a) if a.active().is_some_and(|t| t.is_pristine(cx)));
+        // Reuse the focused tab if it's untouched, or if it's already browsing
+        // this exact table (so a single click that opens a table and its
+        // trailing double-click, or a re-click, refresh in place instead of
+        // stacking duplicate tabs). Otherwise open a new one so the user's
+        // current query and result are preserved.
+        let reuse = matches!(&self.phase, Phase::Connected(a)
+            if a.active().is_some_and(|t| t.is_pristine(cx) || t.title == label));
         if reuse {
             if let Phase::Connected(active) = &mut self.phase {
                 // Repurpose the focused half's untouched tab in place (it stays in its

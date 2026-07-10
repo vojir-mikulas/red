@@ -114,7 +114,7 @@ impl DisplayCell {
                     CellKind::Text
                 };
                 DisplayCell {
-                    text: s.clone().into(),
+                    text: one_line(s),
                     kind,
                 }
             }
@@ -137,11 +137,29 @@ impl DisplayCell {
                     CellKind::Text
                 };
                 DisplayCell {
-                    text: format!("{}…", c.head).into(),
+                    text: format!("{}…", one_line(&c.head)).into(),
                     kind,
                 }
             }
         }
+    }
+}
+
+/// Collapse a value to a single display line: every control character (newline,
+/// carriage return, tab, …) becomes a space. Grid rows have a fixed height and
+/// center their cells vertically, so a value with embedded newlines would render
+/// as a multi-line block clipped to its *middle* — the start, the part you want,
+/// scrolled out of view. Flattening here keeps the cell one line showing its head;
+/// the raw [`Value`] is untouched, so copy and the detail inspector still get the
+/// real multi-line content. Fast path: text with no control chars clones as-is.
+fn one_line(s: &str) -> SharedString {
+    if s.chars().any(char::is_control) {
+        s.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+            .into()
+    } else {
+        s.to_owned().into()
     }
 }
 
@@ -915,6 +933,31 @@ mod row_tests {
         assert_eq!(row.display[1].text.as_ref(), "hello");
         assert_eq!(row.display[1].kind, CellKind::Text);
         assert!(!row.is_truncated(1));
+    }
+
+    /// A multi-line value flattens to a single display line (control chars → space)
+    /// so the grid cell shows its head, not a vertically-centered middle slice. The
+    /// raw value stays intact for copy/inspect.
+    #[test]
+    fn multiline_text_renders_single_line() {
+        let row = Row::new(vec![Value::Text("first line\nsecond\tline\r\n".into())]);
+        assert_eq!(row.display[0].text.as_ref(), "first line second line  ");
+        assert_eq!(
+            row.values[0],
+            Value::Text("first line\nsecond\tline\r\n".into()),
+            "the underlying value is untouched"
+        );
+    }
+
+    /// A capped multi-line head is flattened too, before the ellipsis is appended.
+    #[test]
+    fn capped_multiline_head_flattens() {
+        let row = Row::new(vec![Value::Capped(CappedCell {
+            head: "line one\nline two".into(),
+            len: 9000,
+            blob: false,
+        })]);
+        assert_eq!(row.display[0].text.as_ref(), "line one line two…");
     }
 }
 

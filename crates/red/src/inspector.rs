@@ -794,24 +794,11 @@ impl AppState {
         // editor inherits the body's mono typography from its container, so the value
         // is edited in the very font/size it was just shown in.
         if let Some(edit) = self.inspector.as_ref().and_then(|i| i.editing.as_ref()) {
-            let hint = crate::keymap::localize_hint(
-                "Editing: ⌘↵ to save, Esc to cancel. Enter inserts a line; an empty value sets NULL.",
-            );
             let field = div()
                 .flex_1()
                 .min_h(px(0.))
                 .flex()
                 .flex_col()
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .px_3()
-                        .py_2()
-                        .text_size(s11)
-                        .text_color(faint)
-                        .font_family(ui_family.clone())
-                        .child(hint),
-                )
                 .child(
                     div()
                         .flex_1()

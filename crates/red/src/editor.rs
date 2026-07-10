@@ -1264,6 +1264,26 @@ impl AppState {
         cx.notify();
     }
 
+    /// Open a history entry from the panel: a plain click opens it in a **new**
+    /// query tab (titled from the SQL), a ⌘/Ctrl-click **replaces** the current
+    /// tab's editor in place. With no open tab, both open a fresh one. The panel
+    /// stays open either way so the user can keep browsing. Nothing runs — the SQL
+    /// is only seeded, so a past write is never re-executed by a stray click.
+    pub(crate) fn open_history(
+        &mut self,
+        sql: String,
+        replace_current: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let has_tab = matches!(&self.phase, Phase::Connected(a) if a.active().is_some());
+        if !replace_current || !has_tab {
+            let tab = crate::app::QueryTab::new(history_label(&sql), cx);
+            self.push_tab(tab, cx);
+            self.pending_focus = Some(crate::app::Pane::Editor);
+        }
+        self.load_history(sql, cx);
+    }
+
     /// Load a history entry's SQL into the active tab's editor. The dock panel
     /// stays open (unlike the old transient popover) so the user can keep browsing.
     pub(crate) fn load_history(&mut self, sql: String, cx: &mut Context<Self>) {

@@ -11,7 +11,8 @@
 
 use flint::prelude::*;
 use gpui::{
-    canvas, div, point, prelude::*, px, AnyElement, Bounds, Context, Entity, Pixels, SharedString,
+    canvas, div, point, prelude::*, px, Anchor, AnyElement, Bounds, Context, Entity, Pixels,
+    ScrollHandle, SharedString, Window,
 };
 use red_core::{ColumnMeta, LookupRow, TableRef, Value};
 use red_service::{Command, SessionId};
@@ -47,11 +48,15 @@ pub(crate) struct CellSuggest {
     /// synchronously from the enum cache). Guards `on_lookup_ready` from overwriting an
     /// enum picker if a same-epoch FK reply for a colliding target ever arrives.
     pub(crate) from_lookup: bool,
+    /// Scroll position of the dropdown list, so ↑/↓ can scroll the highlight into view
+    /// (the wheel rides this handle too, keeping the scroll inside the popup).
+    pub(crate) scroll: ScrollHandle,
 }
 
 impl CellSuggest {
     /// Recompute [`filtered`](Self::filtered) for `query`: a case-insensitive substring
-    /// match over each row's display string. Keeps the highlight in range.
+    /// match over each row's display string. Auto-highlights the top match (so Enter/Tab
+    /// accepts it, IDE-completion style) and resets the list scroll to the top.
     fn recompute(&mut self, query: &str) {
         let q = query.trim().to_ascii_lowercase();
         self.query = query.to_string();
@@ -62,7 +67,8 @@ impl CellSuggest {
             .filter(|(_, r)| q.is_empty() || display(r).to_ascii_lowercase().contains(&q))
             .map(|(i, _)| i)
             .collect();
-        self.selected = self.selected.filter(|&s| s < self.filtered.len());
+        self.selected = (!self.filtered.is_empty()).then_some(0);
+        self.scroll.set_offset(point(px(0.), px(0.)));
     }
 
     /// The `LookupRow` at the highlighted position, if any.
@@ -156,6 +162,7 @@ impl AppState {
                 query: String::new(),
                 loading,
                 from_lookup: true,
+                scroll: ScrollHandle::new(),
             };
             suggest.recompute(&seed);
             self.cell_suggest = Some(suggest);
@@ -185,6 +192,7 @@ impl AppState {
                 query: String::new(),
                 loading: false,
                 from_lookup: false,
+                scroll: ScrollHandle::new(),
             };
             suggest.recompute(&seed);
             self.cell_suggest = Some(suggest);
@@ -366,6 +374,7 @@ impl AppState {
                 Some(c) => (c as i32 + delta).rem_euclid(n as i32) as usize,
             };
             s.selected = Some(next);
+            s.scroll.scroll_to_item(next);
             cx.notify();
         }
     }
@@ -374,6 +383,17 @@ impl AppState {
     /// commit/advance writes instead of coercing the typed text.
     pub(crate) fn suggest_selected_value(&self) -> Option<Value> {
         Some(self.cell_suggest.as_ref()?.highlighted()?.id.clone())
+    }
+
+    /// Esc from the cell editor: if the suggestion list is open, close *just the list*
+    /// (so the typed value can then be committed as-is), IDE-completion style; otherwise
+    /// cancel the whole edit.
+    pub(crate) fn suggest_escape_or_cancel(&mut self, cx: &mut Context<Self>) {
+        if self.cell_suggest.take().is_some() {
+            cx.notify();
+        } else {
+            self.cancel_grid_edit(cx);
+        }
     }
 
     /// Pick the suggestion at list position `pos` (a click): highlight it, then commit
@@ -386,10 +406,15 @@ impl AppState {
         self.commit_grid_edit(cx);
     }
 
-    /// The floating suggestion dropdown, anchored below the editor cell (mounted at the
-    /// app root, over every overlay). `None` unless the picker is open, its anchor rect
-    /// is known, and there's something to show.
-    pub(crate) fn render_cell_suggest(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The floating suggestion dropdown, anchored to the editor cell (mounted at the app
+    /// root, over every overlay). `None` unless the picker is open, its anchor rect is
+    /// known, and there's something to show. `window` is used to flip the list *above*
+    /// the cell when there isn't room below (a draft row at the window's bottom edge).
+    pub(crate) fn render_cell_suggest(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let s = self.cell_suggest.as_ref()?;
         let bounds: Bounds<Pixels> = (*self.cell_suggest_bounds.read(cx))?;
         if s.filtered.is_empty() && !s.loading {
@@ -410,6 +435,9 @@ impl AppState {
             .id("cell-suggest-list")
             .max_h(px(240.))
             .overflow_y_scroll()
+            // The wheel rides this handle (and ↑/↓ scroll the highlight into view), so
+            // the list scrolls internally instead of the grid behind it.
+            .track_scroll(&s.scroll)
             .text_size(size)
             .text_color(text);
         if s.loading && s.items.is_empty() {
@@ -439,6 +467,9 @@ impl AppState {
 
         let panel = div()
             .occlude()
+            // Swallow any wheel the list didn't consume so it never reaches (and
+            // scrolls) the data grid behind the popup.
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .w(px(320.))
             .bg(bg)
             .border_1()
@@ -447,12 +478,21 @@ impl AppState {
             .shadow_lg()
             .py_1()
             .child(list);
-        Some(
+
+        // Prefer below the cell; flip above when the list would run off the window's
+        // bottom (covering the very cell being edited — e.g. a draft row at the edge).
+        let below = bounds.bottom_left();
+        let list_h = px(252.); // max_h(240) + chrome; an estimate for the flip decision
+        let gap = px(3.);
+        let float = if below.y + list_h + gap > window.viewport_size().height {
             floating(panel)
-                .at(bounds.bottom_left())
-                .offset(point(px(0.), px(3.)))
-                .into_any_element(),
-        )
+                .anchor(Anchor::BottomLeft)
+                .at(bounds.origin) // top-left of the cell
+                .offset(point(px(0.), -gap))
+        } else {
+            floating(panel).at(below).offset(point(px(0.), gap))
+        };
+        Some(float.into_any_element())
     }
 }
 
@@ -602,6 +642,7 @@ mod tests {
             query: String::new(),
             loading: false,
             from_lookup: true,
+            scroll: ScrollHandle::new(),
         };
         s.recompute("ali");
         assert_eq!(s.filtered, vec![0]); // matches "Alice" (case-insensitive)
