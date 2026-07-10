@@ -2368,6 +2368,23 @@ impl AppState {
             Event::KvListWindowReady { key, values, .. } => {
                 self.on_kv_list_window_ready(session, key, values, cx);
             }
+            Event::KvCommandResult {
+                epoch,
+                argv,
+                result,
+            } => {
+                self.on_kv_command_result(session, epoch, argv, result, cx);
+            }
+            Event::KvEditApplied { epoch, edit } => {
+                self.on_kv_edit_applied(session, epoch, edit, cx);
+            }
+            Event::KvMessage {
+                epoch,
+                channel,
+                payload,
+            } => {
+                self.on_kv_message(session, epoch, channel, payload, cx);
+            }
 
             // --- result grid ---
             Event::ResultReady {

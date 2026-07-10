@@ -158,3 +158,273 @@ pub enum KvValue {
     /// (the key doesn't exist): the key is real, its value just isn't shown.
     Unsupported(KvType),
 }
+
+/// One in-grid edit (see `KvDriver::set_string`/`set_field`/`set_ttl`/
+/// `rename_key`/`delete_keys`), carried through `Command::KvApplyEdit` and
+/// echoed back on `Event::KvEditApplied` so the UI can pattern-match what
+/// just succeeded without a separate event type per edit kind (mirrors
+/// `FetchRun`'s "echo the request back" shape).
+#[derive(Debug, Clone)]
+pub enum KvEdit {
+    SetString {
+        key: String,
+        value: String,
+        ttl: Option<Duration>,
+    },
+    SetField {
+        key: String,
+        field: String,
+        value: String,
+    },
+    SetTtl {
+        key: String,
+        ttl: Option<Duration>,
+    },
+    Rename {
+        from: String,
+        to: String,
+    },
+    Delete {
+        keys: Vec<String>,
+    },
+}
+
+/// A generic RESP reply (the console needs to render *any* command's result,
+/// not one per command), and the redis crate's own `Value` isn't `Send`-free
+/// of engine-specific dependencies for a wire type shared across the
+/// service/UI boundary, so this is a small hand-rolled mirror of RESP2/3's
+/// shapes.
+#[derive(Debug, Clone)]
+pub enum RespValue {
+    Nil,
+    Ok,
+    Int(i64),
+    Double(f64),
+    Bool(bool),
+    /// A short status/simple-string reply (rendered plainly, no quoting).
+    Simple(String),
+    /// A bulk string, decoded lossily if not valid UTF-8 (the console is a
+    /// text log, not a hex viewer).
+    Bulk(String),
+    Array(Vec<RespValue>),
+    /// A server error reply (e.g. `WRONGTYPE`), rendered distinctly (not the
+    /// same as `KvDriver::command` itself returning `Err`, which is a
+    /// transport/connection failure).
+    Error(String),
+}
+
+/// How a raw console command line is classified, for the read-only gate and
+/// the destructive-command confirm (see docs/plans/redis.md's console
+/// phase). Unknown commands default to `Write` (the safer default under a
+/// read-only connection) but never `Destructive` on their own, so a typo
+/// doesn't trigger a confirm prompt for no reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandClass {
+    Read,
+    Write,
+    /// Wide-blast-radius or irreversible: gated behind a confirm even on a
+    /// writable connection (`FLUSHALL`, `FLUSHDB`, `DEL`, `UNLINK`, `SWAPDB`,
+    /// `SHUTDOWN`).
+    Destructive,
+}
+
+/// Every read-only-safe command this build knows about. Anything not listed
+/// here classifies as `Write` (blocked on a read-only connection) even if
+/// it's actually a read in real Redis — a conservative default is cheaper
+/// than an exhaustive command table, and the list already covers the
+/// commands a keyspace-browsing tool's console gets used for.
+const READ_COMMANDS: &[&str] = &[
+    "GET",
+    "MGET",
+    "STRLEN",
+    "GETRANGE",
+    "TYPE",
+    "TTL",
+    "PTTL",
+    "EXISTS",
+    "SCAN",
+    "KEYS",
+    "HGET",
+    "HGETALL",
+    "HKEYS",
+    "HVALS",
+    "HLEN",
+    "HMGET",
+    "HSCAN",
+    "HEXISTS",
+    "HSTRLEN",
+    "SMEMBERS",
+    "SCARD",
+    "SISMEMBER",
+    "SSCAN",
+    "SRANDMEMBER",
+    "SINTER",
+    "SUNION",
+    "SDIFF",
+    "ZRANGE",
+    "ZREVRANGE",
+    "ZSCORE",
+    "ZCARD",
+    "ZSCAN",
+    "ZRANK",
+    "ZREVRANK",
+    "ZCOUNT",
+    "LRANGE",
+    "LLEN",
+    "LINDEX",
+    "XRANGE",
+    "XREVRANGE",
+    "XLEN",
+    "DBSIZE",
+    "INFO",
+    "PING",
+    "ECHO",
+    "TIME",
+    "COMMAND",
+    "OBJECT",
+    "MEMORY",
+    "LASTSAVE",
+    "RANDOMKEY",
+    "DUMP",
+];
+
+/// Commands gated behind the destructive-command confirm even though the
+/// connection is writable.
+const DESTRUCTIVE_COMMANDS: &[&str] =
+    &["FLUSHALL", "FLUSHDB", "SHUTDOWN", "DEL", "UNLINK", "SWAPDB"];
+
+pub fn classify_command(argv: &[String]) -> CommandClass {
+    let Some(name) = argv.first() else {
+        return CommandClass::Read;
+    };
+    let upper = name.to_ascii_uppercase();
+    if DESTRUCTIVE_COMMANDS.contains(&upper.as_str()) {
+        CommandClass::Destructive
+    } else if READ_COMMANDS.contains(&upper.as_str()) {
+        CommandClass::Read
+    } else {
+        CommandClass::Write
+    }
+}
+
+/// Split a console command line into argv, `redis-cli`-style: whitespace
+/// separated, `'single'` and `"double"` quoting to include whitespace in one
+/// argument, `\`-escaping inside double quotes. Malformed quoting (an
+/// unterminated quote) still returns the tokens parsed so far rather than
+/// failing outright, so the console can report "unterminated quote" as a
+/// normal command error instead of a special UI state.
+pub fn tokenize_command(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = line.chars().peekable();
+    loop {
+        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        let mut tok = String::new();
+        match chars.peek() {
+            Some('\'') => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                    tok.push(c);
+                }
+            }
+            Some('"') => {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => {
+                            if let Some(next) = chars.next() {
+                                tok.push(next);
+                            }
+                        }
+                        other => tok.push(other),
+                    }
+                }
+            }
+            _ => {
+                while matches!(chars.peek(), Some(c) if !c.is_whitespace()) {
+                    tok.push(chars.next().unwrap());
+                }
+            }
+        }
+        out.push(tok);
+    }
+    out
+}
+
+/// One Pub/Sub message delivered to a pattern subscription (`PSUBSCRIBE`).
+#[derive(Debug, Clone)]
+pub struct KvMessage {
+    pub channel: String,
+    pub payload: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokenize_splits_on_whitespace() {
+        assert_eq!(tokenize_command("SET foo bar"), vec!["SET", "foo", "bar"]);
+        assert_eq!(tokenize_command("  GET   foo  "), vec!["GET", "foo"]);
+        assert_eq!(tokenize_command(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn tokenize_honors_single_and_double_quotes() {
+        assert_eq!(
+            tokenize_command(r#"SET foo "hello world""#),
+            vec!["SET", "foo", "hello world"]
+        );
+        assert_eq!(
+            tokenize_command("SET foo 'hello world'"),
+            vec!["SET", "foo", "hello world"]
+        );
+    }
+
+    #[test]
+    fn tokenize_unescapes_backslashes_inside_double_quotes() {
+        assert_eq!(
+            tokenize_command(r#"SET foo "a\"b""#),
+            vec!["SET", "foo", "a\"b"]
+        );
+    }
+
+    #[test]
+    fn classify_command_knows_reads_writes_and_destructive() {
+        assert_eq!(
+            classify_command(&["GET".into(), "foo".into()]),
+            CommandClass::Read
+        );
+        assert_eq!(
+            classify_command(&["SET".into(), "foo".into(), "bar".into()]),
+            CommandClass::Write
+        );
+        assert_eq!(
+            classify_command(&["DEL".into(), "foo".into()]),
+            CommandClass::Destructive
+        );
+        assert_eq!(
+            classify_command(&["FLUSHALL".into()]),
+            CommandClass::Destructive
+        );
+        // Case-insensitive, and an unknown command defaults to Write (the
+        // conservative choice under a read-only connection).
+        assert_eq!(
+            classify_command(&["get".into(), "foo".into()]),
+            CommandClass::Read
+        );
+        assert_eq!(
+            classify_command(&["SOMENEWCOMMAND".into()]),
+            CommandClass::Write
+        );
+        assert_eq!(classify_command(&[]), CommandClass::Read);
+    }
+}

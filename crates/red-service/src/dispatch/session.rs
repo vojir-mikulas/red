@@ -107,6 +107,12 @@ pub(crate) struct InFlight {
     /// big-collection sub-grid, supersedes whatever the inspector was
     /// fetching before.
     pub(crate) kv_value: Option<AbortSignal>,
+    /// A live `KvSubscribe` for this epoch (Redis Pub/Sub monitor). Unlike
+    /// every other slot here, this one is long-lived by design (it stays
+    /// armed for as long as the subscription panel is open) rather than
+    /// superseded by a follow-up request; it's torn down by `CloseResult`
+    /// when the panel closes.
+    pub(crate) kv_subscribe: Option<AbortSignal>,
 }
 
 impl InFlight {
@@ -120,6 +126,7 @@ impl InFlight {
             self.lookup.as_ref(),
             self.kv_scan.as_ref(),
             self.kv_value.as_ref(),
+            self.kv_subscribe.as_ref(),
         ]
         .into_iter()
         .flatten()

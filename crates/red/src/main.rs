@@ -26,6 +26,8 @@ mod inspector;
 mod keymap;
 mod keymap_config;
 mod kvbrowse;
+mod kvconsole;
+mod kvpubsub;
 mod local_state;
 mod markdown;
 mod menu;

@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::UnboundedSender;
+use futures::StreamExt;
+use red_core::kv::KvEdit;
 use red_core::{
     coerce_edit_value, Column, ColumnMap, ColumnMeta, CopyMode, FkEdge, ImportFormat, KeyKind,
     KeySpec, QueryOptions, RedError, ResultFilter, TableRef, Value,
@@ -1422,6 +1424,150 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             },
                         ),
                         Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                    }
+                });
+            }
+
+            Command::KvCommand { epoch, argv } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                let entry = state.inflight.entry(epoch).or_default();
+                if let Some(prev) = entry.kv_value.take() {
+                    prev.abort();
+                }
+                entry.kv_value = Some(AbortSignal::new());
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver.command(&argv).await {
+                        Ok(result) => emit(
+                            &events,
+                            session_id,
+                            Event::KvCommandResult {
+                                epoch,
+                                argv,
+                                result,
+                            },
+                        ),
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                    }
+                });
+            }
+
+            Command::KvApplyEdit { epoch, edit } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                // Defense in depth alongside the driver's own refusal (see
+                // `RedisDriver::check_writable`): reject here too, before
+                // even touching the engine.
+                if state.read_only {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("this connection is read-only".into()),
+                    );
+                    continue;
+                }
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                let entry = state.inflight.entry(epoch).or_default();
+                if let Some(prev) = entry.kv_value.take() {
+                    prev.abort();
+                }
+                entry.kv_value = Some(AbortSignal::new());
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let result = match &edit {
+                        KvEdit::SetString { key, value, ttl } => {
+                            driver.set_string(key, value.clone(), *ttl).await
+                        }
+                        KvEdit::SetField { key, field, value } => {
+                            driver.set_field(key, field, value.clone()).await
+                        }
+                        KvEdit::SetTtl { key, ttl } => driver.set_ttl(key, *ttl).await,
+                        KvEdit::Rename { from, to } => driver.rename_key(from, to).await,
+                        KvEdit::Delete { keys } => driver.delete_keys(keys).await.map(|_| ()),
+                    };
+                    match result {
+                        Ok(()) => emit(&events, session_id, Event::KvEditApplied { epoch, edit }),
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                    }
+                });
+            }
+
+            Command::KvSubscribe { epoch, pattern } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                let entry = state.inflight.entry(epoch).or_default();
+                if let Some(prev) = entry.kv_subscribe.take() {
+                    prev.abort();
+                }
+                let abort = AbortSignal::new();
+                entry.kv_subscribe = Some(abort.clone());
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let mut sub = match driver.subscribe(&pattern).await {
+                        Ok(sub) => sub,
+                        Err(e) => {
+                            emit(&events, session_id, Event::Error(e.to_string()));
+                            return;
+                        }
+                    };
+                    // No native cancel for a live pubsub stream (unlike the
+                    // budgeted `SCAN` loops, which check `abort` between
+                    // round trips): poll with a bounded timeout instead, so
+                    // `CloseResult`'s abort is noticed within one tick rather
+                    // than blocking forever on the next message that may
+                    // never come.
+                    loop {
+                        if abort.is_aborted() {
+                            break;
+                        }
+                        match tokio::time::timeout(Duration::from_millis(500), sub.stream.next())
+                            .await
+                        {
+                            Ok(Some(msg)) => emit(
+                                &events,
+                                session_id,
+                                Event::KvMessage {
+                                    epoch,
+                                    channel: msg.channel,
+                                    payload: msg.payload,
+                                },
+                            ),
+                            Ok(None) => break, // the subscription's connection closed
+                            Err(_) => {}       // timed out this tick; loop to recheck `abort`
+                        }
                     }
                 });
             }

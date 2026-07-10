@@ -12,7 +12,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use red_core::kv::{CollectionKind, KeyMeta, KvCollectionPage, KvScanPage, KvValue, ScanBudget};
+use red_core::kv::{
+    CollectionKind, KeyMeta, KvCollectionPage, KvEdit, KvScanPage, KvValue, RespValue, ScanBudget,
+};
 use red_core::{
     ActivityId, ActivityKind, ActivityStatus, AiLimits, AiTier, Column, ColumnMap, ColumnMeta,
     ColumnStats, ConnectionConfig, CopyMode, EditOp, ExportFormat, FkEdge, FkJoin, ImportFormat,
@@ -204,6 +206,34 @@ pub enum Command {
         key: String,
         from_head: bool,
         count: usize,
+    },
+    /// Run an arbitrary command through the console (see
+    /// docs/plans/redis.md). `epoch` scopes cancellation only; console
+    /// history is UI-side. A server-reported command error (WRONGTYPE, a
+    /// bad arity, ...) is normal console output via `KvCommandResult`'s
+    /// `RespValue::Error`, not `Event::Error` — that's reserved for a
+    /// genuine transport/connection failure or the read-only gate.
+    KvCommand {
+        epoch: u64,
+        argv: Vec<String>,
+    },
+    /// One in-grid edit (see `red_core::kv::KvEdit`), gated by `read_only`
+    /// (checked service-side, defense in depth alongside the driver's own
+    /// refusal) and, for a destructive shape, the UI's confirm prompt before
+    /// this is ever sent. Replied with `KvEditApplied`, echoing `edit` back,
+    /// or the global `Event::Error` on failure.
+    KvApplyEdit {
+        epoch: u64,
+        edit: KvEdit,
+    },
+    /// Start a live Pub/Sub pattern subscription (see docs/plans/redis.md's
+    /// R4). `epoch` identifies this subscription; messages stream back as
+    /// `KvMessage` until `CloseResult { epoch }` stops it (the same generic
+    /// epoch-scoped teardown every other open Kv/SQL thing uses — see that
+    /// command's doc comment).
+    KvSubscribe {
+        epoch: u64,
+        pattern: String,
     },
     /// Compute a column's aggregate summary over the open result's *filtered* SQL
     /// (the column-stats bar): a single `count`/`distinct`/`min`/`max`(/`sum`/`avg`)
@@ -595,6 +625,29 @@ pub enum Event {
         key: String,
         from_head: bool,
         values: Vec<String>,
+    },
+    /// One console command's result, in response to `KvCommand`. Echoes
+    /// `argv` back so a console tracking several in-flight lines can match
+    /// the reply to its history entry.
+    KvCommandResult {
+        epoch: u64,
+        argv: Vec<String>,
+        result: RespValue,
+    },
+    /// An in-grid edit succeeded, in response to `KvApplyEdit`. Echoes
+    /// `edit` back so the UI can pattern-match what to update locally
+    /// (patch the inspector's loaded value, rename/remove a browse row, …)
+    /// without a round trip back through `KvReadValue`.
+    KvEditApplied {
+        epoch: u64,
+        edit: KvEdit,
+    },
+    /// One Pub/Sub message, pushed for as long as the `KvSubscribe { epoch,
+    /// .. }` that started it stays open.
+    KvMessage {
+        epoch: u64,
+        channel: String,
+        payload: String,
     },
     /// A result opened: its columns and total row count (for `OpenResult`).
     /// Echoes the open `epoch` so the grid can ignore a late reply for a result

@@ -8,11 +8,26 @@
 //! `probe_key`) adds keyspace browsing. Per-type value reads, the console,
 //! and editing land in later phases per the plan's R2–R3 breakdown.
 
+use std::pin::Pin;
+use std::time::Duration;
+
 use async_trait::async_trait;
-use red_core::kv::{CollectionKind, KeyMeta, KvCollectionPage, KvScanPage, KvValue, ScanBudget};
+use futures_util::Stream;
+use red_core::kv::{
+    CollectionKind, KeyMeta, KvCollectionPage, KvMessage, KvScanPage, KvValue, RespValue,
+    ScanBudget,
+};
 use red_core::Result;
 
 use crate::AbortSignal;
+
+/// A live Pub/Sub subscription's message stream (see
+/// `KvDriver::subscribe`). Boxed because the concrete stream type is
+/// engine-specific (redis-rs's `PubSubStream`) and this trait is
+/// object-safe/engine-agnostic.
+pub struct KvSubscription {
+    pub stream: Pin<Box<dyn Stream<Item = KvMessage> + Send>>,
+}
 
 /// A Redis/Valkey server's deployment topology, detected at connect from
 /// `INFO server`'s `redis_mode` field. Drives UI affordances that don't apply
@@ -101,4 +116,35 @@ pub trait KvDriver: Send + Sync {
         from_head: bool,
         count: usize,
     ) -> Result<Vec<String>>;
+
+    /// Run an arbitrary command (the console; see docs/plans/redis.md).
+    /// `argv[0]` is the command name. Read-only enforcement and the
+    /// destructive-command confirm are the caller's job
+    /// (`red_core::kv::classify_command`), shared between the service's
+    /// read-only gate and the UI's confirm prompt — this method itself
+    /// always runs whatever it's given.
+    async fn command(&self, argv: &[String]) -> Result<RespValue>;
+
+    /// `SET key value [EX seconds]`. Refused on a read-only connection.
+    async fn set_string(&self, key: &str, value: String, ttl: Option<Duration>) -> Result<()>;
+
+    /// `HSET key field value`. Refused on a read-only connection.
+    async fn set_field(&self, key: &str, field: &str, value: String) -> Result<()>;
+
+    /// `EXPIRE key seconds` (`Some`) or `PERSIST key` (`None`). Refused on a
+    /// read-only connection.
+    async fn set_ttl(&self, key: &str, ttl: Option<Duration>) -> Result<()>;
+
+    /// `RENAME from to`. Refused on a read-only connection.
+    async fn rename_key(&self, from: &str, to: &str) -> Result<()>;
+
+    /// `DEL key [key ...]`, returning the number actually removed. Refused
+    /// on a read-only connection.
+    async fn delete_keys(&self, keys: &[String]) -> Result<u64>;
+
+    /// A live Pub/Sub pattern subscription (`PSUBSCRIBE`). The caller owns
+    /// when to stop reading the stream; there's no explicit unsubscribe
+    /// call, dropping the returned `KvSubscription` (and its underlying
+    /// connection) is enough.
+    async fn subscribe(&self, pattern: &str) -> Result<KvSubscription>;
 }

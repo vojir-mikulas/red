@@ -4,7 +4,7 @@
 
 use flint::prelude::*;
 use flint::Theme;
-use gpui::{div, prelude::*, px, Axis, Context, MouseButton, WeakEntity, Window};
+use gpui::{div, prelude::*, px, Axis, Context, MouseButton, SharedString, WeakEntity, Window};
 
 /// Left inset of the top bar. On macOS it clears the seamless traffic lights
 /// overlapping this strip and leaves a little breathing room between them and
@@ -564,9 +564,73 @@ impl AppState {
         let theme = cx.theme().clone();
         let view = cx.entity().downgrade();
         let config = &active.config;
+        let session = active.session;
 
         let topbar = self.render_topbar(&theme, &view, window, cx);
-        let body = self.render_kv_browse(active, window, cx).into_any_element();
+
+        let panel = active
+            .kv_browse
+            .as_ref()
+            .map(|b| b.panel)
+            .unwrap_or(crate::kvbrowse::KvPanel::Browse);
+        let tabs = div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .pt_1()
+            .children(
+                [
+                    (crate::kvbrowse::KvPanel::Browse, "Browse"),
+                    (crate::kvbrowse::KvPanel::Console, "Console"),
+                    (crate::kvbrowse::KvPanel::PubSub, "Pub/Sub"),
+                ]
+                .into_iter()
+                .map(|(kind, label)| {
+                    let active_tab = kind == panel;
+                    let tab_view = view.clone();
+                    div()
+                        .id(SharedString::from(format!("kv-panel-tab-{label}")))
+                        .px_2()
+                        .py_1()
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .text_size(theme.scale(11.5))
+                        .text_color(if active_tab {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
+                        .when(active_tab, |d| d.bg(theme.bg_elevated))
+                        .child(label)
+                        .on_click(move |_, _, cx| {
+                            tab_view
+                                .update(cx, |this, cx| this.kv_set_panel(session, kind, cx))
+                                .ok();
+                        })
+                }),
+            );
+
+        let panel_body = match panel {
+            crate::kvbrowse::KvPanel::Browse => {
+                self.render_kv_browse(active, window, cx).into_any_element()
+            }
+            crate::kvbrowse::KvPanel::Console => self
+                .render_kv_console(active, window, cx)
+                .into_any_element(),
+            crate::kvbrowse::KvPanel::PubSub => {
+                self.render_kv_pubsub(active, window, cx).into_any_element()
+            }
+        };
+        let body = div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(tabs)
+            .child(div().flex_1().min_h(px(0.)).flex().child(panel_body))
+            .into_any_element();
 
         let statusbar = div()
             .flex_shrink_0()

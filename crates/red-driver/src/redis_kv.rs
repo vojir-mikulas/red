@@ -2,16 +2,19 @@
 //! Cluster topology is detected (so the UI can hide the DB-index switch) but
 //! its scan fan-out lands with R1 (see `docs/plans/redis.md`).
 
+use std::time::Duration;
+
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use red_core::kv::{
-    CollectionKind, KeyMeta, KvCollection, KvCollectionPage, KvElement, KvScanPage, KvType,
-    KvValue, ScanBudget,
+    CollectionKind, CommandClass, KeyMeta, KvCollection, KvCollectionPage, KvElement, KvMessage,
+    KvScanPage, KvType, KvValue, RespValue, ScanBudget,
 };
 use red_core::{RedError, Result, Value};
 use redis::aio::MultiplexedConnection;
 use tokio::time::Instant;
 
-use crate::kv::{KvDriver, KvTopology};
+use crate::kv::{KvDriver, KvSubscription, KvTopology};
 use crate::AbortSignal;
 
 /// Below this many elements, `read_value` fetches a hash/set/zset/list in
@@ -30,11 +33,15 @@ const STRING_PREVIEW_CAP: usize = 8 * 1024;
 /// clones (it pipelines internally), so `KvDriver`'s `&self` methods clone it
 /// per call rather than guarding one instance behind a lock — that would
 /// serialize every command through one mutex and defeat the point of a
-/// multiplexed connection.
+/// multiplexed connection. `client` is kept alongside it (cheap to clone,
+/// just holds parsed connection info) because Pub/Sub needs its own
+/// dedicated connection, not the shared multiplexed one.
 pub struct RedisDriver {
+    client: redis::Client,
     conn: MultiplexedConnection,
     version: String,
     topology: KvTopology,
+    read_only: bool,
 }
 
 impl RedisDriver {
@@ -42,7 +49,7 @@ impl RedisDriver {
     /// TLS) and probe `INFO server` to capture the version and topology up
     /// front, the same "fail fast on bad creds, know what we're talking to"
     /// shape as `ClickhouseDriver::connect`'s `fetch_version`.
-    pub async fn connect(dsn: &str, _read_only: bool) -> Result<Self> {
+    pub async fn connect(dsn: &str, read_only: bool) -> Result<Self> {
         let client = redis::Client::open(dsn).map_err(|e| RedError::Connect(e.to_string()))?;
         let mut conn = client
             .get_multiplexed_async_connection()
@@ -60,10 +67,25 @@ impl RedisDriver {
             _ => KvTopology::Standalone,
         };
         Ok(Self {
+            client,
             conn,
             version,
             topology,
+            read_only,
         })
+    }
+
+    /// Redis has no native read-only connection mode to lean on (unlike
+    /// SQLite's `SQLITE_OPEN_READONLY` or Postgres's
+    /// `default_transaction_read_only`); every write method checks this
+    /// explicitly instead. Distinct from `RedError::Auth`: this isn't a
+    /// credentials problem, it's the connection's own configured policy.
+    fn check_writable(&self) -> Result<()> {
+        if self.read_only {
+            Err(RedError::Query("this connection is read-only".to_string()))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -287,6 +309,162 @@ impl KvDriver for RedisDriver {
             .query_async(&mut conn)
             .await
             .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    async fn command(&self, argv: &[String]) -> Result<RespValue> {
+        let Some(name) = argv.first() else {
+            return Err(RedError::Query("empty command".into()));
+        };
+        if self.read_only && red_core::kv::classify_command(argv) != CommandClass::Read {
+            self.check_writable()?;
+        }
+        let mut cmd = redis::cmd(name);
+        for arg in &argv[1..] {
+            cmd.arg(arg);
+        }
+        let mut conn = self.conn.clone();
+        match cmd.query_async::<redis::Value>(&mut conn).await {
+            Ok(value) => Ok(to_resp_value(value)),
+            // A server-reported command error (WRONGTYPE, a bad arity, an
+            // unknown subcommand, ...) is normal console output, like
+            // `redis-cli`'s `(error) ...` line, not a connection failure —
+            // redis-rs surfaces both as `Err`. `code()` is `Some` exactly
+            // when the error carries a RESP error code from the server (even
+            // an unrecognized one; `kind()` alone isn't enough here, since it
+            // only maps *recognized* codes to `ErrorKind::Server` and falls
+            // back to `Extension` for anything else, WRONGTYPE included).
+            // Anything with no code is a genuine transport/connection error.
+            Err(e) if e.code().is_some() => Ok(RespValue::Error(e.to_string())),
+            Err(e) => Err(RedError::Driver(e.to_string())),
+        }
+    }
+
+    async fn set_string(&self, key: &str, value: String, ttl: Option<Duration>) -> Result<()> {
+        self.check_writable()?;
+        let mut conn = self.conn.clone();
+        let mut cmd = redis::cmd("SET");
+        cmd.arg(key).arg(value);
+        if let Some(ttl) = ttl {
+            cmd.arg("EX").arg(ttl.as_secs().max(1));
+        }
+        cmd.query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    async fn set_field(&self, key: &str, field: &str, value: String) -> Result<()> {
+        self.check_writable()?;
+        let mut conn = self.conn.clone();
+        redis::cmd("HSET")
+            .arg(key)
+            .arg(field)
+            .arg(value)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    async fn set_ttl(&self, key: &str, ttl: Option<Duration>) -> Result<()> {
+        self.check_writable()?;
+        let mut conn = self.conn.clone();
+        match ttl {
+            Some(ttl) => redis::cmd("EXPIRE")
+                .arg(key)
+                .arg(ttl.as_secs().max(1))
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| RedError::Driver(e.to_string())),
+            None => redis::cmd("PERSIST")
+                .arg(key)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| RedError::Driver(e.to_string())),
+        }
+    }
+
+    async fn rename_key(&self, from: &str, to: &str) -> Result<()> {
+        self.check_writable()?;
+        let mut conn = self.conn.clone();
+        redis::cmd("RENAME")
+            .arg(from)
+            .arg(to)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    async fn delete_keys(&self, keys: &[String]) -> Result<u64> {
+        self.check_writable()?;
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.clone();
+        let mut cmd = redis::cmd("DEL");
+        for k in keys {
+            cmd.arg(k);
+        }
+        cmd.query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    async fn subscribe(&self, pattern: &str) -> Result<KvSubscription> {
+        let mut pubsub = self
+            .client
+            .get_async_pubsub()
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        pubsub
+            .psubscribe(pattern)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        let stream = pubsub.into_on_message().map(|msg| {
+            let channel = msg.get_channel_name().to_string();
+            let payload: String = msg.get_payload().unwrap_or_default();
+            KvMessage { channel, payload }
+        });
+        Ok(KvSubscription {
+            stream: Box::pin(stream),
+        })
+    }
+}
+
+/// Convert a raw RESP `redis::Value` into the engine-agnostic `RespValue`
+/// the console renders. Bulk strings decode lossily (the console is a text
+/// log, not a hex viewer); anything genuinely binary still round-trips as
+/// *a* string, just not necessarily a meaningful one.
+fn to_resp_value(value: redis::Value) -> RespValue {
+    match value {
+        redis::Value::Nil => RespValue::Nil,
+        redis::Value::Okay => RespValue::Ok,
+        redis::Value::Int(i) => RespValue::Int(i),
+        redis::Value::Double(d) => RespValue::Double(d),
+        redis::Value::Boolean(b) => RespValue::Bool(b),
+        redis::Value::SimpleString(s) => RespValue::Simple(s),
+        redis::Value::BulkString(bytes) => {
+            RespValue::Bulk(String::from_utf8_lossy(&bytes).into_owned())
+        }
+        redis::Value::VerbatimString { text, .. } => RespValue::Bulk(text),
+        redis::Value::BigNumber(n) => RespValue::Simple(String::from_utf8_lossy(&n).into_owned()),
+        redis::Value::Array(items) | redis::Value::Set(items) => {
+            RespValue::Array(items.into_iter().map(to_resp_value).collect())
+        }
+        redis::Value::Map(pairs) => RespValue::Array(
+            pairs
+                .into_iter()
+                .flat_map(|(k, v)| [to_resp_value(k), to_resp_value(v)])
+                .collect(),
+        ),
+        redis::Value::Push { kind, data } => RespValue::Array(
+            std::iter::once(RespValue::Simple(format!("{kind:?}")))
+                .chain(data.into_iter().map(to_resp_value))
+                .collect(),
+        ),
+        redis::Value::ServerError(e) => RespValue::Error(e.to_string()),
+        redis::Value::Attribute { data, .. } => to_resp_value(*data),
+        // `redis::Value` is `#[non_exhaustive]`; anything this build doesn't
+        // know about yet renders as its `Debug` text rather than failing.
+        other => RespValue::Simple(format!("{other:?}")),
     }
 }
 
@@ -838,5 +1016,145 @@ mod tests {
             KvValue::Unsupported(KvType::Stream) => {}
             other => panic!("expected Unsupported(Stream), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn command_runs_an_arbitrary_command() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let key = tag("command-set");
+        match driver
+            .command(&["SET".into(), key.clone(), "hi".into()])
+            .await
+            .unwrap()
+        {
+            RespValue::Ok => {}
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        match driver.command(&["GET".into(), key]).await.unwrap() {
+            RespValue::Bulk(s) => assert_eq!(s, "hi"),
+            other => panic!("expected Bulk, got {other:?}"),
+        }
+        match driver
+            .command(&["TTL".into(), tag("missing")])
+            .await
+            .unwrap()
+        {
+            RespValue::Int(-2) => {} // -2: key doesn't exist
+            other => panic!("expected Int(-2), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn command_reports_server_errors_as_error_not_err() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let key = tag("command-wrongtype");
+        driver
+            .command(&["SET".into(), key.clone(), "v".into()])
+            .await
+            .unwrap();
+        // SADD on a string key is a WRONGTYPE server error, not a transport
+        // failure: `command` must still return `Ok` with a `RespValue::Error`.
+        match driver
+            .command(&["SADD".into(), key, "member".into()])
+            .await
+            .unwrap()
+        {
+            RespValue::Error(msg) => assert!(msg.contains("WRONGTYPE"), "{msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_methods_are_refused_on_a_read_only_connection() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, true).await.unwrap();
+        let key = tag("readonly-refused");
+        assert!(driver.set_string(&key, "v".into(), None).await.is_err());
+        assert!(driver.set_field(&key, "f", "v".into()).await.is_err());
+        assert!(driver.set_ttl(&key, None).await.is_err());
+        assert!(driver.rename_key(&key, "other").await.is_err());
+        assert!(driver.delete_keys(&[key]).await.is_err());
+        // A write command through the console is refused the same way.
+        assert!(driver
+            .command(&["SET".into(), tag("ro-console"), "v".into()])
+            .await
+            .is_err());
+        // But a read still works.
+        assert!(driver.command(&["PING".into()]).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn set_string_field_ttl_rename_and_delete_round_trip() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let key = tag("edit-string");
+        let renamed = tag("edit-string-renamed");
+
+        driver
+            .set_string(&key, "hello".into(), Some(Duration::from_secs(60)))
+            .await
+            .unwrap();
+        let meta = driver.probe_key(&key).await.unwrap().unwrap();
+        assert!(meta.ttl.is_some());
+
+        driver.set_ttl(&key, None).await.unwrap(); // PERSIST
+        let meta = driver.probe_key(&key).await.unwrap().unwrap();
+        assert!(meta.ttl.is_none());
+
+        driver.rename_key(&key, &renamed).await.unwrap();
+        assert!(driver.probe_key(&key).await.unwrap().is_none());
+        assert!(driver.probe_key(&renamed).await.unwrap().is_some());
+
+        let deleted = driver
+            .delete_keys(std::slice::from_ref(&renamed))
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert!(driver.probe_key(&renamed).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn set_field_creates_and_updates_a_hash_field() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let key = tag("edit-hash");
+        driver.set_field(&key, "a", "1".into()).await.unwrap();
+        driver.set_field(&key, "a", "2".into()).await.unwrap();
+        let KvValue::Hash(KvCollection::Loaded(pairs)) =
+            driver.read_value(&key).await.unwrap().unwrap()
+        else {
+            panic!("expected a loaded hash");
+        };
+        assert_eq!(pairs, vec![("a".to_string(), "2".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn subscribe_delivers_published_messages() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let channel = tag("pubsub-channel");
+        let mut sub = driver.subscribe(&format!("{channel}*")).await.unwrap();
+
+        // Give the subscription a moment to actually register server-side
+        // before publishing, then publish through a second connection (a
+        // subscriber connection can't also PUBLISH on some server configs).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut publisher = driver.conn.clone();
+        let full_channel = format!("{channel}:1");
+        redis::cmd("PUBLISH")
+            .arg(&full_channel)
+            .arg("hello")
+            .query_async::<i64>(&mut publisher)
+            .await
+            .unwrap();
+
+        let msg = tokio::time::timeout(Duration::from_secs(2), sub.stream.next())
+            .await
+            .expect("timed out waiting for a pubsub message")
+            .expect("stream ended without a message");
+        assert_eq!(msg.channel, full_channel);
+        assert_eq!(msg.payload, "hello");
     }
 }
