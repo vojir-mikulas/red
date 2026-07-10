@@ -71,6 +71,10 @@ actions!(
         /// Open the "What's New" changelog overlay. No default binding; reached
         /// from the Help menu and the `help: what's new` palette command.
         ShowChangelog,
+        /// Open the read-only schema ER diagram. No default binding; reached from the
+        /// Query menu, the schema-panel button, and the `schema: ER diagram` palette
+        /// command.
+        ShowErDiagram,
         /// ⌘↵ from anywhere: run the active tab's query; or, while the connection
         /// form is open, test the connection.
         RunQuery,
@@ -106,6 +110,8 @@ actions!(
         OpenSavedQueries,
         /// Explain the active tab's query: open the plan view (⇧⌘E). Track B4.
         Explain,
+        /// Beautify the active editor's SQL in place (⌥⌘F).
+        FormatSql,
         /// Begin editing the focused result cell in place (Enter / F2). Track B6.
         BeginEdit,
         /// Submit the staged grid edits as one batch (⌘↵ in the grid); Track B6.
@@ -173,6 +179,7 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
                 ("⌘W", "Close tab"),
                 ("⌃Tab / ⌃⇧Tab", "Next / previous tab"),
                 ("⌘↵", "Run query"),
+                ("⌥⌘F", "Format SQL"),
                 ("⌘F", "Find in query…"),
                 ("⇧⌘E", "Explain query (plan)"),
                 ("⇧⌘S", "Save query"),
@@ -407,6 +414,10 @@ const DEFAULTS: &[ActionDef] = &[
     // EXPLAIN the active query. ⇧⌘E pairs with the Run idiom; the analyze variant
     // is palette / run-bar only (it executes the statement).
     def("cmd-shift-e", "Explain", "Explain query", Some("RedRoot")),
+    // Beautify the editor's SQL. ⌥⌘F is the common "format" idiom and is free
+    // (⇧⌘F is the result filter). RedRoot-scoped so it fires while the editor is
+    // focused, like Explain; the handler no-ops when there's nothing to format.
+    def("cmd-alt-f", "FormatSql", "Format SQL", Some("RedRoot")),
     // Tab management. `RedRoot` is an ancestor of the editor, so these still fire
     // while it's focused; none collide with the editor's keys (it binds plain
     // `tab`, not `ctrl-tab`).
@@ -826,6 +837,7 @@ fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<Ke
         "SaveQuery" => kb!(SaveQuery),
         "OpenSavedQueries" => kb!(OpenSavedQueries),
         "Explain" => kb!(Explain),
+        "FormatSql" => kb!(FormatSql),
         "NewTab" => kb!(NewTab),
         "CloseTab" => kb!(CloseTab),
         "NextTab" => kb!(NextTab),

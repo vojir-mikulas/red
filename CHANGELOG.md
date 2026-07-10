@@ -6,6 +6,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- ER diagram: a read-only, pannable/zoomable map of the schema — every table a
+  box (columns marked PK/FK), every foreign key a connector. Open it from the
+  schema panel's diagram button, the Query menu, or the command palette
+  (`schema: ER diagram`). Drag boxes to arrange, scroll to pan, ⌘/Ctrl+scroll to
+  zoom, Fit to frame it all; double-click a table to browse it.
+- Format SQL: beautify the editor's query in place (⌥⌘F, the Query menu, or the
+  command palette) — re-indents, upper-cases keywords, and puts each clause on
+  its own line.
+- Export a result as SQL `INSERT` statements (Export ▸ SQL). The table name comes
+  from the file you save to.
+- Import a `.json` file that holds a single top-level array of objects, not only
+  newline-delimited JSON. Large files are still streamed, never loaded whole.
+
 ## [0.15.0] - 2026-07-09
 
 ### Added

@@ -30,9 +30,9 @@ use flint::components::text_input::{
 
 use crate::keymap::{
     About, CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusOtherHalf,
-    FocusSchema, NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, ReportBug, RunQuery,
-    SearchSchema, Settings, ShowChangelog, ShowShortcuts, SwitchConnection, ToggleSidebar,
-    ToggleSplit,
+    FocusSchema, FormatSql, NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, ReportBug,
+    RunQuery, SearchSchema, Settings, ShowChangelog, ShowErDiagram, ShowShortcuts,
+    SwitchConnection, ToggleSidebar, ToggleSplit,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 use crate::Quit;
@@ -92,6 +92,8 @@ pub(crate) fn build_menus() -> Vec<Menu> {
             // ⌘↵ runs the active tab's query, or tests the connection while the
             // connection form is open (the unified `RunQuery` action).
             MenuItem::action("Run Query", RunQuery),
+            MenuItem::action("Format SQL", FormatSql),
+            MenuItem::action("ER Diagram", ShowErDiagram),
             MenuItem::action("Refresh Schema", RefreshSchema),
             MenuItem::separator(),
             MenuItem::action("Go to Row…", GoToRow),

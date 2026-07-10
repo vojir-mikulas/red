@@ -1,13 +1,16 @@
-//! Streaming row readers for data import (CSV / JSONL), the read-side mirror of
-//! `format.rs`'s [`ExportWriter`](crate::format::ExportWriter). Engine-independent:
-//! yields one row of raw *text* cells at a time, holding at most one record in
-//! memory, never the whole file. The dispatch import loop coerces each cell to a
-//! typed `Value` per the target column ([`red_core::coerce_edit_value`]) and batches
-//! the rows into [`DatabaseDriver::insert_rows`](crate::DatabaseDriver::insert_rows).
+//! Streaming row readers for data import (CSV / JSONL / JSON array), the read-side
+//! mirror of `format.rs`'s [`ExportWriter`](crate::format::ExportWriter).
+//! Engine-independent: yields one row of raw *text* cells at a time, holding at most
+//! one record in memory, never the whole file. The dispatch import loop coerces each
+//! cell to a typed `Value` per the target column ([`red_core::coerce_edit_value`])
+//! and batches the rows into
+//! [`DatabaseDriver::insert_rows`](crate::DatabaseDriver::insert_rows).
 //!
 //! No external CSV crate: a ~40-line RFC 4180 record reader (quoted fields, embedded
 //! commas/newlines, doubled `""` escapes) per the roadmap's "port ~50 lines over a
-//! dependency" rule. JSONL rides the `serde_json` already in the tree.
+//! dependency" rule. JSONL and the JSON-array reader ride the `serde_json` already in
+//! the tree; the array reader scans one element at a time (brace-depth + string
+//! aware) so a large array is still streamed, not materialized.
 
 use std::io::{self, BufRead};
 
@@ -31,6 +34,7 @@ enum Inner<R: BufRead> {
         /// `next_row` so no data row is lost.
         pending: Option<Vec<String>>,
     },
+    JsonArray(JsonArrayReader<R>),
 }
 
 impl<R: BufRead> ImportReader<R> {
@@ -84,6 +88,32 @@ impl<R: BufRead> ImportReader<R> {
                     }
                 }
             }
+            ImportFormat::JsonArray => {
+                let mut inner = JsonArrayReader {
+                    reader,
+                    columns: Vec::new(),
+                    pending: None,
+                    array_started: false,
+                    first_element: true,
+                    done: false,
+                };
+                let columns = match inner.next_object()? {
+                    // An empty array (or empty file) yields no columns.
+                    None => Vec::new(),
+                    Some(obj) => {
+                        let columns: Vec<String> = obj.keys().cloned().collect();
+                        inner.pending = Some(project_json(&obj, &columns));
+                        inner.columns = columns.clone();
+                        columns
+                    }
+                };
+                Ok((
+                    columns,
+                    Self {
+                        inner: Inner::JsonArray(inner),
+                    },
+                ))
+            }
         }
     }
 
@@ -109,8 +139,183 @@ impl<R: BufRead> ImportReader<R> {
                     }
                 }
             }
+            Inner::JsonArray(r) => {
+                if let Some(first) = r.pending.take() {
+                    return Ok(Some(first));
+                }
+                match r.next_object()? {
+                    None => Ok(None),
+                    Some(obj) => Ok(Some(project_json(&obj, &r.columns))),
+                }
+            }
         }
     }
+}
+
+/// A streaming reader over a single top-level JSON array of objects. Reads one
+/// element at a time — never the whole array — by scanning the raw bytes of each
+/// value (tracking brace/bracket depth and string/escape state) between the array's
+/// `[`, `,`, and `]` framing.
+struct JsonArrayReader<R: BufRead> {
+    reader: R,
+    columns: Vec<String>,
+    /// The first object's projected cells, buffered by `begin` (which read it to
+    /// learn the column names) and handed back on the first `next_row`.
+    pending: Option<Vec<String>>,
+    /// Whether the opening `[` has been consumed yet.
+    array_started: bool,
+    /// Whether the next element is the first (no leading comma expected).
+    first_element: bool,
+    done: bool,
+}
+
+impl<R: BufRead> JsonArrayReader<R> {
+    /// Read the next array element as a JSON object, consuming the surrounding
+    /// `[` / `,` / `]` framing. `None` once the closing `]` (or an empty file) is
+    /// reached. Errors on malformed structure or a non-object element.
+    fn next_object(&mut self) -> io::Result<Option<serde_json::Map<String, serde_json::Value>>> {
+        if self.done {
+            return Ok(None);
+        }
+        if !self.array_started {
+            skip_ws(&mut self.reader)?;
+            match peek_byte(&mut self.reader)? {
+                None => {
+                    // An empty source is treated as an empty array.
+                    self.done = true;
+                    return Ok(None);
+                }
+                Some(b'[') => {
+                    read_byte(&mut self.reader)?;
+                    self.array_started = true;
+                }
+                Some(_) => return Err(invalid("expected '[' at the start of a JSON array")),
+            }
+        }
+        skip_ws(&mut self.reader)?;
+        match peek_byte(&mut self.reader)? {
+            None => return Err(invalid("unterminated JSON array")),
+            Some(b']') => {
+                read_byte(&mut self.reader)?;
+                self.done = true;
+                return Ok(None);
+            }
+            Some(b',') => {
+                if self.first_element {
+                    return Err(invalid("unexpected ',' before the first array element"));
+                }
+                read_byte(&mut self.reader)?;
+                skip_ws(&mut self.reader)?;
+            }
+            Some(_) if self.first_element => {}
+            Some(_) => return Err(invalid("expected ',' or ']' between array elements")),
+        }
+        let bytes = read_json_value_bytes(&mut self.reader)?;
+        self.first_element = false;
+        let text = std::str::from_utf8(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(Some(parse_json_object(text)?))
+    }
+}
+
+fn invalid(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
+}
+
+/// Read and consume one byte, or `None` at EOF.
+fn read_byte<R: BufRead>(reader: &mut R) -> io::Result<Option<u8>> {
+    let byte = reader.fill_buf()?.first().copied();
+    if byte.is_some() {
+        reader.consume(1);
+    }
+    Ok(byte)
+}
+
+/// Peek the next byte without consuming it, or `None` at EOF.
+fn peek_byte<R: BufRead>(reader: &mut R) -> io::Result<Option<u8>> {
+    Ok(reader.fill_buf()?.first().copied())
+}
+
+/// Consume any leading ASCII whitespace.
+fn skip_ws<R: BufRead>(reader: &mut R) -> io::Result<()> {
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let len = buf.len();
+        let n = buf.iter().take_while(|b| b.is_ascii_whitespace()).count();
+        reader.consume(n);
+        // Stop once a non-whitespace byte is in view; if the whole buffer was
+        // whitespace, loop to refill.
+        if n < len || n == 0 {
+            return Ok(());
+        }
+    }
+}
+
+/// Read the raw bytes of one complete JSON value. For an object/array it tracks
+/// brace/bracket depth (ignoring structure inside strings, honoring `\` escapes) and
+/// stops after the matching close; for a scalar it reads until a top-level `,`, `]`,
+/// or whitespace (leaving that delimiter unconsumed). Assumes leading whitespace is
+/// already skipped. Structural characters are ASCII, so depth tracking on raw bytes
+/// is UTF-8 safe.
+fn read_json_value_bytes<R: BufRead>(reader: &mut R) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let first = peek_byte(reader)?.ok_or_else(|| invalid("expected a JSON value"))?;
+    let mut in_str = false;
+    let mut escaped = false;
+    if first == b'{' || first == b'[' {
+        let mut depth = 0i32;
+        loop {
+            let b = read_byte(reader)?.ok_or_else(|| invalid("unterminated JSON value"))?;
+            out.push(b);
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_str = false;
+                }
+            } else {
+                match b {
+                    b'"' => in_str = true,
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    } else {
+        // A bare scalar (number / string / true / false / null).
+        while let Some(b) = peek_byte(reader)? {
+            if in_str {
+                out.push(b);
+                read_byte(reader)?;
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_str = false;
+                }
+            } else if b == b',' || b == b']' || b.is_ascii_whitespace() {
+                break;
+            } else {
+                if b == b'"' {
+                    in_str = true;
+                }
+                out.push(b);
+                read_byte(reader)?;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// A minimal RFC 4180 record reader. Reads whole lines and, when a line ends inside
@@ -312,5 +517,43 @@ mod tests {
     fn empty_sources_yield_nothing() {
         assert_eq!(rows(ImportFormat::Csv, "").1.len(), 0);
         assert_eq!(rows(ImportFormat::Jsonl, "").1.len(), 0);
+        assert_eq!(rows(ImportFormat::JsonArray, "").1.len(), 0);
+        assert_eq!(rows(ImportFormat::JsonArray, "[]").1.len(), 0);
+        assert_eq!(rows(ImportFormat::JsonArray, "  [ ]  ").1.len(), 0);
+    }
+
+    #[test]
+    fn json_array_keys_and_values() {
+        let (cols, data) = rows(
+            ImportFormat::JsonArray,
+            "[{\"id\":1,\"name\":\"alice\"},{\"id\":2,\"name\":\"bob\"}]",
+        );
+        assert_eq!(cols, vec!["id", "name"]);
+        assert_eq!(data[0], vec!["1", "alice"]);
+        assert_eq!(data[1], vec!["2", "bob"]);
+    }
+
+    #[test]
+    fn json_array_pretty_printed_with_nested_and_null() {
+        // Whitespace/newlines between elements, a nested object (stringified), a
+        // null and a missing key (both ""), and commas/braces inside string values
+        // must not confuse the element scanner.
+        let src = "[\n  { \"id\": 1, \"meta\": {\"a\": 1, \"b\": [2, 3]}, \"note\": \"x, }y\" },\n  { \"id\": 2, \"meta\": null },\n  { \"id\": 3 }\n]\n";
+        let (cols, data) = rows(ImportFormat::JsonArray, src);
+        assert_eq!(cols, vec!["id", "meta", "note"]);
+        assert_eq!(
+            data[0],
+            vec!["1".to_string(), "{\"a\":1,\"b\":[2,3]}".to_string(), "x, }y".to_string()]
+        );
+        assert_eq!(data[1], vec!["2".to_string(), "".to_string(), "".to_string()]);
+        assert_eq!(data[2], vec!["3".to_string(), "".to_string(), "".to_string()]);
+    }
+
+    #[test]
+    fn json_array_rejects_non_array_root() {
+        // begin() reads the first element eagerly to learn columns, so a non-array
+        // root (or a non-object element) fails there.
+        assert!(ImportReader::begin("{\"id\":1}".as_bytes(), ImportFormat::JsonArray).is_err());
+        assert!(ImportReader::begin("[1, 2, 3]".as_bytes(), ImportFormat::JsonArray).is_err());
     }
 }

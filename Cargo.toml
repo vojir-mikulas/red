@@ -78,6 +78,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 dirs = "5"
+# SQL beautifier for the editor's Format action. Pinned to the 0.2 line so it
+# reuses the `nom 7` already in the tree (0.3+ drops nom for its own parser);
+# the only new transitive dep is the tiny `unicode-categories`.
+sqlformat = "0.2"
 # OS keychain for connection credentials — passwords never hit connections.toml.
 # Backend features are additive and per-OS, so the consuming crate selects them
 # per target (see crates/red/Cargo.toml); the public API is backend-agnostic.

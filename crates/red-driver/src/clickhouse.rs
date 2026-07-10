@@ -804,8 +804,9 @@ impl DatabaseDriver for ClickhouseDriver {
         let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
 
         let file = File::create(path).map_err(driver_err)?;
+        let table = crate::format::sql_table_name(path);
         let mut writer =
-            ExportWriter::begin(BufWriter::new(file), format, names).map_err(driver_err)?;
+            ExportWriter::begin(BufWriter::new(file), format, names, table).map_err(driver_err)?;
         let mut throttle = ProgressThrottle::new(progress);
 
         // Bail on cancel: drop the writer, remove the partial file, report interruption.

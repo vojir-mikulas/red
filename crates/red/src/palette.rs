@@ -82,10 +82,14 @@ pub(crate) enum Cmd {
     /// Migrate the pending source schema into the target namespace at this index; the
     /// "Migrate to…" picker activation.
     MigrateTarget(usize),
+    /// Open the read-only schema ER diagram overlay.
+    ErDiagram,
     /// EXPLAIN the active tab's query and open the plan view (B4).
     Explain,
     /// EXPLAIN ANALYZE the active tab's query (runs it; read queries only).
     ExplainAnalyze,
+    /// Beautify the active editor's SQL in place.
+    FormatSql,
     /// Submit the staged grid edits as one batch (Track B6). Opens the confirm.
     SubmitChanges,
     /// Discard the staged grid edits (Track B6).
@@ -285,8 +289,10 @@ impl AppState {
             Cmd::CopyNewTable(index) => self.pick_copy_new_table(index, cx),
             Cmd::MigrateSchema => self.open_migrate_picker(cx),
             Cmd::MigrateTarget(index) => self.pick_migrate_target(index, cx),
+            Cmd::ErDiagram => self.open_er_diagram(cx),
             Cmd::Explain => self.explain_query(false, cx),
             Cmd::ExplainAnalyze => self.explain_query(true, cx),
+            Cmd::FormatSql => self.format_active_sql(cx),
             Cmd::SubmitChanges => self.submit_changes(cx),
             Cmd::RevertChanges => self.revert_changes(cx),
             Cmd::AddRow => self.add_draft_row(cx),
@@ -456,6 +462,10 @@ impl AppState {
                             Cmd::ExplainAnalyze,
                         ));
                     }
+                    out.push((
+                        PaletteItem::new("cmd:format-sql", "editor: format SQL").hint("⌥⌘F"),
+                        Cmd::FormatSql,
+                    ));
                 }
                 // Pane focus.
                 out.push((
@@ -485,6 +495,10 @@ impl AppState {
                 out.push((
                     PaletteItem::new("cmd:refresh", "schema: refresh").hint("⌘R"),
                     Cmd::RefreshSchema,
+                ));
+                out.push((
+                    PaletteItem::new("cmd:er-diagram", "schema: ER diagram"),
+                    Cmd::ErDiagram,
                 ));
                 out.push((
                     PaletteItem::new("cmd:disconnect", "connection: disconnect"),

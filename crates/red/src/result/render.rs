@@ -1275,6 +1275,15 @@ impl AppState {
                         cx.notify();
                     },
                 )),
+            )
+            .item(
+                ContextMenuItem::new("export-sql", "SQL (INSERT)").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.export_menu = None;
+                        this.export_result(ExportFormat::Sql, cx);
+                        cx.notify();
+                    },
+                )),
             );
         div()
             .absolute()

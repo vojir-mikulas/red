@@ -1954,6 +1954,7 @@ impl AppState {
             ExportFormat::Csv => "red-export.csv",
             ExportFormat::Json => "red-export.json",
             ExportFormat::Html => "red-report.html",
+            ExportFormat::Sql => "red-export.sql",
         };
         let dir = dirs::download_dir()
             .or_else(dirs::home_dir)
@@ -2182,6 +2183,7 @@ impl AppState {
             .as_deref()
         {
             Some("jsonl") | Some("ndjson") => ImportFormat::Jsonl,
+            Some("json") => ImportFormat::JsonArray,
             _ => ImportFormat::Csv,
         };
         let id = self.next_export_id;

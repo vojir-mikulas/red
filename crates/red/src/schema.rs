@@ -358,12 +358,24 @@ impl AppState {
         let schema_count = s.schemas.len();
         let object_count: usize = s.schemas.iter().map(|sc| sc.objects.len()).sum();
 
+        let er_icon = crate::icons::icon("link", cx.theme().scale(16.), cx.theme().text_muted);
         let filter_row = div()
             .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_1()
             .px_2()
             .pt_2()
             .pb_1()
-            .child(s.filter.clone());
+            .child(div().flex_1().child(s.filter.clone()))
+            // Open the read-only schema ER diagram.
+            .child(
+                IconButton::new("schema-er-diagram", er_icon)
+                    .size(IconButtonSize::Sm)
+                    .tooltip("ER diagram")
+                    .a11y_label("ER diagram")
+                    .on_click(cx.listener(|this, _, _, cx| this.open_er_diagram(cx))),
+            );
 
         // Capture the flattened rows per handler so each can map its click index
         // back to the node it represents.

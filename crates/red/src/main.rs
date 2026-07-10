@@ -16,6 +16,7 @@ mod conversations;
 mod dev_stats;
 mod editor;
 mod env;
+mod er;
 mod filter;
 mod find;
 mod history;

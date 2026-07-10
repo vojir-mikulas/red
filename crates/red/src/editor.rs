@@ -817,6 +817,29 @@ impl AppState {
         }
     }
 
+    /// Beautify the active editor's SQL in place (⌥⌘F / palette / Query menu):
+    /// re-indent, upper-case keywords, and break clauses onto their own lines. It
+    /// reformats the whole buffer (a single undo step) and never touches the
+    /// database. A blank or already-formatted buffer is a no-op.
+    pub(crate) fn format_active_sql(&mut self, cx: &mut Context<Self>) {
+        let Phase::Connected(active) = &self.phase else {
+            return;
+        };
+        let Some(tab) = active.active() else {
+            return;
+        };
+        let editor = tab.editor.clone();
+        let content = editor.read(cx).content();
+        if content.trim().is_empty() {
+            return;
+        }
+        let formatted = crate::sql::format_sql(&content);
+        if formatted != content {
+            editor.update(cx, |editor, cx| editor.set_content(formatted, cx));
+            cx.notify();
+        }
+    }
+
     /// Run a write/DDL statement in a transaction; refresh the schema tree after,
     /// since it may have created or dropped objects. The single seam through which
     /// writes leave the UI, so it also enforces the read-only gate, catching any

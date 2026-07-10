@@ -9,9 +9,11 @@ use red_core::CopyMode;
 use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::keymap::{
     About, AddRow, BeginEdit, CloseInspector, CloseTab, CycleFocusNext, CycleFocusPrev, DeleteRow,
-    Explain, FindInResult, FocusEditor, FocusGrid, FocusOtherHalf, FocusSchema, NewConnection,
+    Explain, FindInResult, FocusEditor, FocusGrid, FocusOtherHalf, FocusSchema, FormatSql,
+    NewConnection,
     NewTab, NextTab, OpenSavedQueries, PrevTab, RefreshSchema, ReportBug, RevertChanges, RunQuery,
-    SaveQuery, SearchSchema, SelectAll, SetNull, Settings, ShowChangelog, ShowShortcuts,
+    SaveQuery, SearchSchema, SelectAll, SetNull, Settings, ShowChangelog, ShowErDiagram,
+    ShowShortcuts,
     SubmitChanges, SwitchConnection, SwitchToConnectionSlot, SwitchToPreviousConnection,
     ToggleAssistant, ToggleColumnsPanel, ToggleFilter, ToggleHistory, ToggleInspector,
     ToggleSidebar, ToggleSplit,
@@ -389,6 +391,13 @@ impl Render for AppState {
             .as_ref()
             .map(|w| self.render_import_wizard(w, cx));
 
+        // The read-only ER diagram is a full-screen overlay hung off the connection
+        // (schema-wide), so it renders whenever the active connection has one open.
+        let er_diagram = match &self.phase {
+            Phase::Connected(active) if active.er.is_some() => Some(self.render_er(active, cx)),
+            _ => None,
+        };
+
         let theme = cx.theme();
         // Copied out now (Hsla is Copy) so the client-decoration frame at the end
         // of this fn doesn't hold `theme`'s borrow of `cx` across the dev-stats
@@ -432,6 +441,8 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &OpenSavedQueries, _, cx| this.open_saved_picker(cx)))
             // EXPLAIN (B4): ⇧⌘E opens the plan view for the active query.
             .on_action(cx.listener(|this, _: &Explain, _, cx| this.explain_query(false, cx)))
+            // Beautify the editor's SQL in place (⌥⌘F).
+            .on_action(cx.listener(|this, _: &FormatSql, _, cx| this.format_active_sql(cx)))
             // App-chrome actions (tabs · sidebar · schema reload), bound in the
             // central keymap to `RedRoot` so they fire from any pane's focus.
             .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_query(cx)))
@@ -469,6 +480,7 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &FocusOtherHalf, _, cx| this.focus_other_half(cx)))
             .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| this.toggle_shortcuts(cx)))
             .on_action(cx.listener(|this, _: &ShowChangelog, _, cx| this.toggle_whats_new(cx)))
+            .on_action(cx.listener(|this, _: &ShowErDiagram, _, cx| this.open_er_diagram(cx)))
             // Settings panel: ⌘, and the RED → Settings… / About RED menu items.
             .on_action(cx.listener(|this, _: &Settings, _, cx| this.open_settings(cx)))
             .on_action(cx.listener(|this, _: &About, _, cx| this.open_about(cx)))
@@ -577,6 +589,7 @@ impl Render for AppState {
             .children(shortcuts)
             .children(whats_new)
             .children(import_wizard)
+            .children(er_diagram)
             // The connection form modal is rendered at the root so it works in any
             // phase (the welcome screen *and* the connected shell, e.g. opened from
             // the switcher's "New connection…").

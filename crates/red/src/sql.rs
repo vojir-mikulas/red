@@ -1140,9 +1140,42 @@ fn referenced_tables(stmt: &str) -> Vec<(String, String)> {
     out
 }
 
+/// Beautify a SQL string for the editor's Format action: re-indent (2 spaces),
+/// upper-case keywords, and put each major clause on its own line. Multi-statement
+/// input is handled per statement. A whitespace-only input is returned unchanged so
+/// the action is a no-op on an empty editor.
+///
+/// SQL formatting is deceptively hard (subqueries, CASE, function args), so this
+/// leans on the well-tested `sqlformat` crate rather than a hand-rolled pass; see
+/// the dependency note in the workspace manifest.
+pub fn format_sql(sql: &str) -> String {
+    if sql.trim().is_empty() {
+        return sql.to_string();
+    }
+    let options = sqlformat::FormatOptions {
+        indent: sqlformat::Indent::Spaces(2),
+        uppercase: true,
+        ..Default::default()
+    };
+    sqlformat::format(sql, &sqlformat::QueryParams::None, options)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The formatter upper-cases keywords, breaks major clauses onto their own
+    /// lines, and no-ops on blank input.
+    #[test]
+    fn format_sql_beautifies_and_no_ops_on_blank() {
+        assert_eq!(format_sql("   \n  "), "   \n  ");
+        let out = format_sql("select id, name from users where id = 1");
+        assert!(out.contains("SELECT"), "keywords upper-cased: {out}");
+        assert!(out.contains("\nFROM"), "FROM on its own line: {out}");
+        assert!(out.contains("\nWHERE"), "WHERE on its own line: {out}");
+        // Formatting is stable: a second pass changes nothing.
+        assert_eq!(format_sql(&out), out);
+    }
 
     /// Split a fixture on the `|` caret marker into `(content, cursor)`.
     fn at(src: &str) -> (String, usize) {

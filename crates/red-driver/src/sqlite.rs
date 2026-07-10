@@ -593,7 +593,8 @@ fn export_blocking(
     let file = File::create(out_path).map_err(driver_err)?;
     let out = BufWriter::new(file);
     let mut rows_iter = stmt.query([]).map_err(driver_err)?;
-    let mut writer = ExportWriter::begin(out, format, names).map_err(driver_err)?;
+    let table = crate::format::sql_table_name(out_path);
+    let mut writer = ExportWriter::begin(out, format, names, table).map_err(driver_err)?;
     let mut throttle = ProgressThrottle::new(progress);
 
     // Bail on cancel: drop the writer, remove the partial file, and report

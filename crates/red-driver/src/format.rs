@@ -9,6 +9,7 @@
 //! export is a later format option.
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use red_core::{ExportFormat, Value};
@@ -66,13 +67,22 @@ pub(crate) struct ExportWriter<W: Write> {
     out: W,
     format: ExportFormat,
     names: Vec<String>,
+    /// Target table name for [`ExportFormat::Sql`] `INSERT` statements; unused by
+    /// the other formats. Derived from the destination file stem by the driver.
+    table: String,
     written: u64,
 }
 
 impl<W: Write> ExportWriter<W> {
     /// Begin an export: write the CSV header row, the opening JSON `[`, or the HTML
-    /// document head + table header.
-    pub(crate) fn begin(mut out: W, format: ExportFormat, names: Vec<String>) -> io::Result<Self> {
+    /// document head + table header. `table` names the target for SQL `INSERT`
+    /// exports and is ignored by every other format.
+    pub(crate) fn begin(
+        mut out: W,
+        format: ExportFormat,
+        names: Vec<String>,
+        table: String,
+    ) -> io::Result<Self> {
         match format {
             ExportFormat::Csv => {
                 writeln!(out, "{}", csv_record(names.iter().map(String::as_str)))?;
@@ -84,11 +94,15 @@ impl<W: Write> ExportWriter<W> {
                 write!(out, "{}", html_head(None))?;
                 write!(out, "{}", html_thead(&names))?;
             }
+            // The INSERT stream needs no preamble; each row is a standalone
+            // statement carrying the table name and column list.
+            ExportFormat::Sql => {}
         }
         Ok(Self {
             out,
             format,
             names,
+            table,
             written: 0,
         })
     }
@@ -127,6 +141,23 @@ impl<W: Write> ExportWriter<W> {
                 }
                 writeln!(self.out, "</tr>")?;
             }
+            ExportFormat::Sql => {
+                write!(self.out, "INSERT INTO {} (", sql_ident(&self.table))?;
+                for (i, name) in self.names.iter().enumerate() {
+                    if i > 0 {
+                        write!(self.out, ", ")?;
+                    }
+                    write!(self.out, "{}", sql_ident(name))?;
+                }
+                write!(self.out, ") VALUES (")?;
+                for (i, value) in cells.iter().enumerate() {
+                    if i > 0 {
+                        write!(self.out, ", ")?;
+                    }
+                    write!(self.out, "{}", sql_value(value))?;
+                }
+                writeln!(self.out, ");")?;
+            }
         }
         self.written += 1;
         Ok(())
@@ -138,7 +169,7 @@ impl<W: Write> ExportWriter<W> {
         match self.format {
             ExportFormat::Json => write!(self.out, "\n]\n")?,
             ExportFormat::Html => write!(self.out, "{}", html_foot(self.written))?,
-            ExportFormat::Csv => {}
+            ExportFormat::Csv | ExportFormat::Sql => {}
         }
         self.out.flush()?;
         Ok(self.written)
@@ -282,6 +313,51 @@ pub(crate) fn json_value(value: &Value) -> String {
     }
 }
 
+/// A SQL identifier (table or column) in portable ANSI form: double-quoted with
+/// any embedded `"` doubled. Works for SQLite / Postgres / ClickHouse and for
+/// MySQL under `ANSI_QUOTES`; a deliberately dialect-neutral default for a text
+/// file the user carries elsewhere.
+pub(crate) fn sql_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// A SQL literal for one cell: NULL keyword, bare numbers, single-quoted strings
+/// (embedded `'` doubled). Blobs keep the module-wide `<N bytes>` length-marker
+/// convention (rendered as a string literal), not raw/hex bytes.
+pub(crate) fn sql_value(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Integer(n) => n.to_string(),
+        Value::Real(x) => x.to_string(),
+        Value::Text(s) => sql_string(s),
+        Value::Blob(b) => sql_string(&format!("<{} bytes>", b.len())),
+        Value::Capped(_) => sql_string(&value.to_string()),
+    }
+}
+
+/// Single-quote a string literal, doubling embedded quotes.
+fn sql_string(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Derive a target table name for a SQL `INSERT` export from the destination file
+/// stem: keep alphanumerics and `_`, fold everything else to `_`, and fall back to
+/// `exported_table` when nothing usable remains (e.g. a leading-digit or empty
+/// stem). The result is later double-quoted by [`sql_ident`].
+pub(crate) fn sql_table_name(path: &Path) -> String {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let sanitized: String = stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() || trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        "exported_table".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 pub(crate) fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -314,6 +390,7 @@ mod tests {
             &mut buf,
             ExportFormat::Html,
             vec!["name".to_string(), "note".to_string()],
+            String::new(),
         )
         .unwrap();
         w.write_row(&[Value::Text("<script>".to_string()), Value::Null])
@@ -339,5 +416,41 @@ mod tests {
     #[test]
     fn html_report_blob_is_a_length_marker() {
         assert_eq!(html_cell(&Value::Blob(vec![0u8; 5])), "&lt;5 bytes&gt;");
+    }
+
+    /// SQL export emits one `INSERT` per row with quoted identifiers, ANSI string
+    /// literals (embedded quotes doubled), bare numbers, and the NULL keyword.
+    #[test]
+    fn sql_export_emits_insert_statements() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut w = ExportWriter::begin(
+            &mut buf,
+            ExportFormat::Sql,
+            vec!["id".to_string(), "name".to_string()],
+            "users".to_string(),
+        )
+        .unwrap();
+        w.write_row(&[Value::Integer(1), Value::Text("O'Brien".to_string())])
+            .unwrap();
+        w.write_row(&[Value::Integer(2), Value::Null]).unwrap();
+        let rows = w.finish().unwrap();
+        assert_eq!(rows, 2);
+
+        let sql = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"users\" (\"id\", \"name\") VALUES (1, 'O''Brien');\n\
+             INSERT INTO \"users\" (\"id\", \"name\") VALUES (2, NULL);\n"
+        );
+    }
+
+    /// The INSERT table name is sanitized from the destination file stem, folding
+    /// unsafe characters and falling back when the stem is unusable.
+    #[test]
+    fn sql_table_name_sanitizes_the_file_stem() {
+        assert_eq!(sql_table_name(Path::new("/tmp/my-export.sql")), "my_export");
+        assert_eq!(sql_table_name(Path::new("orders.sql")), "orders");
+        assert_eq!(sql_table_name(Path::new("/tmp/123.sql")), "exported_table");
+        assert_eq!(sql_table_name(Path::new("/tmp/___.sql")), "exported_table");
     }
 }

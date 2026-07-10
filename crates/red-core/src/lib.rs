@@ -1331,6 +1331,10 @@ pub enum ExportFormat {
     /// light/dark via `prefers-color-scheme`) opened in the system browser, not a
     /// data interchange file. Streamed row-by-row like the others.
     Html,
+    /// A stream of `INSERT INTO "table" (...) VALUES (...);` statements, one per
+    /// row. The table name is derived from the destination file stem; identifiers
+    /// and string literals use portable ANSI quoting (double / single quotes).
+    Sql,
 }
 
 /// A streamed-import source format, the read-side mirror of [`ExportFormat`]. The
@@ -1340,6 +1344,9 @@ pub enum ImportFormat {
     Csv,
     /// Newline-delimited JSON: one JSON object per line.
     Jsonl,
+    /// A single top-level JSON array of objects (`[ {…}, {…} ]`), read one element
+    /// at a time so the whole file is never materialized.
+    JsonArray,
 }
 
 /// One column mapping for a data import / copy: which **source** cell index feeds

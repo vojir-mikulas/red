@@ -667,6 +667,9 @@ pub(crate) struct ActiveConn {
     /// eviction when [`MAX_PARKED_SESSIONS`] is exceeded: the lowest stamp is the
     /// least-recently-foregrounded parked session.
     pub last_active_seq: u64,
+    /// The read-only ER diagram overlay when open (schema-wide, so it hangs off the
+    /// connection, not a tab). `None` when closed. See [`crate::er`].
+    pub er: Option<crate::er::ErView>,
 }
 
 impl ActiveConn {
@@ -711,6 +714,7 @@ impl ActiveConn {
             columns_w: px(260.),
             columns_drag: None,
             last_active_seq: 0,
+            er: None,
         }
     }
 
