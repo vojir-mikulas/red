@@ -432,6 +432,12 @@ impl AppState {
                 EditSlot::Row { row, data_col, .. } => Some((*row, *data_col, e.input.clone())),
                 EditSlot::Draft { .. } => None,
             });
+        // When the FK picker (Track B8) is open, the editor cell also hosts a
+        // bounds-capturing canvas so the dropdown can anchor below it.
+        let suggest_anchor: Option<Entity<Option<gpui::Bounds<Pixels>>>> = is_focused
+            .then_some(self.cell_suggest.as_ref())
+            .flatten()
+            .map(|_| self.cell_suggest_bounds.clone());
 
         // The focused cell, spoken aloud: the grid reports this as its accessible
         // name (a `Grid` landmark), so a screen reader announces "<column>:
@@ -586,14 +592,29 @@ impl AppState {
                 let buffer = buffer_row.borrow();
                 let struck = overlay_cells.deleted.contains(&abs);
                 if show_gutter {
-                    // After an interpolated jump the run's ordinals are estimates;
-                    // the gutter marks them `≈` until a true end pins them exact.
-                    let label = if buffer.is_estimated() {
-                        format!("≈{}", group_digits(abs + 1))
+                    if struck {
+                        // A row staged for deletion trades its ordinal for a clear
+                        // deletion marker (the row-through + red tint already read as
+                        // "going away"; the gutter glyph names why).
+                        out.push(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_color(red)
+                                .child(gpui::svg().path("icons/ban.svg").size(px(13.)).flex_none())
+                                .into_any_element(),
+                        );
                     } else {
-                        group_digits(abs + 1)
-                    };
-                    out.push(div().text_color(faint).child(label).into_any_element());
+                        // After an interpolated jump the run's ordinals are estimates;
+                        // the gutter marks them `≈` until a true end pins them exact.
+                        let label = if buffer.is_estimated() {
+                            format!("≈{}", group_digits(abs + 1))
+                        } else {
+                            group_digits(abs + 1)
+                        };
+                        out.push(div().text_color(faint).child(label).into_any_element());
+                    }
                 }
                 let resident = buffer.row(abs);
                 for c in 0..ncols {
@@ -602,7 +623,17 @@ impl AppState {
                     // the height/padding) rather than drawing a smaller box inside.
                     if let Some((er, ec, input)) = &inline {
                         if *er == abs && *ec == c {
-                            out.push(input.clone().into_any_element());
+                            match &suggest_anchor {
+                                Some(anchor) => out.push(
+                                    div()
+                                        .relative()
+                                        .size_full()
+                                        .child(input.clone())
+                                        .child(super::suggest::anchor_canvas(anchor.clone()))
+                                        .into_any_element(),
+                                ),
+                                None => out.push(input.clone().into_any_element()),
+                            }
                             continue;
                         }
                     }
@@ -975,9 +1006,17 @@ impl AppState {
                             div()
                                 .id(("draft-remove", index))
                                 .cursor_pointer()
+                                // The svg inherits the parent's `text_color`, so the
+                                // hover recolour lands on the icon (a fixed-colour
+                                // `icons::icon` would ignore it).
                                 .text_color(faint)
                                 .hover(|s| s.text_color(accent))
-                                .child("✕")
+                                .child(
+                                    gpui::svg()
+                                        .path("icons/circle-x.svg")
+                                        .size(theme.scale(14.))
+                                        .flex_none(),
+                                )
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.remove_draft_row(index, cx)
                                 })),
@@ -990,6 +1029,7 @@ impl AppState {
                     if *di == index && *dc == c {
                         cells.push(
                             div()
+                                .relative()
                                 .w(px(DATA_COL_WIDTH))
                                 .flex_shrink_0()
                                 .h_full()
@@ -999,6 +1039,13 @@ impl AppState {
                                 .border_r_1()
                                 .border_color(line)
                                 .child(input.clone())
+                                // Anchor the FK picker (Track B8) below this draft cell.
+                                .when_some(
+                                    self.cell_suggest
+                                        .as_ref()
+                                        .map(|_| self.cell_suggest_bounds.clone()),
+                                    |d, anchor| d.child(super::suggest::anchor_canvas(anchor)),
+                                )
                                 .into_any_element(),
                         );
                         continue;

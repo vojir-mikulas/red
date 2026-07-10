@@ -34,6 +34,21 @@ const HEX_MAX: usize = 4 * 1024;
 /// enough to fit the pane without wrapping, which would shear the columns apart.
 const HEX_COLS: usize = 8;
 
+/// How the inspector renders the focused value's body. `Auto` picks per value
+/// (JSON pretty-printed, blob hex-dumped, text as prose); the others force a lens so
+/// the user can read the raw source, force JSON re-indent, or view any value's bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ValueFormat {
+    #[default]
+    Auto,
+    /// The stored text verbatim (no JSON re-indent); a blob still shows as hex.
+    Raw,
+    /// Force JSON re-indent (falls back to raw text when it isn't JSON).
+    Json,
+    /// A hex dump of the value's bytes (text or blob).
+    Hex,
+}
+
 /// All the inspector's persistent state. Present iff the pane is open.
 pub(crate) struct InspectorState {
     /// Scroll position of the value body, kept across frames (the body is
@@ -41,19 +56,25 @@ pub(crate) struct InspectorState {
     pub(crate) scroll: ScrollHandle,
     /// The full value fetched for one capped/evicted cell, formatted once on
     /// arrival so a big value isn't re-formatted (or cloned) every frame. Cleared
-    /// when the cursor moves to a different cell (see [`AppState::reconcile_inspector`]).
+    /// when the target cell changes (see [`AppState::reconcile_inspector`]).
     full: Option<InspectedFull>,
     /// The in-flight full-fetch, if any; its reply is matched by `id`.
     pending: Option<PendingInspect>,
     /// An open inline edit (Track B5): the value field + the cell it targets. The
     /// inspector becomes the editor: type a new value and Save. Cleared when the
-    /// cursor moves off the cell, on Save (the confirm takes over), or on Cancel.
+    /// target cell moves off, on Save (the confirm takes over), or on Cancel.
     editing: Option<InspectorEdit>,
     /// A read-only editor mirroring the displayed value body, so the pane's body is
     /// *selectable* (drag / double-click word / ⌘C a portion), not just whole-cell
     /// Copy. Rebuilt only when [`PreviewKey`] changes (see
     /// [`AppState::reconcile_preview`]); absent while an edit is open.
     preview: Option<PreviewView>,
+    /// When set, the pane is *pinned* to this `(epoch, row, col)`: it keeps showing
+    /// (and holding the loaded bytes / open edit of) that cell even as the grid cursor
+    /// moves, instead of following the cursor live. Cleared on unpin or a result swap.
+    pinned: Option<(u64, usize, usize)>,
+    /// The lens the body is rendered through (Auto / Raw / JSON / Hex).
+    format: ValueFormat,
 }
 
 /// A read-only [`CodeEditor`] hosting the *displayed* value body so the user can
@@ -78,6 +99,8 @@ struct PreviewKey {
     /// value (and a just-patched cell) at the same `(epoch, row, col)`.
     len: usize,
     wrap: bool,
+    /// The lens; a format toggle rebuilds the preview even at the same length.
+    format: ValueFormat,
 }
 
 /// An in-progress inline cell edit hosted in the inspector (Track B5). The editor
@@ -104,6 +127,8 @@ impl InspectorState {
             pending: None,
             editing: None,
             preview: None,
+            pinned: None,
+            format: ValueFormat::Auto,
         }
     }
 }
@@ -120,6 +145,10 @@ struct InspectedFull {
     /// from here. `view` is the formatted (cached) rendering of this same value.
     value: Value,
     view: ValueView,
+    /// The lens `view` was built with; a format change re-renders it (see
+    /// [`AppState::reconcile_inspector`]) so the cache stays correct without
+    /// re-formatting a large value every frame.
+    format: ValueFormat,
 }
 
 /// A `CopyRows` re-fetch issued for the inspector, awaiting its `CopyRowsLoaded`.
@@ -165,6 +194,29 @@ impl AppState {
             None => Some(InspectorState::new()),
         };
         cx.notify();
+    }
+
+    /// Pin the inspector to the cell it's currently showing (so it holds that value —
+    /// and any loaded bytes / open edit — while the grid cursor roams), or unpin it
+    /// back to following the cursor. No-op when the pane is closed.
+    pub(crate) fn toggle_inspector_pin(&mut self, cx: &mut Context<Self>) {
+        let target = self.target_cell();
+        if let Some(insp) = &mut self.inspector {
+            insp.pinned = match insp.pinned {
+                Some(_) => None,
+                None => target,
+            };
+            cx.notify();
+        }
+    }
+
+    /// Switch the render lens (Auto / Raw / JSON / Hex). The cached full value, if any,
+    /// re-renders on the next reconcile; resident values re-format on the spot.
+    pub(crate) fn set_inspector_format(&mut self, fmt: ValueFormat, cx: &mut Context<Self>) {
+        if let Some(insp) = &mut self.inspector {
+            insp.format = fmt;
+            cx.notify();
+        }
     }
 
     /// Open the inspector if it isn't already (the double-click-a-cell entry;
@@ -213,18 +265,54 @@ impl AppState {
         Some((grid.epoch, row, col))
     }
 
+    /// The cell the inspector is showing: the *pinned* cell when the pane is pinned,
+    /// otherwise the one under the grid cursor. Everything the pane resolves (its
+    /// value, preview, load, edit gate) goes through this, so a pin holds the view
+    /// steady while the cursor roams the grid.
+    fn target_cell(&self) -> Option<(u64, usize, usize)> {
+        match self.inspector.as_ref().and_then(|i| i.pinned) {
+            Some(pinned) => Some(pinned),
+            None => self.focused_cell(),
+        }
+    }
+
+    /// The active render lens (Auto when the pane is closed).
+    fn inspector_format(&self) -> ValueFormat {
+        self.inspector
+            .as_ref()
+            .map(|i| i.format)
+            .unwrap_or_default()
+    }
+
     /// Drop a loaded/in-flight full value once the cursor has moved off the cell it
     /// belonged to (or the result was replaced). Called once per frame before the
     /// shell renders, so the bytes of a big inspected value never outlive the
     /// cursor sitting on it. Keeps the "fetched bytes dropped when focus moves"
     /// budget promise without threading inspector state through every grid handler.
     pub(crate) fn reconcile_inspector(&mut self, cx: &mut Context<Self>) {
-        let cur = self.focused_cell();
+        // A pin to a since-replaced result (a re-run/sort/filter bumped the epoch)
+        // can't be honored, so drop it and fall back to following the cursor.
+        let live_epoch = self.focused_cell().map(|(e, _, _)| e);
+        if let Some(insp) = &mut self.inspector {
+            if let Some((pe, _, _)) = insp.pinned {
+                if live_epoch != Some(pe) {
+                    insp.pinned = None;
+                }
+            }
+        }
+        // Resolve against the *target* (pinned cell, else cursor): a pinned pane keeps
+        // its loaded bytes / open edit even as the cursor roams.
+        let cur = self.target_cell();
+        let fmt = self.inspector_format();
         if let Some(insp) = &mut self.inspector {
             let matches = |epoch, row, col| cur == Some((epoch, row, col));
-            if let Some(full) = &insp.full {
+            if let Some(full) = &mut insp.full {
                 if !matches(full.epoch, full.row, full.col) {
                     insp.full = None;
+                } else if full.format != fmt {
+                    // Lens changed: re-render the cached view (never per frame).
+                    full.view = format_value(&full.value, fmt);
+                    full.format = fmt;
                 }
             }
             if let Some(p) = &insp.pending {
@@ -232,7 +320,7 @@ impl AppState {
                     insp.pending = None;
                 }
             }
-            // An inline edit belongs to one cell; abandon it if the cursor moved off
+            // An inline edit belongs to one cell; abandon it if the target moved off
             // (or the result was replaced) so a stray edit can't apply to a new cell.
             if let Some(edit) = &insp.editing {
                 if !matches(edit.ctx.epoch, edit.ctx.row, edit.ctx.data_col) {
@@ -297,9 +385,12 @@ impl AppState {
             return None;
         };
         let grid = active.active_result()?;
-        let (row, col) = grid.cursor_cell(self.gutter())?;
-        let epoch = grid.epoch;
-        // A loaded full value wins; it was formatted once at load.
+        let (epoch, row, col) = self.target_cell()?;
+        if epoch != grid.epoch {
+            return None; // a pin to a since-replaced result (cleared next reconcile)
+        }
+        let fmt = self.inspector_format();
+        // A loaded full value wins; it was formatted once at load / on a lens change.
         if let Some(full) = self.inspector.as_ref().and_then(|i| i.full.as_ref()) {
             if full.epoch == epoch && full.row == row && full.col == col {
                 let body = full.view.body.to_string();
@@ -309,6 +400,7 @@ impl AppState {
                     col,
                     len: body.len(),
                     wrap: full.view.wrap,
+                    format: fmt,
                 };
                 return Some((key, body, full.view.wrap));
             }
@@ -318,7 +410,7 @@ impl AppState {
         match grid.cell_value(row, col)? {
             Value::Capped(_) => None,
             v => {
-                let view = format_value(&v);
+                let view = format_value(&v, fmt);
                 let body = view.body.to_string();
                 let key = PreviewKey {
                     epoch,
@@ -326,6 +418,7 @@ impl AppState {
                     col,
                     len: body.len(),
                     wrap: view.wrap,
+                    format: fmt,
                 };
                 Some((key, body, view.wrap))
             }
@@ -336,7 +429,7 @@ impl AppState {
     /// clipboard's `CopyRows` path, `PageCap::Full`) so a capped or evicted cell
     /// can show its whole value. One row, on demand, behind an explicit click.
     pub(crate) fn load_inspector_full(&mut self, cx: &mut Context<Self>) {
-        let Some((epoch, row, col)) = self.focused_cell() else {
+        let Some((epoch, row, col)) = self.target_cell() else {
             return;
         };
         if self.inspector.is_none() {
@@ -368,6 +461,7 @@ impl AppState {
     /// moved, clearing `pending`) finds no match and is dropped. Returns whether it
     /// claimed the reply, so the copy path only runs when it didn't.
     pub(crate) fn on_inspect_rows(&mut self, id: u64, rows: &[Vec<Value>]) -> bool {
+        let fmt = self.inspector_format();
         let Some(insp) = &mut self.inspector else {
             return false;
         };
@@ -379,8 +473,9 @@ impl AppState {
                 epoch: p.epoch,
                 row: p.row,
                 col: p.col,
-                view: format_value(value),
+                view: format_value(value, fmt),
                 value: value.clone(),
+                format: fmt,
             });
         }
         true
@@ -393,6 +488,11 @@ impl AppState {
     /// the per-frame "is it editable?" check uses [`Self::inspector_can_edit`].
     fn inspector_edit_context(&self) -> Option<EditContext> {
         if !self.editing_enabled() {
+            return None;
+        }
+        // Editing resolves through the grid *cursor* (`active_edit_target`), so a pane
+        // pinned to a different cell is view-only; move the cursor back to edit it.
+        if self.target_cell() != self.focused_cell() {
             return None;
         }
         if let (Some(full), Some((epoch, row, col))) = (
@@ -416,6 +516,10 @@ impl AppState {
     /// it never clones the (possibly large) full value.
     fn inspector_can_edit(&self) -> bool {
         if !self.editing_enabled() {
+            return false;
+        }
+        // A pane pinned away from the cursor is view-only (see `inspector_edit_context`).
+        if self.target_cell() != self.focused_cell() {
             return false;
         }
         if let (Some(full), Some((epoch, row, col))) = (
@@ -450,8 +554,13 @@ impl AppState {
         // Seed the editor with the value *as the pane renders it* (a pretty-printed
         // JSON document, a wrapped text), not the raw one-line `to_string`, so editing
         // doesn't first flatten the formatting the user was just reading. A NULL opens
-        // empty (an empty save sets NULL back).
-        let view = format_value(&ctx.original);
+        // empty (an empty save sets NULL back). The Hex lens has no text round-trip, so
+        // it seeds the raw text instead (editing bytes-as-hex would mis-coerce on save).
+        let edit_fmt = match self.inspector_format() {
+            ValueFormat::Hex => ValueFormat::Raw,
+            other => other,
+        };
+        let view = format_value(&ctx.original, edit_fmt);
         let prefill = match &ctx.original {
             Value::Null => String::new(),
             _ => view.body.to_string(),
@@ -557,12 +666,16 @@ impl AppState {
     /// an evicted (off-window) cell.
     fn inspector_cell(&self, active: &ActiveConn) -> Option<InspectorView> {
         let grid = active.active_result()?;
-        let (row, col) = grid.cursor_cell(self.gutter())?;
+        let (epoch, row, col) = self.target_cell()?;
+        if epoch != grid.epoch {
+            return None; // a pin to a since-replaced result (cleared next reconcile)
+        }
         let (col_name, decl_type) = grid.column_meta(col)?;
+        let fmt = self.inspector_format();
 
-        // A loaded full value wins (formatted once, at load time).
+        // A loaded full value wins (formatted once, re-rendered on a lens change).
         if let Some(full) = self.inspector.as_ref().and_then(|i| i.full.as_ref()) {
-            if full.epoch == grid.epoch && full.row == row && full.col == col {
+            if full.epoch == epoch && full.row == row && full.col == col {
                 return Some(InspectorView {
                     col_name,
                     decl_type,
@@ -576,7 +689,7 @@ impl AppState {
         // column) format straight away; they're bounded, so this is cheap.
         let state = match grid.cell_value(row, col) {
             Some(Value::Capped(c)) => CellState::Capped(c),
-            Some(v) => CellState::Ready(format_value(&v)),
+            Some(v) => CellState::Ready(format_value(&v, fmt)),
             None => CellState::Evicted,
         };
         Some(InspectorView {
@@ -608,7 +721,8 @@ impl AppState {
         let (s11, s12) = (theme.scale(11.), theme.scale(12.));
         let body_size = theme.font_size;
 
-        // Header: column name + type, a close ✕.
+        // Header: column name + type, a pin toggle, a close ✕.
+        let pinned = self.inspector.as_ref().is_some_and(|i| i.pinned.is_some());
         let resolved = self.inspector_cell(active);
         let (title, subtitle) = match &resolved {
             Some(v) => {
@@ -656,6 +770,17 @@ impl AppState {
                     .flex_col()
                     .child(div().text_size(s12).text_color(text).child(title))
                     .child(div().text_size(s11).text_color(faint).child(subtitle)),
+            )
+            .child(
+                // Pin holds the pane on this cell while the cursor roams; active when set.
+                Button::new("inspector-pin", if pinned { "Pinned" } else { "Pin" })
+                    .variant(if pinned {
+                        ButtonVariant::Secondary
+                    } else {
+                        ButtonVariant::Ghost
+                    })
+                    .size(ButtonSize::Sm)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_inspector_pin(cx))),
             )
             .child(
                 Button::new("inspector-close", "✕")
@@ -736,6 +861,9 @@ impl AppState {
         // (A large/capped text loaded in full is editable too, see
         // `inspector_can_edit`.)
         let editable = self.inspector_can_edit();
+        // The lens toggle only makes sense once there's a value to re-render; a capped
+        // or evicted cell must be loaded first.
+        let is_ready = matches!(&resolved, Some(v) if matches!(v.state, CellState::Ready(_)));
 
         // Body + actions vary by state.
         let (body, action): (AnyElement, Option<AnyElement>) = match resolved.map(|v| v.state) {
@@ -867,8 +995,42 @@ impl AppState {
             .bg(bg)
             .text_color(muted)
             .child(header)
+            .children(is_ready.then(|| self.format_bar(cx)))
             .child(body)
             .children(footer)
+            .into_any_element()
+    }
+
+    /// The lens toggle bar (Auto / Raw / JSON / Hex), shown above a resolved value so
+    /// the user can read it as prose, forced JSON, or a hex dump. The active lens reads
+    /// as a filled button.
+    fn format_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let border = cx.theme().border;
+        let cur = self.inspector_format();
+        let opt =
+            |id: &'static str, label: &'static str, fmt: ValueFormat, cx: &mut Context<Self>| {
+                Button::new(id, label)
+                    .variant(if cur == fmt {
+                        ButtonVariant::Secondary
+                    } else {
+                        ButtonVariant::Ghost
+                    })
+                    .size(ButtonSize::Sm)
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_inspector_format(fmt, cx)))
+            };
+        div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_3()
+            .py(px(4.))
+            .border_b_1()
+            .border_color(border)
+            .child(opt("insp-fmt-auto", "Auto", ValueFormat::Auto, cx))
+            .child(opt("insp-fmt-raw", "Raw", ValueFormat::Raw, cx))
+            .child(opt("insp-fmt-json", "JSON", ValueFormat::Json, cx))
+            .child(opt("insp-fmt-hex", "Hex", ValueFormat::Hex, cx))
             .into_any_element()
     }
 
@@ -940,23 +1102,35 @@ impl AppState {
         } else {
             // Fixed-line content (hex, pretty JSON): one non-shrinking row per line
             // inside a horizontally-scrollable column, so a long line scrolls rather
-            // than wrapping and shearing the layout.
-            body.overflow_x_scroll()
-                .flex()
-                .flex_col()
-                .children(view.body.lines().map(|line| {
+            // than wrapping and shearing the layout. Bounded: this non-virtualized
+            // fallback only renders for the frame or two before `reconcile_preview`
+            // builds the (scrollable) editor, so a pathological value can't lay out
+            // millions of line-divs. The editor path shows the whole value.
+            const MAX_LINES: usize = 5_000;
+            let total = view.body.lines().count();
+            let mut col = body.overflow_x_scroll().flex().flex_col().children(
+                view.body.lines().take(MAX_LINES).map(|line| {
                     div()
                         .flex_shrink_0()
                         .child(SharedString::from(line.to_string()))
-                }))
-                .into_any_element()
+                }),
+            );
+            if total > MAX_LINES {
+                col = col.child(div().flex_shrink_0().child(SharedString::from(format!(
+                    "… {} more lines",
+                    group_digits(total - MAX_LINES)
+                ))));
+            }
+            col.into_any_element()
         }
     }
 }
 
-/// Format a value for the pane: the body text, a one-line summary, and whether it
-/// should soft-wrap. Pure and small: the RED-domain half of the inspector.
-fn format_value(value: &Value) -> ValueView {
+/// Format a value for the pane through `fmt`: the body text, a one-line summary, and
+/// whether it should soft-wrap. Pure and small: the RED-domain half of the inspector.
+/// `fmt` only affects text/blob (a scalar has one rendering); `Auto` is the per-value
+/// default (JSON pretty-printed, blob hex, text as prose).
+fn format_value(value: &Value, fmt: ValueFormat) -> ValueView {
     match value {
         Value::Null => ValueView {
             body: "NULL".into(),
@@ -975,19 +1149,26 @@ fn format_value(value: &Value) -> ValueView {
         },
         Value::Text(s) => {
             let chars = group_digits(s.chars().count());
-            match pretty_json(s) {
-                Some(pretty) => ValueView {
-                    body: pretty.into(),
-                    summary: format!("{chars} chars · JSON"),
-                    wrap: false,
-                },
-                None => ValueView {
-                    body: s.clone().into(),
-                    summary: format!("{chars} chars · text"),
-                    wrap: true,
-                },
+            let raw = || ValueView {
+                body: s.clone().into(),
+                summary: format!("{chars} chars · text"),
+                wrap: true,
+            };
+            let json = |pretty: String| ValueView {
+                body: pretty.into(),
+                summary: format!("{chars} chars · JSON"),
+                wrap: false,
+            };
+            match fmt {
+                ValueFormat::Hex => hex_view(s.as_bytes()),
+                ValueFormat::Raw => raw(),
+                // Force a re-indent; if it isn't JSON, show the raw text.
+                ValueFormat::Json => pretty_json(s).map(json).unwrap_or_else(raw),
+                // Default: JSON if it parses, else prose.
+                ValueFormat::Auto => pretty_json(s).map(json).unwrap_or_else(raw),
             }
         }
+        // A blob has no textual rendering; every lens shows its bytes as hex.
         Value::Blob(b) => ValueView {
             body: hex_dump(b, HEX_MAX).into(),
             summary: format!("{} bytes · blob", group_digits(b.len())),
@@ -1072,6 +1253,16 @@ fn indent(out: &mut String, depth: usize) {
     out.push('\n');
     for _ in 0..depth {
         out.push_str("  ");
+    }
+}
+
+/// A [`ValueView`] wrapping a hex dump of `bytes` (the Hex lens over any value): the
+/// dump stays on fixed lines (no wrap) and carries a byte-count summary.
+fn hex_view(bytes: &[u8]) -> ValueView {
+    ValueView {
+        body: hex_dump(bytes, HEX_MAX).into(),
+        summary: format!("{} bytes · hex", group_digits(bytes.len())),
+        wrap: false,
     }
 }
 
@@ -1163,15 +1354,41 @@ mod tests {
 
     #[test]
     fn format_value_classifies_text_json_and_blob() {
+        use ValueFormat::Auto;
         assert!(
-            matches!(format_value(&Value::Text(r#"{"a":1}"#.into())), v if v.summary.contains("JSON") && !v.wrap)
+            matches!(format_value(&Value::Text(r#"{"a":1}"#.into()), Auto), v if v.summary.contains("JSON") && !v.wrap)
         );
         assert!(
-            matches!(format_value(&Value::Text("plain".into())), v if v.summary.contains("text") && v.wrap)
+            matches!(format_value(&Value::Text("plain".into()), Auto), v if v.summary.contains("text") && v.wrap)
         );
         assert!(
-            matches!(format_value(&Value::Blob(vec![1, 2, 3])), v if v.summary.contains("blob") && !v.wrap)
+            matches!(format_value(&Value::Blob(vec![1, 2, 3]), Auto), v if v.summary.contains("blob") && !v.wrap)
         );
-        assert!(matches!(format_value(&Value::Null), v if v.body.as_ref() == "NULL"));
+        assert!(matches!(format_value(&Value::Null, Auto), v if v.body.as_ref() == "NULL"));
+    }
+
+    #[test]
+    fn format_lens_forces_raw_json_and_hex() {
+        let json = Value::Text(r#"{"a":1}"#.into());
+        // Raw shows the source verbatim (no re-indent).
+        assert_eq!(
+            format_value(&json, ValueFormat::Raw).body.as_ref(),
+            r#"{"a":1}"#
+        );
+        // Json re-indents.
+        assert!(format_value(&json, ValueFormat::Json)
+            .body
+            .contains("\n  \"a\": 1"));
+        // Hex dumps the text's bytes and never wraps.
+        let hex = format_value(&Value::Text("AB".into()), ValueFormat::Hex);
+        assert!(hex.body.starts_with("00000000  41 42"));
+        assert!(!hex.wrap && hex.summary.contains("hex"));
+        // Json on non-JSON text falls back to raw prose.
+        assert_eq!(
+            format_value(&Value::Text("plain".into()), ValueFormat::Json)
+                .body
+                .as_ref(),
+            "plain"
+        );
     }
 }

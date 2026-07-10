@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use flint::{TextInput, TextInputEvent, ToastVariant};
+use flint::{CellRange, TextInput, TextInputEvent, ToastVariant};
 use gpui::{prelude::*, Context, Entity, Focusable, Subscription};
 use red_core::{coerce_edit_value, ColumnValue, EditOp, TableRef, Value};
 
@@ -383,15 +383,28 @@ impl AppState {
             // `bare`: no box of its own; it fills the grid cell, inheriting the
             // row's height, padding, font, and selection highlight, so the cell
             // itself becomes the input rather than a smaller box inside it.
-            let mut input = TextInput::new(cx).bare();
+            // `emit_tab`: Tab/Shift-Tab surface as events so we advance to the next
+            // editable cell (fast spreadsheet-style fill) rather than walking the
+            // window's focus ring out of the grid.
+            // `emit_nav`: Up/Down surface as events so they move the FK suggestion
+            // highlight (Track B8) instead of leaking to the grid's row navigation.
+            let mut input = TextInput::new(cx).bare().emit_tab().emit_nav();
             input.set_content(prefill, cx);
             input
         });
         let sub = cx.subscribe(&input, |this, _, event: &TextInputEvent, cx| match event {
             TextInputEvent::Submit => this.commit_grid_edit(cx),
             TextInputEvent::Cancel => this.cancel_grid_edit(cx),
-            TextInputEvent::Change => {}
+            TextInputEvent::Tab => this.advance_grid_edit(true, cx),
+            TextInputEvent::BackTab => this.advance_grid_edit(false, cx),
+            // Drive the FK picker (Track B8) when one is open; otherwise no-op.
+            TextInputEvent::Change => this.on_grid_edit_change(cx),
+            TextInputEvent::Down => this.suggest_move(1, cx),
+            TextInputEvent::Up => this.suggest_move(-1, cx),
         });
+        let data_col = match &slot {
+            EditSlot::Row { data_col, .. } | EditSlot::Draft { data_col, .. } => *data_col,
+        };
         self.grid_edit = Some(GridEdit {
             input,
             slot,
@@ -403,6 +416,9 @@ impl AppState {
         // this new field's focus handle (moving straight from one cell to another).
         self.grid_edit_blur = None;
         self.focus_grid_edit = true;
+        // Set up (or clear) the FK suggestion picker for this cell; needs `grid_edit`
+        // in place so it can seed the filter from the field's current text.
+        self.open_cell_suggest(epoch, data_col, cx);
         cx.notify();
     }
 
@@ -413,15 +429,23 @@ impl AppState {
         let Some(edit) = self.grid_edit.take() else {
             return;
         };
-        let text = edit.input.read(cx).content().to_string();
-        let value = match coerce_edit_value(&text, edit.decl_type.as_deref()) {
-            Ok(v) => v,
-            Err(reason) => {
-                self.notify(ToastVariant::Error, reason, cx);
-                self.grid_edit = Some(edit); // keep it open to correct the value
-                return;
+        // A highlighted FK suggestion (Track B8) wins over the typed text — its id is
+        // already a typed `Value`, no coercion needed.
+        let value = match self.suggest_selected_value() {
+            Some(v) => v,
+            None => {
+                let text = edit.input.read(cx).content().to_string();
+                match coerce_edit_value(&text, edit.decl_type.as_deref()) {
+                    Ok(v) => v,
+                    Err(reason) => {
+                        self.notify(ToastVariant::Error, reason, cx);
+                        self.grid_edit = Some(edit); // keep it open to correct the value
+                        return;
+                    }
+                }
             }
         };
+        self.cell_suggest = None;
         match edit.slot {
             EditSlot::Row {
                 row,
@@ -444,6 +468,7 @@ impl AppState {
     /// Abandon the open inline editor without staging.
     pub(crate) fn cancel_grid_edit(&mut self, cx: &mut Context<Self>) {
         if self.grid_edit.take().is_some() {
+            self.cell_suggest = None;
             self.pending_focus = Some(Pane::Grid);
             cx.notify();
         }
@@ -452,6 +477,168 @@ impl AppState {
     /// The focus handle of the open inline editor, for the render-time focus drain.
     pub(crate) fn grid_edit_focus(&self, cx: &Context<Self>) -> Option<gpui::FocusHandle> {
         Some(self.grid_edit.as_ref()?.input.focus_handle(cx))
+    }
+
+    /// Tab / Shift-Tab from the open inline editor: commit the current cell, then
+    /// open the editor on the next (`forward`) / previous editable cell so a row can
+    /// be filled without the mouse. A coercion failure keeps the field open to fix
+    /// (mirrors [`commit_grid_edit`]). Tab past the last cell of the last draft row
+    /// starts a fresh draft; Shift-Tab off the first cell just returns to the grid.
+    pub(crate) fn advance_grid_edit(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(edit) = self.grid_edit.take() else {
+            return;
+        };
+        // A highlighted FK suggestion wins over the typed text (as in `commit`).
+        let value = match self.suggest_selected_value() {
+            Some(v) => v,
+            None => {
+                let text = edit.input.read(cx).content().to_string();
+                match coerce_edit_value(&text, edit.decl_type.as_deref()) {
+                    Ok(v) => v,
+                    Err(reason) => {
+                        self.notify(ToastVariant::Error, reason, cx);
+                        self.grid_edit = Some(edit); // keep it open to correct the value
+                        return;
+                    }
+                }
+            }
+        };
+        // The next cell's `open_cell_editor` resets the picker; clear it here so an
+        // intermediate frame can't show a stale list against the wrong field.
+        self.cell_suggest = None;
+        match edit.slot {
+            EditSlot::Row {
+                row,
+                data_col,
+                pk_value,
+                original,
+                foreign,
+            } => {
+                self.stage_existing_value(
+                    edit.epoch, row, data_col, pk_value, original, value, foreign,
+                );
+                self.advance_row_edit(row, data_col, forward, cx);
+            }
+            EditSlot::Draft { index, data_col } => {
+                self.stage_draft_value(edit.epoch, index, data_col, value);
+                self.advance_draft_edit(index, data_col, forward, cx);
+            }
+        }
+    }
+
+    /// Move the grid cursor to the next editable cell after `(row, data_col)` and
+    /// open the inline editor there. Steps cell by cell (wrapping across rows),
+    /// skipping any cell the edit gate rejects (the PK column, a clipped/binary
+    /// value, an unresolvable FK), and falls back to grid focus when none is found.
+    fn advance_row_edit(
+        &mut self,
+        row: usize,
+        data_col: usize,
+        forward: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let gutter = self.gutter();
+        let row_height = f32::from(self.settings.grid.density.row_height());
+        let (ncols, pk_idx, total) = match &self.phase {
+            Phase::Connected(active) => match active.active_result() {
+                Some(g) => (g.columns.len(), g.pk_column_index(), g.total),
+                None => return self.focus_grid(cx),
+            },
+            _ => return,
+        };
+        if ncols == 0 {
+            return self.focus_grid(cx);
+        }
+        let (mut r, mut c) = (row, data_col);
+        // Bounded so an all-non-editable stretch can't spin; one row's worth of
+        // steps plus a wrap into the neighbouring row is ample.
+        for _ in 0..(ncols * 2 + 2) {
+            let stepped = if forward {
+                if c + 1 < ncols {
+                    c += 1;
+                    true
+                } else if r + 1 < total {
+                    c = 0;
+                    r += 1;
+                    true
+                } else {
+                    false
+                }
+            } else if c > 0 {
+                c -= 1;
+                true
+            } else if r > 0 {
+                c = ncols - 1;
+                r -= 1;
+                true
+            } else {
+                false
+            };
+            if !stepped {
+                break;
+            }
+            if Some(c) == pk_idx {
+                continue; // identity column is never editable; skip without a probe
+            }
+            if let Phase::Connected(active) = &mut self.phase {
+                if let Some(grid) = active.active_result_mut() {
+                    grid.selection = Some(CellRange::single(r, c + gutter));
+                    grid.scroll_cursor_into_view(r, row_height);
+                    grid.scroll_col_into_view(c + gutter, gutter);
+                }
+            }
+            // `begin_grid_edit` re-resolves the edit target for the moved cursor and
+            // no-ops on a non-editable cell; only open when it will actually take.
+            if self.active_edit_target().is_some() {
+                self.begin_grid_edit(cx);
+                return;
+            }
+        }
+        self.focus_grid(cx);
+    }
+
+    /// Advance the inline editor across a draft (insert) row's cells. Tab past the
+    /// last cell of the last draft appends a fresh draft and lands on its first
+    /// cell, so a table can be filled with a continuous type-and-Tab rhythm.
+    fn advance_draft_edit(
+        &mut self,
+        index: usize,
+        data_col: usize,
+        forward: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let (ncols, ndrafts) = match &self.phase {
+            Phase::Connected(active) => match active.active_result() {
+                Some(g) => (g.columns.len(), g.pending.inserts.len()),
+                None => return self.focus_grid(cx),
+            },
+            _ => return,
+        };
+        if ncols == 0 {
+            return self.focus_grid(cx);
+        }
+        if forward {
+            if data_col + 1 < ncols {
+                self.begin_draft_edit(index, data_col + 1, cx);
+            } else if index + 1 < ndrafts {
+                self.begin_draft_edit(index + 1, 0, cx);
+            } else {
+                self.add_draft_row(cx); // the new draft lands at the old length
+                self.begin_draft_edit(ndrafts, 0, cx);
+            }
+        } else if data_col > 0 {
+            self.begin_draft_edit(index, data_col - 1, cx);
+        } else if index > 0 {
+            self.begin_draft_edit(index - 1, ncols - 1, cx);
+        } else {
+            self.focus_grid(cx);
+        }
+    }
+
+    /// Hand focus back to the grid (cursor navigation, next edit) with nothing open.
+    fn focus_grid(&mut self, cx: &mut Context<Self>) {
+        self.pending_focus = Some(Pane::Grid);
+        cx.notify();
     }
 
     // --- staging ---
@@ -556,6 +743,7 @@ impl AppState {
     /// can't leave the editor pointing at the wrong draft.
     pub(crate) fn remove_draft_row(&mut self, index: usize, cx: &mut Context<Self>) {
         self.grid_edit = None;
+        self.cell_suggest = None;
         if let Phase::Connected(active) = &mut self.phase {
             if let Some(grid) = active.active_result_mut() {
                 if index < grid.pending.inserts.len() {
@@ -637,6 +825,7 @@ impl AppState {
     /// Drop the whole staged change-set (Revert).
     pub(crate) fn revert_changes(&mut self, cx: &mut Context<Self>) {
         self.grid_edit = None;
+        self.cell_suggest = None;
         if let Phase::Connected(active) = &mut self.phase {
             if let Some(grid) = active.active_result_mut() {
                 grid.pending = PendingChanges::default();

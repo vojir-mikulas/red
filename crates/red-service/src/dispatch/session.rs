@@ -53,6 +53,8 @@ pub(crate) struct InFlight {
     pub(crate) build: Option<AbortSignal>,
     /// The latest column-stats summary fetch for this epoch (column-stats bar).
     pub(crate) stats: Option<AbortSignal>,
+    /// The latest FK lookup-list fetch for this epoch (in-cell FK picker).
+    pub(crate) lookup: Option<AbortSignal>,
 }
 
 impl InFlight {
@@ -63,6 +65,7 @@ impl InFlight {
             self.page.as_ref(),
             self.build.as_ref(),
             self.stats.as_ref(),
+            self.lookup.as_ref(),
         ]
         .into_iter()
         .flatten()

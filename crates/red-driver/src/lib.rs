@@ -791,6 +791,65 @@ pub(crate) fn parse_stats(cells: &[Value], numeric: bool, distinct: bool) -> Col
     }
 }
 
+/// Build the `SELECT DISTINCT` for [`DatabaseDriver::fetch_lookup`]: a bounded list
+/// of a referenced table's ids (and an optional label column) for the in-cell FK
+/// picker. `table`/`id`/`label` are already quoted by the caller (engine identifier
+/// quoting), so this only assembles the projection, orders by the id for a stable
+/// list, and caps at `limit`. The label is dropped when it equals the id column, so
+/// a labelless target selects just the id. No user *values* enter the SQL (only
+/// quoted identifiers), so there is no injection surface — the picker filters the
+/// fetched page client-side.
+/// Parse a MySQL `enum('a','b','c')` (or `set(...)`) type string into its variant
+/// list. MySQL stores the allowed values only in `information_schema.columns.
+/// COLUMN_TYPE`; `DATA_TYPE` is just `enum`. Single quotes inside a variant are
+/// doubled (`''`), matching how MySQL renders the definition. Returns an empty vec if
+/// the string isn't a recognizable `enum(...)`/`set(...)` spec.
+pub(crate) fn parse_mysql_enum(column_type: &str) -> Vec<String> {
+    let t = column_type.trim();
+    let inner = t
+        .strip_prefix("enum(")
+        .or_else(|| t.strip_prefix("set("))
+        .or_else(|| t.strip_prefix("ENUM("))
+        .or_else(|| t.strip_prefix("SET("))
+        .and_then(|s| s.strip_suffix(')'));
+    let Some(inner) = inner else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut chars = inner.chars().peekable();
+    while chars.peek().is_some() {
+        // Skip to the opening quote of the next variant.
+        while matches!(chars.peek(), Some(c) if *c != '\'') {
+            chars.next();
+        }
+        if chars.next().is_none() {
+            break; // no opening quote left
+        }
+        let mut val = String::new();
+        loop {
+            match chars.next() {
+                // A doubled '' is an escaped single quote inside the value.
+                Some('\'') if chars.peek() == Some(&'\'') => {
+                    chars.next();
+                    val.push('\'');
+                }
+                Some('\'') | None => break, // closing quote (or malformed end)
+                Some(c) => val.push(c),
+            }
+        }
+        out.push(val);
+    }
+    out
+}
+
+pub(crate) fn lookup_sql(table: &str, id: &str, label: Option<&str>, limit: usize) -> String {
+    let proj = match label {
+        Some(l) if l != id => format!("{id}, {l}"),
+        _ => id.to_string(),
+    };
+    format!("SELECT DISTINCT {proj} FROM {table} ORDER BY {id} LIMIT {limit}")
+}
+
 /// One flat foreign-key *column* row from an `information_schema` scan (Postgres /
 /// MySQL), before composite keys are grouped. `constraint` + the `from` endpoint
 /// identify the edge a row belongs to; [`group_fk_edges`] folds consecutive rows of
@@ -893,6 +952,20 @@ pub trait DatabaseDriver: Send + Sync {
     /// user expands a table, so the initial tree load stays light.
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableDetail>;
 
+    /// The enum-typed columns of `table` and their allowed values (Track B8: the
+    /// in-cell enum picker), `{ column → [variant, …] }`. Used to offer a value
+    /// dropdown when editing an enum cell. The default returns nothing (engines
+    /// without an enum concept, or where it isn't editable); Postgres (`pg_enum`) and
+    /// MySQL (`information_schema.columns.COLUMN_TYPE`) override it. Loaded lazily and
+    /// cached by the caller, like [`foreign_keys`](Self::foreign_keys).
+    async fn enum_columns(
+        &self,
+        table: &TableRef,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        let _ = table;
+        Ok(std::collections::HashMap::new())
+    }
+
     /// The connection-wide foreign-key graph: every declared FK edge across the
     /// visible namespaces (Track B7), for click-through and the relation tree. One
     /// catalog pass where the engine allows (Postgres/MySQL `information_schema`);
@@ -963,6 +1036,39 @@ pub trait DatabaseDriver: Send + Sync {
         distinct: bool,
         abort: &AbortSignal,
     ) -> Result<ColumnStats>;
+
+    /// A bounded list of a referenced table's existing ids (and an optional label
+    /// column) for the in-cell foreign-key picker (Track B8): `SELECT DISTINCT
+    /// <id>[, <label>] FROM <target> ORDER BY <id> LIMIT <limit>` (see [`lookup_sql`]),
+    /// read back through the tested [`fetch_page`](Self::fetch_page) path so no engine
+    /// needs its own body. `target`/`id_column`/`label_column` are quoted with the
+    /// engine's [`quote_table`](Self::quote_table)/[`quote_ident`](Self::quote_ident);
+    /// only identifiers enter the SQL, never user values, so the picker's search runs
+    /// client-side over this page with no injection surface. Cancellable via `abort`.
+    async fn fetch_lookup(
+        &self,
+        target: &TableRef,
+        id_column: &str,
+        label_column: Option<&str>,
+        limit: usize,
+        abort: &AbortSignal,
+    ) -> Result<Vec<red_core::LookupRow>> {
+        let table = self.quote_table(target);
+        let id = self.quote_ident(id_column);
+        let label = label_column.map(|l| self.quote_ident(l));
+        let sql = lookup_sql(&table, &id, label.as_deref(), limit);
+        let page = self
+            .fetch_page(&sql, 0, limit, PageCap::Full, abort)
+            .await?;
+        Ok(page
+            .rows
+            .into_iter()
+            .map(|r| red_core::LookupRow {
+                id: r.first().cloned().unwrap_or(Value::Null),
+                label: r.get(1).cloned(),
+            })
+            .collect())
+    }
 
     /// A random-access `(offset, limit)` page of `sql`'s result. Backs the grid's
     /// load-on-scroll so memory stays flat: only the pages around the viewport are
@@ -1111,6 +1217,12 @@ pub trait DatabaseDriver: Send + Sync {
     /// [`qualify_table`]). Implemented by every driver, including read-only ClickHouse,
     /// which can be a migration *source*.
     fn quote_table(&self, table: &TableRef) -> String;
+
+    /// Quote a single identifier (a column name) for this engine (`"col"`, `` `col` ``),
+    /// so seams like [`fetch_lookup`](Self::fetch_lookup) can build a `SELECT` without
+    /// interpolating raw identifiers. Pure string, no I/O; each driver delegates to its
+    /// own identifier-quoting helper (the same one `quote_table` uses per segment).
+    fn quote_ident(&self, ident: &str) -> String;
 
     /// Create a secondary index on `table` over `columns` (optionally `unique`) in this
     /// engine's dialect: the migration's **deferred index pass**, run after the data
@@ -1650,6 +1762,39 @@ mod tests {
         assert_eq!(sql_literal(&Value::Blob(vec![1, 2, 3]), false), "NULL");
         assert_eq!(sql_literal(&Value::Integer(5), false), "5");
         assert_eq!(sql_literal(&Value::Text("x".into()), false), "'x'");
+    }
+
+    #[test]
+    fn parse_mysql_enum_splits_variants_and_unescapes_quotes() {
+        assert_eq!(
+            parse_mysql_enum("enum('active','inactive','pending')"),
+            vec!["active", "inactive", "pending"]
+        );
+        // Doubled '' inside a variant is one literal quote.
+        assert_eq!(parse_mysql_enum("enum('a''b','c')"), vec!["a'b", "c"]);
+        // `set(...)` parses the same way; a non-enum type yields nothing.
+        assert_eq!(parse_mysql_enum("set('x','y')"), vec!["x", "y"]);
+        assert!(parse_mysql_enum("varchar(255)").is_empty());
+        assert!(parse_mysql_enum("enum()").is_empty());
+    }
+
+    #[test]
+    fn lookup_sql_projects_id_and_optional_label() {
+        // No label: id only, ordered + capped.
+        assert_eq!(
+            lookup_sql("\"pub\".\"users\"", "\"id\"", None, 500),
+            "SELECT DISTINCT \"id\" FROM \"pub\".\"users\" ORDER BY \"id\" LIMIT 500"
+        );
+        // With a distinct label column: both projected.
+        assert_eq!(
+            lookup_sql("\"users\"", "\"id\"", Some("\"name\""), 200),
+            "SELECT DISTINCT \"id\", \"name\" FROM \"users\" ORDER BY \"id\" LIMIT 200"
+        );
+        // Label equal to the id: no duplicate projection.
+        assert_eq!(
+            lookup_sql("\"t\"", "\"id\"", Some("\"id\""), 10),
+            "SELECT DISTINCT \"id\" FROM \"t\" ORDER BY \"id\" LIMIT 10"
+        );
     }
 
     #[test]

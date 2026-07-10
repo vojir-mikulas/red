@@ -58,7 +58,11 @@ impl AppState {
         let sub = cx.subscribe(&input, |this, _input, evt: &TextInputEvent, cx| match evt {
             TextInputEvent::Submit => this.submit_filter(cx),
             TextInputEvent::Cancel => this.close_filter_bar(cx),
-            TextInputEvent::Change => {}
+            TextInputEvent::Change
+            | TextInputEvent::Tab
+            | TextInputEvent::BackTab
+            | TextInputEvent::Up
+            | TextInputEvent::Down => {}
         });
         self.filter_bar = Some(FilterBarState { input, mode, sub });
         // The Window isn't in hand here; focus the input on the next render.

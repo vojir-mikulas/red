@@ -15,8 +15,8 @@ use std::time::Duration;
 use red_core::{
     ActivityId, ActivityKind, ActivityStatus, AiLimits, AiTier, Column, ColumnMap, ColumnMeta,
     ColumnStats, ConnectionConfig, CopyMode, EditOp, ExportFormat, FkEdge, FkJoin, ImportFormat,
-    KeySpec, PlanStep, QueryOptions, QueryPlan, ResultFilter, RowWindow, SchemaMeta, TableDetail,
-    TableRef, UpdateState, Value,
+    KeySpec, LookupRow, PlanStep, QueryOptions, QueryPlan, ResultFilter, RowWindow, SchemaMeta,
+    TableDetail, TableRef, UpdateState, Value,
 };
 
 /// Identifies one keep-alive backend session. Minted UI-side at connect start so
@@ -155,6 +155,27 @@ pub enum Command {
         column: String,
         numeric: bool,
         distinct: bool,
+    },
+    /// Fetch a bounded list of a referenced table's existing ids (+ an optional label
+    /// column) for the in-cell foreign-key picker (Track B8). `epoch` scopes the reply
+    /// to the still-open result; `target`/`id_column`/`label_column` name the referenced
+    /// table and columns (resolved UI-side from the FK graph). Replied with `LookupReady`
+    /// (or the pane-scoped `LookupFailed`), keyed by `target` so a result with several FK
+    /// columns caches each list separately. Only identifiers reach the SQL; the picker
+    /// searches this page client-side. Superseded/cancellable like a page fetch.
+    FetchLookup {
+        epoch: u64,
+        target: TableRef,
+        id_column: String,
+        label_column: Option<String>,
+        limit: usize,
+    },
+    /// Load the enum-typed columns of `table` and their allowed values (Track B8: the
+    /// in-cell enum picker), replied with `EnumsLoaded`. Requested lazily the first time
+    /// an editable table's cell is edited; the UI caches the result per table. Empty on
+    /// engines without enums. Idempotent and cheap (one catalog query).
+    LoadEnums {
+        table: TableRef,
     },
     /// Run a non-row-returning statement (write/DDL) in a transaction.
     Execute {
@@ -525,6 +546,27 @@ pub enum Event {
     ColumnStatsFailed {
         epoch: u64,
         column: String,
+    },
+    /// A foreign-key lookup list, in response to `FetchLookup`. Echoes `epoch` and the
+    /// `target` table so the grid caches it per FK target (dropping a reply for a
+    /// superseded epoch). `rows` is the bounded, distinct id/label list.
+    LookupReady {
+        epoch: u64,
+        target: TableRef,
+        rows: Vec<LookupRow>,
+    },
+    /// A `FetchLookup` failed; pane-scoped (the picker just shows no suggestions and
+    /// the user types the id), not a global toast, like `ColumnStatsFailed`.
+    LookupFailed {
+        epoch: u64,
+        target: TableRef,
+    },
+    /// The enum columns of a table, in response to `LoadEnums`: `{ column → [variant,
+    /// …] }`, empty for a table with no enum columns. Echoes `table` so the UI caches
+    /// it per table. A failure is silent (logged), like a missing FK graph.
+    EnumsLoaded {
+        table: TableRef,
+        columns: std::collections::HashMap<String, Vec<String>>,
     },
     /// A write/DDL statement committed; `affected` rows changed.
     Executed {

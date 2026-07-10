@@ -128,7 +128,10 @@ impl ChatMessage {
     /// for `theme_key` (an assistant bubble bakes theme colors into its runs, so a
     /// theme switch invalidates them). `None` means "render plain, non-selectable"
     /// — nothing built yet, empty text, or a stale theme.
-    pub(super) fn selectables_for(&self, theme_key: gpui::Hsla) -> Option<&[Entity<flint::SelectableLabel>]> {
+    pub(super) fn selectables_for(
+        &self,
+        theme_key: gpui::Hsla,
+    ) -> Option<&[Entity<flint::SelectableLabel>]> {
         if self.selectables.is_empty() || self.selectable_theme != Some(theme_key) {
             return None;
         }

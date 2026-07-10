@@ -413,6 +413,10 @@ impl DatabaseDriver for SqliteDriver {
         crate::qualify_table(table, quote_ident)
     }
 
+    fn quote_ident(&self, ident: &str) -> String {
+        quote_ident(ident)
+    }
+
     async fn create_index(
         &self,
         table: &TableRef,

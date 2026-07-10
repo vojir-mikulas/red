@@ -844,6 +844,19 @@ pub struct ColumnStats {
     pub avg: Option<Value>,
 }
 
+/// One row of a foreign-key lookup list (the in-cell id picker): a referenced-table
+/// row's identity value plus an optional human-readable label column, so the UI can
+/// show `"<id> — <label>"` and let the user search/pick an existing id instead of
+/// typing it. See `DatabaseDriver::fetch_lookup`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LookupRow {
+    /// The referenced (id) column's value — what an FK edit actually writes.
+    pub id: Value,
+    /// A human label column's value (a name/title/…), when one was resolved;
+    /// `None` means only the id is shown.
+    pub label: Option<Value>,
+}
+
 /// Whether a declared column type is numeric (integer or floating/decimal). Drives
 /// the column-stats `sum`/`avg` aggregates, which only make sense on a number, and
 /// reuses the same base-token whitelists the key/edit-coercion paths use.

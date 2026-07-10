@@ -759,6 +759,10 @@ impl DatabaseDriver for ClickhouseDriver {
         crate::qualify_table(table, ch_quote)
     }
 
+    fn quote_ident(&self, ident: &str) -> String {
+        ch_quote(ident)
+    }
+
     async fn create_index(
         &self,
         _table: &TableRef,

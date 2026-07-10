@@ -620,6 +620,19 @@ pub(crate) struct ActiveConn {
     /// connect. Empty until it lands (or when the engine has no FKs); drives the
     /// in-grid FK click-through. See [`Command::LoadForeignKeys`].
     pub fk_graph: Vec<FkEdge>,
+    /// Cached FK lookup lists for the in-cell picker (Track B8), keyed by referenced
+    /// `(schema, table)`. Populated lazily the first time an FK cell of that target is
+    /// edited (`Command::FetchLookup` → `Event::LookupReady`); reused across edits and
+    /// results on this connection. Bounded by the number of distinct FK targets touched.
+    pub lookup_cache: std::collections::HashMap<(String, String), Vec<red_core::LookupRow>>,
+    /// Cached enum columns per `(schema, table)` for the in-cell enum picker (Track B8):
+    /// `{ column → [variant, …] }`, loaded once per table the first time one of its cells
+    /// is edited (`Command::LoadEnums` → `Event::EnumsLoaded`). An absent table means "not
+    /// loaded yet"; a present-but-column-absent means "not an enum".
+    pub enum_cache:
+        std::collections::HashMap<(String, String), std::collections::HashMap<String, Vec<String>>>,
+    /// Tables whose `LoadEnums` is in flight, so the load fires at most once per table.
+    pub enum_requested: std::collections::HashSet<(String, String)>,
     /// Open query tabs (never empty), and the index of the focused one.
     pub tabs: Vec<QueryTab>,
     pub active_tab: usize,
@@ -698,6 +711,9 @@ impl ActiveConn {
             inspector_drag: None,
             schema: SchemaState::new(cx),
             fk_graph: Vec::new(),
+            lookup_cache: std::collections::HashMap::new(),
+            enum_cache: std::collections::HashMap::new(),
+            enum_requested: std::collections::HashSet::new(),
             tabs: vec![tab],
             active_tab: 0,
             query_seq: 1,
@@ -1040,6 +1056,14 @@ pub struct AppState {
     /// in place. `None` when no editor is open. The staged change-set itself lives
     /// on the result; this is just the live `TextInput`.
     pub(crate) grid_edit: Option<crate::result::GridEdit>,
+    /// The in-cell foreign-key suggestion picker (Track B8), when the open editor
+    /// targets an FK column: the fetched id/label list plus the live query and
+    /// highlighted row. `None` for a plain cell. See [`crate::result::CellSuggest`].
+    pub(crate) cell_suggest: Option<crate::result::CellSuggest>,
+    /// The open editor cell's on-screen rect, recorded by a `canvas` in the cell so
+    /// the suggestion dropdown can anchor below it (the ComboBox/CodeEditor pattern).
+    /// One frame behind, like every `canvas`-measured bound; the popover just waits.
+    pub(crate) cell_suggest_bounds: gpui::Entity<Option<gpui::Bounds<gpui::Pixels>>>,
     /// Render-time focus drain: focus the open inline editor's field on the next
     /// frame (set when one opens, like `focus_inspector_edit`).
     pub(crate) focus_grid_edit: bool,
@@ -1496,6 +1520,10 @@ impl AppState {
                 TextInputEvent::Change => this.sync_conn_str_from_fields(cx),
                 TextInputEvent::Submit => this.submit_form(cx),
                 TextInputEvent::Cancel => this.close_form(cx),
+                TextInputEvent::Tab
+                | TextInputEvent::BackTab
+                | TextInputEvent::Up
+                | TextInputEvent::Down => {}
             })
             .detach();
         }
@@ -1505,6 +1533,10 @@ impl AppState {
                 TextInputEvent::Change => this.sync_fields_from_conn_str(cx),
                 TextInputEvent::Submit => this.submit_form(cx),
                 TextInputEvent::Cancel => this.close_form(cx),
+                TextInputEvent::Tab
+                | TextInputEvent::BackTab
+                | TextInputEvent::Up
+                | TextInputEvent::Down => {}
             },
         )
         .detach();
@@ -1514,7 +1546,11 @@ impl AppState {
             |this, _, event: &TextInputEvent, cx| match event {
                 TextInputEvent::Submit => this.submit_form(cx),
                 TextInputEvent::Cancel => this.close_form(cx),
-                TextInputEvent::Change => {}
+                TextInputEvent::Change
+                | TextInputEvent::Tab
+                | TextInputEvent::BackTab
+                | TextInputEvent::Up
+                | TextInputEvent::Down => {}
             },
         )
         .detach();
@@ -1601,6 +1637,10 @@ impl AppState {
                     this.connect_sel = 0;
                     cx.notify();
                 }
+                TextInputEvent::Tab
+                | TextInputEvent::BackTab
+                | TextInputEvent::Up
+                | TextInputEvent::Down => {}
             },
         )
         .detach();
@@ -1621,7 +1661,11 @@ impl AppState {
                     this.keymap_search.update(cx, |i, cx| i.set_content("", cx));
                     cx.notify();
                 }
-                TextInputEvent::Submit => {}
+                TextInputEvent::Submit
+                | TextInputEvent::Tab
+                | TextInputEvent::BackTab
+                | TextInputEvent::Up
+                | TextInputEvent::Down => {}
             },
         )
         .detach();
@@ -1827,6 +1871,8 @@ impl AppState {
             confirm_exec: None,
             pending_import: None,
             grid_edit: None,
+            cell_suggest: None,
+            cell_suggest_bounds: cx.new(|_| None),
             focus_grid_edit: false,
             grid_edit_blur: None,
             confirm_close_tab: None,
@@ -2278,6 +2324,15 @@ impl AppState {
             } => self.on_column_stats(session, epoch, column, stats, cx),
             Event::ColumnStatsFailed { epoch, column } => {
                 self.on_column_stats_failed(session, epoch, column, cx)
+            }
+            Event::LookupReady {
+                epoch,
+                target,
+                rows,
+            } => self.on_lookup_ready(session, epoch, target, rows, cx),
+            Event::LookupFailed { epoch, target } => self.on_lookup_failed(epoch, target, cx),
+            Event::EnumsLoaded { table, columns } => {
+                self.on_enums_loaded(session, table, columns, cx)
             }
 
             // --- export & writes ---

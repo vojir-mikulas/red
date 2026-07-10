@@ -601,7 +601,10 @@ impl Render for AppState {
             // modal — the backdrop's `inset_0` now spans the whole window.
             .children(self.cell_menu.map(|pos| self.render_cell_menu(pos, cx)))
             .children(self.export_menu.map(|pos| self.render_export_menu(pos, cx)))
-            .children(self.more_menu.map(|pos| self.render_more_menu(pos, cx)));
+            .children(self.more_menu.map(|pos| self.render_more_menu(pos, cx)))
+            // The in-cell FK suggestion dropdown (Track B8) anchors to the editor
+            // cell but mounts here so it paints above the grid and escapes its clip.
+            .children(self.render_cell_suggest(cx));
 
         // Dev perf HUD: register its toggle, overlay the panel last (on top), and
         // close the frame so the rings capture this render's cost.

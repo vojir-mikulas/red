@@ -159,7 +159,7 @@ impl AppState {
             .text_size(footer_theme.scale(12.))
             .text_color(footer_theme.text_faint)
             .child(
-                footer_link("connect-import", "Import from DBeaver or DBGate")
+                footer_link("connect-import", "Import from other database tools")
                     .on_click(cx.listener(|this, _, _, cx| this.open_import_wizard(cx))),
             )
             .child("·")

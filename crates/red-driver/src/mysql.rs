@@ -371,6 +371,28 @@ impl DatabaseDriver for MysqlDriver {
         })
     }
 
+    async fn enum_columns(&self, table: &TableRef) -> Result<HashMap<String, Vec<String>>> {
+        // The full `enum('a','b',…)` spec lives in COLUMN_TYPE (DATA_TYPE is just
+        // `enum`); parse the variant list per column. A NULL/absent schema falls back
+        // to the connection's default database.
+        let schema = table.schema.clone();
+        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let rows: Vec<(String, String)> = conn
+            .exec(
+                "SELECT column_name, column_type \
+                 FROM information_schema.columns \
+                 WHERE table_schema = COALESCE(?, DATABASE()) AND table_name = ? \
+                   AND data_type = 'enum'",
+                (schema, &table.name),
+            )
+            .await
+            .map_err(driver_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(col, ty)| (col, crate::parse_mysql_enum(&ty)))
+            .collect())
+    }
+
     async fn foreign_keys(&self) -> Result<Vec<FkEdge>> {
         // `key_column_usage` carries the referenced endpoint per FK column with a
         // reliable `ordinal_position`, so composite keys group correctly. Scope to
@@ -735,6 +757,10 @@ impl DatabaseDriver for MysqlDriver {
 
     fn quote_table(&self, table: &TableRef) -> String {
         crate::qualify_table(table, |id| format!("`{}`", escape_ident(id)))
+    }
+
+    fn quote_ident(&self, ident: &str) -> String {
+        format!("`{}`", escape_ident(ident))
     }
 
     async fn create_index(

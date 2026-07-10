@@ -71,7 +71,11 @@ impl AppState {
                 // compete with the Send button for emphasis.
                 .accent(false)
                 // Lucide disclosure + check glyphs, matching the app's other dropdowns.
-                .chevron(crate::icons::icon("chevron-down", theme.scale(14.), theme.text_dim))
+                .chevron(crate::icons::icon(
+                    "chevron-down",
+                    theme.scale(14.),
+                    theme.text_dim,
+                ))
                 .check(crate::icons::icon("check", theme.scale(13.), theme.text))
                 .placeholder("Default");
             for choice in &opt.choices {
@@ -1101,8 +1105,14 @@ impl AppState {
         }
 
         // The turn's activity timeline (assistant only): tool calls, subagents, and
-        // proposed writes, in call order, each with a live status glyph.
-        if msg.role == ChatRole::Assistant && !msg.activity.is_empty() {
+        // proposed writes, in call order, each with a live status glyph. Reports are
+        // excluded here — they render as a card below the answer (see the bottom of
+        // this fn) — so skip the timeline when a turn's only activity is a report.
+        let has_timeline = msg
+            .activity
+            .iter()
+            .any(|n| !matches!(n.kind, red_core::ActivityKind::Report { .. }));
+        if msg.role == ChatRole::Assistant && has_timeline {
             let empty = HashMap::new();
             let collapse = self
                 .assistant
@@ -1220,6 +1230,23 @@ impl AppState {
             }
         }
 
+        // Generated reports: a prominent card per report, at the very bottom of the
+        // turn (below the answer), so they don't get lost among the tool calls above.
+        // Each carries an "Open" button; the report is never opened automatically.
+        if msg.role == ChatRole::Assistant {
+            for node in &msg.activity {
+                if let red_core::ActivityKind::Report { path, title } = &node.kind {
+                    bubble = bubble.child(div().mt_1().child(render_report_card(
+                        &node.id,
+                        path,
+                        title.as_deref(),
+                        theme,
+                        cx,
+                    )));
+                }
+            }
+        }
+
         bubble.into_any_element()
     }
 }
@@ -1284,7 +1311,7 @@ fn render_plan(steps: &[red_core::PlanStep], theme: &flint::Theme) -> AnyElement
     col.into_any_element()
 }
 
-/// The status glyph + color for an activity node, shared by the row and the
+/// The lucide icon name + color for an activity node, shared by the row and the
 /// subagent card so a delegate and its children read on the same scale.
 fn activity_glyph(
     status: red_core::ActivityStatus,
@@ -1292,11 +1319,11 @@ fn activity_glyph(
 ) -> (&'static str, gpui::Hsla) {
     use red_core::ActivityStatus::*;
     match status {
-        Pending => ("○", theme.text_muted),
-        Running => ("▸", theme.accent),
-        Ok => ("✓", theme.green),
-        Failed => ("✕", theme.red),
-        Denied => ("⊘", theme.yellow),
+        Pending => ("circle-dashed", theme.text_muted),
+        Running => ("loader-circle", theme.accent),
+        Ok => ("circle-check", theme.green),
+        Failed => ("circle-x", theme.red),
+        Denied => ("ban", theme.yellow),
     }
 }
 
@@ -1321,11 +1348,10 @@ fn render_activity(
             col = col.child(render_subagent_card(node, task, collapse, theme, depth, cx));
             continue;
         }
-        if let red_core::ActivityKind::Report { path, title } = &node.kind {
-            // A generated report is a bordered card with an "Open" button, so it stays
-            // in the transcript and the user opens it on demand rather than it flashing
-            // open in the browser.
-            col = col.child(render_report_card(&node.id, path, title.as_deref(), theme, depth, cx));
+        if matches!(node.kind, red_core::ActivityKind::Report { .. }) {
+            // Reports render as a prominent card *below* the answer (see
+            // `render_bubble`), not in this timeline where they're easy to miss next to
+            // the tool calls. Skip them here.
             continue;
         }
         col = col.child(render_activity_row(node, theme, depth));
@@ -1406,8 +1432,11 @@ fn render_subagent_card(
         let (glyph, glyph_color) = activity_glyph(node.status, theme);
         div()
             .flex_none()
-            .text_color(glyph_color)
-            .child(glyph)
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(13.))
+            .child(crate::icons::icon(glyph, theme.scale(12.), glyph_color))
             .into_any_element()
     };
 
@@ -1518,7 +1547,6 @@ fn render_report_card(
     path: &str,
     title: Option<&str>,
     theme: &flint::Theme,
-    depth: usize,
     cx: &mut Context<AppState>,
 ) -> AnyElement {
     let label = title
@@ -1550,7 +1578,6 @@ fn render_report_card(
         .on_click(cx.listener(move |this, _, _, cx| this.open_report(open_path.clone(), cx)));
 
     div()
-        .ml(px(depth as f32 * 14.))
         .flex()
         .items_center()
         .gap(px(8.))
@@ -1571,12 +1598,7 @@ fn render_report_card(
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .child(
-                    div()
-                        .truncate()
-                        .text_color(theme.text)
-                        .child(label),
-                )
+                .child(div().truncate().text_color(theme.text).child(label))
                 .child(
                     div()
                         .text_size(theme.scale(10.))
@@ -1609,10 +1631,7 @@ fn render_activity_row(
         ),
         // Reports render as a card in `render_activity`; this is only a defensive
         // fallback so the match stays exhaustive.
-        red_core::ActivityKind::Report { title, .. } => (
-            "Report".to_string(),
-            title.clone(),
-        ),
+        red_core::ActivityKind::Report { title, .. } => ("Report".to_string(), title.clone()),
     };
 
     let mut row = div()
@@ -1621,7 +1640,13 @@ fn render_activity_row(
         .gap(px(6.))
         .pl(px(depth as f32 * 14.))
         .text_size(theme.scale(11.))
-        .child(div().w(px(10.)).text_color(glyph_color).child(glyph))
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .child(crate::icons::icon(glyph, theme.scale(12.), glyph_color)),
+        )
         .child(div().text_color(theme.text).child(primary));
     if let Some(secondary) = secondary {
         row = row.child(

@@ -612,7 +612,11 @@ impl AppState {
         let sub = cx.subscribe(&input, |this, _, e: &TextInputEvent, cx| match e {
             TextInputEvent::Submit => this.commit_rename(cx),
             TextInputEvent::Cancel => this.cancel_rename(cx),
-            TextInputEvent::Change => {}
+            TextInputEvent::Change
+            | TextInputEvent::Tab
+            | TextInputEvent::BackTab
+            | TextInputEvent::Up
+            | TextInputEvent::Down => {}
         });
         if let Some(state) = self.assistant.as_mut() {
             state.renaming = Some(Rename { key, input, sub });
@@ -832,7 +836,11 @@ impl AppState {
         let agent = self
             .assistant
             .as_ref()
-            .and_then(|s| s.chats.iter().find(|c| c.conversation_id == conversation_id))
+            .and_then(|s| {
+                s.chats
+                    .iter()
+                    .find(|c| c.conversation_id == conversation_id)
+            })
             .map(|c| c.provider.clone());
         if let (Some(agent), Some(state)) = (agent.as_ref(), self.assistant.as_mut()) {
             state
@@ -1071,8 +1079,10 @@ impl AppState {
                     ChatRole::Assistant => {
                         let blocks = msg.markdown();
                         let mut leaves = Vec::new();
-                        let _ =
-                            crate::markdown::render_blocks_with(&blocks, &theme, &mut |text, runs| {
+                        let _ = crate::markdown::render_blocks_with(
+                            &blocks,
+                            &theme,
+                            &mut |text, runs| {
                                 if !text.is_empty() {
                                     let id = next_id;
                                     next_id += 1;
@@ -1083,7 +1093,8 @@ impl AppState {
                                     }));
                                 }
                                 gpui::div().into_any_element()
-                            });
+                            },
+                        );
                         leaves
                     }
                 };

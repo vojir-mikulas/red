@@ -386,6 +386,39 @@ impl DatabaseDriver for PostgresDriver {
         })
     }
 
+    async fn enum_columns(
+        &self,
+        table: &TableRef,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        // Each enum-typed column of the table, joined to its `pg_enum` labels in the
+        // enum's own sort order. Non-enum columns simply don't join, so they're absent.
+        let schema = table.schema.as_deref().unwrap_or("public");
+        let rows = self
+            .client
+            .query(
+                "SELECT a.attname, e.enumlabel \
+                 FROM pg_attribute a \
+                 JOIN pg_type t ON t.oid = a.atttypid \
+                 JOIN pg_enum e ON e.enumtypid = t.oid \
+                 JOIN pg_class c ON c.oid = a.attrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relname = $2 AND n.nspname = $1 AND a.attnum > 0 \
+                   AND NOT a.attisdropped \
+                 ORDER BY a.attnum, e.enumsortorder",
+                &[&schema, &table.name],
+            )
+            .await
+            .map_err(driver_err)?;
+        let mut out: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for row in &rows {
+            let col: String = row.get(0);
+            let label: String = row.get(1);
+            out.entry(col).or_default().push(label);
+        }
+        Ok(out)
+    }
+
     async fn foreign_keys(&self) -> Result<Vec<FkEdge>> {
         // One pass over the catalog: every FK column with both endpoints' schema +
         // table, ordered so a composite key's columns arrive together in key order.
@@ -774,6 +807,10 @@ impl DatabaseDriver for PostgresDriver {
 
     fn quote_table(&self, table: &TableRef) -> String {
         crate::qualify_table(table, pg_quote)
+    }
+
+    fn quote_ident(&self, ident: &str) -> String {
+        pg_quote(ident)
     }
 
     async fn create_index(

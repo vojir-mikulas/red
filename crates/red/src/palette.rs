@@ -535,7 +535,7 @@ impl AppState {
                 out.push((
                     PaletteItem::new(
                         "cmd:import-conns",
-                        "connection: import from DBeaver / DBGate…",
+                        "connection: import from other database tools…",
                     ),
                     Cmd::ImportConnections,
                 ));

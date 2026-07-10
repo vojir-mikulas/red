@@ -94,6 +94,10 @@ impl AppState {
             TextInputEvent::Change => this.recompute_find(cx),
             TextInputEvent::Submit => this.find_step(true, cx),
             TextInputEvent::Cancel => this.close_find_bar(cx),
+            TextInputEvent::Tab
+            | TextInputEvent::BackTab
+            | TextInputEvent::Up
+            | TextInputEvent::Down => {}
         });
         self.find_bar = Some(FindBarState {
             input,

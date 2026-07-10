@@ -7,7 +7,7 @@
 //! (keychain-routed secrets, never the config file).
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Context};
+use gpui::{div, prelude::*, px, Context, Div, ElementId, Stateful};
 use red_core::ConnectionConfig;
 
 use crate::config::StoredConnection;
@@ -16,13 +16,14 @@ use crate::import::{ImportSource, ImportedConnection};
 
 use super::AppState;
 
-/// The tools the wizard offers, always shown in the source step so the user sees
-/// what RED can import from even when a tool isn't installed here.
+/// The tools the wizard can import from, probed in this order. Only the ones
+/// actually detected on this machine make it into the wizard — a tool that isn't
+/// installed here is never shown.
 const PROVIDERS: [ImportSource; 2] = [ImportSource::DBeaver, ImportSource::DBGate];
 
 /// A provider row in the wizard's source step: the tool, the on-disk sources
-/// auto-detection found for it (empty = not installed here), and whether the user
-/// picked it to scan.
+/// auto-detection found for it (never empty — undetected tools are dropped), and
+/// whether the user picked it to scan.
 pub(crate) struct WizardProvider {
     pub(crate) source: ImportSource,
     pub(crate) found: Vec<Found>,
@@ -71,23 +72,25 @@ impl AppState {
     /// When neither tool is installed, an info toast instead of an empty wizard.
     pub(crate) fn open_import_wizard(&mut self, cx: &mut Context<Self>) {
         let all = detect();
+        // Only surface tools that were actually detected here — a tool that isn't
+        // installed never appears in the wizard.
         let providers: Vec<WizardProvider> = PROVIDERS
             .iter()
-            .map(|&source| {
+            .filter_map(|&source| {
                 let found: Vec<Found> =
                     all.iter().filter(|f| f.source == source).cloned().collect();
-                WizardProvider {
+                (!found.is_empty()).then_some(WizardProvider {
                     source,
-                    // Detected providers start ticked; a missing one can't be picked.
-                    selected: !found.is_empty(),
+                    // Everything shown is detected, so it starts ticked.
+                    selected: true,
                     found,
-                }
+                })
             })
             .collect();
-        if providers.iter().all(|p| p.found.is_empty()) {
+        if providers.is_empty() {
             self.notify(
                 ToastVariant::Info,
-                "No DBeaver or DBGate connections found on this machine.",
+                "No connections from other database tools were found on this machine.",
                 cx,
             );
             return;
@@ -186,6 +189,21 @@ impl AppState {
                     cx.notify();
                 }
             }
+        }
+    }
+
+    /// Select step: include (or exclude) every non-duplicate connection at once —
+    /// the "select all" master toggle. Duplicates stay locked.
+    pub(crate) fn set_import_include_all(&mut self, on: bool, cx: &mut Context<Self>) {
+        if let Some(ImportWizard {
+            step: WizardStep::Select { items, .. },
+            ..
+        }) = self.import_wizard.as_mut()
+        {
+            for item in items.iter_mut().filter(|it| !it.duplicate) {
+                item.include = on;
+            }
+            cx.notify();
         }
     }
 
@@ -289,8 +307,8 @@ impl AppState {
         }
     }
 
-    /// Step 1: pick which tools to import from. Each provider is a toggle row,
-    /// disabled (and left unticked) when that tool isn't installed here.
+    /// Step 1: pick which detected tools to scan. Each is a dense, clickable row
+    /// with a checkbox; only tools found on this machine reach this list.
     fn render_import_source(
         &self,
         wizard: &ImportWizard,
@@ -300,56 +318,42 @@ impl AppState {
         let close_view = cx.entity().downgrade();
         let confirm_view = cx.entity().downgrade();
 
-        let any_selected = wizard
-            .providers
-            .iter()
-            .any(|p| p.selected && !p.found.is_empty());
+        let any_selected = wizard.providers.iter().any(|p| p.selected);
 
-        let mut list = div().flex().flex_col().gap_2();
+        let mut list = div().flex().flex_col();
         for (i, provider) in wizard.providers.iter().enumerate() {
-            let installed = !provider.found.is_empty();
-            let hint = if !installed {
-                "Not found on this machine".to_string()
-            } else if provider.found.len() == 1 {
+            let hint = if provider.found.len() == 1 {
                 provider.found[0].dir.display().to_string()
             } else {
                 format!("{} sources found", provider.found.len())
             };
-            let name_color = if installed {
-                theme.text
-            } else {
-                theme.text_faint
-            };
-            let row = div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .py_1()
-                .px_2()
-                .rounded(theme.radius_sm)
-                .when(installed, |d| d.bg(theme.bg_input))
-                .child(
-                    Toggle::new(("import-provider", i), provider.selected)
-                        .disabled(!installed)
-                        .label(provider.source.label())
-                        .on_change(cx.listener(move |this, checked: &bool, _, cx| {
-                            this.set_import_provider(i, *checked, cx)
-                        })),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_0p5()
-                        .child(div().text_color(name_color).child(provider.source.label()))
-                        .child(
-                            div()
-                                .text_size(theme.scale(11.5))
-                                .text_color(theme.text_muted)
-                                .child(hint),
-                        ),
-                );
-            list = list.child(row);
+            let selected = provider.selected;
+            list = list.child(
+                dense_row(("import-provider-row", i), i, true, theme)
+                    .child(
+                        import_checkbox(("import-provider", i), selected, theme)
+                            .label(provider.source.label()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(div().text_color(theme.text).child(provider.source.label()))
+                            .child(
+                                div()
+                                    .text_size(theme.scale(11.5))
+                                    .text_color(theme.text_muted)
+                                    .truncate()
+                                    .child(hint),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_import_provider(i, !selected, cx)
+                    })),
+            );
         }
 
         let body = div()
@@ -361,27 +365,28 @@ impl AppState {
                     .text_color(theme.text_muted)
                     .child("Choose which tools to import saved connections from."),
             )
-            .child(list);
+            .child(list_frame(theme).child(list));
 
-        let footer = div()
-            .flex()
-            .justify_end()
-            .gap_2()
-            .child(
-                Button::new("import-cancel", "Cancel")
-                    .variant(ButtonVariant::Secondary)
-                    .on_click(cx.listener(|this, _, _, cx| this.cancel_import(cx))),
-            )
-            .child(
-                Button::new("import-scan", "Continue")
-                    .variant(ButtonVariant::Primary)
-                    .disabled(!any_selected)
-                    .on_click(cx.listener(|this, _, _, cx| this.import_wizard_scan(cx))),
-            );
+        let footer = wizard_footer(theme).child(div()).child(
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    Button::new("import-cancel", "Cancel")
+                        .variant(ButtonVariant::Secondary)
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_import(cx))),
+                )
+                .child(
+                    Button::new("import-scan", "Continue")
+                        .variant(ButtonVariant::Primary)
+                        .disabled(!any_selected)
+                        .on_click(cx.listener(|this, _, _, cx| this.import_wizard_scan(cx))),
+                ),
+        );
 
         Modal::new("import-wizard")
             .title("Import connections")
-            .width(px(460.))
+            .width(px(520.))
             .focus_handle(self.modal_focus.clone())
             .footer(footer)
             .on_close(move |_, cx| {
@@ -414,15 +419,24 @@ impl AppState {
             .iter()
             .filter(|it| it.include && !it.duplicate)
             .count();
+        // "Select all" only governs the importable (non-duplicate) rows; it reads
+        // as ticked once every one of them is in, and is dead when there are none.
+        let selectable = items.iter().filter(|it| !it.duplicate).count();
+        let all_selected = selectable > 0 && selected == selectable;
 
-        let mut list = div().flex().flex_col().gap_1();
+        let mut list = div().flex().flex_col();
         let mut current_group: Option<&str> = None;
         for (i, item) in items.iter().enumerate() {
             if current_group != Some(item.group.as_str()) {
                 current_group = Some(item.group.as_str());
                 list = list.child(section_header(&item.group, theme));
             }
-            let mut info = div().flex().flex_col().gap_0p5().child(
+            let name_color = if item.duplicate {
+                theme.text_faint
+            } else {
+                theme.text
+            };
+            let mut info = div().flex().flex_col().gap_0p5().min_w_0().flex_1().child(
                 div()
                     .flex()
                     .items_center()
@@ -430,11 +444,9 @@ impl AppState {
                     .gap_2()
                     .child(
                         div()
-                            .text_color(if item.duplicate {
-                                theme.text_faint
-                            } else {
-                                theme.text
-                            })
+                            .min_w_0()
+                            .truncate()
+                            .text_color(name_color)
                             .child(item.imported.source_name.clone()),
                     )
                     .child(
@@ -451,6 +463,7 @@ impl AppState {
                     div()
                         .text_size(theme.scale(11.5))
                         .text_color(theme.text_muted)
+                        .truncate()
                         .child(target),
                 );
             }
@@ -469,34 +482,29 @@ impl AppState {
                         .child(format!("⚠ {warning}")),
                 );
             }
-            let row = div()
-                .flex()
-                .items_start()
-                .gap_3()
-                .py_1()
-                .child(
-                    Toggle::new(("import-item", i), item.include && !item.duplicate)
-                        .disabled(item.duplicate)
-                        .label(item.imported.source_name.clone())
-                        .on_change(cx.listener(move |this, checked: &bool, _, cx| {
-                            this.set_import_include(i, *checked, cx)
-                        })),
-                )
-                .child(info);
-            list = list.child(row);
+            // Duplicates are locked: the box shows off + disabled and the row can't
+            // be toggled. Everything else is a clickable dense row.
+            let checked = item.include && !item.duplicate;
+            let mut row = dense_row(("import-item-row", i), i, !item.duplicate, theme).child(
+                import_checkbox(("import-item", i), checked, theme)
+                    .disabled(item.duplicate)
+                    .label(item.imported.source_name.clone()),
+            );
+            if !item.duplicate {
+                row = row.on_click(
+                    cx.listener(move |this, _, _, cx| this.set_import_include(i, !checked, cx)),
+                );
+            }
+            list = list.child(row.child(info));
         }
 
         // Skipped connections, each with its reason: the "nothing is dropped
         // silently" contract, made visible.
         if !skipped.is_empty() {
-            list = list.child(
-                div()
-                    .pt_2()
-                    .text_size(theme.scale(10.5))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme.text_faint)
-                    .child(format!("SKIPPED ({})", skipped.len())),
-            );
+            list = list.child(section_header(
+                &format!("Skipped ({})", skipped.len()),
+                theme,
+            ));
             for s in skipped {
                 list = list.child(
                     div()
@@ -504,39 +512,59 @@ impl AppState {
                         .items_center()
                         .justify_between()
                         .gap_2()
-                        .py_0p5()
+                        .px_3()
+                        .py_1()
                         .text_size(theme.scale(11.5))
                         .text_color(theme.text_faint)
-                        .child(div().child(s.name.clone()))
+                        .child(div().min_w_0().truncate().child(s.name.clone()))
                         .child(div().flex_shrink_0().child(s.reason.clone())),
                 );
             }
         }
 
-        let body = div()
+        // A master row above the list: a "Select all" checkbox on the left, the
+        // running count on the right.
+        let mut select_all = div()
+            .id("import-select-all")
             .flex()
-            .flex_col()
+            .items_center()
             .gap_2()
+            .rounded(theme.radius_sm)
+            .child(
+                import_checkbox("import-select-all-box", all_selected, theme)
+                    .disabled(selectable == 0),
+            )
+            .child(div().text_color(theme.text_muted).child("Select all"));
+        if selectable > 0 {
+            select_all =
+                select_all
+                    .cursor_pointer()
+                    .tab_index(0)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_import_include_all(!all_selected, cx)
+                    }));
+        }
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(select_all)
             .child(
                 div()
                     .text_color(theme.text_muted)
                     .child(format!("{selected} of {} selected.", items.len())),
-            )
-            .child(
-                div()
-                    .id("import-list")
-                    .max_h(px(320.))
-                    .overflow_y_scroll()
-                    .p_2()
-                    .rounded(theme.radius_sm)
-                    .bg(theme.bg_input)
-                    .child(list),
             );
 
-        let footer = div()
-            .flex()
-            .items_center()
-            .justify_between()
+        let body = div().flex().flex_col().gap_2().child(header).child(
+            list_frame(theme)
+                .id("import-list")
+                .max_h(px(420.))
+                .overflow_y_scroll()
+                .child(list),
+        );
+
+        let footer = wizard_footer(theme)
             .child(
                 Button::new("import-back", "Back")
                     .variant(ButtonVariant::Secondary)
@@ -561,7 +589,7 @@ impl AppState {
 
         Modal::new("import-wizard")
             .title("Select connections")
-            .width(px(480.))
+            .width(px(560.))
             .focus_handle(self.modal_focus.clone())
             .footer(footer)
             .on_close(move |_, cx| {
@@ -578,10 +606,73 @@ impl AppState {
     }
 }
 
-/// A bold, uppercase group header for the select step's connection list.
+/// A dense, file-row style list row: checkbox + content on one compact line,
+/// hairline-separated from the row above, the whole row a click target when
+/// `clickable`. Callers add the checkbox, the content, and (if clickable) an
+/// `on_click`.
+fn dense_row(
+    id: impl Into<ElementId>,
+    index: usize,
+    clickable: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let row = div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_3()
+        .px_3()
+        .py_1p5()
+        // A hairline between rows (not before the first), so the list reads as
+        // stacked rows without a heavy grid.
+        .when(index > 0, |d| d.border_t_1().border_color(theme.border));
+    if clickable {
+        row.cursor_pointer()
+            .tab_index(0)
+            .hover(|s| s.bg(theme.bg_hover))
+            .focus(|s| s.bg(theme.bg_hover))
+    } else {
+        row
+    }
+}
+
+/// A wizard-list checkbox with RED's Lucide "check" mark (masked to `on_accent`),
+/// so the tick matches the rest of the app's line icons rather than a font glyph.
+fn import_checkbox(id: impl Into<ElementId>, checked: bool, theme: &Theme) -> Checkbox {
+    Checkbox::new(id, checked).mark(crate::icons::icon("check", px(12.), theme.on_accent))
+}
+
+/// The framed container the dense rows sit in: a quiet inset panel with a
+/// hairline border, matching the app's other list surfaces.
+fn list_frame(theme: &Theme) -> Div {
+    div()
+        .rounded(theme.radius_sm)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.bg_input)
+        .overflow_hidden()
+}
+
+/// The wizard's footer bar: full width so the leading control (Back / a spacer)
+/// sits hard left and the action group hard right, with one uniform gap in each
+/// cluster. Callers add exactly two children (left, right).
+fn wizard_footer(_theme: &Theme) -> Div {
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+}
+
+/// A bold, uppercase group header for the select step's connection list, sitting
+/// flush inside the framed list with the rows' horizontal padding.
 fn section_header(label: &str, theme: &Theme) -> gpui::Div {
     div()
-        .pt_2()
+        .px_3()
+        .pt_2p5()
+        .pb_1()
+        .bg(theme.bg_bar)
         .text_size(theme.scale(10.5))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(theme.text_faint)

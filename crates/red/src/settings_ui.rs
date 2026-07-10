@@ -1200,9 +1200,7 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     // then pull very large result sets in a single tool call.
     let rows_warn = (ai.limits.max_rows > 5000).then(|| {
         SharedString::from(
-            "Above the safe default (5000 rows). The agent can pull very large result \
-             sets in one tool call — slower queries, far more tokens, higher cost. \
-             Use at your own risk.",
+            "Above the safe default: big result sets mean slower queries and higher cost.",
         )
     });
 
@@ -1245,11 +1243,7 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     // Risky past the old safe top preset, or with the cap disabled entirely.
     let bytes_warn = (ai.limits.max_result_bytes == 0 || ai.limits.max_result_bytes > 1024 * 1024)
         .then(|| {
-            SharedString::from(
-                "Above the safe cap (1 MB). Large tool results can flood the model's \
-                 context and drive up cost; “Off” removes the cap entirely. Use at \
-                 your own risk.",
-            )
+            SharedString::from("Above the safe cap: large results flood the context and drive up cost. “Off” removes the cap.")
         });
 
     // Tool-call budget per conversation (0 = off). The last two segments are risky.
@@ -1274,9 +1268,7 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     // Risky past the old safe top preset, or with the budget disabled entirely.
     let calls_warn = (ai.limits.max_tool_calls == 0 || ai.limits.max_tool_calls > 200).then(|| {
         SharedString::from(
-            "Above the safe budget (200 calls). A high or disabled cap lets a runaway \
-             agent loop rack up many tool calls and cost; “Off” removes the cap. Use \
-             at your own risk.",
+            "Above the safe budget: a runaway agent loop can rack up cost. “Off” removes the cap.",
         )
     });
 
@@ -1339,19 +1331,16 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             .flex_col()
             .child(setting_row(
                 "Enable agent",
-                "The grounded chat sidepanel (⌘L). Off is a true kill switch: it \
-                 removes the panel, runs no agent, and starts no local server.",
+                "The grounded chat sidepanel (⌘L). Off is a true kill switch.",
                 switch,
                 &theme,
             ))
             .child(settings_header("Database access", &theme))
             .child(setting_row(
                 "Access tier",
-                "How much the agent's tools can see. Off: no database tools at \
-                 all. Schema: structure only (tables, columns, types; never row \
-                 data). Read: the full read catalog (run capped SELECTs and EXPLAIN). \
-                 Write: adds INSERT/UPDATE/DELETE, each needing your per-statement \
-                 approval. A tool above the tier is never offered to the model.",
+                "How much the agent can see. Off: nothing. Schema: structure only. \
+                 Read: capped SELECT/EXPLAIN. Write: adds INSERT/UPDATE/DELETE, each \
+                 needing per-statement approval.",
                 tier,
                 &theme,
             ))
@@ -1362,57 +1351,48 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                     .text_size(theme.scale(12.))
                     .text_color(theme.text_muted)
                     .child(
-                        "At the Write tier the assistant may propose INSERT/UPDATE/DELETE: \
-                         every write still needs your explicit per-statement approval, is \
-                         blocked on a read-only connection, and never runs DDL or an \
-                         unqualified UPDATE/DELETE. A connection can override enabled/tier \
-                         in connections.toml (ai_enabled / ai_tier), e.g. grant Write on \
-                         one trusted connection while the global default stays Read, or \
-                         flip it on per writable connection via “AI assistant → Allow \
-                         writes” in the connection form.",
+                        "Writes never run DDL or an unqualified UPDATE/DELETE, and are \
+                         blocked on read-only connections. Override per connection with \
+                         ai_enabled / ai_tier in connections.toml.",
                     ),
             )
             .child(settings_header("Read-tier resource guards", &theme))
             .child(setting_row(
                 "Max rows per query",
-                "Hard ceiling on rows one tool SELECT returns; a larger LIMIT is \
-                 clamped down to this.",
+                "Ceiling on rows one tool SELECT returns; a larger LIMIT is clamped.",
                 risky_control("ai-max-rows-warn", rows_warn, max_rows, &theme),
                 &theme,
             ))
             .child(setting_row(
                 "Statement timeout",
-                "Abort a single tool query that runs longer than this.",
+                "Abort a tool query that runs longer than this.",
                 timeout,
                 &theme,
             ))
             .child(setting_row(
                 "Result size cap",
-                "Trim a tool result larger than this before it's handed back to the \
-                 model, so a wide row set can't blow up the context.",
+                "Trim a tool result larger than this before handing it to the model.",
                 risky_control("ai-max-bytes-warn", bytes_warn, max_bytes, &theme),
                 &theme,
             ))
             .child(setting_row(
                 "Tool calls per chat",
-                "Bound a runaway agent loop: the cumulative tool-call budget for one \
-                 conversation.",
+                "Tool-call budget for one conversation; bounds a runaway loop.",
                 risky_control("ai-max-calls-warn", calls_warn, max_calls, &theme),
                 &theme,
             ))
             .child(settings_header("Display", &theme))
             .child(setting_row(
                 "Show thinking",
-                "Surface a summarized “thinking…” affordance while the model reasons.",
+                "Show a summarized “thinking…” affordance while the model reasons.",
                 show_thinking,
                 &theme,
             ))
             .child(settings_header("Reports", &theme))
             .child(setting_row(
                 "Report folder",
-                "Where the agent saves the HTML reports it generates. Leave unset to use \
-                 the system temporary folder; choose a folder to keep reports somewhere you \
-                 can find them. Takes effect on the next report.",
+                "Where the agent saves generated HTML reports. Unset uses the system \
+                 temp folder.",
                 report_folder,
                 &theme,
             ))
@@ -1852,6 +1832,20 @@ fn about_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 "Build",
                 "The commit and date this build was produced from.",
                 muted_value(build, &theme),
+                &theme,
+            ))
+            .child(setting_row(
+                "What's new",
+                "Open the changelog for this and past releases.",
+                Button::new("about-changelog", "Open changelog…")
+                    .variant(ButtonVariant::Secondary)
+                    .size(ButtonSize::Sm)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        // Close Settings first so the What's New overlay isn't hidden
+                        // behind it; the focus flags resolve in the right order.
+                        this.close_settings(cx);
+                        this.open_whats_new(cx);
+                    })),
                 &theme,
             ))
             .child(settings_header("Updates", &theme))

@@ -15,10 +15,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Format SQL: beautify the editor's query in place (⌥⌘F, the Query menu, or the
   command palette) - re-indents, upper-cases keywords, and puts each clause on
   its own line.
-- Export a result as SQL `INSERT` statements (Export ▸ SQL). The table name comes
+- Export a result as SQL `INSERT` statements (Export -> SQL). The table name comes
   from the file you save to.
 - Import a `.json` file that holds a single top-level array of objects, not only
-  newline-delimited JSON. Large files are still streamed, never loaded whole.
+  newline-delimited JSON.
+- Added Herobrine
 
 ## [0.15.0] - 2026-07-09
 
@@ -31,9 +32,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - A more compact welcome screen: smaller header, tighter spacing, and the
   import / bug-report links folded into one footer line.
-- Importing connections from DBeaver or DBGate is now a wizard: pick the source
-  and choose exactly which connections to bring in. Installs kept inside a
-  Flatpak sandbox are found too.
+- Importing saved connections from other database tools is now a wizard: pick a
+  source, then tick exactly which connections to bring in from a dense checklist.
+  Only tools actually found on this machine are offered, and installs kept inside
+  a Flatpak sandbox are found too.
 - The selected connection on the welcome screen is outlined in its own colour.
 - Reports the AI assistant generates now stay in the chat as a card with an
   "Open" button, instead of flashing open in your browser on their own. Open

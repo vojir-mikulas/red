@@ -676,6 +676,19 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 }
             }
 
+            Command::LoadEnums { table } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    continue;
+                };
+                let driver = state.driver.clone();
+                // Optional, like the FK graph: a failed/unsupported enum lookup just
+                // leaves the picker without enum suggestions rather than toasting.
+                if let Ok(columns) = driver.enum_columns(&table).await {
+                    emit(&events, session_id, Event::EnumsLoaded { table, columns });
+                }
+            }
+
             Command::DescribeTable { schema, table } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get(&id) else {
@@ -1209,6 +1222,64 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                 session_id,
                                 Event::ColumnStatsFailed { epoch, column },
                             );
+                        }
+                    }
+                });
+            }
+
+            Command::FetchLookup {
+                epoch,
+                target,
+                id_column,
+                label_column,
+                limit,
+            } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let driver = state.driver.clone();
+                // A newer lookup for this epoch (editing moved to another FK column)
+                // supersedes the last; cancel its in-flight fetch at the engine.
+                let entry = state.inflight.entry(epoch).or_default();
+                if let Some(prev) = entry.lookup.take() {
+                    prev.abort();
+                }
+                let abort = AbortSignal::new();
+                entry.lookup = Some(abort.clone());
+                let events = events.clone();
+                let limit_src = page_fetch_limit.clone();
+                let timeout = statement_timeout;
+                tokio::spawn(async move {
+                    if abort.is_aborted() {
+                        return;
+                    }
+                    let _permit = limit_src.acquire_owned().await;
+                    if abort.is_aborted() {
+                        return;
+                    }
+                    let fetch = driver.fetch_lookup(
+                        &target,
+                        &id_column,
+                        label_column.as_deref(),
+                        limit,
+                        &abort,
+                    );
+                    match with_timeout(timeout, &abort, fetch).await {
+                        Ok(rows) => emit(
+                            &events,
+                            session_id,
+                            Event::LookupReady {
+                                epoch,
+                                target,
+                                rows,
+                            },
+                        ),
+                        Err(RedError::Interrupted) => {}
+                        Err(e) => {
+                            tracing::warn!(%epoch, "fk lookup failed: {e}");
+                            emit(&events, session_id, Event::LookupFailed { epoch, target });
                         }
                     }
                 });

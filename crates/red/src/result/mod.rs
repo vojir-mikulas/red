@@ -12,8 +12,10 @@ mod buffer;
 mod copy;
 mod edit;
 mod render;
+mod suggest;
 
 pub(crate) use edit::GridEdit;
+pub(crate) use suggest::CellSuggest;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
