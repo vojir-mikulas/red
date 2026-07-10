@@ -11,7 +11,9 @@
 use std::time::Duration;
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Context, Entity, UniformListScrollHandle, Window};
+use gpui::{
+    div, prelude::*, px, AsyncApp, Context, Entity, UniformListScrollHandle, WeakEntity, Window,
+};
 use red_core::kv::{KeyMeta, KvType, ScanBudget};
 use red_service::{Command, SessionId};
 
@@ -34,6 +36,11 @@ const LOAD_AHEAD_ROWS: usize = 60;
 /// evicted row means re-scanning anyway). A very long unfiltered browse
 /// session shouldn't grow this list forever.
 const MAX_RESIDENT_ROWS: usize = 20_000;
+/// How long to wait after the last keystroke before restarting the scan with
+/// the typed pattern, so a fast typist doesn't fire one `KvFetchScan` per
+/// character. Enter (`TextInputEvent::Submit`) bypasses this and restarts
+/// immediately.
+const FILTER_DEBOUNCE_MS: u64 = 300;
 
 fn scan_budget() -> ScanBudget {
     ScanBudget {
@@ -71,18 +78,28 @@ pub(crate) struct RedisBrowse {
     pub(crate) db_size: Option<u64>,
     pub(crate) scroll: UniformListScrollHandle,
     pub(crate) filter: Entity<TextInput>,
+    /// Bumped on every `Change`; a debounce timer captures the value live at
+    /// the time it was scheduled and only restarts the scan if it's still
+    /// current when the timer fires, so rapid typing coalesces into one
+    /// backend round trip (see `AppState::kv_debounce_filter`).
+    pub(crate) filter_gen: u64,
 }
 
 impl RedisBrowse {
     pub(crate) fn new(session: SessionId, cx: &mut Context<AppState>) -> Self {
         let filter = cx.new(|cx| TextInput::new(cx).with_placeholder("Filter (MATCH pattern)…"));
-        // Enter restarts the scan with the typed pattern. Not live-as-you-type
-        // yet (a real backend round trip per keystroke needs debouncing this
-        // first cut doesn't have) — see docs/plans/redis.md's open items.
         cx.subscribe(&filter, move |this, input, event: &TextInputEvent, cx| {
-            if matches!(event, TextInputEvent::Submit) {
-                let pattern = input.read(cx).content().to_string();
-                this.kv_restart_scan(session, non_empty(pattern), cx);
+            match event {
+                // Enter restarts immediately, bypassing the debounce wait.
+                TextInputEvent::Submit => {
+                    let pattern = input.read(cx).content().to_string();
+                    this.kv_restart_scan(session, non_empty(pattern), cx);
+                }
+                TextInputEvent::Change => {
+                    let pattern = input.read(cx).content().to_string();
+                    this.kv_debounce_filter(session, pattern, cx);
+                }
+                _ => {}
             }
         })
         .detach();
@@ -96,6 +113,7 @@ impl RedisBrowse {
             db_size: None,
             scroll: UniformListScrollHandle::new(),
             filter,
+            filter_gen: 0,
         }
     }
 }
@@ -129,6 +147,45 @@ impl AppState {
     /// superseded scan (cancels its in-flight fetch at the engine too, see
     /// `Command::CloseResult`'s doc comment), mint a fresh epoch, and start
     /// over from `cursor: 0` with the new pattern.
+    /// The filter box changed via typing (not Enter): wait `FILTER_DEBOUNCE_MS`
+    /// of no further typing before restarting the scan, so a fast typist
+    /// doesn't fire one `KvFetchScan` per keystroke. Mirrors `connect.rs`'s
+    /// `connect_gen` generation-check shape: bump `filter_gen` now, capture
+    /// it, and only act in the timer callback if it's still current — any
+    /// later `Change` (or an intervening `Submit`, which restarts directly
+    /// and leaves this generation stale) makes this callback a no-op.
+    pub(crate) fn kv_debounce_filter(
+        &mut self,
+        session: SessionId,
+        pattern: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.conn_mut(Some(session)) else {
+            return;
+        };
+        let Some(browse) = &mut active.kv_browse else {
+            return;
+        };
+        browse.filter_gen += 1;
+        let generation = browse.filter_gen;
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            cx.background_executor()
+                .timer(Duration::from_millis(FILTER_DEBOUNCE_MS))
+                .await;
+            this.update(cx, |this, cx| {
+                let still_current = this
+                    .conn_mut(Some(session))
+                    .and_then(|a| a.kv_browse.as_ref())
+                    .is_some_and(|b| b.filter_gen == generation);
+                if still_current {
+                    this.kv_restart_scan(session, non_empty(pattern), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub(crate) fn kv_restart_scan(
         &mut self,
         session: SessionId,
