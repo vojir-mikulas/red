@@ -24,16 +24,20 @@ mod clickhouse;
 mod conformance;
 mod format;
 mod import;
+mod kv;
 mod mysql;
 mod pg_text;
 mod plan;
 mod postgres;
+mod redis_kv;
 mod sqlite;
 pub use clickhouse::ClickhouseDriver;
 pub use format::html_escape;
 pub use import::ImportReader;
+pub use kv::{KvDriver, KvTopology};
 pub use mysql::MysqlDriver;
 pub use postgres::PostgresDriver;
+pub use redis_kv::RedisDriver;
 pub use sqlite::SqliteDriver;
 
 /// Default bytes of a non-key cell's content a *display* fetch keeps; past it,
@@ -367,6 +371,9 @@ pub(crate) fn create_table_sql(
                         format!("{} {} AUTO_INCREMENT", quote(&c.name), spell(kind, &nt))
                     }
                     DbKind::Clickhouse => format!("{} {}", quote(&c.name), spell(kind, &nt)),
+                    // No column/DDL model, no `DatabaseDriver` impl, so this
+                    // never sees `DbKind::Redis` (see `typemap::spell`).
+                    DbKind::Redis => unreachable!("Redis has no column/DDL model"),
                 }
             } else {
                 let ty = spell(kind, &nt);

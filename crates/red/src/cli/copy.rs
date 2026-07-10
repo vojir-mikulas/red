@@ -102,6 +102,9 @@ pub fn cmd_copy(args: CopyArgs) -> u8 {
         Ok(c) => c,
         Err(e) => return usage(e),
     };
+    if let Some(code) = reject_kv(&source, &target_config) {
+        return code;
+    }
     let source_kind = source.kind;
     // The target's schema/database is needed to address the target table (SQLite's
     // describe/insert reject an empty schema). Default it per engine when
@@ -242,6 +245,9 @@ pub fn cmd_migrate(args: MigrateArgs) -> u8 {
         Ok(c) => c,
         Err(e) => return usage(e),
     };
+    if let Some(code) = reject_kv(&source, &target_config) {
+        return code;
+    }
     let source_kind = source.kind;
     let source_db = source.database.clone();
 
@@ -320,6 +326,22 @@ fn split_table(table: &str) -> (Option<String>, String) {
     }
 }
 
+/// `copy`/`migrate` are SQL-shaped (`SELECT`/`INSERT` over a `DatabaseDriver`);
+/// a Redis connection has no such driver at all (see docs/plans/redis.md), so
+/// reject it up front with a clean usage error rather than connecting and
+/// failing deep inside `default_schema`'s exhaustive match.
+fn reject_kv(
+    source: &red_core::ConnectionConfig,
+    target: &red_core::ConnectionConfig,
+) -> Option<u8> {
+    if source.kind == DbKind::Redis || target.kind == DbKind::Redis {
+        return Some(usage(
+            "copy/migrate isn't supported for Redis connections yet".into(),
+        ));
+    }
+    None
+}
+
 /// The default namespace to address a table in when the user passes no explicit
 /// schema: SQLite's sole attached DB is `main`, Postgres's default schema is
 /// `public`, and a MySQL/ClickHouse "schema" *is* the connected database. Used for
@@ -330,6 +352,9 @@ fn default_schema(kind: DbKind, database: &str) -> Option<String> {
         DbKind::Sqlite => Some("main".into()),
         DbKind::Postgres => Some("public".into()),
         DbKind::Mysql | DbKind::Clickhouse => (!database.is_empty()).then(|| database.to_string()),
+        // `red copy`/`red migrate` are SQL-shaped (SELECT/INSERT); the CLI
+        // never routes a Redis connection into them (see docs/plans/redis.md).
+        DbKind::Redis => unreachable!("Redis isn't a copy/migrate SQL source or target"),
     }
 }
 

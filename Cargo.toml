@@ -42,6 +42,13 @@ futures-util = { version = "0.3", default-features = false }
 # SSH tunnels for jump-host DB connections — pure-Rust client (no system libssh),
 # bundles key parsing, known_hosts checks, and an ssh-agent client.
 russh = "0.61"
+# Redis/Valkey — the KvDriver seam (docs/plans/redis.md), not one more
+# DatabaseDriver arm. `tokio-rustls-comp` (not separate tokio-comp+tls-rustls
+# — that pair alone is missing the tokio-rustls glue and fails to build) gives
+# the async multiplexed connection plus TLS (`rediss://`) over the same
+# pure-Rust stack reqwest/mysql_async already use. cluster-async/sentinel land
+# with R1's cluster-aware scan cursor, not before.
+redis = { version = "1", default-features = false, features = ["tokio-rustls-comp"] }
 
 # --- Subscription assistant via ACP (red-acp) ---
 # Drives Claude Code as an external agent over the Agent Client Protocol so the

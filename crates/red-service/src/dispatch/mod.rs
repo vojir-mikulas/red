@@ -320,11 +320,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 message,
                 context,
             } => {
-                // Both backends ground in the connected session's driver.
+                // Both backends ground in the connected session's driver. AI
+                // grounding is SQL-shaped (schema-aware tools), so a KV (Redis)
+                // session has no driver to hand it yet — see docs/plans/redis.md.
                 let driver = session_id
                     .and_then(|id| sessions.get(&id))
-                    .map(|s| s.driver.clone());
-                let Some(driver) = driver else {
+                    .map(|s| s.driver.as_sql().cloned());
+                let Some(driver) = driver.flatten() else {
                     emit(
                         &events,
                         session_id,
@@ -603,7 +605,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
                 state.active = None; // a new query supersedes the previous cursor
-                let driver = state.driver.clone();
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a SQL connection".into()),
+                    );
+                    continue;
+                };
                 match driver.open_cursor(&sql, opts.clone()).await {
                     Ok(cursor) => {
                         let aq = ActiveQuery {
@@ -655,7 +664,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                let driver = state.driver.clone();
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a SQL connection".into()),
+                    );
+                    continue;
+                };
                 match driver.list_objects().await {
                     Ok(schemas) => emit(&events, session_id, Event::ObjectsLoaded { schemas }),
                     Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
@@ -667,10 +683,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 let Some(state) = sessions.get(&id) else {
                     continue;
                 };
-                let driver = state.driver.clone();
                 // Swallow errors: FK navigation is optional, so a failed or
-                // unsupported introspection leaves the graph empty rather than
+                // unsupported introspection (including a KV session, which has
+                // no SQL driver at all) leaves the graph empty rather than
                 // toasting the user on every connect.
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    continue;
+                };
                 if let Ok(graph) = driver.foreign_keys().await {
                     emit(&events, session_id, Event::ForeignKeysLoaded { graph });
                 }
@@ -681,9 +700,12 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 let Some(state) = sessions.get(&id) else {
                     continue;
                 };
-                let driver = state.driver.clone();
-                // Optional, like the FK graph: a failed/unsupported enum lookup just
-                // leaves the picker without enum suggestions rather than toasting.
+                // Optional, like the FK graph: a failed/unsupported enum lookup
+                // (including a KV session) just leaves the picker without enum
+                // suggestions rather than toasting.
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    continue;
+                };
                 if let Ok(columns) = driver.enum_columns(&table).await {
                     emit(&events, session_id, Event::EnumsLoaded { table, columns });
                 }
@@ -695,7 +717,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                let driver = state.driver.clone();
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a SQL connection".into()),
+                    );
+                    continue;
+                };
                 match driver.describe_table(&schema, &table).await {
                     Ok(detail) => emit(
                         &events,
@@ -723,7 +752,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                let driver = state.driver.clone();
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a SQL connection".into()),
+                    );
+                    continue;
+                };
                 // A re-open on the same epoch supersedes any prior probe.
                 if let Some(f) = state.inflight.remove(&epoch) {
                     f.abort_all();
@@ -941,7 +977,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                let driver = state.driver.clone();
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a SQL connection".into()),
+                    );
+                    continue;
+                };
                 // The tab closed or re-sorted (its epoch is gone); skip the stale
                 // request rather than running an expensive query whose result
                 // would be discarded.
@@ -1012,7 +1055,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                let driver = state.driver.clone();
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a SQL connection".into()),
+                    );
+                    continue;
+                };
                 // Stale epoch (tab closed / re-sorted); drop, like `FetchPage`.
                 let Some(spec) = lock(&state.results).get(&epoch).cloned() else {
                     continue;
@@ -1105,7 +1155,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                let driver = state.driver.clone();
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a SQL connection".into()),
+                    );
+                    continue;
+                };
                 // Stale epoch (tab closed / re-sorted); drop, like `FetchPage`.
                 let Some(sql) = lock(&state.results).get(&epoch).map(|s| s.sql.clone()) else {
                     continue;
@@ -1171,7 +1228,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                let driver = state.driver.clone();
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a SQL connection".into()),
+                    );
+                    continue;
+                };
                 // Reuse the result's stored (already-wrapped, filtered) SQL so the
                 // summary matches the visible rows. A stale epoch (tab closed /
                 // re-sorted) drops the request, like `FetchPage`.
@@ -1239,7 +1303,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                let driver = state.driver.clone();
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a SQL connection".into()),
+                    );
+                    continue;
+                };
                 // A newer lookup for this epoch (editing moved to another FK column)
                 // supersedes the last; cancel its in-flight fetch at the engine.
                 let entry = state.inflight.entry(epoch).or_default();
@@ -1291,7 +1362,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                let driver = state.driver.clone();
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a SQL connection".into()),
+                    );
+                    continue;
+                };
                 let results = state.results.clone();
                 match driver.execute(&sql).await {
                     Ok(affected) => {
@@ -1321,7 +1399,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                let driver = state.driver.clone();
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a SQL connection".into()),
+                    );
+                    continue;
+                };
                 let results = state.results.clone();
                 // An atomic batch of bounded writes, each asserted to touch exactly
                 // one row by the driver (all-or-nothing). Like `Execute`, a success
@@ -1359,7 +1444,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                let driver = state.driver.clone();
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a SQL connection".into()),
+                    );
+                    continue;
+                };
                 // A plan is one bounded round-trip: no cursor, no windowing. The
                 // failure is pane-local (`PlanFailed`), not a global error toast.
                 match driver.explain(&sql, analyze).await {
@@ -1386,7 +1478,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                let driver = state.driver.clone();
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a SQL connection".into()),
+                    );
+                    continue;
+                };
                 let Some(sql) = lock(&state.results).get(&epoch).map(|s| s.sql.clone()) else {
                     emit(
                         &events,
@@ -1477,7 +1576,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
-                let driver = state.driver.clone();
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a SQL connection".into()),
+                    );
+                    continue;
+                };
                 // Reuse the session's transfer-cancel registry (a shared id space
                 // with exports) so a `CancelImport` can flip the flag.
                 let cancel = Arc::new(AtomicBool::new(false));
@@ -1578,7 +1684,18 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     );
                     continue;
                 };
-                let driver = state.driver.clone();
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        None,
+                        Event::CopyFailed {
+                            id,
+                            rows: 0,
+                            message: "target connection isn't a SQL connection".into(),
+                        },
+                    );
+                    continue;
+                };
                 let events = events.clone();
                 tokio::spawn(async move {
                     let schema = target.schema.clone().unwrap_or_default();
@@ -1646,7 +1763,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 else {
                     copy_fail!("no open result to copy")
                 };
-                let src = src_state.driver.clone();
+                let Some(src) = src_state.driver.as_sql().cloned() else {
+                    copy_fail!("source isn't a SQL connection")
+                };
                 let src_busy = src_state.busy.clone();
                 let exports = src_state.exports.clone();
                 // Target: another open session (or the same one). Its driver does the
@@ -1654,7 +1773,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 let Some(dst_state) = sessions.get(&target_session) else {
                     copy_fail!("target connection isn't open")
                 };
-                let dst = dst_state.driver.clone();
+                let Some(dst) = dst_state.driver.as_sql().cloned() else {
+                    copy_fail!("target isn't a SQL connection")
+                };
                 let dst_busy = dst_state.busy.clone();
 
                 // Register the cancel flag on the source session's transfer registry
@@ -1749,13 +1870,17 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 let Some(src_state) = sessions.get(&source_sid) else {
                     migrate_fail!("source connection isn't open")
                 };
-                let src = src_state.driver.clone();
+                let Some(src) = src_state.driver.as_sql().cloned() else {
+                    migrate_fail!("source isn't a SQL connection")
+                };
                 let src_busy = src_state.busy.clone();
                 let exports = src_state.exports.clone();
                 let Some(dst_state) = sessions.get(&target_session) else {
                     migrate_fail!("target connection isn't open")
                 };
-                let dst = dst_state.driver.clone();
+                let Some(dst) = dst_state.driver.as_sql().cloned() else {
+                    migrate_fail!("target isn't a SQL connection")
+                };
                 let dst_busy = dst_state.busy.clone();
                 if tables.is_empty() {
                     migrate_fail!("no tables to migrate")

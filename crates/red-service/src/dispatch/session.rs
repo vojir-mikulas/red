@@ -9,13 +9,56 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use red_core::AiTier;
-use red_driver::{AbortSignal, CancelToken, DatabaseDriver, QueryCursor};
+use red_driver::{AbortSignal, CancelToken, DatabaseDriver, KvDriver, QueryCursor};
 
 use crate::tunnel::Tunnel;
 use crate::{Event, SessionId};
 
 use super::paging::ResultMap;
 use super::{emit, lock, Events};
+
+/// A session's driver: either the SQL-shaped `DatabaseDriver` seam or the
+/// parallel `KvDriver` seam (Redis; see `docs/plans/redis.md`). Every SQL
+/// command handler needs the former and has no meaning for the latter, so
+/// [`SessionDriver::as_sql`] is how those handlers reject a KV session with a
+/// clean `Event::Error` instead of a type error or a silent no-op.
+#[derive(Clone)]
+pub(crate) enum SessionDriver {
+    Sql(Arc<dyn DatabaseDriver>),
+    Kv(Arc<dyn KvDriver>),
+}
+
+impl SessionDriver {
+    /// Borrow the SQL driver, or `None` on a KV (Redis) session. Every
+    /// SQL-only command handler (`Query`, `OpenResult`, `Execute`, …) calls
+    /// this first and emits `Event::Error` on `None` rather than assuming a
+    /// `DatabaseDriver` is always behind the session.
+    pub(crate) fn as_sql(&self) -> Option<&Arc<dyn DatabaseDriver>> {
+        match self {
+            SessionDriver::Sql(d) => Some(d),
+            SessionDriver::Kv(_) => None,
+        }
+    }
+
+    /// Borrow the KV driver, or `None` on a SQL session. Unused until R1's
+    /// `Kv*` command handlers land (see docs/plans/redis.md); R0 only needs
+    /// `as_sql`, to reject SQL commands on a KV session.
+    #[allow(dead_code)]
+    pub(crate) fn as_kv(&self) -> Option<&Arc<dyn KvDriver>> {
+        match self {
+            SessionDriver::Sql(_) => None,
+            SessionDriver::Kv(d) => Some(d),
+        }
+    }
+
+    /// Engine version string, whichever seam this session's driver is behind.
+    pub(crate) fn server_version(&self) -> String {
+        match self {
+            SessionDriver::Sql(d) => d.server_version(),
+            SessionDriver::Kv(d) => d.server_version(),
+        }
+    }
+}
 
 /// Backstop cap on open results retained per session. The UI evicts a superseded
 /// result (re-sort / filter / tab-close) by sending `CloseResult`, so the live
@@ -93,7 +136,7 @@ pub(crate) struct ActiveQuery {
 /// idle eviction). Several of these stay warm at once, keyed by [`SessionId`], so
 /// switching between connections is instant: no reconnect, no schema reload.
 pub(crate) struct SessionState {
-    pub(crate) driver: Arc<dyn DatabaseDriver>,
+    pub(crate) driver: SessionDriver,
     /// This connection's optional AI policy overrides (M-S7), captured at connect
     /// from its [`ConnectionConfig`](red_core::ConnectionConfig). Layered over the
     /// global `[ai]` policy when a turn runs on this session, so a sensitive
@@ -161,7 +204,7 @@ pub(crate) struct AiOverride {
 
 impl SessionState {
     pub(crate) fn new(
-        driver: Arc<dyn DatabaseDriver>,
+        driver: SessionDriver,
         tunnel: Option<Tunnel>,
         ai_override: AiOverride,
         read_only: bool,
@@ -232,7 +275,7 @@ pub(crate) enum ConnectOutcome {
         ai_override: AiOverride,
         /// The connection's read-only posture, captured at connect for the AI policy.
         read_only: bool,
-        result: Result<(Arc<dyn DatabaseDriver>, Option<Tunnel>), ConnectFail>,
+        result: Result<(SessionDriver, Option<Tunnel>), ConnectFail>,
     },
     /// A session-less `TestConnection` finished; carries the server version on
     /// success, the error message otherwise.

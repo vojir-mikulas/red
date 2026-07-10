@@ -3,7 +3,8 @@
 //! result grid. The split sizes are caller-owned state on [`ActiveConn`].
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Axis, Context, MouseButton, Window};
+use flint::Theme;
+use gpui::{div, prelude::*, px, Axis, Context, MouseButton, WeakEntity, Window};
 
 /// Left inset of the top bar. On macOS it clears the seamless traffic lights
 /// overlapping this strip and leaves a little breathing room between them and
@@ -30,74 +31,7 @@ impl AppState {
 
         let config = &active.config;
 
-        // --- top bar ---
-        let disconnect = div()
-            .id("disconnect")
-            .flex()
-            .items_center()
-            .gap_1p5()
-            .h(px(24.))
-            .px_2p5()
-            .rounded(px(6.))
-            .border_1()
-            .border_color(theme.border)
-            .text_size(theme.scale(11.5))
-            .text_color(theme.text_muted)
-            .cursor_pointer()
-            .hover(|s| s.border_color(theme.red).text_color(theme.red))
-            .child(crate::icons::icon(
-                "power",
-                theme.scale(13.),
-                theme.text_muted,
-            ))
-            .child("Disconnect")
-            .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx)));
-
-        // Settings gear lives in the top bar (mirrors the welcome screen's
-        // top-right placement) rather than the status strip.
-        let settings_gear = IconButton::new(
-            "shell-settings",
-            crate::icons::icon("settings", theme.scale(16.), theme.text_muted),
-        )
-        .size(IconButtonSize::Sm)
-        .tooltip(crate::keymap::localize_hint("Settings  ⌘,"))
-        .a11y_label("Settings")
-        .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
-
-        // The self-update pill ("Downloading…" / "Restart to update") sits to the
-        // left of the disconnect + settings controls so it never covers them.
-        let topbar_right = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .children(self.render_update_pill(cx))
-            .child(disconnect)
-            .child(settings_gear)
-            // On a client-decorated window (Linux/Wayland) our own min/max/close
-            // buttons live here; `None` on macOS/Windows where the OS draws them.
-            .children(crate::window_chrome::window_controls(window, &theme));
-
-        // The top bar doubles as the window drag region (seamless traffic lights
-        // sit in the left inset); interactive children keep their own hitboxes.
-        // `draggable` wires the move grab (macOS uses the hit-test; Linux uses an
-        // explicit `start_window_move`) and the double-click zoom.
-        let topbar = crate::window_chrome::draggable(div().id("topbar"), window, view.clone())
-            .flex_shrink_0()
-            .h(px(38.))
-            .flex()
-            .items_center()
-            .gap_3()
-            .pl(px(TITLEBAR_LEFT_INSET))
-            .pr_3()
-            .bg(theme.bg_panel)
-            .border_b_1()
-            .border_color(theme.border)
-            // The connection switcher sits on the left, right of the traffic
-            // lights (Zed's project-switcher slot).
-            .child(self.switcher.clone())
-            // Spacer keeps the disconnect control flush right.
-            .child(div().flex_1())
-            .child(topbar_right);
+        let topbar = self.render_topbar(&theme, &view, window, cx);
 
         // --- work area: schema | (one or two side-by-side editor/result panes) ---
         // A single pane normally; when `active.split` is set, two halves in a
@@ -524,6 +458,177 @@ impl AppState {
                     .items_center()
                     .child(status_right)
                     .children(assistant_enabled.then_some(assistant_toggle)),
+            );
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme.bg_app)
+            .font_family(theme.font_family.clone())
+            .child(topbar)
+            .child(body)
+            .child(statusbar)
+    }
+
+    /// The top bar (connection switcher · self-update pill · disconnect ·
+    /// settings gear · window controls), shared by [`Self::render_shell`] (the
+    /// SQL workspace) and [`Self::render_redis_shell`] (the KV placeholder) —
+    /// it's engine-agnostic chrome, not part of the SQL-specific work area.
+    fn render_topbar(
+        &self,
+        theme: &Theme,
+        view: &WeakEntity<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let disconnect = div()
+            .id("disconnect")
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .h(px(24.))
+            .px_2p5()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme.border)
+            .text_size(theme.scale(11.5))
+            .text_color(theme.text_muted)
+            .cursor_pointer()
+            .hover(|s| s.border_color(theme.red).text_color(theme.red))
+            .child(crate::icons::icon(
+                "power",
+                theme.scale(13.),
+                theme.text_muted,
+            ))
+            .child("Disconnect")
+            .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx)));
+
+        // Settings gear lives in the top bar (mirrors the welcome screen's
+        // top-right placement) rather than the status strip.
+        let settings_gear = IconButton::new(
+            "shell-settings",
+            crate::icons::icon("settings", theme.scale(16.), theme.text_muted),
+        )
+        .size(IconButtonSize::Sm)
+        .tooltip(crate::keymap::localize_hint("Settings  ⌘,"))
+        .a11y_label("Settings")
+        .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
+
+        // The self-update pill ("Downloading…" / "Restart to update") sits to the
+        // left of the disconnect + settings controls so it never covers them.
+        let topbar_right = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .children(self.render_update_pill(cx))
+            .child(disconnect)
+            .child(settings_gear)
+            // On a client-decorated window (Linux/Wayland) our own min/max/close
+            // buttons live here; `None` on macOS/Windows where the OS draws them.
+            .children(crate::window_chrome::window_controls(window, theme));
+
+        // The top bar doubles as the window drag region (seamless traffic lights
+        // sit in the left inset); interactive children keep their own hitboxes.
+        // `draggable` wires the move grab (macOS uses the hit-test; Linux uses an
+        // explicit `start_window_move`) and the double-click zoom.
+        crate::window_chrome::draggable(div().id("topbar"), window, view.clone())
+            .flex_shrink_0()
+            .h(px(38.))
+            .flex()
+            .items_center()
+            .gap_3()
+            .pl(px(TITLEBAR_LEFT_INSET))
+            .pr_3()
+            .bg(theme.bg_panel)
+            .border_b_1()
+            .border_color(theme.border)
+            // The connection switcher sits on the left, right of the traffic
+            // lights (Zed's project-switcher slot).
+            .child(self.switcher.clone())
+            // Spacer keeps the disconnect control flush right.
+            .child(div().flex_1())
+            .child(topbar_right)
+    }
+
+    /// The connected shell for a Redis (KV) session: the same top bar as the
+    /// SQL workspace, but a placeholder body instead of the editor/grid/schema
+    /// tree — those all assume a `DatabaseDriver` session (see
+    /// docs/plans/redis.md). Keyspace browsing lands in R1; this is R0's "we
+    /// connected, here's what we know" surface.
+    pub(crate) fn render_redis_shell(
+        &self,
+        active: &ActiveConn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let view = cx.entity().downgrade();
+        let config = &active.config;
+
+        let topbar = self.render_topbar(&theme, &view, window, cx);
+
+        let body = div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .child(crate::icons::icon("db", theme.scale(28.), theme.text_faint))
+            .child(
+                div()
+                    .text_size(theme.scale(13.))
+                    .text_color(theme.text)
+                    .child(format!("Connected to {}", config.name)),
+            )
+            .child(
+                div()
+                    .text_size(theme.scale(11.5))
+                    .text_color(theme.text_muted)
+                    .child(format!("Redis {}", active.version)),
+            )
+            .child(
+                div()
+                    .text_size(theme.scale(11.))
+                    .text_color(theme.text_faint)
+                    .child("Keyspace browsing is coming in a future update."),
+            );
+
+        let statusbar = div()
+            .flex_shrink_0()
+            .h(px(25.))
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_2()
+            .bg(theme.bg_panel_2)
+            .border_t_1()
+            .border_color(theme.border)
+            .font_family(theme.font_family.clone())
+            .text_size(theme.scale(11.))
+            .text_color(theme.text_muted)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .size(px(6.))
+                            .rounded_full()
+                            .bg(theme.green),
+                    )
+                    .child(div().min_w_0().truncate().child(config.display_target()))
+                    .child(div().min_w_0().truncate().px_2().child(config.name.clone())),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .child(format!("{} {}", config.kind, active.version)),
             );
 
         div()

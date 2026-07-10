@@ -21,6 +21,11 @@ pub enum DbKind {
     /// transaction/rollback over a non-unique sort key, so its driver refuses
     /// `apply_edits` (see [`DbKind::write_caps`]).
     Clickhouse,
+    /// Redis/Valkey: a key-value store, not SQL-shaped at all. Reached through
+    /// the parallel `KvDriver` seam (`red-driver`'s `redis_kv` module), not
+    /// `DatabaseDriver` — see `docs/plans/redis.md`. Read-only in R0/R1;
+    /// `write_caps` reflects that until R3 lands in-grid editing.
+    Redis,
 }
 
 impl DbKind {
@@ -33,6 +38,7 @@ impl DbKind {
             DbKind::Sqlite,
             DbKind::Mysql,
             DbKind::Clickhouse,
+            DbKind::Redis,
         ]
     }
 
@@ -48,6 +54,7 @@ impl DbKind {
             DbKind::Postgres => Some(5432),
             DbKind::Mysql => Some(3306),
             DbKind::Clickhouse => Some(8123),
+            DbKind::Redis => Some(6379),
             DbKind::Sqlite => None,
         }
     }
@@ -59,6 +66,7 @@ impl DbKind {
             DbKind::Mysql => "mysql",
             DbKind::Sqlite => "sqlite",
             DbKind::Clickhouse => "clickhouse",
+            DbKind::Redis => "redis",
         }
     }
 
@@ -70,6 +78,11 @@ impl DbKind {
             "mysql" | "mariadb" => Some(DbKind::Mysql),
             "sqlite" | "sqlite3" | "file" => Some(DbKind::Sqlite),
             "clickhouse" | "clickhouse-http" | "ch" => Some(DbKind::Clickhouse),
+            // `rediss` (TLS) parses to the same engine; the form has no TLS
+            // toggle yet (see docs/plans/redis.md), but a pasted `rediss://`
+            // DSN still round-trips through the driver, which honors the
+            // scheme via `redis`'s own URL parsing.
+            "redis" | "rediss" => Some(DbKind::Redis),
             _ => None,
         }
     }
@@ -95,6 +108,16 @@ impl DbKind {
             // over a non-unique sort key (a best-effort edit mode is a later phase).
             DbKind::Clickhouse => WriteCaps {
                 insert: true,
+                guarded_edit: false,
+                best_effort_edit: false,
+            },
+            // Redis: no write path exists yet (R0/R1 are read-only browsing).
+            // R3 (see docs/plans/redis.md) adds SET/HSET/EXPIRE/DEL through the
+            // KvDriver seam, not through this SQL-shaped capability set at all —
+            // this stays all-`false` so any UI affordance still gated on
+            // `write_caps` (rather than the connection kind) stays hidden.
+            DbKind::Redis => WriteCaps {
+                insert: false,
                 guarded_edit: false,
                 best_effort_edit: false,
             },
@@ -124,6 +147,7 @@ impl fmt::Display for DbKind {
             DbKind::Postgres => write!(f, "PostgreSQL"),
             DbKind::Mysql => write!(f, "MySQL/MariaDB"),
             DbKind::Clickhouse => write!(f, "ClickHouse"),
+            DbKind::Redis => write!(f, "Redis"),
         }
     }
 }
@@ -536,7 +560,11 @@ impl ConnectionConfig {
             return self.database.clone();
         }
         let mut url = format!("{}://", self.kind.url_scheme());
-        if !self.user.is_empty() {
+        // A username is optional even with a password set: Redis's classic
+        // `AUTH <password>` (pre-ACL) form is a password-only credential, which
+        // its URI convention spells as `redis://:password@host`. Emitting
+        // nothing here for that case would silently drop the password.
+        if !self.user.is_empty() || !self.password.is_empty() {
             url.push_str(&encode(&self.user));
             if !self.password.is_empty() {
                 url.push(':');
@@ -1742,6 +1770,21 @@ mod conn_tests {
             cfg.dsn(),
             "postgres://postgres:p%40ss%3Aword@localhost:5432/analytics"
         );
+    }
+
+    #[test]
+    fn dsn_composes_password_only_auth() {
+        // Redis's classic `AUTH <password>` (pre-ACL, no username) must still
+        // reach the driver: dropping it here would silently connect
+        // unauthenticated instead of failing loudly.
+        let cfg = ConnectionConfig {
+            kind: DbKind::Redis,
+            host: "localhost".into(),
+            port: Some(6379),
+            password: "hunter2".into(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.dsn(), "redis://:hunter2@localhost:6379/");
     }
 
     #[test]

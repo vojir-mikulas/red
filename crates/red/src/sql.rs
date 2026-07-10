@@ -273,11 +273,18 @@ fn function_engines(name: &str) -> u8 {
 /// filtered by the [`function_engines`] matrix so a MySQL connection is never offered
 /// `string_agg`, nor a Postgres one `group_concat`.
 pub fn functions_for(kind: DbKind) -> Vec<(&'static str, &'static str, &'static str)> {
-    let bit = match kind {
-        DbKind::Postgres => PG,
-        DbKind::Mysql => MY,
-        DbKind::Sqlite => SL,
-        DbKind::Clickhouse => CH,
+    // Redis has no SQL editor surface at all (see docs/plans/redis.md), so no
+    // bit in this matrix names it; `functions_for` returns empty for it below
+    // rather than reaching an `unreachable!()` this function's own callers
+    // don't (yet) structurally rule out for a Redis connection.
+    let Some(bit) = (match kind {
+        DbKind::Postgres => Some(PG),
+        DbKind::Mysql => Some(MY),
+        DbKind::Sqlite => Some(SL),
+        DbKind::Clickhouse => Some(CH),
+        DbKind::Redis => None,
+    }) else {
+        return Vec::new();
     };
     FUNCTIONS
         .iter()

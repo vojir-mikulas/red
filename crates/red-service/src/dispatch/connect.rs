@@ -6,11 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use red_core::{ConnectionConfig, DbKind, RedError};
-use red_driver::{ClickhouseDriver, DatabaseDriver, MysqlDriver, PostgresDriver, SqliteDriver};
+use red_driver::{
+    ClickhouseDriver, DatabaseDriver, MysqlDriver, PostgresDriver, RedisDriver, SqliteDriver,
+};
 
 use crate::tunnel::Tunnel;
 
-use super::session::{ConnectFail, HostKeyPrompt};
+use super::session::{ConnectFail, HostKeyPrompt, SessionDriver};
 
 /// Cap on how long one connect attempt may run before the backend gives up and
 /// reports a timeout. Bounds a hung connect (a black-hole host) so the dispatch
@@ -22,7 +24,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// error like any other failure, so the UI's retry/backoff path handles it.
 pub(crate) async fn attempt_connect(
     config: &ConnectionConfig,
-) -> Result<(Arc<dyn DatabaseDriver>, Option<Tunnel>), ConnectFail> {
+) -> Result<(SessionDriver, Option<Tunnel>), ConnectFail> {
     match tokio::time::timeout(CONNECT_TIMEOUT, connect(config)).await {
         Ok(result) => result.map_err(classify_connect_err),
         Err(_) => Err(ConnectFail {
@@ -62,14 +64,12 @@ fn classify_connect_err(e: RedError) -> ConnectFail {
     }
 }
 
-async fn connect(
-    config: &ConnectionConfig,
-) -> red_core::Result<(Arc<dyn DatabaseDriver>, Option<Tunnel>)> {
+async fn connect(config: &ConnectionConfig) -> red_core::Result<(SessionDriver, Option<Tunnel>)> {
     // SQLite is a local file (no network), so SSH never applies.
     if let DbKind::Sqlite = config.kind {
         let driver = SqliteDriver::new(config.dsn(), config.read_only);
         driver.ping().await?;
-        return Ok((Arc::new(driver), None));
+        return Ok((SessionDriver::Sql(Arc::new(driver)), None));
     }
 
     // For a network engine, stand up the SSH tunnel first (when configured) and
@@ -90,27 +90,37 @@ async fn connect(
         None => (config.dsn(), None),
     };
 
-    let driver: Arc<dyn DatabaseDriver> = match config.kind {
-        DbKind::Postgres => Arc::new(PostgresDriver::connect(&dsn, config.read_only).await?),
+    let driver = match config.kind {
+        DbKind::Postgres => SessionDriver::Sql(Arc::new(
+            PostgresDriver::connect(&dsn, config.read_only).await?,
+        )),
         DbKind::Mysql => {
             // A MySQL connection can see every database on the server; scope the
             // schema tree to the chosen one when the connection names a database.
-            Arc::new(
+            SessionDriver::Sql(Arc::new(
                 MysqlDriver::connect(&dsn, config.read_only)
                     .await?
                     .with_scope(Some(config.database.clone())),
-            )
+            ))
         }
         DbKind::Clickhouse => {
             // Like MySQL, a ClickHouse connection can see every database; scope the
             // tree to the chosen one. Read-only first (the driver refuses in-grid
             // edits regardless, since ClickHouse is OLAP).
-            Arc::new(
+            SessionDriver::Sql(Arc::new(
                 ClickhouseDriver::connect(&dsn, config.read_only)
                     .await?
                     .with_scope(Some(config.database.clone())),
-            )
+            ))
         }
+        // Not a `DatabaseDriver` at all — the parallel KvDriver seam (see
+        // docs/plans/redis.md). No schema-scoping equivalent: a Redis
+        // connection's logical DB index (0..15) lives in `config.database`,
+        // already threaded through `dsn`/`local_dsn` above like any other
+        // engine's database segment.
+        DbKind::Redis => SessionDriver::Kv(Arc::new(
+            RedisDriver::connect(&dsn, config.read_only).await?,
+        )),
         DbKind::Sqlite => unreachable!("handled above"),
     };
     Ok((driver, tunnel))

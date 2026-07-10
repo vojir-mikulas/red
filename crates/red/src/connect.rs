@@ -33,6 +33,11 @@ fn engine_tint(kind: DbKind, theme: &Theme) -> Hsla {
         DbKind::Sqlite => theme.cyan,
         DbKind::Mysql => theme.orange,
         DbKind::Clickhouse => theme.yellow,
+        // Not `theme.red`: that token means error/destructive everywhere else
+        // in the app (close-button hover, error toasts, …), and reusing it
+        // here would make a Redis connection card look like it's in an error
+        // state.
+        DbKind::Redis => theme.purple,
     }
 }
 
@@ -491,6 +496,9 @@ impl AppState {
             DbKind::Postgres => (BadgeVariant::Special, "Postgres"),
             DbKind::Mysql => (BadgeVariant::Warning, "MySQL"),
             DbKind::Clickhouse => (BadgeVariant::Accent, "ClickHouse"),
+            // Neutral, not `Danger`/`Success`: those variants read as a status
+            // (error/healthy) elsewhere, which a plain engine label isn't.
+            DbKind::Redis => (BadgeVariant::Neutral, "Redis"),
         };
         let group = SharedString::from(format!("connect-card-{orig_ix}"));
         // Accessible name: the connection's name, engine, and read-only state;

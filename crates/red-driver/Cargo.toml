@@ -24,6 +24,8 @@ futures-util.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+# Redis driver — the KvDriver seam, see kv.rs/redis_kv.rs.
+redis.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }

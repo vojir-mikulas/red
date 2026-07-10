@@ -352,6 +352,13 @@ impl Render for AppState {
         let screen = match &self.phase {
             Phase::Disconnected => self.render_connect(window, cx).into_any_element(),
             Phase::Connecting(conn) => self.render_connecting(conn, window, cx).into_any_element(),
+            // Redis has no SQL surface at all yet (R0; keyspace browsing lands
+            // in R1, see docs/plans/redis.md) — a dedicated minimal shell
+            // instead of the SQL workspace's editor/grid/schema tree, which
+            // all assume a `DatabaseDriver` session.
+            Phase::Connected(active) if active.config.kind == red_core::DbKind::Redis => self
+                .render_redis_shell(active, window, cx)
+                .into_any_element(),
             Phase::Connected(active) => self.render_shell(active, window, cx).into_any_element(),
         };
 
