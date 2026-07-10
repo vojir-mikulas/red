@@ -98,6 +98,10 @@ pub(crate) struct InFlight {
     pub(crate) stats: Option<AbortSignal>,
     /// The latest FK lookup-list fetch for this epoch (in-cell FK picker).
     pub(crate) lookup: Option<AbortSignal>,
+    /// The latest `KvFetchScan` for this epoch (Redis keyspace browse); a
+    /// fast-retyped filter pattern supersedes the in-flight scan the same
+    /// way a flung scrollbar supersedes a SQL page fetch.
+    pub(crate) kv_scan: Option<AbortSignal>,
 }
 
 impl InFlight {
@@ -109,6 +113,7 @@ impl InFlight {
             self.build.as_ref(),
             self.stats.as_ref(),
             self.lookup.as_ref(),
+            self.kv_scan.as_ref(),
         ]
         .into_iter()
         .flatten()

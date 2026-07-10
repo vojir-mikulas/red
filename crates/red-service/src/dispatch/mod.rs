@@ -1217,6 +1217,89 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 lock(&state.results).remove(&epoch);
             }
 
+            Command::KvFetchScan {
+                epoch,
+                pattern,
+                cursor,
+                budget,
+            } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                // A retyped filter pattern supersedes the previous scan for
+                // this epoch, like a flung scrollbar supersedes a SQL page.
+                let entry = state.inflight.entry(epoch).or_default();
+                if let Some(prev) = entry.kv_scan.take() {
+                    prev.abort();
+                }
+                let abort = AbortSignal::new();
+                entry.kv_scan = Some(abort.clone());
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver
+                        .scan_keys(cursor, pattern.as_deref(), budget, &abort)
+                        .await
+                    {
+                        Ok(page) => emit(&events, session_id, Event::KvScanPage { epoch, page }),
+                        Err(RedError::Interrupted) => {}
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                    }
+                });
+            }
+
+            Command::KvProbeKey { epoch, key } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver.probe_key(&key).await {
+                        Ok(meta) => {
+                            emit(&events, session_id, Event::KvKeyProbed { epoch, key, meta })
+                        }
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                    }
+                });
+            }
+
+            Command::KvDbSize { epoch } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    continue;
+                };
+                // Swallow errors like `LoadForeignKeys`: a missing header stat
+                // isn't worth a toast.
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    if let Ok(count) = driver.db_size().await {
+                        emit(&events, session_id, Event::KvDbSizeReady { epoch, count });
+                    }
+                });
+            }
+
             Command::ColumnStats {
                 epoch,
                 column,

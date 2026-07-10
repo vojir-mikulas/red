@@ -41,6 +41,10 @@ use crate::app::{
     PendingImportPeek, PendingWrite, Phase, TransferKind, TOAST_AUTO_DISMISS,
 };
 
+/// Re-exported so `crate::kvbrowse` (the Redis keyspace browser) mints epochs
+/// from the same process-global counter as the SQL grid, without needing its
+/// own — see `buffer::next_epoch`'s doc comment.
+pub(crate) use buffer::next_epoch as next_kv_epoch;
 use buffer::{next_epoch, window_decision, BufferMode, GridBuffer, KeyedRun, WindowView, WINDOW};
 
 /// The resolved identity of an editable cell, `(row, data_col, pk_value, decl_type,

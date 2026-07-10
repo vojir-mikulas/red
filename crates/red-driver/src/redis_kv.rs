@@ -3,10 +3,13 @@
 //! its scan fan-out lands with R1 (see `docs/plans/redis.md`).
 
 use async_trait::async_trait;
+use red_core::kv::{KeyMeta, KvScanPage, KvType, ScanBudget};
 use red_core::{RedError, Result};
 use redis::aio::MultiplexedConnection;
+use tokio::time::Instant;
 
 use crate::kv::{KvDriver, KvTopology};
+use crate::AbortSignal;
 
 /// One Redis/Valkey session. Holds a single [`MultiplexedConnection`]:
 /// documented as cheap to clone and safe to use concurrently from multiple
@@ -103,6 +106,124 @@ impl KvDriver for RedisDriver {
             .await
             .map_err(|e| RedError::Driver(e.to_string()))
     }
+
+    async fn scan_keys(
+        &self,
+        cursor: u64,
+        pattern: Option<&str>,
+        budget: ScanBudget,
+        abort: &AbortSignal,
+    ) -> Result<KvScanPage> {
+        let mut conn = self.conn.clone();
+        let deadline = Instant::now() + budget.wall_clock;
+        let mut cur = cursor;
+        let mut collected: Vec<String> = Vec::new();
+        loop {
+            if abort.is_aborted() {
+                return Err(RedError::Interrupted);
+            }
+            let mut cmd = redis::cmd("SCAN");
+            cmd.arg(cur).arg("COUNT").arg(budget.count_hint);
+            if let Some(p) = pattern {
+                cmd.arg("MATCH").arg(p);
+            }
+            let (next_cur, batch): (u64, Vec<String>) = cmd
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| RedError::Driver(e.to_string()))?;
+            cur = next_cur;
+            collected.extend(batch);
+            // Never truncate mid-batch: a `SCAN` batch's keys are gone from
+            // future calls the moment the cursor moves past them, so keeping
+            // a whole overshoot batch is the only way not to silently drop
+            // keys `SCAN` already handed us.
+            if cur == 0 || collected.len() >= budget.want || Instant::now() >= deadline {
+                break;
+            }
+        }
+        let exhausted = cur == 0;
+        let keys = fetch_key_meta_batch(&mut conn, &collected).await?;
+        Ok(KvScanPage {
+            keys,
+            next_cursor: cur,
+            exhausted,
+        })
+    }
+
+    async fn probe_key(&self, key: &str) -> Result<Option<KeyMeta>> {
+        let mut conn = self.conn.clone();
+        let keys = fetch_key_meta_batch(&mut conn, std::slice::from_ref(&key.to_string())).await?;
+        Ok(keys.into_iter().next())
+    }
+}
+
+/// Pipeline `TYPE`/`PTTL`/`OBJECT ENCODING`/`MEMORY USAGE` for a batch of keys
+/// into one round trip (see docs/plans/redis.md's "the N+1 metadata
+/// problem"). `.ignore_errors()` keeps a single key that expired between
+/// `SCAN` and this call from failing the whole batch: `OBJECT ENCODING` on a
+/// vanished key is the one sub-command that comes back as a RESP error
+/// (`TYPE` reports `"none"`, `PTTL`/`MEMORY USAGE` report `-2`/nil), and with
+/// `ignore_errors()` set that position decodes as a `Value::ServerError`,
+/// which `redis::from_redis_value` turns into a plain `Err` we treat as
+/// "unavailable" rather than aborting the batch. Rejected alternative: a Lua
+/// script batching all keys in one `EVAL` — breaks under Redis Cluster's
+/// `CROSSSLOT` check once a scanned batch spans slots on the same node (see
+/// the plan's seam-decision section).
+async fn fetch_key_meta_batch(
+    conn: &mut MultiplexedConnection,
+    keys: &[String],
+) -> Result<Vec<KeyMeta>> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut pipe = redis::pipe();
+    pipe.ignore_errors();
+    for k in keys {
+        pipe.cmd("TYPE").arg(k);
+        pipe.cmd("PTTL").arg(k);
+        pipe.cmd("OBJECT").arg("ENCODING").arg(k);
+        pipe.cmd("MEMORY").arg("USAGE").arg(k);
+    }
+    let replies: Vec<redis::Value> = pipe
+        .query_async(conn)
+        .await
+        .map_err(|e| RedError::Driver(e.to_string()))?;
+
+    let mut out = Vec::with_capacity(keys.len());
+    for (i, key) in keys.iter().enumerate() {
+        let base = i * 4;
+        let Some(type_raw) = value_to_string(&replies[base]) else {
+            continue; // TYPE itself didn't decode: drop the row defensively.
+        };
+        let Some(kv_type) = KvType::parse(&type_raw) else {
+            continue; // "none": vanished between SCAN and here.
+        };
+        let ttl = value_to_i64(&replies[base + 1]).and_then(|ms| {
+            if ms < 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_millis(ms as u64))
+            }
+        });
+        let encoding = value_to_string(&replies[base + 2]).unwrap_or_default();
+        let approx_bytes = value_to_i64(&replies[base + 3]).unwrap_or(0).max(0) as u64;
+        out.push(KeyMeta {
+            key: key.clone(),
+            kv_type,
+            ttl,
+            encoding,
+            approx_bytes,
+        });
+    }
+    Ok(out)
+}
+
+fn value_to_string(v: &redis::Value) -> Option<String> {
+    redis::from_redis_value::<String>(v.clone()).ok()
+}
+
+fn value_to_i64(v: &redis::Value) -> Option<i64> {
+    redis::from_redis_value::<i64>(v.clone()).ok()
 }
 
 #[cfg(test)]
@@ -168,5 +289,163 @@ mod tests {
             "NOAUTH Authentication required.",
         ));
         assert!(matches!(map_connect_err(noauth), RedError::Auth(_)));
+    }
+
+    fn budget() -> ScanBudget {
+        ScanBudget {
+            count_hint: 200,
+            wall_clock: std::time::Duration::from_millis(500),
+            want: 50,
+        }
+    }
+
+    /// Seed `n` string keys under a unique per-test prefix, tagged so
+    /// concurrent test runs on a shared server don't collide (mirrors
+    /// clickhouse.rs's `tag` helper).
+    async fn seed(conn: &mut MultiplexedConnection, prefix: &str, n: usize) -> Vec<String> {
+        let mut pipe = redis::pipe();
+        let keys: Vec<String> = (0..n).map(|i| format!("{prefix}:{i}")).collect();
+        for k in &keys {
+            pipe.cmd("SET").arg(k).arg("v");
+        }
+        let _: Vec<redis::Value> = pipe.query_async(conn).await.unwrap();
+        keys
+    }
+
+    fn tag(name: &str) -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        format!("red_test_{name}_{}_{n}", std::process::id())
+    }
+
+    #[tokio::test]
+    async fn scan_finds_every_seeded_key_across_pages() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let prefix = tag("scan");
+        let seeded = seed(&mut driver.conn.clone(), &prefix, 30).await;
+
+        let abort = AbortSignal::new();
+        let mut found = std::collections::HashSet::new();
+        let mut cursor = 0;
+        loop {
+            let page = driver
+                .scan_keys(
+                    cursor,
+                    Some(&format!("{prefix}:*")),
+                    ScanBudget {
+                        count_hint: 5,
+                        want: 5,
+                        ..budget()
+                    },
+                    &abort,
+                )
+                .await
+                .unwrap();
+            for k in &page.keys {
+                found.insert(k.key.clone());
+                assert_eq!(k.kv_type, KvType::String);
+                assert!(k.ttl.is_none()); // no EXPIRE was set
+            }
+            cursor = page.next_cursor;
+            if page.exhausted {
+                break;
+            }
+        }
+        for k in &seeded {
+            assert!(found.contains(k), "missing {k}");
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_reports_ttl_and_types_per_key() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let prefix = tag("types");
+        let mut conn = driver.conn.clone();
+        let str_key = format!("{prefix}:str");
+        let hash_key = format!("{prefix}:hash");
+        let _: () = redis::cmd("SET")
+            .arg(&str_key)
+            .arg("v")
+            .arg("PX")
+            .arg(60_000)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("HSET")
+            .arg(&hash_key)
+            .arg("f")
+            .arg("v")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let abort = AbortSignal::new();
+        let page = driver
+            .scan_keys(0, Some(&format!("{prefix}:*")), budget(), &abort)
+            .await
+            .unwrap();
+        let by_key: std::collections::HashMap<_, _> =
+            page.keys.iter().map(|k| (k.key.clone(), k)).collect();
+
+        let str_meta = by_key.get(&str_key).expect("string key present");
+        assert_eq!(str_meta.kv_type, KvType::String);
+        assert!(str_meta.ttl.is_some());
+        assert!(!str_meta.encoding.is_empty());
+
+        let hash_meta = by_key.get(&hash_key).expect("hash key present");
+        assert_eq!(hash_meta.kv_type, KvType::Hash);
+        assert!(hash_meta.ttl.is_none());
+    }
+
+    /// The vanished-key race this batch fetch has to survive: a key expires
+    /// (or is deleted) between `SCAN` finding it and the pipelined metadata
+    /// fetch reading it. `OBJECT ENCODING` on that key errors inside the
+    /// pipeline; without `.ignore_errors()` this would fail the whole batch
+    /// and drop every other key's metadata along with it.
+    #[tokio::test]
+    async fn vanished_key_is_dropped_not_fatal_to_the_batch() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let mut conn = driver.conn.clone();
+        let present = tag("present");
+        let gone = tag("gone");
+        let _: () = redis::cmd("SET")
+            .arg(&present)
+            .arg("v")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        // `gone` is never set, so `TYPE gone` reports "none" — the same
+        // shape as a key that existed at SCAN time and expired before this
+        // call, without the timing flakiness of a real short-TTL race.
+        let keys = fetch_key_meta_batch(&mut conn, &[present.clone(), gone.clone()])
+            .await
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, present);
+    }
+
+    #[tokio::test]
+    async fn probe_key_finds_existing_and_reports_none_for_missing() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let present = tag("probe-present");
+        let missing = tag("probe-missing");
+        let _: () = redis::cmd("SET")
+            .arg(&present)
+            .arg("v")
+            .query_async(&mut driver.conn.clone())
+            .await
+            .unwrap();
+
+        let found = driver.probe_key(&present).await.unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().kv_type, KvType::String);
+
+        let absent = driver.probe_key(&missing).await.unwrap();
+        assert!(absent.is_none());
     }
 }

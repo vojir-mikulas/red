@@ -552,10 +552,9 @@ impl AppState {
     }
 
     /// The connected shell for a Redis (KV) session: the same top bar as the
-    /// SQL workspace, but a placeholder body instead of the editor/grid/schema
-    /// tree — those all assume a `DatabaseDriver` session (see
-    /// docs/plans/redis.md). Keyspace browsing lands in R1; this is R0's "we
-    /// connected, here's what we know" surface.
+    /// SQL workspace: the keyspace browser (R1, see docs/plans/redis.md)
+    /// instead of the editor/grid/schema tree, which all assume a
+    /// `DatabaseDriver` session.
     pub(crate) fn render_redis_shell(
         &self,
         active: &ActiveConn,
@@ -567,34 +566,7 @@ impl AppState {
         let config = &active.config;
 
         let topbar = self.render_topbar(&theme, &view, window, cx);
-
-        let body = div()
-            .flex_1()
-            .min_h(px(0.))
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .child(crate::icons::icon("db", theme.scale(28.), theme.text_faint))
-            .child(
-                div()
-                    .text_size(theme.scale(13.))
-                    .text_color(theme.text)
-                    .child(format!("Connected to {}", config.name)),
-            )
-            .child(
-                div()
-                    .text_size(theme.scale(11.5))
-                    .text_color(theme.text_muted)
-                    .child(format!("Redis {}", active.version)),
-            )
-            .child(
-                div()
-                    .text_size(theme.scale(11.))
-                    .text_color(theme.text_faint)
-                    .child("Keyspace browsing is coming in a future update."),
-            );
+        let body = self.render_kv_browse(active, window, cx).into_any_element();
 
         let statusbar = div()
             .flex_shrink_0()

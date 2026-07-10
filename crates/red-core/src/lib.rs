@@ -4,6 +4,7 @@
 
 use std::fmt;
 
+pub mod kv;
 pub mod typemap;
 
 /// Which database engine a connection targets. Drives driver selection and,

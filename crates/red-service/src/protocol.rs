@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use red_core::kv::{KeyMeta, KvScanPage, ScanBudget};
 use red_core::{
     ActivityId, ActivityKind, ActivityStatus, AiLimits, AiTier, Column, ColumnMap, ColumnMeta,
     ColumnStats, ConnectionConfig, CopyMode, EditOp, ExportFormat, FkEdge, FkJoin, ImportFormat,
@@ -137,8 +138,41 @@ pub enum Command {
         id: u64,
     },
     /// Drop an open result (its query tab closed, or it was re-sorted into a new
-    /// epoch). Unknown epochs are a no-op.
+    /// epoch). Unknown epochs are a no-op. Also closes a `KvFetchScan` browse:
+    /// `epoch` is a shared id space (see `InFlight::abort_all`), so this
+    /// generically stops an in-flight Redis scan too, not just a SQL result.
     CloseResult {
+        epoch: u64,
+    },
+    /// One page of a Redis keyspace scan (see docs/plans/redis.md's R1):
+    /// `SCAN` (looping, budgeted, optionally `MATCH`-filtered) plus a
+    /// pipelined metadata fetch, via the session's `KvDriver`. Stateless like
+    /// `FetchRun`: `cursor` is whatever `next_cursor` the previous
+    /// `KvScanPage` reply carried (`0` to start or restart on a new
+    /// `pattern`); the service holds no scan position between calls, the UI's
+    /// grid buffer does. `epoch` scopes the reply and supersedes any prior
+    /// in-flight scan for the same epoch (a fast-retyped filter cancels the
+    /// stale request rather than racing it). Replied with `KvScanPage`, or
+    /// the global `Event::Error` on failure (not a SQL connection, or the
+    /// engine round-trip itself failed).
+    KvFetchScan {
+        epoch: u64,
+        pattern: Option<String>,
+        cursor: u64,
+        budget: ScanBudget,
+    },
+    /// Exact-key jump (see docs/plans/redis.md): resolve one key's metadata
+    /// directly, bypassing `SCAN`. Replied with `KvKeyProbed` carrying
+    /// `None` when the key doesn't exist — that's a normal outcome, not an
+    /// `Event::Error`.
+    KvProbeKey {
+        epoch: u64,
+        key: String,
+    },
+    /// The keyspace's total key count (`DBSIZE`), for the unfiltered browse's
+    /// header stat. Replied with `KvDbSizeReady`; failures are swallowed
+    /// (a missing header stat isn't worth a toast), like `LoadForeignKeys`.
+    KvDbSize {
         epoch: u64,
     },
     /// Compute a column's aggregate summary over the open result's *filtered* SQL
@@ -488,6 +522,27 @@ pub enum Event {
     /// `LoadForeignKeys`. Cached on the connected session for click-through.
     ForeignKeysLoaded {
         graph: Vec<FkEdge>,
+    },
+    /// One page of a Redis keyspace scan, in response to `KvFetchScan`.
+    /// `page.next_cursor`/`page.exhausted` are what the UI echoes back as the
+    /// next `KvFetchScan`'s `cursor` (see that command's docs for why the
+    /// service holds no scan position itself).
+    KvScanPage {
+        epoch: u64,
+        page: KvScanPage,
+    },
+    /// One key's metadata, in response to `KvProbeKey`. `meta: None` means
+    /// the key doesn't exist — a normal outcome the UI shows inline ("no
+    /// such key"), not an `Event::Error`.
+    KvKeyProbed {
+        epoch: u64,
+        key: String,
+        meta: Option<KeyMeta>,
+    },
+    /// The keyspace's total key count, in response to `KvDbSize`.
+    KvDbSizeReady {
+        epoch: u64,
+        count: u64,
     },
     /// A result opened: its columns and total row count (for `OpenResult`).
     /// Echoes the open `epoch` so the grid can ignore a late reply for a result

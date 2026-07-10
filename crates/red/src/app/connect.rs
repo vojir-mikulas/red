@@ -122,6 +122,7 @@ impl AppState {
         if let Phase::Connecting(conn) = std::mem::replace(&mut self.phase, Phase::Disconnected) {
             // Invalidate any pending backoff timer from a prior attempt.
             self.connect_gen += 1;
+            let is_redis = conn.config.kind == red_core::DbKind::Redis;
             self.phase = Phase::Connected(Box::new(ActiveConn::new(
                 id,
                 conn.conn_id,
@@ -130,11 +131,18 @@ impl AppState {
                 cx,
             )));
             self.foreground_session = Some(id);
-            // Kick off the schema-tree skeleton load for the sidebar, and
-            // background-prefetch the FK graph (Track B7) so grid FK columns can be
-            // marked before any click. Both run off the connect path.
-            self.service.send_to(id, Command::LoadObjects);
-            self.service.send_to(id, Command::LoadForeignKeys);
+            if is_redis {
+                // Redis has no schema/FK concept; kick off the keyspace
+                // browser's first scan + header stat instead (R1, see
+                // docs/plans/redis.md).
+                self.kv_start_browse(id, cx);
+            } else {
+                // Kick off the schema-tree skeleton load for the sidebar, and
+                // background-prefetch the FK graph (Track B7) so grid FK columns can be
+                // marked before any click. Both run off the connect path.
+                self.service.send_to(id, Command::LoadObjects);
+                self.service.send_to(id, Command::LoadForeignKeys);
+            }
             self.rebuild_switcher(cx);
         }
     }

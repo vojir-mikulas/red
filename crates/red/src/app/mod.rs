@@ -709,6 +709,12 @@ pub(crate) struct ActiveConn {
     /// The read-only ER diagram overlay when open (schema-wide, so it hangs off the
     /// connection, not a tab). `None` when closed. See [`crate::er`].
     pub er: Option<crate::er::ErView>,
+    /// Redis keyspace-browse state (R1, see docs/plans/redis.md); `Some` only
+    /// for a `DbKind::Redis` session, set up in `on_connected`. `None` for
+    /// every SQL engine. Constructed here (needs `cx` to make the filter
+    /// `TextInput`); `on_connected` fires the initial `KvDbSize`/`KvFetchScan`
+    /// once the session is live.
+    pub kv_browse: Option<crate::kvbrowse::RedisBrowse>,
 }
 
 impl ActiveConn {
@@ -720,6 +726,8 @@ impl ActiveConn {
         cx: &mut Context<AppState>,
     ) -> Self {
         let tab = QueryTab::new("query 1".to_string(), cx);
+        let kv_browse =
+            (config.kind == DbKind::Redis).then(|| crate::kvbrowse::RedisBrowse::new(session, cx));
         Self {
             session,
             conn_id,
@@ -757,6 +765,7 @@ impl ActiveConn {
             columns_drag: None,
             last_active_seq: 0,
             er: None,
+            kv_browse,
         }
     }
 
@@ -2337,6 +2346,20 @@ impl AppState {
                 }
                 cx.notify();
             }
+
+            // --- Redis keyspace browser (R1, see docs/plans/redis.md) ---
+            Event::KvScanPage { epoch, page } => {
+                self.on_kv_scan_page(session, epoch, page, cx);
+            }
+            Event::KvDbSizeReady { epoch, count } => {
+                self.on_kv_db_size(session, epoch, count, cx);
+            }
+            Event::KvKeyProbed { .. } => {
+                // Exact-key jump has no UI trigger yet (deferred past this R1
+                // slice); the command/event round-trip is wired and tested
+                // end to end at the driver layer, just not surfaced here.
+            }
+
             // --- result grid ---
             Event::ResultReady {
                 columns,

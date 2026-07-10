@@ -58,7 +58,11 @@ const REANCHOR_MARGIN: usize = 5_000;
 /// is the backend's "no live result" sentinel.
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
-pub(super) fn next_epoch() -> u64 {
+/// `pub(crate)`, not `pub(super)`: the Redis keyspace browser (`crate::kvbrowse`)
+/// mints epochs from this same counter too, one open scan per epoch exactly
+/// like one open SQL result per epoch — different `Command`/`Event` shapes,
+/// same "distinguish this open thing from a superseded one" job.
+pub(crate) fn next_epoch() -> u64 {
     NEXT_EPOCH.fetch_add(1, Ordering::Relaxed)
 }
 
