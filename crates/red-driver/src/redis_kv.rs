@@ -3,13 +3,27 @@
 //! its scan fan-out lands with R1 (see `docs/plans/redis.md`).
 
 use async_trait::async_trait;
-use red_core::kv::{KeyMeta, KvScanPage, KvType, ScanBudget};
-use red_core::{RedError, Result};
+use red_core::kv::{
+    CollectionKind, KeyMeta, KvCollection, KvCollectionPage, KvElement, KvScanPage, KvType,
+    KvValue, ScanBudget,
+};
+use red_core::{RedError, Result, Value};
 use redis::aio::MultiplexedConnection;
 use tokio::time::Instant;
 
 use crate::kv::{KvDriver, KvTopology};
 use crate::AbortSignal;
+
+/// Below this many elements, `read_value` fetches a hash/set/zset/list in
+/// full (one round trip); at/above it, only the length is reported and the
+/// caller pages the rest (see docs/plans/redis.md's "a few hundred elements"
+/// guidance).
+const SMALL_COLLECTION_THRESHOLD: u64 = 200;
+/// Display cap for a string value preview, mirroring the SQL grid's
+/// `Value::Capped` cell cap (`red_driver::DEFAULT_DISPLAY_CELL_CAP`) rather
+/// than reusing it directly: a Redis string preview is a one-off inspector
+/// fetch, not a per-cell grid budget, so it gets its own constant.
+const STRING_PREVIEW_CAP: usize = 8 * 1024;
 
 /// One Redis/Valkey session. Holds a single [`MultiplexedConnection`]:
 /// documented as cheap to clone and safe to use concurrently from multiple
@@ -155,6 +169,207 @@ impl KvDriver for RedisDriver {
         let keys = fetch_key_meta_batch(&mut conn, std::slice::from_ref(&key.to_string())).await?;
         Ok(keys.into_iter().next())
     }
+
+    async fn read_value(&self, key: &str) -> Result<Option<KvValue>> {
+        let mut conn = self.conn.clone();
+        let type_raw: String = redis::cmd("TYPE")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        let Some(kv_type) = KvType::parse(&type_raw) else {
+            return Ok(None); // vanished, or never existed
+        };
+        match kv_type {
+            KvType::String => {
+                // A `GET` for a key that vanished between `TYPE` and here
+                // comes back nil; treat that the same as "doesn't exist".
+                let raw: Option<Vec<u8>> = redis::cmd("GET")
+                    .arg(key)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| RedError::Driver(e.to_string()))?;
+                Ok(raw.map(|bytes| KvValue::Str(cap_string_value(bytes))))
+            }
+            KvType::Hash => {
+                let collection = load_or_probe(&mut conn, "HLEN", "HGETALL", key, pair_up).await?;
+                Ok(Some(KvValue::Hash(collection)))
+            }
+            KvType::Set => {
+                let collection =
+                    load_or_probe(&mut conn, "SCARD", "SMEMBERS", key, |v: Vec<String>| v).await?;
+                Ok(Some(KvValue::Set(collection)))
+            }
+            KvType::ZSet => {
+                let collection =
+                    load_or_probe(&mut conn, "ZCARD", "ZRANGE", key, scored_pairs).await?;
+                Ok(Some(KvValue::ZSet(collection)))
+            }
+            KvType::List => {
+                let collection =
+                    load_or_probe(&mut conn, "LLEN", "LRANGE", key, |v: Vec<String>| v).await?;
+                Ok(Some(KvValue::List(collection)))
+            }
+            KvType::Stream | KvType::Other(_) => Ok(Some(KvValue::Unsupported(kv_type))),
+        }
+    }
+
+    async fn read_collection_page(
+        &self,
+        key: &str,
+        kind: CollectionKind,
+        cursor: u64,
+        budget: ScanBudget,
+        abort: &AbortSignal,
+    ) -> Result<KvCollectionPage> {
+        let mut conn = self.conn.clone();
+        let cmd_name = match kind {
+            CollectionKind::Hash => "HSCAN",
+            CollectionKind::Set => "SSCAN",
+            CollectionKind::ZSet => "ZSCAN",
+        };
+        let deadline = Instant::now() + budget.wall_clock;
+        let mut cur = cursor;
+        let mut elements = Vec::new();
+        loop {
+            if abort.is_aborted() {
+                return Err(RedError::Interrupted);
+            }
+            let mut cmd = redis::cmd(cmd_name);
+            cmd.arg(key).arg(cur).arg("COUNT").arg(budget.count_hint);
+            let (next_cur, flat): (u64, Vec<String>) = cmd
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| RedError::Driver(e.to_string()))?;
+            cur = next_cur;
+            match kind {
+                CollectionKind::Set => elements.extend(flat.into_iter().map(KvElement::Member)),
+                CollectionKind::Hash => elements.extend(
+                    pair_up(flat)
+                        .into_iter()
+                        .map(|(f, v)| KvElement::Field(f, v)),
+                ),
+                CollectionKind::ZSet => elements.extend(
+                    scored_pairs(flat)
+                        .into_iter()
+                        .map(|(m, s)| KvElement::Scored(m, s)),
+                ),
+            }
+            if cur == 0 || elements.len() >= budget.want || Instant::now() >= deadline {
+                break;
+            }
+        }
+        let exhausted = cur == 0;
+        Ok(KvCollectionPage {
+            elements,
+            next_cursor: cur,
+            exhausted,
+        })
+    }
+
+    async fn read_list_window(
+        &self,
+        key: &str,
+        from_head: bool,
+        count: usize,
+    ) -> Result<Vec<String>> {
+        let mut conn = self.conn.clone();
+        let count = count.max(1) as i64;
+        let (start, stop): (i64, i64) = if from_head {
+            (0, count - 1)
+        } else {
+            (-count, -1)
+        };
+        redis::cmd("LRANGE")
+            .arg(key)
+            .arg(start)
+            .arg(stop)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+}
+
+/// Cap a fetched string value like a SQL display cell: under the cap, the
+/// text (or a lossy-UTF8 decode) verbatim; over it, a
+/// [`red_core::CappedCell`] carrying only a char-boundary-safe prefix, never
+/// the full bytes.
+fn cap_string_value(bytes: Vec<u8>) -> Value {
+    let len = bytes.len();
+    if len <= STRING_PREVIEW_CAP {
+        return Value::Text(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    let mut head = String::from_utf8_lossy(&bytes[..STRING_PREVIEW_CAP]).into_owned();
+    // `from_utf8_lossy` on a byte slice cut mid-codepoint already replaces
+    // the truncated tail with U+FFFD, so `head` is always valid UTF-8 here;
+    // no separate char-boundary trim needed.
+    if head.len() > STRING_PREVIEW_CAP {
+        head.truncate(STRING_PREVIEW_CAP);
+    }
+    Value::Capped(red_core::CappedCell {
+        head,
+        len,
+        blob: false,
+    })
+}
+
+/// `HGETALL`/`ZRANGE WITHSCORES` (and `SMEMBERS`/`LRANGE 0 -1`) return a flat
+/// `[a, b, a, b, ...]` array; pair it up into `(a, b)` tuples. A trailing
+/// unpaired element (a torn reply, shouldn't happen) is dropped rather than
+/// panicking.
+fn pair_up(flat: Vec<String>) -> Vec<(String, String)> {
+    let mut it = flat.into_iter();
+    let mut out = Vec::new();
+    while let (Some(a), Some(b)) = (it.next(), it.next()) {
+        out.push((a, b));
+    }
+    out
+}
+
+/// Like [`pair_up`], but the second element of each pair is a score.
+/// `ZRANGE ... WITHSCORES`/`ZSCAN` both reply as flat
+/// `[member, score, member, score, ...]` text; an unparseable score
+/// (shouldn't happen) defaults to `0.0` rather than dropping the member.
+fn scored_pairs(flat: Vec<String>) -> Vec<(String, f64)> {
+    pair_up(flat)
+        .into_iter()
+        .map(|(member, score)| (member, score.parse::<f64>().unwrap_or(0.0)))
+        .collect()
+}
+
+/// The `read_value` shared shape for hash/set/zset/list: probe the O(1)
+/// length first; below the threshold, fetch everything in one more round
+/// trip and `map` it into the collection's element type; at/above it, report
+/// only the length.
+async fn load_or_probe<T>(
+    conn: &mut MultiplexedConnection,
+    len_cmd: &str,
+    load_cmd: &str,
+    key: &str,
+    map: impl FnOnce(Vec<String>) -> Vec<T>,
+) -> Result<KvCollection<T>> {
+    let len: u64 = redis::cmd(len_cmd)
+        .arg(key)
+        .query_async(conn)
+        .await
+        .map_err(|e| RedError::Driver(e.to_string()))?;
+    if len >= SMALL_COLLECTION_THRESHOLD {
+        return Ok(KvCollection::Large { len });
+    }
+    let mut cmd = redis::cmd(load_cmd);
+    cmd.arg(key);
+    // ZRANGE/LRANGE need an explicit whole-range span; HGETALL/SMEMBERS take
+    // just the key.
+    if load_cmd == "ZRANGE" {
+        cmd.arg(0).arg(-1).arg("WITHSCORES");
+    } else if load_cmd == "LRANGE" {
+        cmd.arg(0).arg(-1);
+    }
+    let flat: Vec<String> = cmd
+        .query_async(conn)
+        .await
+        .map_err(|e| RedError::Driver(e.to_string()))?;
+    Ok(KvCollection::Loaded(map(flat)))
 }
 
 /// Pipeline `TYPE`/`PTTL`/`OBJECT ENCODING`/`MEMORY USAGE` for a batch of keys
@@ -447,5 +662,181 @@ mod tests {
 
         let absent = driver.probe_key(&missing).await.unwrap();
         assert!(absent.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_value_reports_a_capped_string() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let mut conn = driver.conn.clone();
+        let small = tag("str-small");
+        let big = tag("str-big");
+        let _: () = redis::cmd("SET")
+            .arg(&small)
+            .arg("hello")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let big_value = "x".repeat(STRING_PREVIEW_CAP + 500);
+        let _: () = redis::cmd("SET")
+            .arg(&big)
+            .arg(&big_value)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        match driver.read_value(&small).await.unwrap().unwrap() {
+            KvValue::Str(Value::Text(s)) => assert_eq!(s, "hello"),
+            other => panic!("expected an uncapped Text value, got {other:?}"),
+        }
+        match driver.read_value(&big).await.unwrap().unwrap() {
+            KvValue::Str(Value::Capped(cell)) => {
+                assert_eq!(cell.len, big_value.len());
+                assert_eq!(cell.head.len(), STRING_PREVIEW_CAP);
+                assert!(!cell.blob);
+            }
+            other => panic!("expected a Capped value, got {other:?}"),
+        }
+        assert!(driver.read_value(&tag("missing")).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_value_loads_a_small_hash_fully() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let key = tag("hash-small");
+        let mut conn = driver.conn.clone();
+        let _: () = redis::cmd("HSET")
+            .arg(&key)
+            .arg("a")
+            .arg("1")
+            .arg("b")
+            .arg("2")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let KvValue::Hash(KvCollection::Loaded(pairs)) =
+            driver.read_value(&key).await.unwrap().unwrap()
+        else {
+            panic!("expected a loaded hash");
+        };
+        let map: std::collections::HashMap<_, _> = pairs.into_iter().collect();
+        assert_eq!(map.get("a").map(String::as_str), Some("1"));
+        assert_eq!(map.get("b").map(String::as_str), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn read_value_reports_a_large_set_as_length_only_then_pages_it() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let key = tag("set-large");
+        let mut conn = driver.conn.clone();
+        let n = SMALL_COLLECTION_THRESHOLD as usize + 20;
+        let members: Vec<String> = (0..n).map(|i| format!("m{i}")).collect();
+        let mut pipe = redis::pipe();
+        for m in &members {
+            pipe.cmd("SADD").arg(&key).arg(m);
+        }
+        let _: Vec<redis::Value> = pipe.query_async(&mut conn).await.unwrap();
+
+        let KvValue::Set(KvCollection::Large { len }) =
+            driver.read_value(&key).await.unwrap().unwrap()
+        else {
+            panic!("expected a large (length-only) set");
+        };
+        assert_eq!(len, n as u64);
+
+        // Page it fully via read_collection_page and confirm every member
+        // that was SADDed is found.
+        let abort = AbortSignal::new();
+        let mut found = std::collections::HashSet::new();
+        let mut cursor = 0;
+        loop {
+            let page = driver
+                .read_collection_page(&key, CollectionKind::Set, cursor, budget(), &abort)
+                .await
+                .unwrap();
+            for el in page.elements {
+                match el {
+                    KvElement::Member(m) => {
+                        found.insert(m);
+                    }
+                    other => panic!("expected Member elements for a set, got {other:?}"),
+                }
+            }
+            cursor = page.next_cursor;
+            if page.exhausted {
+                break;
+            }
+        }
+        for m in &members {
+            assert!(found.contains(m), "missing {m}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_value_zset_carries_scores() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let key = tag("zset-small");
+        let mut conn = driver.conn.clone();
+        let _: () = redis::cmd("ZADD")
+            .arg(&key)
+            .arg(1.5)
+            .arg("a")
+            .arg(2.5)
+            .arg("b")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let KvValue::ZSet(KvCollection::Loaded(pairs)) =
+            driver.read_value(&key).await.unwrap().unwrap()
+        else {
+            panic!("expected a loaded zset");
+        };
+        let map: std::collections::HashMap<_, _> = pairs.into_iter().collect();
+        assert_eq!(map.get("a"), Some(&1.5));
+        assert_eq!(map.get("b"), Some(&2.5));
+    }
+
+    #[tokio::test]
+    async fn read_list_window_reads_head_and_tail() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let key = tag("list-window");
+        let mut conn = driver.conn.clone();
+        let mut pipe = redis::pipe();
+        for i in 0..10 {
+            pipe.cmd("RPUSH").arg(&key).arg(i.to_string());
+        }
+        let _: Vec<redis::Value> = pipe.query_async(&mut conn).await.unwrap();
+
+        let head = driver.read_list_window(&key, true, 3).await.unwrap();
+        assert_eq!(head, vec!["0", "1", "2"]);
+        let tail = driver.read_list_window(&key, false, 3).await.unwrap();
+        assert_eq!(tail, vec!["7", "8", "9"]);
+    }
+
+    #[tokio::test]
+    async fn read_value_reports_stream_as_unsupported() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let key = tag("stream");
+        let mut conn = driver.conn.clone();
+        let _: String = redis::cmd("XADD")
+            .arg(&key)
+            .arg("*")
+            .arg("f")
+            .arg("v")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        match driver.read_value(&key).await.unwrap().unwrap() {
+            KvValue::Unsupported(KvType::Stream) => {}
+            other => panic!("expected Unsupported(Stream), got {other:?}"),
+        }
     }
 }

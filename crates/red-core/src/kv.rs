@@ -4,6 +4,8 @@
 
 use std::time::Duration;
 
+use crate::Value;
+
 /// A key's Redis data type, from `TYPE`. `Other` covers types this build
 /// doesn't render a dedicated inspector for yet (bitmap, hyperloglog — both
 /// report as `string` so rarely land here; a future module type would).
@@ -98,4 +100,61 @@ pub struct KvScanPage {
     pub keys: Vec<KeyMeta>,
     pub next_cursor: u64,
     pub exhausted: bool,
+}
+
+/// The three collection types pageable via a `*SCAN` command. Lists aren't
+/// included: they have no `LSCAN`, so a big list pages by `LRANGE` window
+/// instead (see [`KvValue::List`] and the plan's documented limitation on
+/// deep-middle list access).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionKind {
+    Hash,
+    Set,
+    ZSet,
+}
+
+/// One element of a hash/set/zset page (`HSCAN`/`SSCAN`/`ZSCAN`).
+#[derive(Debug, Clone)]
+pub enum KvElement {
+    Member(String),
+    Field(String, String),
+    Scored(String, f64),
+}
+
+/// One page of a big collection's elements, from
+/// [`KvDriver::read_collection_page`](crate). Stateless like [`KvScanPage`]:
+/// `next_cursor` is what the caller echoes back as the next call's `cursor`.
+#[derive(Debug, Clone)]
+pub struct KvCollectionPage {
+    pub elements: Vec<KvElement>,
+    pub next_cursor: u64,
+    pub exhausted: bool,
+}
+
+/// A collection value below vs. at/above the small-collection threshold (see
+/// docs/plans/redis.md's "big collections inside a single key"): `Loaded`
+/// carries every element, fetched once in `read_value`; `Large` carries only
+/// the O(1) length probe (`HLEN`/`SCARD`/`ZCARD`/`LLEN`) and nothing else —
+/// the caller pages the rest on demand via `read_collection_page`/
+/// `read_list_window` rather than ever issuing a `*GETALL`/`*MEMBERS` on it.
+#[derive(Debug, Clone)]
+pub enum KvCollection<T> {
+    Loaded(Vec<T>),
+    Large { len: u64 },
+}
+
+/// One key's value, from `KvDriver::read_value`.
+#[derive(Debug, Clone)]
+pub enum KvValue {
+    /// Capped like a SQL cell ([`Value::Capped`]) so a huge blob never fully
+    /// materializes just to preview it.
+    Str(Value),
+    Hash(KvCollection<(String, String)>),
+    Set(KvCollection<String>),
+    ZSet(KvCollection<(String, f64)>),
+    List(KvCollection<String>),
+    /// A type this build has no preview for yet (streams; see
+    /// docs/plans/redis.md — not in this pass's scope). Distinct from `Ok(None)`
+    /// (the key doesn't exist): the key is real, its value just isn't shown.
+    Unsupported(KvType),
 }

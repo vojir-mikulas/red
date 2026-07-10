@@ -102,6 +102,11 @@ pub(crate) struct InFlight {
     /// fast-retyped filter pattern supersedes the in-flight scan the same
     /// way a flung scrollbar supersedes a SQL page fetch.
     pub(crate) kv_scan: Option<AbortSignal>,
+    /// The latest `KvReadValue`/`KvReadCollectionPage`/`KvReadListWindow` for
+    /// this epoch (the value inspector): opening a new key, or paging its
+    /// big-collection sub-grid, supersedes whatever the inspector was
+    /// fetching before.
+    pub(crate) kv_value: Option<AbortSignal>,
 }
 
 impl InFlight {
@@ -114,6 +119,7 @@ impl InFlight {
             self.stats.as_ref(),
             self.lookup.as_ref(),
             self.kv_scan.as_ref(),
+            self.kv_value.as_ref(),
         ]
         .into_iter()
         .flatten()

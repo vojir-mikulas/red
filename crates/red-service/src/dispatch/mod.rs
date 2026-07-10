@@ -1300,6 +1300,132 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 });
             }
 
+            Command::KvReadValue { epoch, key } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                // A new key selection (or a re-selection of the same key)
+                // supersedes whatever the inspector was fetching before.
+                let entry = state.inflight.entry(epoch).or_default();
+                if let Some(prev) = entry.kv_value.take() {
+                    prev.abort();
+                }
+                let abort = AbortSignal::new();
+                entry.kv_value = Some(abort.clone());
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver.read_value(&key).await {
+                        Ok(value) => emit(
+                            &events,
+                            session_id,
+                            Event::KvValueReady { epoch, key, value },
+                        ),
+                        Err(RedError::Interrupted) => {}
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                    }
+                });
+            }
+
+            Command::KvReadCollectionPage {
+                epoch,
+                key,
+                kind,
+                cursor,
+                budget,
+            } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                let entry = state.inflight.entry(epoch).or_default();
+                if let Some(prev) = entry.kv_value.take() {
+                    prev.abort();
+                }
+                let abort = AbortSignal::new();
+                entry.kv_value = Some(abort.clone());
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver
+                        .read_collection_page(&key, kind, cursor, budget, &abort)
+                        .await
+                    {
+                        Ok(page) => emit(
+                            &events,
+                            session_id,
+                            Event::KvCollectionPageReady { epoch, key, page },
+                        ),
+                        Err(RedError::Interrupted) => {}
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                    }
+                });
+            }
+
+            Command::KvReadListWindow {
+                epoch,
+                key,
+                from_head,
+                count,
+            } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                let entry = state.inflight.entry(epoch).or_default();
+                if let Some(prev) = entry.kv_value.take() {
+                    prev.abort();
+                }
+                // `read_list_window` has no cancel token to pass (a single
+                // bounded `LRANGE`, unlike the budgeted `SCAN` loops above);
+                // still record an `AbortSignal` in `entry.kv_value` so a
+                // following `KvReadValue`/`KvReadCollectionPage` is tracked
+                // as superseding this fetch, for consistency with them.
+                entry.kv_value = Some(AbortSignal::new());
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver.read_list_window(&key, from_head, count).await {
+                        Ok(values) => emit(
+                            &events,
+                            session_id,
+                            Event::KvListWindowReady {
+                                epoch,
+                                key,
+                                from_head,
+                                values,
+                            },
+                        ),
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                    }
+                });
+            }
+
             Command::ColumnStats {
                 epoch,
                 column,

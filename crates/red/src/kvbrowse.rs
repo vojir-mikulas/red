@@ -14,7 +14,9 @@ use flint::prelude::*;
 use gpui::{
     div, prelude::*, px, AsyncApp, Context, Entity, UniformListScrollHandle, WeakEntity, Window,
 };
-use red_core::kv::{KeyMeta, KvType, ScanBudget};
+use red_core::kv::{
+    CollectionKind, KeyMeta, KvCollection, KvCollectionPage, KvElement, KvType, KvValue, ScanBudget,
+};
 use red_service::{Command, SessionId};
 
 use crate::app::{ActiveConn, AppState};
@@ -41,6 +43,10 @@ const MAX_RESIDENT_ROWS: usize = 20_000;
 /// character. Enter (`TextInputEvent::Submit`) bypasses this and restarts
 /// immediately.
 const FILTER_DEBOUNCE_MS: u64 = 300;
+/// A big list's inspector preview is a single static head window, not an
+/// infinite scroll (lists have no `LSCAN`; see docs/plans/redis.md's
+/// documented limitation on deep-middle list access).
+const LIST_PREVIEW_COUNT: usize = 200;
 
 fn scan_budget() -> ScanBudget {
     ScanBudget {
@@ -83,6 +89,31 @@ pub(crate) struct RedisBrowse {
     /// current when the timer fires, so rapid typing coalesces into one
     /// backend round trip (see `AppState::kv_debounce_filter`).
     pub(crate) filter_gen: u64,
+    /// The value inspector opened by selecting a row, if any.
+    pub(crate) inspector: Option<KvInspector>,
+}
+
+/// The value inspector for one selected key: its value (or just a big
+/// collection's length, per `KvValue`/`KvCollection`), and, for a big
+/// collection, the paged sub-grid state (see docs/plans/redis.md's "big
+/// collections inside a single key"). Replaces `Value::Capped`'s byte-length
+/// triage with an element-count triage one level down, same idea.
+pub(crate) struct KvInspector {
+    pub(crate) key: String,
+    pub(crate) kv_type: KvType,
+    pub(crate) ttl: Option<Duration>,
+    /// `None` while the initial `KvReadValue` is in flight.
+    pub(crate) value: Option<KvValue>,
+    /// The big-collection sub-grid's accumulated rows, only populated once
+    /// `value` reports a `KvCollection::Large`. A list's elements reuse
+    /// `KvElement::Member` (no separate variant; a list has no field/score,
+    /// same shape as a set member for rendering purposes) and are fetched
+    /// once as a static head window, not paged (see `LIST_PREVIEW_COUNT`).
+    pub(crate) collection_rows: Vec<KvElement>,
+    pub(crate) collection_cursor: u64,
+    pub(crate) collection_exhausted: bool,
+    pub(crate) collection_loading: bool,
+    pub(crate) collection_scroll: UniformListScrollHandle,
 }
 
 impl RedisBrowse {
@@ -114,6 +145,7 @@ impl RedisBrowse {
             scroll: UniformListScrollHandle::new(),
             filter,
             filter_gen: 0,
+            inspector: None,
         }
     }
 }
@@ -143,15 +175,11 @@ impl AppState {
         cx.notify();
     }
 
-    /// The filter pattern changed (Enter in the search box): close the
-    /// superseded scan (cancels its in-flight fetch at the engine too, see
-    /// `Command::CloseResult`'s doc comment), mint a fresh epoch, and start
-    /// over from `cursor: 0` with the new pattern.
     /// The filter box changed via typing (not Enter): wait `FILTER_DEBOUNCE_MS`
     /// of no further typing before restarting the scan, so a fast typist
     /// doesn't fire one `KvFetchScan` per keystroke. Mirrors `connect.rs`'s
     /// `connect_gen` generation-check shape: bump `filter_gen` now, capture
-    /// it, and only act in the timer callback if it's still current — any
+    /// it, and only act in the timer callback if it's still current; any
     /// later `Change` (or an intervening `Submit`, which restarts directly
     /// and leaves this generation stale) makes this callback a no-op.
     pub(crate) fn kv_debounce_filter(
@@ -186,6 +214,10 @@ impl AppState {
         .detach();
     }
 
+    /// The filter pattern changed (Enter, or the debounce timer firing):
+    /// close the superseded scan (cancels its in-flight fetch at the engine
+    /// too, see `Command::CloseResult`'s doc comment), mint a fresh epoch,
+    /// and start over from `cursor: 0` with the new pattern.
     pub(crate) fn kv_restart_scan(
         &mut self,
         session: SessionId,
@@ -307,6 +339,237 @@ impl AppState {
         browse.db_size = Some(count);
         cx.notify();
     }
+
+    /// A keyspace row was selected: open the inspector on it and kick off
+    /// `KvReadValue`. Replaces whatever the inspector was showing before.
+    pub(crate) fn kv_open_inspector(
+        &mut self,
+        session: SessionId,
+        ix: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.conn_mut(Some(session)) else {
+            return;
+        };
+        let Some(browse) = &mut active.kv_browse else {
+            return;
+        };
+        let Some(row) = browse.rows.get(ix) else {
+            return;
+        };
+        let key = row.key.clone();
+        let ttl = row.ttl;
+        let kv_type = row.kv_type.clone();
+        let epoch = browse.epoch;
+        browse.inspector = Some(KvInspector {
+            key: key.clone(),
+            kv_type,
+            ttl,
+            value: None,
+            collection_rows: Vec::new(),
+            collection_cursor: 0,
+            collection_exhausted: false,
+            collection_loading: false,
+            collection_scroll: UniformListScrollHandle::new(),
+        });
+        self.service
+            .send_to(session, Command::KvReadValue { epoch, key });
+        cx.notify();
+    }
+
+    pub(crate) fn kv_close_inspector(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(active) = self.conn_mut(Some(session)) else {
+            return;
+        };
+        let Some(browse) = &mut active.kv_browse else {
+            return;
+        };
+        browse.inspector = None;
+        cx.notify();
+    }
+
+    /// `Event::KvValueReady`: apply it if the inspector is still open on this
+    /// key (a `key` comparison, not the browse's epoch, since the inspector
+    /// can outlive a filter-triggered scan restart). A `Large` collection
+    /// auto-loads its first page/window right away, same one-click-in flow
+    /// as opening the inspector itself.
+    pub(crate) fn on_kv_value_ready(
+        &mut self,
+        session: Option<SessionId>,
+        key: String,
+        value: Option<KvValue>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.conn_mut(session) else {
+            return;
+        };
+        let Some(browse) = &mut active.kv_browse else {
+            return;
+        };
+        let Some(inspector) = &mut browse.inspector else {
+            return;
+        };
+        if inspector.key != key {
+            return; // a newer selection has already superseded this reply
+        }
+        inspector.value = value.clone();
+        cx.notify();
+        let Some(session) = session else { return };
+        match value {
+            Some(KvValue::Hash(KvCollection::Large { .. })) => {
+                self.kv_load_collection_page(session, CollectionKind::Hash, cx);
+            }
+            Some(KvValue::Set(KvCollection::Large { .. })) => {
+                self.kv_load_collection_page(session, CollectionKind::Set, cx);
+            }
+            Some(KvValue::ZSet(KvCollection::Large { .. })) => {
+                self.kv_load_collection_page(session, CollectionKind::ZSet, cx);
+            }
+            Some(KvValue::List(KvCollection::Large { .. })) => {
+                self.kv_load_list_preview(session, cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// Fetch the next page of the inspector's big hash/set/zset, or the
+    /// first page if none has loaded yet. The keyspace table's
+    /// `on_visible_range` calls this too, once the sub-grid's own visible
+    /// range nears the end of what's loaded (see `render_kv_inspector`).
+    pub(crate) fn kv_load_collection_page(
+        &mut self,
+        session: SessionId,
+        kind: CollectionKind,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.conn_mut(Some(session)) else {
+            return;
+        };
+        let Some(browse) = &mut active.kv_browse else {
+            return;
+        };
+        let epoch = browse.epoch;
+        let Some(inspector) = &mut browse.inspector else {
+            return;
+        };
+        if inspector.collection_loading || inspector.collection_exhausted {
+            return;
+        }
+        inspector.collection_loading = true;
+        let key = inspector.key.clone();
+        let cursor = inspector.collection_cursor;
+        self.service.send_to(
+            session,
+            Command::KvReadCollectionPage {
+                epoch,
+                key,
+                kind,
+                cursor,
+                budget: scan_budget(),
+            },
+        );
+        cx.notify();
+    }
+
+    fn kv_load_list_preview(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(active) = self.conn_mut(Some(session)) else {
+            return;
+        };
+        let Some(browse) = &mut active.kv_browse else {
+            return;
+        };
+        let epoch = browse.epoch;
+        let Some(inspector) = &mut browse.inspector else {
+            return;
+        };
+        inspector.collection_loading = true;
+        let key = inspector.key.clone();
+        self.service.send_to(
+            session,
+            Command::KvReadListWindow {
+                epoch,
+                key,
+                from_head: true,
+                count: LIST_PREVIEW_COUNT,
+            },
+        );
+        cx.notify();
+    }
+
+    /// The inspector sub-grid's `on_visible_range` hook, mirroring
+    /// `kv_maybe_load_more` for the top-level keyspace table.
+    pub(crate) fn kv_inspector_maybe_load_more(
+        &mut self,
+        session: SessionId,
+        kind: CollectionKind,
+        visible_end: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let loaded = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_browse.as_ref())
+            .and_then(|b| b.inspector.as_ref())
+            .map(|i| i.collection_rows.len());
+        let Some(loaded) = loaded else {
+            return;
+        };
+        if visible_end + LOAD_AHEAD_ROWS < loaded {
+            return;
+        }
+        self.kv_load_collection_page(session, kind, cx);
+    }
+
+    pub(crate) fn on_kv_collection_page_ready(
+        &mut self,
+        session: Option<SessionId>,
+        key: String,
+        page: KvCollectionPage,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.conn_mut(session) else {
+            return;
+        };
+        let Some(browse) = &mut active.kv_browse else {
+            return;
+        };
+        let Some(inspector) = &mut browse.inspector else {
+            return;
+        };
+        if inspector.key != key {
+            return;
+        }
+        inspector.collection_rows.extend(page.elements);
+        inspector.collection_cursor = page.next_cursor;
+        inspector.collection_exhausted = page.exhausted;
+        inspector.collection_loading = false;
+        cx.notify();
+    }
+
+    pub(crate) fn on_kv_list_window_ready(
+        &mut self,
+        session: Option<SessionId>,
+        key: String,
+        values: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.conn_mut(session) else {
+            return;
+        };
+        let Some(browse) = &mut active.kv_browse else {
+            return;
+        };
+        let Some(inspector) = &mut browse.inspector else {
+            return;
+        };
+        if inspector.key != key {
+            return;
+        }
+        inspector.collection_rows = values.into_iter().map(KvElement::Member).collect();
+        // A list's head-window preview is a one-shot fetch, not paged.
+        inspector.collection_exhausted = true;
+        inspector.collection_loading = false;
+        cx.notify();
+    }
 }
 
 /// The type column's short label + tint, mirroring `connect.rs`'s
@@ -388,6 +651,12 @@ impl AppState {
         let rows_render = rows.clone();
         let row_count = rows.len();
         let visible_range_view = view.clone();
+        let select_view = view.clone();
+
+        let selected_ix = browse
+            .inspector
+            .as_ref()
+            .and_then(|i| rows.iter().position(|r| r.key == i.key));
 
         let columns = vec![
             Column::new("Key").flex(),
@@ -407,6 +676,12 @@ impl AppState {
             .grid_lines(true)
             .text_size(cell_size)
             .track_scroll(&browse.scroll)
+            .selected(selected_ix)
+            .on_select(move |ix, _click, _window, cx| {
+                select_view
+                    .update(cx, |this, cx| this.kv_open_inspector(session, ix, cx))
+                    .ok();
+            })
             .render_row(move |ix, _window, _cx| {
                 let Some(row) = rows_render.get(ix) else {
                     return Vec::new();
@@ -464,6 +739,384 @@ impl AppState {
                             .child(header),
                     ),
             )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .child(div().flex_1().min_w(px(0.)).child(table))
+                    .when_some(browse.inspector.as_ref(), |el, inspector| {
+                        el.child(self.render_kv_inspector(session, inspector, &theme, cx))
+                    }),
+            )
+    }
+
+    /// The value inspector panel: key/type/TTL header, then the value
+    /// rendered per type, docked to the right of the keyspace table.
+    fn render_kv_inspector(
+        &self,
+        session: SessionId,
+        inspector: &KvInspector,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        let close_view = view.clone();
+
+        let header = div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1p5()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(theme.scale(12.))
+                    .child(inspector.key.clone()),
+            )
+            .child(type_pill(&inspector.kv_type, theme))
+            .child(
+                div()
+                    .text_size(theme.scale(10.5))
+                    .text_color(theme.text_muted)
+                    .child(fmt_ttl(inspector.ttl)),
+            )
+            .child(
+                IconButton::new(
+                    "kv-inspector-close",
+                    crate::icons::icon("x", theme.scale(13.), theme.text_muted),
+                )
+                .size(IconButtonSize::Sm)
+                .tooltip("Close")
+                .a11y_label("Close inspector")
+                .on_click(move |_, _, cx| {
+                    close_view
+                        .update(cx, |this, cx| this.kv_close_inspector(session, cx))
+                        .ok();
+                }),
+            );
+
+        let body = self.render_kv_value(session, inspector, theme, cx);
+
+        div()
+            .flex_shrink_0()
+            .w(px(380.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .border_l_1()
+            .border_color(theme.border)
+            .bg(theme.bg_panel)
+            .child(header)
+            .child(body)
+    }
+
+    /// The inspector's value area: a per-type renderer for a loaded value, a
+    /// paged sub-grid for a big collection, or a loading/unsupported note.
+    fn render_kv_value(
+        &self,
+        session: SessionId,
+        inspector: &KvInspector,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let text_size = theme.scale(11.5);
+        let dim = theme.text_muted;
+        let mono = theme.mono_family.clone();
+
+        let Some(value) = &inspector.value else {
+            return div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(text_size)
+                .text_color(dim)
+                .child("Loading…")
+                .into_any_element();
+        };
+
+        match value {
+            KvValue::Str(v) => div()
+                .id("kv-inspector-string")
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .p_2()
+                .child(
+                    div()
+                        .font_family(mono)
+                        .text_size(text_size)
+                        .child(render_string_preview(v)),
+                )
+                .into_any_element(),
+            KvValue::Unsupported(kind) => div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_2()
+                .text_size(text_size)
+                .text_color(dim)
+                .child(format!(
+                    "Preview not available for {} keys yet",
+                    kind.label()
+                ))
+                .into_any_element(),
+            KvValue::Hash(KvCollection::Loaded(pairs)) => {
+                render_loaded_list(pairs.iter().map(|(f, v)| (f.clone(), v.clone())), theme)
+            }
+            KvValue::Set(KvCollection::Loaded(members)) => render_loaded_list(
+                members
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| (i.to_string(), m.clone())),
+                theme,
+            ),
+            KvValue::ZSet(KvCollection::Loaded(pairs)) => {
+                render_loaded_list(pairs.iter().map(|(m, s)| (m.clone(), s.to_string())), theme)
+            }
+            KvValue::List(KvCollection::Loaded(items)) => render_loaded_list(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (i.to_string(), v.clone())),
+                theme,
+            ),
+            KvValue::Hash(KvCollection::Large { len }) => self.render_kv_collection_grid(
+                session,
+                CollectionKind::Hash,
+                *len,
+                inspector,
+                theme,
+                cx,
+            ),
+            KvValue::Set(KvCollection::Large { len }) => self.render_kv_collection_grid(
+                session,
+                CollectionKind::Set,
+                *len,
+                inspector,
+                theme,
+                cx,
+            ),
+            KvValue::ZSet(KvCollection::Large { len }) => self.render_kv_collection_grid(
+                session,
+                CollectionKind::ZSet,
+                *len,
+                inspector,
+                theme,
+                cx,
+            ),
+            KvValue::List(KvCollection::Large { len }) => {
+                self.render_kv_list_preview(*len, inspector, theme)
+            }
+        }
+    }
+
+    /// The big hash/set/zset sub-grid: same `Table` + `on_visible_range`
+    /// load-more shape as the top-level keyspace browser, scoped to one
+    /// key's elements.
+    fn render_kv_collection_grid(
+        &self,
+        session: SessionId,
+        kind: CollectionKind,
+        len: u64,
+        inspector: &KvInspector,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let view = cx.entity().downgrade();
+        let rows = std::rc::Rc::new(inspector.collection_rows.clone());
+        let rows_render = rows.clone();
+        let row_count = rows.len();
+
+        let columns = match kind {
+            CollectionKind::Hash => vec![
+                Column::new("Field").width(px(150.)),
+                Column::new("Value").flex(),
+            ],
+            CollectionKind::Set => vec![Column::new("Member").flex()],
+            CollectionKind::ZSet => vec![
+                Column::new("Member").flex(),
+                Column::new("Score").width(px(90.)).align_end(),
+            ],
+        };
+
+        let dim = theme.text_muted;
+        let cell_size = theme.scale(11.5);
+
+        let table = Table::<()>::new("kv-inspector-grid", columns)
+            .row_count(row_count)
+            .grid_lines(true)
+            .text_size(cell_size)
+            .track_scroll(&inspector.collection_scroll)
+            .render_row(move |ix, _window, _cx| match rows_render.get(ix) {
+                Some(KvElement::Field(f, v)) => vec![
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .child(f.clone())
+                        .into_any_element(),
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(dim)
+                        .child(v.clone())
+                        .into_any_element(),
+                ],
+                Some(KvElement::Scored(m, s)) => vec![
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .child(m.clone())
+                        .into_any_element(),
+                    div()
+                        .text_color(dim)
+                        .child(format!("{s}"))
+                        .into_any_element(),
+                ],
+                Some(KvElement::Member(m)) => {
+                    vec![div()
+                        .min_w_0()
+                        .truncate()
+                        .child(m.clone())
+                        .into_any_element()]
+                }
+                None => Vec::new(),
+            })
+            .on_visible_range(move |range, _window, cx| {
+                view.update(cx, |this, cx| {
+                    this.kv_inspector_maybe_load_more(session, kind, range.end, cx)
+                })
+                .ok();
+            });
+
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .px_2()
+                    .py_1()
+                    .text_size(theme.scale(10.5))
+                    .text_color(dim)
+                    .child(format!("{len} elements, paging as you scroll")),
+            )
             .child(div().flex_1().min_h(px(0.)).child(table))
+            .into_any_element()
+    }
+
+    /// A big list's static head-window preview (no infinite scroll; see
+    /// `LIST_PREVIEW_COUNT`'s doc comment).
+    fn render_kv_list_preview(
+        &self,
+        len: u64,
+        inspector: &KvInspector,
+        theme: &Theme,
+    ) -> gpui::AnyElement {
+        let shown = inspector.collection_rows.len();
+        let note = format!("showing the first {shown} of {len} items (head only)");
+        let items = inspector.collection_rows.iter().enumerate().map(|(i, el)| {
+            let KvElement::Member(v) = el else {
+                return div().into_any_element();
+            };
+            div()
+                .flex()
+                .gap_2()
+                .px_2()
+                .py_0p5()
+                .child(
+                    div()
+                        .w(px(36.))
+                        .text_color(theme.text_faint)
+                        .child(i.to_string()),
+                )
+                .child(div().flex_1().min_w_0().truncate().child(v.clone()))
+                .into_any_element()
+        });
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .px_2()
+                    .py_1()
+                    .text_size(theme.scale(10.5))
+                    .text_color(theme.text_muted)
+                    .child(note),
+            )
+            .child(
+                div()
+                    .id("kv-inspector-list-preview")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .text_size(theme.scale(11.5))
+                    .children(items),
+            )
+            .into_any_element()
+    }
+}
+
+/// A small (< threshold) collection rendered as a plain scrollable list, not
+/// the virtualized `Table` the big-collection path uses — capped at a few
+/// hundred rows by construction (`SMALL_COLLECTION_THRESHOLD` on the driver
+/// side), so no virtualization is needed.
+fn render_loaded_list(
+    pairs: impl Iterator<Item = (String, String)>,
+    theme: &Theme,
+) -> gpui::AnyElement {
+    let dim = theme.text_muted;
+    let items: Vec<_> = pairs
+        .map(|(k, v)| {
+            div()
+                .flex()
+                .gap_2()
+                .px_2()
+                .py_0p5()
+                .child(
+                    div()
+                        .w(px(90.))
+                        .min_w_0()
+                        .truncate()
+                        .text_color(dim)
+                        .child(k),
+                )
+                .child(div().flex_1().min_w_0().truncate().child(v))
+                .into_any_element()
+        })
+        .collect();
+    div()
+        .id("kv-inspector-loaded-list")
+        .flex_1()
+        .min_h(px(0.))
+        .overflow_y_scroll()
+        .text_size(theme.scale(11.5))
+        .children(items)
+        .into_any_element()
+}
+
+/// A string value's preview body: pretty-printed if it parses as JSON
+/// (a common Redis string payload shape), else the raw text; a capped value
+/// shows its prefix plus a "… (N bytes total)" note.
+fn render_string_preview(value: &red_core::Value) -> String {
+    match value {
+        red_core::Value::Text(s) => s.clone(),
+        red_core::Value::Capped(cell) => {
+            format!("{}\n\n… ({} bytes total, truncated)", cell.head, cell.len)
+        }
+        other => format!("{other:?}"),
     }
 }

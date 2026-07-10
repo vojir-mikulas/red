@@ -2359,6 +2359,15 @@ impl AppState {
                 // slice); the command/event round-trip is wired and tested
                 // end to end at the driver layer, just not surfaced here.
             }
+            Event::KvValueReady { key, value, .. } => {
+                self.on_kv_value_ready(session, key, value, cx);
+            }
+            Event::KvCollectionPageReady { key, page, .. } => {
+                self.on_kv_collection_page_ready(session, key, page, cx);
+            }
+            Event::KvListWindowReady { key, values, .. } => {
+                self.on_kv_list_window_ready(session, key, values, cx);
+            }
 
             // --- result grid ---
             Event::ResultReady {

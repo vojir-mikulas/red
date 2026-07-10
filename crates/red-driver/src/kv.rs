@@ -9,7 +9,7 @@
 //! and editing land in later phases per the plan's R2–R3 breakdown.
 
 use async_trait::async_trait;
-use red_core::kv::{KeyMeta, KvScanPage, ScanBudget};
+use red_core::kv::{CollectionKind, KeyMeta, KvCollectionPage, KvScanPage, KvValue, ScanBudget};
 use red_core::Result;
 
 use crate::AbortSignal;
@@ -68,4 +68,37 @@ pub trait KvDriver: Send + Sync {
     /// buffer mode"): resolve one key's metadata directly, bypassing `SCAN`
     /// entirely. `Ok(None)` when the key doesn't exist, not an error.
     async fn probe_key(&self, key: &str) -> Result<Option<KeyMeta>>;
+
+    /// One key's value (see docs/plans/redis.md's "big collections inside a
+    /// single key"): a string capped like a SQL cell, or a collection either
+    /// fully loaded (below the small-collection threshold, one round trip)
+    /// or reported as just its length (at/above it — the caller pages the
+    /// rest via [`read_collection_page`](Self::read_collection_page)/
+    /// [`read_list_window`](Self::read_list_window) rather than this ever
+    /// issuing a `*GETALL`/`*MEMBERS` on a huge collection). `Ok(None)` when
+    /// the key doesn't exist.
+    async fn read_value(&self, key: &str) -> Result<Option<KvValue>>;
+
+    /// One page of a big hash/set/zset's elements (`HSCAN`/`SSCAN`/`ZSCAN`).
+    /// Stateless like [`scan_keys`](Self::scan_keys): `cursor` is the
+    /// caller-supplied `next_cursor` from the previous page (`0` to start).
+    async fn read_collection_page(
+        &self,
+        key: &str,
+        kind: CollectionKind,
+        cursor: u64,
+        budget: ScanBudget,
+        abort: &AbortSignal,
+    ) -> Result<KvCollectionPage>;
+
+    /// A windowed slice of a big list (`LRANGE`), from the head or the tail.
+    /// Arbitrary deep-middle access isn't offered: `LRANGE`'s cost grows with
+    /// the offset, unlike a `SCAN`-shaped read (see docs/plans/redis.md's
+    /// documented limitation on this).
+    async fn read_list_window(
+        &self,
+        key: &str,
+        from_head: bool,
+        count: usize,
+    ) -> Result<Vec<String>>;
 }

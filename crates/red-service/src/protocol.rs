@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use red_core::kv::{KeyMeta, KvScanPage, ScanBudget};
+use red_core::kv::{CollectionKind, KeyMeta, KvCollectionPage, KvScanPage, KvValue, ScanBudget};
 use red_core::{
     ActivityId, ActivityKind, ActivityStatus, AiLimits, AiTier, Column, ColumnMap, ColumnMeta,
     ColumnStats, ConnectionConfig, CopyMode, EditOp, ExportFormat, FkEdge, FkJoin, ImportFormat,
@@ -174,6 +174,36 @@ pub enum Command {
     /// (a missing header stat isn't worth a toast), like `LoadForeignKeys`.
     KvDbSize {
         epoch: u64,
+    },
+    /// One key's value, for the detail inspector opened by selecting a row in
+    /// the keyspace browser. `epoch` is the browse's epoch, used only to
+    /// scope the in-flight fetch for cancellation (a newer `KvReadValue`,
+    /// `KvReadCollectionPage`, or `KvReadListWindow` supersedes it); staleness
+    /// of the *reply* is instead checked UI-side by comparing `key`, since the
+    /// inspector can outlive a scan restart. Replied with `KvValueReady`.
+    KvReadValue {
+        epoch: u64,
+        key: String,
+    },
+    /// One page of a big hash/set/zset's elements, for the inspector's
+    /// big-collection sub-grid (see docs/plans/redis.md). Stateless like
+    /// `KvFetchScan`: `cursor` is the caller-supplied `next_cursor` from the
+    /// previous `KvCollectionPageReady`. Replied with `KvCollectionPageReady`.
+    KvReadCollectionPage {
+        epoch: u64,
+        key: String,
+        kind: CollectionKind,
+        cursor: u64,
+        budget: ScanBudget,
+    },
+    /// A windowed slice of a big list, from the head or the tail (see
+    /// `KvDriver::read_list_window`'s docs on why not an arbitrary offset).
+    /// Replied with `KvListWindowReady`.
+    KvReadListWindow {
+        epoch: u64,
+        key: String,
+        from_head: bool,
+        count: usize,
     },
     /// Compute a column's aggregate summary over the open result's *filtered* SQL
     /// (the column-stats bar): a single `count`/`distinct`/`min`/`max`(/`sum`/`avg`)
@@ -543,6 +573,28 @@ pub enum Event {
     KvDbSizeReady {
         epoch: u64,
         count: u64,
+    },
+    /// One key's value, in response to `KvReadValue`. `value: None` means the
+    /// key doesn't exist (it may have been deleted between the browse's
+    /// `SCAN` and this fetch).
+    KvValueReady {
+        epoch: u64,
+        key: String,
+        value: Option<KvValue>,
+    },
+    /// One page of a big collection's elements, in response to
+    /// `KvReadCollectionPage`.
+    KvCollectionPageReady {
+        epoch: u64,
+        key: String,
+        page: KvCollectionPage,
+    },
+    /// A windowed slice of a big list, in response to `KvReadListWindow`.
+    KvListWindowReady {
+        epoch: u64,
+        key: String,
+        from_head: bool,
+        values: Vec<String>,
     },
     /// A result opened: its columns and total row count (for `OpenResult`).
     /// Echoes the open `epoch` so the grid can ignore a late reply for a result
