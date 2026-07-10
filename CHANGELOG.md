@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-10
+
 ### Added
 - ER diagram: a read-only, pannable/zoomable map of the schema - every table a
   box (columns marked PK/FK), every foreign key a connector. Open it from the
@@ -19,10 +21,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   from the file you save to.
 - Import a `.json` file that holds a single top-level array of objects, not only
   newline-delimited JSON.
-- Added Herobrine
 
 ### Changed
-- Schema tree: a single click now acts on the row. 
+- Schema tree: a single click now acts on the row.
 - Query history: click an entry to open it in a new query tab; ⌘/Ctrl-click to
   replace the current tab's editor instead. Nothing runs until you do, so a past
   write is never re-executed by a click.
