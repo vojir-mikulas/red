@@ -248,6 +248,9 @@ pub struct QuerySettings {
     /// Abort a query (and each of its page/run fetches) that runs longer than this
     /// many seconds, so a runaway can't wedge the grid. `0` disables the cap.
     pub statement_timeout: u32,
+    /// Confirm before closing a tab that holds a query or result. The tab-close
+    /// modal's "Don't ask again" checkbox flips this off.
+    pub confirm_close_tab: bool,
 }
 
 impl Default for QuerySettings {
@@ -256,6 +259,7 @@ impl Default for QuerySettings {
             auto_limit: 1000,
             confirm_destructive: true,
             statement_timeout: 0,
+            confirm_close_tab: true,
         }
     }
 }

@@ -6,6 +6,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Tab strip: middle-click a tab to close it, right-click for a context menu
+  (Close, Close Others, Close All, Close Left, Close Right, Pin tab), and pin a
+  tab to keep it visible at the start of the strip no matter how far you've
+  scrolled. The close-with-unsaved-work prompt gained a "Don't ask again"
+  checkbox.
+
 ## [0.16.0] - 2026-07-10
 
 ### Added

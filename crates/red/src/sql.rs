@@ -1505,6 +1505,25 @@ fn cte_names(stmt: &str) -> HashSet<String> {
     names
 }
 
+/// The lower-cased names a statement binds via `... AS name` — output-column aliases
+/// (`SELECT total... AS total`) and table aliases (`FROM foo AS f`) both match, since
+/// distinguishing them isn't needed here: the unqualified-column check just needs to
+/// know a bare word is a defined name, not a schema column, wherever else it's used
+/// (e.g. `ORDER BY total`). Over-collecting only suppresses diagnostics, so the loose
+/// match is safe.
+fn as_aliases(stmt: &str) -> HashSet<String> {
+    let atoms = atomize(stmt);
+    let mut names = HashSet::new();
+    for w in atoms.windows(2) {
+        if let (Atom::Word(kw, _), Atom::Word(name, _)) = (&w[0], &w[1]) {
+            if kw.eq_ignore_ascii_case("as") && !is_keyword(name) {
+                names.insert(name.to_lowercase());
+            }
+        }
+    }
+    names
+}
+
 /// Whether the gap `stmt[from..to]` between two identifier tokens is a member-access
 /// `.` — how the token-level column check spots `qualifier.column` without the
 /// tokenizer emitting a dot token. Tolerates the backticks around a quoted qualifier
@@ -1519,6 +1538,7 @@ fn gap_is_dot(stmt: &str, from: usize, to: usize) -> bool {
 
 fn diagnose_statement(stmt: &str, base: usize, schema: &dyn SchemaView, out: &mut Vec<Diagnostic>) {
     let ctes = cte_names(stmt);
+    let aliases = as_aliases(stmt);
     let refs = referenced_tables_ranged(stmt);
 
     // 1. Unknown tables in FROM/JOIN/INTO/UPDATE positions.
@@ -1601,14 +1621,14 @@ fn diagnose_statement(stmt: &str, base: usize, schema: &dyn SchemaView, out: &mu
         // Unqualified column, only in the unambiguous single-table case.
         if let Some(table) = &single_table {
             let low = word.to_lowercase();
-            // Skip the table's own name/alias, reserved words, and an `AS`-defined
-            // output alias (`SELECT expr AS foo`).
-            if is_keyword(word) || alias_map.contains_key(&low) || schema.has_table(&low) {
-                continue;
-            }
-            if prev.is_some_and(|(pr, ps)| {
-                *ps == TokenStyle::Keyword && stmt[pr.clone()].eq_ignore_ascii_case("as")
-            }) {
+            // Skip the table's own name/alias, reserved words, and any `AS`-defined
+            // alias (an output alias like `SELECT expr AS foo`, referenceable later
+            // in `ORDER BY`/`GROUP BY`/`HAVING`).
+            if is_keyword(word)
+                || alias_map.contains_key(&low)
+                || schema.has_table(&low)
+                || aliases.contains(&low)
+            {
                 continue;
             }
             let cols = schema
@@ -2126,6 +2146,29 @@ mod tests {
         assert!(diag_pairs("SELECT u.id FROM users u", &s).is_empty());
         assert!(diag_pairs("SELECT email AS addr FROM users", &s).is_empty());
         assert!(diag_pairs("SELECT count(email) FROM users", &s).is_empty());
+    }
+
+    #[test]
+    fn order_by_group_by_resolve_select_list_aliases() {
+        let s = TestSchema::new();
+        // A SELECT-list output alias referenced later in the same statement (ORDER
+        // BY, GROUP BY, HAVING) must not read as an unknown column.
+        assert!(diag_pairs(
+            "SELECT name, COUNT(*) AS total FROM users GROUP BY name ORDER BY total DESC",
+            &s
+        )
+        .is_empty());
+        // A genuinely unknown name in ORDER BY is still flagged.
+        assert_eq!(
+            diag_pairs(
+                "SELECT name, COUNT(*) AS total FROM users ORDER BY bogus",
+                &s
+            )
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect::<Vec<_>>(),
+            ["bogus"]
+        );
     }
 
     #[test]

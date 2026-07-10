@@ -752,6 +752,40 @@ impl AppState {
                     .min_h(px(0.))
                     .bg(bg_app)
                     .relative()
+                    // Middle-click hold-to-autoscroll (a joystick, not a drag):
+                    // press starts (or, pressed again, cancels) a session
+                    // targeting this pane's grid; any other click also cancels
+                    // it, mirroring a browser's middle-click autoscroll.
+                    .on_mouse_down(MouseButton::Middle, {
+                        let view = view.clone();
+                        let scroll = grid.scroll.clone();
+                        let h_scroll = grid.h_scroll.clone();
+                        move |ev, _, cx| {
+                            view.update(cx, |this, cx| {
+                                this.toggle_autoscroll(ev.position, &scroll, &h_scroll, cx)
+                            })
+                            .ok();
+                        }
+                    })
+                    .on_mouse_down(MouseButton::Left, {
+                        let view = view.clone();
+                        move |_, _, cx| {
+                            view.update(cx, |this, cx| this.cancel_autoscroll(cx)).ok();
+                        }
+                    })
+                    .on_mouse_down(MouseButton::Right, {
+                        let view = view.clone();
+                        move |_, _, cx| {
+                            view.update(cx, |this, cx| this.cancel_autoscroll(cx)).ok();
+                        }
+                    })
+                    .on_mouse_move({
+                        let view = view.clone();
+                        move |ev, _, cx| {
+                            view.update(cx, |this, cx| this.autoscroll_move(ev.position, cx))
+                                .ok();
+                        }
+                    })
                     .child(table)
                     .child(scrollbar),
             )

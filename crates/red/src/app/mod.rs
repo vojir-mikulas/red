@@ -72,6 +72,18 @@ pub(crate) enum Pane {
     Grid,
 }
 
+/// Which tabs a tab-strip context-menu close action targets, relative to the
+/// clicked tab's own pane. See [`AppState::close_tab_group`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TabCloseScope {
+    /// Just the clicked tab (the menu's plain "Close" item / the × button).
+    One,
+    All,
+    Others,
+    Left,
+    Right,
+}
+
 /// Which half of a side-by-side split (see [`SplitState`]) the run/export/filter
 /// actions target: the focused half. `Primary` is the left pane (`active_tab`);
 /// `Secondary` is the right pane (`SplitState::secondary`).
@@ -431,7 +443,7 @@ pub(crate) struct ForeignEdit {
 /// How long a transient (info / success) toast stays up before it auto-dismisses.
 /// Errors and warnings (and a live export) have no timer; they persist until the
 /// user closes them or the operation resolves.
-const TOAST_AUTO_DISMISS: Duration = Duration::from_secs(4);
+pub(crate) const TOAST_AUTO_DISMISS: Duration = Duration::from_secs(4);
 
 /// Most warm parked sessions kept resident at once. Each is a heavy `ActiveConn`
 /// (editor entities, schema detail map, result buffers), so the map is capped:
@@ -510,11 +522,17 @@ pub(crate) struct Notification {
 }
 
 /// The call-to-action a toast can offer beyond copy/close, rendered as a trailing
-/// accent button in `render_notifications`.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// accent button in `render_notifications`. A toast carrying one of these is
+/// content-specific enough that the generic copy button is skipped (see
+/// `render_notifications`): there's nothing copy-worthy about "RED updated" or
+/// an export's file path, and the action itself is the more useful affordance.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum NotificationAction {
     /// Open the "What's New" panel (the post-update announcement toast).
     ShowChangelog,
+    /// Reveal the written file in the OS file manager (Finder / Explorer / the
+    /// platform's file manager), selected. Carries the file's full path.
+    RevealInFileManager(SharedString),
 }
 
 /// The default editor text a fresh query tab opens with. A tab still holding
@@ -540,6 +558,10 @@ pub(crate) struct QueryTab {
     /// its own tabs, so the two halves never duplicate. Always `Primary` while the
     /// work area is unsplit; a drag across the divider (or `split_right`) reassigns it.
     pub pane: SplitHalf,
+    /// Pinned tabs render in a fixed section at the start of the strip, always
+    /// visible regardless of scroll, and are skipped by the bulk close actions
+    /// (Close Others / Close All / Close Left / Close Right).
+    pub pinned: bool,
 }
 
 impl QueryTab {
@@ -579,6 +601,7 @@ impl QueryTab {
             plan: None,
             // New tabs join the focused pane; `push_tab` reassigns this when split.
             pane: SplitHalf::Primary,
+            pinned: false,
         }
     }
 
@@ -1045,6 +1068,15 @@ pub struct AppState {
     /// Window-coordinate anchor for the result toolbar's "More" dropdown, when
     /// open (Stats toggle · Copy to…); `None` keeps it closed.
     pub(crate) more_menu: Option<gpui::Point<gpui::Pixels>>,
+    /// A middle-click-held autoscroll in progress over a result grid, browser-
+    /// style: holding the button and moving away from the click point scrolls
+    /// continuously toward it, at a speed proportional to the distance. `None`
+    /// when idle. See [`crate::result::autoscroll`].
+    pub(crate) autoscroll: Option<crate::result::Autoscroll>,
+    /// Bumped each time a new autoscroll session starts, so a superseded
+    /// session's still-running timer loop notices and exits instead of driving
+    /// a scroll the user already cancelled/restarted elsewhere.
+    pub(crate) autoscroll_epoch: u64,
     /// A pending write awaiting the user's confirmation before it runs: an editor
     /// destructive statement, or a staged grid edit batch (Track B6). See
     /// [`PendingWrite`].
@@ -1073,6 +1105,13 @@ pub struct AppState {
     pub(crate) grid_edit_blur: Option<gpui::Subscription>,
     /// A non-pristine query tab the user asked to close, awaiting confirmation.
     pub(crate) confirm_close_tab: Option<usize>,
+    /// A bulk close (Close Others / Close All / Close Left / Close Right)
+    /// awaiting confirmation because at least one target tab isn't pristine.
+    pub(crate) confirm_close_batch: Option<Vec<usize>>,
+    /// Window-coordinate anchor for a tab's right-click context menu (Close /
+    /// Close Others / Close All / Close Left / Close Right / Pin), keyed by the
+    /// tab's index; `None` keeps it closed.
+    pub(crate) tab_context_menu: Option<(usize, gpui::Point<gpui::Pixels>)>,
     /// A saved connection the user asked to delete, awaiting confirmation.
     pub(crate) confirm_delete_conn: Option<usize>,
     /// Persisted UI preferences (theme, grid, query, the safety rail) + their store.
@@ -1865,6 +1904,8 @@ impl AppState {
             stats_bar: false,
             filter_bar: None,
             find_bar: None,
+            autoscroll: None,
+            autoscroll_epoch: 0,
             cell_menu: None,
             export_menu: None,
             more_menu: None,
@@ -1876,6 +1917,8 @@ impl AppState {
             focus_grid_edit: false,
             grid_edit_blur: None,
             confirm_close_tab: None,
+            confirm_close_batch: None,
+            tab_context_menu: None,
             confirm_delete_conn: None,
             settings,
             settings_store,
@@ -2535,6 +2578,7 @@ impl AppState {
     pub(crate) fn any_modal_open(&self) -> bool {
         self.confirm_exec.is_some()
             || self.confirm_close_tab.is_some()
+            || self.confirm_close_batch.is_some()
             || self.confirm_delete_conn.is_some()
             || self.shortcuts_open
             || self.whats_new_open
@@ -2858,5 +2902,34 @@ pub(crate) fn open_in_os(path: &std::path::Path) -> std::io::Result<()> {
         c
     };
     // Fire-and-forget: spawn the opener and return without waiting for it to exit.
+    cmd.spawn().map(|_| ())
+}
+
+/// Reveal `path` in the OS file manager, selected, rather than opening it with
+/// its default handler: the "Show in Finder/Explorer" affordance for a written
+/// file (an export). Same fire-and-forget contract as [`open_in_os`]. Linux has
+/// no universal "select a file" verb across file managers, so it falls back to
+/// opening the containing folder.
+pub(crate) fn reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg("-R").arg(path);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("explorer");
+        let mut arg = std::ffi::OsString::from("/select,");
+        arg.push(path.as_os_str());
+        c.arg(arg);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(path.parent().unwrap_or(path));
+        c
+    };
     cmd.spawn().map(|_| ())
 }
