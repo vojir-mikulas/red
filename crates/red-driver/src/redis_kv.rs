@@ -161,6 +161,7 @@ impl RedisDriver {
         &self,
         cursor: ScanCursor,
         pattern: Option<&str>,
+        type_filter: Option<&str>,
         budget: ScanBudget,
         abort: &AbortSignal,
     ) -> Result<KvScanPage> {
@@ -177,7 +178,8 @@ impl RedisDriver {
             if abort.is_aborted() {
                 return Err(RedError::Interrupted);
             }
-            let (next_cur, batch) = scan_once(&mut conn, cur, pattern, budget.count_hint).await?;
+            let (next_cur, batch) =
+                scan_once(&mut conn, cur, pattern, type_filter, budget.count_hint).await?;
             cur = next_cur;
             collected.extend(batch);
             // Never truncate mid-batch: a `SCAN` batch's keys are gone from
@@ -209,6 +211,7 @@ impl RedisDriver {
         cl: &ClusterState,
         cursor: ScanCursor,
         pattern: Option<&str>,
+        type_filter: Option<&str>,
         budget: ScanBudget,
         abort: &AbortSignal,
     ) -> Result<KvScanPage> {
@@ -224,7 +227,8 @@ impl RedisDriver {
                 return Err(RedError::Interrupted);
             }
             let mut conn = cl.masters[node].clone();
-            let (next_cur, batch) = scan_once(&mut conn, cur, pattern, budget.count_hint).await?;
+            let (next_cur, batch) =
+                scan_once(&mut conn, cur, pattern, type_filter, budget.count_hint).await?;
             cur = next_cur;
             if !batch.is_empty() {
                 keys.extend(fetch_key_meta_batch(&mut conn, &batch).await?);
@@ -277,19 +281,23 @@ fn info_field(info: &str, key: &str) -> Option<String> {
         .map(|v| v.trim().to_string())
 }
 
-/// One `SCAN` round trip: `SCAN <cursor> COUNT <hint> [MATCH <pattern>]`,
-/// returning the next cursor and this batch's keys. The shared inner step of
-/// both the standalone and per-node cluster scan loops.
+/// One `SCAN` round trip: `SCAN <cursor> COUNT <hint> [MATCH <pattern>] [TYPE
+/// <type>]`, returning the next cursor and this batch's keys. The shared inner
+/// step of both the standalone and per-node cluster scan loops.
 async fn scan_once(
     conn: &mut MultiplexedConnection,
     cursor: u64,
     pattern: Option<&str>,
+    type_filter: Option<&str>,
     count_hint: u32,
 ) -> Result<(u64, Vec<String>)> {
     let mut cmd = redis::cmd("SCAN");
     cmd.arg(cursor).arg("COUNT").arg(count_hint);
     if let Some(p) = pattern {
         cmd.arg("MATCH").arg(p);
+    }
+    if let Some(t) = type_filter {
+        cmd.arg("TYPE").arg(t);
     }
     cmd.query_async(conn)
         .await
@@ -596,12 +604,19 @@ impl KvDriver for RedisDriver {
         &self,
         cursor: ScanCursor,
         pattern: Option<&str>,
+        type_filter: Option<&str>,
         budget: ScanBudget,
         abort: &AbortSignal,
     ) -> Result<KvScanPage> {
         match &self.cluster {
-            Some(cl) => self.scan_cluster(cl, cursor, pattern, budget, abort).await,
-            None => self.scan_standalone(cursor, pattern, budget, abort).await,
+            Some(cl) => {
+                self.scan_cluster(cl, cursor, pattern, type_filter, budget, abort)
+                    .await
+            }
+            None => {
+                self.scan_standalone(cursor, pattern, type_filter, budget, abort)
+                    .await
+            }
         }
     }
 
@@ -1931,6 +1946,7 @@ mod tests {
                 &mut cl.masters[0].clone(),
                 c,
                 Some(&format!("{prefix}:*")),
+                None,
                 200,
             )
             .await
@@ -1952,7 +1968,7 @@ mod tests {
         let mut cursor = ScanCursor::START;
         loop {
             let page = driver
-                .scan_keys(cursor, Some(&format!("{prefix}:*")), budget(), &abort)
+                .scan_keys(cursor, Some(&format!("{prefix}:*")), None, budget(), &abort)
                 .await
                 .unwrap();
             for k in &page.keys {
@@ -1998,6 +2014,7 @@ mod tests {
                 .scan_keys(
                     cursor,
                     Some(&format!("{prefix}:*")),
+                    None,
                     ScanBudget {
                         count_hint: 5,
                         want: 5,
@@ -2051,6 +2068,7 @@ mod tests {
             .scan_keys(
                 ScanCursor::START,
                 Some(&format!("{prefix}:*")),
+                None,
                 budget(),
                 &abort,
             )
@@ -2067,6 +2085,61 @@ mod tests {
         let hash_meta = by_key.get(&hash_key).expect("hash key present");
         assert_eq!(hash_meta.kv_type, KvType::Hash);
         assert!(hash_meta.ttl.is_none());
+    }
+
+    #[tokio::test]
+    async fn scan_type_filter_returns_only_that_type() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let prefix = tag("typefilter");
+        let mut conn = driver.conn.clone();
+        let str_key = format!("{prefix}:str");
+        let hash_key = format!("{prefix}:hash");
+        let _: () = redis::cmd("SET")
+            .arg(&str_key)
+            .arg("v")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("HSET")
+            .arg(&hash_key)
+            .arg("f")
+            .arg("v")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        // `TYPE hash` alongside the prefix `MATCH` yields only the hash key —
+        // the server skips the string one, so it never reaches the metadata
+        // batch.
+        let abort = AbortSignal::new();
+        let mut found = std::collections::HashSet::new();
+        let mut cursor = ScanCursor::START;
+        loop {
+            let page = driver
+                .scan_keys(
+                    cursor,
+                    Some(&format!("{prefix}:*")),
+                    Some("hash"),
+                    budget(),
+                    &abort,
+                )
+                .await
+                .unwrap();
+            for k in &page.keys {
+                assert_eq!(k.kv_type, KvType::Hash);
+                found.insert(k.key.clone());
+            }
+            cursor = page.next_cursor;
+            if page.exhausted {
+                break;
+            }
+        }
+        assert!(found.contains(&hash_key), "hash key should match TYPE hash");
+        assert!(
+            !found.contains(&str_key),
+            "string key should be filtered out by TYPE hash"
+        );
     }
 
     /// The vanished-key race this batch fetch has to survive: a key expires

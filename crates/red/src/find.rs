@@ -73,6 +73,11 @@ fn editor_match_ranges(content: &str, needle_lower: &str) -> Vec<Range<usize>> {
 impl AppState {
     /// ⌘F over a focused grid or editor: toggle the find bar against that pane.
     pub(crate) fn toggle_find_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // In a Redis session, ⌘F jumps to the keyspace filter box (the search
+        // field) rather than the SQL find bar, which has no target here.
+        if self.kv_focus_filter(window, cx) {
+            return;
+        }
         if self.find_bar.is_some() {
             self.close_find_bar(cx);
             return;

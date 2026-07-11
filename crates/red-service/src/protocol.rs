@@ -149,12 +149,13 @@ pub enum Command {
         epoch: u64,
     },
     /// One page of a Redis keyspace scan (see docs/plans/redis.md's R1):
-    /// `SCAN` (looping, budgeted, optionally `MATCH`-filtered) plus a
+    /// `SCAN` (looping, budgeted, optionally `MATCH`-filtered on `pattern` and
+    /// `TYPE`-filtered on `type_filter`, a type label like `"hash"`) plus a
     /// pipelined metadata fetch, via the session's `KvDriver`. Stateless like
     /// `FetchRun`: `cursor` is whatever `next_cursor` the previous
-    /// `KvScanPage` reply carried (`0` to start or restart on a new
-    /// `pattern`); the service holds no scan position between calls, the UI's
-    /// grid buffer does. `epoch` scopes the reply and supersedes any prior
+    /// `KvScanPage` reply carried (`0` to start or restart on a new `pattern`/
+    /// `type_filter`); the service holds no scan position between calls, the
+    /// UI's grid buffer does. `epoch` scopes the reply and supersedes any prior
     /// in-flight scan for the same epoch (a fast-retyped filter cancels the
     /// stale request rather than racing it). Replied with `KvScanPage`, or
     /// the global `Event::Error` on failure (not a SQL connection, or the
@@ -162,6 +163,7 @@ pub enum Command {
     KvFetchScan {
         epoch: u64,
         pattern: Option<String>,
+        type_filter: Option<String>,
         cursor: ScanCursor,
         budget: ScanBudget,
     },

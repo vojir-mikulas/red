@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use flint::prelude::*;
 use gpui::{
-    div, prelude::*, px, relative, App, AsyncApp, Context, Entity, FocusHandle, Hsla, ScrollHandle,
-    SharedString, UniformListScrollHandle, WeakEntity, Window,
+    div, prelude::*, px, relative, App, AsyncApp, Context, Entity, FocusHandle, Focusable, Hsla,
+    ScrollHandle, SharedString, UniformListScrollHandle, WeakEntity, Window,
 };
 use red_core::kv::{
     CollectionKind, KeyMeta, KvCollection, KvCollectionPage, KvElement, KvStreamActionReq,
@@ -77,6 +77,21 @@ fn non_empty(s: String) -> Option<String> {
     }
 }
 
+/// The concrete Redis types the browse type-filter dropdown offers, in menu
+/// order after the leading "All types" entry. Each maps to a `SCAN ... TYPE`
+/// argument via [`KvType::label`]. `Other` is deliberately absent — the
+/// dropdown is a fixed picker, not a reflection of what's in the keyspace.
+fn kv_filter_types() -> [KvType; 6] {
+    [
+        KvType::String,
+        KvType::Hash,
+        KvType::List,
+        KvType::Set,
+        KvType::ZSet,
+        KvType::Stream,
+    ]
+}
+
 /// The kind of a Redis tab: what the `+` new-tab picker offers and what a
 /// [`RedisTabState`] holds. Unlike the SQL side (every tab is a homogeneous
 /// query editor), Redis tabs are heterogeneous, so the kind is an explicit
@@ -104,6 +119,18 @@ impl KvPanel {
         }
     }
 }
+
+/// The blank-tab chooser's panels, in display order: the shared source of truth
+/// for the cards' layout and their `1`–`6` number shortcuts (see
+/// `render_kv_new_tab` and [`AppState::kv_new_tab_key`]).
+pub(crate) const KV_NEW_TAB_CHOICES: [(KvPanel, &str); 6] = [
+    (KvPanel::Browse, "Scan and inspect keys"),
+    (KvPanel::Console, "Run raw commands (redis-cli)"),
+    (KvPanel::PubSub, "Watch published messages"),
+    (KvPanel::Monitor, "Slow log · live MONITOR · clients"),
+    (KvPanel::Analysis, "Keyspace memory/TTL report"),
+    (KvPanel::Keyspace, "Live keyspace notifications"),
+];
 
 /// A `redis-cli --bigkeys`-style sample (see docs/plans/redis.md's "beyond
 /// R4" list): an extended, bounded keyspace walk collecting metadata for
@@ -178,6 +205,16 @@ pub(crate) struct BrowseState {
     pub(crate) epoch: u64,
     /// The pattern the current scan run applies (`None` = unfiltered `*`).
     pub(crate) pattern: Option<String>,
+    /// The Redis type the current scan run restricts to (`None` = all types),
+    /// pushed down to `SCAN ... TYPE` server-side (see the type-filter
+    /// dropdown in `render_kv_browse`). Composes with `pattern` and with the
+    /// client-side `fuzzy` filter. Only ever one of the six concrete
+    /// [`KvType`] variants — the dropdown never offers `Other`.
+    pub(crate) type_filter: Option<KvType>,
+    /// Whether the type-filter dropdown is showing its option list. Per-tab,
+    /// owned here because Flint's `Select` is stateless (the caller holds the
+    /// open flag).
+    pub(crate) type_filter_open: bool,
     /// Rows accumulated this run, forward-only, oldest-evicted past the cap.
     pub(crate) rows: Vec<KeyMeta>,
     pub(crate) cursor: ScanCursor,
@@ -304,6 +341,11 @@ pub(crate) struct RedisView {
     /// The key whose right-click context menu is open (from either the live
     /// browse list or the biggest-keys sample), anchored at the click position.
     pub(crate) key_menu: Option<KeyMenu>,
+    /// Focus + highlighted choice for the blank-tab panel chooser, so it's
+    /// keyboard-drivable (1–6 / arrows / Enter). One handle is enough: only the
+    /// focused half's chooser binds it (see `render_kv_new_tab`).
+    pub(crate) new_tab_focus: FocusHandle,
+    pub(crate) new_tab_sel: usize,
 }
 
 /// The open key context menu: which key it targets (with the type/TTL captured
@@ -492,6 +534,8 @@ impl BrowseState {
         Self {
             epoch: crate::result::next_kv_epoch(),
             pattern: None,
+            type_filter: None,
+            type_filter_open: false,
             rows: Vec::new(),
             cursor: ScanCursor::START,
             exhausted: false,
@@ -577,6 +621,8 @@ impl RedisView {
             split: None,
             tab_menu: None,
             key_menu: None,
+            new_tab_focus: cx.focus_handle(),
+            new_tab_sel: 0,
         }
     }
 
@@ -861,6 +907,7 @@ impl AppState {
             Command::KvFetchScan {
                 epoch,
                 pattern: None,
+                type_filter: None,
                 cursor: ScanCursor::START,
                 budget: scan_budget(),
             },
@@ -909,32 +956,88 @@ impl AppState {
     }
 
     /// The filter pattern changed (Enter, or the debounce timer firing):
-    /// close the superseded scan (cancels its in-flight fetch at the engine
-    /// too, see `Command::CloseResult`'s doc comment), mint a fresh epoch,
-    /// and start over from `cursor: 0` with the new pattern.
+    /// restart the scan under the new `MATCH` pattern, keeping whatever type
+    /// filter is active.
     pub(crate) fn kv_restart_scan(
         &mut self,
         session: SessionId,
         pattern: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(active) = self.conn_mut(Some(session)) else {
-            return;
-        };
-        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
+        let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        else {
             return;
         };
         if browse.pattern == pattern {
             return; // same filter re-submitted: nothing to restart
         }
+        browse.pattern = pattern;
+        self.kv_relaunch_browse(session, cx);
+    }
+
+    /// The type-filter dropdown picked a type (`None` = all types): restart the
+    /// scan under the new `SCAN ... TYPE`, keeping whatever `MATCH` pattern is
+    /// active. Always closes the dropdown.
+    pub(crate) fn kv_set_type_filter(
+        &mut self,
+        session: SessionId,
+        type_filter: Option<KvType>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        else {
+            return;
+        };
+        browse.type_filter_open = false;
+        if browse.type_filter == type_filter {
+            cx.notify(); // same type re-picked: just dismiss the dropdown
+            return;
+        }
+        browse.type_filter = type_filter;
+        self.kv_relaunch_browse(session, cx);
+    }
+
+    /// Open or dismiss the type-filter dropdown's option list.
+    pub(crate) fn kv_toggle_type_menu(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        {
+            browse.type_filter_open = !browse.type_filter_open;
+            cx.notify();
+        }
+    }
+
+    /// Re-dispatch the browse scan from scratch under a fresh epoch with the
+    /// browse's current `pattern` + `type_filter`. Shared by the pattern and
+    /// type-filter changes: both mutate one field of the filter state, then
+    /// call this to close the superseded scan (which cancels its in-flight
+    /// fetch at the engine too, see `Command::CloseResult`'s doc comment),
+    /// mint a fresh epoch, and start over from `cursor: 0`.
+    fn kv_relaunch_browse(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        else {
+            return;
+        };
         let old_epoch = browse.epoch;
         let new_epoch = crate::result::next_kv_epoch();
         browse.epoch = new_epoch;
-        browse.pattern = pattern.clone();
         browse.rows.clear();
         browse.cursor = ScanCursor::START;
         browse.exhausted = false;
         browse.loading = true;
+        let pattern = browse.pattern.clone();
+        let type_filter = browse.type_filter.as_ref().map(|t| t.label().to_string());
         self.service
             .send_to(session, Command::CloseResult { epoch: old_epoch });
         self.service.send_to(
@@ -942,6 +1045,7 @@ impl AppState {
             Command::KvFetchScan {
                 epoch: new_epoch,
                 pattern,
+                type_filter,
                 cursor: ScanCursor::START,
                 budget: scan_budget(),
             },
@@ -972,12 +1076,14 @@ impl AppState {
         browse.loading = true;
         let epoch = browse.epoch;
         let pattern = browse.pattern.clone();
+        let type_filter = browse.type_filter.as_ref().map(|t| t.label().to_string());
         let cursor = browse.cursor;
         self.service.send_to(
             session,
             Command::KvFetchScan {
                 epoch,
                 pattern,
+                type_filter,
                 cursor,
                 budget: scan_budget(),
             },
@@ -1068,6 +1174,24 @@ impl AppState {
         let cur = browse.nav_row.unwrap_or(0).min(rows.len() - 1);
         let row = rows[cur].clone();
         self.kv_open_inspector(session, row.key, row.ttl, row.kv_type, cx);
+        true
+    }
+
+    /// ⌘F in a Redis session: jump focus to the active browse tab's filter box
+    /// (which *is* the keyspace search field) instead of opening the SQL find
+    /// bar. Returns `true` when it handled it — i.e. the foreground connection is
+    /// Redis and its active tab is a browse — so the caller falls through to the
+    /// SQL find bar otherwise.
+    pub(crate) fn kv_focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Phase::Connected(active) = &self.phase else {
+            return false;
+        };
+        let Some(browse) = active.kv_view.as_ref().and_then(|v| v.active_browse()) else {
+            return false;
+        };
+        let handle = browse.filter.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
         true
     }
 
@@ -1179,12 +1303,14 @@ impl AppState {
         }
         browse.loading = true;
         let epoch = browse.epoch;
+        let type_filter = browse.type_filter.as_ref().map(|t| t.label().to_string());
         let cursor = browse.cursor;
         self.service.send_to(
             session,
             Command::KvFetchScan {
                 epoch,
                 pattern: None,
+                type_filter,
                 cursor,
                 budget: scan_budget(),
             },
@@ -1216,6 +1342,7 @@ impl AppState {
             Command::KvFetchScan {
                 epoch,
                 pattern: None,
+                type_filter: None,
                 cursor: ScanCursor::START,
                 budget: scan_budget(),
             },
@@ -1262,6 +1389,7 @@ impl AppState {
             Command::KvFetchScan {
                 epoch,
                 pattern: None,
+                type_filter: None,
                 cursor,
                 budget: scan_budget(),
             },
@@ -1338,6 +1466,7 @@ impl AppState {
             Command::KvFetchScan {
                 epoch,
                 pattern: None,
+                type_filter: None,
                 cursor: ScanCursor::START,
                 budget: scan_budget(),
             },
@@ -1414,6 +1543,7 @@ impl AppState {
                 Command::KvFetchScan {
                     epoch,
                     pattern: None,
+                    type_filter: None,
                     cursor,
                     budget: scan_budget(),
                 },
@@ -1500,6 +1630,51 @@ impl AppState {
             KvPanel::Console | KvPanel::PubSub => {}
         }
         cx.notify();
+    }
+
+    /// Keyboard driving of the blank-tab chooser (see `render_kv_new_tab`), for
+    /// the empty tab with stable id `id`: digits `1`–`6` pick a panel outright,
+    /// ←/↑ and →/↓ move the highlight (wrapping), and Enter/Space commit the
+    /// highlighted one. Returns `true` when it consumed the key.
+    pub(crate) fn kv_new_tab_key(
+        &mut self,
+        session: SessionId,
+        id: u64,
+        key: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let n = KV_NEW_TAB_CHOICES.len();
+        // A direct digit pick (`1`–`6`).
+        if let Ok(d) = key.parse::<usize>() {
+            if (1..=n).contains(&d) {
+                self.kv_set_tab_kind(session, id, KV_NEW_TAB_CHOICES[d - 1].0, cx);
+                return true;
+            }
+        }
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        else {
+            return false;
+        };
+        match key {
+            "left" | "up" => {
+                view.new_tab_sel = (view.new_tab_sel + n - 1) % n;
+                cx.notify();
+                true
+            }
+            "right" | "down" => {
+                view.new_tab_sel = (view.new_tab_sel + 1) % n;
+                cx.notify();
+                true
+            }
+            "enter" | "space" => {
+                let sel = view.new_tab_sel.min(n - 1);
+                self.kv_set_tab_kind(session, id, KV_NEW_TAB_CHOICES[sel].0, cx);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Step the focused half's active tab one slot forward/back, wrapping (the
@@ -3353,12 +3528,24 @@ impl AppState {
                 )
             }
         } else {
-            match (&browse.pattern, db_size) {
-                (None, Some(n)) => {
+            let type_label = browse.type_filter.as_ref().map(|t| t.label());
+            match (&browse.pattern, type_label, db_size) {
+                // No filter at all: the cheap `DBSIZE` header stat.
+                (None, None, Some(n)) => {
                     format!("~{} keys in db0", crate::result::group_digits(n as usize))
                 }
-                (None, None) => "counting keys…".into(),
-                (Some(p), _) => format!("{} matched \"{p}\" so far", browse.rows.len()),
+                (None, None, None) => "counting keys…".into(),
+                // A pattern and/or type filter is active: there's no cheap
+                // filtered count, so report what's loaded so far.
+                (pattern, ty, _) => {
+                    let kind = ty.map(|t| format!("{t} ")).unwrap_or_default();
+                    match pattern {
+                        Some(p) => {
+                            format!("{} {kind}key(s) matching \"{p}\" so far", browse.rows.len())
+                        }
+                        None => format!("{} {kind}key(s) so far", browse.rows.len()),
+                    }
+                }
             }
         };
 
@@ -3549,6 +3736,46 @@ impl AppState {
                                 .update(cx, |this, cx| this.kv_toggle_fuzzy(session, cx))
                                 .ok();
                         })
+                    })
+                    .child({
+                        // Server-side type filter (`SCAN ... TYPE`): index 0 is
+                        // "All types", 1..=6 the concrete types in menu order.
+                        // Composes with both the MATCH/fuzzy filter above.
+                        let types = kv_filter_types();
+                        let selected_ix = match &browse.type_filter {
+                            None => 0,
+                            Some(t) => types
+                                .iter()
+                                .position(|x| x == t)
+                                .map(|i| i + 1)
+                                .unwrap_or(0),
+                        };
+                        let toggle_view = view.clone();
+                        let select_view = view.clone();
+                        let mut select = Select::new("kv-type-filter")
+                            .accent(false)
+                            .option("All types");
+                        for t in types.iter() {
+                            select = select.option(t.label().to_string());
+                        }
+                        select
+                            .selected(selected_ix)
+                            .open(browse.type_filter_open)
+                            .on_toggle(move |_, cx| {
+                                toggle_view
+                                    .update(cx, |this, cx| this.kv_toggle_type_menu(session, cx))
+                                    .ok();
+                            })
+                            .on_select(move |ix, _, cx| {
+                                let choice = ix
+                                    .checked_sub(1)
+                                    .and_then(|i| kv_filter_types().into_iter().nth(i));
+                                select_view
+                                    .update(cx, |this, cx| {
+                                        this.kv_set_type_filter(session, choice, cx)
+                                    })
+                                    .ok();
+                            })
                     })
                     .child(
                         // Yields width to the filter input when the pane is narrow

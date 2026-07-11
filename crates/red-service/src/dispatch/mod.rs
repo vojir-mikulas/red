@@ -1234,6 +1234,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             Command::KvFetchScan {
                 epoch,
                 pattern,
+                type_filter,
                 cursor,
                 budget,
             } => {
@@ -1261,7 +1262,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 let events = events.clone();
                 tokio::spawn(async move {
                     match driver
-                        .scan_keys(cursor, pattern.as_deref(), budget, &abort)
+                        .scan_keys(
+                            cursor,
+                            pattern.as_deref(),
+                            type_filter.as_deref(),
+                            budget,
+                            &abort,
+                        )
                         .await
                     {
                         Ok(page) => emit(&events, session_id, Event::KvScanPage { epoch, page }),

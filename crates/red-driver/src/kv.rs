@@ -73,17 +73,23 @@ pub trait KvDriver: Send + Sync {
     async fn db_size(&self) -> Result<u64>;
 
     /// One page of a keyspace scan: `SCAN` (looping, budgeted, `MATCH`-
-    /// filtered when `pattern` is set) followed by one pipelined metadata
+    /// filtered when `pattern` is set, `TYPE`-filtered when `type_filter` is
+    /// set to a type label like `"hash"`) followed by one pipelined metadata
     /// round trip for the batch (`TYPE`/`PTTL`/`OBJECT ENCODING`/`MEMORY
-    /// USAGE` per key). Stateless like `DatabaseDriver::fetch_seek`: `cursor`
-    /// is whatever `next_cursor` the previous call returned (`0` to start),
-    /// not a handle the driver holds open between calls — the caller (the
-    /// service, then the UI's grid buffer) owns scan position, same as it
-    /// owns a seek boundary key for the SQL grid.
+    /// USAGE` per key). `type_filter` is pushed down to `SCAN ... TYPE` so the
+    /// server skips non-matching keys entirely rather than the caller filtering
+    /// a materialized page (there's no cheap filtered count either way, but a
+    /// selective type walk doesn't drag every other key's metadata over the
+    /// wire). Stateless like `DatabaseDriver::fetch_seek`: `cursor` is whatever
+    /// `next_cursor` the previous call returned (`0` to start), not a handle the
+    /// driver holds open between calls — the caller (the service, then the UI's
+    /// grid buffer) owns scan position, same as it owns a seek boundary key for
+    /// the SQL grid.
     async fn scan_keys(
         &self,
         cursor: ScanCursor,
         pattern: Option<&str>,
+        type_filter: Option<&str>,
         budget: ScanBudget,
         abort: &AbortSignal,
     ) -> Result<KvScanPage>;

@@ -940,7 +940,7 @@ impl AppState {
                 .into_any_element(),
             // A blank tab (`None` kind): show the type chooser in the body.
             Some(None) => self
-                .render_kv_new_tab(active, tab_idx, cx)
+                .render_kv_new_tab(active, tab_idx, focused, window, cx)
                 .into_any_element(),
             None => div().flex_1().into_any_element(),
         };
@@ -972,51 +972,41 @@ impl AppState {
         &self,
         active: &ActiveConn,
         tab_idx: usize,
+        focused: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        use crate::kvbrowse::KvPanel;
+        use crate::kvbrowse::KV_NEW_TAB_CHOICES;
         let theme = cx.theme().clone();
         let session = active.session;
-        let id = active
-            .kv_view
-            .as_ref()
-            .and_then(|v| v.tabs.get(tab_idx))
-            .map(|t| t.id)
-            .unwrap_or(0);
-        // A one-line hint per kind, so the blank tab explains the choices.
-        let choices: [(KvPanel, &str); 6] = [
-            (KvPanel::Browse, "Scan and inspect keys"),
-            (KvPanel::Console, "Run raw commands (redis-cli)"),
-            (KvPanel::PubSub, "Watch published messages"),
-            (KvPanel::Monitor, "Slow log · live MONITOR · clients"),
-            (KvPanel::Analysis, "Keyspace memory/TTL report"),
-            (KvPanel::Keyspace, "Live keyspace notifications"),
-        ];
-        div()
-            .flex_1()
-            .min_h(px(0.))
+        let Some(v) = active.kv_view.as_ref() else {
+            return div().flex_1();
+        };
+        let id = v.tabs.get(tab_idx).map(|t| t.id).unwrap_or(0);
+        let selected = v.new_tab_sel.min(KV_NEW_TAB_CHOICES.len() - 1);
+
+        // The focused half's chooser owns the keyboard: bind the shared focus
+        // handle here (only one chooser ever binds it) and grab focus so the
+        // digit/arrow shortcuts work the moment a blank tab opens.
+        let focus = v.new_tab_focus.clone();
+        if focused && !focus.is_focused(window) {
+            window.focus(&focus, cx);
+        }
+
+        let cards = div()
             .flex()
-            .flex_col()
-            .items_center()
+            .flex_wrap()
             .justify_center()
-            .gap_4()
-            .bg(theme.bg_app)
-            .child(
-                div()
-                    .font_family(theme.font_family.clone())
-                    .text_size(theme.scale(13.))
-                    .text_color(theme.text_muted)
-                    .child("Choose what to open in this tab"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .justify_center()
-                    .gap_3()
-                    .max_w(px(560.))
-                    .children(choices.into_iter().map(|(kind, hint)| {
+            .gap_3()
+            .max_w(px(560.))
+            .children(
+                KV_NEW_TAB_CHOICES
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (kind, hint))| {
                         let view = cx.entity().downgrade();
+                        let kind = *kind;
+                        let is_sel = focused && i == selected;
                         div()
                             .id(SharedString::from(format!("kv-choose-{}", kind.label())))
                             .w(px(168.))
@@ -1025,17 +1015,40 @@ impl AppState {
                             .gap_1()
                             .p_3()
                             .rounded(px(8.))
-                            .bg(theme.bg_panel)
+                            .bg(if is_sel {
+                                theme.bg_elevated
+                            } else {
+                                theme.bg_panel
+                            })
                             .border_1()
-                            .border_color(theme.border)
+                            .border_color(if is_sel { theme.accent } else { theme.border })
                             .cursor_pointer()
                             .hover(|s| s.bg(theme.bg_elevated).border_color(theme.accent))
                             .child(
+                                // Title row: name on the left, a number-shortcut badge right.
                                 div()
-                                    .font_family(theme.font_family.clone())
-                                    .text_size(theme.scale(12.5))
-                                    .text_color(theme.text)
-                                    .child(kind.label()),
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .font_family(theme.font_family.clone())
+                                            .text_size(theme.scale(12.5))
+                                            .text_color(theme.text)
+                                            .child(kind.label()),
+                                    )
+                                    .child(
+                                        div()
+                                            .px(px(5.))
+                                            .rounded(px(4.))
+                                            .bg(theme.bg_app)
+                                            .border_1()
+                                            .border_color(theme.border)
+                                            .font_family(theme.font_family.clone())
+                                            .text_size(theme.scale(10.))
+                                            .text_color(theme.text_muted)
+                                            .child(format!("{}", i + 1)),
+                                    ),
                             )
                             .child(
                                 div()
@@ -1050,8 +1063,42 @@ impl AppState {
                                 })
                                 .ok();
                             })
-                    })),
+                    }),
+            );
+
+        let key_view = cx.entity().downgrade();
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_4()
+            .bg(theme.bg_app)
+            // Only the focused half's chooser binds the shared focus handle and
+            // its key handler, so a split with two blank tabs never double-binds.
+            .when(focused, |d| {
+                d.track_focus(&focus)
+                    .on_key_down(move |ev: &gpui::KeyDownEvent, _window, cx| {
+                        let key = ev.keystroke.key.clone();
+                        key_view
+                            .update(cx, |this, cx| {
+                                if this.kv_new_tab_key(session, id, &key, cx) {
+                                    cx.stop_propagation();
+                                }
+                            })
+                            .ok();
+                    })
+            })
+            .child(
+                div()
+                    .font_family(theme.font_family.clone())
+                    .text_size(theme.scale(13.))
+                    .text_color(theme.text_muted)
+                    .child("Choose what to open in this tab  ·  press 1–6 or ↵"),
             )
+            .child(cards)
     }
 
     /// The Redis History dock (left, ⌘Y): a Keys section (recently-viewed keys,
