@@ -34,7 +34,7 @@ mod sqlite;
 pub use clickhouse::ClickhouseDriver;
 pub use format::html_escape;
 pub use import::ImportReader;
-pub use kv::{KvDriver, KvTopology};
+pub use kv::{KvDriver, KvMonitorStream, KvSubscription, KvTopology};
 pub use mysql::MysqlDriver;
 pub use postgres::PostgresDriver;
 pub use redis_kv::{sentinel_masters, RedisDriver, SentinelMaster};

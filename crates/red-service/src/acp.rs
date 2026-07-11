@@ -16,10 +16,9 @@ use red_acp::{
     AcpPermission, AcpStop, McpGrounding,
 };
 use red_core::AiPolicy;
-use red_driver::DatabaseDriver;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::ai::{system_prompt, tool_catalog, user_turn, ReportSink};
+use crate::ai::{user_turn, AiBackend, ReportSink};
 use crate::dispatch::{emit, Events};
 use crate::mcp::McpServer;
 use crate::protocol::{
@@ -301,7 +300,7 @@ impl AcpManager {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_turn(
     manager: Arc<tokio::sync::Mutex<AcpManager>>,
-    driver: Arc<dyn DatabaseDriver>,
+    backend: AiBackend,
     command: String,
     cwd: PathBuf,
     events: Events,
@@ -314,7 +313,7 @@ pub(crate) async fn run_turn(
     // Ensure the conversation exists, and learn whether this is its first turn.
     let (agent, first_turn) = match ensure_conversation(
         &manager,
-        driver,
+        backend.clone(),
         command,
         cwd,
         events.clone(),
@@ -345,7 +344,7 @@ pub(crate) async fn run_turn(
     let text = if first_turn {
         format!(
             "{}\n\n{}",
-            system_prompt(&context, &policy),
+            backend.system_prompt(&context, &policy),
             user_turn(&user_message, &context)
         )
     } else {
@@ -552,7 +551,7 @@ pub(crate) async fn sign_out(
 #[allow(clippy::map_entry, clippy::too_many_arguments)]
 async fn ensure_conversation(
     manager: &Arc<tokio::sync::Mutex<AcpManager>>,
-    driver: Arc<dyn DatabaseDriver>,
+    backend: AiBackend,
     command: String,
     cwd: PathBuf,
     events: Events,
@@ -594,7 +593,7 @@ async fn ensure_conversation(
         // UI (the subscription path never routes individual tool calls back through
         // `run_turn`). Built before `events` is moved into the permission relay.
         let report = ReportSink::new(events.clone(), session, conversation_id, theme, report_dir);
-        let mcp = McpServer::start(driver, policy, report)
+        let mcp = McpServer::start(backend.clone(), policy, report)
             .await
             .map_err(|e| format!("could not start the DB tool server: {e}"))?;
         let grounding = McpGrounding {
@@ -637,13 +636,15 @@ async fn ensure_conversation(
             command,
             cwd,
             mcp: Some(grounding),
-            // Auto-allow only the read-only tools; the write tool (Feature B) is
+            // Auto-allow only the read-only tools; the write tools (Feature B) are
             // deliberately excluded so every write is routed to the user for an
-            // explicit Allow/Deny, never silently run by the agent.
-            allow_tools: tool_catalog(&policy)
+            // explicit Allow/Deny, never silently run by the agent. The MCP path
+            // never even offers writes, so this is belt-and-braces for both seams.
+            allow_tools: backend
+                .catalog(&policy)
                 .into_iter()
                 .map(|t| t.name)
-                .filter(|n| !crate::ai::is_write_tool(n))
+                .filter(|n| !backend.is_write_tool(n))
                 .collect(),
             permissions: Some(perm_tx),
             commands: Some(cmd_tx),

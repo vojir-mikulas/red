@@ -322,13 +322,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 message,
                 context,
             } => {
-                // Both backends ground in the connected session's driver. AI
-                // grounding is SQL-shaped (schema-aware tools), so a KV (Redis)
-                // session has no driver to hand it yet — see docs/plans/redis.md.
-                let driver = session_id
+                // The turn grounds in the connected session's driver, either the
+                // SQL `DatabaseDriver` or the Redis `KvDriver` seam (each has its
+                // own tool catalog; see docs/plans/redis-workflow-parity.md Part 1).
+                let session_driver = session_id
                     .and_then(|id| sessions.get(&id))
-                    .map(|s| s.driver.as_sql().cloned());
-                let Some(driver) = driver.flatten() else {
+                    .map(|s| s.driver.clone());
+                let Some(session_driver) = session_driver else {
                     emit(
                         &events,
                         session_id,
@@ -408,11 +408,16 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             continue;
                         };
                         let model = model.clone();
+                        // Ground in whichever seam the session holds.
+                        let backend = match &session_driver {
+                            session::SessionDriver::Sql(d) => crate::ai::AiBackend::Sql(d.clone()),
+                            session::SessionDriver::Kv(d) => crate::ai::AiBackend::Kv(d.clone()),
+                        };
                         let cancel = red_ai::CancelToken::new();
                         lock(&ai_state).register(conversation_id, cancel.clone());
                         tokio::spawn(crate::ai::run_turn(
                             provider,
-                            driver,
+                            backend,
                             events.clone(),
                             ai_state.clone(),
                             session_id,
@@ -426,6 +431,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         ));
                     }
                     AiProfileRuntime::Acp { command } => {
+                        // The external ACP agent grounds through Red's loopback MCP
+                        // server, which hosts whichever seam this session holds (SQL
+                        // schema/query tools or the Redis `kv_*` tools).
+                        let backend = match &session_driver {
+                            session::SessionDriver::Sql(d) => crate::ai::AiBackend::Sql(d.clone()),
+                            session::SessionDriver::Kv(d) => crate::ai::AiBackend::Kv(d.clone()),
+                        };
                         let command = command.clone();
                         // The agent loads its own config (and login) from cwd; use
                         // the process working directory.
@@ -433,7 +445,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             .unwrap_or_else(|_| std::path::PathBuf::from("/"));
                         tokio::spawn(crate::acp::run_turn(
                             ai_acp.clone(),
-                            driver,
+                            backend,
                             command,
                             cwd,
                             events.clone(),

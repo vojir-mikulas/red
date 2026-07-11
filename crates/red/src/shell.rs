@@ -589,8 +589,7 @@ impl AppState {
         let resize = start.clone();
         let end = start.clone();
         div()
-            .flex_1()
-            .min_h(px(0.))
+            .size_full()
             .child(
                 SplitPane::new("kv-split-halves", Axis::Horizontal)
                     .size(width)
@@ -948,9 +947,7 @@ impl AppState {
 
         let focus_view = view.clone();
         div()
-            .flex_1()
-            .min_w_0()
-            .min_h(px(0.))
+            .size_full()
             .flex()
             .flex_col()
             .when(is_split && focused, |d| {
@@ -1164,28 +1161,38 @@ impl AppState {
             .enumerate()
             .map(|(i, (key, kv_type, ttl, when))| {
                 let label = key.clone();
+                let remove_key = key.clone();
                 let type_label = kv_type.label().to_string();
                 let sub = crate::history::relative_time(when);
                 let mono = mono.clone();
+                let group = SharedString::from(format!("kv-key-{i}"));
                 div()
                     .id(("kv-key-row", i))
+                    .group(group.clone())
                     .flex()
                     .items_center()
                     .gap_1()
                     .px_2()
                     .py_1p5()
-                    .cursor_pointer()
                     .hover(move |s| s.bg(bg_hover))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.kv_open_recent_key(session, key.clone(), kv_type.clone(), ttl, cx);
-                    }))
                     .child(
                         div()
+                            .id(("kv-key-open", i))
                             .flex_1()
                             .min_w_0()
                             .flex()
                             .flex_col()
                             .gap_0p5()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.kv_open_recent_key(
+                                    session,
+                                    key.clone(),
+                                    kv_type.clone(),
+                                    ttl,
+                                    cx,
+                                );
+                            }))
                             .child(
                                 div()
                                     .min_w_0()
@@ -1204,6 +1211,26 @@ impl AppState {
                                     .child(type_label)
                                     .child(sub),
                             ),
+                    )
+                    .child(
+                        div()
+                            .id(("kv-key-del", i))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(16.))
+                            .rounded(px(3.))
+                            .invisible()
+                            .group_hover(group, |s| s.visible())
+                            .cursor_pointer()
+                            .text_color(faint)
+                            .tooltip(Tooltip::text("Remove from history"))
+                            .hover(|s| s.bg(bg_elevated).text_color(text))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.kv_remove_recent_key(session, remove_key.clone(), cx);
+                            }))
+                            .child(crate::icons::icon("x", icon_x, faint)),
                     )
             });
 
@@ -1309,8 +1336,12 @@ impl AppState {
         pos: gpui::Point<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        use crate::app::TabCloseScope;
         let session = active.session;
-        let (pinned, is_split) = active
+        // Pin state, split state, and (relative to this tab's own pane) whether
+        // there are tabs to its left/right or any others to close — the same
+        // flags the SQL `render_tab_menu` computes to enable/disable items.
+        let (pinned, is_split, has_left, has_right, has_others) = active
             .kv_view
             .as_ref()
             .map(|v| {
@@ -1320,9 +1351,19 @@ impl AppState {
                     .find(|t| t.id == id)
                     .map(|t| t.pinned)
                     .unwrap_or(false);
-                (pinned, v.split.is_some())
+                let (has_left, has_right, has_others) = v
+                    .tabs
+                    .iter()
+                    .position(|t| t.id == id)
+                    .map(|idx| {
+                        let siblings = v.pane_tab_indices(v.tabs[idx].pane);
+                        let p = siblings.iter().position(|&i| i == idx).unwrap_or(0);
+                        (p > 0, p + 1 < siblings.len(), siblings.len() > 1)
+                    })
+                    .unwrap_or((false, false, false));
+                (pinned, v.split.is_some(), has_left, has_right, has_others)
             })
-            .unwrap_or((false, false));
+            .unwrap_or((false, false, false, false, false));
         let closable = active
             .kv_view
             .as_ref()
@@ -1354,6 +1395,34 @@ impl AppState {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.kv_close_tab_by_id(session, id, cx);
                     })),
+            )
+            .item(
+                ContextMenuItem::new("kv-tab-close-others", "Close Others")
+                    .disabled(!has_others)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.kv_close_tab_group(session, id, TabCloseScope::Others, cx);
+                    })),
+            )
+            .item(
+                ContextMenuItem::new("kv-tab-close-left", "Close Left")
+                    .disabled(!has_left)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.kv_close_tab_group(session, id, TabCloseScope::Left, cx);
+                    })),
+            )
+            .item(
+                ContextMenuItem::new("kv-tab-close-right", "Close Right")
+                    .disabled(!has_right)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.kv_close_tab_group(session, id, TabCloseScope::Right, cx);
+                    })),
+            )
+            .item(
+                ContextMenuItem::new("kv-tab-close-all", "Close All")
+                    .disabled(!closable)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.kv_close_tab_group(session, id, TabCloseScope::All, cx);
+                    })),
             );
         // A full-bleed catcher dismisses the menu on any outside click.
         div()
@@ -1366,6 +1435,125 @@ impl AppState {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, _, _, cx| this.kv_close_tab_menu(session, cx)),
+            )
+            .child(div().absolute().left(pos.x).top(pos.y).child(menu))
+            .into_any_element()
+    }
+
+    /// The right-click context menu for a key row (live browse or biggest-keys
+    /// sample). Its actions reuse the inspector's existing edit flows — Rename /
+    /// Set TTL open the inspector into that inline editor, Delete raises its
+    /// confirm bar — so the menu is a shortcut, not a second implementation.
+    /// Write items are disabled (not hidden) on a read-only connection, matching
+    /// the tab menu's disabled-item convention.
+    fn render_kv_key_menu(
+        &self,
+        active: &ActiveConn,
+        km: &crate::kvbrowse::KeyMenu,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use crate::kvbrowse::KeyMenuEdit;
+        let session = active.session;
+        let writable = !active.config.read_only;
+        let key = km.key.clone();
+        let kv_type = km.kv_type.clone();
+        let ttl = km.ttl;
+        let pos = km.pos;
+
+        let menu = ContextMenu::new("kv-key-context-menu")
+            .item(
+                ContextMenuItem::new("kv-key-open", "Open").on_click(cx.listener({
+                    let key = key.clone();
+                    let kv_type = kv_type.clone();
+                    move |this, _, _, cx| {
+                        this.kv_close_key_menu(session, cx);
+                        this.kv_open_inspector(session, key.clone(), ttl, kv_type.clone(), cx);
+                    }
+                })),
+            )
+            .item(
+                ContextMenuItem::new("kv-key-copy", "Copy key name").on_click(cx.listener({
+                    let key = key.clone();
+                    move |this, _, _, cx| this.kv_copy_key_name(session, key.clone(), cx)
+                })),
+            )
+            .item(
+                ContextMenuItem::new("kv-key-console", "Open in Console").on_click(cx.listener({
+                    let key = key.clone();
+                    let kv_type = kv_type.clone();
+                    move |this, _, _, cx| {
+                        this.kv_key_menu_open_console(session, kv_type.clone(), key.clone(), cx)
+                    }
+                })),
+            )
+            .separator()
+            .item(
+                ContextMenuItem::new("kv-key-rename", "Rename…")
+                    .disabled(!writable)
+                    .on_click(cx.listener({
+                        let key = key.clone();
+                        let kv_type = kv_type.clone();
+                        move |this, _, _, cx| {
+                            this.kv_key_menu_edit(
+                                session,
+                                key.clone(),
+                                kv_type.clone(),
+                                ttl,
+                                KeyMenuEdit::Rename,
+                                cx,
+                            )
+                        }
+                    })),
+            )
+            .item(
+                ContextMenuItem::new("kv-key-ttl", "Set TTL…")
+                    .disabled(!writable)
+                    .on_click(cx.listener({
+                        let key = key.clone();
+                        let kv_type = kv_type.clone();
+                        move |this, _, _, cx| {
+                            this.kv_key_menu_edit(
+                                session,
+                                key.clone(),
+                                kv_type.clone(),
+                                ttl,
+                                KeyMenuEdit::Ttl,
+                                cx,
+                            )
+                        }
+                    })),
+            )
+            .separator()
+            .item(
+                ContextMenuItem::new("kv-key-delete", "Delete")
+                    .danger()
+                    .disabled(!writable)
+                    .on_click(cx.listener({
+                        let key = key.clone();
+                        let kv_type = kv_type.clone();
+                        move |this, _, _, cx| {
+                            this.kv_key_menu_edit(
+                                session,
+                                key.clone(),
+                                kv_type.clone(),
+                                ttl,
+                                KeyMenuEdit::Delete,
+                                cx,
+                            )
+                        }
+                    })),
+            );
+        // A full-bleed catcher dismisses the menu on any outside click.
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.kv_close_key_menu(session, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| this.kv_close_key_menu(session, cx)),
             )
             .child(div().absolute().left(pos.x).top(pos.y).child(menu))
             .into_any_element()
@@ -1395,6 +1583,11 @@ impl AppState {
             .as_ref()
             .and_then(|v| v.tab_menu)
             .map(|(id, pos)| self.render_kv_tab_menu(active, id, pos, cx));
+        let key_menu = active
+            .kv_view
+            .as_ref()
+            .and_then(|v| v.key_menu.as_ref())
+            .map(|km| self.render_kv_key_menu(active, km, cx));
 
         // Optional left History dock (⌘Y), mirroring the SQL shell's history
         // dock: a leading resizable SplitPane over the work area.
@@ -1444,12 +1637,110 @@ impl AppState {
         } else {
             work
         };
-        let body = div()
-            .flex_1()
-            .min_h(px(0.))
+        // With the agent open, dock it to the right of the whole workspace via a
+        // resizable split — the same shape as the SQL shell (`render_shell`).
+        // `render_assistant` is engine-agnostic (a chat over `AiTurn` events), so
+        // it drops in unchanged; the KV backend grounds the turn (Part 1).
+        let body = if self.assistant.is_some() {
+            let start = view.clone();
+            let resize = view.clone();
+            let end = view.clone();
+            let panel = self.render_assistant(cx);
+            div().flex_1().min_h(px(0.)).child(
+                SplitPane::new("kv-split-assistant", Axis::Horizontal)
+                    .sized(SplitSide::Trailing)
+                    .size(self.assistant_w)
+                    .gutter(px(1.))
+                    .drag(self.assistant_drag)
+                    .min_first(px(320.))
+                    .max_first(px(760.))
+                    .on_drag_start(move |anchor, _, cx| {
+                        start
+                            .update(cx, |this, cx| {
+                                this.assistant_drag = Some(anchor);
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+                    .on_resize(move |size, _, cx| {
+                        resize
+                            .update(cx, |this, cx| {
+                                this.assistant_w = size;
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+                    .on_drag_end(move |_, cx| {
+                        end.update(cx, |this, cx| {
+                            this.assistant_drag = None;
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .first(workspace)
+                    .second(panel),
+            )
+        } else {
+            div().flex_1().min_h(px(0.)).flex().child(workspace)
+        }
+        .into_any_element();
+
+        // History dock toggle, pinned far-left with an icon (mirrors the SQL
+        // shell's status-bar toggle); accent-tinted while the panel is open.
+        let history_toggle = div()
+            .id("kv-history-toggle")
+            .mr_1()
+            .flex_shrink_0()
             .flex()
-            .child(workspace)
-            .into_any_element();
+            .items_center()
+            .justify_center()
+            .size(px(20.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .tooltip(Tooltip::text(crate::keymap::localize_hint(
+                "Toggle history  ⌘Y",
+            )))
+            .hover(|s| s.bg(theme.bg_elevated))
+            .child(crate::icons::icon(
+                "history",
+                theme.scale(14.),
+                if active.history_open {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                },
+            ))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx)));
+
+        // Agent toggle, pinned far-right (mirrors the SQL shell). Hidden entirely
+        // when the assistant is disabled for this connection (the M-S7 kill
+        // switch): no entry point, not just a no-op button.
+        let assistant_enabled = self.ai_enabled();
+        let assistant_open = self.assistant.is_some();
+        let assistant_toggle = div()
+            .id("kv-toggle-assistant")
+            .ml_1()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(20.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .tooltip(Tooltip::text(crate::keymap::localize_hint(
+                "Toggle agent  ⌘L",
+            )))
+            .hover(|s| s.bg(theme.bg_elevated))
+            .child(crate::icons::icon(
+                "sparkles",
+                theme.scale(14.),
+                if assistant_open {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                },
+            ))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_assistant(window, cx)));
 
         let statusbar = div()
             .flex_shrink_0()
@@ -1457,7 +1748,7 @@ impl AppState {
             .flex()
             .items_center()
             .justify_between()
-            .px_2()
+            .px_1()
             .bg(theme.bg_panel_2)
             .border_t_1()
             .border_color(theme.border)
@@ -1465,11 +1756,15 @@ impl AppState {
             .text_size(theme.scale(11.))
             .text_color(theme.text_muted)
             .child(
+                // The left group flexes and clips; the history toggle stays fixed
+                // far-left while the connection info truncates.
                 div()
                     .flex()
+                    .flex_1()
                     .items_center()
                     .min_w_0()
                     .gap_1p5()
+                    .child(history_toggle)
                     .child(
                         div()
                             .flex_shrink_0()
@@ -1483,31 +1778,15 @@ impl AppState {
             .child(
                 div()
                     .flex()
+                    .flex_shrink_0()
                     .items_center()
                     .gap_1()
                     .child(
                         div()
-                            .id("kv-history-toggle")
-                            .px_2()
-                            .rounded(px(3.))
-                            .cursor_pointer()
-                            .text_color(if active.history_open {
-                                theme.text
-                            } else {
-                                theme.text_muted
-                            })
-                            .hover(|s| s.bg(theme.bg_elevated).text_color(theme.text))
-                            .tooltip(Tooltip::text(crate::keymap::localize_hint(
-                                "Toggle history  ⌘Y",
-                            )))
-                            .child("History")
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx))),
-                    )
-                    .child(
-                        div()
                             .px_2()
                             .child(format!("{} {}", config.kind, active.version)),
-                    ),
+                    )
+                    .children(assistant_enabled.then_some(assistant_toggle)),
             );
 
         // The tab context menu overlays the whole shell, positioned in window
@@ -1523,6 +1802,7 @@ impl AppState {
             .child(body)
             .child(statusbar)
             .children(menu)
+            .children(key_menu)
     }
 
     /// The work area right of the schema dock: a single editor/result pane, or,

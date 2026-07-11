@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use flint::prelude::*;
 use gpui::{
-    div, prelude::*, px, relative, AsyncApp, Context, Entity, Hsla, ScrollHandle, SharedString,
-    UniformListScrollHandle, WeakEntity, Window,
+    div, prelude::*, px, relative, App, AsyncApp, Context, Entity, FocusHandle, Hsla, ScrollHandle,
+    SharedString, UniformListScrollHandle, WeakEntity, Window,
 };
 use red_core::kv::{
     CollectionKind, KeyMeta, KvCollection, KvCollectionPage, KvElement, KvStreamActionReq,
@@ -22,7 +22,7 @@ use red_core::kv::{
 };
 use red_service::{Command, SessionId};
 
-use crate::app::{ActiveConn, AppState, SplitHalf, SplitState};
+use crate::app::{ActiveConn, AppState, Phase, SplitHalf, SplitState};
 
 /// The `SCAN ... COUNT` hint per round trip (default `10` is far too low for
 /// a large keyspace; see docs/plans/redis.md item 3).
@@ -184,6 +184,15 @@ pub(crate) struct BrowseState {
     pub(crate) exhausted: bool,
     pub(crate) loading: bool,
     pub(crate) scroll: UniformListScrollHandle,
+    /// Focus for the key table, so ↑/↓/PageUp-Down/Home-End/Enter drive the
+    /// keyboard cursor (see [`AppState::kv_browse_nav`]). Focused when a row is
+    /// clicked; the table installs its own key handler while focused.
+    pub(crate) list_focus: FocusHandle,
+    /// The keyboard cursor: an index into the *currently visible* rows (see
+    /// [`BrowseState::visible_rows`]), or `None` before any keyboard/click
+    /// interaction, in which case the highlight falls back to the inspector's
+    /// key. Distinct from `cursor` (the `SCAN` cursor) despite the name.
+    pub(crate) nav_row: Option<usize>,
     pub(crate) filter: Entity<TextInput>,
     /// Bumped on every `Change`; a debounce timer captures the value live at
     /// the time it was scheduled and only restarts the scan if it's still
@@ -292,6 +301,60 @@ pub(crate) struct RedisView {
     pub(crate) split: Option<SplitState>,
     /// The tab whose right-click context menu is open, as `(id, position)`.
     pub(crate) tab_menu: Option<(u64, gpui::Point<gpui::Pixels>)>,
+    /// The key whose right-click context menu is open (from either the live
+    /// browse list or the biggest-keys sample), anchored at the click position.
+    pub(crate) key_menu: Option<KeyMenu>,
+}
+
+/// The open key context menu: which key it targets (with the type/TTL captured
+/// at right-click time so the menu can label itself and open the inspector
+/// without a re-lookup) and where to anchor it. Mirrors the `tab_menu`
+/// `(id, pos)` pattern one level richer.
+pub(crate) struct KeyMenu {
+    pub(crate) key: String,
+    pub(crate) kv_type: KvType,
+    pub(crate) ttl: Option<Duration>,
+    pub(crate) pos: gpui::Point<gpui::Pixels>,
+}
+
+/// Which inline inspector editor a key-menu item drives (see
+/// [`AppState::kv_key_menu_edit`]).
+#[derive(Clone, Copy)]
+pub(crate) enum KeyMenuEdit {
+    Rename,
+    Ttl,
+    Delete,
+}
+
+/// Quote a Redis key for a redis-cli command line: bare when it is a simple
+/// token, otherwise double-quoted with `"` and `\` escaped (redis-cli's own
+/// quoting rules). Only used to seed the Console, which the user still reviews
+/// before running.
+fn quote_redis_arg(arg: &str) -> String {
+    let simple = !arg.is_empty()
+        && arg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-' | b'.' | b'/'));
+    if simple {
+        arg.to_string()
+    } else {
+        format!("\"{}\"", arg.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
+/// The natural "read the whole value" command to pre-fill the Console with for a
+/// key of the given type — a safe probe the user still runs manually.
+fn kv_read_command(kv_type: &KvType, key: &str) -> String {
+    let q = quote_redis_arg(key);
+    match kv_type {
+        KvType::String => format!("GET {q}"),
+        KvType::Hash => format!("HGETALL {q}"),
+        KvType::List => format!("LRANGE {q} 0 -1"),
+        KvType::Set => format!("SMEMBERS {q}"),
+        KvType::ZSet => format!("ZRANGE {q} 0 -1 WITHSCORES"),
+        KvType::Stream => format!("XRANGE {q} - +"),
+        KvType::Other(_) => format!("TYPE {q}"),
+    }
 }
 
 /// The value inspector for one selected key: its value (or just a big
@@ -434,11 +497,31 @@ impl BrowseState {
             exhausted: false,
             loading: false,
             scroll: UniformListScrollHandle::new(),
+            list_focus: cx.focus_handle(),
+            nav_row: None,
             filter,
             filter_gen: 0,
             fuzzy: false,
             inspector: None,
             big_keys: None,
+        }
+    }
+
+    /// The rows as currently shown in the grid: the raw scan rows, or, in fuzzy
+    /// mode with a non-empty query, the fuzzy-scored subset in best-match order.
+    /// Shared by render and keyboard nav so both agree on order and indices.
+    pub(crate) fn visible_rows(&self, cx: &App) -> Vec<KeyMeta> {
+        let query = self.filter.read(cx).content().to_string();
+        if self.fuzzy && !query.is_empty() {
+            let mut scored: Vec<(i32, &KeyMeta)> = self
+                .rows
+                .iter()
+                .filter_map(|r| fuzzy_score(&query, &r.key).map(|s| (s, r)))
+                .collect();
+            scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+            scored.into_iter().map(|(_, r)| r.clone()).collect()
+        } else {
+            self.rows.clone()
         }
     }
 }
@@ -493,6 +576,7 @@ impl RedisView {
             tab_drop_target: None,
             split: None,
             tab_menu: None,
+            key_menu: None,
         }
     }
 
@@ -899,6 +983,92 @@ impl AppState {
             },
         );
         cx.notify();
+    }
+
+    /// Keyboard cursor movement in the key table (arrows / Home-End /
+    /// PageUp-Down / ⌘arrows), driven by Flint's [`TableNav`]. Moving only
+    /// shifts the cursor highlight (and lazily loads more rows as it nears the
+    /// tail); the value inspector opens only on Enter/F2 activation
+    /// ([`AppState::kv_activate_cursor`]), so holding an arrow through a huge
+    /// keyspace doesn't fire a `KvReadValue` per row.
+    pub(crate) fn kv_browse_nav(
+        &mut self,
+        session: SessionId,
+        nav: TableNav,
+        cx: &mut Context<Self>,
+    ) {
+        // Left/Right have no meaning in a single logical column.
+        if matches!(nav, TableNav::Left | TableNav::Right) {
+            return;
+        }
+        let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .and_then(|v| v.active_browse())
+        else {
+            return;
+        };
+        let rows = browse.visible_rows(cx);
+        if rows.is_empty() {
+            return;
+        }
+        let last = rows.len() - 1;
+        let cur = browse.nav_row.unwrap_or(0).min(last);
+
+        const PAGE: usize = 12;
+        let next = match nav {
+            TableNav::Up => cur.saturating_sub(1),
+            TableNav::Down => (cur + 1).min(last),
+            TableNav::PageUp => cur.saturating_sub(PAGE),
+            TableNav::PageDown => (cur + PAGE).min(last),
+            TableNav::First | TableNav::RowStart => 0,
+            TableNav::Last | TableNav::RowEnd => last,
+            // Left/Right handled above.
+            _ => cur,
+        };
+        if let Some(b) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        {
+            b.nav_row = Some(next);
+            b.scroll.scroll_to_item(next, gpui::ScrollStrategy::Nearest);
+        }
+        // Keep the loaded window ahead of a cursor walking toward the tail.
+        self.kv_maybe_load_more(session, next + 1, cx);
+        cx.notify();
+    }
+
+    /// Enter/F2 activation on the key table (the `BeginEdit` action, shared with
+    /// the SQL grid): open the value inspector on the keyboard cursor's row.
+    /// Returns `true` when it handled the key — i.e. a Redis browse list is the
+    /// focused table — so the caller falls through to `begin_grid_edit` for the
+    /// SQL grid otherwise.
+    pub(crate) fn kv_activate_cursor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Phase::Connected(active) = &self.phase else {
+            return false;
+        };
+        let session = active.session;
+        let Some(browse) = active.kv_view.as_ref().and_then(|v| v.active_browse()) else {
+            return false;
+        };
+        // Only when the key table actually holds focus, so Enter elsewhere in a
+        // Redis session (e.g. the filter box) isn't hijacked.
+        if !browse.list_focus.is_focused(window) {
+            return false;
+        }
+        let rows = browse.visible_rows(cx);
+        if rows.is_empty() {
+            return true;
+        }
+        let cur = browse.nav_row.unwrap_or(0).min(rows.len() - 1);
+        let row = rows[cur].clone();
+        self.kv_open_inspector(session, row.key, row.ttl, row.kv_type, cx);
+        true
     }
 
     /// `Event::KvScanPage`: append the page, or drop it if a filter restart
@@ -1706,6 +1876,93 @@ impl AppState {
         }
     }
 
+    /// Open the right-click context menu for a key row (from either the live
+    /// browse list or the biggest-keys sample). The type/TTL are captured now so
+    /// the menu labels itself and its actions target the exact key, independent
+    /// of what the inspector currently shows.
+    pub(crate) fn kv_open_key_menu(
+        &mut self,
+        session: SessionId,
+        key: String,
+        kv_type: KvType,
+        ttl: Option<Duration>,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            view.tab_menu = None;
+            view.key_menu = Some(KeyMenu {
+                key,
+                kv_type,
+                ttl,
+                pos,
+            });
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn kv_close_key_menu(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            if view.key_menu.take().is_some() {
+                cx.notify();
+            }
+        }
+    }
+
+    /// Menu action: put `key` on the clipboard.
+    pub(crate) fn kv_copy_key_name(
+        &mut self,
+        session: SessionId,
+        key: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(key));
+        self.kv_close_key_menu(session, cx);
+    }
+
+    /// Menu action: open the inspector on `key`, then enter one of the inline
+    /// editors (rename / TTL) or raise the delete-confirm bar — reusing the
+    /// inspector's existing edit flows so the menu is a shortcut, not a second
+    /// implementation. `action` selects which one.
+    pub(crate) fn kv_key_menu_edit(
+        &mut self,
+        session: SessionId,
+        key: String,
+        kv_type: KvType,
+        ttl: Option<Duration>,
+        action: KeyMenuEdit,
+        cx: &mut Context<Self>,
+    ) {
+        self.kv_close_key_menu(session, cx);
+        self.kv_open_inspector(session, key, ttl, kv_type, cx);
+        match action {
+            KeyMenuEdit::Rename => self.kv_start_editing_key(session, cx),
+            KeyMenuEdit::Ttl => self.kv_start_editing_ttl(session, cx),
+            KeyMenuEdit::Delete => self.kv_request_delete(session, cx),
+        }
+    }
+
+    /// Menu action: seed the Console with the natural read-all command for
+    /// `key`'s type (never auto-run — the user reviews and presses Enter),
+    /// reusing [`Self::kv_seed_console`].
+    pub(crate) fn kv_key_menu_open_console(
+        &mut self,
+        session: SessionId,
+        kv_type: KvType,
+        key: String,
+        cx: &mut Context<Self>,
+    ) {
+        let cmd = kv_read_command(&kv_type, &key);
+        self.kv_close_key_menu(session, cx);
+        self.kv_seed_console(session, cmd, cx);
+    }
+
     /// Close the tab with `id` (the context menu's Close item; resolves the id
     /// to a current index first, since positions shift).
     pub(crate) fn kv_close_tab_by_id(
@@ -1720,6 +1977,56 @@ impl AppState {
             .and_then(|v| v.tab_index_by_id(id));
         if let Some(idx) = idx {
             self.kv_close_tab(session, idx, cx);
+        }
+    }
+
+    /// Bulk close from the tab context menu: Close Others / Close Left / Close
+    /// Right / Close All, resolved against `id`'s own pane and skipping pinned
+    /// tabs (mirrors the SQL side's [`AppState::close_tab_group`]). Targets are
+    /// collected as stable ids first, then closed one by one so shifting indices
+    /// stay valid; `kv_close_tab`'s "keep at least one tab" guard is respected.
+    pub(crate) fn kv_close_tab_group(
+        &mut self,
+        session: SessionId,
+        id: u64,
+        scope: crate::app::TabCloseScope,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::app::TabCloseScope;
+        if scope == TabCloseScope::One {
+            self.kv_close_tab_by_id(session, id, cx);
+            return;
+        }
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+        else {
+            return;
+        };
+        let Some(idx) = view.tab_index_by_id(id) else {
+            return;
+        };
+        let pane = view.tabs[idx].pane;
+        let siblings = view.pane_tab_indices(pane);
+        let Some(pos) = siblings.iter().position(|&i| i == idx) else {
+            return;
+        };
+        let target_indices: Vec<usize> = match scope {
+            TabCloseScope::One => return,
+            TabCloseScope::All => siblings.clone(),
+            TabCloseScope::Others => siblings.iter().copied().filter(|&i| i != idx).collect(),
+            TabCloseScope::Left => siblings[..pos].to_vec(),
+            TabCloseScope::Right => siblings[pos + 1..].to_vec(),
+        };
+        // Resolve to stable ids now (indices shift as we close), skipping pinned
+        // tabs — those close only via the explicit "Close" item.
+        let target_ids: Vec<u64> = target_indices
+            .into_iter()
+            .filter(|&i| !view.tabs[i].pinned)
+            .map(|i| view.tabs[i].id)
+            .collect();
+        for target in target_ids {
+            self.kv_close_tab_by_id(session, target, cx);
         }
     }
 
@@ -1901,6 +2208,26 @@ impl AppState {
         {
             if !view.recent_keys.is_empty() {
                 view.recent_keys.clear();
+                cx.notify();
+            }
+        }
+    }
+
+    /// Drop a single recently-viewed key from the History dock's Keys section
+    /// (the per-row remove button), leaving the rest of the list intact.
+    pub(crate) fn kv_remove_recent_key(
+        &mut self,
+        session: SessionId,
+        key: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            let before = view.recent_keys.len();
+            view.recent_keys.retain(|r| r.key != key);
+            if view.recent_keys.len() != before {
                 cx.notify();
             }
         }
@@ -3008,17 +3335,7 @@ impl AppState {
         };
 
         let fuzzy_query = browse.filter.read(cx).content().to_string();
-        let rows: std::rc::Rc<Vec<KeyMeta>> = if browse.fuzzy && !fuzzy_query.is_empty() {
-            let mut scored: Vec<(i32, &KeyMeta)> = browse
-                .rows
-                .iter()
-                .filter_map(|r| fuzzy_score(&fuzzy_query, &r.key).map(|s| (s, r)))
-                .collect();
-            scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-            std::rc::Rc::new(scored.into_iter().map(|(_, r)| r.clone()).collect())
-        } else {
-            std::rc::Rc::new(browse.rows.clone())
-        };
+        let rows: std::rc::Rc<Vec<KeyMeta>> = std::rc::Rc::new(browse.visible_rows(cx));
 
         let header = if browse.fuzzy {
             if fuzzy_query.is_empty() {
@@ -3047,14 +3364,22 @@ impl AppState {
 
         let rows_render = rows.clone();
         let rows_select = rows.clone();
+        let rows_menu = rows.clone();
         let row_count = rows.len();
         let visible_range_view = view.clone();
         let select_view = view.clone();
+        let menu_view = view.clone();
+        let nav_view = view.clone();
+        let list_focus = browse.list_focus.clone();
 
-        let selected_ix = browse
-            .inspector
-            .as_ref()
-            .and_then(|i| rows.iter().position(|r| r.key == i.key));
+        // The keyboard cursor drives the highlight once the list has been
+        // touched; before that it falls back to the inspected key.
+        let selected_ix = browse.nav_row.filter(|&i| i < row_count).or_else(|| {
+            browse
+                .inspector
+                .as_ref()
+                .and_then(|i| rows.iter().position(|r| r.key == i.key))
+        });
 
         let columns = vec![
             Column::new("Key").flex(),
@@ -3075,14 +3400,41 @@ impl AppState {
             .text_size(cell_size)
             .track_scroll(&browse.scroll)
             .selected(selected_ix)
-            .on_select(move |ix, _click, _window, cx| {
+            .focus_handle(list_focus)
+            .on_nav(move |nav, _extend, _window, cx| {
+                nav_view
+                    .update(cx, |this, cx| this.kv_browse_nav(session, nav, cx))
+                    .ok();
+            })
+            .on_select(move |ix, _click, window, cx| {
                 let Some(row) = rows_select.get(ix) else {
                     return;
                 };
                 let (key, ttl, kv_type) = (row.key.clone(), row.ttl, row.kv_type.clone());
                 select_view
                     .update(cx, |this, cx| {
+                        // Clicking a row also plants the keyboard cursor there and
+                        // focuses the list, so arrows continue from the click.
+                        if let Some(b) = this
+                            .conn_mut(Some(session))
+                            .and_then(|a| a.kv_view.as_mut())
+                            .and_then(|v| v.active_browse_mut())
+                        {
+                            b.nav_row = Some(ix);
+                            window.focus(&b.list_focus, cx);
+                        }
                         this.kv_open_inspector(session, key, ttl, kv_type, cx)
+                    })
+                    .ok();
+            })
+            .on_secondary(move |ix, pos, _window, cx| {
+                let Some(row) = rows_menu.get(ix) else {
+                    return;
+                };
+                let (key, kv_type, ttl) = (row.key.clone(), row.kv_type.clone(), row.ttl);
+                menu_view
+                    .update(cx, |this, cx| {
+                        this.kv_open_key_menu(session, key, kv_type, ttl, pos, cx)
                     })
                     .ok();
             })
@@ -3173,7 +3525,7 @@ impl AppState {
                     .px_2()
                     .pt_2()
                     .pb_1()
-                    .child(div().flex_1().child(browse.filter.clone()))
+                    .child(div().flex_1().min_w(px(120.)).child(browse.filter.clone()))
                     .child({
                         let fuzzy_view = view.clone();
                         let fuzzy = browse.fuzzy;
@@ -3199,7 +3551,11 @@ impl AppState {
                         })
                     })
                     .child(
+                        // Yields width to the filter input when the pane is narrow
+                        // (e.g. the History dock is open) instead of squeezing it.
                         div()
+                            .min_w_0()
+                            .truncate()
                             .text_size(theme.scale(11.))
                             .text_color(theme.text_muted)
                             .child(header),
@@ -3223,9 +3579,11 @@ impl AppState {
         let view = cx.entity().downgrade();
         let close_view = view.clone();
         let select_view = view.clone();
+        let menu_view = view.clone();
         let rows = std::rc::Rc::new(bk.results.clone());
         let rows_render = rows.clone();
         let rows_select = rows.clone();
+        let rows_menu = rows.clone();
         let row_count = rows.len();
         let selected_ix = inspector.and_then(|i| rows.iter().position(|r| r.key == i.key));
 
@@ -3263,6 +3621,17 @@ impl AppState {
                 select_view
                     .update(cx, |this, cx| {
                         this.kv_open_inspector(session, key, ttl, kv_type, cx)
+                    })
+                    .ok();
+            })
+            .on_secondary(move |ix, pos, _window, cx| {
+                let Some(row) = rows_menu.get(ix) else {
+                    return;
+                };
+                let (key, kv_type, ttl) = (row.key.clone(), row.kv_type.clone(), row.ttl);
+                menu_view
+                    .update(cx, |this, cx| {
+                        this.kv_open_key_menu(session, key, kv_type, ttl, pos, cx)
                     })
                     .ok();
             })

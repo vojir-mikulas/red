@@ -251,7 +251,16 @@ impl AiTier {
     pub fn allows_tool(self, tool: &str) -> bool {
         match self {
             AiTier::Off => false,
-            AiTier::Schema => matches!(tool, "list_schema" | "describe_table"),
+            // Structure-only tools, both backends. For Redis (KV) these read
+            // metadata (types/TTL/sizes/server info) but never a key's value.
+            AiTier::Schema => matches!(
+                tool,
+                "list_schema"
+                    | "describe_table"
+                    | "kv_server_info"
+                    | "kv_scan_keys"
+                    | "kv_key_info"
+            ),
             AiTier::Read => matches!(
                 tool,
                 "list_schema"
@@ -265,12 +274,30 @@ impl AiTier {
                     // Delegation grants no new capability — a subagent runs a
                     // read-only subset of this same tier — so it rides with Read.
                     | "spawn_subagent"
+                    // Redis (KV) read tools: the metadata tools from Schema plus
+                    // value/sample/diagnostic reads. All read-only.
+                    | "kv_server_info"
+                    | "kv_scan_keys"
+                    | "kv_key_info"
+                    | "kv_get_value"
+                    | "kv_biggest_keys"
+                    | "kv_analyze"
+                    | "kv_slowlog"
+                    | "kv_config_get"
             ),
-            // Write inherits the full read catalog and adds the gated write tools
-            // (a single statement, or a multi-statement transactional changeset).
+            // Write inherits the full read catalog and adds the gated write tools:
+            // SQL (a single statement or a transactional changeset) and Redis
+            // (gated key mutations). Every one rides the per-call approval gate.
             AiTier::Write => {
-                matches!(tool, "propose_write" | "propose_changeset")
-                    || AiTier::Read.allows_tool(tool)
+                matches!(
+                    tool,
+                    "propose_write"
+                        | "propose_changeset"
+                        | "kv_expire"
+                        | "kv_delete"
+                        | "kv_rename"
+                        | "kv_config_set"
+                ) || AiTier::Read.allows_tool(tool)
             }
         }
     }

@@ -18,16 +18,74 @@ use std::time::Duration;
 use red_ai::{
     AiProvider, CancelToken, ContentBlock, Message, Role, StopReason, ToolDef, TurnRequest,
 };
+use red_core::kv::{
+    analyze_keyspace, KeyMeta, KvCollection, KvValue, RespValue, ScanBudget, ScanCursor,
+};
 use red_core::{
     ActivityKind, ActivityStatus, AiLimits, AiPolicy, AiTier, RedError, TableRef, Value,
 };
-use red_driver::{AbortSignal, DatabaseDriver, PageCap};
+use red_driver::{AbortSignal, DatabaseDriver, KvDriver, PageCap};
 use serde_json::{json, Value as Json};
 use tokio::sync::oneshot;
 
 use crate::dispatch::{emit, Events};
 use crate::protocol::{AiContext, AiDelta, AiUsage, ReportTheme};
 use crate::{Event, SessionId};
+
+/// Which engine the agent turn is grounded in. The model→tool loop, streaming,
+/// budget, write gate, and history are identical for both; only the tool
+/// catalog, the tool execution, and the system prompt differ (see
+/// `docs/plans/redis-workflow-parity.md` Part 1). A KV (Redis) turn exposes the
+/// `kv_*` read tools; a SQL turn the schema/query tools.
+#[derive(Clone)]
+pub(crate) enum AiBackend {
+    Sql(Arc<dyn DatabaseDriver>),
+    Kv(Arc<dyn KvDriver>),
+}
+
+impl AiBackend {
+    /// The tier-filtered tool catalog this backend offers under `policy`. Routes to
+    /// the SQL schema/query tools or the Redis `kv_*` tools.
+    pub(crate) fn catalog(&self, policy: &AiPolicy) -> Vec<ToolDef> {
+        match self {
+            AiBackend::Sql(_) => tool_catalog(policy),
+            AiBackend::Kv(_) => kv_tool_catalog(policy),
+        }
+    }
+
+    /// The full grounding system prompt for this backend under `ctx`/`policy`.
+    pub(crate) fn system_prompt(&self, ctx: &AiContext, policy: &AiPolicy) -> String {
+        match self {
+            AiBackend::Sql(_) => system_prompt(ctx, policy),
+            AiBackend::Kv(_) => kv_system_prompt(ctx, policy),
+        }
+    }
+
+    /// Whether `name` is a mutating tool for this backend. Used to withhold writes
+    /// over the subscription/MCP path (each backend has its own writer set: the SQL
+    /// `propose_*` tools vs. the Redis `kv_*` writers).
+    pub(crate) fn is_write_tool(&self, name: &str) -> bool {
+        match self {
+            AiBackend::Sql(_) => is_write_tool(name),
+            AiBackend::Kv(_) => is_kv_write_tool(name),
+        }
+    }
+
+    /// Run one tool call against this backend's driver, returning `(content, ok)`.
+    pub(crate) async fn run_tool(
+        &self,
+        name: &str,
+        input: &Json,
+        policy: &AiPolicy,
+        cancel: &CancelToken,
+        report: &ReportSink,
+    ) -> (String, bool) {
+        match self {
+            AiBackend::Sql(d) => run_tool(d, name, input, policy, cancel, report).await,
+            AiBackend::Kv(d) => kv_run_tool(d, name, input, policy, cancel, report).await,
+        }
+    }
+}
 
 /// A small, UI-agnostic announcer the `generate_report` tool uses to hand a
 /// freshly-written report file to the UI, which surfaces it as a card the user can
@@ -261,7 +319,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_turn(
     provider: Arc<dyn AiProvider>,
-    driver: Arc<dyn DatabaseDriver>,
+    backend: AiBackend,
     events: Events,
     state: Arc<Mutex<AiState>>,
     session: Option<SessionId>,
@@ -273,10 +331,11 @@ pub(crate) async fn run_turn(
     context: AiContext,
     cancel: CancelToken,
 ) {
-    let system = system_prompt(&context, &policy);
+    let system = backend.system_prompt(&context, &policy);
     // The tier decides which tools the model is even offered (M-S7): `off` grounds
-    // nothing, `schema` withholds row data, `read` is the full catalog.
-    let tools = tool_catalog(&policy);
+    // nothing, `schema` withholds row data, `read` is the full catalog. The KV
+    // (Redis) backend offers its own read-only `kv_*` catalog.
+    let tools = backend.catalog(&policy);
     // Where `generate_report` delivers its file so the UI opens it (Feature C);
     // carries the active theme so the report matches Red's colors.
     let report = ReportSink::new(
@@ -415,9 +474,11 @@ pub(crate) async fn run_turn(
                         },
                     },
                 );
+                // Delegation runs the parent's backend (SQL or KV), narrowed to a
+                // read-only, non-recursive subset (see the subagent catalogs).
                 let (content, ok) = run_subagent(
                     &provider,
-                    &driver,
+                    &backend,
                     &events,
                     &state,
                     session,
@@ -521,7 +582,14 @@ pub(crate) async fn run_turn(
                     },
                 },
             );
-            let (content, ok) = run_tool(&driver, name, input, &policy, &cancel, &report).await;
+            let (content, ok) = match &backend {
+                AiBackend::Sql(driver) => {
+                    run_tool(driver, name, input, &policy, &cancel, &report).await
+                }
+                AiBackend::Kv(driver) => {
+                    kv_run_tool(driver, name, input, &policy, &cancel, &report).await
+                }
+            };
             emit(
                 &events,
                 session,
@@ -596,7 +664,7 @@ const SUBAGENT_MAX_STEPS: usize = 6;
 #[allow(clippy::too_many_arguments)]
 async fn run_subagent(
     provider: &Arc<dyn AiProvider>,
-    driver: &Arc<dyn DatabaseDriver>,
+    backend: &AiBackend,
     events: &Events,
     state: &Arc<Mutex<AiState>>,
     session: Option<SessionId>,
@@ -608,8 +676,11 @@ async fn run_subagent(
     task: &str,
     cancel: &CancelToken,
 ) -> (String, bool) {
-    let tools = subagent_catalog(policy);
-    let system = subagent_system_prompt(task);
+    // The child runs the parent's backend, narrowed to reads (see the catalogs).
+    let (tools, system) = match backend {
+        AiBackend::Sql(_) => (subagent_catalog(policy), subagent_system_prompt(task)),
+        AiBackend::Kv(_) => (kv_subagent_catalog(policy), kv_subagent_system_prompt(task)),
+    };
     let mut messages = vec![Message::user_text(task.to_string())];
     let mut answer = String::new();
 
@@ -678,7 +749,10 @@ async fn run_subagent(
                     },
                 },
             );
-            let (content, ok) = run_tool(driver, name, input, policy, cancel, report).await;
+            let (content, ok) = match backend {
+                AiBackend::Sql(d) => run_tool(d, name, input, policy, cancel, report).await,
+                AiBackend::Kv(d) => kv_run_tool(d, name, input, policy, cancel, report).await,
+            };
             emit(
                 events,
                 session,
@@ -740,6 +814,27 @@ fn subagent_system_prompt(task: &str) -> String {
          or delegate further. Do the task, then reply with a concise report of your findings — \
          the key facts, figures, and any caveats — that the parent can use directly. Do not ask \
          questions; you cannot receive answers.\n\nTask: {task}"
+    )
+}
+
+/// The Redis subagent's tool subset: the parent's KV catalog minus writes and
+/// minus `spawn_subagent` (no mutation, no recursion), like [`subagent_catalog`].
+fn kv_subagent_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
+    kv_tool_catalog(policy)
+        .into_iter()
+        .filter(|t| t.name != "spawn_subagent" && !is_write_tool(&t.name))
+        .collect()
+}
+
+/// The Redis subagent's system prompt (the KV analogue of [`subagent_system_prompt`]).
+fn kv_subagent_system_prompt(task: &str) -> String {
+    format!(
+        "You are a focused sub-investigator working for a parent AI agent on ONE task against a \
+         Redis server. You have read-only Redis tools (kv_server_info, kv_scan_keys, kv_key_info, \
+         kv_get_value, kv_biggest_keys, kv_analyze, kv_slowlog, kv_config_get); you cannot write \
+         or delegate further. Keys use glob patterns, not SQL. Do the task, then reply with a \
+         concise report of your findings the parent can use directly. Do not ask questions; you \
+         cannot receive answers.\n\nTask: {task}"
     )
 }
 
@@ -871,61 +966,7 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
                 "additionalProperties": false,
             }),
         },
-        ToolDef {
-            name: "generate_report".into(),
-            description: "Write a custom HTML report for the user. It appears as a card in the \
-                chat with an \"Open\" button; the user opens it in their browser when they choose \
-                (it is NOT opened automatically). \
-                YOU author the report: first read the data with run_select, then call this with \
-                `html` set to the report's body: headings, prose/summary, one or more <table>s, \
-                even an inline <svg> chart. Use semantic HTML and inline `style=\"…\"` for any \
-                styling; a base stylesheet (light/dark) is already applied. Scripts and remote/\
-                external resources (other domains, <script>, remote <img>/CSS) are stripped or \
-                blocked for safety, so keep everything self-contained (data URIs for images). \
-                For INTERACTIVE charts (hover tooltips, legends), pass `charts` (an array of \
-                Chart.js v4 config objects) and reference each one from the body with an empty \
-                <div data-red-chart=\"INDEX\"></div> placeholder (INDEX is the chart's position \
-                in the array). The charts are rendered by a trusted built-in Chart.js; you supply \
-                DATA only (no JavaScript/function callbacks; they are ignored). \
-                For INTERACTIVE TABLES the user can search/sort/filter, pass `data` (named \
-                datasets of {columns, rows}) and drop a <div data-red-table=\"NAME\"></div> \
-                placeholder; the user gets a live filter box, click-to-sort headers, and per-column \
-                filters. A chart can BIND to a dataset instead of carrying inline data: give it \
-                {\"dataset\":\"NAME\",\"type\":\"bar\",\"x\":\"colName\",\"y\":[\"colA\"]}, and it \
-                re-draws automatically when the user filters that dataset's table. \
-                For DASHBOARD-style controls (like Grafana variables) that drive EVERY table and \
-                bound chart at once, pass `filters`, e.g. a multi-select to show only chosen \
-                regions: {\"column\":\"Region\",\"type\":\"multiselect\"}. They render as a control \
-                bar at the top of the report. Prefer this (data + bound charts + a table + \
-                filters) when the user wants to explore/slice the data; prefer inline-data charts \
-                for a fixed visual. \
-                Use this when the user asks for a report."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "html": { "type": "string", "description": "The report BODY as self-contained HTML (no <html>/<head>/<body> wrapper; that's added). Reference charts with <div data-red-chart=\"INDEX\"></div> and interactive tables with <div data-red-table=\"NAME\"></div> placeholders." },
-                    "title": { "type": "string", "description": "Report title (browser tab + heading)." },
-                    "charts": {
-                        "type": "array",
-                        "description": "Optional interactive charts. Each item is EITHER a full Chart.js v4 config with inline data, e.g. {\"type\":\"bar\",\"data\":{\"labels\":[…],\"datasets\":[{\"label\":\"Revenue\",\"data\":[…]}]},\"options\":{…}}, OR a dataset binding {\"dataset\":\"NAME\",\"type\":\"bar\",\"x\":\"colName\",\"y\":[\"col1\",\"col2\"],\"aggregate\":\"sum\",\"options\":{…}} that derives its data from a named `data` dataset and follows that table's filters. type is one of bar, line, pie, doughnut, radar, polarArea, scatter, bubble. aggregate (sum/avg/min/max/count/none, default none) groups rows sharing an x value. Data only; no functions/callbacks. Place a <div data-red-chart=\"INDEX\"></div> in the body for each.",
-                        "items": { "type": "object" },
-                    },
-                    "data": {
-                        "type": "object",
-                        "description": "Optional named datasets for interactive tables and filter-linked charts, e.g. {\"sales\":{\"columns\":[\"Month\",\"Region\",\"Revenue\"],\"rows\":[[\"Jan\",\"NA\",120],[\"Feb\",\"EU\",90]]}}. Each value is {columns:[string], rows:[[cell,…]]} (cells are strings/numbers/null). Reference a dataset with <div data-red-table=\"sales\"></div> for a searchable/sortable table, and/or bind charts to it via {\"dataset\":\"sales\",…}.",
-                        "additionalProperties": { "type": "object" },
-                    },
-                    "filters": {
-                        "type": "array",
-                        "description": "Optional report-wide filter controls (Grafana-style variables) that filter EVERY table and bound chart. Each is {\"column\":\"Region\",\"type\":\"multiselect\",\"label\":\"Region\",\"dataset\":\"sales\",\"default\":[…]}. type: multiselect (checkbox dropdown: pick which values to show; this is the 'show only selected regions' control), select (single value), range (numeric min/max), or search (substring). column must exist in the dataset(s); omit `dataset` to apply to all datasets that have that column. `default` pre-selects values (multiselect/select). They appear in a bar at the top; no body placeholder needed (optionally place <div data-red-filters></div> to position it).",
-                        "items": { "type": "object" },
-                    },
-                },
-                "required": ["html"],
-                "additionalProperties": false,
-            }),
-        },
+        report_tool_def(),
         ToolDef {
             name: "open_query".into(),
             description: "Open a SQL query in a new editor tab in the user's workspace so they have \
@@ -962,26 +1003,7 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
                 "additionalProperties": false,
             }),
         },
-        ToolDef {
-            name: "spawn_subagent".into(),
-            description: "Delegate a self-contained READ-ONLY sub-investigation to a subagent and \
-                get back its findings as a short written report. The subagent has the same \
-                schema/query tools you do (read-only: it cannot write or spawn further subagents) \
-                and works in its own context, so use this to parallelize or offload a focused \
-                chunk of work — e.g. \"profile the orders table\" or \"find which tables reference \
-                users\" — without cluttering your own context. Give it ONE clear, bounded task and \
-                everything it needs to know; it cannot ask you follow-ups. It returns only its \
-                final summary (not raw rows)."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "task": { "type": "string", "description": "A single, self-contained read-only task for the subagent, with all needed context." },
-                },
-                "required": ["task"],
-                "additionalProperties": false,
-            }),
-        },
+        spawn_subagent_tool_def(),
         ToolDef {
             name: "propose_write".into(),
             description: "Execute a SINGLE data-modifying statement: INSERT, UPDATE, or DELETE. \
@@ -1110,6 +1132,950 @@ fn truncate_summary(s: &str, max: usize) -> String {
 /// withholds out-of-tier tools, but a misbehaving agent could still *name* one),
 /// and the [`AiLimits`](red_core::AiLimits) clamp rows, time-box the query, and
 /// cap the result bytes handed back to the model.
+/// The `spawn_subagent` tool definition, shared by the SQL and KV catalogs
+/// (delegation is engine-agnostic — the child runs the parent's own read tools).
+fn spawn_subagent_tool_def() -> ToolDef {
+    ToolDef {
+        name: "spawn_subagent".into(),
+        description: "Delegate a self-contained READ-ONLY sub-investigation to a subagent and get \
+            back its findings as a short written report. The subagent has your read-only tools \
+            (it cannot write or spawn further subagents) and works in its own context, so use \
+            this to parallelize or offload a focused chunk of work without cluttering your own \
+            context. Give it ONE clear, bounded task and everything it needs to know; it cannot \
+            ask you follow-ups. It returns only its final summary, not raw data."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "task": { "type": "string", "description": "A single, self-contained read-only task for the subagent, with all needed context." },
+            },
+            "required": ["task"],
+            "additionalProperties": false,
+        }),
+    }
+}
+
+/// The `generate_report` tool definition, shared by the SQL and KV catalogs (the
+/// report pipeline is engine-agnostic — the model authors HTML from whatever it
+/// read).
+fn report_tool_def() -> ToolDef {
+    ToolDef {
+        name: "generate_report".into(),
+        description: "Write a custom HTML report for the user. It appears as a card in the \
+            chat with an \"Open\" button; the user opens it in their browser when they choose \
+            (it is NOT opened automatically). \
+            YOU author the report: first read the data (with the read tools), then call this with \
+            `html` set to the report's body: headings, prose/summary, one or more <table>s, \
+            even an inline <svg> chart. Use semantic HTML and inline `style=\"…\"` for any \
+            styling; a base stylesheet (light/dark) is already applied. Scripts and remote/\
+            external resources (other domains, <script>, remote <img>/CSS) are stripped or \
+            blocked for safety, so keep everything self-contained (data URIs for images). \
+            For INTERACTIVE charts (hover tooltips, legends), pass `charts` (an array of \
+            Chart.js v4 config objects) and reference each one from the body with an empty \
+            <div data-red-chart=\"INDEX\"></div> placeholder (INDEX is the chart's position \
+            in the array). The charts are rendered by a trusted built-in Chart.js; you supply \
+            DATA only (no JavaScript/function callbacks; they are ignored). \
+            For INTERACTIVE TABLES the user can search/sort/filter, pass `data` (named \
+            datasets of {columns, rows}) and drop a <div data-red-table=\"NAME\"></div> \
+            placeholder; the user gets a live filter box, click-to-sort headers, and per-column \
+            filters. A chart can BIND to a dataset instead of carrying inline data: give it \
+            {\"dataset\":\"NAME\",\"type\":\"bar\",\"x\":\"colName\",\"y\":[\"colA\"]}, and it \
+            re-draws automatically when the user filters that dataset's table. \
+            For DASHBOARD-style controls (like Grafana variables) that drive EVERY table and \
+            bound chart at once, pass `filters`, e.g. a multi-select to show only chosen \
+            regions: {\"column\":\"Region\",\"type\":\"multiselect\"}. They render as a control \
+            bar at the top of the report. Prefer this (data + bound charts + a table + \
+            filters) when the user wants to explore/slice the data; prefer inline-data charts \
+            for a fixed visual. \
+            Use this when the user asks for a report."
+            .into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "html": { "type": "string", "description": "The report BODY as self-contained HTML (no <html>/<head>/<body> wrapper; that's added). Reference charts with <div data-red-chart=\"INDEX\"></div> and interactive tables with <div data-red-table=\"NAME\"></div> placeholders." },
+                "title": { "type": "string", "description": "Report title (browser tab + heading)." },
+                "charts": {
+                    "type": "array",
+                    "description": "Optional interactive charts. Each item is EITHER a full Chart.js v4 config with inline data, e.g. {\"type\":\"bar\",\"data\":{\"labels\":[…],\"datasets\":[{\"label\":\"Revenue\",\"data\":[…]}]},\"options\":{…}}, OR a dataset binding {\"dataset\":\"NAME\",\"type\":\"bar\",\"x\":\"colName\",\"y\":[\"col1\",\"col2\"],\"aggregate\":\"sum\",\"options\":{…}} that derives its data from a named `data` dataset and follows that table's filters. type is one of bar, line, pie, doughnut, radar, polarArea, scatter, bubble. aggregate (sum/avg/min/max/count/none, default none) groups rows sharing an x value. Data only; no functions/callbacks. Place a <div data-red-chart=\"INDEX\"></div> in the body for each.",
+                    "items": { "type": "object" },
+                },
+                "data": {
+                    "type": "object",
+                    "description": "Optional named datasets for interactive tables and filter-linked charts, e.g. {\"sales\":{\"columns\":[\"Month\",\"Region\",\"Revenue\"],\"rows\":[[\"Jan\",\"NA\",120],[\"Feb\",\"EU\",90]]}}. Each value is {columns:[string], rows:[[cell,…]]} (cells are strings/numbers/null). Reference a dataset with <div data-red-table=\"sales\"></div> for a searchable/sortable table, and/or bind charts to it via {\"dataset\":\"sales\",…}.",
+                    "additionalProperties": { "type": "object" },
+                },
+                "filters": {
+                    "type": "array",
+                    "description": "Optional report-wide filter controls (Grafana-style variables) that filter EVERY table and bound chart. Each is {\"column\":\"Region\",\"type\":\"multiselect\",\"label\":\"Region\",\"dataset\":\"sales\",\"default\":[…]}. type: multiselect (checkbox dropdown: pick which values to show; this is the 'show only selected regions' control), select (single value), range (numeric min/max), or search (substring). column must exist in the dataset(s); omit `dataset` to apply to all datasets that have that column. `default` pre-selects values (multiselect/select). They appear in a bar at the top; no body placeholder needed (optionally place <div data-red-filters></div> to position it).",
+                    "items": { "type": "object" },
+                },
+            },
+            "required": ["html"],
+            "additionalProperties": false,
+        }),
+    }
+}
+
+/// The `generate_report` tool: wrap the model-authored HTML (+ optional
+/// charts/data/filters) in a sandboxed, themed shell, size-check it, write it to
+/// the report dir, and announce it as a chat card. Engine-agnostic — the report
+/// pipeline is identical for SQL and Redis — so both `run_tool` and `kv_run_tool`
+/// call it (see docs/plans/redis-workflow-parity.md Part 1).
+fn run_generate_report(input: &Json, report: &ReportSink) -> (String, bool) {
+    let body = input
+        .get("html")
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .trim();
+    if body.is_empty() {
+        return (
+            "error: generate_report needs `html` (the report body you authored)".into(),
+            false,
+        );
+    }
+    let title = input.get("title").and_then(Json::as_str);
+    // Optional interactive charts: keep only well-formed Chart.js spec objects.
+    // They are embedded as inert data and rendered by the trusted bundle (see
+    // `wrap_report_html`); anything that isn't an object is dropped rather than
+    // smuggled into the document.
+    let charts: Vec<Json> = input
+        .get("charts")
+        .and_then(Json::as_array)
+        .map(|items| items.iter().filter(|c| c.is_object()).cloned().collect())
+        .unwrap_or_default();
+    // Optional named datasets for interactive (filterable/sortable) tables and
+    // filter-linked charts. Kept only if it's an object map.
+    let data = input.get("data").filter(|v| v.is_object());
+    // Optional report-wide filter controls (Grafana-style variables). Objects only.
+    let filters: Vec<Json> = input
+        .get("filters")
+        .and_then(Json::as_array)
+        .map(|items| items.iter().filter(|c| c.is_object()).cloned().collect())
+        .unwrap_or_default();
+    let html = wrap_report_html(title, body, &charts, data, &filters, report.theme());
+    // Refuse an oversized report by measuring the FINAL document, discounting the
+    // fixed chart bundle so the cap measures the model's contribution.
+    let report_bytes = html.len().saturating_sub(REPORT_CHARTS_JS.len());
+    if report_bytes > MAX_REPORT_BYTES {
+        return (
+            format!(
+                "error: the report is too large ({} KiB; the cap is {} KiB). Summarize or \
+                 aggregate the data, or narrow it, then try again.",
+                report_bytes / 1024,
+                MAX_REPORT_BYTES / 1024,
+            ),
+            false,
+        );
+    }
+    let path = report
+        .output_dir()
+        .join(format!("red-report-{}.html", uuid::Uuid::new_v4().simple()));
+    match write_report_file(&path, &html) {
+        Ok(()) => {
+            let clean_title = title.map(str::trim).filter(|t| !t.is_empty());
+            report.announce(&path, clean_title);
+            let label = clean_title.map(|t| format!(" “{t}”")).unwrap_or_default();
+            (
+                format!(
+                    "Generated the report{label}. It's now available as a card in the chat for \
+                     the user to open."
+                ),
+                true,
+            )
+        }
+        Err(e) => (
+            format!("error: could not write the report file: {e}"),
+            false,
+        ),
+    }
+}
+
+// --- Redis (KV) agent backend (see docs/plans/redis-workflow-parity.md Part 1) ---
+
+/// Round-trip cap on a bounded keyspace walk, so a `kv_scan_keys`/sample never
+/// loops unbounded on a huge keyspace.
+const KV_SCAN_ROUNDS_CAP: usize = 400;
+/// Keys sampled for `kv_analyze` / `kv_biggest_keys` (bounded, like the UI's own
+/// biggest-keys/analysis samplers).
+const KV_SAMPLE_MAX: usize = 20_000;
+/// How many biggest keys `kv_biggest_keys` reports by default.
+const KV_BIGGEST_TOP: usize = 30;
+/// How many elements of a collection `kv_get_value` previews.
+const KV_VALUE_ELEMS: usize = 50;
+/// Max keys a single bulk write (kv_delete/kv_expire by pattern) touches per call;
+/// past this it reports the bound was hit so the agent can run again.
+const KV_BULK_MAX: usize = 50_000;
+
+/// The Redis agent's read-only tool catalog, gated by tier via
+/// [`AiTier::allows_tool`] exactly like the SQL [`tool_catalog`]. Redis writes
+/// aren't wired yet, so every tool here is read-only.
+pub(crate) fn kv_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
+    let all = [
+        ToolDef {
+            name: "kv_server_info".into(),
+            description: "Summarize the server's INFO: version, memory (used/max/fragmentation), \
+                connected clients, ops/sec, keyspace hit rate, evictions/expirations, uptime, and \
+                per-database key counts. Call this first to understand the server's health and size."
+                .into(),
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "kv_scan_keys".into(),
+            description: "Find keys by glob pattern (e.g. `user:*`, `session:??`) and return each \
+                key's type, TTL, and approximate memory. Bounded — use a selective pattern; this \
+                is how you discover what's in the keyspace."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Glob MATCH pattern (default `*`, all keys)." },
+                    "limit": { "type": "integer", "description": "Max keys to return." },
+                },
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "kv_key_info".into(),
+            description: "One key's type, TTL, OBJECT ENCODING, and approximate memory (no value). \
+                Use before reading a value to see what shape it is."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "key": { "type": "string", "description": "The exact key name." } },
+                "required": ["key"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "kv_get_value".into(),
+            description: "Read a key's value (capped): a string's contents, or a preview of a \
+                hash/set/zset/list/stream's elements. Large collections report their length and a \
+                head window rather than materializing whole."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "key": { "type": "string", "description": "The exact key name." } },
+                "required": ["key"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "kv_biggest_keys".into(),
+            description: "Sample the keyspace and return the largest keys by approximate memory \
+                (redis-cli --bigkeys style). Bounded walk; the result says if it was truncated. Use \
+                to find what's eating memory."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Optional glob to restrict the sample." },
+                    "top": { "type": "integer", "description": "How many biggest keys to return." },
+                },
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "kv_analyze".into(),
+            description: "Roll a bounded keyspace sample up into a report: total memory, a per-type \
+                breakdown, the top key-name namespaces (prefix up to the first `:`) by memory, and \
+                a TTL-coverage summary (how many keys never expire vs. expire soon). Use for \
+                'what's in here / why is memory high / what lacks a TTL' questions."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Optional glob to restrict the sample." },
+                },
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "kv_slowlog".into(),
+            description: "The server's SLOWLOG: recent commands that exceeded the slow threshold, \
+                with their execution time and arguments. Use to diagnose slowness."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "count": { "type": "integer", "description": "How many entries (default 32)." } },
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "kv_config_get".into(),
+            description: "Read one or more CONFIG parameters (glob allowed, e.g. `maxmemory*`). \
+                Read-only; never sets."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "parameter": { "type": "string", "description": "CONFIG parameter or glob (e.g. `maxmemory-policy`)." } },
+                "required": ["parameter"],
+                "additionalProperties": false,
+            }),
+        },
+        report_tool_def(),
+        spawn_subagent_tool_def(),
+        // --- gated writes (Write tier, writable connection only) ---
+        ToolDef {
+            name: "kv_expire".into(),
+            description: "Set or remove a key's expiry (EXPIRE / PERSIST). Targets one `key`, or \
+                every key matching a `pattern` (bulk). Requires the user's explicit approval; a \
+                keyspace-wide TTL (pattern `*`) is refused. Read/scan first to know what you'll \
+                affect."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "A single key to expire/persist." },
+                    "pattern": { "type": "string", "description": "Glob to bulk-expire all matching keys (mutually exclusive with `key`)." },
+                    "seconds": { "type": "integer", "description": "TTL in seconds; omit or 0 to PERSIST (remove expiry)." },
+                },
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "kv_delete".into(),
+            description: "Delete keys (DEL): one `key`, an explicit list of `keys`, or every key \
+                matching a `pattern` (bulk). Requires explicit approval; deleting the whole \
+                keyspace (pattern `*`) is refused. Scan/count first and tell the user how many \
+                keys will go."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "A single key to delete." },
+                    "keys": { "type": "array", "items": { "type": "string" }, "description": "An explicit list of keys to delete." },
+                    "pattern": { "type": "string", "description": "Glob to bulk-delete all matching keys." },
+                },
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "kv_rename".into(),
+            description: "Rename a key (RENAME `from` `to`); overwrites `to` if it exists. Requires \
+                explicit approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string", "description": "Existing key name." },
+                    "to": { "type": "string", "description": "New key name." },
+                },
+                "required": ["from", "to"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "kv_config_set".into(),
+            description: "Set a server CONFIG parameter (CONFIG SET). Powerful — can change memory \
+                limits, persistence, eviction. Requires explicit approval; read the current value \
+                with kv_config_get first."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "parameter": { "type": "string", "description": "CONFIG parameter (e.g. `maxmemory-policy`)." },
+                    "value": { "type": "string", "description": "New value." },
+                },
+                "required": ["parameter", "value"],
+                "additionalProperties": false,
+            }),
+        },
+    ];
+    all.into_iter()
+        // The tier gates membership; the write tools are additionally withheld on a
+        // read-only connection so they're never even offered there.
+        .filter(|t| {
+            policy.tier.allows_tool(&t.name) && !(policy.read_only && is_write_tool(&t.name))
+        })
+        .collect()
+}
+
+/// Bounded keyspace walk: loop `scan_keys` accumulating metadata until `max_keys`
+/// are collected, the keyspace is exhausted, or the round cap is hit. Returns the
+/// keys (truncated to `max_keys`) and whether the walk exhausted the keyspace.
+async fn kv_collect_keys(
+    driver: &Arc<dyn KvDriver>,
+    pattern: Option<&str>,
+    max_keys: usize,
+) -> Result<(Vec<KeyMeta>, bool), RedError> {
+    let abort = AbortSignal::new();
+    let mut cursor = ScanCursor::START;
+    let mut out: Vec<KeyMeta> = Vec::new();
+    let mut exhausted = false;
+    for _ in 0..KV_SCAN_ROUNDS_CAP {
+        let budget = ScanBudget {
+            count_hint: 300,
+            wall_clock: Duration::from_millis(300),
+            want: 200,
+        };
+        let page = driver.scan_keys(cursor, pattern, budget, &abort).await?;
+        out.extend(page.keys);
+        cursor = page.next_cursor;
+        exhausted = page.exhausted;
+        if exhausted || out.len() >= max_keys {
+            break;
+        }
+    }
+    out.truncate(max_keys);
+    Ok((out, exhausted))
+}
+
+/// Execute one Redis agent tool (the KV analogue of [`run_tool`]). Read-only:
+/// every arm reads through the `KvDriver` seam. Shares the tier gate, the byte
+/// cap, and the `generate_report` pipeline with the SQL path.
+pub(crate) async fn kv_run_tool(
+    driver: &Arc<dyn KvDriver>,
+    name: &str,
+    input: &Json,
+    policy: &AiPolicy,
+    _cancel: &CancelToken,
+    report: &ReportSink,
+) -> (String, bool) {
+    if !policy.tier.allows_tool(name) {
+        return (
+            format!("error: the `{name}` tool is not available at this access tier"),
+            false,
+        );
+    }
+    let limits = &policy.limits;
+    let (content, ok) = match name {
+        "kv_server_info" => match driver.command(&["INFO".to_string()]).await {
+            Ok(RespValue::Bulk(info)) | Ok(RespValue::Simple(info)) => {
+                (kv_info_summary(&info), true)
+            }
+            Ok(other) => (format!("unexpected INFO reply: {other:?}"), true),
+            Err(e) => (format!("error: {e}"), false),
+        },
+        "kv_scan_keys" => {
+            let pattern = input
+                .get("pattern")
+                .and_then(Json::as_str)
+                .filter(|p| !p.is_empty());
+            let limit = input
+                .get("limit")
+                .and_then(Json::as_u64)
+                .map(|n| n as usize)
+                .unwrap_or(limits.max_rows.max(1))
+                .clamp(1, limits.max_rows.max(1));
+            match kv_collect_keys(driver, pattern, limit).await {
+                Ok((keys, exhausted)) => {
+                    if keys.is_empty() {
+                        ("No keys matched.".to_string(), true)
+                    } else {
+                        let mut out = format!("{} key(s):\n", keys.len());
+                        for k in &keys {
+                            out.push_str(&format!(
+                                "  {}  [{}, {}, ~{}]\n",
+                                k.key,
+                                k.kv_type.label(),
+                                kv_ttl(k.ttl),
+                                kv_bytes(k.approx_bytes),
+                            ));
+                        }
+                        if !exhausted && keys.len() >= limit {
+                            out.push_str(
+                                "(more keys may match; raise `limit` or narrow the pattern)\n",
+                            );
+                        }
+                        (out, true)
+                    }
+                }
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "kv_key_info" => {
+            let key = input.get("key").and_then(Json::as_str).unwrap_or("");
+            if key.is_empty() {
+                return ("error: `key` is required".into(), false);
+            }
+            match driver.probe_key(key).await {
+                Ok(Some(m)) => (
+                    format!(
+                        "{}\n  type: {}\n  ttl: {}\n  encoding: {}\n  memory: ~{}",
+                        m.key,
+                        m.kv_type.label(),
+                        kv_ttl(m.ttl),
+                        m.encoding,
+                        kv_bytes(m.approx_bytes),
+                    ),
+                    true,
+                ),
+                Ok(None) => (format!("key `{key}` does not exist"), true),
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "kv_get_value" => {
+            let key = input.get("key").and_then(Json::as_str).unwrap_or("");
+            if key.is_empty() {
+                return ("error: `key` is required".into(), false);
+            }
+            match driver.read_value(key).await {
+                Ok(Some(v)) => (
+                    cap_result_bytes(
+                        format!("{key} =\n{}", fmt_kv_value(&v)),
+                        limits.max_result_bytes,
+                    ),
+                    true,
+                ),
+                Ok(None) => (format!("key `{key}` does not exist"), true),
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "kv_biggest_keys" => {
+            let pattern = input
+                .get("pattern")
+                .and_then(Json::as_str)
+                .filter(|p| !p.is_empty());
+            let top = input
+                .get("top")
+                .and_then(Json::as_u64)
+                .map(|n| n as usize)
+                .unwrap_or(KV_BIGGEST_TOP)
+                .clamp(1, 200);
+            match kv_collect_keys(driver, pattern, KV_SAMPLE_MAX).await {
+                Ok((mut keys, exhausted)) => {
+                    let sampled = keys.len();
+                    keys.sort_by_key(|k| std::cmp::Reverse(k.approx_bytes));
+                    keys.truncate(top);
+                    let mut out = format!(
+                        "Top {} of {} sampled key(s) by memory{}:\n",
+                        keys.len(),
+                        sampled,
+                        if exhausted { "" } else { " (sample truncated)" },
+                    );
+                    for k in &keys {
+                        out.push_str(&format!(
+                            "  ~{}  {}  [{}, {}]\n",
+                            kv_bytes(k.approx_bytes),
+                            k.key,
+                            k.kv_type.label(),
+                            kv_ttl(k.ttl),
+                        ));
+                    }
+                    (out, true)
+                }
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "kv_analyze" => {
+            let pattern = input
+                .get("pattern")
+                .and_then(Json::as_str)
+                .filter(|p| !p.is_empty());
+            let total = driver.db_size().await.unwrap_or(0);
+            match kv_collect_keys(driver, pattern, KV_SAMPLE_MAX).await {
+                Ok((keys, exhausted)) => {
+                    let report = analyze_keyspace(&keys, total, !exhausted, 0);
+                    (kv_format_analysis(&report), true)
+                }
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "kv_slowlog" => {
+            let count = input
+                .get("count")
+                .and_then(Json::as_u64)
+                .map(|n| n as usize)
+                .unwrap_or(32)
+                .clamp(1, 256);
+            match driver.slowlog(count).await {
+                Ok(entries) if entries.is_empty() => ("The slow log is empty.".to_string(), true),
+                Ok(entries) => {
+                    let mut out = format!("{} slow-log entr(ies):\n", entries.len());
+                    for e in &entries {
+                        out.push_str(&format!(
+                            "  #{} {:.1}ms  {}\n",
+                            e.id,
+                            e.micros as f64 / 1000.0,
+                            e.argv.join(" "),
+                        ));
+                    }
+                    (cap_result_bytes(out, limits.max_result_bytes), true)
+                }
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "kv_config_get" => {
+            let param = input.get("parameter").and_then(Json::as_str).unwrap_or("");
+            if param.is_empty() {
+                return ("error: `parameter` is required".into(), false);
+            }
+            let argv = ["CONFIG".to_string(), "GET".to_string(), param.to_string()];
+            match driver.command(&argv).await {
+                Ok(RespValue::Array(items)) if items.is_empty() => {
+                    (format!("no CONFIG parameter matched `{param}`"), true)
+                }
+                Ok(RespValue::Array(items)) => {
+                    let mut out = String::new();
+                    for pair in items.chunks(2) {
+                        let k = resp_scalar(pair.first());
+                        let v = resp_scalar(pair.get(1));
+                        out.push_str(&format!("{k} = {v}\n"));
+                    }
+                    (out, true)
+                }
+                Ok(other) => (format!("unexpected CONFIG reply: {other:?}"), true),
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        // --- gated writes: run_turn already surfaced the Allow/Deny prompt and
+        // ran these only on approval; execute directly here.
+        "kv_expire" => {
+            let seconds = input.get("seconds").and_then(Json::as_i64);
+            let ttl = match seconds {
+                Some(s) if s > 0 => Some(Duration::from_secs(s as u64)),
+                _ => None,
+            };
+            let verb = if ttl.is_some() {
+                "Set expiry on"
+            } else {
+                "Removed expiry from"
+            };
+            if let Some(key) = input
+                .get("key")
+                .and_then(Json::as_str)
+                .filter(|k| !k.is_empty())
+            {
+                match driver.set_ttl(key, ttl).await {
+                    Ok(()) => (format!("{verb} `{key}`."), true),
+                    Err(e) => (format!("error: {e}"), false),
+                }
+            } else if let Some(pattern) = input
+                .get("pattern")
+                .and_then(Json::as_str)
+                .filter(|p| !p.is_empty())
+            {
+                match kv_collect_keys(driver, Some(pattern), KV_BULK_MAX).await {
+                    Ok((keys, exhausted)) => {
+                        let mut n = 0u64;
+                        for k in &keys {
+                            match driver.set_ttl(&k.key, ttl).await {
+                                Ok(()) => n += 1,
+                                Err(e) => return (format!("error after {n} key(s): {e}"), false),
+                            }
+                        }
+                        let more = if exhausted {
+                            ""
+                        } else {
+                            " (bound hit; run again for the rest)"
+                        };
+                        (
+                            format!("{verb} {n} key(s) matching `{pattern}`{more}."),
+                            true,
+                        )
+                    }
+                    Err(e) => (format!("error: {e}"), false),
+                }
+            } else {
+                ("error: kv_expire needs `key` or `pattern`".into(), false)
+            }
+        }
+        "kv_delete" => {
+            let mut targets: Vec<String> = Vec::new();
+            if let Some(k) = input
+                .get("key")
+                .and_then(Json::as_str)
+                .filter(|k| !k.is_empty())
+            {
+                targets.push(k.to_string());
+            }
+            if let Some(arr) = input.get("keys").and_then(Json::as_array) {
+                targets.extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
+            }
+            let mut note = "";
+            if targets.is_empty() {
+                if let Some(pattern) = input
+                    .get("pattern")
+                    .and_then(Json::as_str)
+                    .filter(|p| !p.is_empty())
+                {
+                    match kv_collect_keys(driver, Some(pattern), KV_BULK_MAX).await {
+                        Ok((keys, exhausted)) => {
+                            targets = keys.into_iter().map(|k| k.key).collect();
+                            if !exhausted {
+                                note = " (bound hit; run again for the rest)";
+                            }
+                        }
+                        Err(e) => return (format!("error: {e}"), false),
+                    }
+                }
+            }
+            if targets.is_empty() {
+                ("No keys matched; nothing deleted.".to_string(), true)
+            } else {
+                match driver.delete_keys(&targets).await {
+                    Ok(n) => (format!("Deleted {n} key(s){note}."), true),
+                    Err(e) => (format!("error: {e}"), false),
+                }
+            }
+        }
+        "kv_rename" => {
+            let from = input.get("from").and_then(Json::as_str).unwrap_or("");
+            let to = input.get("to").and_then(Json::as_str).unwrap_or("");
+            if from.is_empty() || to.is_empty() {
+                return ("error: kv_rename needs `from` and `to`".into(), false);
+            }
+            match driver.rename_key(from, to).await {
+                Ok(()) => (format!("Renamed `{from}` to `{to}`."), true),
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "kv_config_set" => {
+            let param = input.get("parameter").and_then(Json::as_str).unwrap_or("");
+            let value = input.get("value").and_then(Json::as_str).unwrap_or("");
+            if param.is_empty() {
+                return ("error: kv_config_set needs `parameter`".into(), false);
+            }
+            let argv = [
+                "CONFIG".to_string(),
+                "SET".to_string(),
+                param.to_string(),
+                value.to_string(),
+            ];
+            match driver.command(&argv).await {
+                Ok(_) => (format!("Applied CONFIG SET {param} {value}."), true),
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "generate_report" => run_generate_report(input, report),
+        other => (format!("error: unknown tool `{other}`"), false),
+    };
+    (content, ok)
+}
+
+/// The Redis agent's system prompt (the KV analogue of [`system_prompt`]): the
+/// same shape, but describing the `kv_*` tools and Redis idioms instead of SQL.
+/// Grounding is lazy — the model calls `kv_server_info`/`kv_scan_keys` rather
+/// than being handed a pre-built summary — so no per-turn keyspace context is
+/// needed.
+pub(crate) fn kv_system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
+    let tools_line = match policy.tier {
+        AiTier::Off => {
+            "You have NO Redis tools available; answer from the conversation alone and tell the \
+             user you cannot read the live server."
+        }
+        AiTier::Schema => {
+            "You have metadata-only Redis tools: kv_server_info, kv_scan_keys, and kv_key_info. \
+             You can see the server's stats and keys' types/TTLs/sizes but you CANNOT read a \
+             key's value."
+        }
+        AiTier::Read => {
+            "You have read-only Redis tools: kv_server_info (INFO summary), kv_scan_keys (find \
+             keys by glob pattern), kv_key_info (a key's type/TTL/encoding/size), kv_get_value (a \
+             key's value or a collection preview), kv_biggest_keys (sample for the largest keys by \
+             memory), kv_analyze (a keyspace rollup: memory by type and namespace, TTL coverage), \
+             kv_slowlog (recent slow commands), kv_config_get (read a CONFIG parameter), and \
+             generate_report (author an HTML report from what you've read, with optional Chart.js \
+             charts; it appears as a card the user can open — use it when the user asks for a \
+             report). Ground every answer in the live server with these tools rather than guessing."
+        }
+        AiTier::Write => {
+            "You have the read-only Redis tools (kv_server_info, kv_scan_keys, kv_key_info, \
+             kv_get_value, kv_biggest_keys, kv_analyze, kv_slowlog, kv_config_get, generate_report) \
+             AND gated write tools: kv_expire (set/remove a key's TTL), kv_delete (delete keys), \
+             kv_rename, and kv_config_set. Every write requires the user's explicit Allow on the \
+             exact operation; assume it may be denied. Before a bulk kv_delete/kv_expire by \
+             pattern, scan first (kv_scan_keys) and tell the user how many keys will be affected — \
+             a keyspace-wide delete or expire (pattern `*`) is refused outright. Only write when \
+             the user has asked you to change data."
+        }
+    };
+    let mut s = format!(
+        "You are Red's Redis agent, embedded in a native database explorer. You help the user \
+         explore and understand the Redis server they are connected to.\n\n\
+         {tools_line}\n\n\
+         Redis keys are addressed by glob patterns (e.g. `user:*`), not SQL — there are no tables \
+         or joins. Be concise: lead with the answer, then the supporting detail. When you show a \
+         command, put it in a fenced ```sh block (e.g. `redis-cli GET foo`).\n",
+    );
+    if !ctx.connection.is_empty() {
+        s.push_str(&format!("\nConnected to: {}", ctx.connection));
+    }
+    if ctx.read_only {
+        s.push_str("\nThis connection is READ-ONLY.");
+    }
+    s
+}
+
+/// Curate the giant INFO reply down to the fields that matter, plus a computed
+/// hit rate and the per-database key counts.
+fn kv_info_summary(info: &str) -> String {
+    let map: HashMap<&str, &str> = info
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.split_once(':'))
+        .collect();
+    let get = |k: &str| map.get(k).copied().unwrap_or("?");
+    let hits: f64 = get("keyspace_hits").parse().unwrap_or(0.0);
+    let misses: f64 = get("keyspace_misses").parse().unwrap_or(0.0);
+    let hit_rate = if hits + misses > 0.0 {
+        format!("{:.1}%", hits / (hits + misses) * 100.0)
+    } else {
+        "n/a".to_string()
+    };
+    let mut s = String::new();
+    s.push_str(&format!(
+        "Redis {} ({}), uptime {} days\n",
+        get("redis_version"),
+        get("redis_mode"),
+        get("uptime_in_days"),
+    ));
+    s.push_str(&format!(
+        "Memory: {} used, maxmemory {} (policy {}), fragmentation {}\n",
+        get("used_memory_human"),
+        get("maxmemory_human"),
+        get("maxmemory_policy"),
+        get("mem_fragmentation_ratio"),
+    ));
+    s.push_str(&format!(
+        "Clients: {} connected · {} ops/sec\n",
+        get("connected_clients"),
+        get("instantaneous_ops_per_sec"),
+    ));
+    s.push_str(&format!(
+        "Hit rate: {hit_rate} ({} hits / {} misses) · evicted {} · expired {}\n",
+        get("keyspace_hits"),
+        get("keyspace_misses"),
+        get("evicted_keys"),
+        get("expired_keys"),
+    ));
+    let dbs: Vec<&str> = info
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("db") && l.contains("keys="))
+        .collect();
+    if !dbs.is_empty() {
+        s.push_str("Keyspace:\n");
+        for db in dbs {
+            s.push_str(&format!("  {db}\n"));
+        }
+    }
+    s
+}
+
+/// Format a [`RedisAnalysis`] as compact text for the agent.
+fn kv_format_analysis(r: &red_core::kv::RedisAnalysis) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "Sampled {} of {} keys ({}), ~{} total.\n",
+        r.sampled,
+        r.total_keys,
+        if r.truncated {
+            "truncated sample"
+        } else {
+            "full walk"
+        },
+        kv_bytes(r.total_bytes),
+    ));
+    s.push_str("By type (memory):\n");
+    for t in &r.types {
+        s.push_str(&format!(
+            "  {}: {} keys, ~{}\n",
+            t.kv_type,
+            t.count,
+            kv_bytes(t.bytes),
+        ));
+    }
+    s.push_str("Top namespaces (memory):\n");
+    for n in r.namespaces.iter().take(15) {
+        s.push_str(&format!(
+            "  {}: {} keys, ~{}\n",
+            n.prefix,
+            n.count,
+            kv_bytes(n.bytes),
+        ));
+    }
+    let t = &r.ttl;
+    s.push_str(&format!(
+        "TTL: {} persistent (no expiry), {} with a TTL (<1h {}, <1d {}, <1w {}, >1w {})\n",
+        t.persistent,
+        t.with_ttl(),
+        t.under_hour,
+        t.under_day,
+        t.under_week,
+        t.over_week,
+    ));
+    s
+}
+
+/// Preview a [`KvValue`]: a string's contents, or a bounded element preview of a
+/// collection. Large collections report their length, not their contents.
+fn fmt_kv_value(v: &KvValue) -> String {
+    fn coll<T>(kind: &str, c: &KvCollection<T>, fmt: impl Fn(&T) -> String) -> String {
+        match c {
+            KvCollection::Loaded(items) => {
+                let shown = items.len().min(KV_VALUE_ELEMS);
+                let mut out = format!("{kind} with {} element(s):\n", items.len());
+                for it in items.iter().take(shown) {
+                    out.push_str(&format!("  {}\n", fmt(it)));
+                }
+                if items.len() > shown {
+                    out.push_str(&format!("  … {} more\n", items.len() - shown));
+                }
+                out
+            }
+            KvCollection::Large { len } => {
+                format!("{kind} with {len} element(s) (large; browse it to page the contents)")
+            }
+        }
+    }
+    match v {
+        KvValue::Str(val) => format!("string: {}", render_cell(val)),
+        KvValue::Hash(c) => coll("hash", c, |(f, val)| format!("{f} => {val}")),
+        KvValue::Set(c) => coll("set", c, |m| m.clone()),
+        KvValue::ZSet(c) => coll("zset", c, |(m, score)| format!("{m} ({score})")),
+        KvValue::List(c) => coll("list", c, |m| m.clone()),
+        KvValue::Stream(c) => match c {
+            KvCollection::Loaded(entries) => format!("stream with {} entr(ies)", entries.len()),
+            KvCollection::Large { len } => format!("stream with {len} entr(ies) (large)"),
+        },
+        KvValue::Unsupported(kt) => format!("(no value preview for type {})", kt.label()),
+    }
+}
+
+/// A RESP scalar as plain text (for CONFIG GET pairs).
+fn resp_scalar(v: Option<&RespValue>) -> String {
+    match v {
+        Some(RespValue::Bulk(s)) | Some(RespValue::Simple(s)) => s.clone(),
+        Some(RespValue::Int(i)) => i.to_string(),
+        Some(other) => format!("{other:?}"),
+        None => String::new(),
+    }
+}
+
+/// `"no expiry"` or a coarse remaining-time for a key's TTL.
+fn kv_ttl(ttl: Option<Duration>) -> String {
+    match ttl {
+        None => "no expiry".to_string(),
+        Some(d) => {
+            let s = d.as_secs();
+            if s < 60 {
+                format!("{s}s")
+            } else if s < 3600 {
+                format!("{}m", s / 60)
+            } else if s < 86_400 {
+                format!("{}h", s / 3600)
+            } else {
+                format!("{}d", s / 86_400)
+            }
+        }
+    }
+}
+
+/// Coarse human byte count for the agent's text output.
+fn kv_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    if n >= MB {
+        format!("{:.1}MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1}KB", n as f64 / KB as f64)
+    } else {
+        format!("{n}B")
+    }
+}
+
 pub(crate) async fn run_tool(
     driver: &Arc<dyn DatabaseDriver>,
     name: &str,
@@ -1224,86 +2190,7 @@ pub(crate) async fn run_tool(
                 Err(e) => (format!("error: {e}"), false),
             }
         }
-        "generate_report" => {
-            let body = input
-                .get("html")
-                .and_then(Json::as_str)
-                .unwrap_or("")
-                .trim();
-            if body.is_empty() {
-                return (
-                    "error: generate_report needs `html` (the report body you authored)".into(),
-                    false,
-                );
-            }
-            let title = input.get("title").and_then(Json::as_str);
-            // Optional interactive charts: keep only well-formed Chart.js spec
-            // objects. They are embedded as inert data and rendered by the trusted
-            // bundle (see `wrap_report_html`); anything that isn't an object is
-            // dropped rather than smuggled into the document.
-            let charts: Vec<Json> = input
-                .get("charts")
-                .and_then(Json::as_array)
-                .map(|items| items.iter().filter(|c| c.is_object()).cloned().collect())
-                .unwrap_or_default();
-            // Optional named datasets for interactive (filterable/sortable) tables
-            // and filter-linked charts. Kept only if it's an object map; embedded as
-            // inert data and rendered client-side by the trusted bundle.
-            let data = input.get("data").filter(|v| v.is_object());
-            // Optional report-wide filter controls (Grafana-style variables): a bar
-            // of multiselect/select/range/search controls bound to dataset columns
-            // that drive every table and bound chart at once. Objects only.
-            let filters: Vec<Json> = input
-                .get("filters")
-                .and_then(Json::as_array)
-                .map(|items| items.iter().filter(|c| c.is_object()).cloned().collect())
-                .unwrap_or_default();
-            // Wrap the model's HTML in a sandboxed, themed shell (strict CSP) and
-            // open it in the browser. With charts/data, the shell adds a nonce-gated
-            // bundle and a `connect-src 'none'` (no-egress) policy. The active app
-            // theme (if any) paints the report in Red's palette.
-            let html = wrap_report_html(title, body, &charts, data, &filters, report.theme());
-            // Refuse an oversized report by measuring the FINAL document (body + the
-            // re-serialized data + styles) rather than the raw inputs, so the cap
-            // reflects what the (non-virtualizing) renderer actually has to open. The
-            // chart bundle is a fixed ~250 KiB; discount it so the cap measures the
-            // model's contribution, not our constant overhead.
-            let report_bytes = html.len().saturating_sub(REPORT_CHARTS_JS.len());
-            if report_bytes > MAX_REPORT_BYTES {
-                return (
-                    format!(
-                        "error: the report is too large ({} KiB; the cap is {} KiB). Summarize or \
-                         aggregate the data, or narrow it with a tighter query, then try again.",
-                        report_bytes / 1024,
-                        MAX_REPORT_BYTES / 1024,
-                    ),
-                    false,
-                );
-            }
-            let path = report
-                .output_dir()
-                .join(format!("red-report-{}.html", uuid::Uuid::new_v4().simple()));
-            match write_report_file(&path, &html) {
-                Ok(()) => {
-                    // Hand the path to the UI, which surfaces it as a card the user can
-                    // open. Nothing is opened automatically.
-                    let clean_title = title.map(str::trim).filter(|t| !t.is_empty());
-                    report.announce(&path, clean_title);
-                    let label = clean_title.map(|t| format!(" “{t}”")).unwrap_or_default();
-                    (
-                        format!(
-                            "Generated the report{label}. It's now available as a card in the \
-                             chat for the user to open."
-                        ),
-                        true,
-                    )
-                }
-                Err(e) => (
-                    format!("error: could not write the report file: {e}"),
-                    false,
-                ),
-            }
-        }
+        "generate_report" => run_generate_report(input, report),
         "open_query" => {
             let sql = input.get("sql").and_then(Json::as_str).unwrap_or("").trim();
             if sql.is_empty() {
@@ -1558,6 +2445,15 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "open_query",
     // Writes a `.sql` file to the user's saved-queries library; no DB mutation.
     "save_query",
+    // Redis (KV) read tools: pure reads through the `KvDriver` seam.
+    "kv_server_info",
+    "kv_scan_keys",
+    "kv_key_info",
+    "kv_get_value",
+    "kv_biggest_keys",
+    "kv_analyze",
+    "kv_slowlog",
+    "kv_config_get",
 ];
 
 /// Whether `name` is a mutating tool: it never auto-runs and never auto-allows;
@@ -1600,6 +2496,9 @@ pub(crate) fn assess_write(name: &str, input: &Json, policy: &AiPolicy) -> Write
                 .into(),
         );
     }
+    if is_kv_write_tool(name) {
+        return assess_kv_write(name, input);
+    }
     if name == "propose_changeset" {
         return assess_changeset(input);
     }
@@ -1612,6 +2511,104 @@ pub(crate) fn assess_write(name: &str, input: &Json, policy: &AiPolicy) -> Write
             "propose_write is only for INSERT/UPDATE/DELETE; use run_select to read".into(),
         ),
         WriteShape::Blocked(why) => WriteAssessment::Reject(why.into()),
+    }
+}
+
+/// The Redis mutating tools (Feature B, KV backend): each rides the same per-call
+/// approval gate as a SQL write.
+const KV_WRITE_TOOLS: &[&str] = &["kv_expire", "kv_delete", "kv_rename", "kv_config_set"];
+
+fn is_kv_write_tool(name: &str) -> bool {
+    KV_WRITE_TOOLS.contains(&name)
+}
+
+/// Vet a Redis write tool for the approval gate: build the human-readable
+/// operation shown in the Allow/Deny prompt, and hard-block the catastrophic
+/// shapes (a keyspace-wide DELETE or EXPIRE) even with approval — mirroring the
+/// SQL gate's refusal of an unqualified UPDATE/DELETE. Tier + read-only were
+/// already checked by [`assess_write`].
+fn assess_kv_write(name: &str, input: &Json) -> WriteAssessment {
+    let s = |k: &str| {
+        input
+            .get(k)
+            .and_then(Json::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    match name {
+        "kv_expire" => {
+            let seconds = input.get("seconds").and_then(Json::as_i64);
+            let target = match (s("key"), s("pattern")) {
+                (Some(k), _) => format!("key `{k}`"),
+                (None, Some(p)) => {
+                    if p == "*" && seconds.is_some_and(|sec| sec > 0) {
+                        return WriteAssessment::Reject(
+                            "refusing to set a TTL on the entire keyspace (pattern `*`): this \
+                             would expire every key. Narrow the pattern."
+                                .into(),
+                        );
+                    }
+                    format!("all keys matching `{p}`")
+                }
+                (None, None) => {
+                    return WriteAssessment::Reject("kv_expire needs `key` or `pattern`".into())
+                }
+            };
+            let action = match seconds {
+                Some(sec) if sec > 0 => format!("EXPIRE {target} in {sec}s"),
+                _ => format!("PERSIST {target} (remove any expiry)"),
+            };
+            WriteAssessment::NeedsApproval { sql: action }
+        }
+        "kv_delete" => {
+            let keys: Vec<String> = input
+                .get("keys")
+                .and_then(Json::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(k) = s("key") {
+                WriteAssessment::NeedsApproval {
+                    sql: format!("DELETE key `{k}`"),
+                }
+            } else if !keys.is_empty() {
+                WriteAssessment::NeedsApproval {
+                    sql: format!("DELETE {} key(s): {}", keys.len(), keys.join(", ")),
+                }
+            } else if let Some(p) = s("pattern") {
+                if p == "*" {
+                    return WriteAssessment::Reject(
+                        "refusing to DELETE the entire keyspace (pattern `*`): use FLUSHDB by hand \
+                         if that's really intended. Narrow the pattern."
+                            .into(),
+                    );
+                }
+                WriteAssessment::NeedsApproval {
+                    sql: format!("DELETE all keys matching `{p}`"),
+                }
+            } else {
+                WriteAssessment::Reject("kv_delete needs `key`, `keys`, or `pattern`".into())
+            }
+        }
+        "kv_rename" => match (s("from"), s("to")) {
+            (Some(f), Some(t)) => WriteAssessment::NeedsApproval {
+                sql: format!("RENAME `{f}` -> `{t}`"),
+            },
+            _ => WriteAssessment::Reject("kv_rename needs `from` and `to`".into()),
+        },
+        "kv_config_set" => match (s("parameter"), input.get("value").and_then(Json::as_str)) {
+            // A CONFIG value may legitimately be empty (e.g. `save ""`), so `value`
+            // isn't filtered for emptiness like the others.
+            (Some(p), Some(v)) => WriteAssessment::NeedsApproval {
+                sql: format!("CONFIG SET {p} {v}"),
+            },
+            _ => WriteAssessment::Reject("kv_config_set needs `parameter` and `value`".into()),
+        },
+        other => WriteAssessment::Reject(format!("unknown KV write tool `{other}`")),
     }
 }
 
@@ -2539,6 +3536,19 @@ mod tests {
         assert!(!names.iter().any(|n| n == "propose_write"));
         assert!(!names.iter().any(|n| n == "spawn_subagent"));
         assert!(names.iter().any(|n| n == "run_select"));
+
+        // The Redis subagent catalog is likewise read-only and non-recursive:
+        // no KV writes, no spawn_subagent, but the KV read tools survive.
+        let kv: Vec<String> = kv_subagent_catalog(&AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        })
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+        assert!(!kv.iter().any(|n| n == "kv_delete"));
+        assert!(!kv.iter().any(|n| n == "spawn_subagent"));
+        assert!(kv.iter().any(|n| n == "kv_scan_keys"));
     }
 
     #[test]
@@ -3166,6 +4176,113 @@ mod tests {
     }
 
     #[test]
+    fn kv_read_tools_are_not_gated_as_writes() {
+        // Regression guard: the KV read tools must be in READ_ONLY_TOOLS, else the
+        // write gate would reject every one of them at Read tier.
+        let read = AiPolicy::default();
+        for t in [
+            "kv_server_info",
+            "kv_scan_keys",
+            "kv_key_info",
+            "kv_get_value",
+            "kv_biggest_keys",
+            "kv_analyze",
+            "kv_slowlog",
+            "kv_config_get",
+        ] {
+            assert!(!is_write_tool(t), "{t} must be read-only");
+            assert!(
+                matches!(
+                    assess_write(t, &json!({}), &read),
+                    WriteAssessment::NotWrite
+                ),
+                "{t} must not be gated as a write"
+            );
+        }
+    }
+
+    #[test]
+    fn kv_write_gate_prompts_shapes_and_refuses_keyspace_wide() {
+        let write = AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        };
+        // A single-key or scoped-pattern op prompts for approval.
+        assert!(matches!(
+            assess_write("kv_delete", &json!({ "key": "user:1" }), &write),
+            WriteAssessment::NeedsApproval { .. }
+        ));
+        assert!(matches!(
+            assess_write("kv_delete", &json!({ "pattern": "session:*" }), &write),
+            WriteAssessment::NeedsApproval { .. }
+        ));
+        assert!(matches!(
+            assess_write("kv_expire", &json!({ "key": "k", "seconds": 60 }), &write),
+            WriteAssessment::NeedsApproval { .. }
+        ));
+        assert!(matches!(
+            assess_write("kv_rename", &json!({ "from": "a", "to": "b" }), &write),
+            WriteAssessment::NeedsApproval { .. }
+        ));
+        // Keyspace-wide delete/expire is refused outright, even at Write tier.
+        assert!(matches!(
+            assess_write("kv_delete", &json!({ "pattern": "*" }), &write),
+            WriteAssessment::Reject(_)
+        ));
+        assert!(matches!(
+            assess_write(
+                "kv_expire",
+                &json!({ "pattern": "*", "seconds": 60 }),
+                &write
+            ),
+            WriteAssessment::Reject(_)
+        ));
+        // The write tools are rejected below Write tier and on a read-only conn.
+        assert!(matches!(
+            assess_write("kv_delete", &json!({ "key": "k" }), &AiPolicy::default()),
+            WriteAssessment::Reject(_)
+        ));
+        let write_ro = AiPolicy {
+            tier: AiTier::Write,
+            read_only: true,
+            ..AiPolicy::default()
+        };
+        assert!(matches!(
+            assess_write("kv_delete", &json!({ "key": "k" }), &write_ro),
+            WriteAssessment::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn kv_catalog_offers_writes_only_at_write_tier_and_not_read_only() {
+        let names = |p: AiPolicy| {
+            kv_tool_catalog(&p)
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+        };
+        // Read tier: reads only, no write tools.
+        let read = names(AiPolicy::default());
+        assert!(read.iter().any(|n| n == "kv_scan_keys"));
+        assert!(read.iter().all(|n| n != "kv_delete"));
+        // Write tier offers the write tools…
+        let write = names(AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        });
+        assert!(write.iter().any(|n| n == "kv_delete"));
+        assert!(write.iter().any(|n| n == "kv_config_set"));
+        // …but withholds them on a read-only connection.
+        let write_ro = names(AiPolicy {
+            tier: AiTier::Write,
+            read_only: true,
+            ..AiPolicy::default()
+        });
+        assert!(write_ro.iter().all(|n| n != "kv_delete"));
+        assert!(write_ro.iter().any(|n| n == "kv_scan_keys"));
+    }
+
+    #[test]
     fn write_approval_registry_parks_resolves_and_offsets_ids() {
         let mut st = AiState::default();
         let (tx, mut rx) = oneshot::channel();
@@ -3268,7 +4385,7 @@ mod tests {
 
         let turn = tokio::spawn(run_turn(
             provider,
-            driver.clone(),
+            AiBackend::Sql(driver.clone()),
             tx,
             state.clone(),
             None,

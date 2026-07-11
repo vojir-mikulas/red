@@ -336,11 +336,12 @@ impl AppState {
             .child(
                 div()
                     .flex_shrink_0()
+                    .flex()
                     .px_2()
                     .py_1p5()
                     .border_t_1()
                     .border_color(theme.border)
-                    .child(console.input.clone()),
+                    .child(div().flex_1().min_w(px(120.)).child(console.input.clone())),
             )
     }
 }

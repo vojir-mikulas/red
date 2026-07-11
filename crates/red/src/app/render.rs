@@ -503,7 +503,14 @@ impl Render for AppState {
                 this.open_external(crate::app::ISSUES_URL, cx)
             }))
             // --- staged grid editing (Track B6) ---
-            .on_action(cx.listener(|this, _: &BeginEdit, _, cx| this.begin_grid_edit(cx)))
+            // Enter/F2 in the "Table" context: on a Redis key list it opens the
+            // value inspector on the keyboard cursor; otherwise it begins an
+            // in-place SQL cell edit (the same binding, the right thing per pane).
+            .on_action(cx.listener(|this, _: &BeginEdit, window, cx| {
+                if !this.kv_activate_cursor(window, cx) {
+                    this.begin_grid_edit(cx);
+                }
+            }))
             // ⌘↵ in the grid submits staged changes; with nothing staged it falls
             // through to running the active query (so the key still does the
             // expected thing on a clean grid).
