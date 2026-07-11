@@ -84,16 +84,17 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let load = {
-            let Some(browse) = self
+            let Some(mon) = self
                 .conn_mut(Some(session))
-                .and_then(|a| a.kv_browse.as_mut())
+                .and_then(|a| a.kv_view.as_mut())
+                .and_then(|v| v.active_monitor_mut())
             else {
                 return;
             };
-            browse.monitor.view = view;
+            mon.view = view;
             match view {
-                MonitorView::Slowlog if !browse.monitor.slowlog_loaded => Some(true),
-                MonitorView::Clients if !browse.monitor.clients_loaded => Some(false),
+                MonitorView::Slowlog if !mon.slowlog_loaded => Some(true),
+                MonitorView::Clients if !mon.clients_loaded => Some(false),
                 _ => None,
             }
         };
@@ -107,14 +108,15 @@ impl AppState {
 
     /// Fetch (or refresh) the connected-clients list (`CLIENT LIST`).
     pub(crate) fn kv_load_clients(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(browse) = self
+        let Some(mon) = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_browse.as_mut())
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_monitor_mut())
         else {
             return;
         };
-        browse.monitor.clients_loading = true;
-        let epoch = browse.monitor.epoch;
+        mon.clients_loading = true;
+        let epoch = mon.epoch;
         self.service
             .send_to(session, Command::KvClientList { epoch });
         cx.notify();
@@ -123,14 +125,15 @@ impl AppState {
     /// Disconnect a client by id (`CLIENT KILL ID <id>`); the refreshed list
     /// comes back as a `KvClientListReady`.
     pub(crate) fn kv_kill_client(&mut self, session: SessionId, id: i64, cx: &mut Context<Self>) {
-        let Some(browse) = self
+        let Some(mon) = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_browse.as_mut())
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_monitor_mut())
         else {
             return;
         };
-        browse.monitor.clients_loading = true;
-        let epoch = browse.monitor.epoch;
+        mon.clients_loading = true;
+        let epoch = mon.epoch;
         self.service
             .send_to(session, Command::KvClientKill { epoch, id });
         cx.notify();
@@ -143,28 +146,30 @@ impl AppState {
         clients: Vec<ClientInfo>,
         cx: &mut Context<Self>,
     ) {
-        let Some(browse) = self.conn_mut(session).and_then(|a| a.kv_browse.as_mut()) else {
+        let Some(mon) = self
+            .conn_mut(session)
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.monitor_by_epoch_mut(epoch))
+        else {
             return;
         };
-        if browse.monitor.epoch != epoch {
-            return;
-        }
-        browse.monitor.clients = clients;
-        browse.monitor.clients_loaded = true;
-        browse.monitor.clients_loading = false;
+        mon.clients = clients;
+        mon.clients_loaded = true;
+        mon.clients_loading = false;
         cx.notify();
     }
 
     /// Fetch (or refresh) the slow log.
     pub(crate) fn kv_load_slowlog(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(browse) = self
+        let Some(mon) = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_browse.as_mut())
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_monitor_mut())
         else {
             return;
         };
-        browse.monitor.slowlog_loading = true;
-        let epoch = browse.monitor.epoch;
+        mon.slowlog_loading = true;
+        let epoch = mon.epoch;
         self.service.send_to(
             session,
             Command::KvSlowlog {
@@ -177,14 +182,15 @@ impl AppState {
 
     /// Clear the slow log (`SLOWLOG RESET`); the empty reply refreshes the view.
     pub(crate) fn kv_reset_slowlog(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(browse) = self
+        let Some(mon) = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_browse.as_mut())
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_monitor_mut())
         else {
             return;
         };
-        browse.monitor.slowlog_loading = true;
-        let epoch = browse.monitor.epoch;
+        mon.slowlog_loading = true;
+        let epoch = mon.epoch;
         self.service
             .send_to(session, Command::KvSlowlogReset { epoch });
         cx.notify();
@@ -197,32 +203,34 @@ impl AppState {
         entries: Vec<SlowlogEntry>,
         cx: &mut Context<Self>,
     ) {
-        let Some(browse) = self.conn_mut(session).and_then(|a| a.kv_browse.as_mut()) else {
+        let Some(mon) = self
+            .conn_mut(session)
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.monitor_by_epoch_mut(epoch))
+        else {
             return;
         };
-        if browse.monitor.epoch != epoch {
-            return;
-        }
-        browse.monitor.slowlog = entries;
-        browse.monitor.slowlog_loaded = true;
-        browse.monitor.slowlog_loading = false;
+        mon.slowlog = entries;
+        mon.slowlog_loaded = true;
+        mon.slowlog_loading = false;
         cx.notify();
     }
 
     /// Start the live `MONITOR` firehose.
     pub(crate) fn kv_start_monitor(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(browse) = self
+        let Some(mon) = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_browse.as_mut())
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_monitor_mut())
         else {
             return;
         };
-        if browse.monitor.monitoring {
+        if mon.monitoring {
             return;
         }
-        browse.monitor.monitoring = true;
-        browse.monitor.lines.clear();
-        let epoch = browse.monitor.epoch;
+        mon.monitoring = true;
+        mon.lines.clear();
+        let epoch = mon.epoch;
         self.service.send_to(session, Command::KvMonitor { epoch });
         cx.notify();
     }
@@ -230,17 +238,18 @@ impl AppState {
     /// Stop the live `MONITOR` (tears down the dedicated connection service-side
     /// via the generic epoch teardown).
     pub(crate) fn kv_stop_monitor(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(browse) = self
+        let Some(mon) = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_browse.as_mut())
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_monitor_mut())
         else {
             return;
         };
-        if !browse.monitor.monitoring {
+        if !mon.monitoring {
             return;
         }
-        browse.monitor.monitoring = false;
-        let epoch = browse.monitor.epoch;
+        mon.monitoring = false;
+        let epoch = mon.epoch;
         self.service
             .send_to(session, Command::CloseResult { epoch });
         cx.notify();
@@ -253,16 +262,20 @@ impl AppState {
         line: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(browse) = self.conn_mut(session).and_then(|a| a.kv_browse.as_mut()) else {
+        let Some(mon) = self
+            .conn_mut(session)
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.monitor_by_epoch_mut(epoch))
+        else {
             return;
         };
-        if browse.monitor.epoch != epoch || !browse.monitor.monitoring {
-            return; // superseded or already stopped
+        if !mon.monitoring {
+            return; // already stopped
         }
-        browse.monitor.lines.push(line);
-        if browse.monitor.lines.len() > MAX_LINES {
-            let drop = browse.monitor.lines.len() - MAX_LINES;
-            browse.monitor.lines.drain(0..drop);
+        mon.lines.push(line);
+        if mon.lines.len() > MAX_LINES {
+            let drop = mon.lines.len() - MAX_LINES;
+            mon.lines.drain(0..drop);
         }
         cx.notify();
     }
@@ -270,16 +283,16 @@ impl AppState {
     pub(crate) fn render_kv_monitor(
         &self,
         active: &ActiveConn,
+        tab_idx: usize,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme().clone();
         let session = active.session;
         let writable = !active.config.read_only;
-        let Some(browse) = &active.kv_browse else {
+        let Some(mon) = active.kv_view.as_ref().and_then(|v| v.monitor_at(tab_idx)) else {
             return div().flex_1();
         };
-        let mon = &browse.monitor;
 
         // The Slow-log / Live sub-toggle, mirroring the stream inspector's tabs.
         let tab = |label: &'static str, this_view: MonitorView| {

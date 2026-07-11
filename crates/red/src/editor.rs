@@ -28,14 +28,14 @@ pub(crate) struct TabDrag(pub usize);
 /// The floating chip rendered under the cursor while a tab is being dragged.
 /// GPUI's `on_drag` wants an `Entity<impl Render>`, so the tab strip mints one
 /// of these with the dragged tab's label.
-struct TabDragPreview {
-    title: SharedString,
+pub(crate) struct TabDragPreview {
+    pub(crate) title: SharedString,
     /// Grab offset within the tab, so the chip tracks the pointer (not the
     /// tab's top-left, where GPUI anchors the preview).
-    offset: Point<Pixels>,
-    bg: Hsla,
-    border: Hsla,
-    text: Hsla,
+    pub(crate) offset: Point<Pixels>,
+    pub(crate) bg: Hsla,
+    pub(crate) border: Hsla,
+    pub(crate) text: Hsla,
 }
 
 impl Render for TabDragPreview {

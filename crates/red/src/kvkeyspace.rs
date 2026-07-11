@@ -63,13 +63,14 @@ impl KvKeyspace {
 impl AppState {
     /// Fetch the current `notify-keyspace-events` setting (lazy, on first open).
     pub(crate) fn kv_keyspace_load_config(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(browse) = self
+        let Some(ks) = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_browse.as_mut())
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_keyspace_mut())
         else {
             return;
         };
-        let epoch = browse.keyspace.epoch;
+        let epoch = ks.epoch;
         self.service
             .send_to(session, Command::KvNotifyConfig { epoch });
         cx.notify();
@@ -79,13 +80,14 @@ impl AppState {
     /// notify-keyspace-events KEA`). Writable connections only; the fresh value
     /// comes back as a `KvNotifyConfigReady`.
     pub(crate) fn kv_keyspace_enable(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(browse) = self
+        let Some(ks) = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_browse.as_mut())
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_keyspace_mut())
         else {
             return;
         };
-        let epoch = browse.keyspace.epoch;
+        let epoch = ks.epoch;
         self.service.send_to(
             session,
             Command::KvSetNotifyConfig {
@@ -105,17 +107,18 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let restart = {
-            let Some(browse) = self
+            let Some(ks) = self
                 .conn_mut(Some(session))
-                .and_then(|a| a.kv_browse.as_mut())
+                .and_then(|a| a.kv_view.as_mut())
+                .and_then(|v| v.active_keyspace_mut())
             else {
                 return;
             };
-            if browse.keyspace.scope == scope {
+            if ks.scope == scope {
                 return;
             }
-            browse.keyspace.scope = scope;
-            browse.keyspace.watching
+            ks.scope = scope;
+            ks.watching
         };
         if restart {
             self.kv_keyspace_stop(session, cx);
@@ -126,19 +129,20 @@ impl AppState {
 
     /// Start watching: `PSUBSCRIBE` to the current scope's channel pattern.
     pub(crate) fn kv_keyspace_start(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(browse) = self
+        let Some(ks) = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_browse.as_mut())
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_keyspace_mut())
         else {
             return;
         };
-        if browse.keyspace.watching {
+        if ks.watching {
             return;
         }
-        browse.keyspace.watching = true;
-        browse.keyspace.events.clear();
-        let epoch = browse.keyspace.epoch;
-        let pattern = browse.keyspace.scope.pattern().to_string();
+        ks.watching = true;
+        ks.events.clear();
+        let epoch = ks.epoch;
+        let pattern = ks.scope.pattern().to_string();
         self.service
             .send_to(session, Command::KvSubscribe { epoch, pattern });
         cx.notify();
@@ -146,17 +150,18 @@ impl AppState {
 
     /// Stop watching (tears down the subscription connection service-side).
     pub(crate) fn kv_keyspace_stop(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(browse) = self
+        let Some(ks) = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_browse.as_mut())
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_keyspace_mut())
         else {
             return;
         };
-        if !browse.keyspace.watching {
+        if !ks.watching {
             return;
         }
-        browse.keyspace.watching = false;
-        let epoch = browse.keyspace.epoch;
+        ks.watching = false;
+        let epoch = ks.epoch;
         self.service
             .send_to(session, Command::CloseResult { epoch });
         cx.notify();
@@ -169,14 +174,15 @@ impl AppState {
         value: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(browse) = self.conn_mut(session).and_then(|a| a.kv_browse.as_mut()) else {
+        let Some(ks) = self
+            .conn_mut(session)
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.keyspace_by_epoch_mut(epoch))
+        else {
             return;
         };
-        if browse.keyspace.epoch != epoch {
-            return;
-        }
-        browse.keyspace.notify_config = Some(value);
-        browse.keyspace.config_loaded = true;
+        ks.notify_config = Some(value);
+        ks.config_loaded = true;
         cx.notify();
     }
 
@@ -191,19 +197,23 @@ impl AppState {
         payload: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(browse) = self.conn_mut(session).and_then(|a| a.kv_browse.as_mut()) else {
+        let Some(ks) = self
+            .conn_mut(session)
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.keyspace_by_epoch_mut(epoch))
+        else {
             return;
         };
-        if browse.keyspace.epoch != epoch || !browse.keyspace.watching {
+        if !ks.watching {
             return;
         }
         let Some(ev) = red_core::kv::parse_keyspace_channel(&channel, &payload) else {
             return; // not a keyspace notification (shouldn't happen for this pattern)
         };
-        browse.keyspace.events.push(ev);
-        if browse.keyspace.events.len() > MAX_EVENTS {
-            let drop = browse.keyspace.events.len() - MAX_EVENTS;
-            browse.keyspace.events.drain(0..drop);
+        ks.events.push(ev);
+        if ks.events.len() > MAX_EVENTS {
+            let drop = ks.events.len() - MAX_EVENTS;
+            ks.events.drain(0..drop);
         }
         cx.notify();
     }
@@ -211,16 +221,16 @@ impl AppState {
     pub(crate) fn render_kv_keyspace(
         &self,
         active: &ActiveConn,
+        tab_idx: usize,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme().clone();
         let session = active.session;
         let writable = !active.config.read_only;
-        let Some(browse) = &active.kv_browse else {
+        let Some(ks) = active.kv_view.as_ref().and_then(|v| v.keyspace_at(tab_idx)) else {
             return div().flex_1();
         };
-        let ks = &browse.keyspace;
 
         // Scope toggle (By event | By key), mirroring the diagnostics tabs.
         let tab = |label: &'static str, this_scope: KeyspaceScope| {

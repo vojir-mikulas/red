@@ -4,6 +4,23 @@
 
 use super::*;
 
+/// Next global tab index cycling within `pane_tabs` from `cur`, wrapping at the
+/// ends. `None` when there's nothing to switch to (≤1 tab). Shared by the SQL
+/// (`step_active_tab`) and Redis (`kv_step_tab`) tab-cycling so the wrap math
+/// lives in one place.
+pub(crate) fn cycle_tab_index(pane_tabs: &[usize], cur: usize, forward: bool) -> Option<usize> {
+    if pane_tabs.len() <= 1 {
+        return None;
+    }
+    let pos = pane_tabs.iter().position(|&g| g == cur).unwrap_or(0);
+    let n = pane_tabs.len();
+    Some(if forward {
+        pane_tabs[(pos + 1) % n]
+    } else {
+        pane_tabs[(pos + n - 1) % n]
+    })
+}
+
 impl AppState {
     // --- query tabs ---
 
@@ -186,6 +203,14 @@ impl AppState {
     /// nowhere. The palette path has no `Window` to move focus, but it cycles
     /// from the palette (not the editor), so there's nothing to follow.
     fn cycle_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // A Redis connection has no editor to chase focus for; step its tabs.
+        if let Phase::Connected(a) = &self.phase {
+            if a.kv_view.is_some() {
+                let session = a.session;
+                self.kv_step_tab(session, forward, cx);
+                return;
+            }
+        }
         let editor_focused = matches!(
             &self.phase,
             Phase::Connected(active)
@@ -210,16 +235,9 @@ impl AppState {
             // Cycle within the focused pane's own tabs (each half has its own set).
             let half = active.focused_half();
             let pane_tabs = active.pane_tab_indices(half);
-            if pane_tabs.len() <= 1 {
-                return false;
-            }
             let cur = active.focused_tab_index();
-            let pos = pane_tabs.iter().position(|&g| g == cur).unwrap_or(0);
-            let n = pane_tabs.len();
-            let next = if forward {
-                pane_tabs[(pos + 1) % n]
-            } else {
-                pane_tabs[(pos + n - 1) % n]
+            let Some(next) = cycle_tab_index(&pane_tabs, cur, forward) else {
+                return false;
             };
             active.set_focused_tab(next);
             active.tab_scroll.scroll_to_item(next);
@@ -232,6 +250,14 @@ impl AppState {
     /// Close the focused tab (the ⌘W binding); routes through the same
     /// pristine-or-confirm path as the tab's × button. No-op with no open tab.
     pub(crate) fn close_active_tab(&mut self, cx: &mut Context<Self>) {
+        // Redis: close the focused tab of the focused half.
+        if let Phase::Connected(a) = &self.phase {
+            if let Some(v) = &a.kv_view {
+                let (session, idx) = (a.session, v.focused_tab_index());
+                self.kv_close_tab(session, idx, cx);
+                return;
+            }
+        }
         let index = match &self.phase {
             Phase::Connected(active) if active.active().is_some() => active.active_tab,
             _ => return,
@@ -246,6 +272,14 @@ impl AppState {
 
     /// Open a blank query tab (the tab-strip "＋" action).
     pub(crate) fn new_query(&mut self, cx: &mut Context<Self>) {
+        // A Redis connection has no SQL editor; ⌘T opens a blank Redis tab.
+        if let Phase::Connected(a) = &self.phase {
+            if a.kv_view.is_some() {
+                let session = a.session;
+                self.kv_new_empty_tab(session, cx);
+                return;
+            }
+        }
         let tab = match &mut self.phase {
             Phase::Connected(active) => {
                 active.query_seq += 1;

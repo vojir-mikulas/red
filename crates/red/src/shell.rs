@@ -551,6 +551,582 @@ impl AppState {
             .child(topbar_right)
     }
 
+    /// The Redis work body: one pane, or two side-by-side halves when split.
+    fn render_kv_body(
+        &self,
+        active: &ActiveConn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some(v) = active.kv_view.as_ref() else {
+            return div().flex_1().into_any_element();
+        };
+        let Some(s) = v.split.as_ref() else {
+            let idx = v.active_tab;
+            return self.render_kv_half(active, SplitHalf::Primary, idx, true, window, cx);
+        };
+        let (focus, width, drag) = (s.focus, s.width, s.drag);
+        let primary_focused = focus == SplitHalf::Primary;
+        let primary_tab = v.pane_active(SplitHalf::Primary).unwrap_or(v.active_tab);
+        let secondary_tab = v.pane_active(SplitHalf::Secondary).unwrap_or(s.secondary);
+        let first = self.render_kv_half(
+            active,
+            SplitHalf::Primary,
+            primary_tab,
+            primary_focused,
+            window,
+            cx,
+        );
+        let second = self.render_kv_half(
+            active,
+            SplitHalf::Secondary,
+            secondary_tab,
+            !primary_focused,
+            window,
+            cx,
+        );
+        let start = cx.entity().downgrade();
+        let resize = start.clone();
+        let end = start.clone();
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .child(
+                SplitPane::new("kv-split-halves", Axis::Horizontal)
+                    .size(width)
+                    .gutter(px(1.))
+                    .drag(drag)
+                    .min_first(px(320.))
+                    .on_drag_start(move |anchor, _, cx| {
+                        start
+                            .update(cx, |this, cx| {
+                                if let Phase::Connected(a) = &mut this.phase {
+                                    if let Some(v) = &mut a.kv_view {
+                                        if let Some(s) = &mut v.split {
+                                            s.drag = Some(anchor);
+                                        }
+                                    }
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+                    .on_resize(move |size, _, cx| {
+                        resize
+                            .update(cx, |this, cx| {
+                                if let Phase::Connected(a) = &mut this.phase {
+                                    if let Some(v) = &mut a.kv_view {
+                                        if let Some(s) = &mut v.split {
+                                            s.width = size;
+                                        }
+                                    }
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+                    .on_drag_end(move |_, cx| {
+                        end.update(cx, |this, cx| {
+                            if let Phase::Connected(a) = &mut this.phase {
+                                if let Some(v) = &mut a.kv_view {
+                                    if let Some(s) = &mut v.split {
+                                        s.drag = None;
+                                    }
+                                }
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .first(first)
+                    .second(second),
+            )
+            .into_any_element()
+    }
+
+    /// One split half: its own tab strip (only this half's tabs, styled 1:1 with
+    /// the SQL editor's strip) over the active tab's panel body. A mouse-down
+    /// anywhere in the half focuses it, so buttons/inputs act on the half the
+    /// user just touched (the focus-aware `active_*` routing; see
+    /// docs/plans/redis-workflow-parity.md).
+    fn render_kv_half(
+        &self,
+        active: &ActiveConn,
+        half: SplitHalf,
+        tab_idx: usize,
+        focused: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use crate::editor::{TabDrag, TabDragPreview};
+        use crate::kvbrowse::KvPanel;
+        let theme = cx.theme().clone();
+        // Snapshot the same tokens/sizes the SQL strip uses, so the two tab bars
+        // are pixel-identical (see `render_editor`).
+        let (bg_app, bg_panel, bg_elevated, bg_hover) = (
+            theme.bg_app,
+            theme.bg_panel,
+            theme.bg_elevated,
+            theme.bg_hover,
+        );
+        let border = theme.border;
+        let (text, muted, faint) = (theme.text, theme.text_muted, theme.text_faint);
+        let accent = theme.accent;
+        let icon_close = theme.scale(9.);
+        let ui_family = theme.font_family.clone();
+        let size_12 = theme.scale(12.);
+        let view = cx.entity().downgrade();
+        let session = active.session;
+        let Some(v) = active.kv_view.as_ref() else {
+            return div().flex_1().into_any_element();
+        };
+        let is_split = v.split.is_some();
+
+        let active_idx = v.pane_active(half);
+        let pane_indices = v.pane_tab_indices(half);
+        let last_in_pane = pane_indices.last().copied();
+        let drop_target = v.tab_drop_target;
+        let dragging = cx.has_active_drag();
+        let (pinned_indices, unpinned_indices): (Vec<usize>, Vec<usize>) = pane_indices
+            .iter()
+            .copied()
+            .partition(|&i| v.tabs[i].pinned);
+
+        let render_tab = |i: usize| {
+            let t = &v.tabs[i];
+            let is_active = Some(i) == active_idx;
+            let pinned = t.pinned;
+            let id = t.id;
+            let (tab_bg, tab_text) = if is_active {
+                (bg_app, text)
+            } else {
+                (bg_panel, muted)
+            };
+            let drag_title: SharedString = t.title.clone().into();
+            let move_view = view.clone();
+            let drop_view = view.clone();
+            let group = SharedString::from(format!("kv-tab-{i}"));
+            let bar_before = dragging && drop_target == Some(i);
+            let bar_after = dragging && Some(i) == last_in_pane && drop_target == Some(i + 1);
+            div()
+                .id(("kv-tab", i))
+                .group(group.clone())
+                .relative()
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .min_w(px(96.))
+                .max_w(px(200.))
+                .px(px(23.))
+                .bg(tab_bg)
+                .border_r_1()
+                .border_color(border)
+                .cursor_pointer()
+                .when(!is_active, |d| d.hover(|s| s.bg(bg_elevated)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.kv_set_split_focus(session, half, cx);
+                    this.kv_activate_tab(session, i, cx);
+                }))
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(move |this, _, _, cx| {
+                        if !pinned {
+                            this.kv_close_tab(session, i, cx);
+                        }
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        let pos = event.position;
+                        this.kv_open_tab_menu(session, id, pos, cx);
+                    }),
+                )
+                .on_drag(TabDrag(i), move |_, offset, _window, cx| {
+                    let title = drag_title.clone();
+                    cx.new(move |_| TabDragPreview {
+                        title,
+                        offset,
+                        bg: bg_elevated,
+                        border,
+                        text,
+                    })
+                })
+                .on_drag_move::<TabDrag>(move |e, _window, cx| {
+                    let b = e.bounds;
+                    let p = e.event.position;
+                    if p.x < b.origin.x
+                        || p.x >= b.origin.x + b.size.width
+                        || p.y < b.origin.y
+                        || p.y >= b.origin.y + b.size.height
+                    {
+                        return;
+                    }
+                    let gap = if p.x < b.origin.x + b.size.width / 2. {
+                        i
+                    } else {
+                        i + 1
+                    };
+                    move_view
+                        .update(cx, |this, cx| this.kv_set_tab_drop_target(session, gap, cx))
+                        .ok();
+                })
+                .on_drop::<TabDrag>(move |drag, _window, cx| {
+                    let from = drag.0;
+                    cx.stop_propagation();
+                    drop_view
+                        .update(cx, |this, cx| this.kv_drop_tab(session, from, half, cx))
+                        .ok();
+                })
+                .when(bar_before, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(2.))
+                            .bg(accent),
+                    )
+                })
+                .when(bar_after, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .right_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(2.))
+                            .bg(accent),
+                    )
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_1()
+                        .min_w_0()
+                        .when(pinned, |d| {
+                            d.child(crate::icons::icon("pin", icon_close, faint))
+                        })
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .font_family(ui_family.clone())
+                                .text_size(size_12)
+                                .text_color(tab_text)
+                                .child(t.title.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .right(px(4.))
+                        .top_0()
+                        .bottom_0()
+                        .flex()
+                        .items_center()
+                        .invisible()
+                        .group_hover(group, |s| s.visible())
+                        .child(
+                            div()
+                                .id(("kv-tab-close", i))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(15.))
+                                .rounded(px(3.))
+                                .text_color(faint)
+                                .hover(|s| s.bg(bg_hover).text_color(text))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.kv_close_tab(session, i, cx);
+                                }))
+                                .child(crate::icons::icon("close", icon_close, faint)),
+                        ),
+                )
+        };
+        let pinned_tabs: Vec<_> = pinned_indices.iter().map(|&i| render_tab(i)).collect();
+        let unpinned_tabs: Vec<_> = unpinned_indices.iter().map(|&i| render_tab(i)).collect();
+        let strip_move_view = view.clone();
+        let strip_drop_view = view.clone();
+        let tab_viewport = div()
+            .id("kv-tabstrip")
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .flex()
+            .items_stretch()
+            .overflow_x_scroll()
+            .track_scroll(&v.tab_scroll)
+            .on_drag_move::<TabDrag>(move |e, _window, cx| {
+                let b = e.bounds;
+                let p = e.event.position;
+                let outside = p.y < b.origin.y || p.y >= b.origin.y + b.size.height;
+                if outside {
+                    strip_move_view
+                        .update(cx, |this, cx| this.kv_clear_tab_drop_target(session, cx))
+                        .ok();
+                }
+            })
+            .on_drop::<TabDrag>(move |drag, _window, cx| {
+                let from = drag.0;
+                cx.stop_propagation();
+                strip_drop_view
+                    .update(cx, |this, cx| this.kv_drop_tab(session, from, half, cx))
+                    .ok();
+            })
+            .children(unpinned_tabs);
+        let pinned_strip = (!pinned_tabs.is_empty()).then(|| {
+            div()
+                .id("kv-tabstrip-pinned")
+                .flex_shrink_0()
+                .h_full()
+                .flex()
+                .items_stretch()
+                .children(pinned_tabs)
+        });
+        let strip = div()
+            .flex_shrink_0()
+            .h(px(35.))
+            .flex()
+            .items_stretch()
+            .bg(bg_panel)
+            .border_b_1()
+            .border_color(border)
+            .children(pinned_strip)
+            .child(tab_viewport)
+            .child(
+                div()
+                    .id("kv-new")
+                    .flex_shrink_0()
+                    .w(px(34.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .border_l_1()
+                    .border_color(border)
+                    .cursor_pointer()
+                    .tooltip(Tooltip::text(crate::keymap::localize_hint("New tab  ⌘T")))
+                    .text_color(faint)
+                    .hover(|s| s.bg(bg_elevated).text_color(text))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.kv_set_split_focus(session, half, cx);
+                        this.kv_new_empty_tab(session, cx);
+                    }))
+                    .child(crate::icons::icon("plus", theme.scale(13.), faint)),
+            );
+
+        let panel = match v.tabs.get(tab_idx).map(|t| t.state.kind()) {
+            Some(Some(KvPanel::Browse)) => self
+                .render_kv_browse(active, tab_idx, window, cx)
+                .into_any_element(),
+            Some(Some(KvPanel::Console)) => self
+                .render_kv_console(active, tab_idx, window, cx)
+                .into_any_element(),
+            Some(Some(KvPanel::PubSub)) => self
+                .render_kv_pubsub(active, tab_idx, window, cx)
+                .into_any_element(),
+            Some(Some(KvPanel::Monitor)) => self
+                .render_kv_monitor(active, tab_idx, window, cx)
+                .into_any_element(),
+            Some(Some(KvPanel::Analysis)) => self
+                .render_kv_analysis(active, tab_idx, window, cx)
+                .into_any_element(),
+            Some(Some(KvPanel::Keyspace)) => self
+                .render_kv_keyspace(active, tab_idx, window, cx)
+                .into_any_element(),
+            // A blank tab (`None` kind): show the type chooser in the body.
+            Some(None) => self
+                .render_kv_new_tab(active, tab_idx, cx)
+                .into_any_element(),
+            None => div().flex_1().into_any_element(),
+        };
+
+        let focus_view = view.clone();
+        div()
+            .flex_1()
+            .min_w_0()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .when(is_split && focused, |d| {
+                d.border_1().border_color(accent.opacity(0.5))
+            })
+            .when(is_split && !focused, |d| d.border_1().border_color(border))
+            .when(is_split, |d| {
+                d.on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    focus_view
+                        .update(cx, |this, cx| this.kv_set_split_focus(session, half, cx))
+                        .ok();
+                })
+            })
+            .child(strip)
+            .child(div().flex_1().min_h(px(0.)).flex().child(panel))
+            .into_any_element()
+    }
+
+    /// The blank-tab body: a centered chooser of the six panel kinds. Picking one
+    /// converts this tab in place (see [`AppState::kv_set_tab_kind`]).
+    fn render_kv_new_tab(
+        &self,
+        active: &ActiveConn,
+        tab_idx: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        use crate::kvbrowse::KvPanel;
+        let theme = cx.theme().clone();
+        let session = active.session;
+        let id = active
+            .kv_view
+            .as_ref()
+            .and_then(|v| v.tabs.get(tab_idx))
+            .map(|t| t.id)
+            .unwrap_or(0);
+        // A one-line hint per kind, so the blank tab explains the choices.
+        let choices: [(KvPanel, &str); 6] = [
+            (KvPanel::Browse, "Scan and inspect keys"),
+            (KvPanel::Console, "Run raw commands (redis-cli)"),
+            (KvPanel::PubSub, "Watch published messages"),
+            (KvPanel::Monitor, "Slow log · live MONITOR · clients"),
+            (KvPanel::Analysis, "Keyspace memory/TTL report"),
+            (KvPanel::Keyspace, "Live keyspace notifications"),
+        ];
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_4()
+            .bg(theme.bg_app)
+            .child(
+                div()
+                    .font_family(theme.font_family.clone())
+                    .text_size(theme.scale(13.))
+                    .text_color(theme.text_muted)
+                    .child("Choose what to open in this tab"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .justify_center()
+                    .gap_3()
+                    .max_w(px(560.))
+                    .children(choices.into_iter().map(|(kind, hint)| {
+                        let view = cx.entity().downgrade();
+                        div()
+                            .id(SharedString::from(format!("kv-choose-{}", kind.label())))
+                            .w(px(168.))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .p_3()
+                            .rounded(px(8.))
+                            .bg(theme.bg_panel)
+                            .border_1()
+                            .border_color(theme.border)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.bg_elevated).border_color(theme.accent))
+                            .child(
+                                div()
+                                    .font_family(theme.font_family.clone())
+                                    .text_size(theme.scale(12.5))
+                                    .text_color(theme.text)
+                                    .child(kind.label()),
+                            )
+                            .child(
+                                div()
+                                    .font_family(theme.font_family.clone())
+                                    .text_size(theme.scale(11.))
+                                    .text_color(theme.text_muted)
+                                    .child(hint.to_string()),
+                            )
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.kv_set_tab_kind(session, id, kind, cx)
+                                })
+                                .ok();
+                            })
+                    })),
+            )
+    }
+
+    /// The tab right-click context menu (Pin/Unpin · Close · Move to other pane).
+    fn render_kv_tab_menu(
+        &self,
+        active: &ActiveConn,
+        id: u64,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let session = active.session;
+        let (pinned, is_split) = active
+            .kv_view
+            .as_ref()
+            .map(|v| {
+                let pinned = v
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.pinned)
+                    .unwrap_or(false);
+                (pinned, v.split.is_some())
+            })
+            .unwrap_or((false, false));
+        let closable = active
+            .kv_view
+            .as_ref()
+            .map(|v| v.tabs.len() > 1)
+            .unwrap_or(false);
+        let move_label = if is_split {
+            "Move to other pane"
+        } else {
+            "Open in split"
+        };
+        let menu = ContextMenu::new("kv-tab-context-menu")
+            .item(
+                ContextMenuItem::new("kv-tab-pin", if pinned { "Unpin tab" } else { "Pin tab" })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.kv_toggle_tab_pin(session, id, cx);
+                    })),
+            )
+            .item(
+                ContextMenuItem::new("kv-tab-move", move_label).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.kv_move_tab_to_other_half(session, id, cx);
+                    },
+                )),
+            )
+            .separator()
+            .item(
+                ContextMenuItem::new("kv-tab-close", "Close")
+                    .disabled(!closable)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.kv_close_tab_by_id(session, id, cx);
+                    })),
+            );
+        // A full-bleed catcher dismisses the menu on any outside click.
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.kv_close_tab_menu(session, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| this.kv_close_tab_menu(session, cx)),
+            )
+            .child(div().absolute().left(pos.x).top(pos.y).child(menu))
+            .into_any_element()
+    }
+
     /// The connected shell for a Redis (KV) session: the same top bar as the
     /// SQL workspace: the keyspace browser (R1, see docs/plans/redis.md)
     /// instead of the editor/grid/schema tree, which all assume a
@@ -564,84 +1140,22 @@ impl AppState {
         let theme = cx.theme().clone();
         let view = cx.entity().downgrade();
         let config = &active.config;
-        let session = active.session;
 
         let topbar = self.render_topbar(&theme, &view, window, cx);
 
-        let panel = active
-            .kv_browse
+        // The work body: one pane, or two side-by-side halves when split. The
+        // tab context menu (if open) overlays the whole thing.
+        let work = self.render_kv_body(active, window, cx);
+        let menu = active
+            .kv_view
             .as_ref()
-            .map(|b| b.panel)
-            .unwrap_or(crate::kvbrowse::KvPanel::Browse);
-        let tabs = div()
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .pt_1()
-            .children(
-                [
-                    (crate::kvbrowse::KvPanel::Browse, "Browse"),
-                    (crate::kvbrowse::KvPanel::Console, "Console"),
-                    (crate::kvbrowse::KvPanel::PubSub, "Pub/Sub"),
-                    (crate::kvbrowse::KvPanel::Monitor, "Monitor"),
-                    (crate::kvbrowse::KvPanel::Analysis, "Analysis"),
-                    (crate::kvbrowse::KvPanel::Keyspace, "Keyspace"),
-                ]
-                .into_iter()
-                .map(|(kind, label)| {
-                    let active_tab = kind == panel;
-                    let tab_view = view.clone();
-                    div()
-                        .id(SharedString::from(format!("kv-panel-tab-{label}")))
-                        .px_2()
-                        .py_1()
-                        .rounded(px(6.))
-                        .cursor_pointer()
-                        .text_size(theme.scale(11.5))
-                        .text_color(if active_tab {
-                            theme.text
-                        } else {
-                            theme.text_muted
-                        })
-                        .when(active_tab, |d| d.bg(theme.bg_elevated))
-                        .child(label)
-                        .on_click(move |_, _, cx| {
-                            tab_view
-                                .update(cx, |this, cx| this.kv_set_panel(session, kind, cx))
-                                .ok();
-                        })
-                }),
-            );
-
-        let panel_body = match panel {
-            crate::kvbrowse::KvPanel::Browse => {
-                self.render_kv_browse(active, window, cx).into_any_element()
-            }
-            crate::kvbrowse::KvPanel::Console => self
-                .render_kv_console(active, window, cx)
-                .into_any_element(),
-            crate::kvbrowse::KvPanel::PubSub => {
-                self.render_kv_pubsub(active, window, cx).into_any_element()
-            }
-            crate::kvbrowse::KvPanel::Monitor => self
-                .render_kv_monitor(active, window, cx)
-                .into_any_element(),
-            crate::kvbrowse::KvPanel::Analysis => self
-                .render_kv_analysis(active, window, cx)
-                .into_any_element(),
-            crate::kvbrowse::KvPanel::Keyspace => self
-                .render_kv_keyspace(active, window, cx)
-                .into_any_element(),
-        };
+            .and_then(|v| v.tab_menu)
+            .map(|(id, pos)| self.render_kv_tab_menu(active, id, pos, cx));
         let body = div()
             .flex_1()
             .min_h(px(0.))
             .flex()
-            .flex_col()
-            .child(tabs)
-            .child(div().flex_1().min_h(px(0.)).flex().child(panel_body))
+            .child(work)
             .into_any_element();
 
         let statusbar = div()
@@ -679,8 +1193,11 @@ impl AppState {
                     .child(format!("{} {}", config.kind, active.version)),
             );
 
+        // The tab context menu overlays the whole shell, positioned in window
+        // coordinates (from the right-click), so it mounts at the root.
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(theme.bg_app)
@@ -688,6 +1205,7 @@ impl AppState {
             .child(topbar)
             .child(body)
             .child(statusbar)
+            .children(menu)
     }
 
     /// The work area right of the schema dock: a single editor/result pane, or,

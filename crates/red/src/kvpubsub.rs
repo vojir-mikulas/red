@@ -42,35 +42,37 @@ impl KvPubSub {
 
 impl AppState {
     pub(crate) fn kv_subscribe(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(active) = self.conn_mut(Some(session)) else {
+        let Some(pubsub) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_pubsub_mut())
+        else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
-            return;
-        };
-        let pattern = browse.pubsub.pattern_input.read(cx).content().to_string();
+        let pattern = pubsub.pattern_input.read(cx).content().to_string();
         if pattern.is_empty() {
             return;
         }
-        browse.pubsub.subscribed = Some(pattern.clone());
-        browse.pubsub.messages.clear();
-        let epoch = browse.pubsub.epoch;
+        pubsub.subscribed = Some(pattern.clone());
+        pubsub.messages.clear();
+        let epoch = pubsub.epoch;
         self.service
             .send_to(session, Command::KvSubscribe { epoch, pattern });
         cx.notify();
     }
 
     pub(crate) fn kv_unsubscribe(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(active) = self.conn_mut(Some(session)) else {
+        let Some(pubsub) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_pubsub_mut())
+        else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
-            return;
-        };
-        if browse.pubsub.subscribed.take().is_none() {
+        if pubsub.subscribed.take().is_none() {
             return;
         }
-        let epoch = browse.pubsub.epoch;
+        let epoch = pubsub.epoch;
         self.service
             .send_to(session, Command::CloseResult { epoch });
         cx.notify();
@@ -84,25 +86,30 @@ impl AppState {
         payload: String,
         cx: &mut Context<Self>,
     ) {
-        let is_pubsub = {
-            let Some(browse) = self.conn_mut(session).and_then(|a| a.kv_browse.as_mut()) else {
-                return;
-            };
-            browse.pubsub.epoch == epoch && browse.pubsub.subscribed.is_some()
-        };
-        // The keyspace watcher rides the same `KvMessage` path on its own epoch;
-        // route there when this isn't a Pub/Sub-monitor message.
+        // Route by epoch across tabs: a message can target a background
+        // Pub/Sub tab. If no Pub/Sub tab owns this epoch, it's a keyspace
+        // watcher message (that rides the same `KvMessage` path on its own
+        // epoch) — hand it off.
+        let is_pubsub = self
+            .conn_mut(session)
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.pubsub_by_epoch_mut(epoch))
+            .is_some_and(|p| p.subscribed.is_some());
         if !is_pubsub {
             self.on_kv_keyspace_message(session, epoch, channel, payload, cx);
             return;
         }
-        let Some(browse) = self.conn_mut(session).and_then(|a| a.kv_browse.as_mut()) else {
+        let Some(pubsub) = self
+            .conn_mut(session)
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.pubsub_by_epoch_mut(epoch))
+        else {
             return;
         };
-        browse.pubsub.messages.push(KvMessage { channel, payload });
-        if browse.pubsub.messages.len() > MAX_MESSAGES {
-            let drop = browse.pubsub.messages.len() - MAX_MESSAGES;
-            browse.pubsub.messages.drain(0..drop);
+        pubsub.messages.push(KvMessage { channel, payload });
+        if pubsub.messages.len() > MAX_MESSAGES {
+            let drop = pubsub.messages.len() - MAX_MESSAGES;
+            pubsub.messages.drain(0..drop);
         }
         cx.notify();
     }
@@ -110,16 +117,16 @@ impl AppState {
     pub(crate) fn render_kv_pubsub(
         &self,
         active: &ActiveConn,
+        tab_idx: usize,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme().clone();
         let session = active.session;
         let view = cx.entity().downgrade();
-        let Some(browse) = &active.kv_browse else {
+        let Some(pubsub) = active.kv_view.as_ref().and_then(|v| v.pubsub_at(tab_idx)) else {
             return div().flex_1();
         };
-        let pubsub = &browse.pubsub;
 
         let subscribed = pubsub.subscribed.is_some();
         let toggle = if subscribed {

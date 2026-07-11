@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use flint::prelude::*;
 use gpui::{
-    div, prelude::*, px, relative, AsyncApp, Context, Entity, Hsla, SharedString,
+    div, prelude::*, px, relative, AsyncApp, Context, Entity, Hsla, ScrollHandle, SharedString,
     UniformListScrollHandle, WeakEntity, Window,
 };
 use red_core::kv::{
@@ -22,7 +22,7 @@ use red_core::kv::{
 };
 use red_service::{Command, SessionId};
 
-use crate::app::{ActiveConn, AppState};
+use crate::app::{ActiveConn, AppState, SplitHalf, SplitState};
 
 /// The `SCAN ... COUNT` hint per round trip (default `10` is far too low for
 /// a large keyspace; see docs/plans/redis.md item 3).
@@ -77,11 +77,10 @@ fn non_empty(s: String) -> Option<String> {
     }
 }
 
-/// Which of the Redis shell's panels is showing. Browse is the default and
-/// the only one active session state doesn't need to preserve across
-/// switches particularly carefully (console history and pubsub state live
-/// on their own structs regardless of which panel is visible, so switching
-/// away and back never loses anything).
+/// The kind of a Redis tab: what the `+` new-tab picker offers and what a
+/// [`RedisTabState`] holds. Unlike the SQL side (every tab is a homogeneous
+/// query editor), Redis tabs are heterogeneous, so the kind is an explicit
+/// discriminant used for the picker labels and default titles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KvPanel {
     Browse,
@@ -90,6 +89,20 @@ pub(crate) enum KvPanel {
     Monitor,
     Analysis,
     Keyspace,
+}
+
+impl KvPanel {
+    /// The picker label + default tab title for this kind.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            KvPanel::Browse => "Browse",
+            KvPanel::Console => "Console",
+            KvPanel::PubSub => "Pub/Sub",
+            KvPanel::Monitor => "Monitor",
+            KvPanel::Analysis => "Analysis",
+            KvPanel::Keyspace => "Keyspace",
+        }
+    }
 }
 
 /// A `redis-cli --bigkeys`-style sample (see docs/plans/redis.md's "beyond
@@ -152,13 +165,16 @@ pub(crate) struct AnalysisState {
     pub(crate) loaded: bool,
 }
 
-/// One connection's keyspace-browse state. Lives on [`ActiveConn`] for a
-/// Redis session only (`None` for a SQL one).
-pub(crate) struct RedisBrowse {
+/// One keyspace-browse tab's state (a `RedisTabState::Browse`). Everything
+/// here is per-tab: two Browse tabs each have their own scan run, filter,
+/// and inspector. Connection-level state (like `DBSIZE`) lives on
+/// [`RedisView`] instead.
+pub(crate) struct BrowseState {
     /// Identifies the current scan run (bumped on restart — a new filter
     /// pattern — exactly like a SQL result's epoch bumps on re-sort). A
     /// `KvScanPage` reply whose epoch doesn't match is from a superseded
-    /// scan and is dropped.
+    /// scan and is dropped. Also the stable per-tab identity backend events
+    /// route by (see [`RedisView::browse_by_scan_epoch_mut`]).
     pub(crate) epoch: u64,
     /// The pattern the current scan run applies (`None` = unfiltered `*`).
     pub(crate) pattern: Option<String>,
@@ -167,9 +183,6 @@ pub(crate) struct RedisBrowse {
     pub(crate) cursor: ScanCursor,
     pub(crate) exhausted: bool,
     pub(crate) loading: bool,
-    /// `DBSIZE`, fetched once at connect (unfiltered browses only show it —
-    /// see docs/plans/redis.md on why there's no cheap filtered count).
-    pub(crate) db_size: Option<u64>,
     pub(crate) scroll: UniformListScrollHandle,
     pub(crate) filter: Entity<TextInput>,
     /// Bumped on every `Change`; a debounce timer captures the value live at
@@ -187,16 +200,82 @@ pub(crate) struct RedisBrowse {
     pub(crate) fuzzy: bool,
     /// The value inspector opened by selecting a row, if any.
     pub(crate) inspector: Option<KvInspector>,
-    pub(crate) panel: KvPanel,
-    pub(crate) console: crate::kvconsole::KvConsole,
-    pub(crate) pubsub: crate::kvpubsub::KvPubSub,
-    pub(crate) monitor: crate::kvmonitor::KvMonitor,
-    pub(crate) keyspace: crate::kvkeyspace::KvKeyspace,
     /// `Some` while a "find biggest keys" sample is running or showing its
     /// last result; `None` is the normal live-browse state.
     pub(crate) big_keys: Option<BigKeysState>,
-    /// The keyspace-analysis panel's run + report state.
-    pub(crate) analysis: AnalysisState,
+}
+
+/// The per-kind state a Redis tab holds. Heterogeneous, unlike the SQL side's
+/// homogeneous `QueryTab` — a Browse tab and a Monitor tab are structurally
+/// different, so the tab wraps this enum (see docs/plans/redis-workflow-parity.md).
+pub(crate) enum RedisTabState {
+    /// A blank tab awaiting a kind choice: its body shows the type chooser
+    /// (mirrors the SQL side's blank query tab). Picking a kind converts it in
+    /// place via [`AppState::kv_set_tab_kind`].
+    Empty,
+    // Boxed: `BrowseState` (grid rows + inspector + editors) dwarfs the other
+    // variants, so an unboxed enum would size every tab to the biggest.
+    Browse(Box<BrowseState>),
+    Console(crate::kvconsole::KvConsole),
+    PubSub(crate::kvpubsub::KvPubSub),
+    Monitor(crate::kvmonitor::KvMonitor),
+    Keyspace(crate::kvkeyspace::KvKeyspace),
+    Analysis(AnalysisState),
+}
+
+impl RedisTabState {
+    /// The panel kind, or `None` for a not-yet-chosen [`RedisTabState::Empty`].
+    pub(crate) fn kind(&self) -> Option<KvPanel> {
+        match self {
+            RedisTabState::Empty => None,
+            RedisTabState::Browse(_) => Some(KvPanel::Browse),
+            RedisTabState::Console(_) => Some(KvPanel::Console),
+            RedisTabState::PubSub(_) => Some(KvPanel::PubSub),
+            RedisTabState::Monitor(_) => Some(KvPanel::Monitor),
+            RedisTabState::Keyspace(_) => Some(KvPanel::Keyspace),
+            RedisTabState::Analysis(_) => Some(KvPanel::Analysis),
+        }
+    }
+}
+
+/// One tab in the Redis shell: a title, a stable id, and its per-kind state.
+pub(crate) struct RedisTab {
+    /// Stable identity, never reused, assigned from [`RedisView::tab_seq`].
+    /// Used to address a tab across closes/reorders (an index would shift).
+    pub(crate) id: u64,
+    pub(crate) title: String,
+    pub(crate) state: RedisTabState,
+    /// Which split half this tab belongs to (mirrors the SQL side). Always
+    /// `Primary` in the single-pane layout.
+    pub(crate) pane: SplitHalf,
+    /// Pinned tabs sort ahead of the rest in their half's strip.
+    pub(crate) pinned: bool,
+}
+
+/// One Redis connection's whole view: a dynamic, spawnable/closeable set of
+/// tabs (mirrors the SQL side's `Vec<QueryTab>` on `ActiveConn`). Lives on
+/// [`ActiveConn`] for a Redis session only (`None` for a SQL one).
+pub(crate) struct RedisView {
+    pub(crate) tabs: Vec<RedisTab>,
+    /// Index into `tabs` of the visible tab. Kept in range by every close.
+    pub(crate) active_tab: usize,
+    /// Monotonic id source for `RedisTab::id`.
+    pub(crate) tab_seq: u64,
+    /// `DBSIZE`, fetched once at connect (connection-level, shared by every
+    /// Browse tab — see docs/plans/redis.md on why there's no cheap filtered
+    /// count).
+    pub(crate) db_size: Option<u64>,
+    /// Horizontal scroll for the tab strip (mirrors the SQL `ActiveConn::tab_scroll`).
+    pub(crate) tab_scroll: ScrollHandle,
+    /// The gap a dragged tab would land in during a reorder, or `None`.
+    pub(crate) tab_drop_target: Option<usize>,
+    /// The side-by-side split (reuses the SQL side's [`SplitState`]); `None` is
+    /// the ordinary single-pane layout. `active_tab` is the Primary half's
+    /// active tab; `split.secondary` the Secondary half's. See
+    /// docs/plans/redis-workflow-parity.md Part 3 Phase 2.
+    pub(crate) split: Option<SplitState>,
+    /// The tab whose right-click context menu is open, as `(id, position)`.
+    pub(crate) tab_menu: Option<(u64, gpui::Point<gpui::Pixels>)>,
 }
 
 /// The value inspector for one selected key: its value (or just a big
@@ -294,13 +373,17 @@ pub(crate) struct StreamGroupsState {
     pub(crate) claim_editor: Entity<TextInput>,
 }
 
-impl RedisBrowse {
+impl BrowseState {
     pub(crate) fn new(session: SessionId, cx: &mut Context<AppState>) -> Self {
         let filter = cx.new(|cx| TextInput::new(cx).with_placeholder("Filter (MATCH pattern)…"));
         cx.subscribe(&filter, move |this, input, event: &TextInputEvent, cx| {
+            // Only the active (visible, focused) tab can receive input events
+            // in the no-split shell, so routing to the active Browse tab is
+            // unambiguous here (see docs/plans/redis-workflow-parity.md).
             let fuzzy = this
                 .conn_mut(Some(session))
-                .and_then(|a| a.kv_browse.as_ref())
+                .and_then(|a| a.kv_view.as_ref())
+                .and_then(|v| v.active_browse())
                 .map(|b| b.fuzzy)
                 .unwrap_or(false);
             match event {
@@ -334,28 +417,328 @@ impl RedisBrowse {
             cursor: ScanCursor::START,
             exhausted: false,
             loading: false,
-            db_size: None,
             scroll: UniformListScrollHandle::new(),
             filter,
             filter_gen: 0,
             fuzzy: false,
             inspector: None,
-            panel: KvPanel::Browse,
-            console: crate::kvconsole::KvConsole::new(session, cx),
-            pubsub: crate::kvpubsub::KvPubSub::new(cx),
-            monitor: crate::kvmonitor::KvMonitor::new(),
-            keyspace: crate::kvkeyspace::KvKeyspace::new(),
             big_keys: None,
-            analysis: AnalysisState {
-                epoch: crate::result::next_kv_epoch(),
-                cursor: ScanCursor::START,
-                running: false,
-                started: std::time::Instant::now(),
-                collected: Vec::new(),
-                report: None,
-                loaded: false,
-            },
         }
+    }
+}
+
+impl AnalysisState {
+    pub(crate) fn new() -> Self {
+        Self {
+            epoch: crate::result::next_kv_epoch(),
+            cursor: ScanCursor::START,
+            running: false,
+            started: std::time::Instant::now(),
+            collected: Vec::new(),
+            report: None,
+            loaded: false,
+        }
+    }
+}
+
+impl RedisTabState {
+    /// Build a fresh tab body of the given kind. Needs `cx` because several
+    /// panels create persistent `TextInput` entities + subscriptions up front.
+    pub(crate) fn new(kind: KvPanel, session: SessionId, cx: &mut Context<AppState>) -> Self {
+        match kind {
+            KvPanel::Browse => RedisTabState::Browse(Box::new(BrowseState::new(session, cx))),
+            KvPanel::Console => {
+                RedisTabState::Console(crate::kvconsole::KvConsole::new(session, cx))
+            }
+            KvPanel::PubSub => RedisTabState::PubSub(crate::kvpubsub::KvPubSub::new(cx)),
+            KvPanel::Monitor => RedisTabState::Monitor(crate::kvmonitor::KvMonitor::new()),
+            KvPanel::Keyspace => RedisTabState::Keyspace(crate::kvkeyspace::KvKeyspace::new()),
+            KvPanel::Analysis => RedisTabState::Analysis(AnalysisState::new()),
+        }
+    }
+}
+
+impl RedisView {
+    pub(crate) fn new(session: SessionId, cx: &mut Context<AppState>) -> Self {
+        let browse = RedisTabState::Browse(Box::new(BrowseState::new(session, cx)));
+        Self {
+            tabs: vec![RedisTab {
+                id: 0,
+                title: KvPanel::Browse.label().to_string(),
+                state: browse,
+                pane: SplitHalf::Primary,
+                pinned: false,
+            }],
+            active_tab: 0,
+            tab_seq: 1,
+            db_size: None,
+            tab_scroll: ScrollHandle::new(),
+            tab_drop_target: None,
+            split: None,
+            tab_menu: None,
+        }
+    }
+
+    // --- split panes (mirror the SQL `ActiveConn` helpers) ---
+
+    /// Which half currently receives actions/focus (`Primary` when unsplit).
+    pub(crate) fn focused_half(&self) -> SplitHalf {
+        self.split
+            .as_ref()
+            .map(|s| s.focus)
+            .unwrap_or(SplitHalf::Primary)
+    }
+
+    /// Global index of the focused half's active tab.
+    pub(crate) fn focused_tab_index(&self) -> usize {
+        match &self.split {
+            Some(s) if s.focus == SplitHalf::Secondary => s.secondary,
+            _ => self.active_tab,
+        }
+    }
+
+    fn first_tab_in(&self, half: SplitHalf) -> Option<usize> {
+        self.tabs.iter().position(|t| t.pane == half)
+    }
+
+    /// The active tab index of `half`: its stored index when that still names a
+    /// tab in the half, else the first tab in the half (`None` if empty).
+    pub(crate) fn pane_active(&self, half: SplitHalf) -> Option<usize> {
+        let stored = match half {
+            SplitHalf::Primary => Some(self.active_tab),
+            SplitHalf::Secondary => self.split.as_ref().map(|s| s.secondary),
+        };
+        match stored {
+            Some(i) if self.tabs.get(i).is_some_and(|t| t.pane == half) => Some(i),
+            _ => self.first_tab_in(half),
+        }
+    }
+
+    /// Record `i` as `half`'s active tab.
+    pub(crate) fn set_pane_active(&mut self, half: SplitHalf, i: usize) {
+        match half {
+            SplitHalf::Primary => self.active_tab = i,
+            SplitHalf::Secondary => {
+                if let Some(s) = &mut self.split {
+                    s.secondary = i;
+                }
+            }
+        }
+    }
+
+    /// Global indices of the tabs in `half`, pinned first, then in tab order.
+    pub(crate) fn pane_tab_indices(&self, half: SplitHalf) -> Vec<usize> {
+        let mut idx: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.pane == half)
+            .map(|(i, _)| i)
+            .collect();
+        idx.sort_by_key(|&i| !self.tabs[i].pinned); // pinned (true) first
+        idx
+    }
+
+    fn tab_index_by_id(&self, id: u64) -> Option<usize> {
+        self.tabs.iter().position(|t| t.id == id)
+    }
+
+    /// Restore the pane invariants after any tab add/close/move: collapse the
+    /// split when a half empties, and clamp each pane's active index. Mirrors
+    /// the SQL side's `normalize_panes`.
+    pub(crate) fn normalize_panes(&mut self) {
+        if self.tabs.is_empty() {
+            self.active_tab = 0;
+            self.split = None;
+            return;
+        }
+        if self.split.is_some() {
+            let has_primary = self.tabs.iter().any(|t| t.pane == SplitHalf::Primary);
+            let has_secondary = self.tabs.iter().any(|t| t.pane == SplitHalf::Secondary);
+            if !has_primary || !has_secondary {
+                let survivor = if has_primary {
+                    SplitHalf::Primary
+                } else {
+                    SplitHalf::Secondary
+                };
+                let keep = self.pane_active(survivor).unwrap_or(0);
+                for t in &mut self.tabs {
+                    t.pane = SplitHalf::Primary;
+                }
+                self.split = None;
+                self.active_tab = keep.min(self.tabs.len() - 1);
+                return;
+            }
+            if let Some(p) = self.pane_active(SplitHalf::Primary) {
+                self.active_tab = p;
+            }
+            if let Some(sec) = self.pane_active(SplitHalf::Secondary) {
+                if let Some(state) = &mut self.split {
+                    state.secondary = sec;
+                }
+            }
+        } else {
+            for t in &mut self.tabs {
+                t.pane = SplitHalf::Primary;
+            }
+            if self.active_tab >= self.tabs.len() {
+                self.active_tab = self.tabs.len() - 1;
+            }
+        }
+    }
+
+    // --- render-time per-tab-index accessors (each split half displays its
+    // own tab, which may not be the focused one) ---
+
+    pub(crate) fn browse_at(&self, idx: usize) -> Option<&BrowseState> {
+        match self.tabs.get(idx).map(|t| &t.state)? {
+            RedisTabState::Browse(b) => Some(b),
+            _ => None,
+        }
+    }
+    pub(crate) fn console_at(&self, idx: usize) -> Option<&crate::kvconsole::KvConsole> {
+        match self.tabs.get(idx).map(|t| &t.state)? {
+            RedisTabState::Console(c) => Some(c),
+            _ => None,
+        }
+    }
+    pub(crate) fn pubsub_at(&self, idx: usize) -> Option<&crate::kvpubsub::KvPubSub> {
+        match self.tabs.get(idx).map(|t| &t.state)? {
+            RedisTabState::PubSub(p) => Some(p),
+            _ => None,
+        }
+    }
+    pub(crate) fn monitor_at(&self, idx: usize) -> Option<&crate::kvmonitor::KvMonitor> {
+        match self.tabs.get(idx).map(|t| &t.state)? {
+            RedisTabState::Monitor(m) => Some(m),
+            _ => None,
+        }
+    }
+    pub(crate) fn keyspace_at(&self, idx: usize) -> Option<&crate::kvkeyspace::KvKeyspace> {
+        match self.tabs.get(idx).map(|t| &t.state)? {
+            RedisTabState::Keyspace(k) => Some(k),
+            _ => None,
+        }
+    }
+    pub(crate) fn analysis_at(&self, idx: usize) -> Option<&AnalysisState> {
+        match self.tabs.get(idx).map(|t| &t.state)? {
+            RedisTabState::Analysis(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    // --- active-tab accessors (UI actions target the visible tab) ---
+
+    pub(crate) fn active_state(&self) -> Option<&RedisTabState> {
+        self.tabs.get(self.focused_tab_index()).map(|t| &t.state)
+    }
+    pub(crate) fn active_state_mut(&mut self) -> Option<&mut RedisTabState> {
+        let i = self.focused_tab_index();
+        self.tabs.get_mut(i).map(|t| &mut t.state)
+    }
+    pub(crate) fn active_browse(&self) -> Option<&BrowseState> {
+        match self.active_state()? {
+            RedisTabState::Browse(b) => Some(b),
+            _ => None,
+        }
+    }
+    pub(crate) fn active_browse_mut(&mut self) -> Option<&mut BrowseState> {
+        match self.active_state_mut()? {
+            RedisTabState::Browse(b) => Some(b),
+            _ => None,
+        }
+    }
+    pub(crate) fn active_console_mut(&mut self) -> Option<&mut crate::kvconsole::KvConsole> {
+        match self.active_state_mut()? {
+            RedisTabState::Console(c) => Some(c),
+            _ => None,
+        }
+    }
+    pub(crate) fn active_pubsub_mut(&mut self) -> Option<&mut crate::kvpubsub::KvPubSub> {
+        match self.active_state_mut()? {
+            RedisTabState::PubSub(p) => Some(p),
+            _ => None,
+        }
+    }
+    pub(crate) fn active_monitor_mut(&mut self) -> Option<&mut crate::kvmonitor::KvMonitor> {
+        match self.active_state_mut()? {
+            RedisTabState::Monitor(m) => Some(m),
+            _ => None,
+        }
+    }
+    pub(crate) fn active_keyspace_mut(&mut self) -> Option<&mut crate::kvkeyspace::KvKeyspace> {
+        match self.active_state_mut()? {
+            RedisTabState::Keyspace(k) => Some(k),
+            _ => None,
+        }
+    }
+    pub(crate) fn active_analysis_mut(&mut self) -> Option<&mut AnalysisState> {
+        match self.active_state_mut()? {
+            RedisTabState::Analysis(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    // --- epoch routing (backend events may target a background tab) ---
+
+    /// The Browse tab whose live-scan run owns `epoch` (not its big-keys or
+    /// analysis epoch — those have their own lookups).
+    pub(crate) fn browse_by_scan_epoch_mut(&mut self, epoch: u64) -> Option<&mut BrowseState> {
+        self.tabs.iter_mut().find_map(|t| match &mut t.state {
+            RedisTabState::Browse(b) if b.epoch == epoch => Some(&mut **b),
+            _ => None,
+        })
+    }
+    /// The Browse tab whose in-flight biggest-keys sample owns `epoch`.
+    pub(crate) fn browse_by_big_keys_epoch_mut(&mut self, epoch: u64) -> Option<&mut BrowseState> {
+        self.tabs.iter_mut().find_map(|t| match &mut t.state {
+            RedisTabState::Browse(b) if b.big_keys.as_ref().is_some_and(|bk| bk.epoch == epoch) => {
+                Some(&mut **b)
+            }
+            _ => None,
+        })
+    }
+    pub(crate) fn analysis_by_epoch_mut(&mut self, epoch: u64) -> Option<&mut AnalysisState> {
+        self.tabs.iter_mut().find_map(|t| match &mut t.state {
+            RedisTabState::Analysis(a) if a.epoch == epoch => Some(a),
+            _ => None,
+        })
+    }
+    pub(crate) fn console_by_epoch_mut(
+        &mut self,
+        epoch: u64,
+    ) -> Option<&mut crate::kvconsole::KvConsole> {
+        self.tabs.iter_mut().find_map(|t| match &mut t.state {
+            RedisTabState::Console(c) if c.epoch == epoch => Some(c),
+            _ => None,
+        })
+    }
+    pub(crate) fn monitor_by_epoch_mut(
+        &mut self,
+        epoch: u64,
+    ) -> Option<&mut crate::kvmonitor::KvMonitor> {
+        self.tabs.iter_mut().find_map(|t| match &mut t.state {
+            RedisTabState::Monitor(m) if m.epoch == epoch => Some(m),
+            _ => None,
+        })
+    }
+    pub(crate) fn pubsub_by_epoch_mut(
+        &mut self,
+        epoch: u64,
+    ) -> Option<&mut crate::kvpubsub::KvPubSub> {
+        self.tabs.iter_mut().find_map(|t| match &mut t.state {
+            RedisTabState::PubSub(p) if p.epoch == epoch => Some(p),
+            _ => None,
+        })
+    }
+    pub(crate) fn keyspace_by_epoch_mut(
+        &mut self,
+        epoch: u64,
+    ) -> Option<&mut crate::kvkeyspace::KvKeyspace> {
+        self.tabs.iter_mut().find_map(|t| match &mut t.state {
+            RedisTabState::Keyspace(k) if k.epoch == epoch => Some(k),
+            _ => None,
+        })
     }
 }
 
@@ -366,7 +749,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         browse.loading = true;
@@ -400,7 +783,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         browse.filter_gen += 1;
@@ -412,7 +795,8 @@ impl AppState {
             this.update(cx, |this, cx| {
                 let still_current = this
                     .conn_mut(Some(session))
-                    .and_then(|a| a.kv_browse.as_ref())
+                    .and_then(|a| a.kv_view.as_ref())
+                    .and_then(|v| v.active_browse())
                     .is_some_and(|b| b.filter_gen == generation);
                 if still_current {
                     this.kv_restart_scan(session, non_empty(pattern), cx);
@@ -436,7 +820,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         if browse.pattern == pattern {
@@ -475,7 +859,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         if browse.loading || browse.exhausted {
@@ -509,32 +893,34 @@ impl AppState {
         page: red_core::kv::KvScanPage,
         cx: &mut Context<Self>,
     ) {
+        // The scan-page event is shared by three scan runs that each carry
+        // their own epoch: a live browse, a biggest-keys sample, or a
+        // keyspace-analysis run. Route to whichever tab owns this epoch.
         let is_big_keys = self
             .conn_mut(session)
-            .and_then(|a| a.kv_browse.as_ref())
-            .and_then(|b| b.big_keys.as_ref())
-            .is_some_and(|bk| bk.epoch == epoch);
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.browse_by_big_keys_epoch_mut(epoch))
+            .is_some();
         if is_big_keys {
             self.on_big_keys_page(session, epoch, page, cx);
             return;
         }
         let is_analysis = self
             .conn_mut(session)
-            .and_then(|a| a.kv_browse.as_ref())
-            .is_some_and(|b| b.analysis.epoch == epoch && b.analysis.running);
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.analysis_by_epoch_mut(epoch))
+            .is_some_and(|a| a.running);
         if is_analysis {
             self.on_analysis_page(session, epoch, page, cx);
             return;
         }
-        let Some(active) = self.conn_mut(session) else {
-            return;
+        let Some(browse) = self
+            .conn_mut(session)
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.browse_by_scan_epoch_mut(epoch))
+        else {
+            return; // superseded scan run, or no tab owns this epoch
         };
-        let Some(browse) = &mut active.kv_browse else {
-            return;
-        };
-        if browse.epoch != epoch {
-            return; // superseded scan run
-        }
         browse.rows.extend(page.keys);
         if browse.rows.len() > MAX_RESIDENT_ROWS {
             let drop = browse.rows.len() - MAX_RESIDENT_ROWS;
@@ -560,7 +946,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         browse.fuzzy = !browse.fuzzy;
@@ -586,7 +972,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         if !browse.fuzzy || browse.loading || browse.exhausted {
@@ -626,7 +1012,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let epoch = crate::result::next_kv_epoch();
@@ -660,7 +1046,7 @@ impl AppState {
         let Some(active) = self.conn_mut(session) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let Some(bk) = &mut browse.big_keys else {
@@ -702,7 +1088,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let Some(bk) = browse.big_keys.take() else {
@@ -722,18 +1108,19 @@ impl AppState {
             .map(|a| a.conn_id.clone())
             .unwrap_or_default();
         let saved = self.redis_analysis.get(&conn_id).cloned();
-        let Some(browse) = self
+        let Some(analysis) = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_browse.as_mut())
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_analysis_mut())
         else {
             return;
         };
-        if browse.analysis.loaded {
+        if analysis.loaded {
             return;
         }
-        browse.analysis.loaded = true;
-        if browse.analysis.report.is_none() {
-            browse.analysis.report = saved;
+        analysis.loaded = true;
+        if analysis.report.is_none() {
+            analysis.report = saved;
         }
         cx.notify();
     }
@@ -742,22 +1129,23 @@ impl AppState {
     /// pages (like the biggest-keys sampler) until the keyspace is exhausted or
     /// the analysis budget is hit, then rolls the sample up and persists it.
     pub(crate) fn kv_run_analysis(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(browse) = self
+        let Some(analysis) = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_browse.as_mut())
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_analysis_mut())
         else {
             return;
         };
-        if browse.analysis.running {
+        if analysis.running {
             return;
         }
         let epoch = crate::result::next_kv_epoch();
-        browse.analysis.epoch = epoch;
-        browse.analysis.cursor = ScanCursor::START;
-        browse.analysis.running = true;
-        browse.analysis.started = std::time::Instant::now();
-        browse.analysis.collected.clear();
-        browse.analysis.loaded = true;
+        analysis.epoch = epoch;
+        analysis.cursor = ScanCursor::START;
+        analysis.running = true;
+        analysis.started = std::time::Instant::now();
+        analysis.collected.clear();
+        analysis.loaded = true;
         self.service.send_to(
             session,
             Command::KvFetchScan {
@@ -784,29 +1172,33 @@ impl AppState {
                 return;
             };
             let conn_id = active.conn_id.clone();
-            let Some(browse) = &mut active.kv_browse else {
+            let Some(view) = &mut active.kv_view else {
                 return;
             };
-            if browse.analysis.epoch != epoch || !browse.analysis.running {
+            // `DBSIZE` is connection-level; read it before borrowing the tab.
+            let total_keys = view.db_size.unwrap_or(0);
+            let Some(analysis) = view.analysis_by_epoch_mut(epoch) else {
+                return;
+            };
+            if !analysis.running {
                 return;
             }
-            browse.analysis.collected.extend(page.keys);
-            browse.analysis.cursor = page.next_cursor;
-            let over_budget = browse.analysis.collected.len() >= ANALYSIS_SAMPLE_CAP
-                || browse.analysis.started.elapsed() >= Duration::from_millis(ANALYSIS_SAMPLE_MS);
+            analysis.collected.extend(page.keys);
+            analysis.cursor = page.next_cursor;
+            let over_budget = analysis.collected.len() >= ANALYSIS_SAMPLE_CAP
+                || analysis.started.elapsed() >= Duration::from_millis(ANALYSIS_SAMPLE_MS);
             if page.exhausted || over_budget {
-                browse.analysis.running = false;
+                analysis.running = false;
                 let truncated = !page.exhausted;
-                let total_keys = browse.db_size.unwrap_or(0);
                 let report = red_core::kv::analyze_keyspace(
-                    &browse.analysis.collected,
+                    &analysis.collected,
                     total_keys,
                     truncated,
                     crate::conversations::now_unix() as i64,
                 );
-                browse.analysis.report = Some(report.clone());
+                analysis.report = Some(report.clone());
                 // Drop the raw sample now that it's rolled up.
-                browse.analysis.collected = Vec::new();
+                analysis.collected = Vec::new();
                 (true, Some(report), conn_id)
             } else {
                 (false, None, conn_id)
@@ -826,8 +1218,9 @@ impl AppState {
         let Some(session) = session else { return };
         let cursor = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_browse.as_ref())
-            .map(|b| b.analysis.cursor);
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.analysis_by_epoch_mut(epoch))
+            .map(|a| a.cursor);
         if let Some(cursor) = cursor {
             self.service.send_to(
                 session,
@@ -844,55 +1237,473 @@ impl AppState {
 
     /// Stop an in-progress analysis run (leaves any already-shown report).
     pub(crate) fn kv_cancel_analysis(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(browse) = self
+        let Some(analysis) = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_browse.as_mut())
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_analysis_mut())
         else {
             return;
         };
-        if !browse.analysis.running {
+        if !analysis.running {
             return;
         }
-        browse.analysis.running = false;
-        browse.analysis.collected = Vec::new();
-        let epoch = browse.analysis.epoch;
+        analysis.running = false;
+        analysis.collected = Vec::new();
+        let epoch = analysis.epoch;
         self.service
             .send_to(session, Command::CloseResult { epoch });
         cx.notify();
     }
 
-    pub(crate) fn kv_set_panel(
+    /// Open a new blank tab in the focused half (the ＋ / ⌘T action). Its body
+    /// shows the type chooser; picking a kind converts it in place via
+    /// [`kv_set_tab_kind`]. Mirrors the SQL side's `new_query`.
+    pub(crate) fn kv_new_empty_tab(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        else {
+            return;
+        };
+        let half = view.focused_half();
+        let id = view.tab_seq;
+        view.tab_seq += 1;
+        view.tabs.push(RedisTab {
+            id,
+            title: "New tab".to_string(),
+            state: RedisTabState::Empty,
+            pane: half,
+            pinned: false,
+        });
+        let new_idx = view.tabs.len() - 1;
+        view.set_pane_active(half, new_idx);
+        cx.notify();
+    }
+
+    /// Convert the (blank) tab with `id` to `kind`, retitle it, and fire its
+    /// lazy first load — the empty-tab chooser's action.
+    pub(crate) fn kv_set_tab_kind(
         &mut self,
         session: SessionId,
-        panel: KvPanel,
+        id: u64,
+        kind: KvPanel,
         cx: &mut Context<Self>,
     ) {
-        let Some(active) = self.conn_mut(Some(session)) else {
+        let state = RedisTabState::new(kind, session, cx);
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(idx) = view.tab_index_by_id(id) else {
             return;
         };
-        browse.panel = panel;
-        // Opening the diagnostics panel loads its default (Slow-log) view lazily,
-        // the same way the stream inspector's Groups tab loads on first open.
-        let load_slowlog = panel == KvPanel::Monitor
-            && browse.monitor.view == crate::kvmonitor::MonitorView::Slowlog
-            && !browse.monitor.slowlog_loaded;
-        // Opening the Analysis panel restores the connection's saved report.
-        let load_analysis = panel == KvPanel::Analysis && !browse.analysis.loaded;
-        // Opening the Keyspace panel reads the notify-keyspace-events setting.
-        let load_keyspace = panel == KvPanel::Keyspace && !browse.keyspace.config_loaded;
-        if load_slowlog {
-            self.kv_load_slowlog(session, cx);
-        }
-        if load_analysis {
-            self.kv_load_saved_analysis(session, cx);
-        }
-        if load_keyspace {
-            self.kv_keyspace_load_config(session, cx);
+        view.tabs[idx].state = state;
+        view.tabs[idx].title = kind.label().to_string();
+        let half = view.tabs[idx].pane;
+        view.set_pane_active(half, idx);
+        // Fire the chosen kind's lazy first load, the same way the old
+        // single-panel shell did on first switch.
+        match kind {
+            KvPanel::Browse => self.kv_start_browse(session, cx),
+            KvPanel::Monitor => self.kv_load_slowlog(session, cx),
+            KvPanel::Analysis => self.kv_load_saved_analysis(session, cx),
+            KvPanel::Keyspace => self.kv_keyspace_load_config(session, cx),
+            KvPanel::Console | KvPanel::PubSub => {}
         }
         cx.notify();
+    }
+
+    /// Step the focused half's active tab one slot forward/back, wrapping (the
+    /// ctrl-tab / ctrl-shift-tab bindings). Shares the wrap math with the SQL
+    /// side via [`crate::app::tabs::cycle_tab_index`].
+    pub(crate) fn kv_step_tab(
+        &mut self,
+        session: SessionId,
+        forward: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        else {
+            return;
+        };
+        let half = view.focused_half();
+        let pane_tabs = view.pane_tab_indices(half);
+        let cur = view.focused_tab_index();
+        let Some(next) = crate::app::tabs::cycle_tab_index(&pane_tabs, cur, forward) else {
+            return;
+        };
+        view.set_pane_active(half, next);
+        view.tab_scroll.scroll_to_item(next);
+        view.tab_menu = None;
+        cx.notify();
+    }
+
+    /// Activate the tab at `index`: make it its half's active tab and focus
+    /// that half (each strip shows only its own tabs, so a click never crosses).
+    pub(crate) fn kv_activate_tab(
+        &mut self,
+        session: SessionId,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        else {
+            return;
+        };
+        let Some(half) = view.tabs.get(index).map(|t| t.pane) else {
+            return;
+        };
+        view.set_pane_active(half, index);
+        if let Some(s) = &mut view.split {
+            s.focus = half;
+        }
+        view.tab_menu = None;
+        cx.notify();
+    }
+
+    /// Close the tab at `index`: tear down its backend subscription (MONITOR /
+    /// Pub-Sub / keyspace watcher ride an epoch that must be released), drop
+    /// it, and restore the pane invariants. The last tab can't be closed — the
+    /// shell always shows something (mirrors the SQL invariant).
+    pub(crate) fn kv_close_tab(
+        &mut self,
+        session: SessionId,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        else {
+            return;
+        };
+        if view.tabs.len() <= 1 || index >= view.tabs.len() {
+            return;
+        }
+        // Release any backend epoch this tab owned: a live subscription
+        // (MONITOR / Pub-Sub / keyspace watcher) or an in-flight scan run
+        // (browse cursor + biggest-keys sample, a running analysis walk).
+        // `CloseResult` cancels the in-flight fetch at the engine too.
+        let close_epochs: Vec<u64> = match &view.tabs[index].state {
+            RedisTabState::Monitor(m) => vec![m.epoch],
+            RedisTabState::PubSub(p) => vec![p.epoch],
+            RedisTabState::Keyspace(k) => vec![k.epoch],
+            RedisTabState::Browse(b) => {
+                let mut v = vec![b.epoch];
+                if let Some(bk) = &b.big_keys {
+                    v.push(bk.epoch);
+                }
+                v
+            }
+            RedisTabState::Analysis(a) if a.running => vec![a.epoch],
+            RedisTabState::Empty | RedisTabState::Analysis(_) | RedisTabState::Console(_) => {
+                Vec::new()
+            }
+        };
+        view.tabs.remove(index);
+        // Shift the two panes' stored active indices past the removed slot,
+        // then let `normalize_panes` collapse an emptied half + clamp.
+        if view.active_tab > index {
+            view.active_tab -= 1;
+        }
+        if let Some(s) = &mut view.split {
+            if s.secondary > index {
+                s.secondary -= 1;
+            }
+        }
+        view.tab_menu = None;
+        view.normalize_panes();
+        for epoch in close_epochs {
+            self.service
+                .send_to(session, Command::CloseResult { epoch });
+        }
+        cx.notify();
+    }
+
+    // --- drag reorder (mirrors the SQL `drop_tab` / drop-target helpers) ---
+
+    /// Move the dragged tab (`from`) into `half` and reorder it to the current
+    /// drop-target gap. Clears the gap indicator.
+    pub(crate) fn kv_drop_tab(
+        &mut self,
+        session: SessionId,
+        from: usize,
+        half: SplitHalf,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        else {
+            return;
+        };
+        if from >= view.tabs.len() {
+            return;
+        }
+        let gap = view.tab_drop_target.take().unwrap_or(from);
+        view.tabs[from].pane = half;
+        // Remove then reinsert at the gap (adjusting for the removal shift).
+        let tab = view.tabs.remove(from);
+        let dest = if gap > from { gap - 1 } else { gap };
+        let dest = dest.min(view.tabs.len());
+        view.tabs.insert(dest, tab);
+        view.set_pane_active(half, dest);
+        if let Some(s) = &mut view.split {
+            s.focus = half;
+        }
+        view.normalize_panes();
+        cx.notify();
+    }
+
+    pub(crate) fn kv_set_tab_drop_target(
+        &mut self,
+        session: SessionId,
+        gap: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            if view.tab_drop_target != Some(gap) {
+                view.tab_drop_target = Some(gap);
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn kv_clear_tab_drop_target(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            if view.tab_drop_target.take().is_some() {
+                cx.notify();
+            }
+        }
+    }
+
+    // --- split panes ---
+
+    const KV_SPLIT_DEFAULT_WIDTH: f32 = 520.;
+
+    /// Toggle the side-by-side split (the ⌘\ action, routed here for a Redis
+    /// connection): open a second pane, or collapse it when already split.
+    pub(crate) fn kv_toggle_split(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let split = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .is_some_and(|v| v.split.is_some());
+        if split {
+            self.kv_unsplit(session, cx);
+        } else {
+            self.kv_split_right(session, cx);
+        }
+    }
+
+    /// Open the split: a fresh blank tab in a second, focused pane on the right
+    /// (its body shows the type chooser). The left pane keeps its tabs; move a
+    /// tab across with the tab context menu or by dragging.
+    pub(crate) fn kv_split_right(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        else {
+            return;
+        };
+        if view.split.is_some() {
+            return; // already split
+        }
+        let id = view.tab_seq;
+        view.tab_seq += 1;
+        view.tabs.push(RedisTab {
+            id,
+            title: "New tab".to_string(),
+            state: RedisTabState::Empty,
+            pane: SplitHalf::Secondary,
+            pinned: false,
+        });
+        let secondary = view.tabs.len() - 1;
+        view.split = Some(SplitState {
+            secondary,
+            focus: SplitHalf::Secondary,
+            width: px(Self::KV_SPLIT_DEFAULT_WIDTH),
+            drag: None,
+        });
+        view.normalize_panes();
+        cx.notify();
+    }
+
+    /// Collapse the split: every tab folds into the single strip, keeping the
+    /// focused half's tab on screen.
+    pub(crate) fn kv_unsplit(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        else {
+            return;
+        };
+        let Some(s) = view.split.take() else {
+            return;
+        };
+        let keep = if s.focus == SplitHalf::Secondary {
+            s.secondary
+        } else {
+            view.active_tab
+        };
+        for t in &mut view.tabs {
+            t.pane = SplitHalf::Primary;
+        }
+        view.active_tab = keep.min(view.tabs.len().saturating_sub(1));
+        cx.notify();
+    }
+
+    /// Set the focused half (a per-half mouse-down picks this, so actions target
+    /// the half the user just touched). No-op when not split or unchanged.
+    pub(crate) fn kv_set_split_focus(
+        &mut self,
+        session: SessionId,
+        half: SplitHalf,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            if let Some(s) = &mut view.split {
+                if s.focus != half {
+                    s.focus = half;
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// Move focus to the other half (the ⌥⌘\ action). No-op when not split.
+    pub(crate) fn kv_focus_other_half(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            if let Some(s) = &mut view.split {
+                s.focus = if s.focus == SplitHalf::Primary {
+                    SplitHalf::Secondary
+                } else {
+                    SplitHalf::Primary
+                };
+                cx.notify();
+            }
+        }
+    }
+
+    /// Move the tab with `id` to the other split half (tab context menu). If not
+    /// split, opens the split first so there's a half to move to.
+    pub(crate) fn kv_move_tab_to_other_half(
+        &mut self,
+        session: SessionId,
+        id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let is_split = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .is_some_and(|v| v.split.is_some());
+        if !is_split {
+            self.kv_split_right(session, cx);
+            // Then move the requested tab into the (now Secondary) pane below.
+        }
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        else {
+            return;
+        };
+        let Some(idx) = view.tab_index_by_id(id) else {
+            return;
+        };
+        let target = if view.tabs[idx].pane == SplitHalf::Primary {
+            SplitHalf::Secondary
+        } else {
+            SplitHalf::Primary
+        };
+        view.tabs[idx].pane = target;
+        view.set_pane_active(target, idx);
+        if let Some(s) = &mut view.split {
+            s.focus = target;
+        }
+        view.tab_menu = None;
+        view.normalize_panes();
+        cx.notify();
+    }
+
+    /// Pin/unpin the tab with `id` (pinned tabs sort ahead in their strip).
+    pub(crate) fn kv_toggle_tab_pin(
+        &mut self,
+        session: SessionId,
+        id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            if let Some(idx) = view.tab_index_by_id(id) {
+                view.tabs[idx].pinned = !view.tabs[idx].pinned;
+                view.tab_menu = None;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Open / close the tab right-click context menu.
+    pub(crate) fn kv_open_tab_menu(
+        &mut self,
+        session: SessionId,
+        id: u64,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            view.tab_menu = Some((id, pos));
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn kv_close_tab_menu(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            if view.tab_menu.take().is_some() {
+                cx.notify();
+            }
+        }
+    }
+
+    /// Close the tab with `id` (the context menu's Close item; resolves the id
+    /// to a current index first, since positions shift).
+    pub(crate) fn kv_close_tab_by_id(
+        &mut self,
+        session: SessionId,
+        id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let idx = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .and_then(|v| v.tab_index_by_id(id));
+        if let Some(idx) = idx {
+            self.kv_close_tab(session, idx, cx);
+        }
     }
 
     pub(crate) fn on_kv_db_size(
@@ -902,16 +1713,15 @@ impl AppState {
         count: u64,
         cx: &mut Context<Self>,
     ) {
-        let Some(active) = self.conn_mut(session) else {
+        // `DBSIZE` is connection-level: store it on the view (shared by every
+        // Browse tab), matched against the browse tab that requested it.
+        let Some(view) = self.conn_mut(session).and_then(|a| a.kv_view.as_mut()) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
-            return;
-        };
-        if browse.epoch != epoch {
+        if view.browse_by_scan_epoch_mut(epoch).is_none() {
             return;
         }
-        browse.db_size = Some(count);
+        view.db_size = Some(count);
         cx.notify();
     }
 
@@ -930,10 +1740,11 @@ impl AppState {
         kv_type: KvType,
         cx: &mut Context<Self>,
     ) {
-        let Some(active) = self.conn_mut(Some(session)) else {
-            return;
-        };
-        let Some(browse) = &active.kv_browse else {
+        let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .and_then(|v| v.active_browse())
+        else {
             return;
         };
         let epoch = browse.epoch;
@@ -974,7 +1785,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         browse.inspector = Some(KvInspector {
@@ -1037,7 +1848,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         browse.inspector = None;
@@ -1050,7 +1861,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let Some(inspector) = &mut browse.inspector else {
@@ -1071,7 +1882,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let Some(inspector) = &mut browse.inspector else {
@@ -1085,7 +1896,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let epoch = browse.epoch;
@@ -1107,7 +1918,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let Some(inspector) = &mut browse.inspector else {
@@ -1128,7 +1939,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let Some(inspector) = &mut browse.inspector else {
@@ -1145,7 +1956,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let epoch = browse.epoch;
@@ -1171,7 +1982,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let Some(inspector) = &mut browse.inspector else {
@@ -1189,7 +2000,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let Some(inspector) = &mut browse.inspector else {
@@ -1203,7 +2014,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let epoch = browse.epoch;
@@ -1224,7 +2035,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let Some(inspector) = &mut browse.inspector else {
@@ -1238,7 +2049,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let Some(inspector) = &mut browse.inspector else {
@@ -1252,7 +2063,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let epoch = browse.epoch;
@@ -1285,7 +2096,7 @@ impl AppState {
         let Some(active) = self.conn_mut(session) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         if browse.epoch != epoch {
@@ -1366,7 +2177,7 @@ impl AppState {
         let Some(active) = self.conn_mut(session) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let Some(inspector) = &mut browse.inspector else {
@@ -1411,7 +2222,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let epoch = browse.epoch;
@@ -1441,7 +2252,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let epoch = browse.epoch;
@@ -1473,7 +2284,8 @@ impl AppState {
     ) {
         let loaded = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_browse.as_ref())
+            .and_then(|a| a.kv_view.as_ref())
+            .and_then(|v| v.active_browse())
             .and_then(|b| b.inspector.as_ref())
             .map(|i| i.collection_rows.len());
         let Some(loaded) = loaded else {
@@ -1495,7 +2307,7 @@ impl AppState {
         let Some(active) = self.conn_mut(session) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let Some(inspector) = &mut browse.inspector else {
@@ -1521,7 +2333,7 @@ impl AppState {
         let Some(active) = self.conn_mut(session) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let Some(inspector) = &mut browse.inspector else {
@@ -1545,7 +2357,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let epoch = browse.epoch;
@@ -1580,7 +2392,8 @@ impl AppState {
     ) {
         let loaded = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_browse.as_ref())
+            .and_then(|a| a.kv_view.as_ref())
+            .and_then(|v| v.active_browse())
             .and_then(|b| b.inspector.as_ref())
             .map(|i| i.stream_rows.len());
         let Some(loaded) = loaded else {
@@ -1602,7 +2415,7 @@ impl AppState {
         let Some(active) = self.conn_mut(session) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let Some(inspector) = &mut browse.inspector else {
@@ -1648,7 +2461,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let epoch = browse.epoch;
@@ -1704,7 +2517,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let epoch = browse.epoch;
@@ -1850,7 +2663,7 @@ impl AppState {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
         let epoch = browse.epoch;
@@ -1897,7 +2710,8 @@ impl AppState {
         // consumer counts just changed), matching the current inspector.
         let matches = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_browse.as_ref())
+            .and_then(|a| a.kv_view.as_ref())
+            .and_then(|v| v.active_browse())
             .and_then(|b| b.inspector.as_ref())
             .is_some_and(|i| i.key == key && i.stream_groups.selected.as_deref() == Some(&group));
         if matches {
@@ -1910,8 +2724,9 @@ impl AppState {
     /// mutably — the shared preamble every group handler needs.
     fn kv_inspector_mut(&mut self, session: SessionId) -> Option<&mut KvInspector> {
         self.conn_mut(Some(session))?
-            .kv_browse
+            .kv_view
             .as_mut()?
+            .active_browse_mut()?
             .inspector
             .as_mut()
     }
@@ -1921,8 +2736,9 @@ impl AppState {
     /// originating `SessionId`, or `None` for the foreground).
     fn kv_inspector_for(&mut self, session: Option<SessionId>) -> Option<&mut KvInspector> {
         self.conn_mut(session)?
-            .kv_browse
+            .kv_view
             .as_mut()?
+            .active_browse_mut()?
             .inspector
             .as_mut()
     }
@@ -2099,13 +2915,18 @@ impl AppState {
     pub(crate) fn render_kv_browse(
         &self,
         active: &ActiveConn,
+        tab_idx: usize,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme().clone();
         let view = cx.entity().downgrade();
         let session = active.session;
-        let Some(browse) = &active.kv_browse else {
+        let Some(view_ref) = active.kv_view.as_ref() else {
+            return div().flex_1();
+        };
+        let db_size = view_ref.db_size;
+        let Some(browse) = view_ref.browse_at(tab_idx) else {
             return div().flex_1();
         };
 
@@ -2138,7 +2959,7 @@ impl AppState {
                 )
             }
         } else {
-            match (&browse.pattern, browse.db_size) {
+            match (&browse.pattern, db_size) {
                 (None, Some(n)) => {
                     format!("~{} keys in db0", crate::result::group_digits(n as usize))
                 }
@@ -2441,15 +3262,15 @@ impl AppState {
     pub(crate) fn render_kv_analysis(
         &self,
         active: &ActiveConn,
+        tab_idx: usize,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme().clone();
         let session = active.session;
-        let Some(browse) = &active.kv_browse else {
+        let Some(st) = active.kv_view.as_ref().and_then(|v| v.analysis_at(tab_idx)) else {
             return div().flex_1();
         };
-        let st = &browse.analysis;
 
         let run_view = cx.entity().downgrade();
         let cancel_view = cx.entity().downgrade();

@@ -66,14 +66,15 @@ impl AppState {
         if argv.is_empty() {
             return;
         }
-        let Some(active) = self.conn_mut(Some(session)) else {
-            return;
-        };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(console) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_console_mut())
+        else {
             return;
         };
         if classify_command(&argv) == CommandClass::Destructive {
-            browse.console.pending_confirm = Some(argv);
+            console.pending_confirm = Some(argv);
             cx.notify();
             return;
         }
@@ -81,38 +82,41 @@ impl AppState {
     }
 
     pub(crate) fn kv_console_confirm(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(active) = self.conn_mut(Some(session)) else {
+        let Some(console) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_console_mut())
+        else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
-            return;
-        };
-        let Some(argv) = browse.console.pending_confirm.take() else {
+        let Some(argv) = console.pending_confirm.take() else {
             return;
         };
         self.kv_console_send(session, argv, cx);
     }
 
     pub(crate) fn kv_console_cancel_confirm(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(active) = self.conn_mut(Some(session)) else {
+        let Some(console) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_console_mut())
+        else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
-            return;
-        };
-        browse.console.pending_confirm = None;
+        console.pending_confirm = None;
         cx.notify();
     }
 
     fn kv_console_send(&mut self, session: SessionId, argv: Vec<String>, cx: &mut Context<Self>) {
-        let Some(active) = self.conn_mut(Some(session)) else {
+        let Some(console) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_console_mut())
+        else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
-            return;
-        };
-        let epoch = browse.console.epoch;
-        browse.console.history.push(KvConsoleEntry {
+        let epoch = console.epoch;
+        console.history.push(KvConsoleEntry {
             argv: argv.clone(),
             result: None,
         });
@@ -132,17 +136,15 @@ impl AppState {
         result: RespValue,
         cx: &mut Context<Self>,
     ) {
-        let Some(active) = self.conn_mut(session) else {
+        // Route by epoch: the reply may target a background console tab.
+        let Some(console) = self
+            .conn_mut(session)
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.console_by_epoch_mut(epoch))
+        else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
-            return;
-        };
-        if browse.console.epoch != epoch {
-            return;
-        }
-        if let Some(entry) = browse
-            .console
+        if let Some(entry) = console
             .history
             .iter_mut()
             .rev()
@@ -183,16 +185,16 @@ impl AppState {
     pub(crate) fn render_kv_console(
         &self,
         active: &ActiveConn,
+        tab_idx: usize,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme().clone();
         let session = active.session;
         let view = cx.entity().downgrade();
-        let Some(browse) = &active.kv_browse else {
+        let Some(console) = active.kv_view.as_ref().and_then(|v| v.console_at(tab_idx)) else {
             return div().flex_1();
         };
-        let console = &browse.console;
 
         let mono = theme.mono_family.clone();
         let text_size = theme.scale(11.5);

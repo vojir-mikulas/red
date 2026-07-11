@@ -19,7 +19,7 @@ mod keymap_edit;
 mod render;
 mod settings;
 mod switcher;
-mod tabs;
+pub(crate) mod tabs;
 
 use switcher::{switcher_footer, switcher_sections};
 
@@ -712,12 +712,12 @@ pub(crate) struct ActiveConn {
     /// The read-only ER diagram overlay when open (schema-wide, so it hangs off the
     /// connection, not a tab). `None` when closed. See [`crate::er`].
     pub er: Option<crate::er::ErView>,
-    /// Redis keyspace-browse state (R1, see docs/plans/redis.md); `Some` only
-    /// for a `DbKind::Redis` session, set up in `on_connected`. `None` for
-    /// every SQL engine. Constructed here (needs `cx` to make the filter
-    /// `TextInput`); `on_connected` fires the initial `KvDbSize`/`KvFetchScan`
-    /// once the session is live.
-    pub kv_browse: Option<crate::kvbrowse::RedisBrowse>,
+    /// The Redis shell's dynamic tab set (see docs/plans/redis-workflow-parity.md);
+    /// `Some` only for a `DbKind::Redis` session, set up in `on_connected`.
+    /// `None` for every SQL engine. Constructed here (needs `cx` to make the
+    /// default Browse tab's filter `TextInput`); `on_connected` fires that
+    /// tab's initial `KvDbSize`/`KvFetchScan` once the session is live.
+    pub kv_view: Option<crate::kvbrowse::RedisView>,
 }
 
 impl ActiveConn {
@@ -729,8 +729,8 @@ impl ActiveConn {
         cx: &mut Context<AppState>,
     ) -> Self {
         let tab = QueryTab::new("query 1".to_string(), cx);
-        let kv_browse =
-            (config.kind == DbKind::Redis).then(|| crate::kvbrowse::RedisBrowse::new(session, cx));
+        let kv_view =
+            (config.kind == DbKind::Redis).then(|| crate::kvbrowse::RedisView::new(session, cx));
         Self {
             session,
             conn_id,
@@ -768,7 +768,7 @@ impl ActiveConn {
             columns_drag: None,
             last_active_seq: 0,
             er: None,
-            kv_browse,
+            kv_view,
         }
     }
 
@@ -2829,8 +2829,16 @@ impl AppState {
     const SPLIT_DEFAULT_WIDTH: f32 = 560.;
 
     /// Toggle the side-by-side split: open it (the ⌘\ / palette action) or, when
-    /// it's already open, collapse it.
+    /// it's already open, collapse it. Routes to the Redis shell's own split for
+    /// a Redis connection (which has tabs but no SQL editor/result panes).
     pub(crate) fn toggle_split(&mut self, cx: &mut Context<Self>) {
+        if let Phase::Connected(a) = &self.phase {
+            if a.kv_view.is_some() {
+                let session = a.session;
+                self.kv_toggle_split(session, cx);
+                return;
+            }
+        }
         let split = matches!(&self.phase, Phase::Connected(a) if a.split.is_some());
         if split {
             self.unsplit(cx);
@@ -2919,6 +2927,13 @@ impl AppState {
     /// move is deferred to the next render via `pending_focus`, so this needs no
     /// `Window` and works from the palette too.
     pub(crate) fn focus_other_half(&mut self, cx: &mut Context<Self>) {
+        if let Phase::Connected(a) = &self.phase {
+            if a.kv_view.is_some() {
+                let session = a.session;
+                self.kv_focus_other_half(session, cx);
+                return;
+            }
+        }
         let pane = match &self.phase {
             Phase::Connected(active) if active.split.is_some() => active.active_pane,
             _ => return,
