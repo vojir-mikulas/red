@@ -12,6 +12,7 @@ mod cli;
 mod columns_panel;
 mod connect;
 mod conversations;
+mod decode;
 #[cfg(feature = "dev-stats")]
 mod dev_stats;
 mod editor;

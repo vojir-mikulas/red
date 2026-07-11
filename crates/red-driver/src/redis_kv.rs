@@ -1132,13 +1132,20 @@ fn to_resp_value(value: redis::Value) -> RespValue {
 }
 
 /// Cap a fetched string value like a SQL display cell: under the cap, the
-/// text (or a lossy-UTF8 decode) verbatim; over it, a
-/// [`red_core::CappedCell`] carrying only a char-boundary-safe prefix, never
-/// the full bytes.
+/// value verbatim; over it, a [`red_core::CappedCell`] carrying only a
+/// char-boundary-safe prefix, never the full bytes.
+///
+/// Below the cap, valid UTF-8 becomes [`Value::Text`], while binary (a Redis
+/// string holding msgpack/protobuf/pickle/an image) becomes [`Value::Blob`]
+/// with its **exact** bytes preserved — so the inspector's binary decoders and
+/// hex view see the real bytes, not a lossy-UTF8 mangling of them.
 fn cap_string_value(bytes: Vec<u8>) -> Value {
     let len = bytes.len();
     if len <= STRING_PREVIEW_CAP {
-        return Value::Text(String::from_utf8_lossy(&bytes).into_owned());
+        return match String::from_utf8(bytes) {
+            Ok(s) => Value::Text(s),
+            Err(e) => Value::Blob(e.into_bytes()),
+        };
     }
     let mut head = String::from_utf8_lossy(&bytes[..STRING_PREVIEW_CAP]).into_owned();
     // `from_utf8_lossy` on a byte slice cut mid-codepoint already replaces

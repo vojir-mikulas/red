@@ -254,6 +254,11 @@ pub(crate) struct KvInspector {
     pub(crate) rename_editor: Entity<TextInput>,
     pub(crate) editing_key: bool,
     pub(crate) confirm_delete: bool,
+    /// The lens the string value is rendered through (Auto/Raw/JSON/Hex +
+    /// binary decoders), reusing the SQL inspector's `ValueFormat` (see
+    /// docs/plans/redis.md's "binary value decoders" gap). Only meaningful for
+    /// a `KvValue::Str`.
+    pub(crate) str_format: crate::inspector::ValueFormat,
 }
 
 /// Which stream sub-view the inspector shows: the entries grid (the default)
@@ -1006,9 +1011,25 @@ impl AppState {
             rename_editor,
             editing_key: false,
             confirm_delete: false,
+            str_format: crate::inspector::ValueFormat::Auto,
         });
         self.service
             .send_to(session, Command::KvReadValue { epoch, key });
+        cx.notify();
+    }
+
+    /// Change the string inspector's display lens (Auto/Raw/JSON/Hex or a
+    /// binary decoder).
+    pub(crate) fn kv_set_str_format(
+        &mut self,
+        session: SessionId,
+        fmt: crate::inspector::ValueFormat,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(inspector) = self.kv_inspector_mut(session) else {
+            return;
+        };
+        inspector.str_format = fmt;
         cx.notify();
     }
 
@@ -2862,6 +2883,51 @@ impl AppState {
             .child(body)
     }
 
+    /// The string inspector's lens toolbar (Auto/Raw/JSON/Hex + the binary
+    /// decoders), reusing the SQL inspector's `ValueFormat`. Lets a Redis
+    /// string holding msgpack/protobuf/pickle be decoded in place, the same way
+    /// a SQL blob cell can (see docs/plans/redis.md's "binary value decoders").
+    fn render_kv_str_lens(
+        &self,
+        session: SessionId,
+        current: crate::inspector::ValueFormat,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use crate::inspector::ValueFormat;
+        let opt = |id: &'static str, label: &'static str, fmt: ValueFormat| {
+            let view = cx.entity().downgrade();
+            Button::new(id, label)
+                .variant(if current == fmt {
+                    ButtonVariant::Secondary
+                } else {
+                    ButtonVariant::Ghost
+                })
+                .size(ButtonSize::Sm)
+                .on_click(move |_, _, cx| {
+                    view.update(cx, |this, cx| this.kv_set_str_format(session, fmt, cx))
+                        .ok();
+                })
+        };
+        div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(opt("kv-fmt-auto", "Auto", ValueFormat::Auto))
+            .child(opt("kv-fmt-raw", "Raw", ValueFormat::Raw))
+            .child(opt("kv-fmt-json", "JSON", ValueFormat::Json))
+            .child(opt("kv-fmt-hex", "Hex", ValueFormat::Hex))
+            .child(opt("kv-fmt-msgpack", "MsgPack", ValueFormat::MsgPack))
+            .child(opt("kv-fmt-protobuf", "Protobuf", ValueFormat::Protobuf))
+            .child(opt("kv-fmt-pickle", "Pickle", ValueFormat::Pickle))
+            .into_any_element()
+    }
+
     /// The inspector's value area: a per-type renderer for a loaded value, a
     /// paged sub-grid for a big collection, or a loading/unsupported note.
     fn render_kv_value(
@@ -2942,48 +3008,51 @@ impl AppState {
                     )
                     .into_any_element()
             }
-            KvValue::Str(v) => div()
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .id("kv-inspector-string")
-                        .flex_1()
-                        .min_h(px(0.))
-                        .overflow_y_scroll()
-                        .p_2()
-                        .child(
-                            div()
-                                .font_family(mono)
-                                .text_size(text_size)
-                                .child(render_string_preview(v)),
-                        ),
-                )
-                .when(writable, |d| {
-                    let edit_view = view.clone();
-                    d.child(
+            KvValue::Str(v) => {
+                let (body, _summary) = crate::inspector::format_value_body(v, inspector.str_format);
+                // Editing only makes sense for a textual value; a binary value
+                // (now a `Value::Blob`, see `cap_string_value`) is view-only.
+                let editable = matches!(v, red_core::Value::Text(_))
+                    || matches!(v, red_core::Value::Capped(c) if !c.blob);
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .flex_col()
+                    .child(self.render_kv_str_lens(session, inspector.str_format, theme, cx))
+                    .child(
                         div()
-                            .flex_shrink_0()
-                            .px_2()
-                            .py_1p5()
-                            .border_t_1()
-                            .border_color(theme.border)
-                            .child(
-                                Button::new("kv-string-edit", "Edit")
-                                    .size(ButtonSize::Sm)
-                                    .on_click(move |_, _, cx| {
-                                        edit_view
-                                            .update(cx, |this, cx| {
-                                                this.kv_start_editing_value(session, cx)
-                                            })
-                                            .ok();
-                                    }),
-                            ),
+                            .id("kv-inspector-string")
+                            .flex_1()
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
+                            .p_2()
+                            .child(div().font_family(mono).text_size(text_size).child(body)),
                     )
-                })
-                .into_any_element(),
+                    .when(writable && editable, |d| {
+                        let edit_view = view.clone();
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .px_2()
+                                .py_1p5()
+                                .border_t_1()
+                                .border_color(theme.border)
+                                .child(
+                                    Button::new("kv-string-edit", "Edit")
+                                        .size(ButtonSize::Sm)
+                                        .on_click(move |_, _, cx| {
+                                            edit_view
+                                                .update(cx, |this, cx| {
+                                                    this.kv_start_editing_value(session, cx)
+                                                })
+                                                .ok();
+                                        }),
+                                ),
+                        )
+                    })
+                    .into_any_element()
+            }
             KvValue::Stream(_) => self.render_kv_stream(session, inspector, writable, theme, cx),
             KvValue::Unsupported(kind) => div()
                 .flex_1()
