@@ -2368,6 +2368,9 @@ impl AppState {
             Event::KvListWindowReady { key, values, .. } => {
                 self.on_kv_list_window_ready(session, key, values, cx);
             }
+            Event::KvStreamPageReady { key, page, .. } => {
+                self.on_kv_stream_page_ready(session, key, page, cx);
+            }
             Event::KvCommandResult {
                 epoch,
                 argv,

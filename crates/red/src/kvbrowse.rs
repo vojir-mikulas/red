@@ -15,7 +15,8 @@ use gpui::{
     div, prelude::*, px, AsyncApp, Context, Entity, UniformListScrollHandle, WeakEntity, Window,
 };
 use red_core::kv::{
-    CollectionKind, KeyMeta, KvCollection, KvCollectionPage, KvElement, KvType, KvValue, ScanBudget,
+    CollectionKind, KeyMeta, KvCollection, KvCollectionPage, KvElement, KvStreamPage, KvType,
+    KvValue, ScanBudget, ScanCursor, StreamEntry,
 };
 use red_service::{Command, SessionId};
 
@@ -47,6 +48,10 @@ const FILTER_DEBOUNCE_MS: u64 = 300;
 /// infinite scroll (lists have no `LSCAN`; see docs/plans/redis.md's
 /// documented limitation on deep-middle list access).
 const LIST_PREVIEW_COUNT: usize = 200;
+/// How many stream entries to pull per `KvReadStreamPage` round trip. Unlike
+/// a list, a big stream *is* pageable (by entry-ID range, newest-first), so
+/// this is a page size the inspector grows on scroll, not a one-shot cap.
+const STREAM_PAGE_COUNT: usize = 200;
 
 fn scan_budget() -> ScanBudget {
     ScanBudget {
@@ -88,7 +93,7 @@ pub(crate) struct BigKeysState {
     /// different scan run entirely, not a continuation of the live browse,
     /// and must not have its pages misfiled into `RedisBrowse::rows`.
     pub(crate) epoch: u64,
-    pub(crate) cursor: u64,
+    pub(crate) cursor: ScanCursor,
     pub(crate) sampled: usize,
     pub(crate) running: bool,
     pub(crate) started: std::time::Instant,
@@ -117,7 +122,7 @@ pub(crate) struct RedisBrowse {
     pub(crate) pattern: Option<String>,
     /// Rows accumulated this run, forward-only, oldest-evicted past the cap.
     pub(crate) rows: Vec<KeyMeta>,
-    pub(crate) cursor: u64,
+    pub(crate) cursor: ScanCursor,
     pub(crate) exhausted: bool,
     pub(crate) loading: bool,
     /// `DBSIZE`, fetched once at connect (unfiltered browses only show it —
@@ -169,6 +174,19 @@ pub(crate) struct KvInspector {
     pub(crate) collection_exhausted: bool,
     pub(crate) collection_loading: bool,
     pub(crate) collection_scroll: UniformListScrollHandle,
+
+    // --- big-stream paging (only populated once `value` reports a
+    // `KvValue::Stream(KvCollection::Large)`; see docs/plans/redis.md's R4).
+    // Streams page by entry-ID range rather than the `*SCAN` cursor the other
+    // collections use, so they get their own accumulator instead of reusing
+    // `collection_rows`. Entries accumulate newest-first, oldest-continued.
+    pub(crate) stream_rows: Vec<StreamEntry>,
+    /// The oldest entry ID loaded so far, fed back as the next page's
+    /// exclusive upper bound; `None` before the first page or once exhausted.
+    pub(crate) stream_before: Option<String>,
+    pub(crate) stream_exhausted: bool,
+    pub(crate) stream_loading: bool,
+    pub(crate) stream_scroll: UniformListScrollHandle,
 
     // --- editing (see docs/plans/redis.md's editing phase) ---
     // Each editable field gets one persistent `TextInput`, created once when
@@ -222,7 +240,7 @@ impl RedisBrowse {
             epoch: crate::result::next_kv_epoch(),
             pattern: None,
             rows: Vec::new(),
-            cursor: 0,
+            cursor: ScanCursor::START,
             exhausted: false,
             loading: false,
             db_size: None,
@@ -257,7 +275,7 @@ impl AppState {
             Command::KvFetchScan {
                 epoch,
                 pattern: None,
-                cursor: 0,
+                cursor: ScanCursor::START,
                 budget: scan_budget(),
             },
         );
@@ -327,7 +345,7 @@ impl AppState {
         browse.epoch = new_epoch;
         browse.pattern = pattern.clone();
         browse.rows.clear();
-        browse.cursor = 0;
+        browse.cursor = ScanCursor::START;
         browse.exhausted = false;
         browse.loading = true;
         self.service
@@ -337,7 +355,7 @@ impl AppState {
             Command::KvFetchScan {
                 epoch: new_epoch,
                 pattern,
-                cursor: 0,
+                cursor: ScanCursor::START,
                 budget: scan_budget(),
             },
         );
@@ -504,7 +522,7 @@ impl AppState {
         let epoch = crate::result::next_kv_epoch();
         browse.big_keys = Some(BigKeysState {
             epoch,
-            cursor: 0,
+            cursor: ScanCursor::START,
             sampled: 0,
             running: true,
             started: std::time::Instant::now(),
@@ -515,7 +533,7 @@ impl AppState {
             Command::KvFetchScan {
                 epoch,
                 pattern: None,
-                cursor: 0,
+                cursor: ScanCursor::START,
                 budget: scan_budget(),
             },
         );
@@ -686,6 +704,11 @@ impl AppState {
             collection_exhausted: false,
             collection_loading: false,
             collection_scroll: UniformListScrollHandle::new(),
+            stream_rows: Vec::new(),
+            stream_before: None,
+            stream_exhausted: false,
+            stream_loading: false,
+            stream_scroll: UniformListScrollHandle::new(),
             value_editor,
             editing_value: false,
             ttl_editor,
@@ -1057,6 +1080,9 @@ impl AppState {
             Some(KvValue::List(KvCollection::Large { .. })) => {
                 self.kv_load_list_preview(session, cx);
             }
+            Some(KvValue::Stream(KvCollection::Large { .. })) => {
+                self.kv_load_stream_page(session, cx);
+            }
             _ => {}
         }
     }
@@ -1197,6 +1223,87 @@ impl AppState {
         // A list's head-window preview is a one-shot fetch, not paged.
         inspector.collection_exhausted = true;
         inspector.collection_loading = false;
+        cx.notify();
+    }
+
+    /// Fetch the next (older) page of the inspector's big stream, or the first
+    /// (newest) page if none has loaded yet. Mirrors `kv_load_collection_page`
+    /// but continues by entry ID (`stream_before`) rather than a `*SCAN`
+    /// cursor.
+    pub(crate) fn kv_load_stream_page(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(active) = self.conn_mut(Some(session)) else {
+            return;
+        };
+        let Some(browse) = &mut active.kv_browse else {
+            return;
+        };
+        let epoch = browse.epoch;
+        let Some(inspector) = &mut browse.inspector else {
+            return;
+        };
+        if inspector.stream_loading || inspector.stream_exhausted {
+            return;
+        }
+        inspector.stream_loading = true;
+        let key = inspector.key.clone();
+        let before = inspector.stream_before.clone();
+        self.service.send_to(
+            session,
+            Command::KvReadStreamPage {
+                epoch,
+                key,
+                before,
+                count: STREAM_PAGE_COUNT,
+            },
+        );
+        cx.notify();
+    }
+
+    /// The stream sub-grid's `on_visible_range` hook, mirroring
+    /// `kv_inspector_maybe_load_more` for a big hash/set/zset.
+    pub(crate) fn kv_inspector_maybe_load_more_stream(
+        &mut self,
+        session: SessionId,
+        visible_end: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let loaded = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_browse.as_ref())
+            .and_then(|b| b.inspector.as_ref())
+            .map(|i| i.stream_rows.len());
+        let Some(loaded) = loaded else {
+            return;
+        };
+        if visible_end + LOAD_AHEAD_ROWS < loaded {
+            return;
+        }
+        self.kv_load_stream_page(session, cx);
+    }
+
+    pub(crate) fn on_kv_stream_page_ready(
+        &mut self,
+        session: Option<SessionId>,
+        key: String,
+        page: KvStreamPage,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.conn_mut(session) else {
+            return;
+        };
+        let Some(browse) = &mut active.kv_browse else {
+            return;
+        };
+        let Some(inspector) = &mut browse.inspector else {
+            return;
+        };
+        if inspector.key != key {
+            return;
+        }
+        inspector.stream_rows.extend(page.entries);
+        inspector.stream_before = page.next_before;
+        inspector.stream_exhausted = page.exhausted;
+        inspector.stream_loading = false;
         cx.notify();
     }
 }
@@ -2016,6 +2123,10 @@ impl AppState {
                     )
                 })
                 .into_any_element(),
+            KvValue::Stream(KvCollection::Loaded(entries)) => render_loaded_stream(entries, theme),
+            KvValue::Stream(KvCollection::Large { len }) => {
+                self.render_kv_stream_grid(session, *len, inspector, theme, cx)
+            }
             KvValue::Unsupported(kind) => div()
                 .flex_1()
                 .flex()
@@ -2228,6 +2339,130 @@ impl AppState {
             )
             .into_any_element()
     }
+
+    /// The big-stream sub-grid: newest-first entries in a virtualized `Table`
+    /// (ID + fields), paging older on scroll via `kv_load_stream_page`. Mirrors
+    /// `render_kv_collection_grid`, but keyed off `stream_rows` and continuing
+    /// by entry ID rather than a `*SCAN` cursor.
+    fn render_kv_stream_grid(
+        &self,
+        session: SessionId,
+        len: u64,
+        inspector: &KvInspector,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let view = cx.entity().downgrade();
+        let rows = std::rc::Rc::new(inspector.stream_rows.clone());
+        let rows_render = rows.clone();
+        let row_count = rows.len();
+
+        let columns = vec![
+            Column::new("ID").width(px(160.)),
+            Column::new("Fields").flex(),
+        ];
+        let dim = theme.text_muted;
+        let cell_size = theme.scale(11.5);
+
+        let table = Table::<()>::new("kv-inspector-stream", columns)
+            .row_count(row_count)
+            .grid_lines(true)
+            .text_size(cell_size)
+            .track_scroll(&inspector.stream_scroll)
+            .render_row(move |ix, _window, _cx| match rows_render.get(ix) {
+                Some(entry) => vec![
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .child(entry.id.clone())
+                        .into_any_element(),
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(dim)
+                        .child(fmt_stream_fields(&entry.fields))
+                        .into_any_element(),
+                ],
+                None => Vec::new(),
+            })
+            .on_visible_range(move |range, _window, cx| {
+                view.update(cx, |this, cx| {
+                    this.kv_inspector_maybe_load_more_stream(session, range.end, cx)
+                })
+                .ok();
+            });
+
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .px_2()
+                    .py_1()
+                    .text_size(theme.scale(10.5))
+                    .text_color(dim)
+                    .child(format!(
+                        "{len} entries, newest first — paging as you scroll"
+                    )),
+            )
+            .child(div().flex_1().min_h(px(0.)).child(table))
+            .into_any_element()
+    }
+}
+
+/// Flatten a stream entry's field/value pairs into a compact one-line
+/// preview (`field=value  field=value`) for the grid's Fields column.
+fn fmt_stream_fields(fields: &[(String, String)]) -> String {
+    fields
+        .iter()
+        .map(|(f, v)| format!("{f}={v}"))
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+/// A small (< threshold) stream rendered as a plain scrollable list of
+/// `ID → fields` rows, newest-first — the stream counterpart of
+/// [`render_loaded_list`], capped by `SMALL_COLLECTION_THRESHOLD` so it needs
+/// no virtualization.
+fn render_loaded_stream(entries: &[StreamEntry], theme: &Theme) -> gpui::AnyElement {
+    let dim = theme.text_muted;
+    let items: Vec<_> = entries
+        .iter()
+        .map(|e| {
+            div()
+                .flex()
+                .gap_2()
+                .px_2()
+                .py_0p5()
+                .child(
+                    div()
+                        .w(px(150.))
+                        .min_w_0()
+                        .truncate()
+                        .text_color(dim)
+                        .child(e.id.clone()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(fmt_stream_fields(&e.fields)),
+                )
+                .into_any_element()
+        })
+        .collect();
+    div()
+        .id("kv-inspector-loaded-stream")
+        .flex_1()
+        .min_h(px(0.))
+        .overflow_y_scroll()
+        .text_size(theme.scale(11.5))
+        .children(items)
+        .into_any_element()
 }
 
 /// A small (< threshold) collection rendered as a plain scrollable list, not

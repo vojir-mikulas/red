@@ -37,7 +37,7 @@ pub use import::ImportReader;
 pub use kv::{KvDriver, KvTopology};
 pub use mysql::MysqlDriver;
 pub use postgres::PostgresDriver;
-pub use redis_kv::RedisDriver;
+pub use redis_kv::{sentinel_masters, RedisDriver, SentinelMaster};
 pub use sqlite::SqliteDriver;
 
 /// Default bytes of a non-key cell's content a *display* fetch keeps; past it,

@@ -1428,6 +1428,49 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 });
             }
 
+            Command::KvReadStreamPage {
+                epoch,
+                key,
+                before,
+                count,
+            } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                let entry = state.inflight.entry(epoch).or_default();
+                if let Some(prev) = entry.kv_value.take() {
+                    prev.abort();
+                }
+                // Like `read_list_window`, a single bounded `XREVRANGE` with
+                // no cancel token; the `AbortSignal` only marks it superseded
+                // by a following inspector fetch.
+                entry.kv_value = Some(AbortSignal::new());
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver
+                        .read_stream_range(&key, before.as_deref(), count)
+                        .await
+                    {
+                        Ok(page) => emit(
+                            &events,
+                            session_id,
+                            Event::KvStreamPageReady { epoch, key, page },
+                        ),
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                    }
+                });
+            }
+
             Command::KvCommand { epoch, argv } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get_mut(&id) else {

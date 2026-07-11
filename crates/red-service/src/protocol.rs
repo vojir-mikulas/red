@@ -13,7 +13,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use red_core::kv::{
-    CollectionKind, KeyMeta, KvCollectionPage, KvEdit, KvScanPage, KvValue, RespValue, ScanBudget,
+    CollectionKind, KeyMeta, KvCollectionPage, KvEdit, KvScanPage, KvStreamPage, KvValue,
+    RespValue, ScanBudget, ScanCursor,
 };
 use red_core::{
     ActivityId, ActivityKind, ActivityStatus, AiLimits, AiTier, Column, ColumnMap, ColumnMeta,
@@ -160,7 +161,7 @@ pub enum Command {
     KvFetchScan {
         epoch: u64,
         pattern: Option<String>,
-        cursor: u64,
+        cursor: ScanCursor,
         budget: ScanBudget,
     },
     /// Exact-key jump (see docs/plans/redis.md): resolve one key's metadata
@@ -205,6 +206,18 @@ pub enum Command {
         epoch: u64,
         key: String,
         from_head: bool,
+        count: usize,
+    },
+    /// One page of a big stream's entries, newest-first, for the inspector's
+    /// stream view (see docs/plans/redis.md's R4). Streams have no `*SCAN`
+    /// cursor, so unlike `KvReadCollectionPage` this pages by entry-ID range:
+    /// `before` is the previous `KvStreamPageReady`'s `next_before` (the oldest
+    /// ID loaded so far), or `None` to start at the newest entry. Replied with
+    /// `KvStreamPageReady`.
+    KvReadStreamPage {
+        epoch: u64,
+        key: String,
+        before: Option<String>,
         count: usize,
     },
     /// Run an arbitrary command through the console (see
@@ -625,6 +638,15 @@ pub enum Event {
         key: String,
         from_head: bool,
         values: Vec<String>,
+    },
+    /// One page of a big stream's entries (newest-first), in response to
+    /// `KvReadStreamPage`. `page.next_before`/`page.exhausted` are what the UI
+    /// feeds back as the next `KvReadStreamPage`'s `before` to page further
+    /// back in time.
+    KvStreamPageReady {
+        epoch: u64,
+        key: String,
+        page: KvStreamPage,
     },
     /// One console command's result, in response to `KvCommand`. Echoes
     /// `argv` back so a console tracking several in-flight lines can match

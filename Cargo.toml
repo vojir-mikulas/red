@@ -49,6 +49,10 @@ russh = "0.61"
 # pure-Rust stack reqwest/mysql_async already use. cluster-async/sentinel land
 # with R1's cluster-aware scan cursor, not before.
 redis = { version = "1", default-features = false, features = ["tokio-rustls-comp"] }
+# Already in the tree via redis' own URL parsing; used by the Redis driver to
+# rebuild per-master cluster DSNs (host+port swap, credentials/scheme/TLS
+# preserved) without hand-rolling URL surgery.
+url = "2"
 
 # --- Subscription assistant via ACP (red-acp) ---
 # Drives Claude Code as an external agent over the Agent Client Protocol so the

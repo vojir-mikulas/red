@@ -91,14 +91,44 @@ pub struct ScanBudget {
     pub want: usize,
 }
 
-/// One page of a keyspace scan. `next_cursor` is `0` both at the very start
-/// and at genuine exhaustion; `exhausted` disambiguates the two (mirrors
-/// Redis's own `SCAN` cursor convention, but callers shouldn't have to know
-/// that convention to use this).
+/// An opaque keyspace-scan position (see docs/plans/redis.md's cluster
+/// fan-out). Callers treat it as a token: begin from [`ScanCursor::START`],
+/// echo back whatever [`KvScanPage::next_cursor`] the previous page carried,
+/// and stop on `exhausted` — never inspect or construct the `Cluster` shape
+/// themselves. On a standalone/Sentinel server it wraps a single `SCAN`
+/// cursor; on a Cluster, `SCAN` is per-node, so it also tracks which master
+/// is being walked (the driver advances to the next master when one exhausts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanCursor {
+    /// Standalone/Sentinel: one `SCAN` cursor (`0` = start/end, disambiguated
+    /// by [`KvScanPage::exhausted`]).
+    Single(u64),
+    /// Cluster: the master node index being scanned plus that node's `SCAN`
+    /// cursor. The driver walks masters in order, advancing to `node + 1` at
+    /// cursor `0` once a node's scan exhausts.
+    Cluster { node: u32, cursor: u64 },
+}
+
+impl ScanCursor {
+    /// The starting position for a fresh scan or a filter restart. The driver
+    /// maps this to "the first master at cursor 0" under a cluster topology.
+    pub const START: ScanCursor = ScanCursor::Single(0);
+}
+
+impl Default for ScanCursor {
+    fn default() -> Self {
+        ScanCursor::START
+    }
+}
+
+/// One page of a keyspace scan. `next_cursor` is what the caller echoes back
+/// as the next page's cursor; `exhausted` (not `next_cursor == START`)
+/// signals the walk is done, since a `SCAN` cursor of `0` occurs both at the
+/// very start and at genuine exhaustion.
 #[derive(Debug, Clone)]
 pub struct KvScanPage {
     pub keys: Vec<KeyMeta>,
-    pub next_cursor: u64,
+    pub next_cursor: ScanCursor,
     pub exhausted: bool,
 }
 
@@ -131,6 +161,29 @@ pub struct KvCollectionPage {
     pub exhausted: bool,
 }
 
+/// One entry of a Redis stream (`XRANGE`/`XREVRANGE`): its ID (`<ms>-<seq>`,
+/// monotonic and unique) and that entry's flat field/value pairs. A stream
+/// entry is a small ordered map, not a single value, so it carries its own
+/// `Vec` of pairs rather than one scalar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamEntry {
+    pub id: String,
+    pub fields: Vec<(String, String)>,
+}
+
+/// One page of a big stream's entries, newest-first (`XREVRANGE`), from
+/// [`KvDriver::read_stream_range`](crate). Streams have no `*SCAN` cursor;
+/// they page by entry-ID range instead, so unlike [`KvCollectionPage`] the
+/// continuation is the oldest ID loaded so far (`next_before`), which the
+/// caller feeds back as the next page's exclusive upper bound to walk further
+/// back in time. `None` at exhaustion (the start of the stream is reached).
+#[derive(Debug, Clone)]
+pub struct KvStreamPage {
+    pub entries: Vec<StreamEntry>,
+    pub next_before: Option<String>,
+    pub exhausted: bool,
+}
+
 /// A collection value below vs. at/above the small-collection threshold (see
 /// docs/plans/redis.md's "big collections inside a single key"): `Loaded`
 /// carries every element, fetched once in `read_value`; `Large` carries only
@@ -153,8 +206,13 @@ pub enum KvValue {
     Set(KvCollection<String>),
     ZSet(KvCollection<(String, f64)>),
     List(KvCollection<String>),
-    /// A type this build has no preview for yet (streams; see
-    /// docs/plans/redis.md — not in this pass's scope). Distinct from `Ok(None)`
+    /// A stream, newest-first. `Loaded` below the small-collection threshold
+    /// (one `XREVRANGE + -`); `Large` carries only the `XLEN`, and the caller
+    /// pages the newest entries on demand via
+    /// [`KvDriver::read_stream_range`](crate) rather than this ever loading a
+    /// huge stream whole.
+    Stream(KvCollection<StreamEntry>),
+    /// A type this build has no preview for yet. Distinct from `Ok(None)`
     /// (the key doesn't exist): the key is real, its value just isn't shown.
     Unsupported(KvType),
 }

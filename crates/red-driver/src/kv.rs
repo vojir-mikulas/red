@@ -14,8 +14,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::Stream;
 use red_core::kv::{
-    CollectionKind, KeyMeta, KvCollectionPage, KvMessage, KvScanPage, KvValue, RespValue,
-    ScanBudget,
+    CollectionKind, KeyMeta, KvCollectionPage, KvMessage, KvScanPage, KvStreamPage, KvValue,
+    RespValue, ScanBudget, ScanCursor,
 };
 use red_core::Result;
 
@@ -73,7 +73,7 @@ pub trait KvDriver: Send + Sync {
     /// owns a seek boundary key for the SQL grid.
     async fn scan_keys(
         &self,
-        cursor: u64,
+        cursor: ScanCursor,
         pattern: Option<&str>,
         budget: ScanBudget,
         abort: &AbortSignal,
@@ -116,6 +116,19 @@ pub trait KvDriver: Send + Sync {
         from_head: bool,
         count: usize,
     ) -> Result<Vec<String>>;
+
+    /// One page of a big stream's entries, newest-first (`XREVRANGE`). `before`
+    /// is the exclusive upper-bound entry ID to page older than (the previous
+    /// page's `KvStreamPage::next_before`); `None` starts from the newest
+    /// entry (`+`). Streams have no `*SCAN` cursor, so this pages by ID range
+    /// rather than a stateless opaque cursor like
+    /// [`read_collection_page`](Self::read_collection_page).
+    async fn read_stream_range(
+        &self,
+        key: &str,
+        before: Option<&str>,
+        count: usize,
+    ) -> Result<KvStreamPage>;
 
     /// Run an arbitrary command (the console; see docs/plans/redis.md).
     /// `argv[0]` is the command name. Read-only enforcement and the
