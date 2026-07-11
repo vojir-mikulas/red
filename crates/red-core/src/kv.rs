@@ -531,6 +531,188 @@ pub struct KvMessage {
     pub payload: String,
 }
 
+/// A persisted, point-in-time keyspace analysis report (see docs/plans/redis.md's
+/// "persistent database analysis report" gap): a type/namespace/expiry rollup
+/// over a sample of the keyspace. Distinct from the ephemeral biggest-keys
+/// sampler in that it's saved per connection and can be revisited after a
+/// restart. Derives serde (behind the `serde` feature) so the app edge can
+/// store it as JSON.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RedisAnalysis {
+    /// Unix seconds the report was generated (server-independent local clock),
+    /// for the "as of …" line and to tell a stale saved report from a fresh one.
+    pub generated_at: i64,
+    /// Keys actually sampled and rolled up. Equals a full walk when
+    /// `truncated` is false.
+    pub sampled: u64,
+    /// `DBSIZE` at sample time (the whole logical DB), so the UI can say
+    /// "sampled X of Y". `0` if it wasn't known.
+    pub total_keys: u64,
+    /// Sum of `approx_bytes` (sampled `MEMORY USAGE`) across sampled keys.
+    pub total_bytes: u64,
+    /// True when the sample stopped at a budget bound rather than walking the
+    /// whole keyspace — the rollup is then an estimate, not exhaustive.
+    pub truncated: bool,
+    /// Per-type counts + memory, largest by memory first.
+    pub types: Vec<TypeStat>,
+    /// Top key-name prefixes (up to the first `:`) by memory, largest first.
+    pub namespaces: Vec<NamespaceStat>,
+    pub ttl: TtlSummary,
+}
+
+/// One data-type's slice of the keyspace (`string`/`hash`/…), for
+/// [`RedisAnalysis::types`].
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeStat {
+    /// The `KvType` label (`"string"`, `"hash"`, …); a plain string so a
+    /// module type's name round-trips through persistence.
+    pub kv_type: String,
+    pub count: u64,
+    pub bytes: u64,
+}
+
+/// One key-name namespace (the prefix up to the first `:`, or `"(no prefix)"`
+/// for a key with no delimiter), for [`RedisAnalysis::namespaces`].
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceStat {
+    pub prefix: String,
+    pub count: u64,
+    pub bytes: u64,
+}
+
+/// The expiry breakdown of the sampled keyspace: how many keys never expire vs.
+/// expire, bucketed by how soon (for [`RedisAnalysis::ttl`]).
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TtlSummary {
+    /// Keys with no expiry set (`PTTL` reported `-1`).
+    pub persistent: u64,
+    /// Keys expiring in under an hour.
+    pub under_hour: u64,
+    /// Keys expiring in the next hour-to-day window.
+    pub under_day: u64,
+    /// Keys expiring in the next day-to-week window.
+    pub under_week: u64,
+    /// Keys expiring more than a week out.
+    pub over_week: u64,
+}
+
+impl TtlSummary {
+    /// Total keys that carry an expiry (everything but `persistent`).
+    pub fn with_ttl(&self) -> u64 {
+        self.under_hour + self.under_day + self.under_week + self.over_week
+    }
+}
+
+/// The label used for keys with no `:` delimiter in the namespace rollup.
+pub const NO_PREFIX_LABEL: &str = "(no prefix)";
+
+/// The number of top namespaces [`analyze_keyspace`] keeps.
+pub const ANALYSIS_TOP_NAMESPACES: usize = 30;
+
+/// Roll a sample of scanned key metadata up into a [`RedisAnalysis`]: total
+/// memory, a per-type breakdown, the top key-name prefixes by memory, and an
+/// expiry-time summary. Pure and UI-free so it's unit-testable; the app calls
+/// it once a keyspace sample finishes, then persists the result.
+///
+/// `total_keys` is the server's `DBSIZE` (0 if unknown), `truncated` says the
+/// sample stopped at a budget bound, and `generated_at` is the local
+/// wall-clock stamp (passed in rather than read here to keep this deterministic).
+pub fn analyze_keyspace(
+    keys: &[KeyMeta],
+    total_keys: u64,
+    truncated: bool,
+    generated_at: i64,
+) -> RedisAnalysis {
+    use std::collections::HashMap;
+
+    let mut total_bytes = 0u64;
+    let mut by_type: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut by_ns: HashMap<&str, (u64, u64)> = HashMap::new();
+    let mut ttl = TtlSummary::default();
+
+    for k in keys {
+        total_bytes = total_bytes.saturating_add(k.approx_bytes);
+
+        let t = by_type.entry(k.kv_type.label().to_string()).or_default();
+        t.0 += 1;
+        t.1 = t.1.saturating_add(k.approx_bytes);
+
+        let ns = namespace_of(&k.key);
+        let n = by_ns.entry(ns).or_default();
+        n.0 += 1;
+        n.1 = n.1.saturating_add(k.approx_bytes);
+
+        match k.ttl {
+            None => ttl.persistent += 1,
+            Some(d) => {
+                let secs = d.as_secs();
+                if secs < 3_600 {
+                    ttl.under_hour += 1;
+                } else if secs < 86_400 {
+                    ttl.under_day += 1;
+                } else if secs < 604_800 {
+                    ttl.under_week += 1;
+                } else {
+                    ttl.over_week += 1;
+                }
+            }
+        }
+    }
+
+    let mut types: Vec<TypeStat> = by_type
+        .into_iter()
+        .map(|(kv_type, (count, bytes))| TypeStat {
+            kv_type,
+            count,
+            bytes,
+        })
+        .collect();
+    // Biggest by memory first, name as a stable tiebreak.
+    types.sort_by(|a, b| {
+        b.bytes
+            .cmp(&a.bytes)
+            .then_with(|| a.kv_type.cmp(&b.kv_type))
+    });
+
+    let mut namespaces: Vec<NamespaceStat> = by_ns
+        .into_iter()
+        .map(|(prefix, (count, bytes))| NamespaceStat {
+            prefix: prefix.to_string(),
+            count,
+            bytes,
+        })
+        .collect();
+    namespaces.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.prefix.cmp(&b.prefix)));
+    namespaces.truncate(ANALYSIS_TOP_NAMESPACES);
+
+    RedisAnalysis {
+        generated_at,
+        sampled: keys.len() as u64,
+        total_keys,
+        total_bytes,
+        truncated,
+        types,
+        namespaces,
+        ttl,
+    }
+}
+
+/// The namespace a key rolls up under: everything before its first `:`
+/// delimiter (Redis's near-universal key-hierarchy convention), or
+/// [`NO_PREFIX_LABEL`] for a flat key with no delimiter. Grouping delimiter-less
+/// keys together keeps a keyspace of unique flat keys from exploding the rollup
+/// into one namespace per key.
+fn namespace_of(key: &str) -> &str {
+    match key.split_once(':') {
+        Some((prefix, _)) if !prefix.is_empty() => prefix,
+        _ => NO_PREFIX_LABEL,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,5 +773,65 @@ mod tests {
             CommandClass::Write
         );
         assert_eq!(classify_command(&[]), CommandClass::Read);
+    }
+
+    fn meta(key: &str, ty: KvType, ttl: Option<Duration>, bytes: u64) -> KeyMeta {
+        KeyMeta {
+            key: key.to_string(),
+            kv_type: ty,
+            ttl,
+            encoding: String::new(),
+            approx_bytes: bytes,
+        }
+    }
+
+    #[test]
+    fn analyze_rolls_up_types_namespaces_and_ttl() {
+        let keys = vec![
+            meta("user:1", KvType::Hash, None, 100),
+            meta("user:2", KvType::Hash, Some(Duration::from_secs(30)), 200),
+            meta(
+                "session:abc",
+                KvType::String,
+                Some(Duration::from_secs(7200)),
+                50,
+            ),
+            meta(
+                "flat",
+                KvType::String,
+                Some(Duration::from_secs(1_000_000)),
+                10,
+            ),
+        ];
+        let a = analyze_keyspace(&keys, 999, true, 1_700_000_000);
+
+        assert_eq!(a.sampled, 4);
+        assert_eq!(a.total_keys, 999);
+        assert_eq!(a.total_bytes, 360);
+        assert!(a.truncated);
+
+        // Types ordered by memory: hash (300) before string (60).
+        assert_eq!(a.types[0].kv_type, "hash");
+        assert_eq!(a.types[0].count, 2);
+        assert_eq!(a.types[0].bytes, 300);
+        assert_eq!(a.types[1].kv_type, "string");
+        assert_eq!(a.types[1].bytes, 60);
+
+        // Namespaces: `user` (300) biggest, `session` (50), then flat under
+        // the no-prefix bucket (10).
+        assert_eq!(a.namespaces[0].prefix, "user");
+        assert_eq!(a.namespaces[0].bytes, 300);
+        assert!(a
+            .namespaces
+            .iter()
+            .any(|n| n.prefix == NO_PREFIX_LABEL && n.count == 1));
+
+        // TTL buckets: one persistent, one <hour, one <day (7200s = 2h), one
+        // >week (1e6s ≈ 11.6d).
+        assert_eq!(a.ttl.persistent, 1);
+        assert_eq!(a.ttl.under_hour, 1);
+        assert_eq!(a.ttl.under_day, 1);
+        assert_eq!(a.ttl.over_week, 1);
+        assert_eq!(a.ttl.with_ttl(), 3);
     }
 }

@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use flint::prelude::*;
 use gpui::{
-    div, prelude::*, px, AsyncApp, Context, Entity, SharedString, UniformListScrollHandle,
-    WeakEntity, Window,
+    div, prelude::*, px, relative, AsyncApp, Context, Entity, Hsla, SharedString,
+    UniformListScrollHandle, WeakEntity, Window,
 };
 use red_core::kv::{
     CollectionKind, KeyMeta, KvCollection, KvCollectionPage, KvElement, KvStreamActionReq,
@@ -88,6 +88,7 @@ pub(crate) enum KvPanel {
     Console,
     PubSub,
     Monitor,
+    Analysis,
 }
 
 /// A `redis-cli --bigkeys`-style sample (see docs/plans/redis.md's "beyond
@@ -118,6 +119,37 @@ const BIG_KEYS_SAMPLE_CAP: usize = 50_000;
 const BIG_KEYS_SAMPLE_MS: u64 = 5_000;
 /// How many of the biggest keys to keep and show once the sample completes.
 const BIG_KEYS_TOP_N: usize = 200;
+
+/// The analysis sample's own budget, more generous than the biggest-keys
+/// sampler's since a diagnostic report wants breadth: a bigger, slightly
+/// longer walk, still bounded so it can't run away on a huge keyspace. The
+/// report records whether it hit a bound (`truncated`) so the UI can say so.
+const ANALYSIS_SAMPLE_CAP: usize = 200_000;
+const ANALYSIS_SAMPLE_MS: u64 = 12_000;
+
+/// One connection's keyspace-analysis run + the report it's showing (see
+/// docs/plans/redis.md's "persistent database analysis report" gap). The scan
+/// reuses the biggest-keys sampler's chained `KvFetchScan` loop, but rolls the
+/// collected metadata up into a persisted [`RedisAnalysis`] instead of a
+/// biggest-keys list. `report` is `None` until either a run finishes or a saved
+/// report is loaded for the connection.
+pub(crate) struct AnalysisState {
+    /// A dedicated scan epoch, distinct from the browse/big-keys epochs.
+    pub(crate) epoch: u64,
+    pub(crate) cursor: ScanCursor,
+    pub(crate) running: bool,
+    pub(crate) started: std::time::Instant,
+    /// Keys collected so far this run (rolled up once it finishes; not kept
+    /// after, to avoid holding a whole sample resident indefinitely).
+    pub(crate) collected: Vec<KeyMeta>,
+    /// The report on screen: the just-finished run's, or the one restored from
+    /// disk when the panel opened. Persisted across restarts (see
+    /// `redis_analysis.rs`).
+    pub(crate) report: Option<red_core::kv::RedisAnalysis>,
+    /// Set once a persisted report has been looked up for this connection, so
+    /// reopening the panel doesn't re-read the store every time.
+    pub(crate) loaded: bool,
+}
 
 /// One connection's keyspace-browse state. Lives on [`ActiveConn`] for a
 /// Redis session only (`None` for a SQL one).
@@ -161,6 +193,8 @@ pub(crate) struct RedisBrowse {
     /// `Some` while a "find biggest keys" sample is running or showing its
     /// last result; `None` is the normal live-browse state.
     pub(crate) big_keys: Option<BigKeysState>,
+    /// The keyspace-analysis panel's run + report state.
+    pub(crate) analysis: AnalysisState,
 }
 
 /// The value inspector for one selected key: its value (or just a big
@@ -304,6 +338,15 @@ impl RedisBrowse {
             pubsub: crate::kvpubsub::KvPubSub::new(cx),
             monitor: crate::kvmonitor::KvMonitor::new(),
             big_keys: None,
+            analysis: AnalysisState {
+                epoch: crate::result::next_kv_epoch(),
+                cursor: ScanCursor::START,
+                running: false,
+                started: std::time::Instant::now(),
+                collected: Vec::new(),
+                report: None,
+                loaded: false,
+            },
         }
     }
 }
@@ -465,6 +508,14 @@ impl AppState {
             .is_some_and(|bk| bk.epoch == epoch);
         if is_big_keys {
             self.on_big_keys_page(session, epoch, page, cx);
+            return;
+        }
+        let is_analysis = self
+            .conn_mut(session)
+            .and_then(|a| a.kv_browse.as_ref())
+            .is_some_and(|b| b.analysis.epoch == epoch && b.analysis.running);
+        if is_analysis {
+            self.on_analysis_page(session, epoch, page, cx);
             return;
         }
         let Some(active) = self.conn_mut(session) else {
@@ -654,6 +705,154 @@ impl AppState {
         cx.notify();
     }
 
+    /// Load the persisted analysis report for this connection into the panel,
+    /// the first time it's opened this session (see `redis_analysis.rs`). A
+    /// no-op if a run has already produced a fresher report.
+    pub(crate) fn kv_load_saved_analysis(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let conn_id = self
+            .conn_mut(Some(session))
+            .map(|a| a.conn_id.clone())
+            .unwrap_or_default();
+        let saved = self.redis_analysis.get(&conn_id).cloned();
+        let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_browse.as_mut())
+        else {
+            return;
+        };
+        if browse.analysis.loaded {
+            return;
+        }
+        browse.analysis.loaded = true;
+        if browse.analysis.report.is_none() {
+            browse.analysis.report = saved;
+        }
+        cx.notify();
+    }
+
+    /// Start a fresh keyspace-analysis run: a dedicated scan epoch that chains
+    /// pages (like the biggest-keys sampler) until the keyspace is exhausted or
+    /// the analysis budget is hit, then rolls the sample up and persists it.
+    pub(crate) fn kv_run_analysis(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_browse.as_mut())
+        else {
+            return;
+        };
+        if browse.analysis.running {
+            return;
+        }
+        let epoch = crate::result::next_kv_epoch();
+        browse.analysis.epoch = epoch;
+        browse.analysis.cursor = ScanCursor::START;
+        browse.analysis.running = true;
+        browse.analysis.started = std::time::Instant::now();
+        browse.analysis.collected.clear();
+        browse.analysis.loaded = true;
+        self.service.send_to(
+            session,
+            Command::KvFetchScan {
+                epoch,
+                pattern: None,
+                cursor: ScanCursor::START,
+                budget: scan_budget(),
+            },
+        );
+        cx.notify();
+    }
+
+    fn on_analysis_page(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: u64,
+        page: red_core::kv::KvScanPage,
+        cx: &mut Context<Self>,
+    ) {
+        // First mutate the run state under the browse borrow; decide whether it
+        // finished, and if so compute the report (needs `db_size` too).
+        let (finished, report, conn_id) = {
+            let Some(active) = self.conn_mut(session) else {
+                return;
+            };
+            let conn_id = active.conn_id.clone();
+            let Some(browse) = &mut active.kv_browse else {
+                return;
+            };
+            if browse.analysis.epoch != epoch || !browse.analysis.running {
+                return;
+            }
+            browse.analysis.collected.extend(page.keys);
+            browse.analysis.cursor = page.next_cursor;
+            let over_budget = browse.analysis.collected.len() >= ANALYSIS_SAMPLE_CAP
+                || browse.analysis.started.elapsed() >= Duration::from_millis(ANALYSIS_SAMPLE_MS);
+            if page.exhausted || over_budget {
+                browse.analysis.running = false;
+                let truncated = !page.exhausted;
+                let total_keys = browse.db_size.unwrap_or(0);
+                let report = red_core::kv::analyze_keyspace(
+                    &browse.analysis.collected,
+                    total_keys,
+                    truncated,
+                    crate::conversations::now_unix() as i64,
+                );
+                browse.analysis.report = Some(report.clone());
+                // Drop the raw sample now that it's rolled up.
+                browse.analysis.collected = Vec::new();
+                (true, Some(report), conn_id)
+            } else {
+                (false, None, conn_id)
+            }
+        };
+
+        if finished {
+            if let Some(report) = report {
+                // Persist the fresh report so it survives a restart.
+                self.redis_analysis.set(&conn_id, report);
+            }
+            cx.notify();
+            return;
+        }
+
+        // Not finished: chain the next page (outside the browse borrow).
+        let Some(session) = session else { return };
+        let cursor = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_browse.as_ref())
+            .map(|b| b.analysis.cursor);
+        if let Some(cursor) = cursor {
+            self.service.send_to(
+                session,
+                Command::KvFetchScan {
+                    epoch,
+                    pattern: None,
+                    cursor,
+                    budget: scan_budget(),
+                },
+            );
+        }
+        cx.notify();
+    }
+
+    /// Stop an in-progress analysis run (leaves any already-shown report).
+    pub(crate) fn kv_cancel_analysis(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_browse.as_mut())
+        else {
+            return;
+        };
+        if !browse.analysis.running {
+            return;
+        }
+        browse.analysis.running = false;
+        browse.analysis.collected = Vec::new();
+        let epoch = browse.analysis.epoch;
+        self.service
+            .send_to(session, Command::CloseResult { epoch });
+        cx.notify();
+    }
+
     pub(crate) fn kv_set_panel(
         &mut self,
         session: SessionId,
@@ -672,8 +871,13 @@ impl AppState {
         let load_slowlog = panel == KvPanel::Monitor
             && browse.monitor.view == crate::kvmonitor::MonitorView::Slowlog
             && !browse.monitor.slowlog_loaded;
+        // Opening the Analysis panel restores the connection's saved report.
+        let load_analysis = panel == KvPanel::Analysis && !browse.analysis.loaded;
         if load_slowlog {
             self.kv_load_slowlog(session, cx);
+        }
+        if load_analysis {
+            self.kv_load_saved_analysis(session, cx);
         }
         cx.notify();
     }
@@ -1793,6 +1997,73 @@ fn fmt_bytes(n: u64) -> String {
     }
 }
 
+/// A coarse "N ago" from an already-computed seconds delta, for the analysis
+/// report's "as of …" line (mirrors the slow-log's relative time).
+fn fmt_ago_secs(d: i64) -> String {
+    let d = d.max(0);
+    if d < 60 {
+        "just now".to_string()
+    } else if d < 3600 {
+        format!("{}m ago", d / 60)
+    } else if d < 86_400 {
+        format!("{}h ago", d / 3600)
+    } else {
+        format!("{}d ago", d / 86_400)
+    }
+}
+
+/// One labelled proportion bar for the analysis report: `label` on the left,
+/// `right` note on the right, and a fill sized to `value/max` behind them.
+/// Shared by the type, namespace, and expiry sections.
+fn bar_row(
+    label: &str,
+    right: &str,
+    value: u64,
+    max: u64,
+    fill: Hsla,
+    theme: &Theme,
+) -> gpui::AnyElement {
+    let frac = if max == 0 {
+        0.0
+    } else {
+        (value as f64 / max as f64).clamp(0.0, 1.0) as f32
+    };
+    div()
+        .px_2()
+        .py_1()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(theme.scale(11.))
+                        .child(label.to_string()),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(theme.scale(10.))
+                        .text_color(theme.text_muted)
+                        .child(right.to_string()),
+                ),
+        )
+        .child(
+            div()
+                .mt_0p5()
+                .h(px(4.))
+                .w_full()
+                .rounded(px(2.))
+                .bg(theme.border.opacity(0.4))
+                .child(div().h_full().w(relative(frac)).rounded(px(2.)).bg(fill)),
+        )
+        .into_any_element()
+}
+
 impl AppState {
     /// The keyspace browser's body: filter box + header stat + the
     /// virtualized key list. Called from `render_redis_shell`.
@@ -2132,6 +2403,201 @@ impl AppState {
                         el.child(self.render_kv_inspector(session, inspector, writable, theme, cx))
                     }),
             )
+    }
+
+    /// The keyspace-analysis panel: a persisted, point-in-time report (type
+    /// distribution, top namespaces by memory, expiry summary) with a
+    /// Run/Re-run control (see docs/plans/redis.md's "persistent database
+    /// analysis report" gap).
+    pub(crate) fn render_kv_analysis(
+        &self,
+        active: &ActiveConn,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let session = active.session;
+        let Some(browse) = &active.kv_browse else {
+            return div().flex_1();
+        };
+        let st = &browse.analysis;
+
+        let run_view = cx.entity().downgrade();
+        let cancel_view = cx.entity().downgrade();
+        let run_label = if st.report.is_some() {
+            "Re-analyze"
+        } else {
+            "Analyze keyspace"
+        };
+        let status = if st.running {
+            format!("Scanning… {} keys sampled", st.collected.len())
+        } else if let Some(r) = &st.report {
+            let scope = if r.truncated {
+                format!("sampled {} of {}", r.sampled, r.total_keys.max(r.sampled))
+            } else {
+                format!("{} keys (full scan)", r.sampled)
+            };
+            format!(
+                "As of {} — {scope}, {} total",
+                fmt_ago_secs(crate::conversations::now_unix() as i64 - r.generated_at),
+                fmt_bytes(r.total_bytes)
+            )
+        } else {
+            "No analysis yet. Run one to break down types, namespaces and expiry.".to_string()
+        };
+
+        let header = div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1p5()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(theme.scale(10.5))
+                    .text_color(theme.text_muted)
+                    .child(status),
+            )
+            .when(st.running, |d| {
+                d.child(
+                    Button::new("kv-analysis-cancel", "Stop")
+                        .variant(ButtonVariant::Secondary)
+                        .size(ButtonSize::Sm)
+                        .on_click(move |_, _, cx| {
+                            cancel_view
+                                .update(cx, |this, cx| this.kv_cancel_analysis(session, cx))
+                                .ok();
+                        }),
+                )
+            })
+            .when(!st.running, |d| {
+                d.child(
+                    Button::new("kv-analysis-run", run_label)
+                        .size(ButtonSize::Sm)
+                        .on_click(move |_, _, cx| {
+                            run_view
+                                .update(cx, |this, cx| this.kv_run_analysis(session, cx))
+                                .ok();
+                        }),
+                )
+            });
+
+        let body = match &st.report {
+            Some(report) => self
+                .render_analysis_report(report, &theme)
+                .into_any_element(),
+            None => div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_4()
+                .text_size(theme.scale(11.5))
+                .text_color(theme.text_muted)
+                .child(if st.running {
+                    "Analyzing the keyspace…"
+                } else {
+                    "Run an analysis to see the report here."
+                })
+                .into_any_element(),
+        };
+
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(body)
+    }
+
+    /// The report body: type distribution, top namespaces, expiry summary,
+    /// each a section of proportion bars. Read-only, scrollable.
+    fn render_analysis_report(
+        &self,
+        report: &red_core::kv::RedisAnalysis,
+        theme: &Theme,
+    ) -> gpui::AnyElement {
+        let section_label = |s: &str| {
+            div()
+                .flex_shrink_0()
+                .px_2()
+                .pt_2()
+                .pb_1()
+                .text_size(theme.scale(9.5))
+                .text_color(theme.text_muted)
+                .child(s.to_string().to_uppercase())
+        };
+
+        // A labelled proportion bar: `label` left, `right` note, a fill sized
+        // to `value/max` behind it. Reused across the type and namespace lists.
+        let max_type = report.types.iter().map(|t| t.bytes).max().unwrap_or(0);
+        let type_rows: Vec<_> = report
+            .types
+            .iter()
+            .map(|t| {
+                bar_row(
+                    &t.kv_type,
+                    &format!("{} · {}", t.count, fmt_bytes(t.bytes)),
+                    t.bytes,
+                    max_type,
+                    theme.blue,
+                    theme,
+                )
+            })
+            .collect();
+
+        let max_ns = report.namespaces.iter().map(|n| n.bytes).max().unwrap_or(0);
+        let ns_rows: Vec<_> = report
+            .namespaces
+            .iter()
+            .map(|n| {
+                bar_row(
+                    &n.prefix,
+                    &format!("{} · {}", n.count, fmt_bytes(n.bytes)),
+                    n.bytes,
+                    max_ns,
+                    theme.purple,
+                    theme,
+                )
+            })
+            .collect();
+
+        // Expiry summary: persistent vs. bucketed by how soon.
+        let ttl = &report.ttl;
+        let ttl_total = ttl.persistent + ttl.with_ttl();
+        let ttl_rows: Vec<_> = [
+            ("No expiry", ttl.persistent, theme.text_muted),
+            ("< 1 hour", ttl.under_hour, theme.red),
+            ("< 1 day", ttl.under_day, theme.orange),
+            ("< 1 week", ttl.under_week, theme.yellow),
+            ("> 1 week", ttl.over_week, theme.green),
+        ]
+        .into_iter()
+        .filter(|(_, n, _)| *n > 0)
+        .map(|(label, n, color)| bar_row(label, &n.to_string(), n, ttl_total, color, theme))
+        .collect();
+
+        div()
+            .id("kv-analysis-report")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .child(section_label("Types by memory"))
+            .children(type_rows)
+            .child(section_label(&format!(
+                "Top {} namespaces by memory",
+                report.namespaces.len()
+            )))
+            .children(ns_rows)
+            .child(section_label("Expiry"))
+            .children(ttl_rows)
+            .into_any_element()
     }
 
     /// The value inspector panel: key/type/TTL header, then the value

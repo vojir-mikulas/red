@@ -1236,6 +1236,11 @@ pub struct AppState {
     /// loaded once at startup. Each entry is connection-scoped; the run-bar
     /// popover filters to the active connection's `conn_id`.
     pub(crate) query_history: crate::history::QueryHistory,
+    /// Persisted per-connection Redis keyspace-analysis reports (see
+    /// `redis_analysis.rs`), loaded once at startup. Keyed by `conn_id`, so a
+    /// saved report survives a restart and is shown when the Analysis panel
+    /// reopens on that connection.
+    pub(crate) redis_analysis: crate::redis_analysis::AnalysisStore,
     /// App-managed local state (`state.json`): the last-seen version (for the
     /// update toast) and the per-agent config-selector cache that lets the
     /// assistant show its model/reasoning dropdowns before a chat opens a session.
@@ -1968,6 +1973,7 @@ impl AppState {
             saved_queries: Vec::new(),
             loaded_conversations: Vec::new(),
             query_history: crate::history::QueryHistory::load(),
+            redis_analysis: crate::redis_analysis::AnalysisStore::load(),
             local_state,
             switcher,
             parked: HashMap::new(),
