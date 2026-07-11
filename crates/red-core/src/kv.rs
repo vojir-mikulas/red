@@ -318,6 +318,63 @@ pub enum KvEdit {
         field: String,
         value: String,
     },
+    /// `HDEL key field [field ...]` — remove one or more hash fields.
+    HashDelete {
+        key: String,
+        fields: Vec<String>,
+    },
+    /// `SADD key member [member ...]` — add set members (also creates the key).
+    SetAdd {
+        key: String,
+        members: Vec<String>,
+    },
+    /// `SREM key member [member ...]` — remove set members.
+    SetRemove {
+        key: String,
+        members: Vec<String>,
+    },
+    /// Rename a set member: `SREM key old` then `SADD key new`, so an inline
+    /// edit of a set element is one echoed edit rather than a delete + add the
+    /// UI has to sequence itself.
+    SetReplace {
+        key: String,
+        old: String,
+        new: String,
+    },
+    /// `ZADD key score member` — add a sorted-set member or overwrite its
+    /// score (Redis upserts on the member), covering both add and score-edit.
+    ZSetAdd {
+        key: String,
+        member: String,
+        score: f64,
+    },
+    /// `ZREM key member [member ...]` — remove sorted-set members.
+    ZSetRemove {
+        key: String,
+        members: Vec<String>,
+    },
+    /// `LSET key index value` — overwrite the list element at `index`.
+    ListSet {
+        key: String,
+        index: i64,
+        value: String,
+    },
+    /// `LPUSH`/`RPUSH key value` — prepend (`head`) or append a list element
+    /// (also creates the key).
+    ListPush {
+        key: String,
+        value: String,
+        head: bool,
+    },
+    /// `LREM key count value` — remove list elements equal to `value`. A UI
+    /// element delete sends `count = 1` (remove the first occurrence); a
+    /// duplicate value can't be pinned to a single index without a placeholder
+    /// dance, a documented Redis limitation.
+    ListRemove {
+        key: String,
+        count: i64,
+        value: String,
+    },
     SetTtl {
         key: String,
         ttl: Option<Duration>,

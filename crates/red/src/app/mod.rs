@@ -1247,6 +1247,10 @@ pub struct AppState {
     /// saved report survives a restart and is shown when the Analysis panel
     /// reopens on that connection.
     pub(crate) redis_analysis: crate::redis_analysis::AnalysisStore,
+    /// Persisted per-connection "recently viewed keys" (see `recent_keys.rs`),
+    /// loaded once at startup and seeded into a Redis view when it connects, so
+    /// the inspector's browsing history survives a restart.
+    pub(crate) redis_recent_keys: crate::recent_keys::RecentKeysStore,
     /// App-managed local state (`state.json`): the last-seen version (for the
     /// update toast) and the per-agent config-selector cache that lets the
     /// assistant show its model/reasoning dropdowns before a chat opens a session.
@@ -1981,6 +1985,7 @@ impl AppState {
             loaded_conversations: Vec::new(),
             query_history: crate::history::QueryHistory::load(),
             redis_analysis: crate::redis_analysis::AnalysisStore::load(),
+            redis_recent_keys: crate::recent_keys::RecentKeysStore::load(),
             local_state,
             switcher,
             parked: HashMap::new(),
@@ -2374,6 +2379,9 @@ impl AppState {
             }
             Event::KvValueReady { key, value, .. } => {
                 self.on_kv_value_ready(session, key, value, cx);
+            }
+            Event::KvValueError { key, message, .. } => {
+                self.on_kv_value_error(session, key, message, cx);
             }
             Event::KvCollectionPageReady { key, page, .. } => {
                 self.on_kv_collection_page_ready(session, key, page, cx);

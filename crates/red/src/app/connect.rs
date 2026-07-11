@@ -123,6 +123,7 @@ impl AppState {
             // Invalidate any pending backoff timer from a prior attempt.
             self.connect_gen += 1;
             let is_redis = conn.config.kind == red_core::DbKind::Redis;
+            let conn_id = conn.conn_id.clone();
             self.phase = Phase::Connected(Box::new(ActiveConn::new(
                 id,
                 conn.conn_id,
@@ -132,6 +133,9 @@ impl AppState {
             )));
             self.foreground_session = Some(id);
             if is_redis {
+                // Restore the persisted recently-viewed keys for this
+                // connection before the first render reads them.
+                self.kv_seed_recent_keys(id, &conn_id);
                 // Redis has no schema/FK concept; kick off the keyspace
                 // browser's first scan + header stat instead (R1, see
                 // docs/plans/redis.md).

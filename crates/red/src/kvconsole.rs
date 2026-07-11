@@ -27,6 +27,9 @@ pub(crate) struct KvConsole {
     /// A destructive command (`classify_command` says so) waits here for an
     /// explicit confirm before it's actually sent.
     pub(crate) pending_confirm: Option<Vec<String>>,
+    /// Up/Down command recall: an index into `history` while browsing past
+    /// commands, `None` when editing a fresh line. Reset when a command runs.
+    pub(crate) recall: Option<usize>,
     pub(crate) scroll: ScrollHandle,
 }
 
@@ -48,6 +51,7 @@ impl KvConsole {
             input,
             history: Vec::new(),
             pending_confirm: None,
+            recall: None,
             scroll: ScrollHandle::new(),
         }
     }
@@ -126,12 +130,51 @@ impl AppState {
             return;
         };
         let epoch = console.epoch;
+        console.recall = None;
         console.history.push(KvConsoleEntry {
             argv: argv.clone(),
             result: None,
         });
         self.service
             .send_to(session, Command::KvCommand { epoch, argv });
+        cx.notify();
+    }
+
+    /// Walk command history in the input line: `prev` (Up) steps to older
+    /// commands, `!prev` (Down) to newer, past the newest clearing the line.
+    /// Seeds but never runs — Enter runs it, matching shell recall.
+    pub(crate) fn kv_console_recall(
+        &mut self,
+        session: SessionId,
+        prev: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((content, input)) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_console_mut())
+            .and_then(|console| {
+                let n = console.history.len();
+                if n == 0 {
+                    return None;
+                }
+                let new_idx = match (console.recall, prev) {
+                    (None, true) => Some(n - 1),
+                    (None, false) => return None, // Down with a fresh line: nothing to do
+                    (Some(i), true) => Some(i.saturating_sub(1)),
+                    (Some(i), false) if i + 1 >= n => None,
+                    (Some(i), false) => Some(i + 1),
+                };
+                console.recall = new_idx;
+                let content = new_idx
+                    .map(|i| console.history[i].argv.join(" "))
+                    .unwrap_or_default();
+                Some((content, console.input.clone()))
+            })
+        else {
+            return;
+        };
+        input.update(cx, |ti, cx| ti.set_content(&content, cx));
         cx.notify();
     }
 
@@ -341,7 +384,23 @@ impl AppState {
                     .py_1p5()
                     .border_t_1()
                     .border_color(theme.border)
-                    .child(div().flex_1().min_w(px(120.)).child(console.input.clone())),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(120.))
+                            // Up/Down recall past commands into the input; the
+                            // single-line input doesn't use the vertical arrows.
+                            .on_key_down(cx.listener(
+                                move |this, ev: &gpui::KeyDownEvent, _w, cx| {
+                                    match ev.keystroke.key.as_str() {
+                                        "up" => this.kv_console_recall(session, true, cx),
+                                        "down" => this.kv_console_recall(session, false, cx),
+                                        _ => {}
+                                    }
+                                },
+                            ))
+                            .child(console.input.clone()),
+                    ),
             )
     }
 }

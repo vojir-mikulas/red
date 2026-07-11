@@ -49,6 +49,9 @@ pub(crate) struct KvMonitor {
     pub(crate) slowlog_loading: bool,
     /// `true` while a `MONITOR` stream is live (Start pressed, not yet Stopped).
     pub(crate) monitoring: bool,
+    /// `true` when the firehose is paused: the stream stays live but incoming
+    /// lines are dropped so the view holds still (a tail -f style freeze).
+    pub(crate) paused: bool,
     pub(crate) lines: Vec<String>,
     /// The `CLIENT LIST` viewer's rows.
     pub(crate) clients: Vec<ClientInfo>,
@@ -66,6 +69,7 @@ impl KvMonitor {
             slowlog_loaded: false,
             slowlog_loading: false,
             monitoring: false,
+            paused: false,
             lines: Vec::new(),
             clients: Vec::new(),
             clients_loaded: false,
@@ -229,9 +233,35 @@ impl AppState {
             return;
         }
         mon.monitoring = true;
+        mon.paused = false;
         mon.lines.clear();
         let epoch = mon.epoch;
         self.service.send_to(session, Command::KvMonitor { epoch });
+        cx.notify();
+    }
+
+    /// Freeze / unfreeze the live firehose view without tearing the stream
+    /// down. Paused lines are dropped (a tail-style freeze), not buffered.
+    pub(crate) fn kv_toggle_monitor_pause(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(mon) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_monitor_mut())
+        {
+            mon.paused = !mon.paused;
+        }
+        cx.notify();
+    }
+
+    /// Clear the accumulated MONITOR lines.
+    pub(crate) fn kv_clear_monitor(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(mon) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_monitor_mut())
+        {
+            mon.lines.clear();
+        }
         cx.notify();
     }
 
@@ -249,6 +279,7 @@ impl AppState {
             return;
         }
         mon.monitoring = false;
+        mon.paused = false;
         let epoch = mon.epoch;
         self.service
             .send_to(session, Command::CloseResult { epoch });
@@ -269,8 +300,8 @@ impl AppState {
         else {
             return;
         };
-        if !mon.monitoring {
-            return; // already stopped
+        if !mon.monitoring || mon.paused {
+            return; // already stopped, or the view is frozen
         }
         mon.lines.push(line);
         if mon.lines.len() > MAX_LINES {
@@ -523,10 +554,39 @@ impl AppState {
         };
 
         let status = if mon.monitoring {
-            format!("streaming every command — {} line(s)", mon.lines.len())
+            if mon.paused {
+                format!("paused — {} line(s) held", mon.lines.len())
+            } else {
+                format!("streaming every command — {} line(s)", mon.lines.len())
+            }
         } else {
             "stopped (MONITOR streams every command the server runs)".to_string()
         };
+
+        let (pause_view, clear_view) = (cx.entity().downgrade(), cx.entity().downgrade());
+        let pause_button = mon.monitoring.then(|| {
+            Button::new(
+                "kv-monitor-pause",
+                if mon.paused { "Resume" } else { "Pause" },
+            )
+            .variant(ButtonVariant::Secondary)
+            .size(ButtonSize::Sm)
+            .on_click(move |_, _, cx| {
+                pause_view
+                    .update(cx, |this, cx| this.kv_toggle_monitor_pause(session, cx))
+                    .ok();
+            })
+        });
+        let clear_button = (!mon.lines.is_empty()).then(|| {
+            Button::new("kv-monitor-clear", "Clear")
+                .variant(ButtonVariant::Secondary)
+                .size(ButtonSize::Sm)
+                .on_click(move |_, _, cx| {
+                    clear_view
+                        .update(cx, |this, cx| this.kv_clear_monitor(session, cx))
+                        .ok();
+                })
+        });
 
         let header = div()
             .flex_shrink_0()
@@ -544,6 +604,8 @@ impl AppState {
                     .text_color(theme.text_muted)
                     .child(status),
             )
+            .children(clear_button)
+            .children(pause_button)
             .child(toggle);
 
         let mono = theme.mono_family.clone();

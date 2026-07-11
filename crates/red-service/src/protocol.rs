@@ -722,6 +722,15 @@ pub enum Event {
         key: String,
         value: Option<KvValue>,
     },
+    /// Reading a key's value failed (a transport or `WRONGTYPE`-style error),
+    /// in response to `KvReadValue`. Surfaced inline in the inspector for the
+    /// matching key rather than only as a detached toast, so a stuck
+    /// "Loading…" can't outlive a failed read.
+    KvValueError {
+        epoch: u64,
+        key: String,
+        message: String,
+    },
     /// One page of a big collection's elements, in response to
     /// `KvReadCollectionPage`.
     KvCollectionPageReady {

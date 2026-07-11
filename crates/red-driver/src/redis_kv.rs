@@ -932,6 +932,117 @@ impl KvDriver for RedisDriver {
             .map_err(|e| RedError::Driver(e.to_string()))
     }
 
+    async fn hash_delete(&self, key: &str, fields: &[String]) -> Result<u64> {
+        self.check_writable()?;
+        if fields.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.route(key);
+        let mut cmd = redis::cmd("HDEL");
+        cmd.arg(key);
+        for f in fields {
+            cmd.arg(f);
+        }
+        cmd.query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    async fn set_add(&self, key: &str, members: &[String]) -> Result<u64> {
+        self.check_writable()?;
+        if members.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.route(key);
+        let mut cmd = redis::cmd("SADD");
+        cmd.arg(key);
+        for m in members {
+            cmd.arg(m);
+        }
+        cmd.query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    async fn set_remove(&self, key: &str, members: &[String]) -> Result<u64> {
+        self.check_writable()?;
+        if members.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.route(key);
+        let mut cmd = redis::cmd("SREM");
+        cmd.arg(key);
+        for m in members {
+            cmd.arg(m);
+        }
+        cmd.query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    async fn zset_add(&self, key: &str, member: &str, score: f64) -> Result<()> {
+        self.check_writable()?;
+        let mut conn = self.route(key);
+        redis::cmd("ZADD")
+            .arg(key)
+            .arg(score)
+            .arg(member)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    async fn zset_remove(&self, key: &str, members: &[String]) -> Result<u64> {
+        self.check_writable()?;
+        if members.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.route(key);
+        let mut cmd = redis::cmd("ZREM");
+        cmd.arg(key);
+        for m in members {
+            cmd.arg(m);
+        }
+        cmd.query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    async fn list_set(&self, key: &str, index: i64, value: String) -> Result<()> {
+        self.check_writable()?;
+        let mut conn = self.route(key);
+        redis::cmd("LSET")
+            .arg(key)
+            .arg(index)
+            .arg(value)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    async fn list_push(&self, key: &str, value: String, head: bool) -> Result<u64> {
+        self.check_writable()?;
+        let mut conn = self.route(key);
+        redis::cmd(if head { "LPUSH" } else { "RPUSH" })
+            .arg(key)
+            .arg(value)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    async fn list_remove(&self, key: &str, count: i64, value: String) -> Result<u64> {
+        self.check_writable()?;
+        let mut conn = self.route(key);
+        redis::cmd("LREM")
+            .arg(key)
+            .arg(count)
+            .arg(value)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
     async fn set_ttl(&self, key: &str, ttl: Option<Duration>) -> Result<()> {
         self.check_writable()?;
         let mut conn = self.route(key);

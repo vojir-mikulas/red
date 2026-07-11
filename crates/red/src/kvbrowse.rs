@@ -250,6 +250,42 @@ pub(crate) struct BrowseState {
     /// `Some` while a "find biggest keys" sample is running or showing its
     /// last result; `None` is the normal live-browse state.
     pub(crate) big_keys: Option<BigKeysState>,
+    /// `Some` while the "New key" popover is open (see `kv_open_create_key`).
+    pub(crate) create_key: Option<CreateKeyState>,
+    /// Set once the resident-row cap (`MAX_RESIDENT_ROWS`) has evicted the
+    /// oldest scanned keys, so the header can say the view is windowed rather
+    /// than silently dropping keys off the top.
+    pub(crate) evicted: bool,
+}
+
+/// The "New key" popover's state: a name, the chosen type, and the per-type
+/// seed inputs (a hash needs a field, a zset a score; everything else just a
+/// value/member). A new key is created by its first write — `SET`/`HSET`/
+/// `RPUSH`/`SADD`/`ZADD` — so this reuses the same [`KvEdit`](red_core::kv::KvEdit)
+/// path as element editing; stream creation (no `XADD` edit) isn't offered.
+pub(crate) struct CreateKeyState {
+    pub(crate) name: Entity<TextInput>,
+    /// Hash field name (only shown/used when `kv_type` is `Hash`).
+    pub(crate) field: Entity<TextInput>,
+    /// The value, set member, list element, or zset member.
+    pub(crate) value: Entity<TextInput>,
+    /// ZSet score (only shown/used when `kv_type` is `ZSet`).
+    pub(crate) score: Entity<TextInput>,
+    pub(crate) kv_type: KvType,
+    pub(crate) type_open: bool,
+    pub(crate) error: Option<String>,
+}
+
+/// The key types the "New key" popover can create, in menu order. Stream is
+/// omitted (no `XADD` edit exists), matching the element-edit path's coverage.
+fn kv_creatable_types() -> [KvType; 5] {
+    [
+        KvType::String,
+        KvType::Hash,
+        KvType::List,
+        KvType::Set,
+        KvType::ZSet,
+    ]
 }
 
 /// One entry in a connection's "recently viewed keys" list — browser-history
@@ -260,6 +296,31 @@ pub(crate) struct RecentKey {
     pub(crate) kv_type: KvType,
     pub(crate) ttl: Option<Duration>,
     pub(crate) viewed_unix: u64,
+}
+
+impl RecentKey {
+    /// The serde-friendly persisted form (see `recent_keys.rs`): type as its
+    /// label, TTL as whole seconds.
+    fn to_rec(&self) -> crate::recent_keys::RecentKeyRec {
+        crate::recent_keys::RecentKeyRec {
+            key: self.key.clone(),
+            kv_type: self.kv_type.label().to_string(),
+            ttl_secs: self.ttl.map(|d| d.as_secs()),
+            viewed_unix: self.viewed_unix,
+        }
+    }
+
+    /// Rebuild from the persisted form; an unknown type label round-trips as
+    /// `KvType::Other` rather than being dropped.
+    fn from_rec(rec: &crate::recent_keys::RecentKeyRec) -> Self {
+        RecentKey {
+            key: rec.key.clone(),
+            kv_type: KvType::parse(&rec.kv_type)
+                .unwrap_or_else(|| KvType::Other(rec.kv_type.clone())),
+            ttl: rec.ttl_secs.map(Duration::from_secs),
+            viewed_unix: rec.viewed_unix,
+        }
+    }
 }
 
 /// How many recently-viewed keys to retain per connection.
@@ -480,6 +541,47 @@ pub(crate) struct KvInspector {
     /// it back over the key), so we fetch it first and open the editor in
     /// `on_kv_value_ready` once it arrives.
     pub(crate) edit_after_load: bool,
+
+    // --- collection-element editing (hash field / set member / zset member /
+    // list element add/edit/delete; see docs/plans/redis.md's editing phase).
+    /// The two shared inputs the element popover uses: `elem_name` is the
+    /// hash field / set member / list value; `elem_value` is the hash value or
+    /// zset score. Persistent like the other inspector editors.
+    pub(crate) elem_name_editor: Entity<TextInput>,
+    pub(crate) elem_value_editor: Entity<TextInput>,
+    /// The open collection-element edit popover, if any (one at a time).
+    pub(crate) collection_edit: Option<CollectionEditKind>,
+    /// An inline validation message for the element popover (e.g. a
+    /// non-numeric zset score); cleared when the popover reopens.
+    pub(crate) elem_error: Option<String>,
+
+    /// True once a `KvReadValue` reply has landed (even a `None`): lets the
+    /// value area distinguish "still loading" from "loaded, but the key is
+    /// gone", so a vanished key no longer shows a permanent spinner.
+    pub(crate) value_loaded: bool,
+    /// An error from reading the value (a transport / `WRONGTYPE` failure),
+    /// shown in the value area instead of a stuck "Loading…".
+    pub(crate) value_error: Option<String>,
+    /// Inline validation message for the expiry popover (a non-numeric input),
+    /// shown instead of silently ignoring the value.
+    pub(crate) ttl_error: Option<String>,
+}
+
+/// Which collection-element edit popover the inspector is showing: adding or
+/// editing one hash field / set member / zset member / list element. The
+/// per-type `Edit*` variants carry enough to identify the element being
+/// changed; the new content comes from the inspector's shared element editors.
+#[derive(Clone)]
+pub(crate) enum CollectionEditKind {
+    AddHashField,
+    EditHashField { field: String },
+    AddSetMember,
+    EditSetMember { old: String },
+    AddZSetMember,
+    EditZSetScore { member: String },
+    AddListHead,
+    AddListTail,
+    EditListIndex { index: i64 },
 }
 
 /// A read-only [`CodeEditor`] hosting the *displayed* string value so the user
@@ -579,6 +681,8 @@ impl BrowseState {
             fuzzy: false,
             inspector: None,
             big_keys: None,
+            create_key: None,
+            evicted: false,
         }
     }
 
@@ -1034,6 +1138,66 @@ impl AppState {
         self.kv_relaunch_browse(session, cx);
     }
 
+    /// Drill an Analysis type row into a new Browse tab filtered to that type.
+    pub(crate) fn kv_drill_type(
+        &mut self,
+        session: SessionId,
+        type_label: String,
+        cx: &mut Context<Self>,
+    ) {
+        let kv_type = KvType::parse(&type_label).unwrap_or(KvType::Other(type_label));
+        self.kv_open_filtered_browse(session, None, Some(kv_type), cx);
+    }
+
+    /// Drill an Analysis namespace row into a new Browse tab matching
+    /// `prefix:*`.
+    pub(crate) fn kv_drill_namespace(
+        &mut self,
+        session: SessionId,
+        prefix: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.kv_open_filtered_browse(session, Some(format!("{prefix}:*")), None, cx);
+    }
+
+    /// Spawn a fresh Browse tab and apply a `MATCH` pattern and/or `TYPE`
+    /// filter to it — the shared engine behind the Analysis drill-downs. Keeps
+    /// the Analysis tab open (opens a *new* Browse tab rather than reusing one).
+    fn kv_open_filtered_browse(
+        &mut self,
+        session: SessionId,
+        pattern: Option<String>,
+        kv_type: Option<KvType>,
+        cx: &mut Context<Self>,
+    ) {
+        self.kv_new_empty_tab(session, cx);
+        let id = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .and_then(|v| v.tabs.get(v.focused_tab_index()).map(|t| t.id));
+        let Some(id) = id else {
+            return;
+        };
+        // Converts the blank tab to Browse and fires an initial (unfiltered)
+        // scan the filters below then supersede.
+        self.kv_set_tab_kind(session, id, KvPanel::Browse, cx);
+        if let Some(p) = pattern.clone() {
+            if let Some(browse) = self
+                .conn_mut(Some(session))
+                .and_then(|a| a.kv_view.as_mut())
+                .and_then(|v| v.active_browse_mut())
+            {
+                browse.filter.update(cx, |ti, cx| ti.set_content(&p, cx));
+            }
+        }
+        if let Some(t) = kv_type {
+            self.kv_set_type_filter(session, Some(t), cx);
+        }
+        if pattern.is_some() {
+            self.kv_restart_scan(session, pattern, cx);
+        }
+    }
+
     /// Open or dismiss the type-filter dropdown's option list.
     pub(crate) fn kv_toggle_type_menu(&mut self, session: SessionId, cx: &mut Context<Self>) {
         if let Some(browse) = self
@@ -1064,6 +1228,7 @@ impl AppState {
         let new_epoch = crate::result::next_kv_epoch();
         browse.epoch = new_epoch;
         browse.rows.clear();
+        browse.evicted = false;
         browse.cursor = ScanCursor::START;
         browse.exhausted = false;
         browse.loading = true;
@@ -1267,6 +1432,7 @@ impl AppState {
         if browse.rows.len() > MAX_RESIDENT_ROWS {
             let drop = browse.rows.len() - MAX_RESIDENT_ROWS;
             browse.rows.drain(0..drop);
+            browse.evicted = true;
         }
         browse.cursor = page.next_cursor;
         browse.exhausted = page.exhausted;
@@ -2338,6 +2504,7 @@ impl AppState {
             );
             view.recent_keys.truncate(MAX_RECENT_KEYS);
         }
+        self.kv_persist_recent_keys(session);
 
         // A multiline surface (no gutter, no frame of its own) so it reads as
         // the value body becoming editable in place, exactly like the SQL cell
@@ -2385,6 +2552,26 @@ impl AppState {
             }
         })
         .detach();
+        let elem_name_editor = cx.new(TextInput::new);
+        cx.subscribe(
+            &elem_name_editor,
+            move |this, _, event: &TextInputEvent, cx| {
+                if matches!(event, TextInputEvent::Submit) {
+                    this.kv_submit_collection_edit(session, cx);
+                }
+            },
+        )
+        .detach();
+        let elem_value_editor = cx.new(TextInput::new);
+        cx.subscribe(
+            &elem_value_editor,
+            move |this, _, event: &TextInputEvent, cx| {
+                if matches!(event, TextInputEvent::Submit) {
+                    this.kv_submit_collection_edit(session, cx);
+                }
+            },
+        )
+        .detach();
 
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
@@ -2430,6 +2617,13 @@ impl AppState {
             str_format: crate::inspector::ValueFormat::Auto,
             loading_full_value: false,
             edit_after_load: false,
+            elem_name_editor,
+            elem_value_editor,
+            collection_edit: None,
+            elem_error: None,
+            value_loaded: false,
+            value_error: None,
+            ttl_error: None,
         });
         self.service
             .send_to(session, Command::KvReadValue { epoch, key });
@@ -2472,9 +2666,47 @@ impl AppState {
         {
             if !view.recent_keys.is_empty() {
                 view.recent_keys.clear();
+                self.kv_persist_recent_keys(session);
                 cx.notify();
             }
         }
+    }
+
+    /// Seed a freshly-connected Redis view's recently-viewed list from the
+    /// persisted store, so browsing history survives a restart.
+    pub(crate) fn kv_seed_recent_keys(&mut self, session: SessionId, conn_id: &str) {
+        let seeded: Vec<RecentKey> = self
+            .redis_recent_keys
+            .get(conn_id)
+            .map(|recs| recs.iter().map(RecentKey::from_rec).collect())
+            .unwrap_or_default();
+        if seeded.is_empty() {
+            return;
+        }
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            view.recent_keys = seeded;
+        }
+    }
+
+    /// Write the connection's current recently-viewed list to the persisted
+    /// store (called after any change: record / clear / remove).
+    fn kv_persist_recent_keys(&mut self, session: SessionId) {
+        let Some(active) = self.conn_mut(Some(session)) else {
+            return;
+        };
+        let conn_id = active.conn_id.clone();
+        if conn_id.is_empty() {
+            return;
+        }
+        let recs: Vec<crate::recent_keys::RecentKeyRec> = active
+            .kv_view
+            .as_ref()
+            .map(|v| v.recent_keys.iter().map(RecentKey::to_rec).collect())
+            .unwrap_or_default();
+        self.redis_recent_keys.set(&conn_id, recs);
     }
 
     /// Drop a single recently-viewed key from the History dock's Keys section
@@ -2492,6 +2724,7 @@ impl AppState {
             let before = view.recent_keys.len();
             view.recent_keys.retain(|r| r.key != key);
             if view.recent_keys.len() != before {
+                self.kv_persist_recent_keys(session);
                 cx.notify();
             }
         }
@@ -2518,6 +2751,26 @@ impl AppState {
     /// `GET`, no cap), for a value `read_value` returned as a `Value::Capped`.
     /// The reply comes back on `Event::KvValueReady` and replaces the capped
     /// body in place, mirroring the SQL cell inspector's load-full flow.
+    /// Copy the inspected string value to the clipboard. Copies whatever's
+    /// resident — the full text, or a capped value's loaded head (use "Load
+    /// full value" first to copy the whole thing).
+    pub(crate) fn kv_copy_string_value(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let text = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .and_then(|v| v.active_browse())
+            .and_then(|b| b.inspector.as_ref())
+            .and_then(|i| match i.value.as_ref()? {
+                KvValue::Str(red_core::Value::Text(s)) => Some(s.clone()),
+                KvValue::Str(red_core::Value::Capped(c)) => Some(c.head.clone()),
+                KvValue::Str(other) => Some(format!("{other:?}")),
+                _ => None,
+            });
+        if let Some(text) = text {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        }
+    }
+
     pub(crate) fn kv_load_full_value(&mut self, session: SessionId, cx: &mut Context<Self>) {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
@@ -2607,7 +2860,10 @@ impl AppState {
         // A `read_value`-capped string only holds its head; editing must run on
         // the whole value or a save would truncate the key. Fetch the full
         // string first and defer opening the editor to `on_kv_value_ready`.
-        if matches!(&inspector.value, Some(KvValue::Str(red_core::Value::Capped(_)))) {
+        if matches!(
+            &inspector.value,
+            Some(KvValue::Str(red_core::Value::Capped(_)))
+        ) {
             inspector.edit_after_load = true;
             self.kv_load_full_value(session, cx);
             return;
@@ -2680,6 +2936,7 @@ impl AppState {
         inspector
             .ttl_editor
             .update(cx, |ti, cx| ti.set_content(seed, cx));
+        inspector.ttl_error = None;
         inspector.editing_ttl = true;
         cx.notify();
     }
@@ -2699,29 +2956,53 @@ impl AppState {
     }
 
     /// Blank input persists the key (no expiry); otherwise parses as whole
-    /// seconds. An unparseable, non-blank input is a silent no-op — a real
-    /// input validation message is a nice-to-have this pass skips.
+    /// seconds. An unparseable, non-blank input reports inline in the popover
+    /// (`ttl_error`) rather than silently doing nothing.
     pub(crate) fn kv_submit_ttl_edit(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(active) = self.conn_mut(Some(session)) else {
+        let Some((epoch, key, text)) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+            .and_then(|b| {
+                let epoch = b.epoch;
+                let inspector = b.inspector.as_ref()?;
+                Some((
+                    epoch,
+                    inspector.key.clone(),
+                    inspector.ttl_editor.read(cx).content().to_string(),
+                ))
+            })
+        else {
             return;
         };
-        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
-            return;
-        };
-        let epoch = browse.epoch;
-        let Some(inspector) = &browse.inspector else {
-            return;
-        };
-        let key = inspector.key.clone();
-        let text = inspector.ttl_editor.read(cx).content().to_string();
         let ttl = if text.trim().is_empty() {
             None
         } else {
             match text.trim().parse::<u64>() {
                 Ok(secs) => Some(Duration::from_secs(secs)),
-                Err(_) => return,
+                Err(_) => {
+                    if let Some(inspector) = self
+                        .conn_mut(Some(session))
+                        .and_then(|a| a.kv_view.as_mut())
+                        .and_then(|v| v.active_browse_mut())
+                        .and_then(|b| b.inspector.as_mut())
+                    {
+                        inspector.ttl_error =
+                            Some("Enter whole seconds, or leave blank to persist".into());
+                    }
+                    cx.notify();
+                    return;
+                }
             }
         };
+        if let Some(inspector) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+            .and_then(|b| b.inspector.as_mut())
+        {
+            inspector.ttl_error = None;
+        }
         let edit = red_core::kv::KvEdit::SetTtl { key, ttl };
         self.service
             .send_to(session, Command::KvApplyEdit { epoch, edit });
@@ -2831,6 +3112,380 @@ impl AppState {
         cx.notify();
     }
 
+    /// Open the collection-element popover (add or edit a hash field / set
+    /// member / zset member / list element), seeding the shared element editors.
+    /// `seed_name` fills the field/member/list-value input; `seed_value` fills
+    /// the hash-value/zset-score input (either is empty for an add).
+    pub(crate) fn kv_open_collection_edit(
+        &mut self,
+        session: SessionId,
+        kind: CollectionEditKind,
+        seed_name: String,
+        seed_value: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.conn_mut(Some(session)) else {
+            return;
+        };
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
+            return;
+        };
+        let Some(inspector) = &mut browse.inspector else {
+            return;
+        };
+        // Only one popover open at a time.
+        inspector.editing_key = false;
+        inspector.editing_ttl = false;
+        inspector.elem_error = None;
+        inspector
+            .elem_name_editor
+            .update(cx, |ti, cx| ti.set_content(seed_name, cx));
+        inspector
+            .elem_value_editor
+            .update(cx, |ti, cx| ti.set_content(seed_value, cx));
+        inspector.collection_edit = Some(kind);
+        cx.notify();
+    }
+
+    pub(crate) fn kv_cancel_collection_edit(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(active) = self.conn_mut(Some(session)) else {
+            return;
+        };
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
+            return;
+        };
+        let Some(inspector) = &mut browse.inspector else {
+            return;
+        };
+        inspector.collection_edit = None;
+        inspector.elem_error = None;
+        cx.notify();
+    }
+
+    fn kv_set_elem_error(&mut self, session: SessionId, msg: String, cx: &mut Context<Self>) {
+        if let Some(inspector) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+            .and_then(|b| b.inspector.as_mut())
+        {
+            inspector.elem_error = Some(msg);
+        }
+        cx.notify();
+    }
+
+    /// Read the open element popover, build the matching [`KvEdit`], and send
+    /// it. A blank name / unparseable score surfaces inline in the popover
+    /// (`elem_error`) rather than silently no-op'ing.
+    pub(crate) fn kv_submit_collection_edit(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        use red_core::kv::KvEdit;
+        let Some((epoch, key, kind, name, value)) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+            .and_then(|b| {
+                let epoch = b.epoch;
+                let inspector = b.inspector.as_ref()?;
+                let kind = inspector.collection_edit.clone()?;
+                Some((
+                    epoch,
+                    inspector.key.clone(),
+                    kind,
+                    inspector.elem_name_editor.read(cx).content().to_string(),
+                    inspector.elem_value_editor.read(cx).content().to_string(),
+                ))
+            })
+        else {
+            return;
+        };
+
+        // Parse a zset score up front so a bad value reports inline.
+        let parse_score = |raw: &str| raw.trim().parse::<f64>();
+        let edit = match kind {
+            CollectionEditKind::AddHashField => {
+                if name.is_empty() {
+                    return self.kv_set_elem_error(session, "Field name is required".into(), cx);
+                }
+                KvEdit::SetField {
+                    key,
+                    field: name,
+                    value,
+                }
+            }
+            CollectionEditKind::EditHashField { field } => KvEdit::SetField { key, field, value },
+            CollectionEditKind::AddSetMember => {
+                if name.is_empty() {
+                    return self.kv_set_elem_error(session, "Member is required".into(), cx);
+                }
+                KvEdit::SetAdd {
+                    key,
+                    members: vec![name],
+                }
+            }
+            CollectionEditKind::EditSetMember { old } => {
+                if name.is_empty() {
+                    return self.kv_set_elem_error(session, "Member is required".into(), cx);
+                }
+                if name == old {
+                    return self.kv_cancel_collection_edit(session, cx);
+                }
+                KvEdit::SetReplace {
+                    key,
+                    old,
+                    new: name,
+                }
+            }
+            CollectionEditKind::AddZSetMember => {
+                if name.is_empty() {
+                    return self.kv_set_elem_error(session, "Member is required".into(), cx);
+                }
+                let Ok(score) = parse_score(&value) else {
+                    return self.kv_set_elem_error(session, "Score must be a number".into(), cx);
+                };
+                KvEdit::ZSetAdd {
+                    key,
+                    member: name,
+                    score,
+                }
+            }
+            CollectionEditKind::EditZSetScore { member } => {
+                let Ok(score) = parse_score(&value) else {
+                    return self.kv_set_elem_error(session, "Score must be a number".into(), cx);
+                };
+                KvEdit::ZSetAdd { key, member, score }
+            }
+            CollectionEditKind::AddListHead => KvEdit::ListPush {
+                key,
+                value: name,
+                head: true,
+            },
+            CollectionEditKind::AddListTail => KvEdit::ListPush {
+                key,
+                value: name,
+                head: false,
+            },
+            CollectionEditKind::EditListIndex { index } => KvEdit::ListSet {
+                key,
+                index,
+                value: name,
+            },
+        };
+
+        if let Some(inspector) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+            .and_then(|b| b.inspector.as_mut())
+        {
+            inspector.collection_edit = None;
+            inspector.elem_error = None;
+        }
+        self.service
+            .send_to(session, Command::KvApplyEdit { epoch, edit });
+        cx.notify();
+    }
+
+    /// Send a collection-element edit built from the current inspector key
+    /// (the row-level Delete/replace helpers). No-op if the inspector closed.
+    fn kv_send_element_edit(
+        &mut self,
+        session: SessionId,
+        make: impl FnOnce(String) -> red_core::kv::KvEdit,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((epoch, key)) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .and_then(|v| v.active_browse())
+            .and_then(|b| Some((b.epoch, b.inspector.as_ref()?.key.clone())))
+        else {
+            return;
+        };
+        let edit = make(key);
+        self.service
+            .send_to(session, Command::KvApplyEdit { epoch, edit });
+        cx.notify();
+    }
+
+    /// Open the "New key" popover, building its inputs (each submits the form).
+    pub(crate) fn kv_open_create_key(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let sub = |editor: &Entity<TextInput>, cx: &mut Context<Self>| {
+            cx.subscribe(editor, move |this, _, event: &TextInputEvent, cx| {
+                if matches!(event, TextInputEvent::Submit) {
+                    this.kv_submit_create_key(session, cx);
+                }
+            })
+            .detach();
+        };
+        let name = cx.new(|cx| TextInput::new(cx).with_placeholder("key name…"));
+        sub(&name, cx);
+        let field = cx.new(|cx| TextInput::new(cx).with_placeholder("field…"));
+        sub(&field, cx);
+        let value = cx.new(|cx| TextInput::new(cx).with_placeholder("value…"));
+        sub(&value, cx);
+        let score = cx.new(|cx| TextInput::new(cx).with_placeholder("score (e.g. 1.0)"));
+        sub(&score, cx);
+
+        if let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        {
+            browse.create_key = Some(CreateKeyState {
+                name,
+                field,
+                value,
+                score,
+                kv_type: KvType::String,
+                type_open: false,
+                error: None,
+            });
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn kv_cancel_create_key(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        {
+            browse.create_key = None;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn kv_toggle_create_type_menu(
+        &mut self,
+        session: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ck) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+            .and_then(|b| b.create_key.as_mut())
+        {
+            ck.type_open = !ck.type_open;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn kv_set_create_type(
+        &mut self,
+        session: SessionId,
+        kv_type: KvType,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ck) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+            .and_then(|b| b.create_key.as_mut())
+        {
+            ck.kv_type = kv_type;
+            ck.type_open = false;
+            ck.error = None;
+        }
+        cx.notify();
+    }
+
+    fn kv_set_create_error(&mut self, session: SessionId, msg: String, cx: &mut Context<Self>) {
+        if let Some(ck) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+            .and_then(|b| b.create_key.as_mut())
+        {
+            ck.error = Some(msg);
+        }
+        cx.notify();
+    }
+
+    /// Validate the "New key" form, send the key's first write, then open the
+    /// inspector on it so its value shows straight away. Blank required fields
+    /// / a bad score report inline (`create_key.error`).
+    pub(crate) fn kv_submit_create_key(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        use red_core::kv::KvEdit;
+        let Some((epoch, name, kv_type, field, value, score)) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+            .and_then(|b| {
+                let epoch = b.epoch;
+                let ck = b.create_key.as_ref()?;
+                Some((
+                    epoch,
+                    ck.name.read(cx).content().trim().to_string(),
+                    ck.kv_type.clone(),
+                    ck.field.read(cx).content().to_string(),
+                    ck.value.read(cx).content().to_string(),
+                    ck.score.read(cx).content().to_string(),
+                ))
+            })
+        else {
+            return;
+        };
+        if name.is_empty() {
+            return self.kv_set_create_error(session, "Key name is required".into(), cx);
+        }
+        let key = name.clone();
+        let edit = match &kv_type {
+            KvType::String => KvEdit::SetString {
+                key,
+                value,
+                ttl: None,
+            },
+            KvType::Hash => {
+                if field.is_empty() {
+                    return self.kv_set_create_error(session, "Field name is required".into(), cx);
+                }
+                KvEdit::SetField { key, field, value }
+            }
+            KvType::List => KvEdit::ListPush {
+                key,
+                value,
+                head: false,
+            },
+            KvType::Set => {
+                if value.is_empty() {
+                    return self.kv_set_create_error(session, "Member is required".into(), cx);
+                }
+                KvEdit::SetAdd {
+                    key,
+                    members: vec![value],
+                }
+            }
+            KvType::ZSet => {
+                if value.is_empty() {
+                    return self.kv_set_create_error(session, "Member is required".into(), cx);
+                }
+                let Ok(score) = score.trim().parse::<f64>() else {
+                    return self.kv_set_create_error(session, "Score must be a number".into(), cx);
+                };
+                KvEdit::ZSetAdd {
+                    key,
+                    member: value,
+                    score,
+                }
+            }
+            KvType::Stream | KvType::Other(_) => return,
+        };
+
+        if let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        {
+            browse.create_key = None;
+        }
+        self.service
+            .send_to(session, Command::KvApplyEdit { epoch, edit });
+        // Show the freshly created key immediately.
+        self.kv_open_inspector(session, name, None, kv_type, cx);
+        cx.notify();
+    }
+
     /// `Event::KvEditApplied`: patch local state so the UI reflects the edit
     /// without a full re-fetch. Drops the reply if the browse it targets has
     /// since been superseded (a filter restart bumped the epoch).
@@ -2873,6 +3528,166 @@ impl AppState {
                                 Some((_, v)) => *v = value,
                                 None => pairs.push((field, value)),
                             }
+                        }
+                    }
+                }
+            }
+            KvEdit::HashDelete { key, fields } => {
+                if let Some(insp) = &mut browse.inspector {
+                    if insp.key == key {
+                        if let Some(KvValue::Hash(KvCollection::Loaded(pairs))) = &mut insp.value {
+                            pairs.retain(|(f, _)| !fields.contains(f));
+                        }
+                        insp.collection_rows.retain(|e| match e {
+                            KvElement::Field(f, _) => !fields.contains(f),
+                            _ => true,
+                        });
+                    }
+                }
+            }
+            KvEdit::SetAdd { key, members } => {
+                if let Some(insp) = &mut browse.inspector {
+                    if insp.key == key {
+                        if let Some(KvValue::Set(KvCollection::Loaded(items))) = &mut insp.value {
+                            for m in &members {
+                                if !items.contains(m) {
+                                    items.push(m.clone());
+                                }
+                            }
+                        }
+                        for m in &members {
+                            let present = insp
+                                .collection_rows
+                                .iter()
+                                .any(|e| matches!(e, KvElement::Member(x) if x == m));
+                            if !present {
+                                insp.collection_rows.push(KvElement::Member(m.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            KvEdit::SetRemove { key, members } => {
+                if let Some(insp) = &mut browse.inspector {
+                    if insp.key == key {
+                        if let Some(KvValue::Set(KvCollection::Loaded(items))) = &mut insp.value {
+                            items.retain(|m| !members.contains(m));
+                        }
+                        insp.collection_rows.retain(|e| match e {
+                            KvElement::Member(x) => !members.contains(x),
+                            _ => true,
+                        });
+                    }
+                }
+            }
+            KvEdit::SetReplace { key, old, new } => {
+                if let Some(insp) = &mut browse.inspector {
+                    if insp.key == key {
+                        if let Some(KvValue::Set(KvCollection::Loaded(items))) = &mut insp.value {
+                            if let Some(slot) = items.iter_mut().find(|m| **m == old) {
+                                *slot = new.clone();
+                            }
+                        }
+                        for e in insp.collection_rows.iter_mut() {
+                            if let KvElement::Member(x) = e {
+                                if *x == old {
+                                    *x = new.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            KvEdit::ZSetAdd { key, member, score } => {
+                if let Some(insp) = &mut browse.inspector {
+                    if insp.key == key {
+                        if let Some(KvValue::ZSet(KvCollection::Loaded(items))) = &mut insp.value {
+                            match items.iter().position(|(m, _)| *m == member) {
+                                Some(pos) => items[pos].1 = score,
+                                None => items.push((member.clone(), score)),
+                            }
+                        }
+                        match insp
+                            .collection_rows
+                            .iter()
+                            .position(|e| matches!(e, KvElement::Scored(m, _) if *m == member))
+                        {
+                            Some(pos) => {
+                                if let KvElement::Scored(_, s) = &mut insp.collection_rows[pos] {
+                                    *s = score;
+                                }
+                            }
+                            None => insp
+                                .collection_rows
+                                .push(KvElement::Scored(member.clone(), score)),
+                        }
+                    }
+                }
+            }
+            KvEdit::ZSetRemove { key, members } => {
+                if let Some(insp) = &mut browse.inspector {
+                    if insp.key == key {
+                        if let Some(KvValue::ZSet(KvCollection::Loaded(items))) = &mut insp.value {
+                            items.retain(|(m, _)| !members.contains(m));
+                        }
+                        insp.collection_rows.retain(|e| match e {
+                            KvElement::Scored(m, _) => !members.contains(m),
+                            _ => true,
+                        });
+                    }
+                }
+            }
+            KvEdit::ListSet { key, index, value } => {
+                if let Some(insp) = &mut browse.inspector {
+                    if insp.key == key && index >= 0 {
+                        let idx = index as usize;
+                        if let Some(KvValue::List(KvCollection::Loaded(items))) = &mut insp.value {
+                            if let Some(slot) = items.get_mut(idx) {
+                                *slot = value.clone();
+                            }
+                        }
+                        if let Some(KvElement::Member(x)) = insp.collection_rows.get_mut(idx) {
+                            *x = value.clone();
+                        }
+                    }
+                }
+            }
+            KvEdit::ListPush { key, value, head } => {
+                if let Some(insp) = &mut browse.inspector {
+                    if insp.key == key {
+                        if let Some(KvValue::List(KvCollection::Loaded(items))) = &mut insp.value {
+                            if head {
+                                items.insert(0, value.clone());
+                            } else {
+                                items.push(value.clone());
+                            }
+                        }
+                        // For a large list, `collection_rows` is a head window:
+                        // a head push shows immediately; a tail push only when
+                        // the whole list is loaded (else it lands off-window).
+                        if head {
+                            insp.collection_rows
+                                .insert(0, KvElement::Member(value.clone()));
+                        } else if insp.collection_exhausted {
+                            insp.collection_rows.push(KvElement::Member(value.clone()));
+                        }
+                    }
+                }
+            }
+            KvEdit::ListRemove { key, value, .. } => {
+                if let Some(insp) = &mut browse.inspector {
+                    if insp.key == key {
+                        if let Some(KvValue::List(KvCollection::Loaded(items))) = &mut insp.value {
+                            if let Some(pos) = items.iter().position(|v| *v == value) {
+                                items.remove(pos);
+                            }
+                        }
+                        if let Some(pos) = insp
+                            .collection_rows
+                            .iter()
+                            .position(|e| matches!(e, KvElement::Member(x) if *x == value))
+                        {
+                            insp.collection_rows.remove(pos);
                         }
                     }
                 }
@@ -2941,6 +3756,8 @@ impl AppState {
             return; // a newer selection has already superseded this reply
         }
         inspector.value = value.clone();
+        inspector.value_loaded = true;
+        inspector.value_error = None;
         // Whether this is the initial capped read or a "Load full value" reply,
         // the string body is now settled — drop the loading state either way.
         inspector.loading_full_value = false;
@@ -2974,6 +3791,31 @@ impl AppState {
                 self.kv_load_stream_page(session, cx);
             }
             _ => {}
+        }
+    }
+
+    /// `Event::KvValueError`: a value read failed. Settle the inspector's
+    /// value area on the error (for the matching key) instead of leaving it on
+    /// a permanent "Loading…".
+    pub(crate) fn on_kv_value_error(
+        &mut self,
+        session: Option<SessionId>,
+        key: String,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(inspector) = self
+            .conn_mut(session)
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+            .and_then(|b| b.inspector.as_mut())
+        {
+            if inspector.key == key {
+                inspector.value_loaded = true;
+                inspector.value_error = Some(message);
+                inspector.loading_full_value = false;
+                cx.notify();
+            }
         }
     }
 
@@ -3698,8 +4540,16 @@ impl AppState {
             return div().flex_1();
         };
 
+        let writable = !active.config.read_only;
         let fuzzy_query = browse.filter.read(cx).content().to_string();
         let rows: std::rc::Rc<Vec<KeyMeta>> = std::rc::Rc::new(browse.visible_rows(cx));
+
+        // Appended to the header stat once the resident-row cap has kicked in.
+        let evicted_note = if browse.evicted {
+            " · showing the most recent 20k, narrow the filter for older keys"
+        } else {
+            ""
+        };
 
         let header = if browse.fuzzy {
             if fuzzy_query.is_empty() {
@@ -3737,6 +4587,7 @@ impl AppState {
                 }
             }
         };
+        let header = format!("{header}{evicted_note}");
 
         let rows_render = rows.clone();
         let rows_select = rows.clone();
@@ -3859,12 +4710,55 @@ impl AppState {
                     .ok();
             });
 
+        let new_key_button = writable.then(|| {
+            let new_view = view.clone();
+            Button::new("kv-new-key", "+ New key")
+                .size(ButtonSize::Sm)
+                .variant(ButtonVariant::Secondary)
+                .on_click(move |_, _, cx| {
+                    new_view
+                        .update(cx, |this, cx| this.kv_open_create_key(session, cx))
+                        .ok();
+                })
+        });
+
+        let create_popover = browse
+            .create_key
+            .as_ref()
+            .map(|ck| self.render_kv_create_popover(session, ck, &theme, cx));
+
+        // An empty key list gets a settled message instead of a blank grid, so
+        // "no matches" reads as deliberate (mirrors the other panels' empties).
+        let has_filter = browse.pattern.is_some()
+            || browse.type_filter.is_some()
+            || (browse.fuzzy && !fuzzy_query.is_empty());
+        let empty_msg = if browse.loading {
+            "Scanning…"
+        } else if has_filter {
+            "No keys match this filter"
+        } else {
+            "No keys in this database"
+        };
+        let key_area = if row_count == 0 {
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(theme.scale(12.))
+                .text_color(theme.text_muted)
+                .child(empty_msg)
+        } else {
+            div().flex_1().min_w(px(0.)).child(table)
+        };
+
         let main = match &browse.big_keys {
             None => div()
                 .flex_1()
                 .min_h(px(0.))
                 .flex()
-                .child(div().flex_1().min_w(px(0.)).child(table))
+                .child(key_area)
                 .when_some(browse.inspector.as_ref(), |el, inspector| {
                     el.child(self.render_kv_inspector(
                         session,
@@ -3888,6 +4782,7 @@ impl AppState {
         };
 
         div()
+            .relative()
             .flex_1()
             .min_h(px(0.))
             .flex()
@@ -3976,9 +4871,120 @@ impl AppState {
                             .text_color(theme.text_muted)
                             .child(header),
                     )
+                    .children(new_key_button)
                     .child(big_keys_button),
             )
             .child(main)
+            .children(create_popover)
+    }
+
+    /// The "New key" popover card: name, a type dropdown, and the per-type seed
+    /// inputs (a hash field, a zset score), over a panel-wide backdrop that
+    /// dismisses on an outside click — the browse-level twin of
+    /// [`kv_edit_popover`].
+    fn render_kv_create_popover(
+        &self,
+        session: SessionId,
+        ck: &CreateKeyState,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let view = cx.entity().downgrade();
+        let (save_view, cancel_view, backdrop_view) = (view.clone(), view.clone(), view.clone());
+        let (toggle_view, select_view) = (view.clone(), view.clone());
+
+        let types = kv_creatable_types();
+        let selected_ix = types.iter().position(|t| *t == ck.kv_type).unwrap_or(0);
+        let mut type_select = Select::new("kv-create-type").accent(false);
+        for t in types.iter() {
+            type_select = type_select.option(t.label().to_string());
+        }
+        let type_select = type_select
+            .selected(selected_ix)
+            .open(ck.type_open)
+            .on_toggle(move |_, cx| {
+                toggle_view
+                    .update(cx, |this, cx| this.kv_toggle_create_type_menu(session, cx))
+                    .ok();
+            })
+            .on_select(move |ix, _, cx| {
+                let choice = kv_creatable_types()
+                    .into_iter()
+                    .nth(ix)
+                    .unwrap_or(KvType::String);
+                select_view
+                    .update(cx, |this, cx| this.kv_set_create_type(session, choice, cx))
+                    .ok();
+            });
+
+        let show_field = matches!(ck.kv_type, KvType::Hash);
+        let show_score = matches!(ck.kv_type, KvType::ZSet);
+
+        let card = div()
+            .occlude()
+            .w(px(300.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .bg(theme.bg_elevated)
+            .border_1()
+            .border_color(theme.border)
+            .rounded_md()
+            .shadow_lg()
+            .child(
+                div()
+                    .text_size(theme.scale(10.5))
+                    .text_color(theme.text_muted)
+                    .child("New key"),
+            )
+            .child(ck.name.clone())
+            .child(type_select)
+            .children(show_field.then(|| ck.field.clone()))
+            .child(ck.value.clone())
+            .children(show_score.then(|| ck.score.clone()))
+            .children(ck.error.clone().map(|e| {
+                div()
+                    .text_size(theme.scale(10.))
+                    .text_color(theme.red)
+                    .child(e)
+            }))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("kv-create-save", "Create")
+                            .variant(ButtonVariant::Primary)
+                            .size(ButtonSize::Sm)
+                            .on_click(move |_, _, cx| {
+                                save_view
+                                    .update(cx, |this, cx| this.kv_submit_create_key(session, cx))
+                                    .ok();
+                            }),
+                    )
+                    .child(
+                        Button::new("kv-create-cancel", "Cancel")
+                            .variant(ButtonVariant::Secondary)
+                            .size(ButtonSize::Sm)
+                            .on_click(move |_, _, cx| {
+                                cancel_view
+                                    .update(cx, |this, cx| this.kv_cancel_create_key(session, cx))
+                                    .ok();
+                            }),
+                    ),
+            );
+
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                backdrop_view
+                    .update(cx, |this, cx| this.kv_cancel_create_key(session, cx))
+                    .ok();
+            })
+            .child(floating(card).offset(point(px(8.), px(40.))))
+            .into_any_element()
     }
 
     /// The "find biggest keys" sample's own table (see `BigKeysState`),
@@ -4096,13 +5102,20 @@ impl AppState {
                             .child(status),
                     )
                     .child(
-                        Button::new("kv-big-keys-close", "Back to live browse")
-                            .size(ButtonSize::Sm)
-                            .on_click(move |_, _, cx| {
-                                close_view
-                                    .update(cx, |this, cx| this.kv_close_big_keys(session, cx))
-                                    .ok();
-                            }),
+                        Button::new(
+                            "kv-big-keys-close",
+                            if bk.running {
+                                "Stop sampling"
+                            } else {
+                                "Back to live browse"
+                            },
+                        )
+                        .size(ButtonSize::Sm)
+                        .on_click(move |_, _, cx| {
+                            close_view
+                                .update(cx, |this, cx| this.kv_close_big_keys(session, cx))
+                                .ok();
+                        }),
                     ),
             )
             .child(
@@ -4201,7 +5214,7 @@ impl AppState {
 
         let body = match &st.report {
             Some(report) => self
-                .render_analysis_report(report, &theme)
+                .render_analysis_report(report, session, &theme, cx)
                 .into_any_element(),
             None => div()
                 .flex_1()
@@ -4233,7 +5246,9 @@ impl AppState {
     fn render_analysis_report(
         &self,
         report: &red_core::kv::RedisAnalysis,
+        session: SessionId,
         theme: &Theme,
+        cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let section_label = |s: &str| {
             div()
@@ -4248,19 +5263,35 @@ impl AppState {
 
         // A labelled proportion bar: `label` left, `right` note, a fill sized
         // to `value/max` behind it. Reused across the type and namespace lists.
+        // Clicking a type or namespace row drills into a filtered Browse tab
+        // (see `kv_drill_type`/`kv_drill_namespace`).
         let max_type = report.types.iter().map(|t| t.bytes).max().unwrap_or(0);
         let type_rows: Vec<_> = report
             .types
             .iter()
-            .map(|t| {
-                bar_row(
+            .enumerate()
+            .map(|(i, t)| {
+                let row = bar_row(
                     &t.kv_type,
                     &format!("{} · {}", t.count, fmt_bytes(t.bytes)),
                     t.bytes,
                     max_type,
                     theme.blue,
                     theme,
-                )
+                );
+                let drill_view = cx.entity().downgrade();
+                let label = t.kv_type.clone();
+                div()
+                    .id(("kv-analysis-type", i))
+                    .cursor_pointer()
+                    .child(row)
+                    .on_click(move |_, _, cx| {
+                        let label = label.clone();
+                        drill_view
+                            .update(cx, |this, cx| this.kv_drill_type(session, label, cx))
+                            .ok();
+                    })
+                    .into_any_element()
             })
             .collect();
 
@@ -4268,15 +5299,33 @@ impl AppState {
         let ns_rows: Vec<_> = report
             .namespaces
             .iter()
-            .map(|n| {
-                bar_row(
+            .enumerate()
+            .map(|(i, n)| {
+                let row = bar_row(
                     &n.prefix,
                     &format!("{} · {}", n.count, fmt_bytes(n.bytes)),
                     n.bytes,
                     max_ns,
                     theme.purple,
                     theme,
-                )
+                );
+                // The "(no prefix)" bucket has no glob to drill into.
+                if n.prefix == red_core::kv::NO_PREFIX_LABEL {
+                    return row;
+                }
+                let drill_view = cx.entity().downgrade();
+                let prefix = n.prefix.clone();
+                div()
+                    .id(("kv-analysis-ns", i))
+                    .cursor_pointer()
+                    .child(row)
+                    .on_click(move |_, _, cx| {
+                        let prefix = prefix.clone();
+                        drill_view
+                            .update(cx, |this, cx| this.kv_drill_namespace(session, prefix, cx))
+                            .ok();
+                    })
+                    .into_any_element()
             })
             .collect();
 
@@ -4494,12 +5543,21 @@ impl AppState {
             )
         });
         let ttl_popover = inspector.editing_ttl.then(|| {
+            let ttl_field = div()
+                .child(inspector.ttl_editor.clone())
+                .children(inspector.ttl_error.clone().map(|e| {
+                    div()
+                        .text_size(theme.scale(10.))
+                        .text_color(theme.red)
+                        .child(e)
+                }))
+                .into_any_element();
             self.kv_edit_popover(
                 session,
                 "kv-ttl",
                 "Set expiry",
-                Some("Seconds from now. Blank clears the expiry (persist)."),
-                inspector.ttl_editor.clone().into_any_element(),
+                Some("Seconds from now. Blank clears the expiry (persist).".into()),
+                ttl_field,
                 "Set",
                 theme,
                 cx,
@@ -4507,6 +5565,11 @@ impl AppState {
                 |this, session, cx| this.kv_cancel_editing_ttl(session, cx),
             )
         });
+
+        let collection_popover = inspector
+            .collection_edit
+            .clone()
+            .map(|kind| self.render_kv_collection_popover(session, &kind, inspector, theme, cx));
 
         let body = self.render_kv_value(session, inspector, writable, theme, cx);
 
@@ -4525,6 +5588,77 @@ impl AppState {
             .child(body)
             .children(rename_popover)
             .children(ttl_popover)
+            .children(collection_popover)
+    }
+
+    /// The add/edit-element popover for a collection key. Shows one or two
+    /// inputs (member/field + value/score) plus any inline validation error,
+    /// reusing [`kv_edit_popover`]'s card + backdrop.
+    fn render_kv_collection_popover(
+        &self,
+        session: SessionId,
+        kind: &CollectionEditKind,
+        inspector: &KvInspector,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let name = inspector.elem_name_editor.clone();
+        let value = inspector.elem_value_editor.clone();
+        // (title, save label, two_input, name_placeholder)
+        let (title, save_label, two_input): (&'static str, &'static str, bool) = match kind {
+            CollectionEditKind::AddHashField => ("Add field", "Add", true),
+            CollectionEditKind::EditHashField { .. } => ("Edit value", "Save", false),
+            CollectionEditKind::AddSetMember => ("Add member", "Add", false),
+            CollectionEditKind::EditSetMember { .. } => ("Edit member", "Save", false),
+            CollectionEditKind::AddZSetMember => ("Add member", "Add", true),
+            CollectionEditKind::EditZSetScore { .. } => ("Edit score", "Save", false),
+            CollectionEditKind::AddListHead => ("Prepend item", "Add", false),
+            CollectionEditKind::AddListTail => ("Append item", "Add", false),
+            CollectionEditKind::EditListIndex { .. } => ("Edit item", "Save", false),
+        };
+        // The single-input variants that edit `elem_value` (hash value / zset
+        // score) rather than `elem_name` (member / list value).
+        let single_is_value = matches!(
+            kind,
+            CollectionEditKind::EditHashField { .. } | CollectionEditKind::EditZSetScore { .. }
+        );
+
+        let field = if two_input {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .child(name.into_any_element())
+                .child(value.into_any_element())
+        } else if single_is_value {
+            div().child(value.into_any_element())
+        } else {
+            div().child(name.into_any_element())
+        };
+        let field = field
+            .children(inspector.elem_error.clone().map(|e| {
+                div()
+                    .text_size(theme.scale(10.))
+                    .text_color(theme.red)
+                    .child(e)
+            }))
+            .into_any_element();
+
+        let hint: Option<SharedString> = matches!(kind, CollectionEditKind::AddZSetMember)
+            .then(|| "Score is a number (e.g. 1.0).".into());
+
+        self.kv_edit_popover(
+            session,
+            "kv-elem",
+            title,
+            hint,
+            field,
+            save_label,
+            theme,
+            cx,
+            |this, session, cx| this.kv_submit_collection_edit(session, cx),
+            |this, session, cx| this.kv_cancel_collection_edit(session, cx),
+        )
     }
 
     /// A small popover card anchored just under the inspector header, for
@@ -4536,8 +5670,8 @@ impl AppState {
         &self,
         session: SessionId,
         id: &'static str,
-        title: &'static str,
-        hint: Option<&'static str>,
+        title: impl Into<SharedString>,
+        hint: Option<SharedString>,
         field: gpui::AnyElement,
         save_label: &'static str,
         theme: &Theme,
@@ -4548,6 +5682,7 @@ impl AppState {
         let view = cx.entity().downgrade();
         let (save_view, cancel_view, backdrop_view) = (view.clone(), view.clone(), view.clone());
         let on_cancel_backdrop = on_cancel.clone();
+        let title = title.into();
         let card = div()
             .occlude()
             .w(px(300.))
@@ -4670,6 +5805,20 @@ impl AppState {
         let mono = theme.mono_family.clone();
         let view = cx.entity().downgrade();
 
+        // An error reading the value, or a key that vanished between listing
+        // and read, gets a settled message rather than a permanent "Loading…".
+        if let Some(err) = &inspector.value_error {
+            return div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px_3()
+                .text_size(text_size)
+                .text_color(theme.red)
+                .child(format!("Couldn't read value: {err}"))
+                .into_any_element();
+        }
         let Some(value) = &inspector.value else {
             return div()
                 .flex_1()
@@ -4678,7 +5827,11 @@ impl AppState {
                 .justify_center()
                 .text_size(text_size)
                 .text_color(dim)
-                .child("Loading…")
+                .child(if inspector.value_loaded {
+                    "This key no longer exists"
+                } else {
+                    "Loading…"
+                })
                 .into_any_element();
         };
 
@@ -4789,65 +5942,76 @@ impl AppState {
                     .flex_col()
                     .child(self.render_kv_str_lens(session, inspector.str_format, theme, cx))
                     .child(body_el)
-                    .when(capped || (writable && editable), |d| {
-                        let (edit_view, load_view) = (view.clone(), view.clone());
-                        d.child(
-                            div()
-                                .flex_shrink_0()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .px_2()
-                                .py_1p5()
-                                .border_t_1()
-                                .border_color(theme.border)
-                                .when(capped, |d| {
-                                    d.child(
-                                        Button::new(
-                                            "kv-string-load-full",
-                                            if loading_full {
-                                                "Loading…"
-                                            } else {
-                                                "Load full value"
-                                            },
-                                        )
-                                        .variant(ButtonVariant::Primary)
+                    .child({
+                        let (edit_view, load_view, copy_view) =
+                            (view.clone(), view.clone(), view.clone());
+                        div()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_1p5()
+                            .border_t_1()
+                            .border_color(theme.border)
+                            .child(
+                                Button::new("kv-string-copy", "Copy")
+                                    .variant(ButtonVariant::Secondary)
+                                    .size(ButtonSize::Sm)
+                                    .on_click(move |_, _, cx| {
+                                        copy_view
+                                            .update(cx, |this, cx| {
+                                                this.kv_copy_string_value(session, cx)
+                                            })
+                                            .ok();
+                                    }),
+                            )
+                            .when(capped, |d| {
+                                d.child(
+                                    Button::new(
+                                        "kv-string-load-full",
+                                        if loading_full {
+                                            "Loading…"
+                                        } else {
+                                            "Load full value"
+                                        },
+                                    )
+                                    .variant(ButtonVariant::Primary)
+                                    .size(ButtonSize::Sm)
+                                    .disabled(loading_full)
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            load_view
+                                                .update(cx, |this, cx| {
+                                                    this.kv_load_full_value(session, cx)
+                                                })
+                                                .ok();
+                                        },
+                                    ),
+                                )
+                                // The whole value is bigger than the preview:
+                                // say so, so the truncation reads as deliberate.
+                                .child(
+                                    div()
+                                        .text_size(theme.scale(11.))
+                                        .text_color(dim)
+                                        .child("Preview truncated"),
+                                )
+                            })
+                            .when(writable && editable, |d| {
+                                d.child(
+                                    Button::new("kv-string-edit", "Edit")
                                         .size(ButtonSize::Sm)
                                         .disabled(loading_full)
-                                        .on_click(
-                                            move |_, _, cx| {
-                                                load_view
-                                                    .update(cx, |this, cx| {
-                                                        this.kv_load_full_value(session, cx)
-                                                    })
-                                                    .ok();
-                                            },
-                                        ),
-                                    )
-                                    // The whole value is bigger than the preview:
-                                    // say so, so the truncation reads as deliberate.
-                                    .child(
-                                        div()
-                                            .text_size(theme.scale(11.))
-                                            .text_color(dim)
-                                            .child("Preview truncated"),
-                                    )
-                                })
-                                .when(writable && editable, |d| {
-                                    d.child(
-                                        Button::new("kv-string-edit", "Edit")
-                                            .size(ButtonSize::Sm)
-                                            .disabled(loading_full)
-                                            .on_click(move |_, _, cx| {
-                                                edit_view
-                                                    .update(cx, |this, cx| {
-                                                        this.kv_start_editing_value(session, cx)
-                                                    })
-                                                    .ok();
-                                            }),
-                                    )
-                                }),
-                        )
+                                        .on_click(move |_, _, cx| {
+                                            edit_view
+                                                .update(cx, |this, cx| {
+                                                    this.kv_start_editing_value(session, cx)
+                                                })
+                                                .ok();
+                                        }),
+                                )
+                            })
                     })
                     .into_any_element()
             }
@@ -4866,29 +6030,71 @@ impl AppState {
                 ))
                 .into_any_element(),
             KvValue::Hash(KvCollection::Loaded(pairs)) => {
-                render_loaded_list(pairs.iter().map(|(f, v)| (f.clone(), v.clone())), theme)
-            }
-            KvValue::Set(KvCollection::Loaded(members)) => render_loaded_list(
-                members
+                let rows: Vec<KvElement> = pairs
                     .iter()
-                    .enumerate()
-                    .map(|(i, m)| (i.to_string(), m.clone())),
-                theme,
-            ),
+                    .map(|(f, v)| KvElement::Field(f.clone(), v.clone()))
+                    .collect();
+                let len = rows.len() as u64;
+                self.render_kv_collection_grid(
+                    session,
+                    CollectionKind::Hash,
+                    rows,
+                    len,
+                    true,
+                    writable,
+                    inspector,
+                    theme,
+                    cx,
+                )
+            }
+            KvValue::Set(KvCollection::Loaded(members)) => {
+                let rows: Vec<KvElement> = members
+                    .iter()
+                    .map(|m| KvElement::Member(m.clone()))
+                    .collect();
+                let len = rows.len() as u64;
+                self.render_kv_collection_grid(
+                    session,
+                    CollectionKind::Set,
+                    rows,
+                    len,
+                    true,
+                    writable,
+                    inspector,
+                    theme,
+                    cx,
+                )
+            }
             KvValue::ZSet(KvCollection::Loaded(pairs)) => {
-                render_loaded_list(pairs.iter().map(|(m, s)| (m.clone(), s.to_string())), theme)
-            }
-            KvValue::List(KvCollection::Loaded(items)) => render_loaded_list(
-                items
+                let rows: Vec<KvElement> = pairs
                     .iter()
-                    .enumerate()
-                    .map(|(i, v)| (i.to_string(), v.clone())),
-                theme,
-            ),
+                    .map(|(m, s)| KvElement::Scored(m.clone(), *s))
+                    .collect();
+                let len = rows.len() as u64;
+                self.render_kv_collection_grid(
+                    session,
+                    CollectionKind::ZSet,
+                    rows,
+                    len,
+                    true,
+                    writable,
+                    inspector,
+                    theme,
+                    cx,
+                )
+            }
+            KvValue::List(KvCollection::Loaded(items)) => {
+                let rows = items.clone();
+                let len = rows.len() as u64;
+                self.render_kv_list(session, rows, len, false, writable, theme, cx)
+            }
             KvValue::Hash(KvCollection::Large { len }) => self.render_kv_collection_grid(
                 session,
                 CollectionKind::Hash,
+                inspector.collection_rows.clone(),
                 *len,
+                inspector.collection_exhausted,
+                writable,
                 inspector,
                 theme,
                 cx,
@@ -4896,7 +6102,10 @@ impl AppState {
             KvValue::Set(KvCollection::Large { len }) => self.render_kv_collection_grid(
                 session,
                 CollectionKind::Set,
+                inspector.collection_rows.clone(),
                 *len,
+                inspector.collection_exhausted,
+                writable,
                 inspector,
                 theme,
                 cx,
@@ -4904,35 +6113,56 @@ impl AppState {
             KvValue::ZSet(KvCollection::Large { len }) => self.render_kv_collection_grid(
                 session,
                 CollectionKind::ZSet,
+                inspector.collection_rows.clone(),
                 *len,
+                inspector.collection_exhausted,
+                writable,
                 inspector,
                 theme,
                 cx,
             ),
             KvValue::List(KvCollection::Large { len }) => {
-                self.render_kv_list_preview(*len, inspector, theme)
+                let rows: Vec<String> = inspector
+                    .collection_rows
+                    .iter()
+                    .filter_map(|e| match e {
+                        KvElement::Member(v) => Some(v.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                self.render_kv_list(session, rows, *len, true, writable, theme, cx)
             }
         }
     }
 
-    /// The big hash/set/zset sub-grid: same `Table` + `on_visible_range`
-    /// load-more shape as the top-level keyspace browser, scoped to one
-    /// key's elements.
+    /// The hash/set/zset element grid: the same `Table` + `on_visible_range`
+    /// load-more shape as the keyspace browser, scoped to one key's elements,
+    /// now serving both the small (fully `Loaded`) and big (`Large`, paged)
+    /// cases. On a writable connection each row carries inline edit/delete
+    /// buttons and the toolbar an Add button (see the element popover).
+    #[allow(clippy::too_many_arguments)]
     fn render_kv_collection_grid(
         &self,
         session: SessionId,
         kind: CollectionKind,
-        len: u64,
+        rows: Vec<KvElement>,
+        total_len: u64,
+        complete: bool,
+        writable: bool,
         inspector: &KvInspector,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let view = cx.entity().downgrade();
-        let rows = std::rc::Rc::new(inspector.collection_rows.clone());
+        let dim = theme.text_muted;
+        let cell_size = theme.scale(11.5);
+        let edit_color = theme.text_muted;
+        let del_color = theme.red;
+        let icon_sz = theme.scale(12.);
+        let rows = std::rc::Rc::new(rows);
         let rows_render = rows.clone();
         let row_count = rows.len();
 
-        let columns = match kind {
+        let mut columns = match kind {
             CollectionKind::Hash => vec![
                 Column::new("Field").width(px(150.)),
                 Column::new("Value").flex(),
@@ -4943,54 +6173,122 @@ impl AppState {
                 Column::new("Score").width(px(90.)).align_end(),
             ],
         };
+        if writable {
+            columns.push(Column::new("").width(px(60.)).align_end());
+        }
 
-        let dim = theme.text_muted;
-        let cell_size = theme.scale(11.5);
-
-        let table = Table::<()>::new("kv-inspector-grid", columns)
+        let action_view = cx.entity().downgrade();
+        let mut table = Table::<()>::new("kv-inspector-grid", columns)
             .row_count(row_count)
             .grid_lines(true)
             .text_size(cell_size)
             .track_scroll(&inspector.collection_scroll)
-            .render_row(move |ix, _window, _cx| match rows_render.get(ix) {
-                Some(KvElement::Field(f, v)) => vec![
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .child(f.clone())
-                        .into_any_element(),
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(dim)
-                        .child(v.clone())
-                        .into_any_element(),
-                ],
-                Some(KvElement::Scored(m, s)) => vec![
-                    div()
+            .render_row(move |ix, _window, _cx| {
+                let Some(el) = rows_render.get(ix) else {
+                    return Vec::new();
+                };
+                let mut cells = match el {
+                    KvElement::Field(f, v) => vec![
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .child(f.clone())
+                            .into_any_element(),
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(dim)
+                            .child(v.clone())
+                            .into_any_element(),
+                    ],
+                    KvElement::Scored(m, s) => vec![
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .child(m.clone())
+                            .into_any_element(),
+                        div()
+                            .text_color(dim)
+                            .child(format!("{s}"))
+                            .into_any_element(),
+                    ],
+                    KvElement::Member(m) => vec![div()
                         .min_w_0()
                         .truncate()
                         .child(m.clone())
-                        .into_any_element(),
-                    div()
-                        .text_color(dim)
-                        .child(format!("{s}"))
-                        .into_any_element(),
-                ],
-                Some(KvElement::Member(m)) => {
-                    vec![div()
-                        .min_w_0()
-                        .truncate()
-                        .child(m.clone())
-                        .into_any_element()]
+                        .into_any_element()],
+                };
+                if writable {
+                    cells.push(collection_row_actions(
+                        &action_view,
+                        session,
+                        kind,
+                        ix,
+                        el,
+                        edit_color,
+                        del_color,
+                        icon_sz,
+                    ));
                 }
-                None => Vec::new(),
-            })
-            .on_visible_range(move |range, _window, cx| {
-                view.update(cx, |this, cx| {
-                    this.kv_inspector_maybe_load_more(session, kind, range.end, cx)
-                })
-                .ok();
+                cells
+            });
+        // Only page a `Large` collection; a fully loaded one has nothing more
+        // to fetch (and firing load-more would issue a needless `*SCAN`).
+        if !complete {
+            let load_view = cx.entity().downgrade();
+            table = table.on_visible_range(move |range, _window, cx| {
+                load_view
+                    .update(cx, |this, cx| {
+                        this.kv_inspector_maybe_load_more(session, kind, range.end, cx)
+                    })
+                    .ok();
+            });
+        }
+
+        let note = if complete {
+            format!("{total_len} elements")
+        } else {
+            format!("{total_len} elements, paging as you scroll")
+        };
+        let (add_kind, add_label) = match kind {
+            CollectionKind::Hash => (CollectionEditKind::AddHashField, "+ Field"),
+            CollectionKind::Set => (CollectionEditKind::AddSetMember, "+ Member"),
+            CollectionKind::ZSet => (CollectionEditKind::AddZSetMember, "+ Member"),
+        };
+        let add_view = cx.entity().downgrade();
+        let toolbar = div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(theme.scale(10.5))
+                    .text_color(dim)
+                    .child(note),
+            )
+            .when(writable, |d| {
+                d.child(
+                    Button::new("kv-coll-add", add_label)
+                        .size(ButtonSize::Sm)
+                        .on_click(move |_, _, cx| {
+                            let k = add_kind.clone();
+                            add_view
+                                .update(cx, |this, cx| {
+                                    this.kv_open_collection_edit(
+                                        session,
+                                        k,
+                                        String::new(),
+                                        String::new(),
+                                        cx,
+                                    )
+                                })
+                                .ok();
+                        }),
+                )
             });
 
         div()
@@ -4998,64 +6296,182 @@ impl AppState {
             .min_h(px(0.))
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .px_2()
-                    .py_1()
-                    .text_size(theme.scale(10.5))
-                    .text_color(dim)
-                    .child(format!("{len} elements, paging as you scroll")),
-            )
+            .child(toolbar)
             .child(div().flex_1().min_h(px(0.)).child(table))
             .into_any_element()
     }
 
-    /// A big list's static head-window preview (no infinite scroll; see
-    /// `LIST_PREVIEW_COUNT`'s doc comment).
-    fn render_kv_list_preview(
+    /// A list key's element view (small fully loaded, or a big list's head
+    /// window). Each row carries inline edit (`LSET` by index) / delete
+    /// (`LREM`) buttons on a writable connection, plus Prepend/Append in the
+    /// toolbar. A big list stays head-only (see `LIST_PREVIEW_COUNT`), so
+    /// editing reaches only the head window it shows.
+    #[allow(clippy::too_many_arguments)]
+    fn render_kv_list(
         &self,
-        len: u64,
-        inspector: &KvInspector,
+        session: SessionId,
+        rows: Vec<String>,
+        total_len: u64,
+        head_only: bool,
+        writable: bool,
         theme: &Theme,
+        cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let shown = inspector.collection_rows.len();
-        let note = format!("showing the first {shown} of {len} items (head only)");
-        let items = inspector.collection_rows.iter().enumerate().map(|(i, el)| {
-            let KvElement::Member(v) = el else {
-                return div().into_any_element();
-            };
-            div()
-                .flex()
-                .gap_2()
-                .px_2()
-                .py_0p5()
-                .child(
+        let shown = rows.len();
+        let note = if head_only {
+            format!("showing the first {shown} of {total_len} items (head only)")
+        } else {
+            format!("{total_len} items")
+        };
+        let edit_color = theme.text_muted;
+        let del_color = theme.red;
+        let icon_sz = theme.scale(12.);
+
+        let items: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let row = div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_0p5()
+                    .child(
+                        div()
+                            .w(px(36.))
+                            .flex_shrink_0()
+                            .text_color(theme.text_faint)
+                            .child(i.to_string()),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(v.clone()));
+                if !writable {
+                    return row.into_any_element();
+                }
+                let edit_view = cx.entity().downgrade();
+                let del_view = cx.entity().downgrade();
+                let (value_edit, value_del) = (v.clone(), v.clone());
+                let idx = i as i64;
+                row.child(
                     div()
-                        .w(px(36.))
-                        .text_color(theme.text_faint)
-                        .child(i.to_string()),
+                        .flex_shrink_0()
+                        .flex()
+                        .gap_0p5()
+                        .child(
+                            IconButton::new(
+                                SharedString::from(format!("kv-li-edit-{i}")),
+                                crate::icons::icon("edit", icon_sz, edit_color),
+                            )
+                            .size(IconButtonSize::Sm)
+                            .tooltip("Edit")
+                            .a11y_label("Edit item")
+                            .on_click(move |_, _, cx| {
+                                let v = value_edit.clone();
+                                edit_view
+                                    .update(cx, |this, cx| {
+                                        this.kv_open_collection_edit(
+                                            session,
+                                            CollectionEditKind::EditListIndex { index: idx },
+                                            v,
+                                            String::new(),
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            }),
+                        )
+                        .child(
+                            IconButton::new(
+                                SharedString::from(format!("kv-li-del-{i}")),
+                                crate::icons::icon("trash", icon_sz, del_color),
+                            )
+                            .size(IconButtonSize::Sm)
+                            .tooltip("Delete")
+                            .a11y_label("Delete item")
+                            .on_click(move |_, _, cx| {
+                                let v = value_del.clone();
+                                del_view
+                                    .update(cx, |this, cx| {
+                                        this.kv_send_element_edit(
+                                            session,
+                                            move |key| red_core::kv::KvEdit::ListRemove {
+                                                key,
+                                                count: 1,
+                                                value: v,
+                                            },
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            }),
+                        ),
                 )
-                .child(div().flex_1().min_w_0().truncate().child(v.clone()))
                 .into_any_element()
-        });
+            })
+            .collect();
+
+        let head_view = cx.entity().downgrade();
+        let tail_view = cx.entity().downgrade();
+        let toolbar = div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(theme.scale(10.5))
+                    .text_color(theme.text_muted)
+                    .child(note),
+            )
+            .when(writable, |d| {
+                d.child(
+                    Button::new("kv-list-add-head", "+ Head")
+                        .size(ButtonSize::Sm)
+                        .on_click(move |_, _, cx| {
+                            head_view
+                                .update(cx, |this, cx| {
+                                    this.kv_open_collection_edit(
+                                        session,
+                                        CollectionEditKind::AddListHead,
+                                        String::new(),
+                                        String::new(),
+                                        cx,
+                                    )
+                                })
+                                .ok();
+                        }),
+                )
+                .child(
+                    Button::new("kv-list-add-tail", "+ Tail")
+                        .size(ButtonSize::Sm)
+                        .on_click(move |_, _, cx| {
+                            tail_view
+                                .update(cx, |this, cx| {
+                                    this.kv_open_collection_edit(
+                                        session,
+                                        CollectionEditKind::AddListTail,
+                                        String::new(),
+                                        String::new(),
+                                        cx,
+                                    )
+                                })
+                                .ok();
+                        }),
+                )
+            });
+
         div()
             .flex_1()
             .min_h(px(0.))
             .flex()
             .flex_col()
+            .child(toolbar)
             .child(
                 div()
-                    .flex_shrink_0()
-                    .px_2()
-                    .py_1()
-                    .text_size(theme.scale(10.5))
-                    .text_color(theme.text_muted)
-                    .child(note),
-            )
-            .child(
-                div()
-                    .id("kv-inspector-list-preview")
+                    .id("kv-inspector-list")
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_y_scroll()
@@ -5584,9 +7000,8 @@ fn fmt_stream_fields(fields: &[(String, String)]) -> String {
 }
 
 /// A small (< threshold) stream rendered as a plain scrollable list of
-/// `ID → fields` rows, newest-first — the stream counterpart of
-/// [`render_loaded_list`], capped by `SMALL_COLLECTION_THRESHOLD` so it needs
-/// no virtualization.
+/// `ID → fields` rows, newest-first, capped by `SMALL_COLLECTION_THRESHOLD` so
+/// it needs no virtualization.
 fn render_loaded_stream(entries: &[StreamEntry], theme: &Theme) -> gpui::AnyElement {
     let dim = theme.text_muted;
     let items: Vec<_> = entries
@@ -5625,41 +7040,101 @@ fn render_loaded_stream(entries: &[StreamEntry], theme: &Theme) -> gpui::AnyElem
         .into_any_element()
 }
 
-/// A small (< threshold) collection rendered as a plain scrollable list, not
-/// the virtualized `Table` the big-collection path uses — capped at a few
-/// hundred rows by construction (`SMALL_COLLECTION_THRESHOLD` on the driver
-/// side), so no virtualization is needed.
-fn render_loaded_list(
-    pairs: impl Iterator<Item = (String, String)>,
-    theme: &Theme,
+/// The inline edit + delete buttons for one hash/set/zset element row (the
+/// grid's trailing actions cell). Edit opens the element popover seeded with
+/// the row's current content; Delete sends the type's remove edit immediately
+/// (a single element is trivially re-addable, so it skips a confirm).
+#[allow(clippy::too_many_arguments)]
+fn collection_row_actions(
+    view: &WeakEntity<AppState>,
+    session: SessionId,
+    kind: CollectionKind,
+    ix: usize,
+    el: &KvElement,
+    edit_color: Hsla,
+    del_color: Hsla,
+    icon_sz: gpui::Pixels,
 ) -> gpui::AnyElement {
-    let dim = theme.text_muted;
-    let items: Vec<_> = pairs
-        .map(|(k, v)| {
-            div()
-                .flex()
-                .gap_2()
-                .px_2()
-                .py_0p5()
-                .child(
-                    div()
-                        .w(px(90.))
-                        .min_w_0()
-                        .truncate()
-                        .text_color(dim)
-                        .child(k),
-                )
-                .child(div().flex_1().min_w_0().truncate().child(v))
-                .into_any_element()
-        })
-        .collect();
+    use red_core::kv::KvEdit;
+    // Edit: map the element to its popover kind + seeds.
+    let (edit_kind, seed_name, seed_value) = match el {
+        KvElement::Field(f, v) => (
+            CollectionEditKind::EditHashField { field: f.clone() },
+            f.clone(),
+            v.clone(),
+        ),
+        KvElement::Scored(m, s) => (
+            CollectionEditKind::EditZSetScore { member: m.clone() },
+            m.clone(),
+            format!("{s}"),
+        ),
+        KvElement::Member(m) => (
+            CollectionEditKind::EditSetMember { old: m.clone() },
+            m.clone(),
+            String::new(),
+        ),
+    };
+    let ident = match el {
+        KvElement::Field(f, _) => f.clone(),
+        KvElement::Scored(m, _) => m.clone(),
+        KvElement::Member(m) => m.clone(),
+    };
+    let (edit_view, del_view) = (view.clone(), view.clone());
     div()
-        .id("kv-inspector-loaded-list")
-        .flex_1()
-        .min_h(px(0.))
-        .overflow_y_scroll()
-        .text_size(theme.scale(11.5))
-        .children(items)
+        .flex()
+        .gap_0p5()
+        .justify_end()
+        .child(
+            IconButton::new(
+                SharedString::from(format!("kv-el-edit-{ix}")),
+                crate::icons::icon("edit", icon_sz, edit_color),
+            )
+            .size(IconButtonSize::Sm)
+            .tooltip("Edit")
+            .a11y_label("Edit element")
+            .on_click(move |_, _, cx| {
+                let (k, n, v) = (edit_kind.clone(), seed_name.clone(), seed_value.clone());
+                edit_view
+                    .update(cx, |this, cx| {
+                        this.kv_open_collection_edit(session, k, n, v, cx)
+                    })
+                    .ok();
+            }),
+        )
+        .child(
+            IconButton::new(
+                SharedString::from(format!("kv-el-del-{ix}")),
+                crate::icons::icon("trash", icon_sz, del_color),
+            )
+            .size(IconButtonSize::Sm)
+            .tooltip("Delete")
+            .a11y_label("Delete element")
+            .on_click(move |_, _, cx| {
+                let ident = ident.clone();
+                del_view
+                    .update(cx, |this, cx| {
+                        this.kv_send_element_edit(
+                            session,
+                            move |key| match kind {
+                                CollectionKind::Hash => KvEdit::HashDelete {
+                                    key,
+                                    fields: vec![ident],
+                                },
+                                CollectionKind::Set => KvEdit::SetRemove {
+                                    key,
+                                    members: vec![ident],
+                                },
+                                CollectionKind::ZSet => KvEdit::ZSetRemove {
+                                    key,
+                                    members: vec![ident],
+                                },
+                            },
+                            cx,
+                        )
+                    })
+                    .ok();
+            }),
+        )
         .into_any_element()
 }
 

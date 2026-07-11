@@ -701,6 +701,40 @@ mod tests {
         ) -> red_core::Result<()> {
             unimplemented!()
         }
+        async fn hash_delete(&self, _key: &str, _fields: &[String]) -> red_core::Result<u64> {
+            unimplemented!()
+        }
+        async fn set_add(&self, _key: &str, _members: &[String]) -> red_core::Result<u64> {
+            unimplemented!()
+        }
+        async fn set_remove(&self, _key: &str, _members: &[String]) -> red_core::Result<u64> {
+            unimplemented!()
+        }
+        async fn zset_add(&self, _key: &str, _member: &str, _score: f64) -> red_core::Result<()> {
+            unimplemented!()
+        }
+        async fn zset_remove(&self, _key: &str, _members: &[String]) -> red_core::Result<u64> {
+            unimplemented!()
+        }
+        async fn list_set(&self, _key: &str, _index: i64, _value: String) -> red_core::Result<()> {
+            unimplemented!()
+        }
+        async fn list_push(
+            &self,
+            _key: &str,
+            _value: String,
+            _head: bool,
+        ) -> red_core::Result<u64> {
+            unimplemented!()
+        }
+        async fn list_remove(
+            &self,
+            _key: &str,
+            _count: i64,
+            _value: String,
+        ) -> red_core::Result<u64> {
+            unimplemented!()
+        }
         async fn set_ttl(
             &self,
             _key: &str,

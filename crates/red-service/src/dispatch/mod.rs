@@ -1352,7 +1352,15 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             Event::KvValueReady { epoch, key, value },
                         ),
                         Err(RedError::Interrupted) => {}
-                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                        Err(e) => emit(
+                            &events,
+                            session_id,
+                            Event::KvValueError {
+                                epoch,
+                                key,
+                                message: e.to_string(),
+                            },
+                        ),
                     }
                 });
             }
@@ -1793,6 +1801,43 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         KvEdit::SetField { key, field, value } => {
                             driver.set_field(key, field, value.clone()).await
                         }
+                        KvEdit::HashDelete { key, fields } => {
+                            driver.hash_delete(key, fields).await.map(|_| ())
+                        }
+                        KvEdit::SetAdd { key, members } => {
+                            driver.set_add(key, members).await.map(|_| ())
+                        }
+                        KvEdit::SetRemove { key, members } => {
+                            driver.set_remove(key, members).await.map(|_| ())
+                        }
+                        KvEdit::SetReplace { key, old, new } => {
+                            // Rename a member: drop the old, add the new. Both
+                            // no-op cleanly if the set already moved on.
+                            match driver.set_remove(key, std::slice::from_ref(old)).await {
+                                Ok(_) => driver
+                                    .set_add(key, std::slice::from_ref(new))
+                                    .await
+                                    .map(|_| ()),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        KvEdit::ZSetAdd { key, member, score } => {
+                            driver.zset_add(key, member, *score).await
+                        }
+                        KvEdit::ZSetRemove { key, members } => {
+                            driver.zset_remove(key, members).await.map(|_| ())
+                        }
+                        KvEdit::ListSet { key, index, value } => {
+                            driver.list_set(key, *index, value.clone()).await
+                        }
+                        KvEdit::ListPush { key, value, head } => driver
+                            .list_push(key, value.clone(), *head)
+                            .await
+                            .map(|_| ()),
+                        KvEdit::ListRemove { key, count, value } => driver
+                            .list_remove(key, *count, value.clone())
+                            .await
+                            .map(|_| ()),
                         KvEdit::SetTtl { key, ttl } => driver.set_ttl(key, *ttl).await,
                         KvEdit::Rename { from, to } => driver.rename_key(from, to).await,
                         KvEdit::Delete { keys } => driver.delete_keys(keys).await.map(|_| ()),

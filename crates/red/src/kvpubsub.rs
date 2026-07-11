@@ -24,7 +24,10 @@ pub(crate) struct KvPubSub {
     /// unsubscribe. Distinct from "has this pattern ever received a message"
     /// so the panel can show "listening on foo*, no messages yet".
     pub(crate) subscribed: Option<String>,
-    pub(crate) messages: Vec<KvMessage>,
+    /// Received messages, each stamped with the local Unix second it arrived
+    /// (for the relative "N ago" column — Pub/Sub messages carry no time of
+    /// their own).
+    pub(crate) messages: Vec<(i64, KvMessage)>,
 }
 
 impl KvPubSub {
@@ -106,10 +109,24 @@ impl AppState {
         else {
             return;
         };
-        pubsub.messages.push(KvMessage { channel, payload });
+        pubsub
+            .messages
+            .push((now_unix(), KvMessage { channel, payload }));
         if pubsub.messages.len() > MAX_MESSAGES {
             let drop = pubsub.messages.len() - MAX_MESSAGES;
             pubsub.messages.drain(0..drop);
+        }
+        cx.notify();
+    }
+
+    /// Clear the received-message log without unsubscribing.
+    pub(crate) fn kv_clear_pubsub(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(pubsub) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_pubsub_mut())
+        {
+            pubsub.messages.clear();
         }
         cx.notify();
     }
@@ -146,6 +163,18 @@ impl AppState {
                 })
         };
 
+        let clear_view = cx.entity().downgrade();
+        let clear_button = (!pubsub.messages.is_empty()).then(|| {
+            Button::new("kv-pubsub-clear", "Clear")
+                .variant(ButtonVariant::Secondary)
+                .size(ButtonSize::Sm)
+                .on_click(move |_, _, cx| {
+                    clear_view
+                        .update(cx, |this, cx| this.kv_clear_pubsub(session, cx))
+                        .ok();
+                })
+        });
+
         let header = div()
             .flex_shrink_0()
             .flex()
@@ -156,6 +185,7 @@ impl AppState {
             .border_b_1()
             .border_color(theme.border)
             .child(div().flex_1().child(pubsub.pattern_input.clone()))
+            .children(clear_button)
             .child(toggle);
 
         let status = match &pubsub.subscribed {
@@ -168,12 +198,13 @@ impl AppState {
 
         let mono = theme.mono_family.clone();
         let text_size = theme.scale(11.5);
+        let now = now_unix();
         let messages = Rc::new(pubsub.messages.clone());
         let items: Vec<_> = messages
             .iter()
             .rev()
             .take(500)
-            .map(|m| {
+            .map(|(at, m)| {
                 div()
                     .flex()
                     .gap_2()
@@ -181,6 +212,14 @@ impl AppState {
                     .py_0p5()
                     .font_family(mono.clone())
                     .text_size(text_size)
+                    .child(
+                        div()
+                            .w(px(52.))
+                            .flex_shrink_0()
+                            .text_size(theme.scale(10.))
+                            .text_color(theme.text_faint)
+                            .child(fmt_ago(now, *at)),
+                    )
                     .child(
                         div()
                             .w(px(160.))
@@ -217,5 +256,30 @@ impl AppState {
                     .overflow_y_scroll()
                     .children(items),
             )
+    }
+}
+
+/// Local Unix seconds now (for stamping message arrival).
+fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// A compact, timezone-free "N ago" for a message's arrival: `now`, `Ns`, `Nm`,
+/// `Nh`. Timezone-free (relative) so it reads right regardless of the user's
+/// clock offset.
+fn fmt_ago(now: i64, then: i64) -> String {
+    let d = (now - then).max(0);
+    if d < 1 {
+        "now".to_string()
+    } else if d < 60 {
+        format!("{d}s")
+    } else if d < 3_600 {
+        format!("{}m", d / 60)
+    } else {
+        format!("{}h", d / 3_600)
     }
 }

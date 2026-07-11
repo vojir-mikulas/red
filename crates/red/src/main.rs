@@ -37,6 +37,7 @@ mod menu;
 mod palette;
 mod plan;
 mod queries;
+mod recent_keys;
 mod redis_analysis;
 mod result;
 mod sample;

@@ -208,6 +208,39 @@ pub trait KvDriver: Send + Sync {
     /// `HSET key field value`. Refused on a read-only connection.
     async fn set_field(&self, key: &str, field: &str, value: String) -> Result<()>;
 
+    /// `HDEL key field [field ...]`, returning the number of fields removed.
+    /// Refused on a read-only connection.
+    async fn hash_delete(&self, key: &str, fields: &[String]) -> Result<u64>;
+
+    /// `SADD key member [member ...]`, returning the number newly added.
+    /// Creates the set if absent. Refused on a read-only connection.
+    async fn set_add(&self, key: &str, members: &[String]) -> Result<u64>;
+
+    /// `SREM key member [member ...]`, returning the number removed. Refused on
+    /// a read-only connection.
+    async fn set_remove(&self, key: &str, members: &[String]) -> Result<u64>;
+
+    /// `ZADD key score member` — add a member or overwrite its score (Redis
+    /// upserts). Refused on a read-only connection.
+    async fn zset_add(&self, key: &str, member: &str, score: f64) -> Result<()>;
+
+    /// `ZREM key member [member ...]`, returning the number removed. Refused on
+    /// a read-only connection.
+    async fn zset_remove(&self, key: &str, members: &[String]) -> Result<u64>;
+
+    /// `LSET key index value` — overwrite the element at `index`. A bad index
+    /// surfaces Redis's own "index out of range" error. Refused on a read-only
+    /// connection.
+    async fn list_set(&self, key: &str, index: i64, value: String) -> Result<()>;
+
+    /// `LPUSH`/`RPUSH key value` by `head`, returning the new list length.
+    /// Creates the list if absent. Refused on a read-only connection.
+    async fn list_push(&self, key: &str, value: String, head: bool) -> Result<u64>;
+
+    /// `LREM key count value`, returning the number of elements removed.
+    /// Refused on a read-only connection.
+    async fn list_remove(&self, key: &str, count: i64, value: String) -> Result<u64>;
+
     /// `EXPIRE key seconds` (`Some`) or `PERSIST key` (`None`). Refused on a
     /// read-only connection.
     async fn set_ttl(&self, key: &str, ttl: Option<Duration>) -> Result<()>;

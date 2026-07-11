@@ -33,7 +33,9 @@ pub(crate) struct KvKeyspace {
     pub(crate) scope: KeyspaceScope,
     /// `true` while a subscription is live (Start pressed, not yet Stopped).
     pub(crate) watching: bool,
-    pub(crate) events: Vec<KeyspaceEvent>,
+    /// Received events, each stamped with the local Unix second it arrived (for
+    /// the relative "N ago" column — notifications carry no time of their own).
+    pub(crate) events: Vec<(i64, KeyspaceEvent)>,
     /// The server's `notify-keyspace-events` value; `None` until first fetched.
     /// Empty string means notifications are disabled.
     pub(crate) notify_config: Option<String>,
@@ -210,10 +212,22 @@ impl AppState {
         let Some(ev) = red_core::kv::parse_keyspace_channel(&channel, &payload) else {
             return; // not a keyspace notification (shouldn't happen for this pattern)
         };
-        ks.events.push(ev);
+        ks.events.push((now_unix(), ev));
         if ks.events.len() > MAX_EVENTS {
             let drop = ks.events.len() - MAX_EVENTS;
             ks.events.drain(0..drop);
+        }
+        cx.notify();
+    }
+
+    /// Clear the accumulated keyspace events without stopping the watcher.
+    pub(crate) fn kv_keyspace_clear(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(ks) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_keyspace_mut())
+        {
+            ks.events.clear();
         }
         cx.notify();
     }
@@ -283,6 +297,18 @@ impl AppState {
                 })
         };
 
+        let clear_view = cx.entity().downgrade();
+        let clear_button = (!ks.events.is_empty()).then(|| {
+            Button::new("kv-keyspace-clear", "Clear")
+                .variant(ButtonVariant::Secondary)
+                .size(ButtonSize::Sm)
+                .on_click(move |_, _, cx| {
+                    clear_view
+                        .update(cx, |this, cx| this.kv_keyspace_clear(session, cx))
+                        .ok();
+                })
+        });
+
         let header = div()
             .flex_shrink_0()
             .flex()
@@ -295,6 +321,7 @@ impl AppState {
             .child(tab("By event", KeyspaceScope::ByEvent))
             .child(tab("By key", KeyspaceScope::ByKey))
             .child(div().flex_1())
+            .children(clear_button)
             .child(watch_button);
 
         // When notifications are known to be off, a banner explains why nothing
@@ -355,12 +382,13 @@ impl AppState {
         };
 
         let mono = theme.mono_family.clone();
+        let now = now_unix();
         let events = Rc::new(ks.events.clone());
         let items: Vec<_> = events
             .iter()
             .rev()
             .take(1_000)
-            .map(|e| {
+            .map(|(at, e)| {
                 div()
                     .flex()
                     .items_center()
@@ -369,6 +397,14 @@ impl AppState {
                     .py_0p5()
                     .font_family(mono.clone())
                     .text_size(theme.scale(11.))
+                    .child(
+                        div()
+                            .w(px(44.))
+                            .flex_shrink_0()
+                            .text_size(theme.scale(9.5))
+                            .text_color(theme.text_faint)
+                            .child(fmt_ago(now, *at)),
+                    )
                     .child(
                         div()
                             .w(px(28.))
@@ -415,5 +451,29 @@ impl AppState {
                     .overflow_y_scroll()
                     .children(items),
             )
+    }
+}
+
+/// Local Unix seconds now (for stamping event arrival).
+fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// A compact, timezone-free "N ago" for an event's arrival: `now`, `Ns`, `Nm`,
+/// `Nh`.
+fn fmt_ago(now: i64, then: i64) -> String {
+    let d = (now - then).max(0);
+    if d < 1 {
+        "now".to_string()
+    } else if d < 60 {
+        format!("{d}s")
+    } else if d < 3_600 {
+        format!("{}m", d / 60)
+    } else {
+        format!("{}h", d / 3_600)
     }
 }
