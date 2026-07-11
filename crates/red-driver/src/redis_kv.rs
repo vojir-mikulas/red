@@ -688,6 +688,22 @@ impl KvDriver for RedisDriver {
         }
     }
 
+    async fn read_string_full(&self, key: &str) -> Result<Option<Value>> {
+        let mut conn = self.route(key);
+        // A plain `GET` with no capping (unlike `read_value`'s `cap_string_value`):
+        // the caller asked for the whole thing. `nil` (key gone / not a string)
+        // reads as `None`; a non-UTF-8 body stays exact as a `Blob`.
+        let raw: Option<Vec<u8>> = redis::cmd("GET")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        Ok(raw.map(|bytes| match String::from_utf8(bytes) {
+            Ok(s) => Value::Text(s),
+            Err(e) => Value::Blob(e.into_bytes()),
+        }))
+    }
+
     async fn read_collection_page(
         &self,
         key: &str,
@@ -2225,6 +2241,36 @@ mod tests {
             other => panic!("expected a Capped value, got {other:?}"),
         }
         assert!(driver.read_value(&tag("missing")).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_string_full_returns_the_uncapped_body() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let mut conn = driver.conn.clone();
+        let big = tag("str-full-big");
+        let big_value = "x".repeat(STRING_PREVIEW_CAP + 500);
+        let _: () = redis::cmd("SET")
+            .arg(&big)
+            .arg(&big_value)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        // `read_value` caps this key; `read_string_full` returns every byte.
+        match driver.read_value(&big).await.unwrap().unwrap() {
+            KvValue::Str(Value::Capped(_)) => {}
+            other => panic!("expected a Capped value from read_value, got {other:?}"),
+        }
+        match driver.read_string_full(&big).await.unwrap().unwrap() {
+            Value::Text(s) => assert_eq!(s, big_value),
+            other => panic!("expected the full Text value, got {other:?}"),
+        }
+        assert!(driver
+            .read_string_full(&tag("missing"))
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

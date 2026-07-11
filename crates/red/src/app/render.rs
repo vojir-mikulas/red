@@ -377,6 +377,12 @@ impl Render for AppState {
             .and_then(|i| self.tab_title(i))
             .map(|title| self.render_confirm_close(title, cx));
 
+        let confirm_kv_delete = self
+            .confirm_kv_delete
+            .as_ref()
+            .map(|(_, key)| key.clone())
+            .map(|key| self.render_kv_confirm_delete(key, cx));
+
         let confirm_close_batch = self
             .confirm_close_batch
             .clone()
@@ -605,6 +611,7 @@ impl Render for AppState {
             .children(toast)
             .children(confirm)
             .children(confirm_close)
+            .children(confirm_kv_delete)
             .children(confirm_close_batch)
             .children(confirm_delete)
             .children(settings)
@@ -1055,6 +1062,67 @@ impl AppState {
             .on_confirm(move |_, cx| {
                 confirm_view
                     .update(cx, |this, cx| this.confirm_delete_connection(cx))
+                    .ok();
+            })
+            .child(body)
+    }
+
+    /// Confirmation modal for deleting a Redis key straight from a browse list's
+    /// right-click menu (see [`AppState::kv_request_delete_key`]). Enter deletes,
+    /// Esc / Cancel backs out — the destructive action gets an explicit prompt
+    /// rather than the inspector's quieter inline confirm bar.
+    fn render_kv_confirm_delete(&self, key: String, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let close_view = cx.entity().downgrade();
+        let confirm_view = cx.entity().downgrade();
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().text_color(theme.text_muted).child(
+                "This key and its value will be permanently deleted from Redis. This can't be undone.",
+            ))
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded(theme.radius_sm)
+                    .bg(theme.bg_panel)
+                    .border_1()
+                    .border_color(theme.border)
+                    .font_family(theme.mono_family.clone())
+                    .text_size(theme.scale(12.))
+                    .text_color(theme.text)
+                    .truncate()
+                    .child(key),
+            );
+        let footer = div()
+            .flex()
+            .justify_end()
+            .gap_2()
+            .child(
+                Button::new("kv-delete-cancel", "Cancel")
+                    .variant(ButtonVariant::Secondary)
+                    .on_click(cx.listener(|this, _, _, cx| this.kv_cancel_delete_key(cx))),
+            )
+            .child(
+                Button::new("kv-delete-confirm", "Delete key")
+                    .variant(ButtonVariant::Danger)
+                    .on_click(cx.listener(|this, _, _, cx| this.kv_confirm_delete_key(cx))),
+            );
+        Modal::new("confirm-kv-delete")
+            .title("Delete key")
+            .width(px(440.))
+            .focus_handle(self.modal_focus.clone())
+            .footer(footer)
+            .on_close(move |_, cx| {
+                close_view
+                    .update(cx, |this, cx| this.kv_cancel_delete_key(cx))
+                    .ok();
+            })
+            .on_confirm(move |_, cx| {
+                confirm_view
+                    .update(cx, |this, cx| this.kv_confirm_delete_key(cx))
                     .ok();
             })
             .child(body)

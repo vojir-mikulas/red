@@ -609,6 +609,9 @@ mod tests {
         async fn read_value(&self, _key: &str) -> red_core::Result<Option<red_core::kv::KvValue>> {
             unimplemented!()
         }
+        async fn read_string_full(&self, _key: &str) -> red_core::Result<Option<red_core::Value>> {
+            unimplemented!()
+        }
         async fn read_collection_page(
             &self,
             _key: &str,

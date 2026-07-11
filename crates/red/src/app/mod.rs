@@ -1117,6 +1117,9 @@ pub struct AppState {
     pub(crate) grid_edit_blur: Option<gpui::Subscription>,
     /// A non-pristine query tab the user asked to close, awaiting confirmation.
     pub(crate) confirm_close_tab: Option<usize>,
+    /// A Redis key the user asked to delete from a browse list (via its
+    /// right-click menu), awaiting the confirmation modal: `(session, key)`.
+    pub(crate) confirm_kv_delete: Option<(SessionId, String)>,
     /// A bulk close (Close Others / Close All / Close Left / Close Right)
     /// awaiting confirmation because at least one target tab isn't pristine.
     pub(crate) confirm_close_batch: Option<Vec<usize>>,
@@ -1934,6 +1937,7 @@ impl AppState {
             focus_grid_edit: false,
             grid_edit_blur: None,
             confirm_close_tab: None,
+            confirm_kv_delete: None,
             confirm_close_batch: None,
             tab_context_menu: None,
             confirm_delete_conn: None,
@@ -2679,6 +2683,7 @@ impl AppState {
     pub(crate) fn any_modal_open(&self) -> bool {
         self.confirm_exec.is_some()
             || self.confirm_close_tab.is_some()
+            || self.confirm_kv_delete.is_some()
             || self.confirm_close_batch.is_some()
             || self.confirm_delete_conn.is_some()
             || self.shortcuts_open

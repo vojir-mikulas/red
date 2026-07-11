@@ -1357,6 +1357,49 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 });
             }
 
+            Command::KvReadStringFull { epoch, key } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                // Shares the inspector's in-flight slot with `KvReadValue`: a new
+                // key selection mid-load supersedes this fetch.
+                let entry = state.inflight.entry(epoch).or_default();
+                if let Some(prev) = entry.kv_value.take() {
+                    prev.abort();
+                }
+                let abort = AbortSignal::new();
+                entry.kv_value = Some(abort.clone());
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver.read_string_full(&key).await {
+                        // Wrap the whole string back into `KvValue::Str` and reuse
+                        // `KvValueReady`: the UI's key-matched apply path swaps the
+                        // capped body for this one with no new event.
+                        Ok(value) => emit(
+                            &events,
+                            session_id,
+                            Event::KvValueReady {
+                                epoch,
+                                key,
+                                value: value.map(red_core::kv::KvValue::Str),
+                            },
+                        ),
+                        Err(RedError::Interrupted) => {}
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                    }
+                });
+            }
+
             Command::KvReadCollectionPage {
                 epoch,
                 key,

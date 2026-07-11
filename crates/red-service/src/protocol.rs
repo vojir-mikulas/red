@@ -191,6 +191,16 @@ pub enum Command {
         epoch: u64,
         key: String,
     },
+    /// The full, uncapped bytes of a string key, for the inspector's "Load full
+    /// value" over a string `KvReadValue` returned capped (see
+    /// `KvDriver::read_string_full`). Replied with `KvValueReady` too (carrying
+    /// the whole `KvValue::Str`), so the UI's existing key-matched apply path
+    /// handles it with no new event; `epoch` scopes cancellation like
+    /// `KvReadValue`.
+    KvReadStringFull {
+        epoch: u64,
+        key: String,
+    },
     /// One page of a big hash/set/zset's elements, for the inspector's
     /// big-collection sub-grid (see docs/plans/redis.md). Stateless like
     /// `KvFetchScan`: `cursor` is the caller-supplied `next_cursor` from the

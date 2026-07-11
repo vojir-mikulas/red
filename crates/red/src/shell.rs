@@ -1483,7 +1483,17 @@ impl AppState {
                 MouseButton::Right,
                 cx.listener(move |this, _, _, cx| this.kv_close_tab_menu(session, cx)),
             )
-            .child(div().absolute().left(pos.x).top(pos.y).child(menu))
+            // `occlude()` keeps a click on the menu from reaching the dismiss
+            // catcher behind it — without it the catcher's mouse-down closes the
+            // menu on *press*, so the item's on_click never fires on release.
+            .child(
+                div()
+                    .occlude()
+                    .absolute()
+                    .left(pos.x)
+                    .top(pos.y)
+                    .child(menu),
+            )
             .into_any_element()
     }
 
@@ -1577,17 +1587,7 @@ impl AppState {
                     .disabled(!writable)
                     .on_click(cx.listener({
                         let key = key.clone();
-                        let kv_type = kv_type.clone();
-                        move |this, _, _, cx| {
-                            this.kv_key_menu_edit(
-                                session,
-                                key.clone(),
-                                kv_type.clone(),
-                                ttl,
-                                KeyMenuEdit::Delete,
-                                cx,
-                            )
-                        }
+                        move |this, _, _, cx| this.kv_request_delete_key(session, key.clone(), cx)
                     })),
             );
         // A full-bleed catcher dismisses the menu on any outside click.
@@ -1602,7 +1602,17 @@ impl AppState {
                 MouseButton::Right,
                 cx.listener(move |this, _, _, cx| this.kv_close_key_menu(session, cx)),
             )
-            .child(div().absolute().left(pos.x).top(pos.y).child(menu))
+            // `occlude()` keeps a click on the menu from reaching the dismiss
+            // catcher behind it — without it the catcher's mouse-down closes the
+            // menu on *press*, so the item's on_click never fires on release.
+            .child(
+                div()
+                    .occlude()
+                    .absolute()
+                    .left(pos.x)
+                    .top(pos.y)
+                    .child(menu),
+            )
             .into_any_element()
     }
 

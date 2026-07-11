@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use flint::prelude::*;
 use gpui::{
-    div, prelude::*, px, relative, App, AsyncApp, Context, Entity, FocusHandle, Focusable, Hsla,
-    ScrollHandle, SharedString, UniformListScrollHandle, WeakEntity, Window,
+    div, point, prelude::*, px, relative, App, AsyncApp, Context, Entity, FocusHandle, Focusable,
+    Hsla, MouseButton, ScrollHandle, SharedString, Subscription, UniformListScrollHandle,
+    WeakEntity, Window,
 };
 use red_core::kv::{
     CollectionKind, KeyMeta, KvCollection, KvCollectionPage, KvElement, KvStreamActionReq,
@@ -360,12 +361,12 @@ pub(crate) struct KeyMenu {
 }
 
 /// Which inline inspector editor a key-menu item drives (see
-/// [`AppState::kv_key_menu_edit`]).
+/// [`AppState::kv_key_menu_edit`]). Delete is not here — it goes through the
+/// confirmation modal ([`AppState::kv_request_delete_key`]) instead.
 #[derive(Clone, Copy)]
 pub(crate) enum KeyMenuEdit {
     Rename,
     Ttl,
-    Delete,
 }
 
 /// Quote a Redis key for a redis-cli command line: bare when it is a simple
@@ -447,8 +448,19 @@ pub(crate) struct KvInspector {
     // visibility flag instead of constructing a fresh entity mid-render
     // (render only has shared `&Context`, not the `&mut Context` entity
     // construction needs).
-    pub(crate) value_editor: Entity<TextInput>,
+    /// The value editor is a multiline [`CodeEditor`] (not a single-line
+    /// `TextInput`), mirroring the SQL cell inspector so a multi-line string
+    /// (pretty JSON, a blob's text) is edited full-height in place. ⌘↵ saves,
+    /// Esc cancels (see the subscription in `kv_open_inspector`).
+    pub(crate) value_editor: Entity<CodeEditor>,
     pub(crate) editing_value: bool,
+    /// The read-only, *selectable* preview of the string value (drag /
+    /// double-click a word / ⌘C a portion), mirroring the SQL cell inspector.
+    /// Rebuilt only when the value or lens changes (see
+    /// `kv_rebuild_str_preview`) so an in-progress selection and scroll survive
+    /// across frames; `None` while editing (the editor owns the body then) or
+    /// for a non-string value.
+    pub(crate) str_preview: Option<KvStrPreview>,
     pub(crate) ttl_editor: Entity<TextInput>,
     pub(crate) editing_ttl: bool,
     pub(crate) rename_editor: Entity<TextInput>,
@@ -459,6 +471,25 @@ pub(crate) struct KvInspector {
     /// docs/plans/redis.md's "binary value decoders" gap). Only meaningful for
     /// a `KvValue::Str`.
     pub(crate) str_format: crate::inspector::ValueFormat,
+    /// True while a "Load full value" `KvReadStringFull` is in flight (the
+    /// string was `read_value`-capped and the user asked for the whole thing);
+    /// drives the button's "Loading…" state. Cleared when the value lands.
+    pub(crate) loading_full_value: bool,
+    /// Set when the user hit Edit on a still-capped string: the editor can't
+    /// open until the full value lands (editing the truncated head would save
+    /// it back over the key), so we fetch it first and open the editor in
+    /// `on_kv_value_ready` once it arrives.
+    pub(crate) edit_after_load: bool,
+}
+
+/// A read-only [`CodeEditor`] hosting the *displayed* string value so the user
+/// can select and copy part of it, mirroring the SQL cell inspector's
+/// `PreviewView`. Built by [`AppState::kv_rebuild_str_preview`].
+pub(crate) struct KvStrPreview {
+    pub(crate) editor: Entity<CodeEditor>,
+    /// Kept alive for the editor's Escape → close-inspector subscription.
+    #[allow(dead_code)]
+    sub: Subscription,
 }
 
 /// Which stream sub-view the inspector shows: the entries grid (the default)
@@ -2119,8 +2150,49 @@ impl AppState {
         match action {
             KeyMenuEdit::Rename => self.kv_start_editing_key(session, cx),
             KeyMenuEdit::Ttl => self.kv_start_editing_ttl(session, cx),
-            KeyMenuEdit::Delete => self.kv_request_delete(session, cx),
         }
+    }
+
+    /// Menu action: ask to delete `key`. Unlike the inspector (which has its own
+    /// inline confirm bar), a delete straight from the list opens a proper modal
+    /// — the destructive action deserves an unmissable "are you sure?".
+    pub(crate) fn kv_request_delete_key(
+        &mut self,
+        session: SessionId,
+        key: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.kv_close_key_menu(session, cx);
+        self.confirm_kv_delete = Some((session, key));
+        self.focus_modal = true;
+        cx.notify();
+    }
+
+    pub(crate) fn kv_cancel_delete_key(&mut self, cx: &mut Context<Self>) {
+        if self.confirm_kv_delete.take().is_some() {
+            self.refocus_root = true;
+            cx.notify();
+        }
+    }
+
+    /// The modal's Delete button: commit the `DEL` against the active browse's
+    /// epoch (so [`Self::on_kv_edit_applied`] patches the right list) and close.
+    pub(crate) fn kv_confirm_delete_key(&mut self, cx: &mut Context<Self>) {
+        let Some((session, key)) = self.confirm_kv_delete.take() else {
+            return;
+        };
+        let epoch = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .and_then(|v| v.active_browse())
+            .map(|b| b.epoch);
+        if let Some(epoch) = epoch {
+            let edit = red_core::kv::KvEdit::Delete { keys: vec![key] };
+            self.service
+                .send_to(session, Command::KvApplyEdit { epoch, edit });
+        }
+        self.refocus_root = true;
+        cx.notify();
     }
 
     /// Menu action: seed the Console with the natural read-all command for
@@ -2267,12 +2339,26 @@ impl AppState {
             view.recent_keys.truncate(MAX_RECENT_KEYS);
         }
 
-        let value_editor = cx.new(TextInput::new);
-        cx.subscribe(&value_editor, move |this, _, event: &TextInputEvent, cx| {
-            if matches!(event, TextInputEvent::Submit) {
-                this.kv_submit_value_edit(session, cx);
-            }
-        })
+        // A multiline surface (no gutter, no frame of its own) so it reads as
+        // the value body becoming editable in place, exactly like the SQL cell
+        // inspector's inline editor. ⌘↵ (Run) saves; Esc cancels. Enter inserts
+        // a newline, so multi-line JSON stays editable.
+        let value_editor = cx.new(|cx| {
+            CodeEditor::new(cx)
+                .gutter(false)
+                .resting_border(false)
+                .corner_radius(px(0.))
+                .soft_wrap(true)
+                .a11y_label("Key value editor")
+        });
+        cx.subscribe(
+            &value_editor,
+            move |this, _, event: &CodeEditorEvent, cx| match event {
+                CodeEditorEvent::Run => this.kv_submit_value_edit(session, cx),
+                CodeEditorEvent::Escape => this.kv_cancel_editing_value(session, cx),
+                _ => {}
+            },
+        )
         .detach();
         let ttl_editor =
             cx.new(|cx| TextInput::new(cx).with_placeholder("seconds, blank = no expiry"));
@@ -2335,12 +2421,15 @@ impl AppState {
             },
             value_editor,
             editing_value: false,
+            str_preview: None,
             ttl_editor,
             editing_ttl: false,
             rename_editor,
             editing_key: false,
             confirm_delete: false,
             str_format: crate::inspector::ValueFormat::Auto,
+            loading_full_value: false,
+            edit_after_load: false,
         });
         self.service
             .send_to(session, Command::KvReadValue { epoch, key });
@@ -2420,7 +2509,76 @@ impl AppState {
             return;
         };
         inspector.str_format = fmt;
+        // The preview renders through the lens, so rebuild it under the new one.
+        self.kv_rebuild_str_preview(session, cx);
         cx.notify();
+    }
+
+    /// "Load full value": re-fetch the inspector's string key in full (a plain
+    /// `GET`, no cap), for a value `read_value` returned as a `Value::Capped`.
+    /// The reply comes back on `Event::KvValueReady` and replaces the capped
+    /// body in place, mirroring the SQL cell inspector's load-full flow.
+    pub(crate) fn kv_load_full_value(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(active) = self.conn_mut(Some(session)) else {
+            return;
+        };
+        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
+            return;
+        };
+        let epoch = browse.epoch;
+        let Some(inspector) = &mut browse.inspector else {
+            return;
+        };
+        if inspector.loading_full_value {
+            return;
+        }
+        inspector.loading_full_value = true;
+        let key = inspector.key.clone();
+        self.service
+            .send_to(session, Command::KvReadStringFull { epoch, key });
+        cx.notify();
+    }
+
+    /// Build (or drop) the read-only, selectable preview editor for the
+    /// inspector's string value, keyed off the current value + lens. Called
+    /// whenever either changes — not per frame — so an in-progress selection
+    /// and scroll survive. A non-string value, a still-loading value, or an
+    /// open edit leaves `str_preview` empty (those render their own body).
+    fn kv_rebuild_str_preview(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(inspector) = self.kv_inspector_mut(session) else {
+            return;
+        };
+        let build = match (&inspector.value, inspector.editing_value) {
+            (Some(KvValue::Str(v)), false) => Some((v.clone(), inspector.str_format)),
+            _ => None,
+        };
+        let Some((value, fmt)) = build else {
+            inspector.str_preview = None;
+            return;
+        };
+        let (body, _summary, wrap) = crate::inspector::format_value_body(&value, fmt);
+        let editor = cx.new(|cx| {
+            let mut e = CodeEditor::new(cx)
+                .gutter(false)
+                .resting_border(false)
+                .corner_radius(px(0.))
+                .soft_wrap(wrap)
+                .a11y_label("Key value")
+                .with_content(body);
+            e.set_read_only(true, cx);
+            e
+        });
+        // Esc from the focused preview closes the inspector, matching Esc from
+        // the keyspace grid (the editor swallows the key otherwise).
+        let sub = cx.subscribe(&editor, move |this, _, event: &CodeEditorEvent, cx| {
+            if matches!(event, CodeEditorEvent::Escape) {
+                this.kv_close_inspector(session, cx);
+            }
+        });
+        let Some(inspector) = self.kv_inspector_mut(session) else {
+            return;
+        };
+        inspector.str_preview = Some(KvStrPreview { editor, sub });
     }
 
     pub(crate) fn kv_close_inspector(&mut self, session: SessionId, cx: &mut Context<Self>) {
@@ -2446,14 +2604,24 @@ impl AppState {
         let Some(inspector) = &mut browse.inspector else {
             return;
         };
+        // A `read_value`-capped string only holds its head; editing must run on
+        // the whole value or a save would truncate the key. Fetch the full
+        // string first and defer opening the editor to `on_kv_value_ready`.
+        if matches!(&inspector.value, Some(KvValue::Str(red_core::Value::Capped(_)))) {
+            inspector.edit_after_load = true;
+            self.kv_load_full_value(session, cx);
+            return;
+        }
         let seed = match &inspector.value {
             Some(KvValue::Str(v)) => render_string_preview(v),
             _ => String::new(),
         };
         inspector
             .value_editor
-            .update(cx, |ti, cx| ti.set_content(seed, cx));
+            .update(cx, |ed, cx| ed.set_content(seed, cx));
         inspector.editing_value = true;
+        // The editor owns the body while editing, so drop the read-only preview.
+        inspector.str_preview = None;
         cx.notify();
     }
 
@@ -2468,6 +2636,8 @@ impl AppState {
             return;
         };
         inspector.editing_value = false;
+        // Restore the selectable read-only preview now the editor is gone.
+        self.kv_rebuild_str_preview(session, cx);
         cx.notify();
     }
 
@@ -2487,7 +2657,7 @@ impl AppState {
         // clears any expiry, and editing the value isn't meant to also
         // reset the countdown.
         let ttl = inspector.ttl;
-        let value = inspector.value_editor.read(cx).content().to_string();
+        let value = inspector.value_editor.read(cx).content();
         let edit = red_core::kv::KvEdit::SetString { key, value, ttl };
         self.service
             .send_to(session, Command::KvApplyEdit { epoch, edit });
@@ -2738,6 +2908,11 @@ impl AppState {
                 browse.rows.retain(|r| !keys.contains(&r.key));
             }
         }
+        // A `SetString` replaced the string body (and cleared the edit); refresh
+        // the selectable preview so it shows the just-written value.
+        if let Some(session) = session {
+            self.kv_rebuild_str_preview(session, cx);
+        }
         cx.notify();
     }
 
@@ -2766,8 +2941,22 @@ impl AppState {
             return; // a newer selection has already superseded this reply
         }
         inspector.value = value.clone();
+        // Whether this is the initial capped read or a "Load full value" reply,
+        // the string body is now settled — drop the loading state either way.
+        inspector.loading_full_value = false;
+        // A pending "Edit" that was waiting on the full value can now open, but
+        // only if the loaded body is editable text (a binary `Blob` is not).
+        let start_edit = inspector.edit_after_load
+            && matches!(&value, Some(KvValue::Str(red_core::Value::Text(_))));
+        inspector.edit_after_load = false;
         cx.notify();
         let Some(session) = session else { return };
+        if start_edit {
+            self.kv_start_editing_value(session, cx);
+            return;
+        }
+        // Build the selectable read-only preview for a freshly-loaded string.
+        self.kv_rebuild_str_preview(session, cx);
         match value {
             Some(KvValue::Hash(KvCollection::Large { .. })) => {
                 self.kv_load_collection_page(session, CollectionKind::Hash, cx);
@@ -4135,51 +4324,10 @@ impl AppState {
     ) -> impl IntoElement {
         let view = cx.entity().downgrade();
 
-        // --- key name, with an inline rename affordance ---
-        let key_row = if inspector.editing_key {
-            let (save_view, cancel_view) = (view.clone(), view.clone());
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(inspector.rename_editor.clone()),
-                )
-                .child(
-                    IconButton::new(
-                        "kv-rename-save",
-                        crate::icons::icon("check", theme.scale(13.), theme.green),
-                    )
-                    .size(IconButtonSize::Sm)
-                    .tooltip("Rename")
-                    .a11y_label("Save rename")
-                    .on_click(move |_, _, cx| {
-                        save_view
-                            .update(cx, |this, cx| this.kv_submit_rename(session, cx))
-                            .ok();
-                    }),
-                )
-                .child(
-                    IconButton::new(
-                        "kv-rename-cancel",
-                        crate::icons::icon("x", theme.scale(13.), theme.text_muted),
-                    )
-                    .size(IconButtonSize::Sm)
-                    .tooltip("Cancel")
-                    .a11y_label("Cancel rename")
-                    .on_click(move |_, _, cx| {
-                        cancel_view
-                            .update(cx, |this, cx| this.kv_cancel_editing_key(session, cx))
-                            .ok();
-                    }),
-                )
-                .into_any_element()
-        } else {
+        // --- key name; the rename affordance opens a popover (see the
+        // `rename_popover` overlay on the panel root below) rather than swapping
+        // the header inline. ---
+        let key_row = {
             let rename_view = view.clone();
             div()
                 .flex_1()
@@ -4204,6 +4352,7 @@ impl AppState {
                         .size(IconButtonSize::Sm)
                         .tooltip("Rename key")
                         .a11y_label("Rename key")
+                        .active(inspector.editing_key)
                         .on_click(move |_, _, cx| {
                             rename_view
                                 .update(cx, |this, cx| this.kv_start_editing_key(session, cx))
@@ -4214,44 +4363,8 @@ impl AppState {
                 .into_any_element()
         };
 
-        // --- TTL, with an inline edit affordance ---
-        let ttl_row = if inspector.editing_ttl {
-            let (save_view, cancel_view) = (view.clone(), view.clone());
-            div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(div().w(px(110.)).child(inspector.ttl_editor.clone()))
-                .child(
-                    IconButton::new(
-                        "kv-ttl-save",
-                        crate::icons::icon("check", theme.scale(13.), theme.green),
-                    )
-                    .size(IconButtonSize::Sm)
-                    .tooltip("Set TTL (blank = no expiry)")
-                    .a11y_label("Save TTL")
-                    .on_click(move |_, _, cx| {
-                        save_view
-                            .update(cx, |this, cx| this.kv_submit_ttl_edit(session, cx))
-                            .ok();
-                    }),
-                )
-                .child(
-                    IconButton::new(
-                        "kv-ttl-cancel",
-                        crate::icons::icon("x", theme.scale(13.), theme.text_muted),
-                    )
-                    .size(IconButtonSize::Sm)
-                    .tooltip("Cancel")
-                    .a11y_label("Cancel TTL edit")
-                    .on_click(move |_, _, cx| {
-                        cancel_view
-                            .update(cx, |this, cx| this.kv_cancel_editing_ttl(session, cx))
-                            .ok();
-                    }),
-                )
-                .into_any_element()
-        } else {
+        // --- TTL; clicking opens the expiry popover (see `ttl_popover` below). ---
+        let ttl_row = {
             let ttl_view = view.clone();
             let label = div()
                 .text_size(theme.scale(10.5))
@@ -4352,6 +4465,7 @@ impl AppState {
                 )
                 .child(
                     Button::new("kv-inspector-delete-cancel", "Cancel")
+                        .variant(ButtonVariant::Secondary)
                         .size(ButtonSize::Sm)
                         .on_click(move |_, _, cx| {
                             cancel_view
@@ -4361,9 +4475,43 @@ impl AppState {
                 )
         });
 
+        // Rename / expiry each open as a small popover card anchored under the
+        // header, dismissed by an outside click on the panel-wide backdrop, the
+        // Cancel button (secondary), or Escape/Submit in the field. Replaces the
+        // old inline header-swap so the header stays legible while editing.
+        let rename_popover = inspector.editing_key.then(|| {
+            self.kv_edit_popover(
+                session,
+                "kv-rename",
+                "Rename key",
+                None,
+                inspector.rename_editor.clone().into_any_element(),
+                "Rename",
+                theme,
+                cx,
+                |this, session, cx| this.kv_submit_rename(session, cx),
+                |this, session, cx| this.kv_cancel_editing_key(session, cx),
+            )
+        });
+        let ttl_popover = inspector.editing_ttl.then(|| {
+            self.kv_edit_popover(
+                session,
+                "kv-ttl",
+                "Set expiry",
+                Some("Seconds from now. Blank clears the expiry (persist)."),
+                inspector.ttl_editor.clone().into_any_element(),
+                "Set",
+                theme,
+                cx,
+                |this, session, cx| this.kv_submit_ttl_edit(session, cx),
+                |this, session, cx| this.kv_cancel_editing_ttl(session, cx),
+            )
+        });
+
         let body = self.render_kv_value(session, inspector, writable, theme, cx);
 
         div()
+            .relative()
             .flex_shrink_0()
             .w(px(380.))
             .h_full()
@@ -4375,6 +4523,91 @@ impl AppState {
             .child(header)
             .children(confirm_delete)
             .child(body)
+            .children(rename_popover)
+            .children(ttl_popover)
+    }
+
+    /// A small popover card anchored just under the inspector header, for
+    /// editing the key name or its expiry. Its own panel-wide backdrop dismisses
+    /// on an outside click; the card carries a title, the caller's editor field,
+    /// an optional hint, and Save (primary) / Cancel (secondary) buttons.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_edit_popover(
+        &self,
+        session: SessionId,
+        id: &'static str,
+        title: &'static str,
+        hint: Option<&'static str>,
+        field: gpui::AnyElement,
+        save_label: &'static str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+        on_save: impl Fn(&mut Self, SessionId, &mut Context<Self>) + 'static,
+        on_cancel: impl Fn(&mut Self, SessionId, &mut Context<Self>) + Clone + 'static,
+    ) -> gpui::AnyElement {
+        let view = cx.entity().downgrade();
+        let (save_view, cancel_view, backdrop_view) = (view.clone(), view.clone(), view.clone());
+        let on_cancel_backdrop = on_cancel.clone();
+        let card = div()
+            .occlude()
+            .w(px(300.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .bg(theme.bg_elevated)
+            .border_1()
+            .border_color(theme.border)
+            .rounded_md()
+            .shadow_lg()
+            .child(
+                div()
+                    .text_size(theme.scale(10.5))
+                    .text_color(theme.text_muted)
+                    .child(title),
+            )
+            .child(field)
+            .children(hint.map(|h| {
+                div()
+                    .text_size(theme.scale(10.))
+                    .text_color(theme.text_muted)
+                    .child(h)
+            }))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new(SharedString::from(format!("{id}-save")), save_label)
+                            .variant(ButtonVariant::Primary)
+                            .size(ButtonSize::Sm)
+                            .on_click(move |_, _, cx| {
+                                save_view
+                                    .update(cx, |this, cx| on_save(this, session, cx))
+                                    .ok();
+                            }),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("{id}-cancel")), "Cancel")
+                            .variant(ButtonVariant::Secondary)
+                            .size(ButtonSize::Sm)
+                            .on_click(move |_, _, cx| {
+                                cancel_view
+                                    .update(cx, |this, cx| on_cancel(this, session, cx))
+                                    .ok();
+                            }),
+                    ),
+            );
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                backdrop_view
+                    .update(cx, |this, cx| on_cancel_backdrop(this, session, cx))
+                    .ok();
+            })
+            .child(floating(card).offset(point(px(8.), px(38.))))
+            .into_any_element()
     }
 
     /// The string inspector's lens toolbar (Auto/Raw/JSON/Hex + the binary
@@ -4450,7 +4683,7 @@ impl AppState {
         };
 
         match value {
-            KvValue::Str(v) if inspector.editing_value => {
+            KvValue::Str(_) if inspector.editing_value => {
                 let (save_view, cancel_view) = (view.clone(), view.clone());
                 div()
                     .flex_1()
@@ -4458,14 +4691,16 @@ impl AppState {
                     .flex()
                     .flex_col()
                     .child(
+                        // Full-height editor (it scrolls itself): the value body
+                        // becomes editable in place, inheriting the mono
+                        // typography just like the read-only preview.
                         div()
                             .id("kv-inspector-string-edit")
                             .flex_1()
                             .min_h(px(0.))
-                            .overflow_y_scroll()
-                            .p_2()
-                            .font_family(mono)
+                            .font_family(mono.clone())
                             .text_size(text_size)
+                            .line_height(text_size * 1.5)
                             .child(inspector.value_editor.clone()),
                     )
                     .child(
@@ -4479,6 +4714,7 @@ impl AppState {
                             .border_color(theme.border)
                             .child(
                                 Button::new("kv-string-save", "Save")
+                                    .variant(ButtonVariant::Primary)
                                     .size(ButtonSize::Sm)
                                     .on_click(move |_, _, cx| {
                                         save_view
@@ -4490,6 +4726,7 @@ impl AppState {
                             )
                             .child(
                                 Button::new("kv-string-cancel", "Cancel")
+                                    .variant(ButtonVariant::Secondary)
                                     .size(ButtonSize::Sm)
                                     .on_click(move |_, _, cx| {
                                         cancel_view
@@ -4503,46 +4740,113 @@ impl AppState {
                     .into_any_element()
             }
             KvValue::Str(v) => {
-                let (body, _summary) = crate::inspector::format_value_body(v, inspector.str_format);
-                // Editing only makes sense for a textual value; a binary value
-                // (now a `Value::Blob`, see `cap_string_value`) is view-only.
+                // A `read_value`-capped string shows only its head; editing that
+                // would save the truncated head back over the whole key, so a
+                // capped value is view-only until "Load full value" pulls the
+                // rest (see `kv_load_full_value`).
+                let capped = matches!(v, red_core::Value::Capped(_));
+                // Editing makes sense for any textual value; a binary value (a
+                // `Value::Blob`, see `cap_string_value`) is view-only. A capped
+                // text is editable too — Edit fetches the full value first (see
+                // `kv_start_editing_value`) so a save never truncates the key.
                 let editable = matches!(v, red_core::Value::Text(_))
                     || matches!(v, red_core::Value::Capped(c) if !c.blob);
-                div()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .flex()
-                    .flex_col()
-                    .child(self.render_kv_str_lens(session, inspector.str_format, theme, cx))
-                    .child(
+                let loading_full = inspector.loading_full_value;
+                // Prefer the selectable read-only preview editor (mirrors the
+                // SQL cell inspector); fall back to plain, non-selectable text
+                // for the frame or two before `kv_rebuild_str_preview` runs.
+                let body_el = match &inspector.str_preview {
+                    Some(p) => div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .font_family(mono.clone())
+                        .text_size(text_size)
+                        .line_height(text_size * 1.5)
+                        .child(p.editor.clone())
+                        .into_any_element(),
+                    None => {
+                        let (body, _summary, _wrap) =
+                            crate::inspector::format_value_body(v, inspector.str_format);
                         div()
                             .id("kv-inspector-string")
                             .flex_1()
                             .min_h(px(0.))
                             .overflow_y_scroll()
                             .p_2()
-                            .child(div().font_family(mono).text_size(text_size).child(body)),
-                    )
-                    .when(writable && editable, |d| {
-                        let edit_view = view.clone();
+                            .child(
+                                div()
+                                    .font_family(mono.clone())
+                                    .text_size(text_size)
+                                    .child(body),
+                            )
+                            .into_any_element()
+                    }
+                };
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .flex_col()
+                    .child(self.render_kv_str_lens(session, inspector.str_format, theme, cx))
+                    .child(body_el)
+                    .when(capped || (writable && editable), |d| {
+                        let (edit_view, load_view) = (view.clone(), view.clone());
                         d.child(
                             div()
                                 .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .gap_2()
                                 .px_2()
                                 .py_1p5()
                                 .border_t_1()
                                 .border_color(theme.border)
-                                .child(
-                                    Button::new("kv-string-edit", "Edit")
+                                .when(capped, |d| {
+                                    d.child(
+                                        Button::new(
+                                            "kv-string-load-full",
+                                            if loading_full {
+                                                "Loading…"
+                                            } else {
+                                                "Load full value"
+                                            },
+                                        )
+                                        .variant(ButtonVariant::Primary)
                                         .size(ButtonSize::Sm)
-                                        .on_click(move |_, _, cx| {
-                                            edit_view
-                                                .update(cx, |this, cx| {
-                                                    this.kv_start_editing_value(session, cx)
-                                                })
-                                                .ok();
-                                        }),
-                                ),
+                                        .disabled(loading_full)
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                load_view
+                                                    .update(cx, |this, cx| {
+                                                        this.kv_load_full_value(session, cx)
+                                                    })
+                                                    .ok();
+                                            },
+                                        ),
+                                    )
+                                    // The whole value is bigger than the preview:
+                                    // say so, so the truncation reads as deliberate.
+                                    .child(
+                                        div()
+                                            .text_size(theme.scale(11.))
+                                            .text_color(dim)
+                                            .child("Preview truncated"),
+                                    )
+                                })
+                                .when(writable && editable, |d| {
+                                    d.child(
+                                        Button::new("kv-string-edit", "Edit")
+                                            .size(ButtonSize::Sm)
+                                            .disabled(loading_full)
+                                            .on_click(move |_, _, cx| {
+                                                edit_view
+                                                    .update(cx, |this, cx| {
+                                                        this.kv_start_editing_value(session, cx)
+                                                    })
+                                                    .ok();
+                                            }),
+                                    )
+                                }),
                         )
                     })
                     .into_any_element()

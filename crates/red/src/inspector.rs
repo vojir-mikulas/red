@@ -1135,10 +1135,11 @@ impl AppState {
 /// default (JSON pretty-printed, blob hex, text as prose).
 /// The formatted body text for `value` through `fmt`, for callers outside the
 /// inspector (the Redis string view) that reuse the same lens without the full
-/// `ValueView`. Returns `(body, summary)`.
-pub(crate) fn format_value_body(value: &Value, fmt: ValueFormat) -> (String, String) {
+/// `ValueView`. Returns `(body, summary, wrap)` — `wrap` mirrors the SQL
+/// inspector's soft-wrap choice (prose wraps; hex/JSON stay on fixed lines).
+pub(crate) fn format_value_body(value: &Value, fmt: ValueFormat) -> (String, String, bool) {
     let v = format_value(value, fmt);
-    (v.body.to_string(), v.summary)
+    (v.body.to_string(), v.summary, v.wrap)
 }
 
 fn format_value(value: &Value, fmt: ValueFormat) -> ValueView {

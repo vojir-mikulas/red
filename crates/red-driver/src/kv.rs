@@ -109,6 +109,15 @@ pub trait KvDriver: Send + Sync {
     /// the key doesn't exist.
     async fn read_value(&self, key: &str) -> Result<Option<KvValue>>;
 
+    /// The full, *uncapped* bytes of a string key (a plain `GET`), for the
+    /// inspector's "Load full value" over a value [`read_value`](Self::read_value)
+    /// returned as a capped [`Value`](red_core::Value). String-only — collections
+    /// already page rather than cap — so this is only meaningful when the key is a
+    /// string. `Ok(None)` when the key vanished; a non-UTF-8 body comes back as a
+    /// [`Value::Blob`](red_core::Value::Blob), a textual one as
+    /// [`Value::Text`](red_core::Value::Text), never `Value::Capped`.
+    async fn read_string_full(&self, key: &str) -> Result<Option<red_core::Value>>;
+
     /// One page of a big hash/set/zset's elements (`HSCAN`/`SSCAN`/`ZSCAN`).
     /// Stateless like [`scan_keys`](Self::scan_keys): `cursor` is the
     /// caller-supplied `next_cursor` from the previous page (`0` to start).
