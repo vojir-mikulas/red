@@ -331,6 +331,29 @@ pub enum KvEdit {
     },
 }
 
+/// One entry of the server's slow-command log (`SLOWLOG GET`), for the
+/// diagnostics panel (see docs/plans/redis.md's "slowlog viewer" gap). Redis
+/// records a command here when its execution time exceeds
+/// `slowlog-log-slower-than` microseconds; the log is a fixed-size ring, so
+/// this is always a bounded, recent view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlowlogEntry {
+    /// The entry's unique, monotonically increasing id.
+    pub id: i64,
+    /// Unix timestamp (seconds, server clock) the command ran at.
+    pub time_secs: i64,
+    /// Execution time in microseconds (the reason it was logged).
+    pub micros: u64,
+    /// The command and its arguments as the server recorded them. Long
+    /// arguments are truncated by the server itself (to
+    /// `slowlog-max-len`-adjacent limits), so this is display-safe as-is.
+    pub argv: Vec<String>,
+    /// The client address (`ip:port`), empty on servers predating that field.
+    pub client: String,
+    /// The client's `CLIENT SETNAME`, empty if unset or unsupported.
+    pub client_name: String,
+}
+
 /// A generic RESP reply (the console needs to render *any* command's result,
 /// not one per command), and the redis crate's own `Value` isn't `Send`-free
 /// of engine-specific dependencies for a wire type shared across the

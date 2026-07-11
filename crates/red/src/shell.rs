@@ -585,6 +585,7 @@ impl AppState {
                     (crate::kvbrowse::KvPanel::Browse, "Browse"),
                     (crate::kvbrowse::KvPanel::Console, "Console"),
                     (crate::kvbrowse::KvPanel::PubSub, "Pub/Sub"),
+                    (crate::kvbrowse::KvPanel::Monitor, "Monitor"),
                 ]
                 .into_iter()
                 .map(|(kind, label)| {
@@ -622,6 +623,9 @@ impl AppState {
             crate::kvbrowse::KvPanel::PubSub => {
                 self.render_kv_pubsub(active, window, cx).into_any_element()
             }
+            crate::kvbrowse::KvPanel::Monitor => self
+                .render_kv_monitor(active, window, cx)
+                .into_any_element(),
         };
         let body = div()
             .flex_1()

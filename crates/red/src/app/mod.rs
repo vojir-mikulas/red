@@ -2416,6 +2416,12 @@ impl AppState {
             } => {
                 self.on_kv_message(session, epoch, channel, payload, cx);
             }
+            Event::KvSlowlogReady { epoch, entries } => {
+                self.on_kv_slowlog_ready(session, epoch, entries, cx);
+            }
+            Event::KvMonitorLine { epoch, line } => {
+                self.on_kv_monitor_line(session, epoch, line, cx);
+            }
 
             // --- result grid ---
             Event::ResultReady {

@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use red_core::kv::{
     CollectionKind, KeyMeta, KvCollectionPage, KvEdit, KvScanPage, KvStreamActionReq, KvStreamPage,
-    KvValue, PendingEntry, RespValue, ScanBudget, ScanCursor, StreamAction, StreamConsumer,
-    StreamGroup,
+    KvValue, PendingEntry, RespValue, ScanBudget, ScanCursor, SlowlogEntry, StreamAction,
+    StreamConsumer, StreamGroup,
 };
 use red_core::{
     ActivityId, ActivityKind, ActivityStatus, AiLimits, AiTier, Column, ColumnMap, ColumnMeta,
@@ -284,6 +284,26 @@ pub enum Command {
     KvSubscribe {
         epoch: u64,
         pattern: String,
+    },
+    /// Fetch the server's slow-command log (see docs/plans/redis.md's "slowlog
+    /// viewer" gap). `epoch` scopes cancellation; replied with `KvSlowlogReady`.
+    KvSlowlog {
+        epoch: u64,
+        count: usize,
+    },
+    /// Clear the slow log (`SLOWLOG RESET`), gated by `read_only` (checked
+    /// service-side, defense in depth alongside the driver). On success the
+    /// service replies with an empty `KvSlowlogReady` so the UI updates without
+    /// a separate reply type.
+    KvSlowlogReset {
+        epoch: u64,
+    },
+    /// Start a live `MONITOR` firehose (see docs/plans/redis.md's "MONITOR-based
+    /// live command profiler" gap). Like `KvSubscribe`, `epoch` identifies the
+    /// stream and lines push back as `KvMonitorLine` until `CloseResult { epoch }`
+    /// tears it down.
+    KvMonitor {
+        epoch: u64,
     },
     /// Compute a column's aggregate summary over the open result's *filtered* SQL
     /// (the column-stats bar): a single `count`/`distinct`/`min`/`max`(/`sum`/`avg`)
@@ -738,6 +758,19 @@ pub enum Event {
         epoch: u64,
         channel: String,
         payload: String,
+    },
+    /// The slow-command log, in response to `KvSlowlog` (or an empty list in
+    /// response to a successful `KvSlowlogReset`). Newest entry first.
+    KvSlowlogReady {
+        epoch: u64,
+        entries: Vec<SlowlogEntry>,
+    },
+    /// One `MONITOR` line, pushed for as long as the `KvMonitor { epoch, .. }`
+    /// that started it stays open. `line` is the server's raw preformatted
+    /// firehose line.
+    KvMonitorLine {
+        epoch: u64,
+        line: String,
     },
     /// A result opened: its columns and total row count (for `OpenResult`).
     /// Echoes the open `epoch` so the grid can ignore a late reply for a result

@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use futures_util::Stream;
 use red_core::kv::{
     CollectionKind, KeyMeta, KvCollectionPage, KvMessage, KvScanPage, KvStreamPage, KvValue,
-    PendingEntry, RespValue, ScanBudget, ScanCursor, StreamConsumer, StreamGroup,
+    PendingEntry, RespValue, ScanBudget, ScanCursor, SlowlogEntry, StreamConsumer, StreamGroup,
 };
 use red_core::Result;
 
@@ -27,6 +27,14 @@ use crate::AbortSignal;
 /// object-safe/engine-agnostic.
 pub struct KvSubscription {
     pub stream: Pin<Box<dyn Stream<Item = KvMessage> + Send>>,
+}
+
+/// A live `MONITOR` firehose: every command the server executes, one raw line
+/// per item (see `KvDriver::monitor`). Its own type rather than reusing
+/// [`KvSubscription`] because a MONITOR line is a single preformatted string
+/// (`"<ts> [<db> <client>] \"CMD\" \"arg\" ..."`), not a channel/payload pair.
+pub struct KvMonitorStream {
+    pub stream: Pin<Box<dyn Stream<Item = String> + Send>>,
 }
 
 /// A Redis/Valkey server's deployment topology, detected at connect from
@@ -194,6 +202,25 @@ pub trait KvDriver: Send + Sync {
     /// `DEL key [key ...]`, returning the number actually removed. Refused
     /// on a read-only connection.
     async fn delete_keys(&self, keys: &[String]) -> Result<u64>;
+
+    /// The server's slow-command log (`SLOWLOG GET <count>`), newest first,
+    /// for the diagnostics panel (see docs/plans/redis.md's "slowlog viewer"
+    /// gap). Under a cluster this reports the seed node's log only (the slow
+    /// log is per-node; there's no aggregate view).
+    async fn slowlog(&self, count: usize) -> Result<Vec<SlowlogEntry>>;
+
+    /// Clear the slow log (`SLOWLOG RESET`). A server-state maintenance write,
+    /// so it's refused on a read-only connection.
+    async fn slowlog_reset(&self) -> Result<()>;
+
+    /// A live `MONITOR` stream: every command the server runs, pushed as a raw
+    /// line for as long as the returned stream is read (see docs/plans/redis.md's
+    /// "MONITOR-based live command profiler" gap). Like [`subscribe`](Self::subscribe),
+    /// dropping the stream ends it; there's no explicit stop command. Runs over
+    /// its own dedicated connection (MONITOR monopolizes a connection), so it
+    /// never blocks the shared multiplexed one. Under a cluster it observes the
+    /// seed node only.
+    async fn monitor(&self) -> Result<KvMonitorStream>;
 
     /// A live Pub/Sub pattern subscription (`PSUBSCRIBE`). The caller owns
     /// when to stop reading the stream; there's no explicit unsubscribe

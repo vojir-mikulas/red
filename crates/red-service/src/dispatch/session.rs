@@ -122,6 +122,10 @@ pub(crate) struct InFlight {
     /// superseded by a follow-up request; it's torn down by `CloseResult`
     /// when the panel closes.
     pub(crate) kv_subscribe: Option<AbortSignal>,
+    /// A live `KvMonitor` firehose for this epoch (Redis MONITOR profiler).
+    /// Long-lived like `kv_subscribe`: it stays armed until `CloseResult`
+    /// stops it, rather than being superseded by a follow-up request.
+    pub(crate) kv_monitor: Option<AbortSignal>,
 }
 
 impl InFlight {
@@ -138,6 +142,7 @@ impl InFlight {
             self.kv_group_detail.as_ref(),
             self.kv_group_pending.as_ref(),
             self.kv_subscribe.as_ref(),
+            self.kv_monitor.as_ref(),
         ]
         .into_iter()
         .flatten()

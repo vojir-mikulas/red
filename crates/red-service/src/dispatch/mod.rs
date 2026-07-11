@@ -1800,6 +1800,127 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 });
             }
 
+            Command::KvSlowlog { epoch, count } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                let entry = state.inflight.entry(epoch).or_default();
+                if let Some(prev) = entry.kv_value.take() {
+                    prev.abort();
+                }
+                entry.kv_value = Some(AbortSignal::new());
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver.slowlog(count).await {
+                        Ok(entries) => emit(
+                            &events,
+                            session_id,
+                            Event::KvSlowlogReady { epoch, entries },
+                        ),
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                    }
+                });
+            }
+
+            Command::KvSlowlogReset { epoch } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                if state.read_only {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("this connection is read-only".into()),
+                    );
+                    continue;
+                }
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver.slowlog_reset().await {
+                        // Reply with an empty log so the UI clears without a
+                        // second round trip.
+                        Ok(()) => emit(
+                            &events,
+                            session_id,
+                            Event::KvSlowlogReady {
+                                epoch,
+                                entries: Vec::new(),
+                            },
+                        ),
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                    }
+                });
+            }
+
+            Command::KvMonitor { epoch } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                let entry = state.inflight.entry(epoch).or_default();
+                if let Some(prev) = entry.kv_monitor.take() {
+                    prev.abort();
+                }
+                let abort = AbortSignal::new();
+                entry.kv_monitor = Some(abort.clone());
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let mut mon = match driver.monitor().await {
+                        Ok(mon) => mon,
+                        Err(e) => {
+                            emit(&events, session_id, Event::Error(e.to_string()));
+                            return;
+                        }
+                    };
+                    // Same bounded-poll teardown as `KvSubscribe`: MONITOR has
+                    // no native cancel, so check `abort` between reads rather
+                    // than blocking forever on the next line.
+                    loop {
+                        if abort.is_aborted() {
+                            break;
+                        }
+                        match tokio::time::timeout(Duration::from_millis(500), mon.stream.next())
+                            .await
+                        {
+                            Ok(Some(line)) => {
+                                emit(&events, session_id, Event::KvMonitorLine { epoch, line })
+                            }
+                            Ok(None) => break, // the monitor connection closed
+                            Err(_) => {}       // timed out this tick; recheck `abort`
+                        }
+                    }
+                });
+            }
+
             Command::ColumnStats {
                 epoch,
                 column,

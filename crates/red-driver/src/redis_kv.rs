@@ -9,13 +9,13 @@ use futures_util::StreamExt;
 use red_core::kv::{
     CollectionKind, CommandClass, KeyMeta, KvCollection, KvCollectionPage, KvElement, KvMessage,
     KvScanPage, KvStreamPage, KvType, KvValue, PendingEntry, RespValue, ScanBudget, ScanCursor,
-    StreamConsumer, StreamEntry, StreamGroup,
+    SlowlogEntry, StreamConsumer, StreamEntry, StreamGroup,
 };
 use red_core::{RedError, Result, Value};
 use redis::aio::MultiplexedConnection;
 use tokio::time::Instant;
 
-use crate::kv::{KvDriver, KvSubscription, KvTopology};
+use crate::kv::{KvDriver, KvMonitorStream, KvSubscription, KvTopology};
 use crate::AbortSignal;
 
 /// Below this many elements, `read_value` fetches a hash/set/zset/list in
@@ -980,6 +980,43 @@ impl KvDriver for RedisDriver {
             .map_err(|e| RedError::Driver(e.to_string()))
     }
 
+    async fn slowlog(&self, count: usize) -> Result<Vec<SlowlogEntry>> {
+        let mut conn = self.conn.clone();
+        let reply: redis::Value = redis::cmd("SLOWLOG")
+            .arg("GET")
+            .arg(count.max(1))
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        Ok(parse_slowlog(&reply))
+    }
+
+    async fn slowlog_reset(&self) -> Result<()> {
+        self.check_writable()?;
+        let mut conn = self.conn.clone();
+        redis::cmd("SLOWLOG")
+            .arg("RESET")
+            .query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    async fn monitor(&self) -> Result<KvMonitorStream> {
+        // MONITOR monopolizes its connection (the server pushes every command
+        // and accepts nothing back), so it gets its own dedicated one, exactly
+        // like `subscribe` does for Pub/Sub — never the shared multiplexed
+        // `conn`. Each MONITOR item decodes as a preformatted status line.
+        let monitor = self
+            .client
+            .get_async_monitor()
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        let stream = monitor.into_on_message::<String>();
+        Ok(KvMonitorStream {
+            stream: Box::pin(stream),
+        })
+    }
+
     async fn subscribe(&self, pattern: &str) -> Result<KvSubscription> {
         let mut pubsub = self
             .client
@@ -1373,6 +1410,39 @@ fn parse_pending_entries(v: &redis::Value) -> Vec<PendingEntry> {
         .collect()
 }
 
+/// Parse a `SLOWLOG GET` reply: an array of entries, each
+/// `[id, timestamp, micros, [argv...], client_addr?, client_name?]`. The last
+/// two fields arrived in Redis 4.0, so they're read defensively (empty when
+/// absent). A torn entry (too few fields) is skipped rather than fatal.
+fn parse_slowlog(v: &redis::Value) -> Vec<SlowlogEntry> {
+    let (redis::Value::Array(items) | redis::Value::Set(items)) = v else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let (redis::Value::Array(parts) | redis::Value::Set(parts)) = item else {
+                return None;
+            };
+            if parts.len() < 4 {
+                return None;
+            }
+            let id = value_to_i64(&parts[0])?;
+            let time_secs = value_to_i64(&parts[1])?;
+            let micros = value_to_i64(&parts[2]).unwrap_or(0).max(0) as u64;
+            let argv = value_to_string_vec(&parts[3]);
+            Some(SlowlogEntry {
+                id,
+                time_secs,
+                micros,
+                argv,
+                client: parts.get(4).and_then(value_to_string).unwrap_or_default(),
+                client_name: parts.get(5).and_then(value_to_string).unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
 fn value_to_string(v: &redis::Value) -> Option<String> {
     redis::from_redis_value::<String>(v.clone()).ok()
 }
@@ -1629,6 +1699,47 @@ mod tests {
                 idle: Duration::from_millis(9000),
             }]
         );
+    }
+
+    #[test]
+    fn parse_slowlog_reads_entries_with_and_without_client_fields() {
+        use redis::Value;
+        let bulk = |s: &str| Value::BulkString(s.as_bytes().to_vec());
+        let reply = Value::Array(vec![
+            // Redis 4+ shape: id, ts, micros, argv, client_addr, client_name.
+            Value::Array(vec![
+                Value::Int(3),
+                Value::Int(1_700_000_000),
+                Value::Int(15000),
+                Value::Array(vec![bulk("GET"), bulk("big:key")]),
+                bulk("127.0.0.1:52814"),
+                bulk("worker"),
+            ]),
+            // Legacy 4-field shape (no client info).
+            Value::Array(vec![
+                Value::Int(2),
+                Value::Int(1_699_999_000),
+                Value::Int(9000),
+                Value::Array(vec![bulk("KEYS"), bulk("*")]),
+            ]),
+            // Torn entry: dropped, not fatal.
+            Value::Array(vec![Value::Int(1)]),
+        ]);
+        let entries = parse_slowlog(&reply);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0],
+            SlowlogEntry {
+                id: 3,
+                time_secs: 1_700_000_000,
+                micros: 15000,
+                argv: vec!["GET".into(), "big:key".into()],
+                client: "127.0.0.1:52814".into(),
+                client_name: "worker".into(),
+            }
+        );
+        assert_eq!(entries[1].argv, vec!["KEYS".to_string(), "*".to_string()]);
+        assert_eq!(entries[1].client, "");
     }
 
     fn budget() -> ScanBudget {
@@ -2272,6 +2383,103 @@ mod tests {
             .stream_claim("k", "g", "c", Duration::ZERO, &["1-1".into()])
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn slowlog_captures_and_resets() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let mut conn = driver.conn.clone();
+        // Remember the server's threshold, then log *everything* so a single
+        // command lands in the log deterministically.
+        let prev = value_to_string_vec(
+            &redis::cmd("CONFIG")
+                .arg("GET")
+                .arg("slowlog-log-slower-than")
+                .query_async::<redis::Value>(&mut conn)
+                .await
+                .unwrap(),
+        );
+        let _: () = redis::cmd("CONFIG")
+            .arg("SET")
+            .arg("slowlog-log-slower-than")
+            .arg(0)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("SLOWLOG")
+            .arg("RESET")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let key = tag("slowlog");
+        let _: () = redis::cmd("SET")
+            .arg(&key)
+            .arg("v")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let entries = driver.slowlog(128).await.unwrap();
+        assert!(
+            !entries.is_empty(),
+            "the slow log should have captured commands"
+        );
+        assert!(entries.iter().all(|e| !e.argv.is_empty()));
+
+        // Restore the original threshold *before* resetting, so the reset (and
+        // the verifying `SLOWLOG GET`) aren't themselves logged — otherwise the
+        // "empty after reset" check races the very command doing the checking.
+        if let Some(threshold) = prev.get(1) {
+            let _: () = redis::cmd("CONFIG")
+                .arg("SET")
+                .arg("slowlog-log-slower-than")
+                .arg(threshold)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+        }
+        driver.slowlog_reset().await.unwrap();
+        assert!(driver.slowlog(128).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn slowlog_reset_refused_on_a_read_only_connection() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, true).await.unwrap();
+        assert!(driver.slowlog_reset().await.is_err());
+        // Reading the log is still allowed read-only.
+        driver.slowlog(16).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn monitor_streams_executed_commands() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let mut mon = driver.monitor().await.unwrap();
+        // Run a uniquely-tagged command on a separate connection; MONITOR
+        // should echo it back on the firehose.
+        let key = tag("monitor");
+        let mut conn = driver.conn.clone();
+        let _: () = redis::cmd("SET")
+            .arg(&key)
+            .arg("v")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let found = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match mon.stream.next().await {
+                    Some(line) if line.contains(&key) => break true,
+                    Some(_) => continue,
+                    None => break false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(found, "expected MONITOR to surface our tagged SET command");
     }
 
     #[test]

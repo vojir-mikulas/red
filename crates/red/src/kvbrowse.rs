@@ -87,6 +87,7 @@ pub(crate) enum KvPanel {
     Browse,
     Console,
     PubSub,
+    Monitor,
 }
 
 /// A `redis-cli --bigkeys`-style sample (see docs/plans/redis.md's "beyond
@@ -156,6 +157,7 @@ pub(crate) struct RedisBrowse {
     pub(crate) panel: KvPanel,
     pub(crate) console: crate::kvconsole::KvConsole,
     pub(crate) pubsub: crate::kvpubsub::KvPubSub,
+    pub(crate) monitor: crate::kvmonitor::KvMonitor,
     /// `Some` while a "find biggest keys" sample is running or showing its
     /// last result; `None` is the normal live-browse state.
     pub(crate) big_keys: Option<BigKeysState>,
@@ -300,6 +302,7 @@ impl RedisBrowse {
             panel: KvPanel::Browse,
             console: crate::kvconsole::KvConsole::new(session, cx),
             pubsub: crate::kvpubsub::KvPubSub::new(cx),
+            monitor: crate::kvmonitor::KvMonitor::new(),
             big_keys: None,
         }
     }
@@ -664,6 +667,14 @@ impl AppState {
             return;
         };
         browse.panel = panel;
+        // Opening the diagnostics panel loads its default (Slow-log) view lazily,
+        // the same way the stream inspector's Groups tab loads on first open.
+        let load_slowlog = panel == KvPanel::Monitor
+            && browse.monitor.view == crate::kvmonitor::MonitorView::Slowlog
+            && !browse.monitor.slowlog_loaded;
+        if load_slowlog {
+            self.kv_load_slowlog(session, cx);
+        }
         cx.notify();
     }
 
