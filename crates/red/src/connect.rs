@@ -1196,7 +1196,38 @@ impl AppState {
                                     },
                                 ))
                                 .child("Read-only"),
-                        ),
+                        )
+                        // TLS toggle — network engines only (a file engine has no
+                        // wire to encrypt). See docs/plans/redis.md's TLS item.
+                        .when(!form.kind.is_file(), |row| {
+                            row.child(Toggle::new("tls", form.tls).label("TLS").on_change(
+                                cx.listener(|this, checked: &bool, _, cx| {
+                                    this.set_form_tls(*checked, cx)
+                                }),
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_size(theme.scale(12.5))
+                                    .text_color(if form.tls {
+                                        theme.accent
+                                    } else {
+                                        theme.text_muted
+                                    })
+                                    .child(crate::icons::icon(
+                                        "key-round",
+                                        theme.scale(12.),
+                                        if form.tls {
+                                            theme.accent
+                                        } else {
+                                            theme.text_muted
+                                        },
+                                    ))
+                                    .child("TLS"),
+                            )
+                        }),
                 ),
             )
     }

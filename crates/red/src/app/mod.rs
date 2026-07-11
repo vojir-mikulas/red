@@ -234,6 +234,9 @@ pub(crate) struct FormState {
     /// Label-palette index (see `connect::label_color`).
     pub color: u8,
     pub read_only: bool,
+    /// Encrypt the connection with TLS (see `docs/plans/redis.md`'s TLS toggle
+    /// item). Off by default; only offered for network engines.
+    pub tls: bool,
     /// `Some(index)` when editing an existing connection, `None` when adding.
     pub editing: Option<usize>,
     /// Set once the user tries to Save/Connect (or Test) with missing fields.

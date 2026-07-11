@@ -104,6 +104,18 @@ impl PostgresDriver {
     /// Connect over the network, drive the connection in the background, apply the
     /// read-only posture, and read the server version.
     pub async fn connect(dsn: &str, read_only: bool) -> Result<Self> {
+        // TLS for Postgres isn't wired yet (the driver dials `NoTls`; adding it
+        // needs a rustls connector — tracked in `security-review-2026-07.md`).
+        // Rather than silently connect in cleartext when the form's TLS toggle
+        // is on, refuse with an actionable message. The `sslmode=require` marker
+        // is what `ConnectionConfig::dsn()` emits for a TLS Postgres connection.
+        if dsn.contains("sslmode=require") || dsn.contains("sslmode=verify") {
+            return Err(RedError::Connect(
+                "TLS for PostgreSQL isn't supported yet in this build — turn TLS off, \
+                 or tunnel the connection over SSH instead."
+                    .to_string(),
+            ));
+        }
         let (client, connection) = tokio_postgres::connect(dsn, NoTls)
             .await
             .map_err(map_connect_err)?;
@@ -1320,6 +1332,19 @@ mod tests {
         let driver = PostgresDriver::connect(&url, true).await.unwrap();
         assert!(!driver.server_version().is_empty());
         driver.ping().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_dsn_is_refused_not_silently_downgraded() {
+        // Postgres TLS isn't wired yet; a `sslmode=require` DSN must error rather
+        // than connect in cleartext. No server needed — it fails before dialing.
+        match PostgresDriver::connect("postgres://h:5432/db?sslmode=require", true).await {
+            Ok(_) => panic!("a TLS Postgres DSN should be refused, not connected"),
+            Err(e) => assert!(
+                e.to_string().to_lowercase().contains("tls"),
+                "expected a TLS-not-supported error, got {e}"
+            ),
+        }
     }
 
     /// The non-scalar types `pg_value` renders from their binary wire form must

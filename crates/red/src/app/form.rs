@@ -81,6 +81,7 @@ impl AppState {
             color: 3,
             // Read-only by default, RED's safe-by-default posture.
             read_only: true,
+            tls: false,
             editing: None,
             submitted: false,
             test: TestState::Idle,
@@ -147,6 +148,7 @@ impl AppState {
             kind: config.kind,
             color: config.color,
             read_only: config.read_only,
+            tls: config.tls,
             editing: Some(index),
             submitted: false,
             test: TestState::Idle,
@@ -218,6 +220,7 @@ impl AppState {
             database: read(&self.database_input),
             color: form.color,
             read_only: form.read_only,
+            tls: form.tls && !form.kind.is_file(),
             ai_enabled,
             ai_tier,
             ssh,
@@ -489,6 +492,7 @@ impl AppState {
             .update(cx, |i, cx| i.set_content(parsed.database, cx));
         if let Some(form) = &mut self.form {
             form.kind = parsed.kind;
+            form.tls = parsed.tls;
             form.test = TestState::Idle;
         }
         cx.notify();
@@ -504,6 +508,13 @@ impl AppState {
     pub(crate) fn set_form_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
         if let Some(form) = &mut self.form {
             form.read_only = read_only;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn set_form_tls(&mut self, tls: bool, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.form {
+            form.tls = tls;
         }
         cx.notify();
     }

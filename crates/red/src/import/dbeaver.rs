@@ -109,6 +109,9 @@ pub fn import(dir: &Path) -> Result<ImportReport> {
                 database,
                 color: 0,
                 read_only: conn.read_only,
+                // TLS isn't extracted from the external store yet; a `rediss://`
+                // etc. pasted later still sets it.
+                tls: false,
                 ai_enabled: None,
                 ai_tier: None,
                 ssh,
