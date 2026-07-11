@@ -205,6 +205,19 @@ pub(crate) struct BrowseState {
     pub(crate) big_keys: Option<BigKeysState>,
 }
 
+/// One entry in a connection's "recently viewed keys" list — browser-history
+/// for the keyspace (see docs/plans/redis-workflow-parity.md Part 2). In-memory,
+/// newest-first, capped; recorded whenever the inspector opens on a key.
+pub(crate) struct RecentKey {
+    pub(crate) key: String,
+    pub(crate) kv_type: KvType,
+    pub(crate) ttl: Option<Duration>,
+    pub(crate) viewed_unix: u64,
+}
+
+/// How many recently-viewed keys to retain per connection.
+const MAX_RECENT_KEYS: usize = 50;
+
 /// The per-kind state a Redis tab holds. Heterogeneous, unlike the SQL side's
 /// homogeneous `QueryTab` — a Browse tab and a Monitor tab are structurally
 /// different, so the tab wraps this enum (see docs/plans/redis-workflow-parity.md).
@@ -265,6 +278,9 @@ pub(crate) struct RedisView {
     /// Browse tab — see docs/plans/redis.md on why there's no cheap filtered
     /// count).
     pub(crate) db_size: Option<u64>,
+    /// Recently-viewed keys, newest-first (browser-history for the keyspace),
+    /// shown in the History dock's Keys section.
+    pub(crate) recent_keys: Vec<RecentKey>,
     /// Horizontal scroll for the tab strip (mirrors the SQL `ActiveConn::tab_scroll`).
     pub(crate) tab_scroll: ScrollHandle,
     /// The gap a dragged tab would land in during a reorder, or `None`.
@@ -472,6 +488,7 @@ impl RedisView {
             active_tab: 0,
             tab_seq: 1,
             db_size: None,
+            recent_keys: Vec::new(),
             tab_scroll: ScrollHandle::new(),
             tab_drop_target: None,
             split: None,
@@ -1749,6 +1766,25 @@ impl AppState {
         };
         let epoch = browse.epoch;
 
+        // Record this key in the connection's recently-viewed list (newest-first,
+        // deduped, capped) — the History dock's Keys section reads it.
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            view.recent_keys.retain(|r| r.key != key);
+            view.recent_keys.insert(
+                0,
+                RecentKey {
+                    key: key.clone(),
+                    kv_type: kv_type.clone(),
+                    ttl,
+                    viewed_unix: crate::conversations::now_unix(),
+                },
+            );
+            view.recent_keys.truncate(MAX_RECENT_KEYS);
+        }
+
         let value_editor = cx.new(TextInput::new);
         cx.subscribe(&value_editor, move |this, _, event: &TextInputEvent, cx| {
             if matches!(event, TextInputEvent::Submit) {
@@ -1827,6 +1863,47 @@ impl AppState {
         self.service
             .send_to(session, Command::KvReadValue { epoch, key });
         cx.notify();
+    }
+
+    /// Open a recently-viewed key (the History dock's Keys section): make sure
+    /// the focused half shows a Browse tab, then open the inspector on it.
+    pub(crate) fn kv_open_recent_key(
+        &mut self,
+        session: SessionId,
+        key: String,
+        kv_type: KvType,
+        ttl: Option<Duration>,
+        cx: &mut Context<Self>,
+    ) {
+        let is_browse = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .is_some_and(|v| matches!(v.active_state(), Some(RedisTabState::Browse(_))));
+        if !is_browse {
+            self.kv_new_empty_tab(session, cx);
+            let id = self
+                .conn_mut(Some(session))
+                .and_then(|a| a.kv_view.as_ref())
+                .and_then(|v| v.tabs.get(v.focused_tab_index()))
+                .map(|t| t.id);
+            if let Some(id) = id {
+                self.kv_set_tab_kind(session, id, KvPanel::Browse, cx);
+            }
+        }
+        self.kv_open_inspector(session, key, ttl, kv_type, cx);
+    }
+
+    /// Clear the connection's recently-viewed keys (the History dock's trash).
+    pub(crate) fn kv_clear_recent_keys(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            if !view.recent_keys.is_empty() {
+                view.recent_keys.clear();
+                cx.notify();
+            }
+        }
     }
 
     /// Change the string inspector's display lens (Auto/Raw/JSON/Hex or a

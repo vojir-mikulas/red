@@ -108,6 +108,16 @@ impl AppState {
     }
 
     fn kv_console_send(&mut self, session: SessionId, argv: Vec<String>, cx: &mut Context<Self>) {
+        // Log the executed command in the shared query-history store (the same
+        // store SQL uses — it's just text keyed by `conn_id`). The History dock's
+        // Commands section reads it back.
+        let conn_id = self
+            .conn_mut(Some(session))
+            .map(|a| a.conn_id.clone())
+            .unwrap_or_default();
+        if !conn_id.is_empty() {
+            self.query_history.record(&conn_id, &argv.join(" "));
+        }
         let Some(console) = self
             .conn_mut(Some(session))
             .and_then(|a| a.kv_view.as_mut())
@@ -122,6 +132,43 @@ impl AppState {
         });
         self.service
             .send_to(session, Command::KvCommand { epoch, argv });
+        cx.notify();
+    }
+
+    /// Seed `text` into a Console tab's input (the History dock's Commands
+    /// click). Ensures the focused half shows a Console tab, sets the input, and
+    /// leaves it for the user to run — never auto-executes (a logged command may
+    /// be destructive), mirroring the SQL history's seed-don't-run behaviour.
+    pub(crate) fn kv_seed_console(
+        &mut self,
+        session: SessionId,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::kvbrowse::{KvPanel, RedisTabState};
+        let is_console = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .is_some_and(|v| matches!(v.active_state(), Some(RedisTabState::Console(_))));
+        if !is_console {
+            self.kv_new_empty_tab(session, cx);
+            let id = self
+                .conn_mut(Some(session))
+                .and_then(|a| a.kv_view.as_ref())
+                .and_then(|v| v.tabs.get(v.focused_tab_index()))
+                .map(|t| t.id);
+            if let Some(id) = id {
+                self.kv_set_tab_kind(session, id, KvPanel::Console, cx);
+            }
+        }
+        let input = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_console_mut())
+            .map(|c| c.input.clone());
+        if let Some(input) = input {
+            input.update(cx, |ti, cx| ti.set_content(&text, cx));
+        }
         cx.notify();
     }
 
