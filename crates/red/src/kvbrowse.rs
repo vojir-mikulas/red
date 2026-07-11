@@ -130,6 +130,14 @@ pub(crate) struct RedisBrowse {
     /// current when the timer fires, so rapid typing coalesces into one
     /// backend round trip (see `AppState::kv_debounce_filter`).
     pub(crate) filter_gen: u64,
+    /// `true`: the filter box is a client-side fuzzy query over already-
+    /// loaded rows (see `fuzzy_score`), auto-continuing the scan in the
+    /// background while under-matched (`kv_maybe_grow_fuzzy_pool`) instead
+    /// of the server-side `SCAN ... MATCH` glob filter. Toggled by the
+    /// filter box's "fuzzy" button; switching it on drops any active `MATCH`
+    /// pattern and restarts unfiltered, since a glob-filtered pool would
+    /// silently hide keys the fuzzy query could otherwise have matched.
+    pub(crate) fuzzy: bool,
     /// The value inspector opened by selecting a row, if any.
     pub(crate) inspector: Option<KvInspector>,
     pub(crate) panel: KvPanel,
@@ -181,15 +189,30 @@ impl RedisBrowse {
     pub(crate) fn new(session: SessionId, cx: &mut Context<AppState>) -> Self {
         let filter = cx.new(|cx| TextInput::new(cx).with_placeholder("Filter (MATCH pattern)…"));
         cx.subscribe(&filter, move |this, input, event: &TextInputEvent, cx| {
+            let fuzzy = this
+                .conn_mut(Some(session))
+                .and_then(|a| a.kv_browse.as_ref())
+                .map(|b| b.fuzzy)
+                .unwrap_or(false);
             match event {
                 // Enter restarts immediately, bypassing the debounce wait.
-                TextInputEvent::Submit => {
+                // No-op in fuzzy mode: there's no server round trip to fire
+                // early, filtering already happens live at render time.
+                TextInputEvent::Submit if !fuzzy => {
                     let pattern = input.read(cx).content().to_string();
                     this.kv_restart_scan(session, non_empty(pattern), cx);
                 }
-                TextInputEvent::Change => {
+                TextInputEvent::Change if !fuzzy => {
                     let pattern = input.read(cx).content().to_string();
                     this.kv_debounce_filter(session, pattern, cx);
+                }
+                TextInputEvent::Change => {
+                    // Fuzzy filtering itself reads the input live at render
+                    // time (see `render_kv_browse`); this just needs to (a)
+                    // repaint and (b) keep the candidate pool growing if the
+                    // new query is under-matched.
+                    this.kv_maybe_grow_fuzzy_pool(session, cx);
+                    cx.notify();
                 }
                 _ => {}
             }
@@ -206,6 +229,7 @@ impl RedisBrowse {
             scroll: UniformListScrollHandle::new(),
             filter,
             filter_gen: 0,
+            fuzzy: false,
             inspector: None,
             panel: KvPanel::Browse,
             console: crate::kvconsole::KvConsole::new(session, cx),
@@ -392,6 +416,79 @@ impl AppState {
         browse.exhausted = page.exhausted;
         browse.loading = false;
         cx.notify();
+        // Outside the `browse` borrow: if a fuzzy search is under-matched,
+        // this page landing is what chains the next one (see
+        // `kv_maybe_grow_fuzzy_pool`'s doc comment for the full loop shape).
+        if let Some(session) = session {
+            self.kv_maybe_grow_fuzzy_pool(session, cx);
+        }
+    }
+
+    /// Toggle between the server-side `MATCH` glob filter and client-side
+    /// fuzzy filtering. Turning fuzzy on drops any active glob pattern and
+    /// restarts unfiltered: a glob-filtered pool would silently exclude keys
+    /// the fuzzy query could otherwise have matched.
+    pub(crate) fn kv_toggle_fuzzy(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(active) = self.conn_mut(Some(session)) else {
+            return;
+        };
+        let Some(browse) = &mut active.kv_browse else {
+            return;
+        };
+        browse.fuzzy = !browse.fuzzy;
+        let had_pattern = browse.pattern.is_some();
+        let now_fuzzy = browse.fuzzy;
+        cx.notify();
+        if now_fuzzy && had_pattern {
+            self.kv_restart_scan(session, None, cx);
+        }
+    }
+
+    /// While a fuzzy search is active and under-matched, keep requesting
+    /// more scan pages in the background (reusing the ordinary
+    /// `KvFetchScan`/`on_kv_scan_page` round trip, budgeted exactly like a
+    /// scroll-triggered load-more) until either `FUZZY_MATCH_TARGET` matches
+    /// are found or the keyspace is exhausted. This is what makes fuzzy
+    /// search feel like it covers "the whole keyspace" for a query with
+    /// reasonably few true matches, without ever doing a synchronous,
+    /// unbounded full walk: each step is the same bounded round trip the
+    /// live browse already uses, chained by `on_kv_scan_page` as pages land
+    /// and re-armed here on every keystroke.
+    pub(crate) fn kv_maybe_grow_fuzzy_pool(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(active) = self.conn_mut(Some(session)) else {
+            return;
+        };
+        let Some(browse) = &mut active.kv_browse else {
+            return;
+        };
+        if !browse.fuzzy || browse.loading || browse.exhausted {
+            return;
+        }
+        let query = browse.filter.read(cx).content().to_string();
+        if query.is_empty() {
+            return;
+        }
+        let matches = browse
+            .rows
+            .iter()
+            .filter(|r| fuzzy_score(&query, &r.key).is_some())
+            .count();
+        if matches >= FUZZY_MATCH_TARGET {
+            return;
+        }
+        browse.loading = true;
+        let epoch = browse.epoch;
+        let cursor = browse.cursor;
+        self.service.send_to(
+            session,
+            Command::KvFetchScan {
+                epoch,
+                pattern: None,
+                cursor,
+                budget: scan_budget(),
+            },
+        );
+        cx.notify();
     }
 
     /// Kick off a "find biggest keys" sample (see `BigKeysState`'s doc
@@ -526,24 +623,25 @@ impl AppState {
 
     /// A keyspace row was selected: open the inspector on it and kick off
     /// `KvReadValue`. Replaces whatever the inspector was showing before.
+    /// Open the inspector on `key` (called with the resolved `KeyMeta`
+    /// fields rather than a row index, so both the live browse table and
+    /// the biggest-keys sample's table — two different backing `Vec`s — can
+    /// open the same inspector without this needing to know which list a
+    /// selection came from).
     pub(crate) fn kv_open_inspector(
         &mut self,
         session: SessionId,
-        ix: usize,
+        key: String,
+        ttl: Option<Duration>,
+        kv_type: KvType,
         cx: &mut Context<Self>,
     ) {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
-        let Some(browse) = &mut active.kv_browse else {
+        let Some(browse) = &active.kv_browse else {
             return;
         };
-        let Some(row) = browse.rows.get(ix) else {
-            return;
-        };
-        let key = row.key.clone();
-        let ttl = row.ttl;
-        let kv_type = row.kv_type.clone();
         let epoch = browse.epoch;
 
         let value_editor = cx.new(TextInput::new);
@@ -1125,6 +1223,51 @@ fn type_pill(kv_type: &KvType, theme: &Theme) -> impl IntoElement {
         .child(kv_type.label().to_string())
 }
 
+/// How many fuzzy-matched keys is "enough" before the auto-continue scan
+/// (see `AppState::kv_maybe_grow_fuzzy_pool`) stops chasing more pages.
+/// Keeps a fuzzy search from silently walking the entire keyspace just to
+/// find a handful of matches, while still finding more than the first
+/// page's worth for a query that's genuinely common.
+const FUZZY_MATCH_TARGET: usize = 40;
+
+/// A fast, dependency-free subsequence fuzzy match + score (fzf-ish, not a
+/// byte-for-byte reimplementation): every character of `query` must appear
+/// in `target` in order, not necessarily contiguously. `None` when `query`
+/// isn't a subsequence of `target` at all. Higher score wins ties by
+/// rewarding consecutive runs, an early match position, and a tighter
+/// (shorter) overall target — the usual "closer to what you typed" signals.
+/// Case-insensitive. O(len(target)) per candidate: cheap enough to run over
+/// every loaded row on every keystroke without debouncing (see
+/// `render_kv_browse`, where this replaces the server-side `MATCH` filter
+/// in fuzzy mode rather than running alongside it).
+fn fuzzy_score(query: &str, target: &str) -> Option<i32> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let query_lower: Vec<char> = query.to_lowercase().chars().collect();
+    let target_lower: Vec<char> = target.to_lowercase().chars().collect();
+    let mut score: i32 = 0;
+    let mut qi = 0;
+    let mut consecutive: i32 = 0;
+    for (ti, tc) in target_lower.iter().enumerate() {
+        if qi < query_lower.len() && *tc == query_lower[qi] {
+            score += 10 + consecutive * 5;
+            if ti == 0 || qi == 0 {
+                score += 15;
+            }
+            consecutive += 1;
+            qi += 1;
+        } else {
+            consecutive = 0;
+        }
+    }
+    if qi < query_lower.len() {
+        return None; // not every query character was found, in order
+    }
+    score -= (target_lower.len() as i32) / 4; // mild bonus for tighter targets
+    Some(score)
+}
+
 /// `"no expiry"` for `None` (Redis `PTTL -1`), else a coarse "expires in Xm"
 /// countdown — a static snapshot at fetch time, not a live tick (see
 /// docs/plans/redis.md's deferred-polish list). Mirrors `connect.rs::fmt_ago`'s
@@ -1172,14 +1315,46 @@ impl AppState {
             return div().flex_1();
         };
 
-        let header = match (&browse.pattern, browse.db_size) {
-            (None, Some(n)) => format!("~{} keys in db0", crate::result::group_digits(n as usize)),
-            (None, None) => "counting keys…".into(),
-            (Some(p), _) => format!("{} matched \"{p}\" so far", browse.rows.len()),
+        let fuzzy_query = browse.filter.read(cx).content().to_string();
+        let rows: std::rc::Rc<Vec<KeyMeta>> = if browse.fuzzy && !fuzzy_query.is_empty() {
+            let mut scored: Vec<(i32, &KeyMeta)> = browse
+                .rows
+                .iter()
+                .filter_map(|r| fuzzy_score(&fuzzy_query, &r.key).map(|s| (s, r)))
+                .collect();
+            scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+            std::rc::Rc::new(scored.into_iter().map(|(_, r)| r.clone()).collect())
+        } else {
+            std::rc::Rc::new(browse.rows.clone())
         };
 
-        let rows = std::rc::Rc::new(browse.rows.clone());
+        let header = if browse.fuzzy {
+            if fuzzy_query.is_empty() {
+                format!("{} keys loaded so far", browse.rows.len())
+            } else {
+                format!(
+                    "{} fuzzy match(es) of {} loaded{}",
+                    rows.len(),
+                    browse.rows.len(),
+                    if browse.exhausted {
+                        ""
+                    } else {
+                        ", still scanning…"
+                    }
+                )
+            }
+        } else {
+            match (&browse.pattern, browse.db_size) {
+                (None, Some(n)) => {
+                    format!("~{} keys in db0", crate::result::group_digits(n as usize))
+                }
+                (None, None) => "counting keys…".into(),
+                (Some(p), _) => format!("{} matched \"{p}\" so far", browse.rows.len()),
+            }
+        };
+
         let rows_render = rows.clone();
+        let rows_select = rows.clone();
         let row_count = rows.len();
         let visible_range_view = view.clone();
         let select_view = view.clone();
@@ -1209,8 +1384,14 @@ impl AppState {
             .track_scroll(&browse.scroll)
             .selected(selected_ix)
             .on_select(move |ix, _click, _window, cx| {
+                let Some(row) = rows_select.get(ix) else {
+                    return;
+                };
+                let (key, ttl, kv_type) = (row.key.clone(), row.ttl, row.kv_type.clone());
                 select_view
-                    .update(cx, |this, cx| this.kv_open_inspector(session, ix, cx))
+                    .update(cx, |this, cx| {
+                        this.kv_open_inspector(session, key, ttl, kv_type, cx)
+                    })
                     .ok();
             })
             .render_row(move |ix, _window, _cx| {
@@ -1275,7 +1456,14 @@ impl AppState {
                 })
                 .into_any_element(),
             Some(bk) => self
-                .render_big_keys(session, bk, &theme, cx)
+                .render_big_keys(
+                    session,
+                    bk,
+                    browse.inspector.as_ref(),
+                    !active.config.read_only,
+                    &theme,
+                    cx,
+                )
                 .into_any_element(),
         };
 
@@ -1294,6 +1482,30 @@ impl AppState {
                     .pt_2()
                     .pb_1()
                     .child(div().flex_1().child(browse.filter.clone()))
+                    .child({
+                        let fuzzy_view = view.clone();
+                        let fuzzy = browse.fuzzy;
+                        IconButton::new(
+                            "kv-fuzzy-toggle",
+                            crate::icons::icon(
+                                "sparkles",
+                                theme.scale(14.),
+                                if fuzzy { theme.accent } else { theme.text_muted },
+                            ),
+                        )
+                        .size(IconButtonSize::Sm)
+                        .tooltip(if fuzzy {
+                            "Fuzzy search (on): searches loaded keys and keeps scanning until enough match"
+                        } else {
+                            "Switch to fuzzy search"
+                        })
+                        .a11y_label("Toggle fuzzy search")
+                        .on_click(move |_, _, cx| {
+                            fuzzy_view
+                                .update(cx, |this, cx| this.kv_toggle_fuzzy(session, cx))
+                                .ok();
+                        })
+                    })
                     .child(
                         div()
                             .text_size(theme.scale(11.))
@@ -1311,13 +1523,19 @@ impl AppState {
         &self,
         session: SessionId,
         bk: &BigKeysState,
+        inspector: Option<&KvInspector>,
+        writable: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let view = cx.entity().downgrade();
+        let close_view = view.clone();
+        let select_view = view.clone();
         let rows = std::rc::Rc::new(bk.results.clone());
         let rows_render = rows.clone();
+        let rows_select = rows.clone();
         let row_count = rows.len();
+        let selected_ix = inspector.and_then(|i| rows.iter().position(|r| r.key == i.key));
 
         let status = if bk.running {
             format!("sampling… {} keys scanned so far", bk.sampled)
@@ -1344,6 +1562,18 @@ impl AppState {
             .row_count(row_count)
             .grid_lines(true)
             .text_size(cell_size)
+            .selected(selected_ix)
+            .on_select(move |ix, _click, _window, cx| {
+                let Some(row) = rows_select.get(ix) else {
+                    return;
+                };
+                let (key, ttl, kv_type) = (row.key.clone(), row.ttl, row.kv_type.clone());
+                select_view
+                    .update(cx, |this, cx| {
+                        this.kv_open_inspector(session, key, ttl, kv_type, cx)
+                    })
+                    .ok();
+            })
             .render_row(move |ix, _window, _cx| {
                 let Some(row) = rows_render.get(ix) else {
                     return Vec::new();
@@ -1392,12 +1622,22 @@ impl AppState {
                         Button::new("kv-big-keys-close", "Back to live browse")
                             .size(ButtonSize::Sm)
                             .on_click(move |_, _, cx| {
-                                view.update(cx, |this, cx| this.kv_close_big_keys(session, cx))
+                                close_view
+                                    .update(cx, |this, cx| this.kv_close_big_keys(session, cx))
                                     .ok();
                             }),
                     ),
             )
-            .child(div().flex_1().min_h(px(0.)).child(table))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .child(div().flex_1().min_w(px(0.)).child(table))
+                    .when_some(inspector, |el, inspector| {
+                        el.child(self.render_kv_inspector(session, inspector, writable, theme, cx))
+                    }),
+            )
     }
 
     /// The value inspector panel: key/type/TTL header, then the value
@@ -2038,5 +2278,43 @@ fn render_string_preview(value: &red_core::Value) -> String {
             format!("{}\n\n… ({} bytes total, truncated)", cell.head, cell.len)
         }
         other => format!("{other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuzzy_score_requires_an_in_order_subsequence() {
+        assert!(fuzzy_score("usr1", "user:1:profile").is_some());
+        assert!(fuzzy_score("1ru", "user:1:profile").is_none()); // out of order
+        assert!(fuzzy_score("xyz", "user:1:profile").is_none()); // not present
+        assert_eq!(fuzzy_score("", "anything"), Some(0));
+    }
+
+    #[test]
+    fn fuzzy_score_is_case_insensitive() {
+        assert!(fuzzy_score("USR", "user:1").is_some());
+        assert_eq!(fuzzy_score("usr", "user:1"), fuzzy_score("USR", "USER:1"));
+    }
+
+    #[test]
+    fn fuzzy_score_prefers_consecutive_and_earlier_matches() {
+        // "user" is a contiguous, leading match in the first key; only a
+        // scattered subsequence in the second. The contiguous one must win.
+        let contiguous = fuzzy_score("user", "user:session:1").unwrap();
+        let scattered = fuzzy_score("user", "u_n_s_e_e_r").unwrap();
+        assert!(
+            contiguous > scattered,
+            "{contiguous} should beat {scattered}"
+        );
+    }
+
+    #[test]
+    fn fuzzy_score_prefers_tighter_targets_on_equal_match_quality() {
+        let short = fuzzy_score("abc", "abc").unwrap();
+        let long = fuzzy_score("abc", "abc-followed-by-a-lot-of-other-text").unwrap();
+        assert!(short > long);
     }
 }
