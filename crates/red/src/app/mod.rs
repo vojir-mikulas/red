@@ -2371,6 +2371,34 @@ impl AppState {
             Event::KvStreamPageReady { key, page, .. } => {
                 self.on_kv_stream_page_ready(session, key, page, cx);
             }
+            Event::KvStreamGroupsReady { key, groups, .. } => {
+                self.on_kv_stream_groups_ready(session, key, groups, cx);
+            }
+            Event::KvStreamConsumersReady {
+                key,
+                group,
+                consumers,
+                ..
+            } => {
+                self.on_kv_stream_consumers_ready(session, key, group, consumers, cx);
+            }
+            Event::KvStreamPendingReady {
+                key,
+                group,
+                pending,
+                ..
+            } => {
+                self.on_kv_stream_pending_ready(session, key, group, pending, cx);
+            }
+            Event::KvStreamActionDone {
+                key,
+                group,
+                action,
+                count,
+                ..
+            } => {
+                self.on_kv_stream_action_done(session, key, group, action, count, cx);
+            }
             Event::KvCommandResult {
                 epoch,
                 argv,

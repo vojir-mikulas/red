@@ -13,8 +13,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use red_core::kv::{
-    CollectionKind, KeyMeta, KvCollectionPage, KvEdit, KvScanPage, KvStreamPage, KvValue,
-    RespValue, ScanBudget, ScanCursor,
+    CollectionKind, KeyMeta, KvCollectionPage, KvEdit, KvScanPage, KvStreamActionReq, KvStreamPage,
+    KvValue, PendingEntry, RespValue, ScanBudget, ScanCursor, StreamAction, StreamConsumer,
+    StreamGroup,
 };
 use red_core::{
     ActivityId, ActivityKind, ActivityStatus, AiLimits, AiTier, Column, ColumnMap, ColumnMeta,
@@ -219,6 +220,42 @@ pub enum Command {
         key: String,
         before: Option<String>,
         count: usize,
+    },
+    /// A stream's consumer groups (`XINFO GROUPS`), for the inspector's
+    /// consumer-group management view (see docs/plans/redis.md's "stream
+    /// consumer-group management" gap). `epoch` scopes cancellation like the
+    /// other inspector reads; the reply's staleness is checked UI-side by
+    /// `key`. Replied with `KvStreamGroupsReady`.
+    KvStreamGroups {
+        epoch: u64,
+        key: String,
+    },
+    /// One group's consumers (`XINFO CONSUMERS`). Replied with
+    /// `KvStreamConsumersReady`.
+    KvStreamConsumers {
+        epoch: u64,
+        key: String,
+        group: String,
+    },
+    /// Up to `count` of a group's pending entries (`XPENDING ... - + count`).
+    /// Replied with `KvStreamPendingReady`.
+    KvStreamPending {
+        epoch: u64,
+        key: String,
+        group: String,
+        count: usize,
+    },
+    /// Acknowledge (`XACK`) or reassign (`XCLAIM`) pending entries in a group,
+    /// gated by `read_only` (checked service-side, defense in depth alongside
+    /// the driver's own refusal). `Claim` carries the target consumer and a
+    /// `min_idle` guard; `Ack` drops the entries from the PEL. Replied with
+    /// `KvStreamActionDone` (echoing `key`/`group` so the UI refreshes that
+    /// group's consumers+pending), or the global `Event::Error` on failure.
+    KvStreamAction {
+        epoch: u64,
+        key: String,
+        group: String,
+        action: KvStreamActionReq,
     },
     /// Run an arbitrary command through the console (see
     /// docs/plans/redis.md). `epoch` scopes cancellation only; console
@@ -647,6 +684,37 @@ pub enum Event {
         epoch: u64,
         key: String,
         page: KvStreamPage,
+    },
+    /// A stream's consumer groups, in response to `KvStreamGroups`. `key`
+    /// lets the UI drop a reply for a key the inspector has since moved off.
+    KvStreamGroupsReady {
+        epoch: u64,
+        key: String,
+        groups: Vec<StreamGroup>,
+    },
+    /// One group's consumers, in response to `KvStreamConsumers`.
+    KvStreamConsumersReady {
+        epoch: u64,
+        key: String,
+        group: String,
+        consumers: Vec<StreamConsumer>,
+    },
+    /// One group's pending entries, in response to `KvStreamPending`.
+    KvStreamPendingReady {
+        epoch: u64,
+        key: String,
+        group: String,
+        pending: Vec<PendingEntry>,
+    },
+    /// An `XACK`/`XCLAIM` completed, in response to `KvStreamAction`. `count`
+    /// is how many entries it affected; `action` says which verb. The UI
+    /// re-requests the group's consumers+pending on this to reflect the change.
+    KvStreamActionDone {
+        epoch: u64,
+        key: String,
+        group: String,
+        action: StreamAction,
+        count: u64,
     },
     /// One console command's result, in response to `KvCommand`. Echoes
     /// `argv` back so a console tracking several in-flight lines can match

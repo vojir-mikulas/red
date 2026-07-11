@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use red_core::kv::{
     CollectionKind, CommandClass, KeyMeta, KvCollection, KvCollectionPage, KvElement, KvMessage,
-    KvScanPage, KvStreamPage, KvType, KvValue, RespValue, ScanBudget, ScanCursor, StreamEntry,
+    KvScanPage, KvStreamPage, KvType, KvValue, PendingEntry, RespValue, ScanBudget, ScanCursor,
+    StreamConsumer, StreamEntry, StreamGroup,
 };
 use red_core::{RedError, Result, Value};
 use redis::aio::MultiplexedConnection;
@@ -757,6 +758,96 @@ impl KvDriver for RedisDriver {
         fetch_stream_page(&mut conn, key, before, count).await
     }
 
+    async fn stream_groups(&self, key: &str) -> Result<Vec<StreamGroup>> {
+        let mut conn = self.route(key);
+        let reply: redis::Value = redis::cmd("XINFO")
+            .arg("GROUPS")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        Ok(parse_stream_groups(&reply))
+    }
+
+    async fn stream_consumers(&self, key: &str, group: &str) -> Result<Vec<StreamConsumer>> {
+        let mut conn = self.route(key);
+        let reply: redis::Value = redis::cmd("XINFO")
+            .arg("CONSUMERS")
+            .arg(key)
+            .arg(group)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        Ok(parse_stream_consumers(&reply))
+    }
+
+    async fn stream_pending(
+        &self,
+        key: &str,
+        group: &str,
+        count: usize,
+    ) -> Result<Vec<PendingEntry>> {
+        let mut conn = self.route(key);
+        let reply: redis::Value = redis::cmd("XPENDING")
+            .arg(key)
+            .arg(group)
+            .arg("-")
+            .arg("+")
+            .arg(count.max(1))
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        Ok(parse_pending_entries(&reply))
+    }
+
+    async fn stream_ack(&self, key: &str, group: &str, ids: &[String]) -> Result<u64> {
+        self.check_writable()?;
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.route(key);
+        let mut cmd = redis::cmd("XACK");
+        cmd.arg(key).arg(group);
+        for id in ids {
+            cmd.arg(id);
+        }
+        cmd.query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    async fn stream_claim(
+        &self,
+        key: &str,
+        group: &str,
+        consumer: &str,
+        min_idle: Duration,
+        ids: &[String],
+    ) -> Result<u64> {
+        self.check_writable()?;
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.route(key);
+        let mut cmd = redis::cmd("XCLAIM");
+        cmd.arg(key)
+            .arg(group)
+            .arg(consumer)
+            .arg(min_idle.as_millis() as u64);
+        for id in ids {
+            cmd.arg(id);
+        }
+        // `JUSTID` returns just the claimed IDs (no field/value payload), which
+        // is all the count needs and avoids materializing entry bodies. It also
+        // stops `XCLAIM` bumping the delivery counter, matching a plain reclaim.
+        cmd.arg("JUSTID");
+        let claimed: Vec<String> = cmd
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        Ok(claimed.len() as u64)
+    }
+
     async fn command(&self, argv: &[String]) -> Result<RespValue> {
         let Some(name) = argv.first() else {
             return Err(RedError::Query("empty command".into()));
@@ -1161,6 +1252,127 @@ async fn fetch_key_meta_batch(
     Ok(out)
 }
 
+/// Flatten a RESP reply that models a `field -> value` map into ordered
+/// `(field, value)` pairs, tolerating both wire shapes the redis crate hands
+/// back: a RESP3 `Map`, or the RESP2 flat `[field, value, field, value, ...]`
+/// array that `XINFO`/`XPENDING` use over a RESP2 connection (what a default
+/// `MultiplexedConnection` negotiates). Values stay as `redis::Value` so a
+/// caller can pull an integer field (`pending`, `idle`) without a lossy string
+/// round trip. A trailing unpaired element in the flat form is dropped.
+fn resp_map(v: &redis::Value) -> Vec<(String, redis::Value)> {
+    match v {
+        redis::Value::Map(pairs) => pairs
+            .iter()
+            .filter_map(|(k, val)| value_to_string(k).map(|k| (k, val.clone())))
+            .collect(),
+        redis::Value::Array(items) | redis::Value::Set(items) => {
+            let mut out = Vec::with_capacity(items.len() / 2);
+            let mut it = items.iter();
+            while let (Some(k), Some(val)) = (it.next(), it.next()) {
+                if let Some(k) = value_to_string(k) {
+                    out.push((k, val.clone()));
+                }
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Look up one field in a [`resp_map`]-flattened reply.
+fn map_field<'a>(map: &'a [(String, redis::Value)], key: &str) -> Option<&'a redis::Value> {
+    map.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+/// Parse an `XINFO GROUPS` reply: an array of per-group maps. A group missing
+/// its `name` is skipped; numeric fields default to `0` and `lag` stays `None`
+/// when the server omits it or reports it as nil (an older server, or a trimmed
+/// stream Redis can't compute lag for).
+fn parse_stream_groups(v: &redis::Value) -> Vec<StreamGroup> {
+    let (redis::Value::Array(items) | redis::Value::Set(items)) = v else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let map = resp_map(item);
+            let name = map_field(&map, "name").and_then(value_to_string)?;
+            Some(StreamGroup {
+                name,
+                consumers: map_field(&map, "consumers")
+                    .and_then(value_to_i64)
+                    .unwrap_or(0)
+                    .max(0) as u64,
+                pending: map_field(&map, "pending")
+                    .and_then(value_to_i64)
+                    .unwrap_or(0)
+                    .max(0) as u64,
+                last_delivered_id: map_field(&map, "last-delivered-id")
+                    .and_then(value_to_string)
+                    .unwrap_or_default(),
+                lag: map_field(&map, "lag").and_then(value_to_i64),
+            })
+        })
+        .collect()
+}
+
+/// Parse an `XINFO CONSUMERS` reply: an array of per-consumer maps. A consumer
+/// missing its `name` is skipped.
+fn parse_stream_consumers(v: &redis::Value) -> Vec<StreamConsumer> {
+    let (redis::Value::Array(items) | redis::Value::Set(items)) = v else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let map = resp_map(item);
+            let name = map_field(&map, "name").and_then(value_to_string)?;
+            let idle_ms = map_field(&map, "idle")
+                .and_then(value_to_i64)
+                .unwrap_or(0)
+                .max(0) as u64;
+            Some(StreamConsumer {
+                name,
+                pending: map_field(&map, "pending")
+                    .and_then(value_to_i64)
+                    .unwrap_or(0)
+                    .max(0) as u64,
+                idle: Duration::from_millis(idle_ms),
+            })
+        })
+        .collect()
+}
+
+/// Parse the extended `XPENDING key group - + count` reply: an array of
+/// `[id, consumer, idle_ms, delivery_count]` rows. A torn row (wrong arity, or
+/// a missing id/consumer) is skipped rather than fatal, like the stream-entry
+/// parser.
+fn parse_pending_entries(v: &redis::Value) -> Vec<PendingEntry> {
+    let (redis::Value::Array(items) | redis::Value::Set(items)) = v else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let (redis::Value::Array(row) | redis::Value::Set(row)) = item else {
+                return None;
+            };
+            let [id_v, consumer_v, idle_v, count_v] = row.as_slice() else {
+                return None;
+            };
+            let id = value_to_string(id_v)?;
+            let consumer = value_to_string(consumer_v)?;
+            let idle_ms = value_to_i64(idle_v).unwrap_or(0).max(0) as u64;
+            Some(PendingEntry {
+                id,
+                consumer,
+                idle: Duration::from_millis(idle_ms),
+                delivery_count: value_to_i64(count_v).unwrap_or(0).max(0) as u64,
+            })
+        })
+        .collect()
+}
+
 fn value_to_string(v: &redis::Value) -> Option<String> {
     redis::from_redis_value::<String>(v.clone()).ok()
 }
@@ -1321,6 +1533,102 @@ mod tests {
         // seed host, changing only the port.
         let out = node_dsn("redis://seed.example:6379", "", 7001).unwrap();
         assert!(out.contains("seed.example:7001"), "{out}");
+    }
+
+    #[test]
+    fn parse_stream_groups_reads_the_resp2_flat_map() {
+        use redis::Value;
+        let bulk = |s: &str| Value::BulkString(s.as_bytes().to_vec());
+        // One group, RESP2 flat `[field, value, ...]` shape. `lag` present.
+        let reply = Value::Array(vec![Value::Array(vec![
+            bulk("name"),
+            bulk("g1"),
+            bulk("consumers"),
+            Value::Int(2),
+            bulk("pending"),
+            Value::Int(5),
+            bulk("last-delivered-id"),
+            bulk("1526569495631-0"),
+            bulk("entries-read"),
+            Value::Int(10),
+            bulk("lag"),
+            Value::Int(3),
+        ])]);
+        assert_eq!(
+            parse_stream_groups(&reply),
+            vec![StreamGroup {
+                name: "g1".into(),
+                consumers: 2,
+                pending: 5,
+                last_delivered_id: "1526569495631-0".into(),
+                lag: Some(3),
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_stream_groups_tolerates_nil_lag_and_the_resp3_map_shape() {
+        use redis::Value;
+        let bulk = |s: &str| Value::BulkString(s.as_bytes().to_vec());
+        // RESP3 `Map` shape, and `lag` reported as nil (a trimmed stream).
+        let reply = Value::Array(vec![Value::Map(vec![
+            (bulk("name"), bulk("g2")),
+            (bulk("consumers"), Value::Int(1)),
+            (bulk("pending"), Value::Int(0)),
+            (bulk("last-delivered-id"), bulk("0-0")),
+            (bulk("lag"), Value::Nil),
+        ])]);
+        let groups = parse_stream_groups(&reply);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "g2");
+        assert_eq!(groups[0].lag, None);
+    }
+
+    #[test]
+    fn parse_pending_entries_reads_the_extended_rows() {
+        use redis::Value;
+        let bulk = |s: &str| Value::BulkString(s.as_bytes().to_vec());
+        let reply = Value::Array(vec![
+            Value::Array(vec![
+                bulk("1526569498055-0"),
+                bulk("consumer-1"),
+                Value::Int(1200),
+                Value::Int(2),
+            ]),
+            // A torn row (too few fields) is dropped, not fatal.
+            Value::Array(vec![bulk("bad")]),
+        ]);
+        assert_eq!(
+            parse_pending_entries(&reply),
+            vec![PendingEntry {
+                id: "1526569498055-0".into(),
+                consumer: "consumer-1".into(),
+                idle: Duration::from_millis(1200),
+                delivery_count: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_stream_consumers_reads_name_pending_and_idle() {
+        use redis::Value;
+        let bulk = |s: &str| Value::BulkString(s.as_bytes().to_vec());
+        let reply = Value::Array(vec![Value::Array(vec![
+            bulk("name"),
+            bulk("consumer-1"),
+            bulk("pending"),
+            Value::Int(4),
+            bulk("idle"),
+            Value::Int(9000),
+        ])]);
+        assert_eq!(
+            parse_stream_consumers(&reply),
+            vec![StreamConsumer {
+                name: "consumer-1".into(),
+                pending: 4,
+                idle: Duration::from_millis(9000),
+            }]
+        );
     }
 
     fn budget() -> ScanBudget {
@@ -1872,6 +2180,98 @@ mod tests {
                 i + 1
             );
         }
+    }
+
+    #[tokio::test]
+    async fn stream_consumer_groups_round_trip() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let key = tag("stream-groups");
+        let mut conn = driver.conn.clone();
+        // Two entries, a group, and a consumer that reads (but doesn't ack)
+        // both — so they land in the group's pending list.
+        for (id, val) in [("1-1", "a"), ("2-1", "b")] {
+            let _: String = redis::cmd("XADD")
+                .arg(&key)
+                .arg(id)
+                .arg("f")
+                .arg(val)
+                .query_async(&mut conn)
+                .await
+                .unwrap();
+        }
+        let _: () = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(&key)
+            .arg("g1")
+            .arg("0")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        // `>` delivers new entries to this consumer, populating the PEL.
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg("g1")
+            .arg("worker-a")
+            .arg("COUNT")
+            .arg(10)
+            .arg("STREAMS")
+            .arg(&key)
+            .arg(">")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let groups = driver.stream_groups(&key).await.unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "g1");
+        assert_eq!(groups[0].pending, 2);
+        assert_eq!(groups[0].consumers, 1);
+
+        let consumers = driver.stream_consumers(&key, "g1").await.unwrap();
+        assert_eq!(consumers.len(), 1);
+        assert_eq!(consumers[0].name, "worker-a");
+        assert_eq!(consumers[0].pending, 2);
+
+        let pending = driver.stream_pending(&key, "g1", 10).await.unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().all(|p| p.consumer == "worker-a"));
+        assert!(pending.iter().any(|p| p.id == "1-1"));
+
+        // Claim one entry to a different consumer (min-idle 0 so it's eligible),
+        // then ack the other. Both writes reflect in the pending set afterward.
+        let claimed = driver
+            .stream_claim(&key, "g1", "worker-b", Duration::ZERO, &["1-1".into()])
+            .await
+            .unwrap();
+        assert_eq!(claimed, 1);
+        let acked = driver
+            .stream_ack(&key, "g1", &["2-1".into()])
+            .await
+            .unwrap();
+        assert_eq!(acked, 1);
+
+        let pending = driver.stream_pending(&key, "g1", 10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "1-1");
+        assert_eq!(pending[0].consumer, "worker-b"); // reassigned by the claim
+
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_writes_refused_on_a_read_only_connection() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, true).await.unwrap();
+        assert!(driver.stream_ack("k", "g", &["1-1".into()]).await.is_err());
+        assert!(driver
+            .stream_claim("k", "g", "c", Duration::ZERO, &["1-1".into()])
+            .await
+            .is_err());
     }
 
     #[test]

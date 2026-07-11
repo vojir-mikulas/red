@@ -12,11 +12,13 @@ use std::time::Duration;
 
 use flint::prelude::*;
 use gpui::{
-    div, prelude::*, px, AsyncApp, Context, Entity, UniformListScrollHandle, WeakEntity, Window,
+    div, prelude::*, px, AsyncApp, Context, Entity, SharedString, UniformListScrollHandle,
+    WeakEntity, Window,
 };
 use red_core::kv::{
-    CollectionKind, KeyMeta, KvCollection, KvCollectionPage, KvElement, KvStreamPage, KvType,
-    KvValue, ScanBudget, ScanCursor, StreamEntry,
+    CollectionKind, KeyMeta, KvCollection, KvCollectionPage, KvElement, KvStreamActionReq,
+    KvStreamPage, KvType, KvValue, PendingEntry, ScanBudget, ScanCursor, StreamAction,
+    StreamConsumer, StreamEntry, StreamGroup,
 };
 use red_service::{Command, SessionId};
 
@@ -52,6 +54,12 @@ const LIST_PREVIEW_COUNT: usize = 200;
 /// a list, a big stream *is* pageable (by entry-ID range, newest-first), so
 /// this is a page size the inspector grows on scroll, not a one-shot cap.
 const STREAM_PAGE_COUNT: usize = 200;
+/// How many pending entries to pull per group in the consumer-group view
+/// (`XPENDING ... - + count`). A bounded window, not the whole PEL: a group
+/// with a huge backlog still surfaces its head (the oldest, most-stuck
+/// entries) without an unbounded fetch, matching the size-triage the rest of
+/// the inspector uses.
+const STREAM_PENDING_COUNT: usize = 100;
 
 fn scan_budget() -> ScanBudget {
     ScanBudget {
@@ -188,6 +196,13 @@ pub(crate) struct KvInspector {
     pub(crate) stream_loading: bool,
     pub(crate) stream_scroll: UniformListScrollHandle,
 
+    /// Consumer-group management state for a stream key (see
+    /// docs/plans/redis.md's "stream consumer-group management" gap). Only
+    /// meaningful when `kv_type` is `Stream`; its `view` toggles the stream
+    /// body between the entries grid and the groups view. Loaded lazily the
+    /// first time the user switches to the Groups tab.
+    pub(crate) stream_groups: StreamGroupsState,
+
     // --- editing (see docs/plans/redis.md's editing phase) ---
     // Each editable field gets one persistent `TextInput`, created once when
     // the inspector opens rather than lazily, so a click just flips a
@@ -201,6 +216,39 @@ pub(crate) struct KvInspector {
     pub(crate) rename_editor: Entity<TextInput>,
     pub(crate) editing_key: bool,
     pub(crate) confirm_delete: bool,
+}
+
+/// Which stream sub-view the inspector shows: the entries grid (the default)
+/// or the consumer-group management panel.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum StreamView {
+    #[default]
+    Entries,
+    Groups,
+}
+
+/// The inspector's consumer-group panel for a stream: the list of groups, the
+/// selected group's consumers + pending entries, and the inline claim form.
+/// Fetched lazily (nothing loads until the user opens the Groups tab), then
+/// refreshed after each `XACK`/`XCLAIM` so counts stay live.
+pub(crate) struct StreamGroupsState {
+    pub(crate) view: StreamView,
+    /// Set once the first `XINFO GROUPS` reply lands, so switching to the tab
+    /// again doesn't re-fetch on every toggle (an explicit refresh still does).
+    pub(crate) loaded: bool,
+    pub(crate) loading: bool,
+    pub(crate) groups: Vec<StreamGroup>,
+    /// The group whose consumers/pending are shown, if any.
+    pub(crate) selected: Option<String>,
+    pub(crate) consumers: Vec<StreamConsumer>,
+    pub(crate) pending: Vec<PendingEntry>,
+    pub(crate) detail_loading: bool,
+    /// The pending entry ID whose inline "claim to consumer" form is open, if
+    /// any (only one at a time).
+    pub(crate) claiming: Option<String>,
+    /// The target-consumer input for the claim form. Persistent (built once
+    /// when the inspector opens), like the other inspector editors.
+    pub(crate) claim_editor: Entity<TextInput>,
 }
 
 impl RedisBrowse {
@@ -687,6 +735,13 @@ impl AppState {
             },
         )
         .detach();
+        let claim_editor = cx.new(|cx| TextInput::new(cx).with_placeholder("claim to consumer…"));
+        cx.subscribe(&claim_editor, move |this, _, event: &TextInputEvent, cx| {
+            if matches!(event, TextInputEvent::Submit) {
+                this.kv_submit_claim(session, cx);
+            }
+        })
+        .detach();
 
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
@@ -709,6 +764,18 @@ impl AppState {
             stream_exhausted: false,
             stream_loading: false,
             stream_scroll: UniformListScrollHandle::new(),
+            stream_groups: StreamGroupsState {
+                view: StreamView::Entries,
+                loaded: false,
+                loading: false,
+                groups: Vec::new(),
+                selected: None,
+                consumers: Vec::new(),
+                pending: Vec::new(),
+                detail_loading: false,
+                claiming: None,
+                claim_editor,
+            },
             value_editor,
             editing_value: false,
             ttl_editor,
@@ -1305,6 +1372,315 @@ impl AppState {
         inspector.stream_exhausted = page.exhausted;
         inspector.stream_loading = false;
         cx.notify();
+    }
+
+    // --- stream consumer groups (see docs/plans/redis.md's "stream
+    // consumer-group management" gap) ---
+
+    /// Switch the stream inspector between its entries grid and its
+    /// consumer-group view. Opening the Groups tab for the first time kicks
+    /// off the lazy `XINFO GROUPS` load.
+    pub(crate) fn kv_set_stream_view(
+        &mut self,
+        session: SessionId,
+        view: StreamView,
+        cx: &mut Context<Self>,
+    ) {
+        let need_load = {
+            let Some(inspector) = self.kv_inspector_mut(session) else {
+                return;
+            };
+            inspector.stream_groups.view = view;
+            view == StreamView::Groups && !inspector.stream_groups.loaded
+        };
+        if need_load {
+            self.kv_load_stream_groups(session, cx);
+        }
+        cx.notify();
+    }
+
+    /// Fetch (or refresh) the stream's consumer groups.
+    pub(crate) fn kv_load_stream_groups(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(active) = self.conn_mut(Some(session)) else {
+            return;
+        };
+        let Some(browse) = &mut active.kv_browse else {
+            return;
+        };
+        let epoch = browse.epoch;
+        let Some(inspector) = &mut browse.inspector else {
+            return;
+        };
+        inspector.stream_groups.loading = true;
+        let key = inspector.key.clone();
+        self.service
+            .send_to(session, Command::KvStreamGroups { epoch, key });
+        cx.notify();
+    }
+
+    pub(crate) fn on_kv_stream_groups_ready(
+        &mut self,
+        session: Option<SessionId>,
+        key: String,
+        groups: Vec<StreamGroup>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(inspector) = self.kv_inspector_for(session) else {
+            return;
+        };
+        if inspector.key != key {
+            return;
+        }
+        inspector.stream_groups.loaded = true;
+        inspector.stream_groups.loading = false;
+        // Keep a valid selection: default to the first group, and if the
+        // previously-selected group is gone (dropped meanwhile), fall back.
+        let still_present = inspector
+            .stream_groups
+            .selected
+            .as_ref()
+            .is_some_and(|s| groups.iter().any(|g| &g.name == s));
+        let auto_select = (!still_present).then(|| groups.first().map(|g| g.name.clone()));
+        inspector.stream_groups.groups = groups;
+        cx.notify();
+        if let Some(Some(first)) = auto_select {
+            if let Some(session) = session {
+                self.kv_select_stream_group(session, first, cx);
+            }
+        }
+    }
+
+    /// Select a group and load its consumers + pending entries.
+    pub(crate) fn kv_select_stream_group(
+        &mut self,
+        session: SessionId,
+        group: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.conn_mut(Some(session)) else {
+            return;
+        };
+        let Some(browse) = &mut active.kv_browse else {
+            return;
+        };
+        let epoch = browse.epoch;
+        let Some(inspector) = &mut browse.inspector else {
+            return;
+        };
+        let key = inspector.key.clone();
+        inspector.stream_groups.selected = Some(group.clone());
+        inspector.stream_groups.consumers.clear();
+        inspector.stream_groups.pending.clear();
+        inspector.stream_groups.claiming = None;
+        inspector.stream_groups.detail_loading = true;
+        self.service.send_to(
+            session,
+            Command::KvStreamConsumers {
+                epoch,
+                key: key.clone(),
+                group: group.clone(),
+            },
+        );
+        self.service.send_to(
+            session,
+            Command::KvStreamPending {
+                epoch,
+                key,
+                group,
+                count: STREAM_PENDING_COUNT,
+            },
+        );
+        cx.notify();
+    }
+
+    pub(crate) fn on_kv_stream_consumers_ready(
+        &mut self,
+        session: Option<SessionId>,
+        key: String,
+        group: String,
+        consumers: Vec<StreamConsumer>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(inspector) = self.kv_inspector_for(session) else {
+            return;
+        };
+        // Drop a reply for a key/group the inspector has since moved off.
+        if inspector.key != key || inspector.stream_groups.selected.as_deref() != Some(&group) {
+            return;
+        }
+        inspector.stream_groups.consumers = consumers;
+        inspector.stream_groups.detail_loading = false;
+        cx.notify();
+    }
+
+    pub(crate) fn on_kv_stream_pending_ready(
+        &mut self,
+        session: Option<SessionId>,
+        key: String,
+        group: String,
+        pending: Vec<PendingEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(inspector) = self.kv_inspector_for(session) else {
+            return;
+        };
+        if inspector.key != key || inspector.stream_groups.selected.as_deref() != Some(&group) {
+            return;
+        }
+        inspector.stream_groups.pending = pending;
+        inspector.stream_groups.detail_loading = false;
+        cx.notify();
+    }
+
+    /// Acknowledge one pending entry (`XACK`), dropping it from the group's PEL.
+    pub(crate) fn kv_stream_ack(&mut self, session: SessionId, id: String, cx: &mut Context<Self>) {
+        self.kv_send_stream_action(session, KvStreamActionReq::Ack { ids: vec![id] }, cx);
+    }
+
+    /// Open the inline "claim to consumer" form for one pending entry.
+    pub(crate) fn kv_start_claim(
+        &mut self,
+        session: SessionId,
+        id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(inspector) = self.kv_inspector_mut(session) else {
+            return;
+        };
+        inspector
+            .stream_groups
+            .claim_editor
+            .update(cx, |ti, cx| ti.set_content(String::new(), cx));
+        inspector.stream_groups.claiming = Some(id);
+        cx.notify();
+    }
+
+    pub(crate) fn kv_cancel_claim(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(inspector) = self.kv_inspector_mut(session) else {
+            return;
+        };
+        inspector.stream_groups.claiming = None;
+        cx.notify();
+    }
+
+    /// Submit the open claim form: reassign the pending entry to the typed
+    /// consumer (`XCLAIM`, `min-idle 0` since the operator is deliberately
+    /// reclaiming it now). A blank consumer name is a no-op.
+    pub(crate) fn kv_submit_claim(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(inspector) = self.kv_inspector_mut(session) else {
+            return;
+        };
+        let Some(id) = inspector.stream_groups.claiming.clone() else {
+            return;
+        };
+        let consumer = inspector
+            .stream_groups
+            .claim_editor
+            .read(cx)
+            .content()
+            .trim()
+            .to_string();
+        if consumer.is_empty() {
+            return;
+        }
+        inspector.stream_groups.claiming = None;
+        self.kv_send_stream_action(
+            session,
+            KvStreamActionReq::Claim {
+                consumer,
+                min_idle_ms: 0,
+                ids: vec![id],
+            },
+            cx,
+        );
+    }
+
+    /// Shared send path for `XACK`/`XCLAIM`: needs the selected group, which
+    /// both actions target.
+    fn kv_send_stream_action(
+        &mut self,
+        session: SessionId,
+        action: KvStreamActionReq,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.conn_mut(Some(session)) else {
+            return;
+        };
+        let Some(browse) = &mut active.kv_browse else {
+            return;
+        };
+        let epoch = browse.epoch;
+        let Some(inspector) = &mut browse.inspector else {
+            return;
+        };
+        let Some(group) = inspector.stream_groups.selected.clone() else {
+            return;
+        };
+        let key = inspector.key.clone();
+        self.service.send_to(
+            session,
+            Command::KvStreamAction {
+                epoch,
+                key,
+                group,
+                action,
+            },
+        );
+        cx.notify();
+    }
+
+    pub(crate) fn on_kv_stream_action_done(
+        &mut self,
+        session: Option<SessionId>,
+        key: String,
+        group: String,
+        action: StreamAction,
+        count: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let verb = match action {
+            StreamAction::Ack => "Acknowledged",
+            StreamAction::Claim => "Claimed",
+        };
+        let plural = if count == 1 { "entry" } else { "entries" };
+        self.notify(
+            ToastVariant::Success,
+            format!("{verb} {count} pending {plural} in \"{group}\""),
+            cx,
+        );
+        let Some(session) = session else { return };
+        // Refresh the affected group's detail and the group list (pending /
+        // consumer counts just changed), matching the current inspector.
+        let matches = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_browse.as_ref())
+            .and_then(|b| b.inspector.as_ref())
+            .is_some_and(|i| i.key == key && i.stream_groups.selected.as_deref() == Some(&group));
+        if matches {
+            self.kv_select_stream_group(session, group, cx);
+            self.kv_load_stream_groups(session, cx);
+        }
+    }
+
+    /// The current inspector for `session` if the browse is live, borrowed
+    /// mutably — the shared preamble every group handler needs.
+    fn kv_inspector_mut(&mut self, session: SessionId) -> Option<&mut KvInspector> {
+        self.conn_mut(Some(session))?
+            .kv_browse
+            .as_mut()?
+            .inspector
+            .as_mut()
+    }
+
+    /// Like [`kv_inspector_mut`](Self::kv_inspector_mut) but resolving the
+    /// session `Option` an event carries (events are delivered with the
+    /// originating `SessionId`, or `None` for the foreground).
+    fn kv_inspector_for(&mut self, session: Option<SessionId>) -> Option<&mut KvInspector> {
+        self.conn_mut(session)?
+            .kv_browse
+            .as_mut()?
+            .inspector
+            .as_mut()
     }
 }
 
@@ -2123,10 +2499,7 @@ impl AppState {
                     )
                 })
                 .into_any_element(),
-            KvValue::Stream(KvCollection::Loaded(entries)) => render_loaded_stream(entries, theme),
-            KvValue::Stream(KvCollection::Large { len }) => {
-                self.render_kv_stream_grid(session, *len, inspector, theme, cx)
-            }
+            KvValue::Stream(_) => self.render_kv_stream(session, inspector, writable, theme, cx),
             KvValue::Unsupported(kind) => div()
                 .flex_1()
                 .flex()
@@ -2340,6 +2713,423 @@ impl AppState {
             .into_any_element()
     }
 
+    /// The stream inspector body: a segmented `Entries | Groups` toggle over
+    /// either the entries view (loaded list or paged sub-grid) or the
+    /// consumer-group management panel (see docs/plans/redis.md's "stream
+    /// consumer-group management" gap).
+    fn render_kv_stream(
+        &self,
+        session: SessionId,
+        inspector: &KvInspector,
+        writable: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let view = inspector.stream_groups.view;
+        let tab = |label: &'static str, this_view: StreamView| {
+            let active = view == this_view;
+            let tab_view = cx.entity().downgrade();
+            div()
+                .id(label)
+                .px_2()
+                .py_0p5()
+                .cursor_pointer()
+                .text_size(theme.scale(11.))
+                .text_color(if active { theme.text } else { theme.text_muted })
+                .border_b_2()
+                .border_color(if active {
+                    theme.accent
+                } else {
+                    theme.border.opacity(0.)
+                })
+                .child(label)
+                .on_click(move |_, _, cx| {
+                    tab_view
+                        .update(cx, |this, cx| {
+                            this.kv_set_stream_view(session, this_view, cx)
+                        })
+                        .ok();
+                })
+        };
+
+        let toggle = div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(tab("Entries", StreamView::Entries))
+            .child(tab("Groups", StreamView::Groups));
+
+        let body = match view {
+            StreamView::Entries => match &inspector.value {
+                Some(KvValue::Stream(KvCollection::Loaded(entries))) => {
+                    render_loaded_stream(entries, theme)
+                }
+                Some(KvValue::Stream(KvCollection::Large { len })) => {
+                    self.render_kv_stream_grid(session, *len, inspector, theme, cx)
+                }
+                _ => div().flex_1().into_any_element(),
+            },
+            StreamView::Groups => {
+                self.render_kv_stream_groups(session, inspector, writable, theme, cx)
+            }
+        };
+
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(toggle)
+            .child(body)
+            .into_any_element()
+    }
+
+    /// The consumer-group management panel: the stream's groups, and the
+    /// selected group's consumers + pending entries with per-entry
+    /// `XACK`/`XCLAIM` actions when the connection is writable.
+    fn render_kv_stream_groups(
+        &self,
+        session: SessionId,
+        inspector: &KvInspector,
+        writable: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let st = &inspector.stream_groups;
+        let dim = theme.text_muted;
+        let text_size = theme.scale(11.);
+
+        let note = |msg: &str| {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_2()
+                .text_size(text_size)
+                .text_color(dim)
+                .child(msg.to_string())
+                .into_any_element()
+        };
+
+        if st.groups.is_empty() {
+            return if st.loading || !st.loaded {
+                note("Loading groups…")
+            } else {
+                note("No consumer groups on this stream.")
+            };
+        }
+
+        // The groups list: one clickable row each, the selected one tinted.
+        let group_rows: Vec<_> = st
+            .groups
+            .iter()
+            .map(|g| {
+                let selected = st.selected.as_deref() == Some(&g.name);
+                let select_view = cx.entity().downgrade();
+                let name = g.name.clone();
+                let lag = g.lag.map(|l| format!(" · lag {l}")).unwrap_or_default();
+                div()
+                    .id(SharedString::from(format!("kv-group-{}", g.name)))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .cursor_pointer()
+                    .when(selected, |d| d.bg(theme.accent.opacity(0.12)))
+                    .hover(|d| d.bg(theme.bg_hover))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(text_size)
+                            .text_color(if selected {
+                                theme.text
+                            } else {
+                                theme.text_muted
+                            })
+                            .child(g.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(theme.scale(10.))
+                            .text_color(dim)
+                            .child(format!("{}c · {}p{lag}", g.consumers, g.pending)),
+                    )
+                    .on_click(move |_, _, cx| {
+                        select_view
+                            .update(cx, |this, cx| {
+                                this.kv_select_stream_group(session, name.clone(), cx)
+                            })
+                            .ok();
+                    })
+                    .into_any_element()
+            })
+            .collect();
+
+        let groups_list = div()
+            .id("kv-groups-list")
+            .flex_shrink_0()
+            .max_h(px(120.))
+            .overflow_y_scroll()
+            .border_b_1()
+            .border_color(theme.border)
+            .children(group_rows);
+
+        let detail = st
+            .selected
+            .as_ref()
+            .map(|_| self.render_kv_group_detail(session, inspector, writable, theme, cx));
+
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(groups_list)
+            .children(detail)
+            .into_any_element()
+    }
+
+    /// The selected group's detail: its consumers, then its pending entries,
+    /// each with `Ack`/`Claim` affordances when writable.
+    fn render_kv_group_detail(
+        &self,
+        session: SessionId,
+        inspector: &KvInspector,
+        writable: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let st = &inspector.stream_groups;
+        let dim = theme.text_muted;
+        let text_size = theme.scale(11.);
+        let section_label = |s: &str| {
+            div()
+                .flex_shrink_0()
+                .px_2()
+                .py_0p5()
+                .text_size(theme.scale(9.5))
+                .text_color(dim)
+                .child(s.to_string().to_uppercase())
+        };
+
+        // Consumers.
+        let consumer_rows: Vec<_> = st
+            .consumers
+            .iter()
+            .map(|c| {
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_2()
+                    .py_0p5()
+                    .text_size(text_size)
+                    .child(div().min_w_0().truncate().child(c.name.clone()))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(theme.scale(10.))
+                            .text_color(dim)
+                            .child(format!("{}p · idle {}", c.pending, fmt_idle(c.idle))),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        let consumers_empty = st.consumers.is_empty();
+
+        // Pending entries.
+        let pending_rows: Vec<_> = st
+            .pending
+            .iter()
+            .map(|p| self.render_pending_row(session, inspector, p, writable, theme, cx))
+            .collect();
+        let pending_empty = st.pending.is_empty();
+        let pending_header = format!(
+            "Pending ({}{})",
+            st.pending.len(),
+            if st.pending.len() >= STREAM_PENDING_COUNT {
+                "+"
+            } else {
+                ""
+            }
+        );
+
+        div()
+            .id("kv-group-detail")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .child(section_label("Consumers"))
+            .when(consumers_empty, |d| {
+                d.child(
+                    div()
+                        .px_2()
+                        .py_0p5()
+                        .text_size(text_size)
+                        .text_color(dim)
+                        .child("No consumers."),
+                )
+            })
+            .children(consumer_rows)
+            .child(section_label(&pending_header))
+            .when(pending_empty && !st.detail_loading, |d| {
+                d.child(
+                    div()
+                        .px_2()
+                        .py_0p5()
+                        .text_size(text_size)
+                        .text_color(dim)
+                        .child("Nothing pending — all delivered entries are acknowledged."),
+                )
+            })
+            .children(pending_rows)
+            .into_any_element()
+    }
+
+    /// One pending entry row: id, consumer, idle, delivery-count, plus an
+    /// `Ack`/`Claim` action pair (writable only). The row expands to an inline
+    /// claim form while this entry is the one being claimed.
+    fn render_pending_row(
+        &self,
+        session: SessionId,
+        inspector: &KvInspector,
+        entry: &PendingEntry,
+        writable: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let dim = theme.text_muted;
+        let text_size = theme.scale(11.);
+        let claiming = inspector.stream_groups.claiming.as_deref() == Some(&entry.id);
+
+        let meta = div().flex().items_center().justify_between().gap_2().child(
+            div()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(theme.mono_family.clone())
+                        .text_size(theme.scale(10.5))
+                        .child(entry.id.clone()),
+                )
+                .child(
+                    div()
+                        .text_size(theme.scale(9.5))
+                        .text_color(dim)
+                        .child(format!(
+                            "{} · idle {} · delivered {}×",
+                            entry.consumer,
+                            fmt_idle(entry.idle),
+                            entry.delivery_count
+                        )),
+                ),
+        );
+
+        let actions = writable.then(|| {
+            let id_ack = entry.id.clone();
+            let ack_view = cx.entity().downgrade();
+            let id_claim = entry.id.clone();
+            let claim_view = cx.entity().downgrade();
+            div()
+                .flex_shrink_0()
+                .flex()
+                .gap_1()
+                .child(
+                    Button::new(SharedString::from(format!("kv-ack-{}", entry.id)), "Ack")
+                        .size(ButtonSize::Sm)
+                        .on_click(move |_, _, cx| {
+                            ack_view
+                                .update(cx, |this, cx| {
+                                    this.kv_stream_ack(session, id_ack.clone(), cx)
+                                })
+                                .ok();
+                        }),
+                )
+                .child(
+                    Button::new(
+                        SharedString::from(format!("kv-claim-{}", entry.id)),
+                        "Claim",
+                    )
+                    .size(ButtonSize::Sm)
+                    .on_click(move |_, _, cx| {
+                        claim_view
+                            .update(cx, |this, cx| {
+                                this.kv_start_claim(session, id_claim.clone(), cx)
+                            })
+                            .ok();
+                    }),
+                )
+        });
+
+        let claim_form = claiming.then(|| {
+            let (submit_view, cancel_view) = (cx.entity().downgrade(), cx.entity().downgrade());
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .pt_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(inspector.stream_groups.claim_editor.clone()),
+                )
+                .child(
+                    Button::new("kv-claim-submit", "Claim")
+                        .size(ButtonSize::Sm)
+                        .on_click(move |_, _, cx| {
+                            submit_view
+                                .update(cx, |this, cx| this.kv_submit_claim(session, cx))
+                                .ok();
+                        }),
+                )
+                .child(
+                    Button::new("kv-claim-cancel", "Cancel")
+                        .size(ButtonSize::Sm)
+                        .on_click(move |_, _, cx| {
+                            cancel_view
+                                .update(cx, |this, cx| this.kv_cancel_claim(session, cx))
+                                .ok();
+                        }),
+                )
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border.opacity(0.5))
+            .text_size(text_size)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(meta)
+                    .children(actions),
+            )
+            .children(claim_form)
+            .into_any_element()
+    }
+
     /// The big-stream sub-grid: newest-first entries in a virtualized `Table`
     /// (ID + fields), paging older on scroll via `kv_load_stream_page`. Mirrors
     /// `render_kv_collection_grid`, but keyed off `stream_rows` and continuing
@@ -2410,6 +3200,24 @@ impl AppState {
             )
             .child(div().flex_1().min_h(px(0.)).child(table))
             .into_any_element()
+    }
+}
+
+/// A compact human idle-time for the consumer-group view (`XINFO`/`XPENDING`
+/// idle is in ms): `"820ms"`, `"3.4s"`, `"5m"`, `"2h"`, `"1d"`. Coarse on
+/// purpose — the operator wants "how stuck is this", not millisecond precision.
+fn fmt_idle(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else if ms < 3_600_000 {
+        format!("{}m", ms / 60_000)
+    } else if ms < 86_400_000 {
+        format!("{}h", ms / 3_600_000)
+    } else {
+        format!("{}d", ms / 86_400_000)
     }
 }
 

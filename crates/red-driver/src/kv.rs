@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use futures_util::Stream;
 use red_core::kv::{
     CollectionKind, KeyMeta, KvCollectionPage, KvMessage, KvScanPage, KvStreamPage, KvValue,
-    RespValue, ScanBudget, ScanCursor,
+    PendingEntry, RespValue, ScanBudget, ScanCursor, StreamConsumer, StreamGroup,
 };
 use red_core::Result;
 
@@ -129,6 +129,46 @@ pub trait KvDriver: Send + Sync {
         before: Option<&str>,
         count: usize,
     ) -> Result<KvStreamPage>;
+
+    /// A stream's consumer groups (`XINFO GROUPS <key>`), for the inspector's
+    /// consumer-group management view (see docs/plans/redis.md's "stream
+    /// consumer-group management" gap). An empty vec means the stream has no
+    /// groups yet; an error is only a transport/`WRONGTYPE` failure.
+    async fn stream_groups(&self, key: &str) -> Result<Vec<StreamGroup>>;
+
+    /// The consumers registered in one group (`XINFO CONSUMERS <key>
+    /// <group>`), each with its own pending count and idle time.
+    async fn stream_consumers(&self, key: &str, group: &str) -> Result<Vec<StreamConsumer>>;
+
+    /// Up to `count` of a group's pending (delivered-but-unacked) entries, the
+    /// extended `XPENDING <key> <group> - + <count>` form (id, consumer, idle,
+    /// delivery-count per entry). Newest-position order as Redis returns it.
+    async fn stream_pending(
+        &self,
+        key: &str,
+        group: &str,
+        count: usize,
+    ) -> Result<Vec<PendingEntry>>;
+
+    /// Acknowledge pending entries (`XACK <key> <group> <id...>`), dropping
+    /// them from the group's PEL. Returns the number actually acked. Refused
+    /// on a read-only connection.
+    async fn stream_ack(&self, key: &str, group: &str, ids: &[String]) -> Result<u64>;
+
+    /// Reassign pending entries to `consumer` (`XCLAIM <key> <group>
+    /// <consumer> <min_idle_ms> <id...> JUSTID`), the reclaim-stuck-messages
+    /// operation. `min_idle_ms` guards against stealing an entry another
+    /// consumer just picked up (only entries idle at least this long are
+    /// claimed). Returns the number of entries actually claimed. Refused on a
+    /// read-only connection.
+    async fn stream_claim(
+        &self,
+        key: &str,
+        group: &str,
+        consumer: &str,
+        min_idle: Duration,
+        ids: &[String],
+    ) -> Result<u64>;
 
     /// Run an arbitrary command (the console; see docs/plans/redis.md).
     /// `argv[0]` is the command name. Read-only enforcement and the

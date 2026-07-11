@@ -184,6 +184,90 @@ pub struct KvStreamPage {
     pub exhausted: bool,
 }
 
+/// One consumer group on a stream (`XINFO GROUPS <key>`): the read-position
+/// bookkeeping Redis keeps per group. A stream can carry several independent
+/// groups, each with its own last-delivered position, pending set, and pool of
+/// consumers — the shape the plan's "consumer-group management" gap is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamGroup {
+    pub name: String,
+    /// Number of consumers registered in the group (`consumers`).
+    pub consumers: u64,
+    /// Entries delivered-but-not-acked across the whole group (`pending`).
+    pub pending: u64,
+    /// The last entry ID the group delivered to any consumer
+    /// (`last-delivered-id`).
+    pub last_delivered_id: String,
+    /// How many entries the group is behind the tip of the stream (`lag`,
+    /// Redis 7+). `None` when the server can't compute it (an older server, or
+    /// after certain trims Redis reports lag as nil).
+    pub lag: Option<i64>,
+}
+
+/// One consumer within a group (`XINFO CONSUMERS <key> <group>`): a named
+/// reader with its own slice of the group's pending set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamConsumer {
+    pub name: String,
+    /// Entries delivered to this consumer and not yet acked (`pending`).
+    pub pending: u64,
+    /// Time since this consumer last interacted with the group (`idle`, ms).
+    pub idle: Duration,
+}
+
+/// One pending (delivered-but-unacknowledged) entry in a group's PEL, from the
+/// extended `XPENDING <key> <group> - + <count>` form: which consumer holds it,
+/// how long it's been idle, and how many times it's been delivered. A high
+/// `delivery_count` with a large `idle` is the signature of a stuck message the
+/// operator reclaims with `XCLAIM` or discards with `XACK`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingEntry {
+    pub id: String,
+    pub consumer: String,
+    /// Milliseconds since the entry was last delivered (`idle`).
+    pub idle: Duration,
+    /// How many times the entry has been delivered (`delivery-count`).
+    pub delivery_count: u64,
+}
+
+/// Which consumer-group write just completed, echoed on
+/// [`crate::kv`]'s stream-action reply so the UI knows what it applied (and
+/// can word its toast/refresh accordingly) without a reply type per verb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamAction {
+    /// `XACK`: the entries were acknowledged and dropped from the PEL.
+    Ack,
+    /// `XCLAIM`: the entries were reassigned to another consumer.
+    Claim,
+}
+
+/// A consumer-group write to apply to a group's pending set, carried through
+/// `Command::KvStreamAction`. Mirrors [`KvEdit`]'s "one enum per family of
+/// writes" shape, kept separate because these are stream/group-scoped (they
+/// carry a group name and entry IDs, not a bare key) and gated on the same
+/// read-only check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KvStreamActionReq {
+    /// `XACK <key> <group> <ids...>`.
+    Ack { ids: Vec<String> },
+    /// `XCLAIM <key> <group> <consumer> <min_idle_ms> <ids...> JUSTID`.
+    Claim {
+        consumer: String,
+        min_idle_ms: u64,
+        ids: Vec<String>,
+    },
+}
+
+impl KvStreamActionReq {
+    /// Which verb this is, for the reply the UI pattern-matches on.
+    pub fn action(&self) -> StreamAction {
+        match self {
+            KvStreamActionReq::Ack { .. } => StreamAction::Ack,
+            KvStreamActionReq::Claim { .. } => StreamAction::Claim,
+        }
+    }
+}
+
 /// A collection value below vs. at/above the small-collection threshold (see
 /// docs/plans/redis.md's "big collections inside a single key"): `Loaded`
 /// carries every element, fetched once in `read_value`; `Large` carries only

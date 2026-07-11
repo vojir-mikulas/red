@@ -107,6 +107,15 @@ pub(crate) struct InFlight {
     /// big-collection sub-grid, supersedes whatever the inspector was
     /// fetching before.
     pub(crate) kv_value: Option<AbortSignal>,
+    /// The latest `KvStreamConsumers` fetch for this epoch (the inspector's
+    /// consumer-group view). Separate from `kv_value` so selecting a group
+    /// doesn't cancel the key's value read, and separate from
+    /// `kv_group_pending` so the paired consumers+pending fetches for one
+    /// group don't cancel each other.
+    pub(crate) kv_group_detail: Option<AbortSignal>,
+    /// The latest `KvStreamPending` fetch for this epoch (the inspector's
+    /// consumer-group pending list). See `kv_group_detail`.
+    pub(crate) kv_group_pending: Option<AbortSignal>,
     /// A live `KvSubscribe` for this epoch (Redis Pub/Sub monitor). Unlike
     /// every other slot here, this one is long-lived by design (it stays
     /// armed for as long as the subscription panel is open) rather than
@@ -126,6 +135,8 @@ impl InFlight {
             self.lookup.as_ref(),
             self.kv_scan.as_ref(),
             self.kv_value.as_ref(),
+            self.kv_group_detail.as_ref(),
+            self.kv_group_pending.as_ref(),
             self.kv_subscribe.as_ref(),
         ]
         .into_iter()
