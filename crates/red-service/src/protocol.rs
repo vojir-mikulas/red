@@ -285,6 +285,20 @@ pub enum Command {
         epoch: u64,
         pattern: String,
     },
+    /// Read the server's `notify-keyspace-events` setting, for the keyspace-
+    /// notification watcher (see docs/plans/redis.md's "keyspace-notification
+    /// live tooling" gap). Replied with `KvNotifyConfigReady`.
+    KvNotifyConfig {
+        epoch: u64,
+    },
+    /// Set `notify-keyspace-events` (enable/disable keyspace notifications),
+    /// gated by `read_only` (checked service-side, defense in depth alongside
+    /// the driver). On success the service re-reads and replies with a fresh
+    /// `KvNotifyConfigReady`.
+    KvSetNotifyConfig {
+        epoch: u64,
+        flags: String,
+    },
     /// Fetch the server's slow-command log (see docs/plans/redis.md's "slowlog
     /// viewer" gap). `epoch` scopes cancellation; replied with `KvSlowlogReady`.
     KvSlowlog {
@@ -772,6 +786,13 @@ pub enum Event {
         epoch: u64,
         channel: String,
         payload: String,
+    },
+    /// The `notify-keyspace-events` setting, in response to `KvNotifyConfig`
+    /// (or a `KvSetNotifyConfig` that then re-read it). Empty `value` means
+    /// keyspace notifications are disabled.
+    KvNotifyConfigReady {
+        epoch: u64,
+        value: String,
     },
     /// The slow-command log, in response to `KvSlowlog` (or an empty list in
     /// response to a successful `KvSlowlogReset`). Newest entry first.

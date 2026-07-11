@@ -84,15 +84,21 @@ impl AppState {
         payload: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(active) = self.conn_mut(session) else {
-            return;
+        let is_pubsub = {
+            let Some(browse) = self.conn_mut(session).and_then(|a| a.kv_browse.as_mut()) else {
+                return;
+            };
+            browse.pubsub.epoch == epoch && browse.pubsub.subscribed.is_some()
         };
-        let Some(browse) = &mut active.kv_browse else {
+        // The keyspace watcher rides the same `KvMessage` path on its own epoch;
+        // route there when this isn't a Pub/Sub-monitor message.
+        if !is_pubsub {
+            self.on_kv_keyspace_message(session, epoch, channel, payload, cx);
             return;
-        };
-        if browse.pubsub.epoch != epoch || browse.pubsub.subscribed.is_none() {
-            return; // superseded or already unsubscribed
         }
+        let Some(browse) = self.conn_mut(session).and_then(|a| a.kv_browse.as_mut()) else {
+            return;
+        };
         browse.pubsub.messages.push(KvMessage { channel, payload });
         if browse.pubsub.messages.len() > MAX_MESSAGES {
             let drop = browse.pubsub.messages.len() - MAX_MESSAGES;

@@ -1045,6 +1045,32 @@ impl KvDriver for RedisDriver {
         })
     }
 
+    async fn notify_config(&self) -> Result<String> {
+        let mut conn = self.conn.clone();
+        // `CONFIG GET notify-keyspace-events` replies as `[name, value]`; the
+        // value may be empty (notifications off). Decode as a flat vec so a
+        // missing value degrades to "off" rather than erroring.
+        let pair: Vec<String> = redis::cmd("CONFIG")
+            .arg("GET")
+            .arg("notify-keyspace-events")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        Ok(pair.into_iter().nth(1).unwrap_or_default())
+    }
+
+    async fn set_notify_config(&self, flags: &str) -> Result<()> {
+        self.check_writable()?;
+        let mut conn = self.conn.clone();
+        redis::cmd("CONFIG")
+            .arg("SET")
+            .arg("notify-keyspace-events")
+            .arg(flags)
+            .query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
     async fn subscribe(&self, pattern: &str) -> Result<KvSubscription> {
         let mut pubsub = self
             .client
@@ -2478,6 +2504,69 @@ mod tests {
         assert!(driver.slowlog_reset().await.is_err());
         // Reading the log is still allowed read-only.
         driver.slowlog(16).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn keyspace_notifications_config_and_delivery() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        // Remember the original setting, enable all notifications, and confirm
+        // the getter reads it back.
+        let prev = driver.notify_config().await.unwrap();
+        driver.set_notify_config("KEA").await.unwrap();
+        assert!(!driver.notify_config().await.unwrap().is_empty());
+
+        // Subscribe to the keyevent firehose, then trigger an event and confirm
+        // it arrives and decodes.
+        let key = tag("keyspace");
+        let mut sub = driver
+            .subscribe(red_core::kv::KeyspaceScope::ByEvent.pattern())
+            .await
+            .unwrap();
+        let mut conn = driver.conn.clone();
+        let _: () = redis::cmd("SET")
+            .arg(&key)
+            .arg("v")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let got = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match sub.stream.next().await {
+                    Some(m) => {
+                        if let Some(ev) =
+                            red_core::kv::parse_keyspace_channel(&m.channel, &m.payload)
+                        {
+                            if ev.key == key {
+                                break Some(ev);
+                            }
+                        }
+                    }
+                    None => break None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+
+        // Restore the original config before asserting, so a failure doesn't
+        // leave the shared test server reconfigured.
+        driver.set_notify_config(&prev).await.unwrap();
+
+        let ev = got.expect("a keyspace notification for our SET");
+        assert_eq!(ev.event, "set");
+        assert_eq!(ev.key, key);
+    }
+
+    #[tokio::test]
+    async fn set_notify_config_refused_on_a_read_only_connection() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, true).await.unwrap();
+        assert!(driver.set_notify_config("KEA").await.is_err());
+        // Reading the config is still allowed read-only.
+        driver.notify_config().await.unwrap();
     }
 
     #[tokio::test]

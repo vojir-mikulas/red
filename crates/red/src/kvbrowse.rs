@@ -89,6 +89,7 @@ pub(crate) enum KvPanel {
     PubSub,
     Monitor,
     Analysis,
+    Keyspace,
 }
 
 /// A `redis-cli --bigkeys`-style sample (see docs/plans/redis.md's "beyond
@@ -190,6 +191,7 @@ pub(crate) struct RedisBrowse {
     pub(crate) console: crate::kvconsole::KvConsole,
     pub(crate) pubsub: crate::kvpubsub::KvPubSub,
     pub(crate) monitor: crate::kvmonitor::KvMonitor,
+    pub(crate) keyspace: crate::kvkeyspace::KvKeyspace,
     /// `Some` while a "find biggest keys" sample is running or showing its
     /// last result; `None` is the normal live-browse state.
     pub(crate) big_keys: Option<BigKeysState>,
@@ -337,6 +339,7 @@ impl RedisBrowse {
             console: crate::kvconsole::KvConsole::new(session, cx),
             pubsub: crate::kvpubsub::KvPubSub::new(cx),
             monitor: crate::kvmonitor::KvMonitor::new(),
+            keyspace: crate::kvkeyspace::KvKeyspace::new(),
             big_keys: None,
             analysis: AnalysisState {
                 epoch: crate::result::next_kv_epoch(),
@@ -873,11 +876,16 @@ impl AppState {
             && !browse.monitor.slowlog_loaded;
         // Opening the Analysis panel restores the connection's saved report.
         let load_analysis = panel == KvPanel::Analysis && !browse.analysis.loaded;
+        // Opening the Keyspace panel reads the notify-keyspace-events setting.
+        let load_keyspace = panel == KvPanel::Keyspace && !browse.keyspace.config_loaded;
         if load_slowlog {
             self.kv_load_slowlog(session, cx);
         }
         if load_analysis {
             self.kv_load_saved_analysis(session, cx);
+        }
+        if load_keyspace {
+            self.kv_keyspace_load_config(session, cx);
         }
         cx.notify();
     }

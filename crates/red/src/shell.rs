@@ -587,6 +587,7 @@ impl AppState {
                     (crate::kvbrowse::KvPanel::PubSub, "Pub/Sub"),
                     (crate::kvbrowse::KvPanel::Monitor, "Monitor"),
                     (crate::kvbrowse::KvPanel::Analysis, "Analysis"),
+                    (crate::kvbrowse::KvPanel::Keyspace, "Keyspace"),
                 ]
                 .into_iter()
                 .map(|(kind, label)| {
@@ -629,6 +630,9 @@ impl AppState {
                 .into_any_element(),
             crate::kvbrowse::KvPanel::Analysis => self
                 .render_kv_analysis(active, window, cx)
+                .into_any_element(),
+            crate::kvbrowse::KvPanel::Keyspace => self
+                .render_kv_keyspace(active, window, cx)
                 .into_any_element(),
         };
         let body = div()

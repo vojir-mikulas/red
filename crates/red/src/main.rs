@@ -27,6 +27,7 @@ mod keymap;
 mod keymap_config;
 mod kvbrowse;
 mod kvconsole;
+mod kvkeyspace;
 mod kvmonitor;
 mod kvpubsub;
 mod local_state;

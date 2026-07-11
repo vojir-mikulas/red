@@ -1800,6 +1800,78 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 });
             }
 
+            Command::KvNotifyConfig { epoch } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                let entry = state.inflight.entry(epoch).or_default();
+                if let Some(prev) = entry.kv_value.take() {
+                    prev.abort();
+                }
+                entry.kv_value = Some(AbortSignal::new());
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver.notify_config().await {
+                        Ok(value) => emit(
+                            &events,
+                            session_id,
+                            Event::KvNotifyConfigReady { epoch, value },
+                        ),
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                    }
+                });
+            }
+
+            Command::KvSetNotifyConfig { epoch, flags } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                if state.read_only {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("this connection is read-only".into()),
+                    );
+                    continue;
+                }
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    // Set, then re-read so the watcher reflects the actual stored
+                    // value (Redis canonicalizes the flag string) in one reply.
+                    match driver.set_notify_config(&flags).await {
+                        Ok(()) => match driver.notify_config().await {
+                            Ok(value) => emit(
+                                &events,
+                                session_id,
+                                Event::KvNotifyConfigReady { epoch, value },
+                            ),
+                            Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                        },
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                    }
+                });
+            }
+
             Command::KvSlowlog { epoch, count } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get_mut(&id) else {

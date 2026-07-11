@@ -598,6 +598,69 @@ pub struct KvMessage {
     pub payload: String,
 }
 
+/// One decoded keyspace notification (see docs/plans/redis.md's "keyspace-
+/// notification live tooling" gap): a key and the event that happened to it, in
+/// which logical database. Redis delivers these over Pub/Sub on two mirror
+/// channel families — `__keyspace@<db>__:<key>` (payload is the event) and
+/// `__keyevent@<db>__:<event>` (payload is the key) — both of which decode to
+/// this same shape via [`parse_keyspace_channel`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyspaceEvent {
+    pub db: i64,
+    /// The event name (`set`, `del`, `expired`, `lpush`, …).
+    pub event: String,
+    /// The key the event happened to.
+    pub key: String,
+}
+
+/// Decode a keyspace-notification Pub/Sub message into a [`KeyspaceEvent`],
+/// handling both channel families (see [`KeyspaceEvent`]). Returns `None` for a
+/// channel that isn't a keyspace notification (so an ordinary Pub/Sub message
+/// on an unrelated channel is ignored rather than mis-parsed).
+pub fn parse_keyspace_channel(channel: &str, payload: &str) -> Option<KeyspaceEvent> {
+    let (is_keyspace, rest) = if let Some(r) = channel.strip_prefix("__keyspace@") {
+        (true, r)
+    } else if let Some(r) = channel.strip_prefix("__keyevent@") {
+        (false, r)
+    } else {
+        return None;
+    };
+    // `rest` is `<db>__:<suffix>`: the db index, then the key (keyspace) or the
+    // event name (keyevent).
+    let (db_str, suffix) = rest.split_once("__:")?;
+    let db = db_str.parse::<i64>().ok()?;
+    let (event, key) = if is_keyspace {
+        // `__keyspace@0__:mykey` → key is the suffix, event is the payload.
+        (payload.to_string(), suffix.to_string())
+    } else {
+        // `__keyevent@0__:expired` → event is the suffix, key is the payload.
+        (suffix.to_string(), payload.to_string())
+    };
+    Some(KeyspaceEvent { db, event, key })
+}
+
+/// The two keyspace-notification channel families a watcher can subscribe to
+/// (see [`KeyspaceEvent`]). Only one is subscribed at a time — every real
+/// operation fires on *both*, so watching both would double every event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyspaceScope {
+    /// `__keyevent@*__:*` — grouped by event; the classic "what's happening"
+    /// firehose (payload is the affected key).
+    ByEvent,
+    /// `__keyspace@*__:*` — grouped by key (payload is the event name).
+    ByKey,
+}
+
+impl KeyspaceScope {
+    /// The `PSUBSCRIBE` glob for this scope, across all logical databases.
+    pub fn pattern(self) -> &'static str {
+        match self {
+            KeyspaceScope::ByEvent => "__keyevent@*__:*",
+            KeyspaceScope::ByKey => "__keyspace@*__:*",
+        }
+    }
+}
+
 /// A persisted, point-in-time keyspace analysis report (see docs/plans/redis.md's
 /// "persistent database analysis report" gap): a type/namespace/expiry rollup
 /// over a sample of the keyspace. Distinct from the ephemeral biggest-keys
@@ -869,6 +932,38 @@ mod tests {
         assert_eq!(clients[1].cmd, "client|list");
         // A line with no id is dropped.
         assert!(parse_client_line("addr=1.2.3.4:5 flags=N").is_none());
+    }
+
+    #[test]
+    fn parse_keyspace_channel_decodes_both_families() {
+        // keyevent: channel suffix is the event, payload is the key.
+        assert_eq!(
+            parse_keyspace_channel("__keyevent@0__:expired", "session:abc"),
+            Some(KeyspaceEvent {
+                db: 0,
+                event: "expired".into(),
+                key: "session:abc".into(),
+            })
+        );
+        // keyspace: channel suffix is the key, payload is the event.
+        assert_eq!(
+            parse_keyspace_channel("__keyspace@3__:user:1", "hset"),
+            Some(KeyspaceEvent {
+                db: 3,
+                event: "hset".into(),
+                key: "user:1".into(),
+            })
+        );
+        // A key containing a colon survives (only the first `__:` splits).
+        assert_eq!(
+            parse_keyspace_channel("__keyspace@0__:a:b:c", "del")
+                .unwrap()
+                .key,
+            "a:b:c"
+        );
+        // An unrelated Pub/Sub channel is not a keyspace notification.
+        assert_eq!(parse_keyspace_channel("news.tech", "hello"), None);
+        assert_eq!(KeyspaceScope::ByEvent.pattern(), "__keyevent@*__:*");
     }
 
     fn meta(key: &str, ty: KvType, ttl: Option<Duration>, bytes: u64) -> KeyMeta {

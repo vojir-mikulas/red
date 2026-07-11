@@ -2431,6 +2431,9 @@ impl AppState {
             Event::KvClientListReady { epoch, clients } => {
                 self.on_kv_client_list_ready(session, epoch, clients, cx);
             }
+            Event::KvNotifyConfigReady { epoch, value } => {
+                self.on_kv_notify_config_ready(session, epoch, value, cx);
+            }
 
             // --- result grid ---
             Event::ResultReady {

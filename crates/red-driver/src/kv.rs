@@ -233,6 +233,17 @@ pub trait KvDriver: Send + Sync {
     /// seed node only.
     async fn monitor(&self) -> Result<KvMonitorStream>;
 
+    /// The server's `notify-keyspace-events` setting (`CONFIG GET`), for the
+    /// keyspace-notification watcher (see docs/plans/redis.md's "keyspace-
+    /// notification live tooling" gap). Empty string means notifications are
+    /// off — nothing will be delivered until it's enabled.
+    async fn notify_config(&self) -> Result<String>;
+
+    /// Set `notify-keyspace-events` (`CONFIG SET`), to turn keyspace
+    /// notifications on/off. A server-config write, so it's refused on a
+    /// read-only connection.
+    async fn set_notify_config(&self, flags: &str) -> Result<()>;
+
     /// A live Pub/Sub pattern subscription (`PSUBSCRIBE`). The caller owns
     /// when to stop reading the stream; there's no explicit unsubscribe
     /// call, dropping the returned `KvSubscription` (and its underlying
