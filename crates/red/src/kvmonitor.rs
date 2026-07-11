@@ -1,19 +1,20 @@
-//! The Redis diagnostics panel (see docs/plans/redis.md's "slowlog viewer +
-//! MONITOR-based live command profiler" gap). Two related-but-distinct views
-//! behind one panel:
+//! The Redis diagnostics panel (see docs/plans/redis.md). Three
+//! related-but-distinct views behind one panel:
 //!
 //! - **Slow log** — a one-shot `SLOWLOG GET` of the server's recorded slow
 //!   commands (refreshable, resettable on a writable connection).
 //! - **Live (MONITOR)** — a `MONITOR` firehose of every command the server
 //!   runs, streamed in via `Event::KvMonitorLine` and capped like the Pub/Sub
 //!   monitor's message log, so a busy server can't grow it without bound.
+//! - **Clients** — a `CLIENT LIST` viewer (id/addr/name/db/age/idle/cmd), with
+//!   a per-client `CLIENT KILL` on a writable connection.
 
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Context, Window};
-use red_core::kv::SlowlogEntry;
+use gpui::{div, prelude::*, px, Context, SharedString, Window};
+use red_core::kv::{ClientInfo, SlowlogEntry};
 use red_service::{Command, SessionId};
 
 use crate::app::{ActiveConn, AppState};
@@ -32,6 +33,7 @@ pub(crate) enum MonitorView {
     #[default]
     Slowlog,
     Live,
+    Clients,
 }
 
 pub(crate) struct KvMonitor {
@@ -48,6 +50,11 @@ pub(crate) struct KvMonitor {
     /// `true` while a `MONITOR` stream is live (Start pressed, not yet Stopped).
     pub(crate) monitoring: bool,
     pub(crate) lines: Vec<String>,
+    /// The `CLIENT LIST` viewer's rows.
+    pub(crate) clients: Vec<ClientInfo>,
+    /// Set once the first `CLIENT LIST` reply lands (lazy load on first open).
+    pub(crate) clients_loaded: bool,
+    pub(crate) clients_loading: bool,
 }
 
 impl KvMonitor {
@@ -60,20 +67,23 @@ impl KvMonitor {
             slowlog_loading: false,
             monitoring: false,
             lines: Vec::new(),
+            clients: Vec::new(),
+            clients_loaded: false,
+            clients_loading: false,
         }
     }
 }
 
 impl AppState {
-    /// Switch between the Slow-log and Live views. Opening Slow-log for the
-    /// first time triggers the lazy `SLOWLOG GET`.
+    /// Switch diagnostics views. Opening Slow-log or Clients for the first time
+    /// triggers their lazy fetch (`SLOWLOG GET` / `CLIENT LIST`).
     pub(crate) fn kv_set_monitor_view(
         &mut self,
         session: SessionId,
         view: MonitorView,
         cx: &mut Context<Self>,
     ) {
-        let need_load = {
+        let load = {
             let Some(browse) = self
                 .conn_mut(Some(session))
                 .and_then(|a| a.kv_browse.as_mut())
@@ -81,11 +91,67 @@ impl AppState {
                 return;
             };
             browse.monitor.view = view;
-            view == MonitorView::Slowlog && !browse.monitor.slowlog_loaded
+            match view {
+                MonitorView::Slowlog if !browse.monitor.slowlog_loaded => Some(true),
+                MonitorView::Clients if !browse.monitor.clients_loaded => Some(false),
+                _ => None,
+            }
         };
-        if need_load {
-            self.kv_load_slowlog(session, cx);
+        match load {
+            Some(true) => self.kv_load_slowlog(session, cx),
+            Some(false) => self.kv_load_clients(session, cx),
+            None => {}
         }
+        cx.notify();
+    }
+
+    /// Fetch (or refresh) the connected-clients list (`CLIENT LIST`).
+    pub(crate) fn kv_load_clients(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_browse.as_mut())
+        else {
+            return;
+        };
+        browse.monitor.clients_loading = true;
+        let epoch = browse.monitor.epoch;
+        self.service
+            .send_to(session, Command::KvClientList { epoch });
+        cx.notify();
+    }
+
+    /// Disconnect a client by id (`CLIENT KILL ID <id>`); the refreshed list
+    /// comes back as a `KvClientListReady`.
+    pub(crate) fn kv_kill_client(&mut self, session: SessionId, id: i64, cx: &mut Context<Self>) {
+        let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_browse.as_mut())
+        else {
+            return;
+        };
+        browse.monitor.clients_loading = true;
+        let epoch = browse.monitor.epoch;
+        self.service
+            .send_to(session, Command::KvClientKill { epoch, id });
+        cx.notify();
+    }
+
+    pub(crate) fn on_kv_client_list_ready(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: u64,
+        clients: Vec<ClientInfo>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(browse) = self.conn_mut(session).and_then(|a| a.kv_browse.as_mut()) else {
+            return;
+        };
+        if browse.monitor.epoch != epoch {
+            return;
+        }
+        browse.monitor.clients = clients;
+        browse.monitor.clients_loaded = true;
+        browse.monitor.clients_loading = false;
         cx.notify();
     }
 
@@ -255,11 +321,13 @@ impl AppState {
             .border_b_1()
             .border_color(theme.border)
             .child(tab("Slow log", MonitorView::Slowlog))
-            .child(tab("Live (MONITOR)", MonitorView::Live));
+            .child(tab("Live (MONITOR)", MonitorView::Live))
+            .child(tab("Clients", MonitorView::Clients));
 
         let body = match mon.view {
             MonitorView::Slowlog => self.render_slowlog(session, mon, writable, &theme, cx),
             MonitorView::Live => self.render_live_monitor(session, mon, &theme, cx),
+            MonitorView::Clients => self.render_clients(session, mon, writable, &theme, cx),
         };
 
         div()
@@ -500,6 +568,158 @@ impl AppState {
             )
             .into_any_element()
     }
+
+    fn render_clients(
+        &self,
+        session: SessionId,
+        mon: &KvMonitor,
+        writable: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let refresh_view = cx.entity().downgrade();
+        let header = div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1p5()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(theme.scale(10.5))
+                    .text_color(theme.text_muted)
+                    .child(if mon.clients_loading {
+                        "Loading clients…".to_string()
+                    } else {
+                        format!("{} connected client(s)", mon.clients.len())
+                    }),
+            )
+            .child(
+                Button::new("kv-clients-refresh", "Refresh")
+                    .size(ButtonSize::Sm)
+                    .on_click(move |_, _, cx| {
+                        refresh_view
+                            .update(cx, |this, cx| this.kv_load_clients(session, cx))
+                            .ok();
+                    }),
+            );
+
+        let mono = theme.mono_family.clone();
+        let rows: Vec<_> = mon
+            .clients
+            .iter()
+            .map(|c| {
+                let kill_view = cx.entity().downgrade();
+                let id = c.id;
+                // `name` is often empty; show a dim placeholder so the row
+                // doesn't look truncated.
+                let name = if c.name.is_empty() {
+                    "—".to_string()
+                } else {
+                    c.name.clone()
+                };
+                let resp = if c.resp.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · RESP{}", c.resp)
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(theme.border.opacity(0.5))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .font_family(mono.clone())
+                                            .text_size(theme.scale(11.))
+                                            .child(format!("#{} {}", c.id, c.addr)),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(theme.scale(10.5))
+                                            .text_color(theme.text_muted)
+                                            .child(name),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(theme.scale(9.5))
+                                    .text_color(theme.text_muted)
+                                    .child(format!(
+                                        "db {} · age {} · idle {} · cmd {}{resp}",
+                                        c.db,
+                                        fmt_secs(c.age),
+                                        fmt_secs(c.idle),
+                                        c.cmd,
+                                    )),
+                            ),
+                    )
+                    .when(writable, |d| {
+                        d.child(
+                            Button::new(SharedString::from(format!("kv-client-kill-{id}")), "Kill")
+                                .variant(ButtonVariant::Secondary)
+                                .size(ButtonSize::Sm)
+                                .on_click(move |_, _, cx| {
+                                    kill_view
+                                        .update(cx, |this, cx| this.kv_kill_client(session, id, cx))
+                                        .ok();
+                                }),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect();
+
+        let list = if mon.clients.is_empty() && !mon.clients_loading {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_2()
+                .text_size(theme.scale(11.))
+                .text_color(theme.text_muted)
+                .child("No connected clients.")
+                .into_any_element()
+        } else {
+            div()
+                .id("kv-clients-list")
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .children(rows)
+                .into_any_element()
+        };
+
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(list)
+            .into_any_element()
+    }
 }
 
 /// Seconds since the Unix epoch on the local clock, for the slow log's
@@ -526,6 +746,20 @@ fn fmt_ago(now: i64, then: i64) -> String {
         format!("{}h ago", d / 3600)
     } else {
         format!("{}d ago", d / 86_400)
+    }
+}
+
+/// A compact human duration from whole seconds (`CLIENT LIST` age/idle):
+/// `"0s"`, `"45s"`, `"3m"`, `"2h"`, `"1d"`.
+fn fmt_secs(s: u64) -> String {
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3_600 {
+        format!("{}m", s / 60)
+    } else if s < 86_400 {
+        format!("{}h", s / 3_600)
+    } else {
+        format!("{}d", s / 86_400)
     }
 }
 

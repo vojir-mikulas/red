@@ -2428,6 +2428,9 @@ impl AppState {
             Event::KvMonitorLine { epoch, line } => {
                 self.on_kv_monitor_line(session, epoch, line, cx);
             }
+            Event::KvClientListReady { epoch, clients } => {
+                self.on_kv_client_list_ready(session, epoch, clients, cx);
+            }
 
             // --- result grid ---
             Event::ResultReady {

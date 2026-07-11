@@ -13,9 +13,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use red_core::kv::{
-    CollectionKind, KeyMeta, KvCollectionPage, KvEdit, KvScanPage, KvStreamActionReq, KvStreamPage,
-    KvValue, PendingEntry, RespValue, ScanBudget, ScanCursor, SlowlogEntry, StreamAction,
-    StreamConsumer, StreamGroup,
+    ClientInfo, CollectionKind, KeyMeta, KvCollectionPage, KvEdit, KvScanPage, KvStreamActionReq,
+    KvStreamPage, KvValue, PendingEntry, RespValue, ScanBudget, ScanCursor, SlowlogEntry,
+    StreamAction, StreamConsumer, StreamGroup,
 };
 use red_core::{
     ActivityId, ActivityKind, ActivityStatus, AiLimits, AiTier, Column, ColumnMap, ColumnMeta,
@@ -304,6 +304,20 @@ pub enum Command {
     /// tears it down.
     KvMonitor {
         epoch: u64,
+    },
+    /// Fetch the connected clients (`CLIENT LIST`) for the diagnostics panel's
+    /// clients viewer (see docs/plans/redis.md's "CLIENT LIST viewer" gap).
+    /// Replied with `KvClientListReady`.
+    KvClientList {
+        epoch: u64,
+    },
+    /// Disconnect a client by id (`CLIENT KILL ID <id>`), gated by `read_only`
+    /// (checked service-side, defense in depth alongside the driver). On success
+    /// the service refetches and replies with a fresh `KvClientListReady` so the
+    /// viewer updates without a separate reply type.
+    KvClientKill {
+        epoch: u64,
+        id: i64,
     },
     /// Compute a column's aggregate summary over the open result's *filtered* SQL
     /// (the column-stats bar): a single `count`/`distinct`/`min`/`max`(/`sum`/`avg`)
@@ -771,6 +785,12 @@ pub enum Event {
     KvMonitorLine {
         epoch: u64,
         line: String,
+    },
+    /// The connected clients, in response to `KvClientList` (or a `KvClientKill`
+    /// that then refetched).
+    KvClientListReady {
+        epoch: u64,
+        clients: Vec<ClientInfo>,
     },
     /// A result opened: its columns and total row count (for `OpenResult`).
     /// Echoes the open `epoch` so the grid can ignore a late reply for a result

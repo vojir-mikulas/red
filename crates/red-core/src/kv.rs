@@ -354,6 +354,73 @@ pub struct SlowlogEntry {
     pub client_name: String,
 }
 
+/// One connected client, from a `CLIENT LIST` reply line (see docs/plans/redis.md's
+/// "CLIENT LIST viewer" gap). Only the fields the viewer surfaces are kept;
+/// `CLIENT LIST` carries many more, but a curated set reads better than a raw
+/// dump and stays stable across server versions that add/rename fields.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClientInfo {
+    /// The client's unique connection id (`id=`), the handle `CLIENT KILL ID`
+    /// takes.
+    pub id: i64,
+    /// The client's address (`addr=`, `ip:port`).
+    pub addr: String,
+    /// The client's `CLIENT SETNAME` (`name=`), empty if unset.
+    pub name: String,
+    /// The selected logical database (`db=`).
+    pub db: i64,
+    /// Seconds the connection has been alive (`age=`).
+    pub age: u64,
+    /// Seconds the connection has been idle (`idle=`).
+    pub idle: u64,
+    /// Client flags (`flags=`, e.g. `N`, `S` for a replica, `M` for a master).
+    pub flags: String,
+    /// The last command the client ran (`cmd=`, e.g. `client|list`).
+    pub cmd: String,
+    /// The RESP protocol version the client negotiated (`resp=`), empty on
+    /// servers predating that field.
+    pub resp: String,
+}
+
+/// Parse a single `CLIENT LIST` line into a [`ClientInfo`]. Each line is
+/// space-separated `field=value` pairs; unknown fields are ignored and missing
+/// ones default. Returns `None` for a line with no `id` (a torn or blank line),
+/// which the caller drops rather than surfacing an id-less client.
+pub fn parse_client_line(line: &str) -> Option<ClientInfo> {
+    let mut c = ClientInfo::default();
+    let mut saw_id = false;
+    for tok in line.split_whitespace() {
+        let Some((k, v)) = tok.split_once('=') else {
+            continue;
+        };
+        match k {
+            "id" => match v.parse::<i64>() {
+                Ok(id) => {
+                    c.id = id;
+                    saw_id = true;
+                }
+                Err(_) => return None,
+            },
+            "addr" => c.addr = v.to_string(),
+            "name" => c.name = v.to_string(),
+            "db" => c.db = v.parse().unwrap_or(0),
+            "age" => c.age = v.parse().unwrap_or(0),
+            "idle" => c.idle = v.parse().unwrap_or(0),
+            "flags" => c.flags = v.to_string(),
+            "cmd" => c.cmd = v.to_string(),
+            "resp" => c.resp = v.to_string(),
+            _ => {}
+        }
+    }
+    saw_id.then_some(c)
+}
+
+/// Parse a whole `CLIENT LIST` reply (one client per line) into
+/// [`ClientInfo`]s, dropping any torn/blank line (see [`parse_client_line`]).
+pub fn parse_client_list(reply: &str) -> Vec<ClientInfo> {
+    reply.lines().filter_map(parse_client_line).collect()
+}
+
 /// A generic RESP reply (the console needs to render *any* command's result,
 /// not one per command), and the redis crate's own `Value` isn't `Send`-free
 /// of engine-specific dependencies for a wire type shared across the
@@ -773,6 +840,35 @@ mod tests {
             CommandClass::Write
         );
         assert_eq!(classify_command(&[]), CommandClass::Read);
+    }
+
+    #[test]
+    fn parse_client_list_reads_lines_and_curated_fields() {
+        // Two real-ish CLIENT LIST lines plus a blank one (dropped).
+        let reply = "id=7 addr=127.0.0.1:52814 laddr=127.0.0.1:6379 fd=8 name=worker age=42 idle=3 flags=N db=2 sub=0 psub=0 resp=3 cmd=get\n\
+                     id=8 addr=127.0.0.1:52820 name= age=0 idle=0 flags=N db=0 resp=2 cmd=client|list\n\
+                     \n";
+        let clients = parse_client_list(reply);
+        assert_eq!(clients.len(), 2);
+        assert_eq!(
+            clients[0],
+            ClientInfo {
+                id: 7,
+                addr: "127.0.0.1:52814".into(),
+                name: "worker".into(),
+                db: 2,
+                age: 42,
+                idle: 3,
+                flags: "N".into(),
+                cmd: "get".into(),
+                resp: "3".into(),
+            }
+        );
+        assert_eq!(clients[1].id, 8);
+        assert_eq!(clients[1].name, "");
+        assert_eq!(clients[1].cmd, "client|list");
+        // A line with no id is dropped.
+        assert!(parse_client_line("addr=1.2.3.4:5 flags=N").is_none());
     }
 
     fn meta(key: &str, ty: KvType, ttl: Option<Duration>, bytes: u64) -> KeyMeta {

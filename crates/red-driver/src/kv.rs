@@ -14,8 +14,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::Stream;
 use red_core::kv::{
-    CollectionKind, KeyMeta, KvCollectionPage, KvMessage, KvScanPage, KvStreamPage, KvValue,
-    PendingEntry, RespValue, ScanBudget, ScanCursor, SlowlogEntry, StreamConsumer, StreamGroup,
+    ClientInfo, CollectionKind, KeyMeta, KvCollectionPage, KvMessage, KvScanPage, KvStreamPage,
+    KvValue, PendingEntry, RespValue, ScanBudget, ScanCursor, SlowlogEntry, StreamConsumer,
+    StreamGroup,
 };
 use red_core::Result;
 
@@ -212,6 +213,16 @@ pub trait KvDriver: Send + Sync {
     /// Clear the slow log (`SLOWLOG RESET`). A server-state maintenance write,
     /// so it's refused on a read-only connection.
     async fn slowlog_reset(&self) -> Result<()>;
+
+    /// The connected clients (`CLIENT LIST`), for the diagnostics panel's
+    /// clients viewer (see docs/plans/redis.md's "CLIENT LIST viewer" gap).
+    /// Under a cluster this reports the seed node's clients only (client lists
+    /// are per-node).
+    async fn client_list(&self) -> Result<Vec<ClientInfo>>;
+
+    /// Disconnect a client by its connection id (`CLIENT KILL ID <id>`). A
+    /// server-state write, so it's refused on a read-only connection.
+    async fn client_kill(&self, id: i64) -> Result<()>;
 
     /// A live `MONITOR` stream: every command the server runs, pushed as a raw
     /// line for as long as the returned stream is read (see docs/plans/redis.md's

@@ -7,9 +7,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use red_core::kv::{
-    CollectionKind, CommandClass, KeyMeta, KvCollection, KvCollectionPage, KvElement, KvMessage,
-    KvScanPage, KvStreamPage, KvType, KvValue, PendingEntry, RespValue, ScanBudget, ScanCursor,
-    SlowlogEntry, StreamConsumer, StreamEntry, StreamGroup,
+    ClientInfo, CollectionKind, CommandClass, KeyMeta, KvCollection, KvCollectionPage, KvElement,
+    KvMessage, KvScanPage, KvStreamPage, KvType, KvValue, PendingEntry, RespValue, ScanBudget,
+    ScanCursor, SlowlogEntry, StreamConsumer, StreamEntry, StreamGroup,
 };
 use red_core::{RedError, Result, Value};
 use redis::aio::MultiplexedConnection;
@@ -998,6 +998,34 @@ impl KvDriver for RedisDriver {
             .arg("RESET")
             .query_async::<()>(&mut conn)
             .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    async fn client_list(&self) -> Result<Vec<ClientInfo>> {
+        let mut conn = self.conn.clone();
+        // `CLIENT LIST` replies as one bulk string, one client per line. Decode
+        // as bytes then lossily, so a non-UTF8 client name can't fail the read.
+        let raw: Vec<u8> = redis::cmd("CLIENT")
+            .arg("LIST")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        let text = String::from_utf8_lossy(&raw);
+        Ok(red_core::kv::parse_client_list(&text))
+    }
+
+    async fn client_kill(&self, id: i64) -> Result<()> {
+        self.check_writable()?;
+        let mut conn = self.conn.clone();
+        // `CLIENT KILL ID <id>` returns the number killed (0 if the id is
+        // already gone); either way the caller just refreshes the list.
+        redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("ID")
+            .arg(id)
+            .query_async::<i64>(&mut conn)
+            .await
+            .map(|_| ())
             .map_err(|e| RedError::Driver(e.to_string()))
     }
 
@@ -2450,6 +2478,38 @@ mod tests {
         assert!(driver.slowlog_reset().await.is_err());
         // Reading the log is still allowed read-only.
         driver.slowlog(16).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_list_includes_our_own_connection() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        // Name our own connection so we can find it in the list deterministically.
+        let name = tag("client");
+        let mut conn = driver.conn.clone();
+        let _: () = redis::cmd("CLIENT")
+            .arg("SETNAME")
+            .arg(&name)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        let clients = driver.client_list().await.unwrap();
+        assert!(!clients.is_empty());
+        assert!(
+            clients.iter().any(|c| c.name == name),
+            "our named connection should appear in CLIENT LIST"
+        );
+        assert!(clients.iter().all(|c| c.id > 0 && !c.addr.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn client_kill_refused_on_a_read_only_connection() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, true).await.unwrap();
+        assert!(driver.client_kill(999_999).await.is_err());
+        // Listing is still allowed read-only.
+        driver.client_list().await.unwrap();
     }
 
     #[tokio::test]
