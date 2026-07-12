@@ -81,7 +81,7 @@ async fn connect(config: &ConnectionConfig) -> red_core::Result<(SessionDriver, 
                 .port
                 .or_else(|| config.kind.default_port())
                 .unwrap_or(0);
-            let tunnel = Tunnel::open(ssh, &config.host, port).await?;
+            let tunnel = Tunnel::open(ssh, config.effective_host(), port).await?;
             (
                 config.local_dsn("127.0.0.1", tunnel.local_addr().port()),
                 Some(tunnel),

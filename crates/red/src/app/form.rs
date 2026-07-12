@@ -241,13 +241,10 @@ impl AppState {
             if config.database.is_empty() {
                 errors.push((FormField::Database, "A database file path is required"));
             }
-        } else {
-            if config.host.is_empty() {
-                errors.push((FormField::Host, "Host is required"));
-            }
-            if config.kind == DbKind::Postgres && config.database.is_empty() {
-                errors.push((FormField::Database, "Database is required"));
-            }
+        } else if config.kind == DbKind::Postgres && config.database.is_empty() {
+            // A blank host is allowed: it falls back to `localhost` (see
+            // `ConnectionConfig::effective_host`), so we don't reject it here.
+            errors.push((FormField::Database, "Database is required"));
         }
         // `ssh` is `Some` only when the tunnel toggle is on, so these fire only then.
         if let Some(ssh) = &config.ssh {

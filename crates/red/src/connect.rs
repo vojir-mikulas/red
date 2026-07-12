@@ -12,6 +12,10 @@ use red_core::DbKind;
 
 use crate::app::{AppState, ConnectSortField, FormField, FormState, SshAuthMode, TestState};
 
+/// How many saved-connection cards the welcome screen shows per page. Kept small
+/// so a long roster paginates into single screens instead of one tall scroll.
+const CONNECTIONS_PER_PAGE: usize = 8;
+
 /// The six label colors a connection can be tagged with, mapped onto semantic
 /// theme tokens so they track the active theme. A connection stores the index.
 pub(crate) fn label_color(index: u8, theme: &Theme) -> Hsla {
@@ -33,11 +37,10 @@ fn engine_tint(kind: DbKind, theme: &Theme) -> Hsla {
         DbKind::Sqlite => theme.cyan,
         DbKind::Mysql => theme.orange,
         DbKind::Clickhouse => theme.yellow,
-        // Not `theme.red`: that token means error/destructive everywhere else
-        // in the app (close-button hover, error toasts, …), and reusing it
-        // here would make a Redis connection card look like it's in an error
-        // state.
-        DbKind::Redis => theme.purple,
+        // Redis leans into the app's red accent deliberately (the welcome-card
+        // badge is `Danger`/red to match); here `theme.red` is used as a colour,
+        // not to signal an error state.
+        DbKind::Redis => theme.red,
     }
 }
 
@@ -116,10 +119,22 @@ impl AppState {
         // stored connection regardless of display order, while the keyboard
         // highlight (`connect_sel`) tracks the display position.
         let visible = self.visible_connections(cx);
-        let cards: Vec<AnyElement> = visible
+        // Paginate the list so a large roster stays a single screen rather than a
+        // long scroll. The shown page is derived from the keyboard selection, so
+        // ↑/↓ and the page controls stay in lockstep (the highlight always sits on
+        // the visible page); clicking a card connects immediately, so it never
+        // needs syncing. `display_ix` stays a global index into the visible list so
+        // the highlight comparison in `connection_card` lines up.
+        let total = visible.len();
+        let page_count = total.div_ceil(CONNECTIONS_PER_PAGE).max(1);
+        let page = self.connect_sel.min(total.saturating_sub(1)) / CONNECTIONS_PER_PAGE;
+        let start = page * CONNECTIONS_PER_PAGE;
+        let end = (start + CONNECTIONS_PER_PAGE).min(total);
+        let cards: Vec<AnyElement> = visible[start..end]
             .iter()
             .enumerate()
-            .map(|(display_ix, &orig_ix)| {
+            .map(|(offset, &orig_ix)| {
+                let display_ix = start + offset;
                 let stored = &self.connections[orig_ix];
                 self.connection_card(
                     display_ix,
@@ -132,6 +147,8 @@ impl AppState {
                 .into_any_element()
             })
             .collect();
+        let pagination =
+            (page_count > 1).then(|| self.connect_pagination(page, page_count, total, cx));
         let toolbar = (!self.connections.is_empty()).then(|| self.connect_toolbar(cx));
         let new_button = self.new_button(cx);
         let connections_header = self.connections_header(cx);
@@ -230,6 +247,7 @@ impl AppState {
             .child(connections_header)
             .children(toolbar)
             .child(saved)
+            .children(pagination)
             .child(new_button)
             .child(footer);
 
@@ -336,6 +354,53 @@ impl AppState {
             }
         });
         indices
+    }
+
+    /// The page controls beneath the saved-connection list: Previous / Next around
+    /// a "Page X of Y" label, shown only when the list spans more than one page.
+    /// Both buttons move the keyboard selection to the first card of the target
+    /// page, which is what drives the visible page (see [`Self::render_connect`]).
+    fn connect_pagination(
+        &self,
+        page: usize,
+        page_count: usize,
+        total: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // Cloned so the theme doesn't hold an immutable borrow of `cx` across the
+        // `cx.listener` calls on the buttons below.
+        let theme = cx.theme().clone();
+        div()
+            .pt_2()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(
+                Button::new("connect-prev-page", "Previous")
+                    .variant(ButtonVariant::Ghost)
+                    .disabled(page == 0)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.connect_sel = page.saturating_sub(1) * CONNECTIONS_PER_PAGE;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .text_size(theme.scale(12.))
+                    .text_color(theme.text_muted)
+                    .child(format!("Page {} of {page_count}", page + 1)),
+            )
+            .child(
+                Button::new("connect-next-page", "Next")
+                    .variant(ButtonVariant::Ghost)
+                    .disabled(page + 1 >= page_count)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.connect_sel =
+                            ((page + 1) * CONNECTIONS_PER_PAGE).min(total.saturating_sub(1));
+                        cx.notify();
+                    })),
+            )
     }
 
     /// The toolbar above the saved-connection list: a search box that filters the
@@ -496,9 +561,9 @@ impl AppState {
             DbKind::Postgres => (BadgeVariant::Special, "Postgres"),
             DbKind::Mysql => (BadgeVariant::Warning, "MySQL"),
             DbKind::Clickhouse => (BadgeVariant::Accent, "ClickHouse"),
-            // Neutral, not `Danger`/`Success`: those variants read as a status
-            // (error/healthy) elsewhere, which a plain engine label isn't.
-            DbKind::Redis => (BadgeVariant::Neutral, "Redis"),
+            // Redis gets a red badge (leaning into the app's accent) but keeps its
+            // own name; `Danger` here is used for its colour, not a status meaning.
+            DbKind::Redis => (BadgeVariant::Danger, "Redis"),
         };
         let group = SharedString::from(format!("connect-card-{orig_ix}"));
         // Accessible name: the connection's name, engine, and read-only state;

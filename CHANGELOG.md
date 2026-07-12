@@ -7,11 +7,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Welcome screen: the saved-connection list now paginates (8 per page) with
+  Previous / Next controls, so a large roster stays a single screen instead of
+  one long scroll. ↑/↓ still walk the whole list and flip pages at the edges.
 - Tab strip: middle-click a tab to close it, right-click for a context menu
   (Close, Close Others, Close All, Close Left, Close Right, Pin tab), and pin a
   tab to keep it visible at the start of the strip no matter how far you've
   scrolled. The close-with-unsaved-work prompt gained a "Don't ask again"
   checkbox.
+
+### Changed
+- Connection form: the host may now be left blank; it falls back to `localhost`
+  (as `psql` and `redis-cli` do) instead of being rejected.
+- Redis connections now carry a red badge (matching the app's accent) while
+  keeping the "Redis" label.
 
 ## [0.16.0] - 2026-07-10
 

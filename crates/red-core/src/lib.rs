@@ -616,6 +616,18 @@ impl fmt::Debug for ConnectionConfig {
 }
 
 impl ConnectionConfig {
+    /// The host to dial for a network engine, defaulting to `localhost` when the
+    /// field is left blank. A blank host is the common "just connect to my local
+    /// server" case, so we fill it in rather than reject it, matching the
+    /// convention of clients like `psql` and `redis-cli`.
+    pub fn effective_host(&self) -> &str {
+        if self.host.is_empty() {
+            "localhost"
+        } else {
+            &self.host
+        }
+    }
+
     /// The connection string handed to the driver. File engines yield the bare
     /// path; network engines compose `scheme://user:pass@host:port/database`, with
     /// the userinfo and database percent-encoded so credentials with reserved
@@ -646,7 +658,7 @@ impl ConnectionConfig {
             }
             url.push('@');
         }
-        url.push_str(&bracket_host(&self.host));
+        url.push_str(&bracket_host(self.effective_host()));
         if let Some(port) = self.port {
             url.push(':');
             url.push_str(&port.to_string());
@@ -690,7 +702,7 @@ impl ConnectionConfig {
             s.push_str(&self.user);
             s.push('@');
         }
-        s.push_str(&bracket_host(&self.host));
+        s.push_str(&bracket_host(self.effective_host()));
         if let Some(port) = self.port {
             s.push(':');
             s.push_str(&port.to_string());
@@ -1876,6 +1888,22 @@ mod conn_tests {
             ..Default::default()
         };
         assert_eq!(cfg.dsn(), "redis://:hunter2@localhost:6379/");
+    }
+
+    #[test]
+    fn blank_host_falls_back_to_localhost() {
+        // Leaving the host empty is the common "connect to my local server" case;
+        // both the DSN and the display label fill in `localhost` rather than
+        // emitting an empty authority.
+        let cfg = ConnectionConfig {
+            kind: DbKind::Redis,
+            host: String::new(),
+            port: Some(6379),
+            ..Default::default()
+        };
+        assert_eq!(cfg.dsn(), "redis://localhost:6379/");
+        assert_eq!(cfg.display_target(), "localhost:6379");
+        assert_eq!(cfg.effective_host(), "localhost");
     }
 
     #[test]
