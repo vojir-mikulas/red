@@ -1884,6 +1884,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     // `CloseResult`'s abort is noticed within one tick rather
                     // than blocking forever on the next message that may
                     // never come.
+                    let mut rate = StreamRate::new();
                     loop {
                         if abort.is_aborted() {
                             break;
@@ -1891,15 +1892,33 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         match tokio::time::timeout(Duration::from_millis(500), sub.stream.next())
                             .await
                         {
-                            Ok(Some(msg)) => emit(
-                                &events,
-                                session_id,
-                                Event::KvMessage {
-                                    epoch,
-                                    channel: msg.channel,
-                                    payload: msg.payload,
-                                },
-                            ),
+                            Ok(Some(msg)) => {
+                                // Rate-limit a firehose subscription (`PSUBSCRIBE *`)
+                                // so it can't outgrow the event channel.
+                                let (admit, dropped) = rate.admit();
+                                if let Some(n) = dropped {
+                                    emit(
+                                        &events,
+                                        session_id,
+                                        Event::KvMessage {
+                                            epoch,
+                                            channel: "[red]".into(),
+                                            payload: format!("dropped {n} messages (rate limit)"),
+                                        },
+                                    );
+                                }
+                                if admit {
+                                    emit(
+                                        &events,
+                                        session_id,
+                                        Event::KvMessage {
+                                            epoch,
+                                            channel: msg.channel,
+                                            payload: msg.payload,
+                                        },
+                                    );
+                                }
+                            }
                             Ok(None) => break, // the subscription's connection closed
                             Err(_) => {}       // timed out this tick; loop to recheck `abort`
                         }
@@ -2083,6 +2102,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     // Same bounded-poll teardown as `KvSubscribe`: MONITOR has
                     // no native cancel, so check `abort` between reads rather
                     // than blocking forever on the next line.
+                    let mut rate = StreamRate::new();
                     loop {
                         if abort.is_aborted() {
                             break;
@@ -2091,7 +2111,24 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             .await
                         {
                             Ok(Some(line)) => {
-                                emit(&events, session_id, Event::KvMonitorLine { epoch, line })
+                                // Rate-limit the firehose so it can't outgrow the
+                                // event channel; report dropped lines in-band.
+                                let (admit, dropped) = rate.admit();
+                                if let Some(n) = dropped {
+                                    emit(
+                                        &events,
+                                        session_id,
+                                        Event::KvMonitorLine {
+                                            epoch,
+                                            line: format!(
+                                                "[red] dropped {n} MONITOR lines (rate limit)"
+                                            ),
+                                        },
+                                    );
+                                }
+                                if admit {
+                                    emit(&events, session_id, Event::KvMonitorLine { epoch, line });
+                                }
                             }
                             Ok(None) => break, // the monitor connection closed
                             Err(_) => {}       // timed out this tick; recheck `abort`
@@ -2943,6 +2980,57 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
 /// routes it to the right workspace (`None` for the session-less probe replies).
 pub(crate) fn emit(events: &Events, session: Option<SessionId>, event: Event) {
     let _ = events.unbounded_send((session, event));
+}
+
+/// The per-second admission budget for a live stream (MONITOR firehose, a broad
+/// `PSUBSCRIBE`). Comfortably above a readable live view, well below what would
+/// grow the unbounded event channel without bound.
+const MAX_STREAM_EVENTS_PER_SEC: usize = 2_000;
+
+/// Producer-side rate limiter for the (unbounded) live-stream event channel. A
+/// firehose — MONITOR on a busy server, `PSUBSCRIBE *` — can emit faster than
+/// the frame-throttled UI drains, growing the channel backlog until the process
+/// runs out of memory (the UI-side buffer caps don't help: they apply only
+/// after an event has already left the channel). This caps admitted events per
+/// rolling second and counts the rest so the loop can surface a "dropped N"
+/// notice.
+struct StreamRate {
+    window: Instant,
+    in_window: usize,
+    dropped: usize,
+}
+
+impl StreamRate {
+    fn new() -> Self {
+        Self {
+            window: Instant::now(),
+            in_window: 0,
+            dropped: 0,
+        }
+    }
+
+    /// Record one arriving item. Returns whether to admit it, plus — roughly
+    /// once a second, when the window rolls over after drops — how many were
+    /// dropped, for a synthetic notice.
+    fn admit(&mut self) -> (bool, Option<usize>) {
+        let now = Instant::now();
+        let mut notice = None;
+        if now.duration_since(self.window) >= Duration::from_secs(1) {
+            if self.dropped > 0 {
+                notice = Some(self.dropped);
+            }
+            self.window = now;
+            self.in_window = 0;
+            self.dropped = 0;
+        }
+        if self.in_window < MAX_STREAM_EVENTS_PER_SEC {
+            self.in_window += 1;
+            (true, notice)
+        } else {
+            self.dropped += 1;
+            (false, notice)
+        }
+    }
 }
 
 /// Stream `path` (CSV/JSONL) into `target`, coercing each source cell to a typed

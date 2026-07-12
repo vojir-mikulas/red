@@ -609,8 +609,11 @@ impl AppState {
             .child(toggle);
 
         let mono = theme.mono_family.clone();
-        let lines = Rc::new(mon.lines.clone());
-        let items: Vec<_> = lines
+        // Iterate the resident buffer directly: cloning the whole thing (up to
+        // MAX_LINES) every frame just to read the newest 1_000 was pure waste —
+        // the clone was never captured in a closure.
+        let items: Vec<_> = mon
+            .lines
             .iter()
             .rev()
             .take(1_000)

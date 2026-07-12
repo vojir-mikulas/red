@@ -133,6 +133,27 @@ impl DbKind {
     }
 }
 
+/// Whether a DSN string requests TLS — by scheme (`rediss`/`clickhouses`) or a
+/// recognized query flag (`sslmode=<anything but disable>`, `require_ssl=true`,
+/// `ssl=true`, `tls=true`). The single source of truth for "is this a TLS DSN",
+/// shared by [`ConnectionConfig::parse_conn_str`] and the engine drivers'
+/// cleartext-refusal guard, so the two can't disagree on which spellings count
+/// (a driver matching only `sslmode=require` would silently connect in
+/// cleartext for `?ssl=true` or `?sslmode=prefer`).
+pub fn dsn_requests_tls(dsn: &str) -> bool {
+    let Some((scheme, rest)) = dsn.trim().split_once("://") else {
+        return false;
+    };
+    if DbKind::scheme_is_tls(scheme) {
+        return true;
+    }
+    let q = rest.split(['?', '#']).nth(1).unwrap_or("").to_ascii_lowercase();
+    (q.contains("sslmode=") && !q.contains("sslmode=disable"))
+        || q.contains("require_ssl=true")
+        || q.contains("ssl=true")
+        || q.contains("tls=true")
+}
+
 /// The write operations an engine can honor, independent of a connection's
 /// `read_only` flag (see [`DbKind::write_caps`]). A cheap `Copy` descriptor the UI
 /// reads to gate the edit affordances and the copy/migration target pickers.
@@ -690,17 +711,8 @@ impl ConnectionConfig {
         let (scheme, rest) = input.split_once("://")?;
         let kind = DbKind::from_scheme(scheme).unwrap_or(DbKind::Postgres);
         // TLS is signalled either by the scheme (`rediss`/`clickhouses`) or by a
-        // recognized query flag (`sslmode=require`/`verify-*`, `require_ssl=true`,
-        // `ssl=true`) — read it from the query *before* it's dropped below.
-        let query = rest.split(['?', '#']).nth(1).unwrap_or("");
-        let query_tls = {
-            let q = query.to_ascii_lowercase();
-            (q.contains("sslmode=") && !q.contains("sslmode=disable"))
-                || q.contains("require_ssl=true")
-                || q.contains("ssl=true")
-                || q.contains("tls=true")
-        };
-        let tls = DbKind::scheme_is_tls(scheme) || query_tls;
+        // recognized query flag — read it before the query tail is dropped below.
+        let tls = dsn_requests_tls(input);
         // Drop any ?query / #fragment tail.
         let rest = rest
             .split(['?', '#'])

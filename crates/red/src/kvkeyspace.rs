@@ -124,6 +124,18 @@ impl AppState {
         };
         if restart {
             self.kv_keyspace_stop(session, cx);
+            // Rotate the epoch before resubscribing: the old-scope subscription
+            // keeps emitting for a bounded teardown window after `CloseResult`,
+            // and routing is by epoch — reusing it would let those stale
+            // old-scope events land in the new-scope view. A fresh epoch makes
+            // `keyspace_by_epoch_mut` drop them.
+            if let Some(ks) = self
+                .conn_mut(Some(session))
+                .and_then(|a| a.kv_view.as_mut())
+                .and_then(|v| v.active_keyspace_mut())
+            {
+                ks.epoch = crate::result::next_kv_epoch();
+            }
             self.kv_keyspace_start(session, cx);
         }
         cx.notify();

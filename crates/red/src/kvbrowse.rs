@@ -23,7 +23,7 @@ use red_core::kv::{
 };
 use red_service::{Command, SessionId};
 
-use crate::app::{ActiveConn, AppState, Phase, SplitHalf, SplitState};
+use crate::app::{ActiveConn, AppState, Phase, SplitHalf, SplitState, TabWorkspace, WorkspaceTab};
 
 /// The `SCAN ... COUNT` hint per round trip (default `10` is far too low for
 /// a large keyspace; see docs/plans/redis.md item 3).
@@ -736,6 +736,45 @@ impl RedisTabState {
     }
 }
 
+impl WorkspaceTab for RedisTab {
+    fn pane(&self) -> SplitHalf {
+        self.pane
+    }
+    fn set_pane(&mut self, half: SplitHalf) {
+        self.pane = half;
+    }
+    fn pinned(&self) -> bool {
+        self.pinned
+    }
+}
+
+impl TabWorkspace for RedisView {
+    type Tab = RedisTab;
+    fn ws_tabs(&self) -> &[RedisTab] {
+        &self.tabs
+    }
+    fn ws_tabs_mut(&mut self) -> &mut Vec<RedisTab> {
+        &mut self.tabs
+    }
+    fn ws_active(&self) -> usize {
+        self.active_tab
+    }
+    fn ws_set_active(&mut self, i: usize) {
+        self.active_tab = i;
+    }
+    fn ws_split(&self) -> Option<&SplitState> {
+        self.split.as_ref()
+    }
+    fn ws_split_mut(&mut self) -> &mut Option<SplitState> {
+        &mut self.split
+    }
+    /// Redis has no separate pinned strip section, so pinned tabs sort ahead
+    /// within their pane's strip.
+    fn pins_sort_first(&self) -> bool {
+        true
+    }
+}
+
 impl RedisView {
     pub(crate) fn new(session: SessionId, cx: &mut Context<AppState>) -> Self {
         let browse = RedisTabState::Browse(Box::new(BrowseState::new(session, cx)));
@@ -761,112 +800,12 @@ impl RedisView {
         }
     }
 
-    // --- split panes (mirror the SQL `ActiveConn` helpers) ---
-
-    /// Which half currently receives actions/focus (`Primary` when unsplit).
-    pub(crate) fn focused_half(&self) -> SplitHalf {
-        self.split
-            .as_ref()
-            .map(|s| s.focus)
-            .unwrap_or(SplitHalf::Primary)
-    }
-
-    /// Global index of the focused half's active tab.
-    pub(crate) fn focused_tab_index(&self) -> usize {
-        match &self.split {
-            Some(s) if s.focus == SplitHalf::Secondary => s.secondary,
-            _ => self.active_tab,
-        }
-    }
-
-    fn first_tab_in(&self, half: SplitHalf) -> Option<usize> {
-        self.tabs.iter().position(|t| t.pane == half)
-    }
-
-    /// The active tab index of `half`: its stored index when that still names a
-    /// tab in the half, else the first tab in the half (`None` if empty).
-    pub(crate) fn pane_active(&self, half: SplitHalf) -> Option<usize> {
-        let stored = match half {
-            SplitHalf::Primary => Some(self.active_tab),
-            SplitHalf::Secondary => self.split.as_ref().map(|s| s.secondary),
-        };
-        match stored {
-            Some(i) if self.tabs.get(i).is_some_and(|t| t.pane == half) => Some(i),
-            _ => self.first_tab_in(half),
-        }
-    }
-
-    /// Record `i` as `half`'s active tab.
-    pub(crate) fn set_pane_active(&mut self, half: SplitHalf, i: usize) {
-        match half {
-            SplitHalf::Primary => self.active_tab = i,
-            SplitHalf::Secondary => {
-                if let Some(s) = &mut self.split {
-                    s.secondary = i;
-                }
-            }
-        }
-    }
-
-    /// Global indices of the tabs in `half`, pinned first, then in tab order.
-    pub(crate) fn pane_tab_indices(&self, half: SplitHalf) -> Vec<usize> {
-        let mut idx: Vec<usize> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.pane == half)
-            .map(|(i, _)| i)
-            .collect();
-        idx.sort_by_key(|&i| !self.tabs[i].pinned); // pinned (true) first
-        idx
-    }
+    // --- split panes: the pane-routing + split-invariant logic is shared with
+    // the SQL side via the `TabWorkspace` trait (see `crate::app`); this view
+    // supplies only the field accessors, below. ---
 
     fn tab_index_by_id(&self, id: u64) -> Option<usize> {
         self.tabs.iter().position(|t| t.id == id)
-    }
-
-    /// Restore the pane invariants after any tab add/close/move: collapse the
-    /// split when a half empties, and clamp each pane's active index. Mirrors
-    /// the SQL side's `normalize_panes`.
-    pub(crate) fn normalize_panes(&mut self) {
-        if self.tabs.is_empty() {
-            self.active_tab = 0;
-            self.split = None;
-            return;
-        }
-        if self.split.is_some() {
-            let has_primary = self.tabs.iter().any(|t| t.pane == SplitHalf::Primary);
-            let has_secondary = self.tabs.iter().any(|t| t.pane == SplitHalf::Secondary);
-            if !has_primary || !has_secondary {
-                let survivor = if has_primary {
-                    SplitHalf::Primary
-                } else {
-                    SplitHalf::Secondary
-                };
-                let keep = self.pane_active(survivor).unwrap_or(0);
-                for t in &mut self.tabs {
-                    t.pane = SplitHalf::Primary;
-                }
-                self.split = None;
-                self.active_tab = keep.min(self.tabs.len() - 1);
-                return;
-            }
-            if let Some(p) = self.pane_active(SplitHalf::Primary) {
-                self.active_tab = p;
-            }
-            if let Some(sec) = self.pane_active(SplitHalf::Secondary) {
-                if let Some(state) = &mut self.split {
-                    state.secondary = sec;
-                }
-            }
-        } else {
-            for t in &mut self.tabs {
-                t.pane = SplitHalf::Primary;
-            }
-            if self.active_tab >= self.tabs.len() {
-                self.active_tab = self.tabs.len() - 1;
-            }
-        }
     }
 
     // --- render-time per-tab-index accessors (each split half displays its
@@ -1942,7 +1881,7 @@ impl AppState {
         else {
             return;
         };
-        if view.tabs.len() <= 1 || index >= view.tabs.len() {
+        if index >= view.tabs.len() {
             return;
         }
         // Release any backend epoch this tab owned: a live subscription
@@ -1965,6 +1904,21 @@ impl AppState {
                 Vec::new()
             }
         };
+        if view.tabs.len() <= 1 {
+            // The view must always show a tab, so we can't remove the only one —
+            // but we must still release its epoch, or a lone MONITOR/Pub-Sub/
+            // keyspace tab would leak its firehose connection forever. Reset it
+            // to the blank chooser in place and release below.
+            view.tabs[index].state = RedisTabState::Empty;
+            view.tabs[index].title = "New tab".to_string();
+            view.tab_menu = None;
+            for epoch in close_epochs {
+                self.service
+                    .send_to(session, Command::CloseResult { epoch });
+            }
+            cx.notify();
+            return;
+        }
         view.tabs.remove(index);
         // Shift the two panes' stored active indices past the removed slot,
         // then let `normalize_panes` collapse an emptied half + clamp.

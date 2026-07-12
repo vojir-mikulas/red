@@ -293,6 +293,18 @@ impl SessionState {
     }
 }
 
+impl Drop for SessionState {
+    /// Backstop the manual `teardown()` calls at each removal site: if any path
+    /// drops a session without calling it, still abort in-flight fetches —
+    /// including detached MONITOR/subscribe stream tasks, which loop until their
+    /// `AbortSignal` fires — and signal exports, so nothing leaks a driver clone
+    /// or a dedicated connection. Idempotent: `teardown` drains/clears, so a
+    /// prior explicit call makes this a no-op.
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
 /// The result of a spawned connect/probe, delivered back to the dispatch loop so
 /// the (single-threaded) loop owns every mutation of `sessions`. Dialing runs off
 /// the loop (see `CONNECT_TIMEOUT` and the `Connect` arm), so one slow connect

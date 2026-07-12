@@ -15,7 +15,7 @@ pub(crate) const TITLEBAR_LEFT_INSET: f32 = 88.;
 #[cfg(not(target_os = "macos"))]
 pub(crate) const TITLEBAR_LEFT_INSET: f32 = 12.;
 
-use crate::app::{ActiveConn, AppState, Phase, SplitHalf};
+use crate::app::{ActiveConn, AppState, Phase, SplitHalf, TabWorkspace};
 
 impl AppState {
     pub(crate) fn render_shell(

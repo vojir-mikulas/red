@@ -227,11 +227,32 @@ impl RedisDriver {
                 return Err(RedError::Interrupted);
             }
             let mut conn = cl.masters[node].clone();
-            let (next_cur, batch) =
-                scan_once(&mut conn, cur, pattern, type_filter, budget.count_hint).await?;
+            // Isolate a single unreachable/failing master (node down, failover
+            // in progress, partial partition): skip it and continue the fan-out
+            // rather than propagating `?` and failing the whole keyspace browse
+            // while every other shard is healthy.
+            let scanned =
+                scan_once(&mut conn, cur, pattern, type_filter, budget.count_hint).await;
+            let (next_cur, batch) = match scanned {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("Redis cluster scan skipped master {node}: {e}");
+                    node += 1;
+                    cur = 0;
+                    continue;
+                }
+            };
             cur = next_cur;
             if !batch.is_empty() {
-                keys.extend(fetch_key_meta_batch(&mut conn, &batch).await?);
+                match fetch_key_meta_batch(&mut conn, &batch).await {
+                    Ok(metas) => keys.extend(metas),
+                    Err(e) => {
+                        tracing::warn!("Redis cluster metadata skipped master {node}: {e}");
+                        node += 1;
+                        cur = 0;
+                        continue;
+                    }
+                }
             }
             // This node exhausted: advance to the next master, its cursor at 0.
             if cur == 0 {
@@ -1363,12 +1384,12 @@ async fn load_or_probe<T>(
 }
 
 /// One page of a stream's entries, newest-first (`XREVRANGE key <end> - COUNT
-/// n`). `before` (the previous page's oldest ID) becomes an exclusive upper
-/// bound `(<id>` so paging back in time never re-yields an entry already
-/// shown; `None` starts at the newest entry (`+`). `exhausted` is inferred
-/// from a short page (fewer than `count` came back), and `next_before` carries
-/// the oldest ID loaded here for the caller to continue from, or `None` once
-/// exhausted.
+/// n`). `before` (the previous page's oldest ID) is used as an *inclusive*
+/// upper bound and the boundary entry is dropped client-side, rather than the
+/// `(<id>` exclusive syntax which only exists on Redis >= 6.2 and hard-errors
+/// on older servers. `None` starts at the newest entry (`+`). `exhausted` is
+/// inferred from a short page, and `next_before` carries the oldest ID loaded
+/// here for the caller to continue from, or `None` once exhausted.
 async fn fetch_stream_page(
     conn: &mut MultiplexedConnection,
     key: &str,
@@ -1376,21 +1397,38 @@ async fn fetch_stream_page(
     count: usize,
 ) -> Result<KvStreamPage> {
     let count = count.max(1);
-    let end = match before {
-        Some(id) => format!("({id}"), // exclusive: don't repeat the boundary entry
-        None => "+".to_string(),
+    // Inclusive upper bound; when continuing, fetch one extra so a full page
+    // still yields `count` fresh entries after the boundary entry is dropped.
+    let (end, fetch) = match before {
+        Some(id) => (id.to_string(), count + 1),
+        None => ("+".to_string(), count),
     };
     let reply: redis::Value = redis::cmd("XREVRANGE")
         .arg(key)
         .arg(end)
         .arg("-")
         .arg("COUNT")
-        .arg(count)
+        .arg(fetch)
         .query_async(conn)
         .await
         .map_err(|e| RedError::Driver(e.to_string()))?;
-    let entries = parse_stream_entries(&reply);
-    let exhausted = entries.len() < count;
+    // Base exhaustion on how many entries Redis actually returned, not on how
+    // many decoded: `parse_stream_entries` silently skips a malformed entry, so
+    // deriving it from `entries.len()` would treat a full page with one skipped
+    // entry as the end of the stream and stop paging, hiding older entries.
+    let raw_len = match &reply {
+        redis::Value::Array(items) | redis::Value::Set(items) => items.len(),
+        _ => 0,
+    };
+    let mut entries = parse_stream_entries(&reply);
+    // Drop the boundary entry (the previous page's oldest ID) if it came back,
+    // so paging back in time never re-yields an already-shown entry.
+    if let Some(b) = before {
+        if entries.first().map(|e| e.id.as_str()) == Some(b) {
+            entries.remove(0);
+        }
+    }
+    let exhausted = raw_len < fetch;
     let next_before = if exhausted {
         None
     } else {
@@ -1466,21 +1504,32 @@ async fn fetch_key_meta_batch(
     let mut out = Vec::with_capacity(keys.len());
     for (i, key) in keys.iter().enumerate() {
         let base = i * 4;
-        let Some(type_raw) = value_to_string(&replies[base]) else {
-            continue; // TYPE itself didn't decode: drop the row defensively.
+        // Index through `.get()`, not `replies[base + n]`: the pipeline is
+        // expected to yield exactly 4 replies per key, but a short reply (a
+        // proxy collapsing errored positions, RESP3 push interleaving) would
+        // otherwise panic and abort the whole scan instead of dropping the row.
+        let Some(type_raw) = replies.get(base).and_then(value_to_string) else {
+            continue; // TYPE itself didn't decode / is missing: drop the row defensively.
         };
         let Some(kv_type) = KvType::parse(&type_raw) else {
             continue; // "none": vanished between SCAN and here.
         };
-        let ttl = value_to_i64(&replies[base + 1]).and_then(|ms| {
+        let ttl = replies.get(base + 1).and_then(value_to_i64).and_then(|ms| {
             if ms < 0 {
                 None
             } else {
                 Some(std::time::Duration::from_millis(ms as u64))
             }
         });
-        let encoding = value_to_string(&replies[base + 2]).unwrap_or_default();
-        let approx_bytes = value_to_i64(&replies[base + 3]).unwrap_or(0).max(0) as u64;
+        let encoding = replies
+            .get(base + 2)
+            .and_then(value_to_string)
+            .unwrap_or_default();
+        let approx_bytes = replies
+            .get(base + 3)
+            .and_then(value_to_i64)
+            .unwrap_or(0)
+            .max(0) as u64;
         out.push(KeyMeta {
             key: key.clone(),
             kv_type,

@@ -512,8 +512,11 @@ pub enum CommandClass {
     Read,
     Write,
     /// Wide-blast-radius or irreversible: gated behind a confirm even on a
-    /// writable connection (`FLUSHALL`, `FLUSHDB`, `DEL`, `UNLINK`, `SWAPDB`,
-    /// `SHUTDOWN`).
+    /// writable connection. Covers the key-nuking family (`FLUSHALL`,
+    /// `FLUSHDB`, `DEL`, `UNLINK`, `SWAPDB`), server/topology/persistence
+    /// control (`SHUTDOWN`, `DEBUG`, `REPLICAOF`/`SLAVEOF`, `FAILOVER`), and the
+    /// dangerous *form* of an otherwise-benign command (`CONFIG SET`,
+    /// `CLIENT KILL`, `ACL SETUSER`, `SCRIPT FLUSH`, `CLUSTER RESET`, ...).
     Destructive,
 }
 
@@ -577,17 +580,45 @@ const READ_COMMANDS: &[&str] = &[
     "DUMP",
 ];
 
-/// Commands gated behind the destructive-command confirm even though the
-/// connection is writable.
-const DESTRUCTIVE_COMMANDS: &[&str] =
-    &["FLUSHALL", "FLUSHDB", "SHUTDOWN", "DEL", "UNLINK", "SWAPDB"];
+/// Commands that are destructive purely by name (any invocation), gated behind
+/// the confirm even on a writable connection.
+const DESTRUCTIVE_COMMANDS: &[&str] = &[
+    "FLUSHALL", "FLUSHDB", "SHUTDOWN", "DEL", "UNLINK", "SWAPDB", "DEBUG", "REPLICAOF", "SLAVEOF",
+    "FAILOVER",
+];
+
+/// `(command, subcommand)` pairs that are destructive only in a specific form,
+/// so the read/introspection form of the same command (`CONFIG GET`,
+/// `CLIENT LIST`, `ACL WHOAMI`, ...) stays non-destructive.
+const DESTRUCTIVE_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("CONFIG", "SET"),
+    ("CONFIG", "RESETSTAT"),
+    ("CONFIG", "REWRITE"),
+    ("CLIENT", "KILL"),
+    ("CLIENT", "UNPAUSE"),
+    ("ACL", "SETUSER"),
+    ("ACL", "DELUSER"),
+    ("ACL", "LOAD"),
+    ("SCRIPT", "FLUSH"),
+    ("FUNCTION", "FLUSH"),
+    ("CLUSTER", "RESET"),
+    ("CLUSTER", "FAILOVER"),
+    ("CLUSTER", "FORGET"),
+    ("CLUSTER", "SETSLOT"),
+    ("XGROUP", "DESTROY"),
+];
 
 pub fn classify_command(argv: &[String]) -> CommandClass {
     let Some(name) = argv.first() else {
         return CommandClass::Read;
     };
     let upper = name.to_ascii_uppercase();
-    if DESTRUCTIVE_COMMANDS.contains(&upper.as_str()) {
+    let sub = argv.get(1).map(|s| s.to_ascii_uppercase());
+    let destructive = DESTRUCTIVE_COMMANDS.contains(&upper.as_str())
+        || sub
+            .as_deref()
+            .is_some_and(|s| DESTRUCTIVE_SUBCOMMANDS.contains(&(upper.as_str(), s)));
+    if destructive {
         CommandClass::Destructive
     } else if READ_COMMANDS.contains(&upper.as_str()) {
         CommandClass::Read
@@ -960,6 +991,32 @@ mod tests {
             CommandClass::Write
         );
         assert_eq!(classify_command(&[]), CommandClass::Read);
+        // Server/topology/persistence control is destructive by name.
+        for cmd in ["DEBUG", "REPLICAOF", "SLAVEOF", "SHUTDOWN"] {
+            assert_eq!(
+                classify_command(&[cmd.into()]),
+                CommandClass::Destructive,
+                "{cmd} should be destructive"
+            );
+        }
+        // The dangerous *form* of a subcommand-bearing command is destructive,
+        // while its read/introspection form is not.
+        assert_eq!(
+            classify_command(&["CONFIG".into(), "SET".into(), "dir".into(), "/tmp".into()]),
+            CommandClass::Destructive
+        );
+        assert_eq!(
+            classify_command(&["config".into(), "get".into(), "dir".into()]),
+            CommandClass::Write // not destructive; CONFIG GET isn't in READ_COMMANDS
+        );
+        assert_eq!(
+            classify_command(&["CLIENT".into(), "KILL".into(), "id".into(), "5".into()]),
+            CommandClass::Destructive
+        );
+        assert_eq!(
+            classify_command(&["ACL".into(), "SETUSER".into(), "bob".into()]),
+            CommandClass::Destructive
+        );
     }
 
     #[test]

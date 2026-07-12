@@ -65,10 +65,14 @@ impl AiBackend {
     /// over the subscription/MCP path (each backend has its own writer set: the SQL
     /// `propose_*` tools vs. the Redis `kv_*` writers).
     pub(crate) fn is_write_tool(&self, name: &str) -> bool {
-        match self {
-            AiBackend::Sql(_) => is_write_tool(name),
-            AiBackend::Kv(_) => is_kv_write_tool(name),
-        }
+        // Both backends fail *closed*: a tool is a write unless it's explicitly
+        // named in the read-only allowlist (`READ_ONLY_TOOLS`, which lists the
+        // `kv_*` reads too). Classifying KV via the `KV_WRITE_TOOLS` denylist
+        // here would fail *open* — a future KV writer not added to that list
+        // would be advertised over MCP and auto-allowed over ACP with no
+        // approval. (`is_kv_write_tool` still routes the known writers to their
+        // KV-specific validator inside `assess_write`.)
+        is_write_tool(name)
     }
 
     /// Run one tool call against this backend's driver, returning `(content, ok)`.
@@ -2605,13 +2609,53 @@ fn assess_kv_write(name: &str, input: &Json) -> WriteAssessment {
         "kv_config_set" => match (s("parameter"), input.get("value").and_then(Json::as_str)) {
             // A CONFIG value may legitimately be empty (e.g. `save ""`), so `value`
             // isn't filtered for emptiness like the others.
-            (Some(p), Some(v)) => WriteAssessment::NeedsApproval {
-                sql: format!("CONFIG SET {p} {v}"),
-            },
+            (Some(p), Some(v)) => {
+                let mut op = format!("CONFIG SET {p} {v}");
+                // Surface a danger note in the approval prompt for parameters
+                // that relocate/toggle persistence or change auth: a single
+                // Allow on `CONFIG SET dir` + `dbfilename` is the classic
+                // RDB-write server-takeover, indistinguishable in the raw
+                // command from a benign `maxmemory-policy` tweak.
+                if is_dangerous_config_param(p) {
+                    op.push_str(
+                        "\n\u{26a0} This parameter can change where/how Redis persists data or \
+                         its auth, and is a known server-takeover vector. Allow only if this \
+                         exact value was intended.",
+                    );
+                }
+                WriteAssessment::NeedsApproval { sql: op }
+            }
             _ => WriteAssessment::Reject("kv_config_set needs `parameter` and `value`".into()),
         },
         other => WriteAssessment::Reject(format!("unknown KV write tool `{other}`")),
     }
+}
+
+/// CONFIG parameters that can relocate or toggle Redis persistence (the
+/// `CONFIG SET dir` + `dbfilename` RDB-write takeover and its AOF equivalents)
+/// or change authentication/exposure. A `CONFIG SET` of one of these gets a
+/// danger note in the approval prompt so it can't be waved through as routine.
+fn is_dangerous_config_param(param: &str) -> bool {
+    const DANGEROUS: &[&str] = &[
+        "dir",
+        "dbfilename",
+        "appendfilename",
+        "appenddirname",
+        "appendonly",
+        "save",
+        "requirepass",
+        "masterauth",
+        "masteruser",
+        "aclfile",
+        "unixsocket",
+        "logfile",
+        "pidfile",
+        "bind",
+        "protected-mode",
+        "enable-debug-command",
+        "enable-module-command",
+    ];
+    DANGEROUS.contains(&param.trim().to_ascii_lowercase().as_str())
 }
 
 /// The statements of a `propose_changeset` call: the non-empty, trimmed entries of

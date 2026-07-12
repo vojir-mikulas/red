@@ -11,7 +11,13 @@ use red_service::{Command, SessionId};
 
 use flint::prelude::*;
 
-use crate::app::{ActiveConn, AppState};
+use crate::app::{ActiveConn, AppState, TabWorkspace};
+
+/// Cap on retained console entries. The panel re-renders every entry each frame
+/// and keeps them all resident, so an unbounded log would grow render cost and
+/// memory with the whole session's command count; the oldest are dropped past
+/// this (like the other live panels' `MAX_LINES`/`MAX_MESSAGES` caps).
+const MAX_CONSOLE_HISTORY: usize = 500;
 
 /// One submitted command line and its reply, once it arrives.
 pub(crate) struct KvConsoleEntry {
@@ -135,6 +141,10 @@ impl AppState {
             argv: argv.clone(),
             result: None,
         });
+        if console.history.len() > MAX_CONSOLE_HISTORY {
+            let drop = console.history.len() - MAX_CONSOLE_HISTORY;
+            console.history.drain(0..drop);
+        }
         self.service
             .send_to(session, Command::KvCommand { epoch, argv });
         cx.notify();

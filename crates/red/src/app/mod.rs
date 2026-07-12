@@ -124,6 +124,277 @@ pub(crate) struct SplitState {
     pub drag: Option<DragAnchor>,
 }
 
+/// A tab that lives in a split workspace: the two structural facts the
+/// pane-routing and split invariants need, independent of what the tab renders.
+/// Implemented by both [`QueryTab`] (SQL) and `RedisTab` (Redis).
+pub(crate) trait WorkspaceTab {
+    fn pane(&self) -> SplitHalf;
+    fn set_pane(&mut self, half: SplitHalf);
+    fn pinned(&self) -> bool;
+}
+
+/// A view hosting a set of tabs in an optional side-by-side split. The
+/// pane-routing and split-invariant logic lives here once, as provided methods,
+/// for both the SQL query workspace ([`ActiveConn`]) and the Redis workspace
+/// (`RedisView`) — which previously carried byte-for-byte copies that could
+/// drift. An implementor supplies only the field accessors; everything below is
+/// shared. The one deliberate difference (Redis orders pinned tabs first within
+/// a strip; SQL renders pinned in a separate section and keeps raw order) is a
+/// `pins_sort_first` hook rather than a forked method.
+pub(crate) trait TabWorkspace {
+    type Tab: WorkspaceTab;
+
+    fn ws_tabs(&self) -> &[Self::Tab];
+    fn ws_tabs_mut(&mut self) -> &mut Vec<Self::Tab>;
+    fn ws_active(&self) -> usize;
+    fn ws_set_active(&mut self, i: usize);
+    fn ws_split(&self) -> Option<&SplitState>;
+    fn ws_split_mut(&mut self) -> &mut Option<SplitState>;
+
+    /// Whether pinned tabs sort ahead of the rest within a pane's strip.
+    fn pins_sort_first(&self) -> bool {
+        false
+    }
+
+    /// Which half currently receives actions/focus (`Primary` when unsplit).
+    fn focused_half(&self) -> SplitHalf {
+        self.ws_split()
+            .map(|s| s.focus)
+            .unwrap_or(SplitHalf::Primary)
+    }
+
+    /// The global tab index the focused half points at.
+    fn focused_tab_index(&self) -> usize {
+        match self.ws_split() {
+            Some(s) if s.focus == SplitHalf::Secondary => s.secondary,
+            _ => self.ws_active(),
+        }
+    }
+
+    /// Record `i` as `half`'s active tab.
+    fn set_pane_active(&mut self, half: SplitHalf, i: usize) {
+        match half {
+            SplitHalf::Primary => self.ws_set_active(i),
+            SplitHalf::Secondary => {
+                if let Some(s) = self.ws_split_mut() {
+                    s.secondary = i;
+                }
+            }
+        }
+    }
+
+    /// First tab belonging to `half`, if any.
+    fn first_tab_in(&self, half: SplitHalf) -> Option<usize> {
+        self.ws_tabs().iter().position(|t| t.pane() == half)
+    }
+
+    /// The active tab index of `half`: its stored index when that still names a
+    /// tab in the half, else the first tab in the half (`None` if empty).
+    fn pane_active(&self, half: SplitHalf) -> Option<usize> {
+        let stored = match half {
+            SplitHalf::Primary => Some(self.ws_active()),
+            SplitHalf::Secondary => self.ws_split().map(|s| s.secondary),
+        };
+        match stored {
+            Some(i) if self.ws_tabs().get(i).is_some_and(|t| t.pane() == half) => Some(i),
+            _ => self.first_tab_in(half),
+        }
+    }
+
+    /// Global indices of the tabs in `half`, in strip order (pinned first when
+    /// [`pins_sort_first`](Self::pins_sort_first)).
+    fn pane_tab_indices(&self, half: SplitHalf) -> Vec<usize> {
+        let mut idx: Vec<usize> = self
+            .ws_tabs()
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.pane() == half)
+            .map(|(i, _)| i)
+            .collect();
+        if self.pins_sort_first() {
+            // Stable sort: pinned (`true`) first, relative order preserved.
+            idx.sort_by_key(|&i| !self.ws_tabs()[i].pinned());
+        }
+        idx
+    }
+
+    /// Restore the pane invariants after any tab add/close/move/reorder: collapse
+    /// the split when a half has emptied, and re-point each pane's active index at
+    /// a tab it actually owns. The safety net every mutation ends on.
+    fn normalize_panes(&mut self) {
+        if self.ws_tabs().is_empty() {
+            self.ws_set_active(0);
+            *self.ws_split_mut() = None;
+            return;
+        }
+        if self.ws_split().is_some() {
+            let has_primary = self.ws_tabs().iter().any(|t| t.pane() == SplitHalf::Primary);
+            let has_secondary = self
+                .ws_tabs()
+                .iter()
+                .any(|t| t.pane() == SplitHalf::Secondary);
+            if !has_primary || !has_secondary {
+                // A half emptied: collapse, keeping the surviving half's tab on screen.
+                let survivor = if has_primary {
+                    SplitHalf::Primary
+                } else {
+                    SplitHalf::Secondary
+                };
+                let keep = self.pane_active(survivor).unwrap_or(0);
+                for t in self.ws_tabs_mut() {
+                    t.set_pane(SplitHalf::Primary);
+                }
+                *self.ws_split_mut() = None;
+                let clamped = keep.min(self.ws_tabs().len() - 1);
+                self.ws_set_active(clamped);
+                return;
+            }
+            // Both halves populated: clamp each active index into its own pane.
+            if let Some(p) = self.pane_active(SplitHalf::Primary) {
+                self.ws_set_active(p);
+            }
+            if let Some(sec) = self.pane_active(SplitHalf::Secondary) {
+                if let Some(state) = self.ws_split_mut() {
+                    state.secondary = sec;
+                }
+            }
+        } else {
+            // Single pane: every tab lives in `Primary`; keep the index in range.
+            for t in self.ws_tabs_mut() {
+                t.set_pane(SplitHalf::Primary);
+            }
+            if self.ws_active() >= self.ws_tabs().len() {
+                let last = self.ws_tabs().len() - 1;
+                self.ws_set_active(last);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    struct TestTab {
+        pane: SplitHalf,
+        pinned: bool,
+    }
+    impl WorkspaceTab for TestTab {
+        fn pane(&self) -> SplitHalf {
+            self.pane
+        }
+        fn set_pane(&mut self, half: SplitHalf) {
+            self.pane = half;
+        }
+        fn pinned(&self) -> bool {
+            self.pinned
+        }
+    }
+
+    struct TestWs {
+        tabs: Vec<TestTab>,
+        active: usize,
+        split: Option<SplitState>,
+        sort_pins: bool,
+    }
+    impl TabWorkspace for TestWs {
+        type Tab = TestTab;
+        fn ws_tabs(&self) -> &[TestTab] {
+            &self.tabs
+        }
+        fn ws_tabs_mut(&mut self) -> &mut Vec<TestTab> {
+            &mut self.tabs
+        }
+        fn ws_active(&self) -> usize {
+            self.active
+        }
+        fn ws_set_active(&mut self, i: usize) {
+            self.active = i;
+        }
+        fn ws_split(&self) -> Option<&SplitState> {
+            self.split.as_ref()
+        }
+        fn ws_split_mut(&mut self) -> &mut Option<SplitState> {
+            &mut self.split
+        }
+        fn pins_sort_first(&self) -> bool {
+            self.sort_pins
+        }
+    }
+
+    fn tab(pane: SplitHalf, pinned: bool) -> TestTab {
+        TestTab { pane, pinned }
+    }
+    fn split(secondary: usize, focus: SplitHalf) -> SplitState {
+        SplitState {
+            secondary,
+            focus,
+            width: px(500.),
+            drag: None,
+        }
+    }
+
+    #[test]
+    fn pane_active_falls_back_to_first_tab_in_half() {
+        let ws = TestWs {
+            tabs: vec![
+                tab(SplitHalf::Primary, false),
+                tab(SplitHalf::Secondary, false),
+                tab(SplitHalf::Secondary, false),
+            ],
+            active: 0,
+            // Secondary points at a Primary tab (index 0): should fall back to
+            // the first Secondary tab (index 1).
+            split: Some(split(0, SplitHalf::Secondary)),
+            sort_pins: false,
+        };
+        assert_eq!(ws.pane_active(SplitHalf::Primary), Some(0));
+        assert_eq!(ws.pane_active(SplitHalf::Secondary), Some(1));
+        assert_eq!(ws.focused_tab_index(), 0); // stored secondary is 0
+    }
+
+    #[test]
+    fn normalize_collapses_split_when_a_half_empties() {
+        let mut ws = TestWs {
+            // Both tabs in Primary; the split claims a Secondary that no tab owns.
+            tabs: vec![tab(SplitHalf::Primary, false), tab(SplitHalf::Primary, false)],
+            active: 5, // out of range on purpose
+            split: Some(split(1, SplitHalf::Secondary)),
+            sort_pins: false,
+        };
+        ws.normalize_panes();
+        assert!(ws.split.is_none(), "an emptied half collapses the split");
+        assert!(ws.active < ws.tabs.len(), "active index clamped into range");
+        assert!(ws.tabs.iter().all(|t| t.pane == SplitHalf::Primary));
+    }
+
+    #[test]
+    fn pane_tab_indices_orders_pinned_first_only_when_requested() {
+        let tabs = || {
+            vec![
+                tab(SplitHalf::Primary, false),
+                tab(SplitHalf::Primary, true),
+                tab(SplitHalf::Primary, false),
+            ]
+        };
+        let raw = TestWs {
+            tabs: tabs(),
+            active: 0,
+            split: None,
+            sort_pins: false,
+        };
+        assert_eq!(raw.pane_tab_indices(SplitHalf::Primary), vec![0, 1, 2]);
+        let pinned_first = TestWs {
+            tabs: tabs(),
+            active: 0,
+            split: None,
+            sort_pins: true,
+        };
+        // Pinned (index 1) moves ahead; relative order otherwise preserved.
+        assert_eq!(pinned_first.pane_tab_indices(SplitHalf::Primary), vec![1, 0, 2]);
+    }
+}
+
 /// Which key the welcome screen's saved-connection list is ordered by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectSortField {
@@ -615,6 +886,42 @@ impl QueryTab {
     }
 }
 
+impl WorkspaceTab for QueryTab {
+    fn pane(&self) -> SplitHalf {
+        self.pane
+    }
+    fn set_pane(&mut self, half: SplitHalf) {
+        self.pane = half;
+    }
+    fn pinned(&self) -> bool {
+        self.pinned
+    }
+}
+
+impl TabWorkspace for ActiveConn {
+    type Tab = QueryTab;
+    fn ws_tabs(&self) -> &[QueryTab] {
+        &self.tabs
+    }
+    fn ws_tabs_mut(&mut self) -> &mut Vec<QueryTab> {
+        &mut self.tabs
+    }
+    fn ws_active(&self) -> usize {
+        self.active_tab
+    }
+    fn ws_set_active(&mut self, i: usize) {
+        self.active_tab = i;
+    }
+    fn ws_split(&self) -> Option<&SplitState> {
+        self.split.as_ref()
+    }
+    fn ws_split_mut(&mut self) -> &mut Option<SplitState> {
+        &mut self.split
+    }
+    // SQL renders pinned tabs in a separate strip section, so `pane_tab_indices`
+    // keeps raw order (`pins_sort_first` stays the default `false`).
+}
+
 /// The live-connection view state: which connection, its engine version, the
 /// resizable split sizes (caller-owned, per `SplitPane`'s stateless contract),
 /// the schema explorer, and the open query tabs.
@@ -772,72 +1079,11 @@ impl ActiveConn {
         }
     }
 
-    /// The tab index the focused half points at: `active_tab` for the single-pane
-    /// layout (or when the left half is focused), `secondary` when the split's
-    /// right half is focused. The one place "which tab is active" resolves, so run/
-    /// export/filter and the `active*` accessors all target the focused half.
-    pub(crate) fn focused_tab_index(&self) -> usize {
-        match &self.split {
-            Some(s) if s.focus == SplitHalf::Secondary => s.secondary,
-            _ => self.active_tab,
-        }
-    }
-
     /// Point the focused half at tab `i` (a global index that already belongs to that
     /// half; each strip shows only its own tabs, so a strip click never crosses).
     pub(crate) fn set_focused_tab(&mut self, i: usize) {
         let half = self.focused_half();
         self.set_pane_active(half, i);
-    }
-
-    /// Record `i` as the active tab of `half` (the global index its strip highlights
-    /// and its editor/result render).
-    pub(crate) fn set_pane_active(&mut self, half: SplitHalf, i: usize) {
-        match half {
-            SplitHalf::Primary => self.active_tab = i,
-            SplitHalf::Secondary => {
-                if let Some(s) = &mut self.split {
-                    s.secondary = i;
-                }
-            }
-        }
-    }
-
-    /// Global indices of the tabs that belong to `half`, in strip (global) order.
-    pub(crate) fn pane_tab_indices(&self, half: SplitHalf) -> Vec<usize> {
-        self.tabs
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.pane == half)
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    /// First tab belonging to `half`, if any.
-    fn first_tab_in(&self, half: SplitHalf) -> Option<usize> {
-        self.tabs.iter().position(|t| t.pane == half)
-    }
-
-    /// The active tab of `half`: its stored index when that still names a tab in the
-    /// half, else the first tab in the half (or `None` when the half is empty).
-    pub(crate) fn pane_active(&self, half: SplitHalf) -> Option<usize> {
-        let stored = match half {
-            SplitHalf::Primary => Some(self.active_tab),
-            SplitHalf::Secondary => self.split.as_ref().map(|s| s.secondary),
-        };
-        match stored {
-            Some(i) if self.tabs.get(i).is_some_and(|t| t.pane == half) => Some(i),
-            _ => self.first_tab_in(half),
-        }
-    }
-
-    /// Which half currently receives focus: the split's focused half, or `Primary`
-    /// in the single-pane layout.
-    pub(crate) fn focused_half(&self) -> SplitHalf {
-        self.split
-            .as_ref()
-            .map(|s| s.focus)
-            .unwrap_or(SplitHalf::Primary)
     }
 
     /// The focus handle for the result grid in `half`; the second half has its own
@@ -877,54 +1123,6 @@ impl ActiveConn {
             .iter_mut()
             .filter_map(|t| t.result.as_mut())
             .find(|g| g.epoch == epoch)
-    }
-
-    /// Restore the pane invariants after any tab mutation: collapse the split when a
-    /// half has emptied (its last tab closed or dragged away; everything folds back
-    /// to one pane), and re-point each pane's active index at a tab it actually owns.
-    /// The single safety net every add / close / move / reorder ends on.
-    pub(crate) fn normalize_panes(&mut self) {
-        if self.tabs.is_empty() {
-            self.active_tab = 0;
-            self.split = None;
-            return;
-        }
-        if self.split.is_some() {
-            let has_primary = self.tabs.iter().any(|t| t.pane == SplitHalf::Primary);
-            let has_secondary = self.tabs.iter().any(|t| t.pane == SplitHalf::Secondary);
-            if !has_primary || !has_secondary {
-                // A half emptied: collapse, keeping the surviving half's tab on screen.
-                let survivor = if has_primary {
-                    SplitHalf::Primary
-                } else {
-                    SplitHalf::Secondary
-                };
-                let keep = self.pane_active(survivor).unwrap_or(0);
-                for t in &mut self.tabs {
-                    t.pane = SplitHalf::Primary;
-                }
-                self.split = None;
-                self.active_tab = keep.min(self.tabs.len() - 1);
-                return;
-            }
-            // Both halves populated: clamp each active index into its own pane.
-            if let Some(p) = self.pane_active(SplitHalf::Primary) {
-                self.active_tab = p;
-            }
-            if let Some(s) = self.pane_active(SplitHalf::Secondary) {
-                if let Some(state) = &mut self.split {
-                    state.secondary = s;
-                }
-            }
-        } else {
-            // Single pane: every tab lives in `Primary`; keep `active_tab` in range.
-            for t in &mut self.tabs {
-                t.pane = SplitHalf::Primary;
-            }
-            if self.active_tab >= self.tabs.len() {
-                self.active_tab = self.tabs.len() - 1;
-            }
-        }
     }
 
     /// Find the open plan carrying `epoch`, across all tabs; `PlanReady`/

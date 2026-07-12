@@ -106,10 +106,12 @@ impl PostgresDriver {
     pub async fn connect(dsn: &str, read_only: bool) -> Result<Self> {
         // TLS for Postgres isn't wired yet (the driver dials `NoTls`; adding it
         // needs a rustls connector — tracked in `security-review-2026-07.md`).
-        // Rather than silently connect in cleartext when the form's TLS toggle
-        // is on, refuse with an actionable message. The `sslmode=require` marker
-        // is what `ConnectionConfig::dsn()` emits for a TLS Postgres connection.
-        if dsn.contains("sslmode=require") || dsn.contains("sslmode=verify") {
+        // Rather than silently connect in cleartext when TLS is requested, refuse
+        // with an actionable message. Uses the same TLS detection as the DSN
+        // parser (`sslmode=`/`ssl=true`/`tls=true`/`require_ssl=true`), not a
+        // narrow `sslmode=require` substring match that a raw `?ssl=true` DSN
+        // would slip past into a silent cleartext connection.
+        if red_core::dsn_requests_tls(dsn) {
             return Err(RedError::Connect(
                 "TLS for PostgreSQL isn't supported yet in this build — turn TLS off, \
                  or tunnel the connection over SSH instead."

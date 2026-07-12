@@ -12,7 +12,7 @@ use gpui::{div, prelude::*, px, Context, Hsla, MouseButton, Pixels, Point, Share
 use red_core::{DbKind, FkEdge, ObjectKind, SchemaMeta, TableDetail};
 use red_service::Command;
 
-use crate::app::{ActiveConn, AppState, Phase, TabCloseScope};
+use crate::app::{ActiveConn, AppState, Phase, TabCloseScope, TabWorkspace};
 use crate::sql::CompletionContext;
 
 /// How many candidates the popup ever shows; the editor renders at most 8, but

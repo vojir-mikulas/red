@@ -42,6 +42,14 @@ impl Decoded {
     }
 
     fn write(&self, out: &mut String, depth: usize) {
+        // Guard the render recursion the same way the parsers guard theirs: a
+        // decoder can build a value tree deeper than MAX_DEPTH (pickle's build
+        // loop is iterative and imposes no depth cap), and rendering it would
+        // otherwise recurse once per level and blow the stack.
+        if depth > MAX_DEPTH {
+            out.push('…');
+            return;
+        }
         match self {
             Decoded::Null => out.push_str("null"),
             Decoded::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -389,7 +397,12 @@ fn render_protobuf(fields: &[PbField], out: &mut String, depth: usize) {
                 // A length-delimited field is a nested message, a string, or raw
                 // bytes. Prefer a nested message when it parses cleanly; else a
                 // printable string; else hex.
-                if let Some(nested) = protobuf_message(data).filter(|m| !m.is_empty()) {
+                // Only recurse into a nested message while under the depth cap;
+                // a payload of nested length-delimited wrappers would otherwise
+                // reparse-and-recurse per level and overflow the stack.
+                if let Some(nested) =
+                    protobuf_message(data).filter(|m| !m.is_empty() && depth < MAX_DEPTH)
+                {
                     out.push_str(&format!("field {n} (message):\n"));
                     render_protobuf(&nested, out, depth + 1);
                 } else if let Ok(s) = std::str::from_utf8(data) {
@@ -730,5 +743,45 @@ mod tests {
     fn unknown_pickle_opcode_bails() {
         // A lone unsupported opcode should not panic or half-decode.
         assert!(decode_pickle(b"\x80\x02\xfe").is_none());
+    }
+
+    #[test]
+    fn deeply_nested_render_does_not_overflow() {
+        // A decoder can build a value tree deeper than any stack tolerates
+        // (pickle's build loop is iterative, no depth cap); rendering it must
+        // not recurse unbounded. The `Decoded::write` depth guard truncates.
+        let mut d = Decoded::Int(1);
+        for _ in 0..5_000 {
+            d = Decoded::Array(vec![d]);
+        }
+        let out = d.render(); // must not stack-overflow
+        assert!(out.contains('…'), "depth guard should truncate the render");
+    }
+
+    #[test]
+    fn deeply_nested_protobuf_does_not_overflow() {
+        fn pb_varint(mut v: u64, out: &mut Vec<u8>) {
+            loop {
+                let mut b = (v & 0x7f) as u8;
+                v >>= 7;
+                if v != 0 {
+                    b |= 0x80;
+                }
+                out.push(b);
+                if v == 0 {
+                    break;
+                }
+            }
+        }
+        // Nest thousands of length-delimited wrappers, each a message holding
+        // the next. Without the render depth guard this overflows the stack.
+        let mut inner = vec![0x08u8, 0x01]; // innermost: field 1 varint 1
+        for _ in 0..2_000 {
+            let mut wrapped = vec![0x0au8]; // field 1, wire type 2 (length-delimited)
+            pb_varint(inner.len() as u64, &mut wrapped);
+            wrapped.extend_from_slice(&inner);
+            inner = wrapped;
+        }
+        let _ = decode_protobuf(&inner); // must not stack-overflow
     }
 }
