@@ -732,10 +732,8 @@ pub struct KeyspaceEvent {
 pub fn parse_keyspace_channel(channel: &str, payload: &str) -> Option<KeyspaceEvent> {
     let (is_keyspace, rest) = if let Some(r) = channel.strip_prefix("__keyspace@") {
         (true, r)
-    } else if let Some(r) = channel.strip_prefix("__keyevent@") {
-        (false, r)
     } else {
-        return None;
+        (false, channel.strip_prefix("__keyevent@")?)
     };
     // `rest` is `<db>__:<suffix>`: the db index, then the key (keyspace) or the
     // event name (keyevent).
