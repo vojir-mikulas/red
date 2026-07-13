@@ -1428,12 +1428,15 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     );
                     continue;
                 };
+                // Its own slot (not `kv_value`): a sibling value read must not
+                // abort an in-progress page scan and leave the sub-grid stuck
+                // on "Loading…" (an interrupted scan emits no event).
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.kv_value.take() {
+                if let Some(prev) = entry.kv_collection.take() {
                     prev.abort();
                 }
                 let abort = AbortSignal::new();
-                entry.kv_value = Some(abort.clone());
+                entry.kv_collection = Some(abort.clone());
                 let events = events.clone();
                 tokio::spawn(async move {
                     match driver
@@ -1732,6 +1735,22 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(&events, session_id, Event::Error("not connected".into()));
                     continue;
                 };
+                // Defense in depth alongside the driver's own `classify_command`
+                // refusal (see `RedisDriver::command`): a read-only connection
+                // rejects any non-read console command at the service boundary
+                // too, so a classifier gap can't let a write reach the engine.
+                // The driver still runs the read/write split for reads it does
+                // allow.
+                if state.read_only
+                    && red_core::kv::classify_command(&argv) != red_core::kv::CommandClass::Read
+                {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("this connection is read-only".into()),
+                    );
+                    continue;
+                }
                 let Some(driver) = state.driver.as_kv().cloned() else {
                     emit(
                         &events,
@@ -1811,15 +1830,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             driver.set_remove(key, members).await.map(|_| ())
                         }
                         KvEdit::SetReplace { key, old, new } => {
-                            // Rename a member: drop the old, add the new. Both
-                            // no-op cleanly if the set already moved on.
-                            match driver.set_remove(key, std::slice::from_ref(old)).await {
-                                Ok(_) => driver
-                                    .set_add(key, std::slice::from_ref(new))
-                                    .await
-                                    .map(|_| ()),
-                                Err(e) => Err(e),
-                            }
+                            // Atomic remove+add (one MULTI): a failure mid-way
+                            // can't drop the old member without adding the new.
+                            driver.set_replace(key, old, new).await
                         }
                         KvEdit::ZSetAdd { key, member, score } => {
                             driver.zset_add(key, member, *score).await

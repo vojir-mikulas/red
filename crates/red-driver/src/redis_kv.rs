@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 use red_core::kv::{
     ClientInfo, CollectionKind, CommandClass, KeyMeta, KvCollection, KvCollectionPage, KvElement,
     KvMessage, KvScanPage, KvStreamPage, KvType, KvValue, PendingEntry, RespValue, ScanBudget,
-    ScanCursor, SlowlogEntry, StreamConsumer, StreamEntry, StreamGroup,
+    ScanCursor, SlowlogEntry, StreamConsumer, StreamEntry, StreamGroup, StringTtl,
 };
 use red_core::{RedError, Result, Value};
 use redis::aio::MultiplexedConnection;
@@ -23,6 +23,11 @@ use crate::AbortSignal;
 /// caller pages the rest (see docs/plans/redis.md's "a few hundred elements"
 /// guidance).
 const SMALL_COLLECTION_THRESHOLD: u64 = 200;
+/// How many times a cluster scan retries the *same* master + cursor on a
+/// transient error before giving up on that master. Retrying in place (rather
+/// than skipping ahead) is what keeps a brief failover/partition from silently
+/// dropping a master's un-scanned keys.
+const MAX_SCAN_NODE_RETRIES: u32 = 3;
 /// Display cap for a string value preview, mirroring the SQL grid's
 /// `Value::Capped` cell cap (`red_driver::DEFAULT_DISPLAY_CELL_CAP`) rather
 /// than reusing it directly: a Redis string preview is a one-off inspector
@@ -222,38 +227,69 @@ impl RedisDriver {
         };
         let deadline = Instant::now() + budget.wall_clock;
         let mut keys: Vec<KeyMeta> = Vec::new();
+        // Retries against the current master at the current cursor. Only reset
+        // when we make forward progress (a fully successful round trip) or give
+        // up and advance to the next master.
+        let mut node_retries = 0u32;
         while node < cl.masters.len() {
             if abort.is_aborted() {
                 return Err(RedError::Interrupted);
             }
             let mut conn = cl.masters[node].clone();
-            // Isolate a single unreachable/failing master (node down, failover
-            // in progress, partial partition): skip it and continue the fan-out
-            // rather than propagating `?` and failing the whole keyspace browse
-            // while every other shard is healthy.
-            let scanned =
-                scan_once(&mut conn, cur, pattern, type_filter, budget.count_hint).await;
+            // On a transient error (failover in progress, brief partition, a
+            // dropped multiplexed connection) retry the SAME cursor a few times
+            // before isolating the master — advancing past it would silently
+            // drop the keys it had not yet handed us. Only a master that stays
+            // unreachable across every retry is skipped, so the fan-out still
+            // survives a genuinely-down shard without failing the whole browse.
+            let scanned = scan_once(&mut conn, cur, pattern, type_filter, budget.count_hint).await;
             let (next_cur, batch) = match scanned {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!("Redis cluster scan skipped master {node}: {e}");
+                    node_retries += 1;
+                    if node_retries <= MAX_SCAN_NODE_RETRIES {
+                        tracing::warn!(
+                            "Redis cluster scan retry {node_retries} on master {node} at cursor {cur}: {e}"
+                        );
+                        continue;
+                    }
+                    tracing::warn!(
+                        "Redis cluster scan skipped master {node} after {} retries: {e}",
+                        node_retries - 1
+                    );
+                    node_retries = 0;
                     node += 1;
                     cur = 0;
                     continue;
                 }
             };
-            cur = next_cur;
             if !batch.is_empty() {
                 match fetch_key_meta_batch(&mut conn, &batch).await {
                     Ok(metas) => keys.extend(metas),
                     Err(e) => {
-                        tracing::warn!("Redis cluster metadata skipped master {node}: {e}");
+                        // Don't advance `cur`: retry this position so the batch
+                        // `SCAN` already returned isn't lost to a metadata blip.
+                        node_retries += 1;
+                        if node_retries <= MAX_SCAN_NODE_RETRIES {
+                            tracing::warn!(
+                                "Redis cluster metadata retry {node_retries} on master {node}: {e}"
+                            );
+                            continue;
+                        }
+                        tracing::warn!(
+                            "Redis cluster metadata skipped master {node} after {} retries: {e}",
+                            node_retries - 1
+                        );
+                        node_retries = 0;
                         node += 1;
                         cur = 0;
                         continue;
                     }
                 }
             }
+            // Forward progress: commit the new cursor and clear the retry count.
+            node_retries = 0;
+            cur = next_cur;
             // This node exhausted: advance to the next master, its cursor at 0.
             if cur == 0 {
                 node += 1;
@@ -320,9 +356,13 @@ async fn scan_once(
     if let Some(t) = type_filter {
         cmd.arg("TYPE").arg(t);
     }
-    cmd.query_async(conn)
+    // Read keys as raw bytes (binary-safe) so one non-UTF-8 key doesn't fail
+    // the whole scan; convert lossily for display.
+    let (next, raw): (u64, Vec<Vec<u8>>) = cmd
+        .query_async(conn)
         .await
-        .map_err(|e| RedError::Driver(e.to_string()))
+        .map_err(|e| RedError::Driver(e.to_string()))?;
+    Ok((next, raw.into_iter().map(lossy_utf8).collect()))
 }
 
 /// Discover a cluster's masters via `CLUSTER SLOTS` and open a dedicated
@@ -748,10 +788,13 @@ impl KvDriver for RedisDriver {
             }
             let mut cmd = redis::cmd(cmd_name);
             cmd.arg(key).arg(cur).arg("COUNT").arg(budget.count_hint);
-            let (next_cur, flat): (u64, Vec<String>) = cmd
+            // Binary-safe: decode raw bytes so a non-UTF-8 member/field doesn't
+            // fail the page (see [`lossy_utf8`]).
+            let (next_cur, raw): (u64, Vec<Vec<u8>>) = cmd
                 .query_async(&mut conn)
                 .await
                 .map_err(|e| RedError::Driver(e.to_string()))?;
+            let flat: Vec<String> = raw.into_iter().map(lossy_utf8).collect();
             cur = next_cur;
             match kind {
                 CollectionKind::Set => elements.extend(flat.into_iter().map(KvElement::Member)),
@@ -791,13 +834,16 @@ impl KvDriver for RedisDriver {
         } else {
             (-count, -1)
         };
-        redis::cmd("LRANGE")
+        // Binary-safe: decode raw bytes so a non-UTF-8 list item doesn't fail
+        // the window (see [`lossy_utf8`]).
+        let raw: Vec<Vec<u8>> = redis::cmd("LRANGE")
             .arg(key)
             .arg(start)
             .arg(stop)
             .query_async(&mut conn)
             .await
-            .map_err(|e| RedError::Driver(e.to_string()))
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        Ok(raw.into_iter().map(lossy_utf8).collect())
     }
 
     async fn read_stream_range(
@@ -911,7 +957,21 @@ impl KvDriver for RedisDriver {
         for arg in &argv[1..] {
             cmd.arg(arg);
         }
-        let mut conn = self.conn.clone();
+        // Under a cluster the seed connection only owns ~1/N of the slots and a
+        // plain `MultiplexedConnection` doesn't follow `MOVED`, so a console
+        // command for a key on another shard would come back as a raw `MOVED`
+        // line. Route by the command's key (best-effort: `argv[1]`, where the
+        // key sits for the overwhelming majority of commands) the same way the
+        // single-key methods do; keyless commands fall back to the seed and run
+        // on any node. A stale slot map mid-reshard can still surface `MOVED`,
+        // matching the single-key paths.
+        let mut conn = match &self.cluster {
+            Some(_) => match argv.get(1) {
+                Some(key) => self.route(key),
+                None => self.conn.clone(),
+            },
+            None => self.conn.clone(),
+        };
         match cmd.query_async::<redis::Value>(&mut conn).await {
             Ok(value) => Ok(to_resp_value(value)),
             // A server-reported command error (WRONGTYPE, a bad arity, an
@@ -928,13 +988,26 @@ impl KvDriver for RedisDriver {
         }
     }
 
-    async fn set_string(&self, key: &str, value: String, ttl: Option<Duration>) -> Result<()> {
+    async fn set_string(&self, key: &str, value: String, ttl: StringTtl) -> Result<()> {
         self.check_writable()?;
         let mut conn = self.route(key);
         let mut cmd = redis::cmd("SET");
         cmd.arg(key).arg(value);
-        if let Some(ttl) = ttl {
-            cmd.arg("EX").arg(ttl.as_secs().max(1));
+        match ttl {
+            // `KEEPTTL` retains the server's actual remaining expiry exactly, so
+            // editing a value never resets the countdown (nor rounds a
+            // sub-second remainder up to a whole second, as re-applying an `EX`
+            // snapshot would).
+            StringTtl::Keep => {
+                cmd.arg("KEEPTTL");
+            }
+            // Plain `SET` clears any expiry — the right default for a new key.
+            StringTtl::Clear => {}
+            // `PX` (milliseconds), not `EX`, so an explicit sub-second TTL keeps
+            // its precision instead of being floored to 1s.
+            StringTtl::Set(d) => {
+                cmd.arg("PX").arg((d.as_millis() as u64).max(1));
+            }
         }
         cmd.query_async(&mut conn)
             .await
@@ -997,6 +1070,27 @@ impl KvDriver for RedisDriver {
             cmd.arg(m);
         }
         cmd.query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    async fn set_replace(&self, key: &str, old: &str, new: &str) -> Result<()> {
+        self.check_writable()?;
+        let mut conn = self.route(key);
+        // One `MULTI`/`EXEC` so the remove+add commit together: a failure
+        // between them can't leave the set missing both members. Both commands
+        // touch the same `key` (same slot), so this is valid under a cluster.
+        redis::pipe()
+            .atomic()
+            .cmd("SREM")
+            .arg(key)
+            .arg(old)
+            .ignore()
+            .cmd("SADD")
+            .arg(key)
+            .arg(new)
+            .ignore()
+            .query_async::<()>(&mut conn)
             .await
             .map_err(|e| RedError::Driver(e.to_string()))
     }
@@ -1068,9 +1162,11 @@ impl KvDriver for RedisDriver {
         self.check_writable()?;
         let mut conn = self.route(key);
         match ttl {
-            Some(ttl) => redis::cmd("EXPIRE")
+            // `PEXPIRE` (milliseconds), not `EXPIRE`, so a sub-second TTL keeps
+            // its precision instead of being floored to a whole second.
+            Some(ttl) => redis::cmd("PEXPIRE")
                 .arg(key)
-                .arg(ttl.as_secs().max(1))
+                .arg((ttl.as_millis() as u64).max(1))
                 .query_async(&mut conn)
                 .await
                 .map_err(|e| RedError::Driver(e.to_string())),
@@ -1324,6 +1420,20 @@ fn cap_string_value(bytes: Vec<u8>) -> Value {
     })
 }
 
+/// Redis keys, set members, hash fields and list items are all binary-safe, so
+/// decoding a `SCAN`/`SMEMBERS`/`LRANGE` reply straight into `Vec<String>`
+/// makes redis-rs reject the *whole* batch on a single non-UTF-8 element —
+/// failing the entire browse for one binary key. Read raw bytes instead and
+/// convert lossily, so a binary element degrades to a replacement-char label
+/// (matching how binary string *values* fall back to a `Blob`) rather than
+/// taking the page down with it.
+fn lossy_utf8(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
+}
+
 /// `HGETALL`/`ZRANGE WITHSCORES` (and `SMEMBERS`/`LRANGE 0 -1`) return a flat
 /// `[a, b, a, b, ...]` array; pair it up into `(a, b)` tuples. A trailing
 /// unpaired element (a torn reply, shouldn't happen) is dropped rather than
@@ -1376,10 +1486,13 @@ async fn load_or_probe<T>(
     } else if load_cmd == "LRANGE" {
         cmd.arg(0).arg(-1);
     }
-    let flat: Vec<String> = cmd
+    // Binary-safe read: decode raw bytes, then convert lossily (see
+    // [`lossy_utf8`]) so a binary member/field doesn't fail the whole load.
+    let raw: Vec<Vec<u8>> = cmd
         .query_async(conn)
         .await
         .map_err(|e| RedError::Driver(e.to_string()))?;
+    let flat: Vec<String> = raw.into_iter().map(lossy_utf8).collect();
     Ok(KvCollection::Loaded(map(flat)))
 }
 
@@ -2071,7 +2184,10 @@ mod tests {
         let driver = RedisDriver::connect(&master_dsn, false).await.unwrap();
         assert_eq!(driver.topology(), KvTopology::Standalone);
         let key = tag("sentinel");
-        driver.set_string(&key, "v".into(), None).await.unwrap();
+        driver
+            .set_string(&key, "v".into(), StringTtl::Clear)
+            .await
+            .unwrap();
         assert!(driver.probe_key(&key).await.unwrap().is_some());
         driver
             .delete_keys(std::slice::from_ref(&key))
@@ -2107,7 +2223,7 @@ mod tests {
         let n = 300usize;
         for i in 0..n {
             driver
-                .set_string(&format!("{prefix}:{i}"), "v".into(), None)
+                .set_string(&format!("{prefix}:{i}"), "v".into(), StringTtl::Clear)
                 .await
                 .unwrap();
         }
@@ -2998,7 +3114,10 @@ mod tests {
         let url = url_or_skip!();
         let driver = RedisDriver::connect(&url, true).await.unwrap();
         let key = tag("readonly-refused");
-        assert!(driver.set_string(&key, "v".into(), None).await.is_err());
+        assert!(driver
+            .set_string(&key, "v".into(), StringTtl::Clear)
+            .await
+            .is_err());
         assert!(driver.set_field(&key, "f", "v".into()).await.is_err());
         assert!(driver.set_ttl(&key, None).await.is_err());
         assert!(driver.rename_key(&key, "other").await.is_err());
@@ -3020,7 +3139,11 @@ mod tests {
         let renamed = tag("edit-string-renamed");
 
         driver
-            .set_string(&key, "hello".into(), Some(Duration::from_secs(60)))
+            .set_string(
+                &key,
+                "hello".into(),
+                StringTtl::Set(Duration::from_secs(60)),
+            )
             .await
             .unwrap();
         let meta = driver.probe_key(&key).await.unwrap().unwrap();

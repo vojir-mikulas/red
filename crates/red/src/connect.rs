@@ -846,9 +846,7 @@ impl AppState {
                             .child(self.name_input.clone())
                             .children(field_error_line(theme, field_err(&errors, FormField::Name))),
                     )
-                    .child(
-                        labeled_field("Engine", theme).child(self.engine_combo.clone()),
-                    )
+                    .child(labeled_field("Engine", theme).child(self.engine_combo.clone()))
                     .children(conn_str_field)
                     .child(self.render_connection_fields(form, is_file, &errors, theme))
                     .children(self.render_ssh_section(form, is_file, &errors, theme, cx))
@@ -1326,7 +1324,6 @@ impl AppState {
                     .on_click(cx.listener(|this, _, _, cx| this.save_form(true, cx))),
             )
     }
-
 }
 
 /// The first validation message tagged for `field`, if any; the per-input lookup

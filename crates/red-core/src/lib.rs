@@ -147,7 +147,11 @@ pub fn dsn_requests_tls(dsn: &str) -> bool {
     if DbKind::scheme_is_tls(scheme) {
         return true;
     }
-    let q = rest.split(['?', '#']).nth(1).unwrap_or("").to_ascii_lowercase();
+    let q = rest
+        .split(['?', '#'])
+        .nth(1)
+        .unwrap_or("")
+        .to_ascii_lowercase();
     (q.contains("sslmode=") && !q.contains("sslmode=disable"))
         || q.contains("require_ssl=true")
         || q.contains("ssl=true")

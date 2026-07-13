@@ -228,7 +228,10 @@ pub(crate) trait TabWorkspace {
             return;
         }
         if self.ws_split().is_some() {
-            let has_primary = self.ws_tabs().iter().any(|t| t.pane() == SplitHalf::Primary);
+            let has_primary = self
+                .ws_tabs()
+                .iter()
+                .any(|t| t.pane() == SplitHalf::Primary);
             let has_secondary = self
                 .ws_tabs()
                 .iter()
@@ -357,7 +360,10 @@ mod workspace_tests {
     fn normalize_collapses_split_when_a_half_empties() {
         let mut ws = TestWs {
             // Both tabs in Primary; the split claims a Secondary that no tab owns.
-            tabs: vec![tab(SplitHalf::Primary, false), tab(SplitHalf::Primary, false)],
+            tabs: vec![
+                tab(SplitHalf::Primary, false),
+                tab(SplitHalf::Primary, false),
+            ],
             active: 5, // out of range on purpose
             split: Some(split(1, SplitHalf::Secondary)),
             sort_pins: false,
@@ -391,7 +397,10 @@ mod workspace_tests {
             sort_pins: true,
         };
         // Pinned (index 1) moves ahead; relative order otherwise preserved.
-        assert_eq!(pinned_first.pane_tab_indices(SplitHalf::Primary), vec![1, 0, 2]);
+        assert_eq!(
+            pinned_first.pane_tab_indices(SplitHalf::Primary),
+            vec![1, 0, 2]
+        );
     }
 }
 

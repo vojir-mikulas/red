@@ -32,6 +32,38 @@ enum Decoded {
 /// Guard against a pathological deeply-nested input blowing the stack.
 const MAX_DEPTH: usize = 64;
 
+/// Guard against a pathological *wide* input exhausting memory. The pickle
+/// build loop can clone whole subtrees (DUP, MEMOIZE, BINGET), so a tiny blob
+/// of repeated DUP+APPEND doubles the node count every couple of bytes — 2^n
+/// growth from ~n bytes. Bounding the total cloned node count turns that DoS
+/// into a clean fall-back-to-hex.
+const MAX_NODES: usize = 2_000_000;
+
+/// Count the nodes in a value tree, stopping early once `cap` is reached.
+/// Iterative (an explicit worklist, not recursion) so counting a deeply nested
+/// tree can't itself overflow the stack.
+fn node_count_capped(v: &Decoded, cap: usize) -> usize {
+    let mut count = 0usize;
+    let mut work = vec![v];
+    while let Some(cur) = work.pop() {
+        count += 1;
+        if count > cap {
+            return count;
+        }
+        match cur {
+            Decoded::Array(items) => work.extend(items.iter()),
+            Decoded::Map(pairs) => {
+                for (k, val) in pairs {
+                    work.push(k);
+                    work.push(val);
+                }
+            }
+            _ => {}
+        }
+    }
+    count
+}
+
 impl Decoded {
     /// Render as a readable, indented, JSON-ish tree (2-space indent, matching
     /// the inspector's `pretty_json`).
@@ -360,9 +392,15 @@ fn protobuf_message(bytes: &[u8]) -> Option<Vec<PbField>> {
 
 fn varint(cur: &mut Cur) -> Option<u64> {
     let mut v = 0u64;
-    for shift in (0..10).map(|i| i * 7) {
+    for i in 0..10 {
         let b = cur.u8()?;
-        v |= ((b & 0x7f) as u64) << shift;
+        // The 10th byte only contributes bit 63, so any payload above 0x01
+        // there overflows a u64: a real protobuf varint never sets those bits.
+        // Reject rather than silently truncating them away.
+        if i == 9 && b & 0x7f > 0x01 {
+            return None;
+        }
+        v |= ((b & 0x7f) as u64) << (i * 7);
         if b & 0x80 == 0 {
             return Some(v);
         }
@@ -434,6 +472,8 @@ pub fn decode_pickle(bytes: &[u8]) -> Option<String> {
     let mut stack: Vec<Decoded> = Vec::new();
     let mut marks: Vec<usize> = Vec::new();
     let mut memo: std::collections::HashMap<u64, Decoded> = std::collections::HashMap::new();
+    // Running count of nodes produced by cloning ops; bounds the 2^n blow-up.
+    let mut total_nodes: usize = 0;
 
     loop {
         let op = cur.u8()?;
@@ -450,8 +490,16 @@ pub fn decode_pickle(bytes: &[u8]) -> Option<String> {
                 stack.pop()?; // POP
             }
             b'2' => {
-                let top = stack.last()?.clone(); // DUP
-                stack.push(top);
+                // DUP: clones the top of the stack. Bound the clone so a
+                // DUP+APPEND loop can't grow the tree exponentially.
+                let top = stack.last()?;
+                let n = node_count_capped(top, MAX_NODES - total_nodes);
+                if total_nodes + n > MAX_NODES {
+                    return None;
+                }
+                total_nodes += n;
+                let dup = top.clone();
+                stack.push(dup);
             }
             b'N' => stack.push(Decoded::Null),
             0x88 => stack.push(Decoded::Bool(true)),
@@ -533,23 +581,58 @@ pub fn decode_pickle(bytes: &[u8]) -> Option<String> {
             }
             0x94 => {
                 // MEMOIZE
-                memo.insert(memo.len() as u64, stack.last()?.clone());
+                let top = stack.last()?;
+                let n = node_count_capped(top, MAX_NODES - total_nodes);
+                if total_nodes + n > MAX_NODES {
+                    return None;
+                }
+                total_nodes += n;
+                memo.insert(memo.len() as u64, top.clone());
             }
             b'q' => {
                 let i = cur.u8()? as u64; // BINPUT
-                memo.insert(i, stack.last()?.clone());
+                let top = stack.last()?;
+                let n = node_count_capped(top, MAX_NODES - total_nodes);
+                if total_nodes + n > MAX_NODES {
+                    return None;
+                }
+                total_nodes += n;
+                memo.insert(i, top.clone());
             }
             b'r' => {
                 let i = le_uint(&mut cur, 4)?; // LONG_BINPUT
-                memo.insert(i, stack.last()?.clone());
+                let top = stack.last()?;
+                let n = node_count_capped(top, MAX_NODES - total_nodes);
+                if total_nodes + n > MAX_NODES {
+                    return None;
+                }
+                total_nodes += n;
+                memo.insert(i, top.clone());
             }
             b'h' => {
                 let i = cur.u8()? as u64; // BINGET
-                stack.push(memo.get(&i).cloned().unwrap_or(Decoded::Null));
+                                          // A reference to an undefined memo slot means the pickle is
+                                          // malformed/truncated: bail (fall back to hex) rather than
+                                          // fabricating a Null.
+                let v = memo.get(&i)?;
+                let n = node_count_capped(v, MAX_NODES - total_nodes);
+                if total_nodes + n > MAX_NODES {
+                    return None;
+                }
+                total_nodes += n;
+                let v = v.clone();
+                stack.push(v);
             }
             b'j' => {
                 let i = le_uint(&mut cur, 4)?; // LONG_BINGET
-                stack.push(memo.get(&i).cloned().unwrap_or(Decoded::Null));
+                let v = memo.get(&i)?;
+                let n = node_count_capped(v, MAX_NODES - total_nodes);
+                if total_nodes + n > MAX_NODES {
+                    return None;
+                }
+                total_nodes += n;
+                let v = v.clone();
+                stack.push(v);
             }
             0x93 => {
                 // STACK_GLOBAL: module, name on stack
@@ -617,14 +700,16 @@ fn pickle_long(cur: &mut Cur) -> Option<i64> {
 }
 
 fn pickle_str(cur: &mut Cur, len_bytes: usize) -> Option<Decoded> {
-    let n = le_uint(cur, len_bytes)? as usize;
+    // `usize::try_from` (not `as usize`) so an 8-byte length above 2^32 is
+    // rejected on a 32-bit target rather than wrapping to a wrong span.
+    let n = usize::try_from(le_uint(cur, len_bytes)?).ok()?;
     Some(Decoded::Str(
         String::from_utf8_lossy(cur.take(n)?).into_owned(),
     ))
 }
 
 fn pickle_bytes(cur: &mut Cur, len_bytes: usize) -> Option<Decoded> {
-    let n = le_uint(cur, len_bytes)? as usize;
+    let n = usize::try_from(le_uint(cur, len_bytes)?).ok()?;
     Some(Decoded::Bytes(cur.take(n)?.to_vec()))
 }
 
@@ -743,6 +828,39 @@ mod tests {
     fn unknown_pickle_opcode_bails() {
         // A lone unsupported opcode should not panic or half-decode.
         assert!(decode_pickle(b"\x80\x02\xfe").is_none());
+    }
+
+    #[test]
+    fn pickle_dup_append_bomb_bails_without_oom() {
+        // EMPTY_LIST then many DUP('2')+APPEND('a') pairs: each doubles the
+        // node count. The node budget must turn this into a clean `None`
+        // (fall back to hex) rather than exhausting memory. 30 pairs would be
+        // 2^30 nodes unguarded.
+        let mut bytes = vec![0x80, 0x02, b']'];
+        for _ in 0..30 {
+            bytes.push(b'2');
+            bytes.push(b'a');
+        }
+        bytes.push(b'.');
+        assert!(decode_pickle(&bytes).is_none());
+    }
+
+    #[test]
+    fn pickle_binget_missing_memo_bails() {
+        // BINGET ('h') index 5 with an empty memo is malformed: bail rather
+        // than fabricating a Null.
+        assert!(decode_pickle(b"\x80\x02h\x05.").is_none());
+    }
+
+    #[test]
+    fn protobuf_rejects_overlong_varint() {
+        // A 10-byte varint whose final byte sets bits above 0x01 would overflow
+        // a u64; reject it instead of silently truncating.
+        let overlong = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f];
+        assert!(varint(&mut Cur::new(&overlong)).is_none());
+        // The boundary value 0x01 in the 10th byte is still a valid u64.
+        let ok = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        assert!(varint(&mut Cur::new(&ok)).is_some());
     }
 
     #[test]

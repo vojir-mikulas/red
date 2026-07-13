@@ -55,6 +55,9 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "OpenSSL",
+    # xxhash-rust (via the redis driver) is BSL-1.0: a permissive, OSI-approved,
+    # FSF-free license.
+    "BSL-1.0",
 ]
 confidence-threshold = 0.8
 

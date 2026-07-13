@@ -16,7 +16,7 @@ use futures_util::Stream;
 use red_core::kv::{
     ClientInfo, CollectionKind, KeyMeta, KvCollectionPage, KvMessage, KvScanPage, KvStreamPage,
     KvValue, PendingEntry, RespValue, ScanBudget, ScanCursor, SlowlogEntry, StreamConsumer,
-    StreamGroup,
+    StreamGroup, StringTtl,
 };
 use red_core::Result;
 
@@ -202,8 +202,9 @@ pub trait KvDriver: Send + Sync {
     /// always runs whatever it's given.
     async fn command(&self, argv: &[String]) -> Result<RespValue>;
 
-    /// `SET key value [EX seconds]`. Refused on a read-only connection.
-    async fn set_string(&self, key: &str, value: String, ttl: Option<Duration>) -> Result<()>;
+    /// `SET key value` with an explicit [`StringTtl`] expiry policy. Refused on
+    /// a read-only connection.
+    async fn set_string(&self, key: &str, value: String, ttl: StringTtl) -> Result<()>;
 
     /// `HSET key field value`. Refused on a read-only connection.
     async fn set_field(&self, key: &str, field: &str, value: String) -> Result<()>;
@@ -219,6 +220,12 @@ pub trait KvDriver: Send + Sync {
     /// `SREM key member [member ...]`, returning the number removed. Refused on
     /// a read-only connection.
     async fn set_remove(&self, key: &str, members: &[String]) -> Result<u64>;
+
+    /// Atomically replace one set member: `SREM old` then `SADD new` in a
+    /// single `MULTI`/`EXEC`, so a mid-operation failure can't leave the set
+    /// with neither member (the data loss a two-round-trip remove-then-add
+    /// risks). Refused on a read-only connection.
+    async fn set_replace(&self, key: &str, old: &str, new: &str) -> Result<()>;
 
     /// `ZADD key score member` — add a member or overwrite its score (Redis
     /// upserts). Refused on a read-only connection.

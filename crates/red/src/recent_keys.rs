@@ -98,8 +98,14 @@ impl RecentKeysStore {
     }
 }
 
-/// Serialize `keys` to `path` via a temp file + rename, owner-only on Unix (the
-/// same crash-safe discipline as `redis_analysis.rs`).
+/// Serialize `keys` to `path` via a temp file + rename, owner-only on Unix.
+///
+/// Deliberately *not* `fsync`ed (unlike `redis_analysis.rs`): this runs on the
+/// UI thread on every key open, and a durable disk flush per click is a visible
+/// stall. The atomic rename still guarantees a reader never sees a torn file;
+/// the only thing dropped is the durability wait, and recent-keys is a
+/// throwaway convenience list (the loader is fail-open) where losing the last
+/// write to a crash is harmless.
 fn save(path: &PathBuf, keys: &HashMap<String, Vec<RecentKeyRec>>) -> Result<()> {
     use std::io::Write;
 
@@ -120,7 +126,6 @@ fn save(path: &PathBuf, keys: &HashMap<String, Vec<RecentKeyRec>>) -> Result<()>
         .open(&tmp)
         .context("creating the recent-keys temp file")?;
     f.write_all(contents.as_bytes())?;
-    f.sync_all()?;
     drop(f);
     std::fs::rename(&tmp, path).context("renaming the recent-keys temp file")?;
     Ok(())

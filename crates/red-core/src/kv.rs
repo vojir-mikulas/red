@@ -306,12 +306,28 @@ pub enum KvValue {
 /// echoed back on `Event::KvEditApplied` so the UI can pattern-match what
 /// just succeeded without a separate event type per edit kind (mirrors
 /// `FetchRun`'s "echo the request back" shape).
+/// How a `SetString` write should treat the key's expiry. `SET`'s default
+/// (plain, no option) clears any existing TTL, which is wrong when the edit is
+/// only meant to change the value — so the intent is explicit rather than
+/// inferred from an `Option<Duration>` snapshot that would otherwise reset the
+/// countdown or lose sub-second precision.
+#[derive(Debug, Clone, Copy)]
+pub enum StringTtl {
+    /// Leave the current expiry untouched (`SET ... KEEPTTL`): editing a value
+    /// must not reset the key's countdown.
+    Keep,
+    /// Write the key with no expiry (plain `SET`): the default for a new key.
+    Clear,
+    /// Apply an explicit expiry with millisecond precision (`SET ... PX <ms>`).
+    Set(Duration),
+}
+
 #[derive(Debug, Clone)]
 pub enum KvEdit {
     SetString {
         key: String,
         value: String,
-        ttl: Option<Duration>,
+        ttl: StringTtl,
     },
     SetField {
         key: String,
@@ -583,7 +599,15 @@ const READ_COMMANDS: &[&str] = &[
 /// Commands that are destructive purely by name (any invocation), gated behind
 /// the confirm even on a writable connection.
 const DESTRUCTIVE_COMMANDS: &[&str] = &[
-    "FLUSHALL", "FLUSHDB", "SHUTDOWN", "DEL", "UNLINK", "SWAPDB", "DEBUG", "REPLICAOF", "SLAVEOF",
+    "FLUSHALL",
+    "FLUSHDB",
+    "SHUTDOWN",
+    "DEL",
+    "UNLINK",
+    "SWAPDB",
+    "DEBUG",
+    "REPLICAOF",
+    "SLAVEOF",
     "FAILOVER",
 ];
 

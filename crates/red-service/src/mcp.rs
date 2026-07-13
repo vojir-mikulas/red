@@ -689,7 +689,7 @@ mod tests {
             &self,
             _key: &str,
             _value: String,
-            _ttl: Option<std::time::Duration>,
+            _ttl: red_core::kv::StringTtl,
         ) -> red_core::Result<()> {
             unimplemented!()
         }
@@ -708,6 +708,9 @@ mod tests {
             unimplemented!()
         }
         async fn set_remove(&self, _key: &str, _members: &[String]) -> red_core::Result<u64> {
+            unimplemented!()
+        }
+        async fn set_replace(&self, _key: &str, _old: &str, _new: &str) -> red_core::Result<()> {
             unimplemented!()
         }
         async fn zset_add(&self, _key: &str, _member: &str, _score: f64) -> red_core::Result<()> {

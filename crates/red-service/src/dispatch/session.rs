@@ -107,6 +107,13 @@ pub(crate) struct InFlight {
     /// big-collection sub-grid, supersedes whatever the inspector was
     /// fetching before.
     pub(crate) kv_value: Option<AbortSignal>,
+    /// The latest `KvReadCollectionPage` for this epoch (the inspector's
+    /// big-collection sub-grid). Separate from `kv_value` so a sibling value
+    /// read (e.g. re-selecting the key) can't abort an in-progress page scan
+    /// and strand the sub-grid on "Loading…" — an interrupted collection scan
+    /// emits no event, and a stale page for another key is already filtered
+    /// out UI-side by its key.
+    pub(crate) kv_collection: Option<AbortSignal>,
     /// The latest `KvStreamConsumers` fetch for this epoch (the inspector's
     /// consumer-group view). Separate from `kv_value` so selecting a group
     /// doesn't cancel the key's value read, and separate from
@@ -139,6 +146,7 @@ impl InFlight {
             self.lookup.as_ref(),
             self.kv_scan.as_ref(),
             self.kv_value.as_ref(),
+            self.kv_collection.as_ref(),
             self.kv_group_detail.as_ref(),
             self.kv_group_pending.as_ref(),
             self.kv_subscribe.as_ref(),

@@ -8,6 +8,8 @@
 //! on) directly instead: a plain growing `Vec` is all the "buffer" this
 //! needs, no windowing/eviction/margin machinery.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use flint::prelude::*;
@@ -217,7 +219,17 @@ pub(crate) struct BrowseState {
     /// open flag).
     pub(crate) type_filter_open: bool,
     /// Rows accumulated this run, forward-only, oldest-evicted past the cap.
-    pub(crate) rows: Vec<KeyMeta>,
+    /// Held behind an `Rc` so the per-frame render (and keyboard nav) share the
+    /// buffer by a refcount bump instead of deep-cloning up to `MAX_RESIDENT_ROWS`
+    /// `KeyMeta` every frame; mutate only via [`BrowseState::rows_mut`].
+    pub(crate) rows: Rc<Vec<KeyMeta>>,
+    /// Bumped on every mutation of `rows` (via [`BrowseState::rows_mut`]) so the
+    /// fuzzy `visible_rows` cache can tell when its scored subset is stale.
+    rows_gen: u64,
+    /// Memoized result of the fuzzy `visible_rows` computation, valid while the
+    /// query and `rows_gen` are unchanged — so an unrelated re-render doesn't
+    /// re-score and re-sort every loaded key.
+    visible_cache: RefCell<Option<VisibleRowsCache>>,
     pub(crate) cursor: ScanCursor,
     pub(crate) exhausted: bool,
     pub(crate) loading: bool,
@@ -477,7 +489,10 @@ pub(crate) struct KvInspector {
     /// `KvElement::Member` (no separate variant; a list has no field/score,
     /// same shape as a set member for rendering purposes) and are fetched
     /// once as a static head window, not paged (see `LIST_PREVIEW_COUNT`).
-    pub(crate) collection_rows: Vec<KvElement>,
+    /// Behind an `Rc` so the per-frame grid render shares the buffer by a
+    /// refcount bump instead of deep-cloning every paged element each frame;
+    /// mutate via `Rc::make_mut`.
+    pub(crate) collection_rows: Rc<Vec<KvElement>>,
     pub(crate) collection_cursor: u64,
     pub(crate) collection_exhausted: bool,
     pub(crate) collection_loading: bool,
@@ -488,7 +503,8 @@ pub(crate) struct KvInspector {
     // Streams page by entry-ID range rather than the `*SCAN` cursor the other
     // collections use, so they get their own accumulator instead of reusing
     // `collection_rows`. Entries accumulate newest-first, oldest-continued.
-    pub(crate) stream_rows: Vec<StreamEntry>,
+    /// Behind an `Rc` for the same reason as `collection_rows`.
+    pub(crate) stream_rows: Rc<Vec<StreamEntry>>,
     /// The oldest entry ID loaded so far, fed back as the next page's
     /// exclusive upper bound; `None` before the first page or once exhausted.
     pub(crate) stream_before: Option<String>,
@@ -669,7 +685,9 @@ impl BrowseState {
             pattern: None,
             type_filter: None,
             type_filter_open: false,
-            rows: Vec::new(),
+            rows: Rc::new(Vec::new()),
+            rows_gen: 0,
+            visible_cache: RefCell::new(None),
             cursor: ScanCursor::START,
             exhausted: false,
             loading: false,
@@ -686,23 +704,60 @@ impl BrowseState {
         }
     }
 
+    /// Mutable access to the loaded rows. Bumps the generation counter so the
+    /// fuzzy `visible_rows` cache recomputes, and `Rc::make_mut` gives a unique
+    /// buffer — which is in-place (no clone) whenever the previous frame's
+    /// shared `Rc` has already been dropped, as it has by the next mutation.
+    fn rows_mut(&mut self) -> &mut Vec<KeyMeta> {
+        self.rows_gen = self.rows_gen.wrapping_add(1);
+        Rc::make_mut(&mut self.rows)
+    }
+
     /// The rows as currently shown in the grid: the raw scan rows, or, in fuzzy
     /// mode with a non-empty query, the fuzzy-scored subset in best-match order.
     /// Shared by render and keyboard nav so both agree on order and indices.
-    pub(crate) fn visible_rows(&self, cx: &App) -> Vec<KeyMeta> {
-        let query = self.filter.read(cx).content().to_string();
-        if self.fuzzy && !query.is_empty() {
-            let mut scored: Vec<(i32, &KeyMeta)> = self
-                .rows
-                .iter()
-                .filter_map(|r| fuzzy_score(&query, &r.key).map(|s| (s, r)))
-                .collect();
-            scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-            scored.into_iter().map(|(_, r)| r.clone()).collect()
-        } else {
-            self.rows.clone()
+    /// Returns a shared `Rc` (a refcount bump), never a deep clone; the fuzzy
+    /// subset is memoized on `(query, rows_gen)` so an unrelated re-render
+    /// doesn't re-score and re-sort every loaded key.
+    pub(crate) fn visible_rows(&self, cx: &App) -> Rc<Vec<KeyMeta>> {
+        if !self.fuzzy {
+            return Rc::clone(&self.rows);
         }
+        let query = self.filter.read(cx).content().to_string();
+        if query.is_empty() {
+            return Rc::clone(&self.rows);
+        }
+        if let Some(cached) = self.visible_cache.borrow().as_ref() {
+            if cached.query == query && cached.gen == self.rows_gen {
+                return Rc::clone(&cached.rows);
+            }
+        }
+        let mut scored: Vec<(i32, &KeyMeta)> = self
+            .rows
+            .iter()
+            .filter_map(|r| fuzzy_score(&query, &r.key).map(|s| (s, r)))
+            .collect();
+        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        let result = Rc::new(
+            scored
+                .into_iter()
+                .map(|(_, r)| r.clone())
+                .collect::<Vec<_>>(),
+        );
+        *self.visible_cache.borrow_mut() = Some(VisibleRowsCache {
+            query,
+            gen: self.rows_gen,
+            rows: Rc::clone(&result),
+        });
+        result
     }
+}
+
+/// Memoized fuzzy [`BrowseState::visible_rows`] result (see that field).
+struct VisibleRowsCache {
+    query: String,
+    gen: u64,
+    rows: Rc<Vec<KeyMeta>>,
 }
 
 impl AnalysisState {
@@ -1166,7 +1221,7 @@ impl AppState {
         let old_epoch = browse.epoch;
         let new_epoch = crate::result::next_kv_epoch();
         browse.epoch = new_epoch;
-        browse.rows.clear();
+        browse.rows_mut().clear();
         browse.evicted = false;
         browse.cursor = ScanCursor::START;
         browse.exhausted = false;
@@ -1367,10 +1422,10 @@ impl AppState {
         else {
             return; // superseded scan run, or no tab owns this epoch
         };
-        browse.rows.extend(page.keys);
+        browse.rows_mut().extend(page.keys);
         if browse.rows.len() > MAX_RESIDENT_ROWS {
             let drop = browse.rows.len() - MAX_RESIDENT_ROWS;
-            browse.rows.drain(0..drop);
+            browse.rows_mut().drain(0..drop);
             browse.evicted = true;
         }
         browse.cursor = page.next_cursor;
@@ -2538,12 +2593,12 @@ impl AppState {
             kv_type,
             ttl,
             value: None,
-            collection_rows: Vec::new(),
+            collection_rows: Rc::new(Vec::new()),
             collection_cursor: 0,
             collection_exhausted: false,
             collection_loading: false,
             collection_scroll: UniformListScrollHandle::new(),
-            stream_rows: Vec::new(),
+            stream_rows: Rc::new(Vec::new()),
             stream_before: None,
             stream_exhausted: false,
             stream_loading: false,
@@ -2863,12 +2918,15 @@ impl AppState {
             return;
         };
         let key = inspector.key.clone();
-        // Preserve the key's existing TTL: a plain `SET` with no `EX`
-        // clears any expiry, and editing the value isn't meant to also
-        // reset the countdown.
-        let ttl = inspector.ttl;
+        // Preserve the key's existing TTL: `KEEPTTL` retains the server's actual
+        // expiry exactly, so editing the value neither clears nor resets the
+        // countdown (a re-applied `EX` snapshot would do both).
         let value = inspector.value_editor.read(cx).content();
-        let edit = red_core::kv::KvEdit::SetString { key, value, ttl };
+        let edit = red_core::kv::KvEdit::SetString {
+            key,
+            value,
+            ttl: red_core::kv::StringTtl::Keep,
+        };
         self.service
             .send_to(session, Command::KvApplyEdit { epoch, edit });
     }
@@ -3388,7 +3446,7 @@ impl AppState {
             KvType::String => KvEdit::SetString {
                 key,
                 value,
-                ttl: None,
+                ttl: red_core::kv::StringTtl::Clear,
             },
             KvType::Hash => {
                 if field.is_empty() {
@@ -3468,8 +3526,13 @@ impl AppState {
                         inspector.editing_value = false;
                     }
                 }
-                if let Some(row) = browse.rows.iter_mut().find(|r| r.key == key) {
-                    row.ttl = ttl;
+                if let Some(row) = browse.rows_mut().iter_mut().find(|r| r.key == key) {
+                    // Mirror the write's TTL intent onto the optimistic row.
+                    match ttl {
+                        red_core::kv::StringTtl::Keep => {}
+                        red_core::kv::StringTtl::Clear => row.ttl = None,
+                        red_core::kv::StringTtl::Set(d) => row.ttl = Some(d),
+                    }
                 }
             }
             KvEdit::SetField { key, field, value } => {
@@ -3492,7 +3555,7 @@ impl AppState {
                         if let Some(KvValue::Hash(KvCollection::Loaded(pairs))) = &mut insp.value {
                             pairs.retain(|(f, _)| !fields.contains(f));
                         }
-                        insp.collection_rows.retain(|e| match e {
+                        Rc::make_mut(&mut insp.collection_rows).retain(|e| match e {
                             KvElement::Field(f, _) => !fields.contains(f),
                             _ => true,
                         });
@@ -3515,7 +3578,8 @@ impl AppState {
                                 .iter()
                                 .any(|e| matches!(e, KvElement::Member(x) if x == m));
                             if !present {
-                                insp.collection_rows.push(KvElement::Member(m.clone()));
+                                Rc::make_mut(&mut insp.collection_rows)
+                                    .push(KvElement::Member(m.clone()));
                             }
                         }
                     }
@@ -3527,7 +3591,7 @@ impl AppState {
                         if let Some(KvValue::Set(KvCollection::Loaded(items))) = &mut insp.value {
                             items.retain(|m| !members.contains(m));
                         }
-                        insp.collection_rows.retain(|e| match e {
+                        Rc::make_mut(&mut insp.collection_rows).retain(|e| match e {
                             KvElement::Member(x) => !members.contains(x),
                             _ => true,
                         });
@@ -3542,7 +3606,7 @@ impl AppState {
                                 *slot = new.clone();
                             }
                         }
-                        for e in insp.collection_rows.iter_mut() {
+                        for e in Rc::make_mut(&mut insp.collection_rows).iter_mut() {
                             if let KvElement::Member(x) = e {
                                 if *x == old {
                                     *x = new.clone();
@@ -3567,12 +3631,13 @@ impl AppState {
                             .position(|e| matches!(e, KvElement::Scored(m, _) if *m == member))
                         {
                             Some(pos) => {
-                                if let KvElement::Scored(_, s) = &mut insp.collection_rows[pos] {
+                                if let KvElement::Scored(_, s) =
+                                    &mut Rc::make_mut(&mut insp.collection_rows)[pos]
+                                {
                                     *s = score;
                                 }
                             }
-                            None => insp
-                                .collection_rows
+                            None => Rc::make_mut(&mut insp.collection_rows)
                                 .push(KvElement::Scored(member.clone(), score)),
                         }
                     }
@@ -3584,7 +3649,7 @@ impl AppState {
                         if let Some(KvValue::ZSet(KvCollection::Loaded(items))) = &mut insp.value {
                             items.retain(|(m, _)| !members.contains(m));
                         }
-                        insp.collection_rows.retain(|e| match e {
+                        Rc::make_mut(&mut insp.collection_rows).retain(|e| match e {
                             KvElement::Scored(m, _) => !members.contains(m),
                             _ => true,
                         });
@@ -3600,7 +3665,9 @@ impl AppState {
                                 *slot = value.clone();
                             }
                         }
-                        if let Some(KvElement::Member(x)) = insp.collection_rows.get_mut(idx) {
+                        if let Some(KvElement::Member(x)) =
+                            Rc::make_mut(&mut insp.collection_rows).get_mut(idx)
+                        {
                             *x = value.clone();
                         }
                     }
@@ -3620,10 +3687,11 @@ impl AppState {
                         // a head push shows immediately; a tail push only when
                         // the whole list is loaded (else it lands off-window).
                         if head {
-                            insp.collection_rows
+                            Rc::make_mut(&mut insp.collection_rows)
                                 .insert(0, KvElement::Member(value.clone()));
                         } else if insp.collection_exhausted {
-                            insp.collection_rows.push(KvElement::Member(value.clone()));
+                            Rc::make_mut(&mut insp.collection_rows)
+                                .push(KvElement::Member(value.clone()));
                         }
                     }
                 }
@@ -3641,7 +3709,7 @@ impl AppState {
                             .iter()
                             .position(|e| matches!(e, KvElement::Member(x) if *x == value))
                         {
-                            insp.collection_rows.remove(pos);
+                            Rc::make_mut(&mut insp.collection_rows).remove(pos);
                         }
                     }
                 }
@@ -3653,7 +3721,7 @@ impl AppState {
                         inspector.editing_ttl = false;
                     }
                 }
-                if let Some(row) = browse.rows.iter_mut().find(|r| r.key == key) {
+                if let Some(row) = browse.rows_mut().iter_mut().find(|r| r.key == key) {
                     row.ttl = ttl;
                 }
             }
@@ -3664,7 +3732,7 @@ impl AppState {
                         inspector.editing_key = false;
                     }
                 }
-                if let Some(row) = browse.rows.iter_mut().find(|r| r.key == from) {
+                if let Some(row) = browse.rows_mut().iter_mut().find(|r| r.key == from) {
                     row.key = to;
                 }
             }
@@ -3674,7 +3742,7 @@ impl AppState {
                         browse.inspector = None;
                     }
                 }
-                browse.rows.retain(|r| !keys.contains(&r.key));
+                browse.rows_mut().retain(|r| !keys.contains(&r.key));
             }
         }
         // A `SetString` replaced the string body (and cleared the edit); refresh
@@ -3880,7 +3948,7 @@ impl AppState {
         if inspector.key != key {
             return;
         }
-        inspector.collection_rows.extend(page.elements);
+        Rc::make_mut(&mut inspector.collection_rows).extend(page.elements);
         inspector.collection_cursor = page.next_cursor;
         inspector.collection_exhausted = page.exhausted;
         inspector.collection_loading = false;
@@ -3906,7 +3974,7 @@ impl AppState {
         if inspector.key != key {
             return;
         }
-        inspector.collection_rows = values.into_iter().map(KvElement::Member).collect();
+        inspector.collection_rows = Rc::new(values.into_iter().map(KvElement::Member).collect());
         // A list's head-window preview is a one-shot fetch, not paged.
         inspector.collection_exhausted = true;
         inspector.collection_loading = false;
@@ -3988,7 +4056,7 @@ impl AppState {
         if inspector.key != key {
             return;
         }
-        inspector.stream_rows.extend(page.entries);
+        Rc::make_mut(&mut inspector.stream_rows).extend(page.entries);
         inspector.stream_before = page.next_before;
         inspector.stream_exhausted = page.exhausted;
         inspector.stream_loading = false;
@@ -4496,7 +4564,7 @@ impl AppState {
 
         let writable = !active.config.read_only;
         let fuzzy_query = browse.filter.read(cx).content().to_string();
-        let rows: std::rc::Rc<Vec<KeyMeta>> = std::rc::Rc::new(browse.visible_rows(cx));
+        let rows: Rc<Vec<KeyMeta>> = browse.visible_rows(cx);
 
         // Appended to the header stat once the resident-row cap has kicked in.
         let evicted_note = if browse.evicted {
@@ -5984,10 +6052,12 @@ impl AppState {
                 ))
                 .into_any_element(),
             KvValue::Hash(KvCollection::Loaded(pairs)) => {
-                let rows: Vec<KvElement> = pairs
-                    .iter()
-                    .map(|(f, v)| KvElement::Field(f.clone(), v.clone()))
-                    .collect();
+                let rows: Rc<Vec<KvElement>> = Rc::new(
+                    pairs
+                        .iter()
+                        .map(|(f, v)| KvElement::Field(f.clone(), v.clone()))
+                        .collect(),
+                );
                 let len = rows.len() as u64;
                 self.render_kv_collection_grid(
                     session,
@@ -6002,10 +6072,12 @@ impl AppState {
                 )
             }
             KvValue::Set(KvCollection::Loaded(members)) => {
-                let rows: Vec<KvElement> = members
-                    .iter()
-                    .map(|m| KvElement::Member(m.clone()))
-                    .collect();
+                let rows: Rc<Vec<KvElement>> = Rc::new(
+                    members
+                        .iter()
+                        .map(|m| KvElement::Member(m.clone()))
+                        .collect(),
+                );
                 let len = rows.len() as u64;
                 self.render_kv_collection_grid(
                     session,
@@ -6020,10 +6092,12 @@ impl AppState {
                 )
             }
             KvValue::ZSet(KvCollection::Loaded(pairs)) => {
-                let rows: Vec<KvElement> = pairs
-                    .iter()
-                    .map(|(m, s)| KvElement::Scored(m.clone(), *s))
-                    .collect();
+                let rows: Rc<Vec<KvElement>> = Rc::new(
+                    pairs
+                        .iter()
+                        .map(|(m, s)| KvElement::Scored(m.clone(), *s))
+                        .collect(),
+                );
                 let len = rows.len() as u64;
                 self.render_kv_collection_grid(
                     session,
@@ -6099,7 +6173,7 @@ impl AppState {
         &self,
         session: SessionId,
         kind: CollectionKind,
-        rows: Vec<KvElement>,
+        rows: Rc<Vec<KvElement>>,
         total_len: u64,
         complete: bool,
         writable: bool,
@@ -6112,7 +6186,6 @@ impl AppState {
         let edit_color = theme.text_muted;
         let del_color = theme.red;
         let icon_sz = theme.scale(12.);
-        let rows = std::rc::Rc::new(rows);
         let rows_render = rows.clone();
         let row_count = rows.len();
 
@@ -6865,7 +6938,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let view = cx.entity().downgrade();
-        let rows = std::rc::Rc::new(inspector.stream_rows.clone());
+        let rows = inspector.stream_rows.clone();
         let rows_render = rows.clone();
         let row_count = rows.len();
 
