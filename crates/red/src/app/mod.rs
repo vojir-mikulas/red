@@ -488,12 +488,12 @@ pub(crate) enum ConnectStatus {
     },
 }
 
-/// The result of the latest "Test connection" probe, shown in the form footer.
+/// Whether a "Test connection" probe is in flight — drives the footer button's
+/// "Testing…"/disabled state. The probe's *result* is reported as a toast (see
+/// the `TestSucceeded`/`TestFailed` arms in `on_event`), not stored here.
 pub(crate) enum TestState {
     Idle,
     Testing,
-    Ok(SharedString),
-    Fail(SharedString),
 }
 
 /// Add/edit connection form state. The field text lives in the shared `TextInput`
@@ -1395,6 +1395,12 @@ pub struct AppState {
     pub(crate) font_combo_ui: Entity<ComboBox>,
     pub(crate) font_combo_ui_mono: Entity<ComboBox>,
     pub(crate) font_combo_editor: Entity<ComboBox>,
+    /// The connection-form engine picker: a searchable dropdown over
+    /// [`DbKind::all`], each option carrying its engine tint dot. Replaces the old
+    /// fixed segmented control so the list stays tidy as plugins add drivers. Its
+    /// options are static; only the current selection changes, refreshed by
+    /// [`Self::refresh_engine_combo`] when a form opens or its engine changes.
+    pub(crate) engine_combo: Entity<ComboBox>,
     /// Installed font families, sorted + deduped. Enumerating these hits the OS
     /// text system (a CoreText scan of hundreds of faces), far too slow to do
     /// per render, so the Appearance panel reads this cache. Filled lazily when
@@ -2060,6 +2066,38 @@ impl AppState {
         })
         .detach();
 
+        // The connection-form engine dropdown. Unlike the appearance combos its
+        // option list is static (every `DbKind`), so it's filled once here; each
+        // row carries the engine's tint dot via `set_leading`, keyed by the option
+        // index — which matches `DbKind::all` order. Full-width so it lines up with
+        // the form's other inputs. `refresh_engine_combo` re-selects the current
+        // engine when a form opens or its engine changes (e.g. a pasted DSN).
+        let engine_combo = new_combo(cx, "pick-engine", "Search engines…");
+        engine_combo.update(cx, |c, cx| {
+            c.set_placeholder("Select an engine…", cx);
+            c.set_full_width(true, cx);
+            c.set_leading(
+                |ix, app| {
+                    let kind = red_core::DbKind::all().get(ix).copied().unwrap_or_default();
+                    crate::connect::engine_dot(kind, app.theme()).into_any_element()
+                },
+                cx,
+            );
+            c.set_options(crate::connect::engine_combo_options(), None, cx);
+        });
+        cx.subscribe(&engine_combo, |this, _, e: &ComboBoxEvent, cx| {
+            if let ComboBoxEvent::Select(name) = e {
+                if let Some(kind) = red_core::DbKind::all()
+                    .iter()
+                    .copied()
+                    .find(|k| k.to_string() == name.as_ref())
+                {
+                    this.set_form_kind(kind, cx);
+                }
+            }
+        })
+        .detach();
+
         // One-shot "updated to X" announcement: compare this build's version to
         // the last one we recorded. A first-ever launch records silently (there's
         // no prior version to have updated *from*); a changed version is remembered
@@ -2169,6 +2207,7 @@ impl AppState {
             font_combo_ui,
             font_combo_ui_mono,
             font_combo_editor,
+            engine_combo,
             font_names_cache: None,
             query_ticking: false,
             connect_gen: 0,
@@ -2482,14 +2521,24 @@ impl AppState {
             Event::Connected { version } => self.on_connected(session, version, cx),
             Event::Disconnected => self.on_disconnected(session, cx),
             Event::TestSucceeded { version } => {
+                // Clear the in-flight state (footer button back to "Test
+                // connection") and report the result as a self-dismissing toast.
                 if let Some(form) = &mut self.form {
-                    form.test = TestState::Ok(format!("Connection successful · {version}").into());
+                    form.test = TestState::Idle;
                 }
+                self.notify(
+                    ToastVariant::Success,
+                    format!("Connection successful · {version}"),
+                    cx,
+                );
             }
             Event::TestFailed { message } => {
                 if let Some(form) = &mut self.form {
-                    form.test = TestState::Fail(message.into());
+                    form.test = TestState::Idle;
                 }
+                // Engine errors can be long, so use the detail variant (copyable,
+                // collapsible) and let it persist until dismissed.
+                self.notify_detail(ToastVariant::Error, "Connection failed", message, cx);
             }
             Event::ConnectFailed { message, fatal } => {
                 tracing::error!(?session, fatal, "{message}");

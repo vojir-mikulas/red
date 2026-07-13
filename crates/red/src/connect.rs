@@ -44,6 +44,27 @@ fn engine_tint(kind: DbKind, theme: &Theme) -> Hsla {
     }
 }
 
+/// The small tinted dot that marks an engine in the picker dropdown — drawn in the
+/// trigger for the current engine and on every option row. Shares the per-engine
+/// palette with the connection cards via [`engine_tint`].
+pub(crate) fn engine_dot(kind: DbKind, theme: &Theme) -> impl IntoElement {
+    div()
+        .size(px(8.))
+        .rounded_full()
+        .flex_none()
+        .bg(engine_tint(kind, theme))
+}
+
+/// The engine dropdown's option labels, in [`DbKind::all`] order so a row's index
+/// maps straight back to its `DbKind` (the picker's leading-dot factory and the
+/// `Select` handler both rely on this ordering).
+pub(crate) fn engine_combo_options() -> Vec<SharedString> {
+    DbKind::all()
+        .iter()
+        .map(|k| SharedString::from(k.to_string()))
+        .collect()
+}
+
 /// A connection's last-used time as a coarse relative label ("just now", "5m
 /// ago", "never"): the per-card recency the design shows on the right.
 pub(crate) fn fmt_ago(secs: Option<u64>) -> String {
@@ -826,15 +847,13 @@ impl AppState {
                             .children(field_error_line(theme, field_err(&errors, FormField::Name))),
                     )
                     .child(
-                        labeled_field("Engine", theme)
-                            .child(self.render_engine_picker(form.kind, theme, cx)),
+                        labeled_field("Engine", theme).child(self.engine_combo.clone()),
                     )
                     .children(conn_str_field)
                     .child(self.render_connection_fields(form, is_file, &errors, theme))
                     .children(self.render_ssh_section(form, is_file, &errors, theme, cx))
                     .child(self.render_label_access_row(form, theme, cx))
-                    .children(self.render_ai_write_row(form, theme, cx))
-                    .children(self.render_form_status(form, cx)),
+                    .children(self.render_ai_write_row(form, theme, cx)),
             )
     }
 
@@ -1077,50 +1096,6 @@ impl AppState {
             .into_any_element()
     }
 
-    /// The engine segmented control: one cell per `DbKind`, with the engine tint
-    /// dot. Data-driven off `DbKind::all`, so a new driver appears automatically.
-    fn render_engine_picker(
-        &self,
-        selected: DbKind,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let cells = DbKind::all().iter().map(|&kind| {
-            let on = kind == selected;
-            let (bg, border, text) = if on {
-                (theme.accent_ghost, theme.accent, theme.text)
-            } else {
-                (theme.bg_input, theme.border_soft, theme.text_muted)
-            };
-            div()
-                .id(SharedString::from(format!("engine-{}", kind.url_scheme())))
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .gap_1p5()
-                .h(px(32.))
-                .rounded(theme.radius)
-                .bg(bg)
-                .border_1()
-                .border_color(border)
-                .text_size(theme.scale(12.))
-                .text_color(text)
-                .cursor_pointer()
-                .hover(|s| s.text_color(theme.text))
-                .child(
-                    div()
-                        .size(px(8.))
-                        .rounded_full()
-                        .flex_none()
-                        .bg(engine_tint(kind, theme)),
-                )
-                .child(kind.to_string())
-                .on_click(cx.listener(move |this, _, _, cx| this.set_form_kind(kind, cx)))
-        });
-        div().flex().gap_1p5().children(cells)
-    }
-
     /// The AI write opt-in (Feature B): lets the assistant propose INSERT/UPDATE/
     /// DELETE on this connection, each gated by per-statement approval. Shown only
     /// when the assistant is enabled and the connection is *writable*; write access
@@ -1298,8 +1273,9 @@ impl AppState {
     }
 
     /// The modal footer: the Test-connection action on the left, Cancel / Save /
-    /// Connect on the right. The test *result* renders in the full-width status row
-    /// above (see [`Self::render_form_status`]) so it has room to read.
+    /// Connect on the right. The button shows "Testing…" while a probe is in
+    /// flight; the result arrives as a toast (see the `TestSucceeded`/`TestFailed`
+    /// arms in `on_event`), not inline.
     fn render_form_footer(&self, form: &FormState, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let testing = matches!(form.test, TestState::Testing);
@@ -1351,40 +1327,6 @@ impl AppState {
             )
     }
 
-    /// The full-width status row beneath the form fields: the test-connection
-    /// result, in a tinted, wrapping panel so a long engine error stays readable
-    /// instead of being truncated next to the buttons. `None` while idle/testing.
-    fn render_form_status(&self, form: &FormState, cx: &Context<Self>) -> Option<gpui::Div> {
-        let theme = cx.theme();
-        let (msg, color, icon_name) = match &form.test {
-            TestState::Ok(msg) => (msg.clone(), theme.green, "check"),
-            TestState::Fail(msg) => (msg.clone(), theme.red, "close"),
-            TestState::Idle | TestState::Testing => return None,
-        };
-        Some(
-            div()
-                .flex()
-                .items_start()
-                .gap_2()
-                .w_full()
-                .p(px(9.))
-                .rounded(theme.radius)
-                .bg(color.opacity(0.10))
-                .child(div().flex_none().mt(px(1.)).child(crate::icons::icon(
-                    icon_name,
-                    theme.scale(13.),
-                    color,
-                )))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_size(theme.scale(12.))
-                        .text_color(theme.text)
-                        .child(msg),
-                ),
-        )
-    }
 }
 
 /// The first validation message tagged for `field`, if any; the per-input lookup

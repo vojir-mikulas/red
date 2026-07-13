@@ -897,7 +897,12 @@ impl AppState {
             );
         }
 
-        col
+        // Defer the whole stack so it paints in the late pass, above the modals
+        // (the connection form, settings, confirm dialogs) — which are plain
+        // `.absolute()` siblings and would otherwise cover toasts by tree order.
+        // Deferred, same-priority as Flint's `floating()` menus, so an open menu
+        // still paints above a toast (menus sit later in the root child list).
+        gpui::deferred(col)
     }
 
     /// The title of tab `index`, if it exists, for the close-confirm prompt.

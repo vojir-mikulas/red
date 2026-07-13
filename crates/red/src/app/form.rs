@@ -89,6 +89,7 @@ impl AppState {
             ssh_auth: SshAuthMode::Agent,
             ai_allow_writes: false,
         });
+        self.refresh_engine_combo(cx);
         self.focus_name_field = true;
         cx.notify();
     }
@@ -156,6 +157,7 @@ impl AppState {
             ssh_auth: ssh_auth.unwrap_or(SshAuthMode::Agent),
             ai_allow_writes: config.ai_tier == Some(red_core::AiTier::Write),
         });
+        self.refresh_engine_combo(cx);
         self.focus_name_field = true;
         cx.notify();
     }
@@ -163,6 +165,18 @@ impl AppState {
     pub(crate) fn close_form(&mut self, cx: &mut Context<Self>) {
         self.form = None;
         cx.notify();
+    }
+
+    /// Point the engine dropdown at the open form's current engine (or the default
+    /// when no form is open). The option list is static, so this only moves the
+    /// selection — called on form open and whenever the engine changes out from
+    /// under the combo (a pasted connection string, the port-default reset path).
+    pub(crate) fn refresh_engine_combo(&mut self, cx: &mut Context<Self>) {
+        let kind = self.form.as_ref().map(|f| f.kind).unwrap_or_default();
+        let selected = DbKind::all().iter().position(|k| *k == kind);
+        self.engine_combo.update(cx, |c, cx| {
+            c.set_options(crate::connect::engine_combo_options(), selected, cx);
+        });
     }
 
     /// Read the form's inputs + state into a `ConnectionConfig`. Unused fields for
@@ -444,6 +458,9 @@ impl AppState {
             .map(|p| p.to_string())
             .unwrap_or_default();
         self.port_input.update(cx, |i, cx| i.set_content(port, cx));
+        // Keep the engine dropdown's selection in step — this path also fires when a
+        // pasted connection string changes the scheme, not just a direct pick.
+        self.refresh_engine_combo(cx);
         // The scheme changed, so refresh the connection-string mirror.
         self.sync_conn_str_from_fields(cx);
         cx.notify();
