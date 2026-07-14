@@ -1345,7 +1345,16 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 entry.kv_value = Some(abort.clone());
                 let events = events.clone();
                 tokio::spawn(async move {
-                    match driver.read_value(&key).await {
+                    let result = driver.read_value(&key).await;
+                    // `read_value` doesn't arm the abort with an engine token, so
+                    // supersession is advisory: a concurrent `KvApplyEdit` (or a
+                    // new selection) takes and aborts this slot while the read is
+                    // in flight. Drop a late reply so it can't stomp the
+                    // freshly-applied value back to its pre-edit contents.
+                    if abort.is_aborted() {
+                        return;
+                    }
+                    match result {
                         Ok(value) => emit(
                             &events,
                             session_id,
@@ -1389,7 +1398,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 entry.kv_value = Some(abort.clone());
                 let events = events.clone();
                 tokio::spawn(async move {
-                    match driver.read_string_full(&key).await {
+                    let result = driver.read_string_full(&key).await;
+                    // Like `KvReadValue`: drop a late reply if a concurrent edit or
+                    // a new selection superseded this fetch, so it can't overwrite
+                    // freshly-applied data.
+                    if abort.is_aborted() {
+                        return;
+                    }
+                    match result {
                         // Wrap the whole string back into `KvValue::Str` and reuse
                         // `KvValueReady`: the UI's key-matched apply path swaps the
                         // capped body for this one with no new event.
@@ -1851,6 +1867,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             .list_remove(key, *count, value.clone())
                             .await
                             .map(|_| ()),
+                        KvEdit::ListRemoveAt { key, index } => {
+                            driver.list_remove_at(key, *index).await
+                        }
                         KvEdit::SetTtl { key, ttl } => driver.set_ttl(key, *ttl).await,
                         KvEdit::Rename { from, to } => driver.rename_key(from, to).await,
                         KvEdit::Delete { keys } => driver.delete_keys(keys).await.map(|_| ()),
@@ -1933,7 +1952,22 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                 }
                             }
                             Ok(None) => break, // the subscription's connection closed
-                            Err(_) => {}       // timed out this tick; loop to recheck `abort`
+                            Err(_) => {
+                                // Timed out this tick; recheck `abort` on the next
+                                // loop, but first flush any drops a burst left
+                                // pending so a now-quiet firehose still reports them.
+                                if let Some(n) = rate.flush_drops() {
+                                    emit(
+                                        &events,
+                                        session_id,
+                                        Event::KvMessage {
+                                            epoch,
+                                            channel: "[red]".into(),
+                                            payload: format!("dropped {n} messages (rate limit)"),
+                                        },
+                                    );
+                                }
+                            }
                         }
                     }
                 });
@@ -2144,7 +2178,23 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                 }
                             }
                             Ok(None) => break, // the monitor connection closed
-                            Err(_) => {}       // timed out this tick; recheck `abort`
+                            Err(_) => {
+                                // Timed out this tick; recheck `abort` next loop,
+                                // but flush any drops a burst left pending so a
+                                // now-quiet firehose still reports them.
+                                if let Some(n) = rate.flush_drops() {
+                                    emit(
+                                        &events,
+                                        session_id,
+                                        Event::KvMonitorLine {
+                                            epoch,
+                                            line: format!(
+                                                "[red] dropped {n} MONITOR lines (rate limit)"
+                                            ),
+                                        },
+                                    );
+                                }
+                            }
                         }
                     }
                 });
@@ -3042,6 +3092,23 @@ impl StreamRate {
         } else {
             self.dropped += 1;
             (false, notice)
+        }
+    }
+
+    /// Surface any pending drop count when the firehose falls quiet. `admit` only
+    /// rolls the window on an arriving item, so a burst that overruns the budget
+    /// and then goes silent would otherwise never report its drops; the poll
+    /// loop calls this on its idle tick to flush them.
+    fn flush_drops(&mut self) -> Option<usize> {
+        let now = Instant::now();
+        if now.duration_since(self.window) >= Duration::from_secs(1) && self.dropped > 0 {
+            let n = self.dropped;
+            self.window = now;
+            self.in_window = 0;
+            self.dropped = 0;
+            Some(n)
+        } else {
+            None
         }
     }
 }

@@ -495,6 +495,12 @@ pub(crate) struct KvInspector {
     pub(crate) collection_rows: Rc<Vec<KvElement>>,
     pub(crate) collection_cursor: u64,
     pub(crate) collection_exhausted: bool,
+    /// True when `collection_rows` is a one-shot *head window* (a big list's
+    /// preview) rather than the whole collection. Distinct from
+    /// `collection_exhausted`, which a head window also sets: a tail append
+    /// lands off-window, so the optimistic patch must not push it into the
+    /// preview as if it were the next element.
+    pub(crate) collection_head_only: bool,
     pub(crate) collection_loading: bool,
     pub(crate) collection_scroll: UniformListScrollHandle,
 
@@ -965,6 +971,20 @@ impl RedisView {
             _ => None,
         })
     }
+    /// The Browse tab whose open inspector is on `key`, regardless of which tab
+    /// is focused. Inspector replies (value/collection/stream/edit) route here
+    /// rather than through `active_browse_mut`, so in split view a reply still
+    /// lands on the tab that asked even if focus moved to the other half while
+    /// the read was in flight (which would otherwise drop it and strand the
+    /// inspector on "Loading…", or apply it to the wrong tab).
+    pub(crate) fn browse_by_inspector_key_mut(&mut self, key: &str) -> Option<&mut BrowseState> {
+        self.tabs.iter_mut().find_map(|t| match &mut t.state {
+            RedisTabState::Browse(b) if b.inspector.as_ref().is_some_and(|i| i.key == key) => {
+                Some(&mut **b)
+            }
+            _ => None,
+        })
+    }
     /// The Browse tab whose in-flight biggest-keys sample owns `epoch`.
     pub(crate) fn browse_by_big_keys_epoch_mut(&mut self, epoch: u64) -> Option<&mut BrowseState> {
         self.tabs.iter_mut().find_map(|t| match &mut t.state {
@@ -1260,7 +1280,13 @@ impl AppState {
         if browse.loading || browse.exhausted {
             return;
         }
-        if visible_end + LOAD_AHEAD_ROWS < browse.rows.len() {
+        // `visible_end` indexes the *visible* rows (the fuzzy-filtered subset in
+        // fuzzy mode), so compare it against that same list's length — not
+        // `browse.rows.len()` (the full unfiltered scan). Mixing the two made the
+        // guard think there were always rows ahead in fuzzy mode, so this
+        // scroll-triggered load never fired.
+        let visible_count = browse.visible_rows(cx).len();
+        if visible_end + LOAD_AHEAD_ROWS < visible_count {
             return; // plenty of loaded rows still ahead of the viewport
         }
         browse.loading = true;
@@ -1427,6 +1453,15 @@ impl AppState {
             let drop = browse.rows.len() - MAX_RESIDENT_ROWS;
             browse.rows_mut().drain(0..drop);
             browse.evicted = true;
+            // Front eviction shifts every row index down by `drop`, so move the
+            // keyboard cursor with it to keep it on the same key. Only in the
+            // plain scan view, where `visible_rows == rows`; fuzzy mode indexes a
+            // re-scored subset, so a rows-delta wouldn't apply there.
+            if !browse.fuzzy {
+                if let Some(n) = browse.nav_row.as_mut() {
+                    *n = n.saturating_sub(drop);
+                }
+            }
         }
         browse.cursor = page.next_cursor;
         browse.exhausted = page.exhausted;
@@ -2596,6 +2631,7 @@ impl AppState {
             collection_rows: Rc::new(Vec::new()),
             collection_cursor: 0,
             collection_exhausted: false,
+            collection_head_only: false,
             collection_loading: false,
             collection_scroll: UniformListScrollHandle::new(),
             stream_rows: Rc::new(Vec::new()),
@@ -3512,12 +3548,16 @@ impl AppState {
         let Some(active) = self.conn_mut(session) else {
             return;
         };
-        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
+        // Route by the owning scan epoch across all tabs, not the focused tab: in
+        // split view the edit must patch the tab it was issued from even if focus
+        // moved. A superseded epoch (filter restart) still finds nothing and drops.
+        let Some(browse) = active
+            .kv_view
+            .as_mut()
+            .and_then(|v| v.browse_by_scan_epoch_mut(epoch))
+        else {
             return;
         };
-        if browse.epoch != epoch {
-            return;
-        }
         match edit {
             KvEdit::SetString { key, value, ttl } => {
                 if let Some(inspector) = &mut browse.inspector {
@@ -3689,7 +3729,7 @@ impl AppState {
                         if head {
                             Rc::make_mut(&mut insp.collection_rows)
                                 .insert(0, KvElement::Member(value.clone()));
-                        } else if insp.collection_exhausted {
+                        } else if insp.collection_exhausted && !insp.collection_head_only {
                             Rc::make_mut(&mut insp.collection_rows)
                                 .push(KvElement::Member(value.clone()));
                         }
@@ -3710,6 +3750,22 @@ impl AppState {
                             .position(|e| matches!(e, KvElement::Member(x) if *x == value))
                         {
                             Rc::make_mut(&mut insp.collection_rows).remove(pos);
+                        }
+                    }
+                }
+            }
+            KvEdit::ListRemoveAt { key, index } => {
+                if let Some(insp) = &mut browse.inspector {
+                    if insp.key == key && index >= 0 {
+                        let idx = index as usize;
+                        if let Some(KvValue::List(KvCollection::Loaded(items))) = &mut insp.value {
+                            if idx < items.len() {
+                                items.remove(idx);
+                            }
+                        }
+                        let rows = Rc::make_mut(&mut insp.collection_rows);
+                        if idx < rows.len() {
+                            rows.remove(idx);
                         }
                     }
                 }
@@ -3768,15 +3824,18 @@ impl AppState {
         let Some(active) = self.conn_mut(session) else {
             return;
         };
-        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
-            return;
+        // Route by the inspector's key across all tabs, not the focused tab: in
+        // split view the reply must reach the tab that asked even if focus moved.
+        let Some(browse) = active
+            .kv_view
+            .as_mut()
+            .and_then(|v| v.browse_by_inspector_key_mut(&key))
+        else {
+            return; // no open inspector on this key: a newer selection superseded it
         };
         let Some(inspector) = &mut browse.inspector else {
             return;
         };
-        if inspector.key != key {
-            return; // a newer selection has already superseded this reply
-        }
         inspector.value = value.clone();
         inspector.value_loaded = true;
         inspector.value_error = None;
@@ -3829,15 +3888,13 @@ impl AppState {
         if let Some(inspector) = self
             .conn_mut(session)
             .and_then(|a| a.kv_view.as_mut())
-            .and_then(|v| v.active_browse_mut())
+            .and_then(|v| v.browse_by_inspector_key_mut(&key))
             .and_then(|b| b.inspector.as_mut())
         {
-            if inspector.key == key {
-                inspector.value_loaded = true;
-                inspector.value_error = Some(message);
-                inspector.loading_full_value = false;
-                cx.notify();
-            }
+            inspector.value_loaded = true;
+            inspector.value_error = Some(message);
+            inspector.loading_full_value = false;
+            cx.notify();
         }
     }
 
@@ -3939,15 +3996,16 @@ impl AppState {
         let Some(active) = self.conn_mut(session) else {
             return;
         };
-        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
+        let Some(browse) = active
+            .kv_view
+            .as_mut()
+            .and_then(|v| v.browse_by_inspector_key_mut(&key))
+        else {
             return;
         };
         let Some(inspector) = &mut browse.inspector else {
             return;
         };
-        if inspector.key != key {
-            return;
-        }
         Rc::make_mut(&mut inspector.collection_rows).extend(page.elements);
         inspector.collection_cursor = page.next_cursor;
         inspector.collection_exhausted = page.exhausted;
@@ -3965,18 +4023,22 @@ impl AppState {
         let Some(active) = self.conn_mut(session) else {
             return;
         };
-        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
+        let Some(browse) = active
+            .kv_view
+            .as_mut()
+            .and_then(|v| v.browse_by_inspector_key_mut(&key))
+        else {
             return;
         };
         let Some(inspector) = &mut browse.inspector else {
             return;
         };
-        if inspector.key != key {
-            return;
-        }
         inspector.collection_rows = Rc::new(values.into_iter().map(KvElement::Member).collect());
-        // A list's head-window preview is a one-shot fetch, not paged.
+        // A list's head-window preview is a one-shot fetch, not paged: mark it
+        // exhausted (no more pages) but also head-only, so a tail append isn't
+        // optimistically shown inside the head window (it lands off-window).
         inspector.collection_exhausted = true;
+        inspector.collection_head_only = true;
         inspector.collection_loading = false;
         cx.notify();
     }
@@ -4047,15 +4109,16 @@ impl AppState {
         let Some(active) = self.conn_mut(session) else {
             return;
         };
-        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
+        let Some(browse) = active
+            .kv_view
+            .as_mut()
+            .and_then(|v| v.browse_by_inspector_key_mut(&key))
+        else {
             return;
         };
         let Some(inspector) = &mut browse.inspector else {
             return;
         };
-        if inspector.key != key {
-            return;
-        }
         Rc::make_mut(&mut inspector.stream_rows).extend(page.entries);
         inspector.stream_before = page.next_before;
         inspector.stream_exhausted = page.exhausted;
@@ -6377,7 +6440,7 @@ impl AppState {
                 }
                 let edit_view = cx.entity().downgrade();
                 let del_view = cx.entity().downgrade();
-                let (value_edit, value_del) = (v.clone(), v.clone());
+                let value_edit = v.clone();
                 let idx = i as i64;
                 row.child(
                     div()
@@ -6416,15 +6479,13 @@ impl AppState {
                             .tooltip("Delete")
                             .a11y_label("Delete item")
                             .on_click(move |_, _, cx| {
-                                let v = value_del.clone();
                                 del_view
                                     .update(cx, |this, cx| {
                                         this.kv_send_element_edit(
                                             session,
-                                            move |key| red_core::kv::KvEdit::ListRemove {
+                                            move |key| red_core::kv::KvEdit::ListRemoveAt {
                                                 key,
-                                                count: 1,
-                                                value: v,
+                                                index: idx,
                                             },
                                             cx,
                                         )

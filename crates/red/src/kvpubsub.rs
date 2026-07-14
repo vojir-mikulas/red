@@ -3,8 +3,6 @@
 //! `Event::KvMessage` for as long as the subscription is open, capped so a
 //! chatty channel can't grow the log forever.
 
-use std::rc::Rc;
-
 use flint::prelude::*;
 use gpui::{div, prelude::*, px, Context, Entity, Window};
 use red_core::kv::KvMessage;
@@ -58,6 +56,12 @@ impl AppState {
         }
         pubsub.subscribed = Some(pattern.clone());
         pubsub.messages.clear();
+        // Rotate the epoch before subscribing: a just-unsubscribed pattern keeps
+        // emitting on the old epoch for a bounded teardown window after
+        // `CloseResult`, and routing is by epoch — reusing it would let a late
+        // message from the old pattern land in the new subscription's log. A new
+        // epoch makes `pubsub_by_epoch_mut` drop it (mirrors the keyspace watcher).
+        pubsub.epoch = crate::result::next_kv_epoch();
         let epoch = pubsub.epoch;
         self.service
             .send_to(session, Command::KvSubscribe { epoch, pattern });
@@ -199,8 +203,8 @@ impl AppState {
         let mono = theme.mono_family.clone();
         let text_size = theme.scale(11.5);
         let now = now_unix();
-        let messages = Rc::new(pubsub.messages.clone());
-        let items: Vec<_> = messages
+        let items: Vec<_> = pubsub
+            .messages
             .iter()
             .rev()
             .take(500)

@@ -8,8 +8,6 @@
 //! so the panel surfaces the current setting and, on a writable connection,
 //! offers to enable them before nothing would otherwise arrive.
 
-use std::rc::Rc;
-
 use flint::prelude::*;
 use gpui::{div, prelude::*, px, Context, Window};
 use red_core::kv::{KeyspaceEvent, KeyspaceScope};
@@ -395,8 +393,8 @@ impl AppState {
 
         let mono = theme.mono_family.clone();
         let now = now_unix();
-        let events = Rc::new(ks.events.clone());
-        let items: Vec<_> = events
+        let items: Vec<_> = ks
+            .events
             .iter()
             .rev()
             .take(1_000)

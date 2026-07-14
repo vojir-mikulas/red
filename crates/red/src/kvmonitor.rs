@@ -9,7 +9,6 @@
 //! - **Clients** — a `CLIENT LIST` viewer (id/addr/name/db/age/idle/cmd), with
 //!   a per-client `CLIENT KILL` on a writable connection.
 
-use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use flint::prelude::*;
@@ -235,6 +234,12 @@ impl AppState {
         mon.monitoring = true;
         mon.paused = false;
         mon.lines.clear();
+        // Rotate the epoch before subscribing: a just-stopped MONITOR keeps
+        // emitting on the old epoch for a bounded teardown window after
+        // `CloseResult`, and routing is by epoch — reusing it would let those
+        // stale firehose lines bleed into the fresh run. A new epoch makes
+        // `monitor_by_epoch_mut` drop them (mirrors the keyspace watcher).
+        mon.epoch = crate::result::next_kv_epoch();
         let epoch = mon.epoch;
         self.service.send_to(session, Command::KvMonitor { epoch });
         cx.notify();
@@ -436,8 +441,8 @@ impl AppState {
 
         let mono = theme.mono_family.clone();
         let now = unix_now();
-        let entries = Rc::new(mon.slowlog.clone());
-        let rows: Vec<_> = entries
+        let rows: Vec<_> = mon
+            .slowlog
             .iter()
             .map(|e| {
                 let dur = fmt_micros(e.micros);

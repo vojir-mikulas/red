@@ -37,6 +37,11 @@ const STRING_PREVIEW_CAP: usize = 8 * 1024;
 /// The total number of hash slots in a Redis Cluster (fixed by the protocol).
 const CLUSTER_SLOTS: u16 = 16384;
 
+/// Process-global counter for the positional list-delete sentinel, so each
+/// `list_remove_at` uses a value that can't collide with a real element (or a
+/// sentinel left by a prior, interrupted delete). See [`RedisDriver::list_remove_at`].
+static SENTINEL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A live Redis Cluster's per-master fan-out state, discovered at connect via
 /// `CLUSTER SLOTS` (see docs/plans/redis.md's cluster fan-out gap). `SCAN` is
 /// per-node in a cluster, and single-key commands must reach the node that
@@ -452,9 +457,30 @@ fn parse_cluster_slots(v: &redis::Value) -> Vec<(u16, u16, String, u16)> {
         if !(0..=max).contains(&start) || !(0..=max).contains(&end) || start > end {
             continue;
         }
+        // Guard the port the same way as the slot range: an out-of-range value
+        // (a malformed/proxied reply) would otherwise be silently truncated by
+        // `as u16` and dial a wrong port rather than being dropped.
+        if !(0..=i64::from(u16::MAX)).contains(&port) {
+            continue;
+        }
         out.push((start as u16, end as u16, ip, port as u16));
     }
     out
+}
+
+/// Keyless commands whose blast radius is a whole node and which a user issuing
+/// them against a cluster means cluster-wide: on a `MultiplexedConnection` they
+/// would touch only the seed shard, so [`RedisDriver::command`] fans them out to
+/// every master. Keyed destructive commands (`DEL`, `UNLINK`) are excluded — they
+/// route to their key's owner correctly.
+fn is_cluster_fanout_command(argv: &[String]) -> bool {
+    let head = argv.first().map(|s| s.to_ascii_uppercase());
+    let sub = argv.get(1).map(|s| s.to_ascii_uppercase());
+    match head.as_deref() {
+        Some("FLUSHALL" | "FLUSHDB" | "SWAPDB") => true,
+        Some("SCRIPT" | "FUNCTION") => sub.as_deref() == Some("FLUSH"),
+        _ => false,
+    }
 }
 
 /// Rebuild the seed `dsn` with a cluster node's `host`/`port` swapped in,
@@ -569,8 +595,17 @@ async fn resolve_sentinel(dsn: &str) -> Result<String> {
             qp.append_pair(k, v);
         }
     }
-    let client =
-        redis::Client::open(base.to_string()).map_err(|e| RedError::Connect(e.to_string()))?;
+    // Dial the Sentinel with only scheme/host/port (plus any kept query, e.g.
+    // TLS): a Sentinel typically has no `requirepass` and no selectable db, so
+    // sending the *data node's* credentials or db path (AUTH/SELECT) makes a
+    // passwordless Sentinel reject the connection ("Client sent AUTH, but no
+    // password is set"). The credentials stay on `data`, the resolved master DSN.
+    let mut sentinel_url = base.clone();
+    let _ = sentinel_url.set_username("");
+    let _ = sentinel_url.set_password(None);
+    sentinel_url.set_path("");
+    let client = redis::Client::open(sentinel_url.to_string())
+        .map_err(|e| RedError::Connect(e.to_string()))?;
     let mut conn = client
         .get_multiplexed_async_connection()
         .await
@@ -957,6 +992,25 @@ impl KvDriver for RedisDriver {
         for arg in &argv[1..] {
             cmd.arg(arg);
         }
+        // Cluster fan-out: a keyless whole-node command (FLUSHALL, FLUSHDB,
+        // SWAPDB, SCRIPT/FUNCTION FLUSH) only affects the node it lands on. On a
+        // cluster the user means it cluster-wide, so run it on every master and
+        // aggregate rather than silently clearing just the seed shard and still
+        // reporting OK.
+        if let Some(cl) = &self.cluster {
+            if is_cluster_fanout_command(argv) {
+                let mut last = RespValue::Simple("OK".into());
+                for master in &cl.masters {
+                    let mut conn = master.clone();
+                    match cmd.query_async::<redis::Value>(&mut conn).await {
+                        Ok(value) => last = to_resp_value(value),
+                        Err(e) if e.code().is_some() => return Ok(RespValue::Error(e.to_string())),
+                        Err(e) => return Err(RedError::Driver(e.to_string())),
+                    }
+                }
+                return Ok(last);
+            }
+        }
         // Under a cluster the seed connection only owns ~1/N of the slots and a
         // plain `MultiplexedConnection` doesn't follow `MOVED`, so a console
         // command for a key on another shard would come back as a raw `MOVED`
@@ -1154,6 +1208,33 @@ impl KvDriver for RedisDriver {
             .arg(count)
             .arg(value)
             .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    async fn list_remove_at(&self, key: &str, index: i64) -> Result<()> {
+        self.check_writable()?;
+        let mut conn = self.route(key);
+        // Atomic positional delete: LSET a unique sentinel at `index`, then LREM
+        // it, wrapped in one MULTI/EXEC so no concurrent client observes the
+        // sentinel or races between the two commands. An out-of-range index
+        // surfaces Redis's own error and aborts the transaction. The nonce keeps
+        // the sentinel from colliding with a real element even across calls.
+        let nonce = SENTINEL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sentinel = format!("\u{0}__red_del_{index}_{nonce}__\u{0}");
+        redis::pipe()
+            .atomic()
+            .cmd("LSET")
+            .arg(key)
+            .arg(index)
+            .arg(&sentinel)
+            .ignore()
+            .cmd("LREM")
+            .arg(key)
+            .arg(1)
+            .arg(&sentinel)
+            .ignore()
+            .query_async::<()>(&mut conn)
             .await
             .map_err(|e| RedError::Driver(e.to_string()))
     }
@@ -1406,18 +1487,21 @@ fn cap_string_value(bytes: Vec<u8>) -> Value {
             Err(e) => Value::Blob(e.into_bytes()),
         };
     }
-    let mut head = String::from_utf8_lossy(&bytes[..STRING_PREVIEW_CAP]).into_owned();
+    let window = &bytes[..STRING_PREVIEW_CAP];
+    // Is the value binary? `error_len() == None` means the only fault is a
+    // codepoint sliced off at the window's end (valid UTF-8, just truncated);
+    // `Some(_)` is a genuine invalid byte sequence, i.e. binary content — so a
+    // large msgpack/protobuf/image value is flagged `blob` and the inspector
+    // offers its binary/hex affordance instead of a U+FFFD-riddled text preview.
+    let blob = matches!(std::str::from_utf8(window), Err(e) if e.error_len().is_some());
+    let mut head = String::from_utf8_lossy(window).into_owned();
     // `from_utf8_lossy` on a byte slice cut mid-codepoint already replaces
     // the truncated tail with U+FFFD, so `head` is always valid UTF-8 here;
     // no separate char-boundary trim needed.
     if head.len() > STRING_PREVIEW_CAP {
         head.truncate(STRING_PREVIEW_CAP);
     }
-    Value::Capped(red_core::CappedCell {
-        head,
-        len,
-        blob: false,
-    })
+    Value::Capped(red_core::CappedCell { head, len, blob })
 }
 
 /// Redis keys, set members, hash fields and list items are all binary-safe, so
@@ -1823,6 +1907,26 @@ fn value_to_string_vec(v: &redis::Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cluster_fanout_covers_keyless_whole_node_commands() {
+        // Keyless whole-node commands fan out cluster-wide.
+        assert!(is_cluster_fanout_command(&argv(&["FLUSHALL"])));
+        assert!(is_cluster_fanout_command(&argv(&["flushdb"])));
+        assert!(is_cluster_fanout_command(&argv(&["SWAPDB", "0", "1"])));
+        assert!(is_cluster_fanout_command(&argv(&["SCRIPT", "FLUSH"])));
+        assert!(is_cluster_fanout_command(&argv(&["function", "flush"])));
+        // Keyed / non-flush commands route normally (must NOT fan out).
+        assert!(!is_cluster_fanout_command(&argv(&["DEL", "k"])));
+        assert!(!is_cluster_fanout_command(&argv(&["GET", "k"])));
+        assert!(!is_cluster_fanout_command(&argv(&["SCRIPT", "LOAD", "x"])));
+        assert!(!is_cluster_fanout_command(&argv(&["INFO"])));
+        assert!(!is_cluster_fanout_command(&[]));
+    }
 
     #[test]
     fn info_field_reads_a_known_key() {

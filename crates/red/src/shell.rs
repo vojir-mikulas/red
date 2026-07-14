@@ -562,7 +562,11 @@ impl AppState {
             return div().flex_1().into_any_element();
         };
         let Some(s) = v.split.as_ref() else {
-            let idx = v.active_tab;
+            // Derive the body's tab from `pane_active` (the same source the strip
+            // highlight uses), not `active_tab` directly, so an `active_tab` that
+            // is momentarily out of range can't render an empty body under a
+            // highlighted strip tab.
+            let idx = v.pane_active(SplitHalf::Primary).unwrap_or(v.active_tab);
             return self.render_kv_half(active, SplitHalf::Primary, idx, true, window, cx);
         };
         let (focus, width, drag) = (s.focus, s.width, s.drag);

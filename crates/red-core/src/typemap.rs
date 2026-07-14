@@ -133,8 +133,14 @@ pub fn spell(kind: DbKind, t: &NormType) -> String {
         DbKind::Clickhouse => spell_clickhouse(t),
         // Redis has no column/DDL model at all (see docs/plans/redis.md); it
         // isn't a `DatabaseDriver`, so it can never appear in a create-table or
-        // migration target picker and this is unreachable in practice.
-        DbKind::Redis => unreachable!("Redis has no column/DDL model"),
+        // migration target picker (`write_caps().insert` is false, which the
+        // pickers filter on). Degrade to an empty type rather than panicking on
+        // the backend thread if that invariant ever regresses; debug builds still
+        // trip the assert.
+        DbKind::Redis => {
+            debug_assert!(false, "Redis has no column/DDL model");
+            String::new()
+        }
     }
 }
 

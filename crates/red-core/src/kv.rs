@@ -382,14 +382,21 @@ pub enum KvEdit {
         value: String,
         head: bool,
     },
-    /// `LREM key count value` — remove list elements equal to `value`. A UI
-    /// element delete sends `count = 1` (remove the first occurrence); a
-    /// duplicate value can't be pinned to a single index without a placeholder
-    /// dance, a documented Redis limitation.
+    /// `LREM key count value` — remove list elements equal to `value`. Used for
+    /// value-targeted removals; a positional row delete uses [`Self::ListRemoveAt`]
+    /// instead so a duplicate value can't take the wrong element.
     ListRemove {
         key: String,
         count: i64,
         value: String,
+    },
+    /// Delete the list element at a specific `index` (the placeholder dance:
+    /// `LSET` a sentinel there, then `LREM` it). This is what a UI row-delete
+    /// sends, so clicking the trash on row N removes exactly element N even when
+    /// the list holds duplicate values.
+    ListRemoveAt {
+        key: String,
+        index: i64,
     },
     SetTtl {
         key: String,

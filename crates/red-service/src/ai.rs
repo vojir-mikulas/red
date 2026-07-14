@@ -753,9 +753,26 @@ async fn run_subagent(
                     },
                 },
             );
-            let (content, ok) = match backend {
-                AiBackend::Sql(d) => run_tool(d, name, input, policy, cancel, report).await,
-                AiBackend::Kv(d) => kv_run_tool(d, name, input, policy, cancel, report).await,
+            // A subagent is read-only by contract (its catalog excludes writes).
+            // Enforce that at the *execution* seam too: even if the model emits a
+            // write tool by name that its catalog never advertised, refuse it here
+            // rather than dispatching into a mutating arm. Without this, a KV
+            // subagent could reach kv_delete/kv_config_set and bypass the per-call
+            // Allow/Deny gate (and the keyspace-wide refusal), which only run_turn
+            // applies.
+            let (content, ok) = if is_write_tool(name) {
+                (
+                    format!(
+                        "error: `{name}` is a write tool; a subagent is read-only and cannot \
+                         mutate data"
+                    ),
+                    false,
+                )
+            } else {
+                match backend {
+                    AiBackend::Sql(d) => run_tool(d, name, input, policy, cancel, report).await,
+                    AiBackend::Kv(d) => kv_run_tool(d, name, input, policy, cancel, report).await,
+                }
             };
             emit(
                 events,
@@ -1543,6 +1560,14 @@ pub(crate) async fn kv_run_tool(
             false,
         );
     }
+    // Defense in depth: run_turn already vetted and prompted, but re-run the
+    // catastrophic-shape guard here so no caller (a subagent, a future path) can
+    // execute a keyspace-wide write that assess_kv_write would refuse.
+    if is_kv_write_tool(name) {
+        if let WriteAssessment::Reject(why) = assess_kv_write(name, input) {
+            return (format!("error: {why}"), false);
+        }
+    }
     let limits = &policy.limits;
     let (content, ok) = match name {
         "kv_server_info" => match driver.command(&["INFO".to_string()]).await {
@@ -1715,7 +1740,15 @@ pub(crate) async fn kv_run_tool(
                     let mut out = String::new();
                     for pair in items.chunks(2) {
                         let k = resp_scalar(pair.first());
-                        let v = resp_scalar(pair.get(1));
+                        // Never echo an auth secret back to the model/provider: a
+                        // CONFIG GET of `requirepass` (or a glob like `*`) would
+                        // otherwise exfiltrate the server's credentials as tool
+                        // output. Redact the value while keeping the key visible.
+                        let v = if is_secret_config_param(&k) {
+                            "<redacted>".to_string()
+                        } else {
+                            resp_scalar(pair.get(1))
+                        };
                         out.push_str(&format!("{k} = {v}\n"));
                     }
                     (out, true)
@@ -2528,6 +2561,31 @@ fn is_kv_write_tool(name: &str) -> bool {
     KV_WRITE_TOOLS.contains(&name)
 }
 
+/// Whether a Redis glob is (near) keyspace-wide: it carries no literal anchoring
+/// character, so it matches essentially every key. `*`, `**`, `?*`, and `[a-z]*`
+/// all qualify; `user:*` does not (the `user:` literal anchors it). A destructive
+/// write over such a pattern is refused even with approval, so the keyspace-wide
+/// guard can't be evaded by an equivalent glob.
+fn matches_whole_keyspace(pattern: &str) -> bool {
+    let mut chars = pattern.chars();
+    let mut in_class = false;
+    let mut has_literal = false;
+    while let Some(c) = chars.next() {
+        match c {
+            // An escaped character is a literal anchor.
+            '\\' => has_literal |= chars.next().is_some(),
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            // Class contents are a wildcard set, not an anchor.
+            _ if in_class => {}
+            // Wildcards provide no selectivity.
+            '*' | '?' => {}
+            _ => has_literal = true,
+        }
+    }
+    !has_literal
+}
+
 /// Vet a Redis write tool for the approval gate: build the human-readable
 /// operation shown in the Allow/Deny prompt, and hard-block the catastrophic
 /// shapes (a keyspace-wide DELETE or EXPIRE) even with approval — mirroring the
@@ -2547,12 +2605,12 @@ fn assess_kv_write(name: &str, input: &Json) -> WriteAssessment {
             let target = match (s("key"), s("pattern")) {
                 (Some(k), _) => format!("key `{k}`"),
                 (None, Some(p)) => {
-                    if p == "*" && seconds.is_some_and(|sec| sec > 0) {
-                        return WriteAssessment::Reject(
-                            "refusing to set a TTL on the entire keyspace (pattern `*`): this \
-                             would expire every key. Narrow the pattern."
-                                .into(),
-                        );
+                    if matches_whole_keyspace(p) && seconds.is_some_and(|sec| sec > 0) {
+                        return WriteAssessment::Reject(format!(
+                            "refusing to set a TTL on the entire keyspace (pattern `{p}` matches \
+                             essentially every key): this would expire every key. Narrow the \
+                             pattern."
+                        ));
                     }
                     format!("all keys matching `{p}`")
                 }
@@ -2586,12 +2644,12 @@ fn assess_kv_write(name: &str, input: &Json) -> WriteAssessment {
                     sql: format!("DELETE {} key(s): {}", keys.len(), keys.join(", ")),
                 }
             } else if let Some(p) = s("pattern") {
-                if p == "*" {
-                    return WriteAssessment::Reject(
-                        "refusing to DELETE the entire keyspace (pattern `*`): use FLUSHDB by hand \
-                         if that's really intended. Narrow the pattern."
-                            .into(),
-                    );
+                if matches_whole_keyspace(p) {
+                    return WriteAssessment::Reject(format!(
+                        "refusing to DELETE the entire keyspace (pattern `{p}` matches essentially \
+                         every key): use FLUSHDB by hand if that's really intended. Narrow the \
+                         pattern."
+                    ));
                 }
                 WriteAssessment::NeedsApproval {
                     sql: format!("DELETE all keys matching `{p}`"),
@@ -2656,6 +2714,14 @@ fn is_dangerous_config_param(param: &str) -> bool {
         "enable-module-command",
     ];
     DANGEROUS.contains(&param.trim().to_ascii_lowercase().as_str())
+}
+
+/// CONFIG parameters whose *value* is a credential and must never be echoed back
+/// to the model (a `CONFIG GET requirepass` exfiltration vector). Broader than an
+/// exact list so a `*pass*`-shaped parameter can't slip a secret through.
+fn is_secret_config_param(param: &str) -> bool {
+    let p = param.trim().to_ascii_lowercase();
+    matches!(p.as_str(), "requirepass" | "masterauth" | "masteruser") || p.contains("pass")
 }
 
 /// The statements of a `propose_changeset` call: the non-empty, trimmed entries of
@@ -3408,6 +3474,51 @@ fn write_plan_node(out: &mut String, node: &red_core::PlanNode, depth: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whole_keyspace_glob_catches_wildcard_equivalents() {
+        // No literal anchor: matches essentially every key, so refused.
+        for p in ["*", "**", "?*", "*?", "[a-z]*", "?", "[^a]"] {
+            assert!(matches_whole_keyspace(p), "{p} should be whole-keyspace");
+        }
+        // A literal anchor narrows it: allowed (rides the normal approval gate).
+        for p in ["user:*", "a*", "*:cache", "[a-z]_role", "\\*", "session:?"] {
+            assert!(
+                !matches_whole_keyspace(p),
+                "{p} should NOT be whole-keyspace"
+            );
+        }
+    }
+
+    #[test]
+    fn kv_delete_star_equivalents_are_rejected_not_prompted() {
+        // The literal `*` and its glob-equivalents are hard-refused, never a
+        // NeedsApproval the user could wave through.
+        for p in ["*", "?*", "[a-z]*"] {
+            assert!(
+                matches!(
+                    assess_kv_write("kv_delete", &json!({ "pattern": p })),
+                    WriteAssessment::Reject(_)
+                ),
+                "kv_delete pattern `{p}` must be rejected"
+            );
+        }
+        // A scoped pattern still prompts.
+        assert!(matches!(
+            assess_kv_write("kv_delete", &json!({ "pattern": "user:*" })),
+            WriteAssessment::NeedsApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn config_get_secrets_are_redacted() {
+        for p in ["requirepass", "masterauth", "masteruser", "primarypass"] {
+            assert!(is_secret_config_param(p), "{p} should be secret");
+        }
+        for p in ["maxmemory", "dir", "save"] {
+            assert!(!is_secret_config_param(p), "{p} should not be secret");
+        }
+    }
 
     #[test]
     fn tool_args_summary_pulls_the_salient_scalar() {

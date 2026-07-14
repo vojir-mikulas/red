@@ -372,8 +372,12 @@ pub(crate) fn create_table_sql(
                     }
                     DbKind::Clickhouse => format!("{} {}", quote(&c.name), spell(kind, &nt)),
                     // No column/DDL model, no `DatabaseDriver` impl, so this
-                    // never sees `DbKind::Redis` (see `typemap::spell`).
-                    DbKind::Redis => unreachable!("Redis has no column/DDL model"),
+                    // never sees `DbKind::Redis` (see `typemap::spell`). Degrade
+                    // rather than panic on the backend thread if that ever breaks.
+                    DbKind::Redis => {
+                        debug_assert!(false, "Redis has no column/DDL model");
+                        format!("{} {}", quote(&c.name), spell(kind, &nt))
+                    }
                 }
             } else {
                 let ty = spell(kind, &nt);

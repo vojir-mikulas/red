@@ -248,6 +248,19 @@ pub trait KvDriver: Send + Sync {
     /// Refused on a read-only connection.
     async fn list_remove(&self, key: &str, count: i64, value: String) -> Result<u64>;
 
+    /// Delete the list element at a specific `index`. `LREM` alone matches by
+    /// *value*, so a positional row delete over a list with duplicate values
+    /// would remove the wrong (first-equal) element; this pins the deletion to
+    /// the index via the standard Redis idiom — `LSET` a unique sentinel there,
+    /// then `LREM` that sentinel. The default is two round trips; an engine that
+    /// can do it atomically overrides. Refused on a read-only connection.
+    async fn list_remove_at(&self, key: &str, index: i64) -> Result<()> {
+        let sentinel = format!("\u{0}__red_del_{index}__\u{0}");
+        self.list_set(key, index, sentinel.clone()).await?;
+        self.list_remove(key, 1, sentinel).await?;
+        Ok(())
+    }
+
     /// `EXPIRE key seconds` (`Some`) or `PERSIST key` (`None`). Refused on a
     /// read-only connection.
     async fn set_ttl(&self, key: &str, ttl: Option<Duration>) -> Result<()>;

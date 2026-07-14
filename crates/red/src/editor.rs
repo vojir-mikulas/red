@@ -1075,6 +1075,12 @@ impl AppState {
     }
 
     fn run_editor_query_impl(&mut self, force_offset: Option<usize>, cx: &mut Context<Self>) {
+        // A Redis session has no SQL editor — its `query 1` tab is a phantom that
+        // is never rendered (the Redis shell replaces the editor). ⌘↵ / gutter-run
+        // must not construct and send a SQL statement against it.
+        if matches!(&self.phase, Phase::Connected(a) if a.kv_view.is_some()) {
+            return;
+        }
         let sql = match &self.phase {
             Phase::Connected(active) => match active.active() {
                 Some(tab) => {
