@@ -116,7 +116,7 @@ pub(crate) enum QueryMode {
     /// (bypasses `SCAN`) — the list shows the single hit, or nothing.
     Exact,
     /// Client-side fuzzy match over loaded keys, auto-growing the scan pool
-    /// while under-matched (see `kv_maybe_grow_fuzzy_pool`).
+    /// while under-matched (see `kv_maybe_grow_pool`).
     Fuzzy,
     /// Substring search over string *values* (the driver reads scanned string
     /// values); runs on Enter, not per keystroke.
@@ -184,6 +184,72 @@ fn kv_filter_types() -> [KvType; 6] {
         KvType::ZSet,
         KvType::Stream,
     ]
+}
+
+/// A client-side filter on a loaded key's remaining TTL (the browse toolbar's
+/// `TTL ▾` dropdown). Redis's `SCAN` can't filter by expiry, so — unlike the
+/// server-side type/`MATCH` filters — this is a predicate applied to the rows
+/// already pulled into the resident window (see [`BrowseState::visible_rows`]).
+/// Every scanned key already carries its `PTTL` (fetched in the same pipeline as
+/// its type/encoding/size), so the filter reads data that's already present and
+/// costs nothing extra server-side. `Permanent` matches keys with no expiry
+/// (`ttl == None`); the bucket variants match a finite TTL under/over a bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TtlFilter {
+    /// No expiry set (`PERSIST`ed / never-expiring keys).
+    Permanent,
+    /// Expiring in 3 minutes or less — "ending soon".
+    EndingSoon,
+    /// A finite TTL under one hour.
+    UnderHour,
+    /// A finite TTL under one day.
+    UnderDay,
+    /// A finite TTL under one week.
+    UnderWeek,
+    /// A finite TTL of a week or more.
+    OverWeek,
+}
+
+impl TtlFilter {
+    /// The dropdown entries after the leading "Any TTL", in menu order.
+    pub(crate) const ALL: [TtlFilter; 6] = [
+        TtlFilter::Permanent,
+        TtlFilter::EndingSoon,
+        TtlFilter::UnderHour,
+        TtlFilter::UnderDay,
+        TtlFilter::UnderWeek,
+        TtlFilter::OverWeek,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            TtlFilter::Permanent => "Permanent",
+            TtlFilter::EndingSoon => "Ending ≤ 3 min",
+            TtlFilter::UnderHour => "TTL < 1 hour",
+            TtlFilter::UnderDay => "TTL < 1 day",
+            TtlFilter::UnderWeek => "TTL < 1 week",
+            TtlFilter::OverWeek => "TTL ≥ 1 week",
+        }
+    }
+
+    /// Whether a row with this remaining TTL (`None` = no expiry) passes.
+    fn matches(self, ttl: Option<Duration>) -> bool {
+        const HOUR: Duration = Duration::from_secs(3_600);
+        const DAY: Duration = Duration::from_secs(86_400);
+        const WEEK: Duration = Duration::from_secs(604_800);
+        const SOON: Duration = Duration::from_secs(180);
+        match (self, ttl) {
+            (TtlFilter::Permanent, ttl) => ttl.is_none(),
+            // Every bucket below is about a *finite* expiry, so a permanent key
+            // (no TTL) never matches them.
+            (_, None) => false,
+            (TtlFilter::EndingSoon, Some(t)) => t <= SOON,
+            (TtlFilter::UnderHour, Some(t)) => t < HOUR,
+            (TtlFilter::UnderDay, Some(t)) => t < DAY,
+            (TtlFilter::UnderWeek, Some(t)) => t < WEEK,
+            (TtlFilter::OverWeek, Some(t)) => t >= WEEK,
+        }
+    }
 }
 
 /// The kind of a Redis tab: what the `+` new-tab picker offers and what a
@@ -309,6 +375,15 @@ pub(crate) struct BrowseState {
     /// owned here because Flint's `Select` is stateless (the caller holds the
     /// open flag).
     pub(crate) type_filter_open: bool,
+    /// A client-side remaining-TTL filter over the loaded rows (`None` = any
+    /// TTL). Unlike `type_filter`/`pattern` it is *not* pushed down to `SCAN`
+    /// (Redis can't filter by expiry), so it narrows the resident window at
+    /// render time — see [`BrowseState::visible_rows`] and the `TTL ▾` dropdown
+    /// in `render_kv_browse`. Composes with every other filter.
+    pub(crate) ttl_filter: Option<TtlFilter>,
+    /// Whether the TTL-filter dropdown is showing its option list (Flint's
+    /// `Select` is stateless, so the open flag lives here, like `type_filter_open`).
+    pub(crate) ttl_filter_open: bool,
     /// Rows accumulated this run, forward-only, oldest-evicted past the cap.
     /// Held behind an `Rc` so the per-frame render (and keyboard nav) share the
     /// buffer by a refcount bump instead of deep-cloning up to `MAX_RESIDENT_ROWS`
@@ -343,7 +418,7 @@ pub(crate) struct BrowseState {
     /// How the filter box's text is interpreted (the query-mode dropdown at the
     /// head of the filter bar). `Glob`/`Prefix` push down to `SCAN … MATCH`;
     /// `Exact` probes a single key; `Fuzzy` filters loaded rows client-side and
-    /// auto-grows the pool (`kv_maybe_grow_fuzzy_pool`); `Value` reads scanned
+    /// auto-grows the pool (`kv_maybe_grow_pool`); `Value` reads scanned
     /// string values. Switching mode re-applies the box text under the new
     /// meaning (see `kv_set_query_mode`).
     pub(crate) mode: QueryMode,
@@ -590,6 +665,11 @@ pub(crate) struct RedisView {
     /// Auto-refresh), anchored at the trigger's position while open. `None` =
     /// closed. Mirrors the `tab_menu`/`key_menu` positioned-menu pattern.
     pub(crate) actions_menu: Option<gpui::Point<gpui::Pixels>>,
+    /// The browse toolbar's auto-refresh interval popover (Off · 2/5/10/30s),
+    /// anchored at the disclosure caret while open. `None` = closed. Mirrors the
+    /// `actions_menu` positioned-menu pattern; the interval lives per-tab on
+    /// [`BrowseState::auto_refresh`].
+    pub(crate) auto_menu: Option<gpui::Point<gpui::Pixels>>,
     /// The "Import keys" modal, when open (see [`AppState::kv_open_import`]).
     /// Connection-level (imports into the current DB), like `annotate`.
     pub(crate) import: Option<ImportState>,
@@ -854,8 +934,14 @@ pub(crate) struct StreamGroupsState {
 
 impl BrowseState {
     pub(crate) fn new(session: SessionId, cx: &mut Context<AppState>) -> Self {
-        let filter =
-            cx.new(|cx| TextInput::new(cx).with_placeholder(QueryMode::Glob.placeholder()));
+        // `bare()` so the box has no border/background of its own: it sits inside
+        // the combined `[mode ▾ │ input]` search field, which owns the chrome
+        // (see the toolbar in `render_kv_browse`).
+        let filter = cx.new(|cx| {
+            TextInput::new(cx)
+                .bare()
+                .with_placeholder(QueryMode::Glob.placeholder())
+        });
         cx.subscribe(&filter, move |this, input, event: &TextInputEvent, cx| {
             // Only the active (visible, focused) tab can receive input events
             // in the no-split shell, so routing to the active Browse tab is
@@ -883,20 +969,21 @@ impl BrowseState {
                     QueryMode::Fuzzy => {}
                 },
                 TextInputEvent::Change => match mode {
-                    // Debounced scan restart under the current mode's pattern.
-                    QueryMode::Glob | QueryMode::Prefix => {
-                        this.kv_debounce_filter(session, text, cx)
-                    }
+                    // Every server-backed mode applies on a debounce (Enter is an
+                    // accelerator, not a requirement): Glob/Prefix restart the
+                    // scan, Exact probes the typed key, Value re-scans reading
+                    // values. `kv_debounce_filter` re-reads the mode at fire time.
+                    QueryMode::Glob
+                    | QueryMode::Prefix
+                    | QueryMode::Exact
+                    | QueryMode::Value => this.kv_debounce_filter(session, text, cx),
                     // Fuzzy filtering reads the input live at render time (see
                     // `render_kv_browse`); this just repaints and keeps the
                     // candidate pool growing if the new query is under-matched.
                     QueryMode::Fuzzy => {
-                        this.kv_maybe_grow_fuzzy_pool(session, cx);
+                        this.kv_maybe_grow_pool(session, cx);
                         cx.notify();
                     }
-                    // Exact/Value wait for Enter; a Change just repaints so the
-                    // typed text shows.
-                    QueryMode::Exact | QueryMode::Value => cx.notify(),
                 },
                 _ => {}
             }
@@ -907,6 +994,8 @@ impl BrowseState {
             pattern: None,
             type_filter: None,
             type_filter_open: false,
+            ttl_filter: None,
+            ttl_filter_open: false,
             rows: Rc::new(Vec::new()),
             rows_gen: 0,
             visible_cache: RefCell::new(None),
@@ -971,32 +1060,48 @@ impl BrowseState {
     /// subset is memoized on `(query, rows_gen)` so an unrelated re-render
     /// doesn't re-score and re-sort every loaded key.
     pub(crate) fn visible_rows(&self, cx: &App) -> Rc<Vec<KeyMeta>> {
-        if !self.is_fuzzy() {
-            return Rc::clone(&self.rows);
-        }
-        let query = self.filter.read(cx).content().to_string();
-        if query.is_empty() {
+        let fuzzy = self.is_fuzzy();
+        let query = if fuzzy {
+            self.filter.read(cx).content().to_string()
+        } else {
+            String::new()
+        };
+        let fuzzy_active = fuzzy && !query.is_empty();
+        let ttl = self.ttl_filter;
+        // Fast path: nothing narrows the raw scan buffer, so share it by refcount.
+        if !fuzzy_active && ttl.is_none() {
             return Rc::clone(&self.rows);
         }
         if let Some(cached) = self.visible_cache.borrow().as_ref() {
-            if cached.query == query && cached.gen == self.rows_gen {
+            if cached.query == query && cached.ttl == ttl && cached.gen == self.rows_gen {
                 return Rc::clone(&cached.rows);
             }
         }
-        let mut scored: Vec<(i32, &KeyMeta)> = self
-            .rows
-            .iter()
-            .filter_map(|r| fuzzy_score(&query, &r.key).map(|s| (s, r)))
-            .collect();
-        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-        let result = Rc::new(
-            scored
-                .into_iter()
-                .map(|(_, r)| r.clone())
-                .collect::<Vec<_>>(),
-        );
+        // The TTL predicate (if any) prunes first; a fuzzy query then scores and
+        // best-match-orders what's left, otherwise the surviving rows keep scan
+        // order.
+        let passes_ttl = |r: &KeyMeta| ttl.is_none_or(|t| t.matches(r.ttl));
+        let result = if fuzzy_active {
+            let mut scored: Vec<(i32, &KeyMeta)> = self
+                .rows
+                .iter()
+                .filter(|r| passes_ttl(r))
+                .filter_map(|r| fuzzy_score(&query, &r.key).map(|s| (s, r)))
+                .collect();
+            scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+            Rc::new(scored.into_iter().map(|(_, r)| r.clone()).collect::<Vec<_>>())
+        } else {
+            Rc::new(
+                self.rows
+                    .iter()
+                    .filter(|r| passes_ttl(r))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        };
         *self.visible_cache.borrow_mut() = Some(VisibleRowsCache {
             query,
+            ttl,
             gen: self.rows_gen,
             rows: Rc::clone(&result),
         });
@@ -1004,9 +1109,11 @@ impl BrowseState {
     }
 }
 
-/// Memoized fuzzy [`BrowseState::visible_rows`] result (see that field).
+/// Memoized [`BrowseState::visible_rows`] result (see that field). Valid while
+/// the fuzzy query, the TTL filter, and the row generation are all unchanged.
 struct VisibleRowsCache {
     query: String,
+    ttl: Option<TtlFilter>,
     gen: u64,
     rows: Rc<Vec<KeyMeta>>,
 }
@@ -1235,6 +1342,7 @@ impl RedisView {
             key_menu: None,
             annotate: None,
             actions_menu: None,
+            auto_menu: None,
             import: None,
             new_tab_focus: cx.focus_handle(),
             new_tab_sel: 0,
@@ -1458,12 +1566,14 @@ impl AppState {
     }
 
     /// The filter box changed via typing (not Enter): wait `FILTER_DEBOUNCE_MS`
-    /// of no further typing before restarting the scan, so a fast typist
-    /// doesn't fire one `KvFetchScan` per keystroke. Mirrors `connect.rs`'s
-    /// `connect_gen` generation-check shape: bump `filter_gen` now, capture
-    /// it, and only act in the timer callback if it's still current; any
-    /// later `Change` (or an intervening `Submit`, which restarts directly
-    /// and leaves this generation stale) makes this callback a no-op.
+    /// of no further typing before applying the box text under the current mode,
+    /// so a fast typist doesn't fire one backend round trip per keystroke. Every
+    /// mode debounces through here (Fuzzy filters loaded rows live and never
+    /// reaches this); Enter is just an accelerator that applies the same thing
+    /// immediately. Mirrors `connect.rs`'s `connect_gen` generation-check shape:
+    /// bump `filter_gen` now, capture it, and only act in the timer callback if
+    /// it's still current; any later `Change` (or an intervening `Submit`, which
+    /// applies directly and leaves this generation stale) makes this a no-op.
     pub(crate) fn kv_debounce_filter(
         &mut self,
         session: SessionId,
@@ -1483,7 +1593,7 @@ impl AppState {
                 .timer(Duration::from_millis(FILTER_DEBOUNCE_MS))
                 .await;
             this.update(cx, |this, cx| {
-                // Re-read the mode at fire time so the pattern honors it even if
+                // Re-read the mode at fire time so the action honors it even if
                 // the user switched modes mid-debounce.
                 let current = this
                     .conn_mut(Some(session))
@@ -1491,8 +1601,17 @@ impl AppState {
                     .and_then(|v| v.active_browse())
                     .filter(|b| b.filter_gen == generation)
                     .map(|b| b.mode);
-                if let Some(mode) = current {
-                    this.kv_restart_scan(session, mode.scan_pattern(&text), cx);
+                match current {
+                    Some(mode @ (QueryMode::Glob | QueryMode::Prefix)) => {
+                        this.kv_restart_scan(session, mode.scan_pattern(&text), cx)
+                    }
+                    // A single-key metadata probe — cheap enough to run live.
+                    Some(QueryMode::Exact) => this.kv_probe_exact(session, non_empty(text), cx),
+                    // A value search reads each scanned key's value, so it's the
+                    // heaviest filter; debounce keeps it to one scan per typing
+                    // pause rather than per keystroke.
+                    Some(QueryMode::Value) => this.kv_set_value_needle(session, non_empty(text), cx),
+                    Some(QueryMode::Fuzzy) | None => {}
                 }
             })
             .ok();
@@ -1546,6 +1665,37 @@ impl AppState {
         }
         browse.type_filter = type_filter;
         self.kv_relaunch_browse(session, cx);
+    }
+
+    /// Set (or clear) the client-side TTL filter on the active Browse tab. Unlike
+    /// the type filter this needs no re-scan — it prunes the already-loaded rows
+    /// at render time (see [`BrowseState::visible_rows`]) — but a newly-applied
+    /// bucket can hide most of the resident window, so it kicks the pool-grow
+    /// loop to keep the grid filling (mirrors fuzzy).
+    pub(crate) fn kv_set_ttl_filter(
+        &mut self,
+        session: SessionId,
+        ttl_filter: Option<TtlFilter>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        else {
+            return;
+        };
+        browse.ttl_filter_open = false;
+        if browse.ttl_filter == ttl_filter {
+            cx.notify(); // same bucket re-picked: just dismiss the dropdown
+            return;
+        }
+        browse.ttl_filter = ttl_filter;
+        // The visible-row indices shift under a new client-side filter, so the
+        // keyboard cursor (an index into the visible rows) is no longer valid.
+        browse.nav_row = None;
+        cx.notify();
+        self.kv_maybe_grow_pool(session, cx);
     }
 
     /// Toggle the active Browse tab between the flat grid and the collapsible
@@ -1658,6 +1808,18 @@ impl AppState {
         }
     }
 
+    /// Open or dismiss the TTL-filter dropdown's option list.
+    pub(crate) fn kv_toggle_ttl_menu(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        {
+            browse.ttl_filter_open = !browse.ttl_filter_open;
+            cx.notify();
+        }
+    }
+
     /// Open the browse toolbar's actions dropdown at `pos` (Refresh · Expand /
     /// Collapse all · Auto-refresh). Closes the other positioned menus first.
     pub(crate) fn kv_open_actions_menu(
@@ -1683,6 +1845,62 @@ impl AppState {
             .and_then(|a| a.kv_view.as_mut())
         {
             if view.actions_menu.take().is_some() {
+                cx.notify();
+            }
+        }
+    }
+
+    /// Toggle the active Browse tab's auto-refresh on/off from the toolbar's
+    /// dedicated auto-refresh button (its primary click). Turning it on uses the
+    /// `redis.auto_refresh_secs` setting's interval, falling back to 5s when the
+    /// setting is "off"; the exact interval is still pickable from the button's
+    /// disclosure caret (see `render_kv_auto_menu`).
+    pub(crate) fn kv_toggle_auto_refresh(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let on = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .and_then(|v| v.active_browse())
+            .map(|b| b.auto_refresh.is_some())
+            .unwrap_or(false);
+        let next = if on {
+            None
+        } else {
+            Some(
+                self.settings
+                    .redis
+                    .auto_refresh_interval()
+                    .unwrap_or(Duration::from_secs(5)),
+            )
+        };
+        self.kv_set_auto_refresh(session, next, cx);
+    }
+
+    /// Open the auto-refresh interval popover (Off · 2/5/10/30s) at `pos`, closing
+    /// the other positioned menus first. Mirrors [`Self::kv_open_actions_menu`].
+    pub(crate) fn kv_open_auto_menu(
+        &mut self,
+        session: SessionId,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            view.tab_menu = None;
+            view.key_menu = None;
+            view.actions_menu = None;
+            view.auto_menu = Some(pos);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn kv_close_auto_menu(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            if view.auto_menu.take().is_some() {
                 cx.notify();
             }
         }
@@ -1893,6 +2111,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         self.kv_close_actions_menu(session, cx);
+        self.kv_close_auto_menu(session, cx);
         let tab_id = self
             .conn_mut(Some(session))
             .and_then(|a| a.kv_view.as_ref())
@@ -2248,9 +2467,9 @@ impl AppState {
         cx.notify();
         // Outside the `browse` borrow: if a fuzzy search is under-matched,
         // this page landing is what chains the next one (see
-        // `kv_maybe_grow_fuzzy_pool`'s doc comment for the full loop shape).
+        // `kv_maybe_grow_pool`'s doc comment for the full loop shape).
         if let Some(session) = session {
-            self.kv_maybe_grow_fuzzy_pool(session, cx);
+            self.kv_maybe_grow_pool(session, cx);
         }
     }
 
@@ -2414,24 +2633,31 @@ impl AppState {
     /// unbounded full walk: each step is the same bounded round trip the
     /// live browse already uses, chained by `on_kv_scan_page` as pages land
     /// and re-armed here on every keystroke.
-    pub(crate) fn kv_maybe_grow_fuzzy_pool(&mut self, session: SessionId, cx: &mut Context<Self>) {
+    pub(crate) fn kv_maybe_grow_pool(&mut self, session: SessionId, cx: &mut Context<Self>) {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
         let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
-        if !browse.is_fuzzy() || browse.loading || browse.exhausted {
+        if browse.loading || browse.exhausted {
             return;
         }
+        // The two client-side filters (fuzzy query, TTL bucket) narrow the
+        // resident window rather than the scan, so a short match set can hide
+        // matches that live deeper in the keyspace. While either is active and
+        // under-matched, chase more pages so the grid keeps filling.
         let query = browse.filter.read(cx).content().to_string();
-        if query.is_empty() {
+        let fuzzy_active = browse.is_fuzzy() && !query.is_empty();
+        let ttl = browse.ttl_filter;
+        if !fuzzy_active && ttl.is_none() {
             return;
         }
         let matches = browse
             .rows
             .iter()
-            .filter(|r| fuzzy_score(&query, &r.key).is_some())
+            .filter(|r| ttl.is_none_or(|t| t.matches(r.ttl)))
+            .filter(|r| !fuzzy_active || fuzzy_score(&query, &r.key).is_some())
             .count();
         if matches >= FUZZY_MATCH_TARGET {
             return;
@@ -2458,6 +2684,9 @@ impl AppState {
     /// comment): a fresh, dedicated scan epoch that keeps requesting pages
     /// until it's exhausted the keyspace or hit the sample's own bounds.
     pub(crate) fn kv_start_big_keys_sample(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        // Reachable from the browse actions menu now — dismiss it on the way in
+        // (a no-op when launched from the palette).
+        self.kv_close_actions_menu(session, cx);
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
@@ -5711,7 +5940,7 @@ fn type_pill(kv_type: &KvType, theme: &Theme) -> impl IntoElement {
 }
 
 /// How many fuzzy-matched keys is "enough" before the auto-continue scan
-/// (see `AppState::kv_maybe_grow_fuzzy_pool`) stops chasing more pages.
+/// (see `AppState::kv_maybe_grow_pool`) stops chasing more pages.
 /// Keeps a fuzzy search from silently walking the entire keyspace just to
 /// find a handful of matches, while still finding more than the first
 /// page's worth for a query that's genuinely common.
@@ -5869,7 +6098,6 @@ impl AppState {
         let Some(view_ref) = active.kv_view.as_ref() else {
             return div().flex_1();
         };
-        let db_size = view_ref.db_size;
         let Some(browse) = view_ref.browse_at(tab_idx) else {
             return div().flex_1();
         };
@@ -5877,74 +6105,6 @@ impl AppState {
         let writable = !active.config.read_only;
         let fuzzy_query = browse.filter.read(cx).content().to_string();
         let rows: Rc<Vec<KeyMeta>> = browse.visible_rows(cx);
-
-        // Appended to the header stat once the resident-row cap has kicked in.
-        let evicted_note = if browse.evicted {
-            " · showing the most recent 20k, narrow the filter for older keys"
-        } else {
-            ""
-        };
-
-        let still = |exhausted: bool| if exhausted { "" } else { ", still scanning…" };
-        let header = match browse.mode {
-            QueryMode::Fuzzy => {
-                if fuzzy_query.is_empty() {
-                    format!("{} keys loaded so far", browse.rows.len())
-                } else {
-                    format!(
-                        "{} fuzzy match(es) of {} loaded{}",
-                        rows.len(),
-                        browse.rows.len(),
-                        still(browse.exhausted)
-                    )
-                }
-            }
-            QueryMode::Exact => {
-                if browse.loading {
-                    "looking up key…".into()
-                } else if fuzzy_query.is_empty() {
-                    "type an exact key name".into()
-                } else if browse.rows.is_empty() {
-                    "no such key".into()
-                } else {
-                    "1 key".into()
-                }
-            }
-            QueryMode::Value => match &browse.value_needle {
-                Some(n) => format!(
-                    "{} key(s) with a value containing \"{n}\"{}",
-                    browse.rows.len(),
-                    still(browse.exhausted)
-                ),
-                None => format!(
-                    "{} keys loaded — type a value substring, then Enter",
-                    browse.rows.len()
-                ),
-            },
-            QueryMode::Glob | QueryMode::Prefix => {
-                let type_label = browse.type_filter.as_ref().map(|t| t.label());
-                match (&browse.pattern, type_label, db_size) {
-                    // No filter at all: the cheap `DBSIZE` header stat.
-                    (None, None, Some(n)) => {
-                        format!("~{} keys in db0", crate::result::group_digits(n as usize))
-                    }
-                    (None, None, None) => "counting keys…".into(),
-                    // A pattern and/or type filter is active: there's no cheap
-                    // filtered count, so report what's loaded so far.
-                    (pattern, ty, _) => {
-                        let kind = ty.map(|t| format!("{t} ")).unwrap_or_default();
-                        match pattern {
-                            Some(p) => format!(
-                                "{} {kind}key(s) matching \"{p}\" so far",
-                                browse.rows.len()
-                            ),
-                            None => format!("{} {kind}key(s) so far", browse.rows.len()),
-                        }
-                    }
-                }
-            }
-        };
-        let header = format!("{header}{evicted_note}");
 
         // In tree mode the list is a flattened namespace trie (folders + keys);
         // in grid mode it's the raw key rows (no per-row allocation — the flat
@@ -6181,16 +6341,6 @@ impl AppState {
                     .ok();
             });
 
-        let big_keys_view = view.clone();
-        let big_keys_button = Button::new("kv-find-big-keys", "Find biggest keys")
-            .size(ButtonSize::Sm)
-            .variant(ButtonVariant::Secondary)
-            .on_click(move |_, _, cx| {
-                big_keys_view
-                    .update(cx, |this, cx| this.kv_start_big_keys_sample(session, cx))
-                    .ok();
-            });
-
         let new_key_button = writable.then(|| {
             let new_view = view.clone();
             Button::new("kv-new-key", "+ New key")
@@ -6203,11 +6353,77 @@ impl AppState {
                 })
         });
 
-        // The actions dropdown: Refresh · Expand/Collapse all · Auto-refresh.
-        // A button-shaped trigger (styled like the Secondary buttons) that opens
-        // a positioned `ContextMenu`; tinted + clock-badged while auto-refresh is
-        // on, so the toolbar shows the tab is live-refreshing.
+        // Auto-refresh gets its own toolbar control (promoted out of the actions
+        // menu): a pill whose left region toggles auto-refresh on/off and whose
+        // right caret opens the interval popover. Accent-tinted + interval-labelled
+        // while live, so the toolbar shows the tab is refreshing at a glance.
         let auto_on = browse.auto_refresh.is_some();
+        let auto_secs = browse.auto_refresh.map(|d| d.as_secs());
+        let auto_hue = if auto_on { theme.accent } else { theme.text_muted };
+        let toggle_view = view.clone();
+        let caret_view = view.clone();
+        let auto_button = div()
+            .flex()
+            .items_center()
+            .h(px(24.))
+            .rounded(px(5.))
+            .border_1()
+            .border_color(if auto_on { theme.accent } else { theme.border })
+            .bg(theme.bg_elevated)
+            .text_size(theme.scale(12.))
+            .child(
+                div()
+                    .id("kv-auto-toggle")
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .h_full()
+                    .px_1p5()
+                    .cursor_pointer()
+                    .text_color(auto_hue)
+                    .hover(|s| s.bg(theme.bg_hover))
+                    .tooltip(Tooltip::text(if auto_on {
+                        "Auto-refresh on — click to turn off"
+                    } else {
+                        "Auto-refresh off — click to turn on"
+                    }))
+                    .child(crate::icons::icon("refresh-cw", theme.scale(13.), auto_hue))
+                    .when_some(auto_secs, |s, secs| s.child(format!("{secs}s")))
+                    .on_click(move |_, _, cx| {
+                        toggle_view
+                            .update(cx, |this, cx| this.kv_toggle_auto_refresh(session, cx))
+                            .ok();
+                    }),
+            )
+            .child(div().w(px(1.)).h(px(14.)).bg(theme.border))
+            .child(
+                div()
+                    .id("kv-auto-caret")
+                    .flex()
+                    .items_center()
+                    .h_full()
+                    .px_1()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.bg_hover))
+                    .tooltip(Tooltip::text("Auto-refresh interval"))
+                    .child(crate::icons::icon(
+                        "chevron-down",
+                        theme.scale(12.),
+                        theme.text_muted,
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        move |event: &gpui::MouseDownEvent, _, cx| {
+                            let pos = event.position;
+                            caret_view
+                                .update(cx, |this, cx| this.kv_open_auto_menu(session, pos, cx))
+                                .ok();
+                        },
+                    ),
+            );
+
+        // The actions dropdown: Refresh · Import · Expand/Collapse all · Find
+        // biggest keys. A button-shaped trigger opening a positioned `ContextMenu`.
         let actions_view = view.clone();
         let actions_button = div()
             .id("kv-actions-btn")
@@ -6221,16 +6437,9 @@ impl AppState {
             .border_color(theme.border)
             .bg(theme.bg_elevated)
             .text_size(theme.scale(12.))
-            .text_color(if auto_on {
-                theme.accent
-            } else {
-                theme.text_muted
-            })
+            .text_color(theme.text_muted)
             .cursor_pointer()
             .hover(|s| s.bg(theme.bg_hover))
-            .when(auto_on, |s| {
-                s.child(crate::icons::icon("clock", theme.scale(12.), theme.accent))
-            })
             .child("Actions")
             .child(crate::icons::icon(
                 "chevron-down",
@@ -6251,6 +6460,7 @@ impl AppState {
         // "no matches" reads as deliberate (mirrors the other panels' empties).
         let has_filter = browse.pattern.is_some()
             || browse.type_filter.is_some()
+            || browse.ttl_filter.is_some()
             || browse.value_needle.is_some()
             || (browse.is_fuzzy() && !fuzzy_query.is_empty());
         let empty_msg = if browse.loading {
@@ -6259,6 +6469,10 @@ impl AppState {
             "No key with that exact name"
         } else if browse.value_needle.is_some() {
             "No string values match this search"
+        } else if browse.ttl_filter.is_some() && !browse.exhausted {
+            // A client-side TTL filter only sees the loaded window; be explicit
+            // that a deeper match may exist rather than implying none do.
+            "No matching TTL among the loaded keys yet — still scanning, or narrow with a prefix"
         } else if has_filter {
             "No keys match this filter"
         } else {
@@ -6380,21 +6594,23 @@ impl AppState {
                     .pt_2()
                     .pb_1()
                     .child({
-                        // Query-mode dropdown at the head of the filter bar: how
-                        // the box text is interpreted (Glob / Prefix / Exact /
-                        // Fuzzy / Value). Replaces the old separate fuzzy and
-                        // value-search toggles with one explicit control.
+                        // The combined search field: `[ mode ▾ │ filter… ]` as one
+                        // bordered unit. The leading `seamless` Select picks how the
+                        // box text is read (Glob / Prefix / Exact / Fuzzy / Value)
+                        // and drives the input's placeholder; the `bare()` input
+                        // (see `BrowseState::new`) fills the rest. The container owns
+                        // the border/background so the two read as a single control.
                         let toggle_view = view.clone();
                         let select_view = view.clone();
                         let selected_ix = QueryMode::ALL
                             .iter()
                             .position(|m| *m == browse.mode)
                             .unwrap_or(0);
-                        let mut select = Select::new("kv-query-mode").accent(false);
+                        let mut mode_select = Select::new("kv-query-mode").accent(false).seamless();
                         for m in QueryMode::ALL.iter() {
-                            select = select.option(m.label().to_string());
+                            mode_select = mode_select.option(m.label().to_string());
                         }
-                        select
+                        let mode_select = mode_select
                             .selected(selected_ix)
                             .open(browse.mode_open)
                             .on_toggle(move |_, cx| {
@@ -6411,9 +6627,34 @@ impl AppState {
                                         this.kv_set_query_mode(session, mode, cx)
                                     })
                                     .ok();
+                            });
+                        div()
+                            .flex()
+                            .flex_1()
+                            .items_center()
+                            .min_w(px(180.))
+                            .h(px(28.))
+                            .rounded(theme.radius)
+                            .bg(theme.bg_input)
+                            .border_1()
+                            .border_color(if browse.mode_open {
+                                theme.border_strong
+                            } else {
+                                theme.border
                             })
+                            .child(mode_select)
+                            .child(div().flex_shrink_0().w(px(1.)).h(px(16.)).bg(theme.border))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(80.))
+                                    .px_2()
+                                    // The `bare()` input inherits the ambient text
+                                    // size, so set it here to match the mode label.
+                                    .text_size(theme.font_size)
+                                    .child(browse.filter.clone()),
+                            )
                     })
-                    .child(div().flex_1().min_w(px(120.)).child(browse.filter.clone()))
                     .child({
                         // Namespace tree ↔ flat grid view toggle. Groups keys by
                         // their `:` hierarchy without a re-scan.
@@ -6483,18 +6724,48 @@ impl AppState {
                                     .ok();
                             })
                     })
-                    .child(
-                        // Yields width to the filter input when the pane is narrow
-                        // (e.g. the History dock is open) instead of squeezing it.
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(theme.scale(11.))
-                            .text_color(theme.text_muted)
-                            .child(header),
-                    )
+                    .child({
+                        // Client-side TTL filter (index 0 = "Any TTL", 1..=6 the
+                        // `TtlFilter` buckets). Prunes the loaded rows at render
+                        // time — Redis can't filter by expiry — so it composes with
+                        // every server-side filter (see `kv_set_ttl_filter`).
+                        let selected_ix = match &browse.ttl_filter {
+                            None => 0,
+                            Some(f) => TtlFilter::ALL
+                                .iter()
+                                .position(|x| x == f)
+                                .map(|i| i + 1)
+                                .unwrap_or(0),
+                        };
+                        let toggle_view = view.clone();
+                        let select_view = view.clone();
+                        let mut select = Select::new("kv-ttl-filter")
+                            .accent(false)
+                            .option("Any TTL");
+                        for f in TtlFilter::ALL.iter() {
+                            select = select.option(f.label().to_string());
+                        }
+                        select
+                            .selected(selected_ix)
+                            .open(browse.ttl_filter_open)
+                            .on_toggle(move |_, cx| {
+                                toggle_view
+                                    .update(cx, |this, cx| this.kv_toggle_ttl_menu(session, cx))
+                                    .ok();
+                            })
+                            .on_select(move |ix, _, cx| {
+                                let choice = ix
+                                    .checked_sub(1)
+                                    .and_then(|i| TtlFilter::ALL.get(i).copied());
+                                select_view
+                                    .update(cx, |this, cx| {
+                                        this.kv_set_ttl_filter(session, choice, cx)
+                                    })
+                                    .ok();
+                            })
+                    })
                     .children(new_key_button)
-                    .child(big_keys_button)
+                    .child(auto_button)
                     .child(actions_button),
             )
             .child(main)
@@ -6655,10 +6926,79 @@ impl AppState {
         let has_folders = browse
             .map(|b| b.rows.iter().any(|m| m.key.contains(':')))
             .unwrap_or(false);
-        let auto = browse.and_then(|b| b.auto_refresh);
 
-        // Auto-refresh submenu: Off + the interval presets, a ✓ on the active one.
-        let mut submenu = Submenu::new("kv-auto-refresh", "Auto-refresh").item({
+        let menu = ContextMenu::new("kv-actions-menu")
+            .item(
+                ContextMenuItem::new("kv-act-refresh", "Refresh keys")
+                    .shortcut(crate::keymap::localize_hint("⌘R"))
+                    .on_click(cx.listener(move |this, _, _, cx| this.kv_refresh_keys(session, cx))),
+            )
+            .item(
+                ContextMenuItem::new("kv-act-big-keys", "Find biggest keys")
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.kv_start_big_keys_sample(session, cx)
+                        }),
+                    ),
+            )
+            .item(
+                ContextMenuItem::new("kv-act-import", "Import keys…")
+                    .disabled(!writable)
+                    .on_click(cx.listener(move |this, _, _, cx| this.kv_open_import(session, cx))),
+            )
+            .separator()
+            .item(
+                ContextMenuItem::new("kv-act-expand", "Expand all")
+                    .disabled(!tree_mode || !has_folders)
+                    .on_click(cx.listener(move |this, _, _, cx| this.kv_expand_all(session, cx))),
+            )
+            .item(
+                ContextMenuItem::new("kv-act-collapse", "Collapse all")
+                    .disabled(!tree_mode)
+                    .on_click(cx.listener(move |this, _, _, cx| this.kv_collapse_all(session, cx))),
+            );
+
+        // The dismiss catcher fills the shell; the menu itself floats via Flint's
+        // `floating` helper, which snaps it inside the viewport — so a trigger near
+        // the right edge no longer spills the menu off-screen. Anchored top-right so
+        // it drops leftward from the right-aligned Actions button.
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.kv_close_actions_menu(session, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| this.kv_close_actions_menu(session, cx)),
+            )
+            .child(
+                floating(div().occlude().child(menu.into_any_element()))
+                    .at(pos)
+                    .anchor(gpui::Anchor::TopRight),
+            )
+            .into_any_element()
+    }
+
+    /// The auto-refresh interval popover (Off · 2/5/10/30s) opened from the
+    /// toolbar's auto-refresh caret. A positioned `ContextMenu` over a full-bleed
+    /// dismiss catcher, mirroring [`Self::render_kv_actions_menu`]; a ✓ marks the
+    /// active interval.
+    pub(crate) fn render_kv_auto_menu(
+        &self,
+        active: &ActiveConn,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let session = active.session;
+        let auto = active
+            .kv_view
+            .as_ref()
+            .and_then(|v| v.active_browse())
+            .and_then(|b| b.auto_refresh);
+
+        let mut menu = ContextMenu::new("kv-auto-menu").item({
             let off = ContextMenuItem::new("kv-auto-off", "Off").on_click(
                 cx.listener(move |this, _, _, cx| this.kv_set_auto_refresh(session, None, cx)),
             );
@@ -6677,56 +7017,28 @@ impl AppState {
             .on_click(
                 cx.listener(move |this, _, _, cx| this.kv_set_auto_refresh(session, Some(dur), cx)),
             );
-            submenu = submenu.item(if auto == Some(dur) {
+            menu = menu.item(if auto == Some(dur) {
                 item.shortcut("✓")
             } else {
                 item
             });
         }
 
-        let menu = ContextMenu::new("kv-actions-menu")
-            .item(
-                ContextMenuItem::new("kv-act-refresh", "Refresh keys")
-                    .shortcut(crate::keymap::localize_hint("⌘R"))
-                    .on_click(cx.listener(move |this, _, _, cx| this.kv_refresh_keys(session, cx))),
-            )
-            .item(
-                ContextMenuItem::new("kv-act-import", "Import keys…")
-                    .disabled(!writable)
-                    .on_click(cx.listener(move |this, _, _, cx| this.kv_open_import(session, cx))),
-            )
-            .separator()
-            .item(
-                ContextMenuItem::new("kv-act-expand", "Expand all")
-                    .disabled(!tree_mode || !has_folders)
-                    .on_click(cx.listener(move |this, _, _, cx| this.kv_expand_all(session, cx))),
-            )
-            .item(
-                ContextMenuItem::new("kv-act-collapse", "Collapse all")
-                    .disabled(!tree_mode)
-                    .on_click(cx.listener(move |this, _, _, cx| this.kv_collapse_all(session, cx))),
-            )
-            .separator()
-            .submenu(submenu);
-
         div()
             .absolute()
             .inset_0()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, _, cx| this.kv_close_actions_menu(session, cx)),
+                cx.listener(move |this, _, _, cx| this.kv_close_auto_menu(session, cx)),
             )
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, _, _, cx| this.kv_close_actions_menu(session, cx)),
+                cx.listener(move |this, _, _, cx| this.kv_close_auto_menu(session, cx)),
             )
             .child(
-                div()
-                    .occlude()
-                    .absolute()
-                    .left(pos.x)
-                    .top(pos.y)
-                    .child(menu),
+                floating(div().occlude().child(menu.into_any_element()))
+                    .at(pos)
+                    .anchor(gpui::Anchor::TopRight),
             )
             .into_any_element()
     }
@@ -9058,6 +9370,33 @@ mod tests {
             encoding: String::new(),
             approx_bytes: 0,
         }
+    }
+
+    #[test]
+    fn ttl_filter_buckets_match_expected_ranges() {
+        use std::time::Duration;
+        let secs = Duration::from_secs;
+        // Permanent matches only keys with no expiry, never a finite TTL.
+        assert!(TtlFilter::Permanent.matches(None));
+        assert!(!TtlFilter::Permanent.matches(Some(secs(10))));
+        // A permanent key never falls into any finite bucket.
+        for f in TtlFilter::ALL {
+            if f != TtlFilter::Permanent {
+                assert!(!f.matches(None), "{f:?} should reject a permanent key");
+            }
+        }
+        // Ending soon: 3 minutes inclusive.
+        assert!(TtlFilter::EndingSoon.matches(Some(secs(180))));
+        assert!(!TtlFilter::EndingSoon.matches(Some(secs(181))));
+        // Bound edges are exclusive on the "under" buckets, inclusive on OverWeek.
+        assert!(TtlFilter::UnderHour.matches(Some(secs(3599))));
+        assert!(!TtlFilter::UnderHour.matches(Some(secs(3600))));
+        assert!(TtlFilter::UnderDay.matches(Some(secs(86_399))));
+        assert!(!TtlFilter::UnderDay.matches(Some(secs(86_400))));
+        assert!(TtlFilter::UnderWeek.matches(Some(secs(604_799))));
+        assert!(!TtlFilter::UnderWeek.matches(Some(secs(604_800))));
+        assert!(TtlFilter::OverWeek.matches(Some(secs(604_800))));
+        assert!(!TtlFilter::OverWeek.matches(Some(secs(604_799))));
     }
 
     #[test]

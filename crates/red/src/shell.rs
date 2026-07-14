@@ -1772,6 +1772,11 @@ impl AppState {
             .as_ref()
             .and_then(|v| v.actions_menu)
             .map(|pos| self.render_kv_actions_menu(active, pos, cx));
+        let auto_menu = active
+            .kv_view
+            .as_ref()
+            .and_then(|v| v.auto_menu)
+            .map(|pos| self.render_kv_auto_menu(active, pos, cx));
 
         // Optional left History dock (⌘Y), mirroring the SQL shell's history
         // dock: a leading resizable SplitPane over the work area.
@@ -1965,6 +1970,26 @@ impl AppState {
                     .flex_shrink_0()
                     .items_center()
                     .gap_1()
+                    // The keyspace size lives here (moved off the busy browse
+                    // toolbar), and only while a Browse tab is focused: the stable,
+                    // unfiltered `DBSIZE` — never the churny per-filter "so far"
+                    // count — plus a windowing note once the resident cap has
+                    // evicted the oldest scanned keys.
+                    .children(active.kv_view.as_ref().and_then(|v| {
+                        let browse = v.active_browse()?;
+                        let base = match v.db_size {
+                            Some(n) => {
+                                format!("~{} keys", crate::result::group_digits(n as usize))
+                            }
+                            None => "counting keys…".to_string(),
+                        };
+                        let label = if browse.evicted {
+                            format!("{base} · showing recent 20k")
+                        } else {
+                            base
+                        };
+                        Some(div().px_2().text_color(theme.text).child(label))
+                    }))
                     .child(
                         div()
                             .px_2()
@@ -1989,6 +2014,7 @@ impl AppState {
             .children(key_menu)
             .children(annotate)
             .children(actions_menu)
+            .children(auto_menu)
     }
 
     /// The work area right of the schema dock: a single editor/result pane, or,

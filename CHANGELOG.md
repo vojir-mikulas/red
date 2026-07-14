@@ -24,10 +24,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 - Redis key browser: an Actions dropdown in the toolbar — Refresh keys (also
-  ⌘/Ctrl+R), Expand all / Collapse all for the namespace tree, and an
-  Auto-refresh submenu (Off / 2s / 5s / 10s / 30s) that periodically re-scans the
-  keyspace. A new `[redis] auto_refresh_secs` setting (Settings → Behavior) sets
-  the interval new browse tabs start at.
+  ⌘/Ctrl+R), Find biggest keys, Import keys, and Expand all / Collapse all for
+  the namespace tree.
+- Redis key browser: the filter bar is now a single combined search field —
+  the query-mode picker (Glob / Prefix / Exact / Fuzzy / Value) sits inside the
+  input as one control instead of a separate dropdown beside it.
+- Redis key browser: a TTL filter dropdown beside the type filter narrows the
+  visible keys by remaining expiry — Permanent (no TTL), ending in ≤ 3 minutes,
+  or under an hour / day / week, or a week or more. It filters the loaded keys,
+  so pair it with a prefix or type filter on very large keyspaces.
+- Redis key browser: auto-refresh is now a dedicated toolbar button — click to
+  turn periodic re-scanning on/off (shown accent-tinted with its interval while
+  live), and use its caret to pick the interval (Off / 2s / 5s / 10s / 30s). A
+  new `[redis] auto_refresh_secs` setting (Settings → Behavior) sets the interval
+  new browse tabs start at.
 - Redis key browser: Import keys (Actions → Import keys…) — choose a text file of
   Redis commands (one per line, e.g. `SET user:1 alice`; blank lines and `#`
   comments ignored) and run them in order against the current database, with a
@@ -41,7 +51,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   replaced by a single query-mode dropdown at the head of the bar — Glob (`*`),
   Prefix, Exact, Fuzzy, and Value. Prefix matches keys starting with the typed
   text; Exact jumps straight to one key by name (no scan); Glob/Fuzzy/Value keep
-  their old behaviour. The placeholder and result count follow the mode.
+  their old behaviour. The placeholder and result count follow the mode. Every
+  mode now filters as you type (debounced) — pressing Enter is an optional
+  accelerator, no longer required for Exact or Value lookups.
+- Redis key browser: the browse toolbar is decluttered — the keyspace size
+  ("~N keys") moved to the status bar at the bottom (shown only while browsing,
+  and always the stable unfiltered count), "Find biggest keys" moved into the
+  Actions dropdown, and the toolbar's dropdown menus no longer open off-screen
+  near the window edge.
 - Redis "New key": now a centred modal with a labelled, form-friendly layout and
   a segmented type picker (String · Hash · List · Set · ZSet · Stream). The
   fields adapt to the chosen type — a string gains an optional expiry (TTL), a
