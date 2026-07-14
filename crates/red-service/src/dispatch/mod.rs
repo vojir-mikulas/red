@@ -2829,6 +2829,17 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 let Some(dst_state) = sessions.get(&target_session) else {
                     copy_fail!("target connection isn't open")
                 };
+                // Defense in depth alongside the UI's target filter (see
+                // `collect_targets`/`collect_namespaces`, which hide read-only
+                // connections): never write to — or create a table on — a
+                // read-only destination, even if a stale command reaches here.
+                if dst_state.read_only {
+                    copy_fail!(if create.is_some() {
+                        "target connection is read-only — can't create a table there"
+                    } else {
+                        "target connection is read-only"
+                    })
+                }
                 let Some(dst) = dst_state.driver.as_sql().cloned() else {
                     copy_fail!("target isn't a SQL connection")
                 };

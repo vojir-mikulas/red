@@ -852,8 +852,18 @@ impl QueryTab {
         let editor = cx.new(|cx| {
             CodeEditor::new(cx)
                 .highlighter(crate::sql::tokenize)
-                // A ▶ run marker in the gutter on each statement's first line.
+                // A play run marker in the gutter on each statement's first line.
+                // The svg inherits the marker cell's `currentColor`, so flint's
+                // hover recolour still lands on it (a fixed-colour `icons::icon`
+                // would ignore it).
                 .gutter_markers(crate::sql::statement_start_lines)
+                .gutter_marker_icon(|| {
+                    gpui::svg()
+                        .path("icons/play.svg")
+                        .size(px(11.))
+                        .flex_none()
+                        .into_any_element()
+                })
                 .corner_radius(px(0.))
                 .resting_border(false)
                 .a11y_label("Query editor")

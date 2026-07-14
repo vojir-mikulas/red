@@ -1010,11 +1010,12 @@ impl AppState {
         let row_height = self.settings.grid.density.row_height();
         let mono_family = theme.mono_family.clone();
         let cell_size = theme.font_size;
-        let show_gutter = self.settings.grid.row_numbers;
         let gutter_px = gutter_width(grid.total);
-        let gutter_w = if show_gutter { gutter_px } else { 0.0 };
+        // Draft rows always carry a leading action cell holding the remove-X,
+        // even when the row-number gutter is hidden — otherwise there is no way
+        // to discard a staged insert.
         let ncols = grid.columns.len();
-        let content_w = gutter_w + ncols as f32 * DATA_COL_WIDTH;
+        let content_w = gutter_px + ncols as f32 * DATA_COL_WIDTH;
         // The cell of an open editor that targets a draft row.
         let draft_inline: Option<(usize, usize, Entity<TextInput>)> =
             self.grid_edit.as_ref().and_then(|e| match &e.slot {
@@ -1024,40 +1025,38 @@ impl AppState {
 
         let mut rows = Vec::with_capacity(grid.pending.inserts.len());
         for (index, draft) in grid.pending.inserts.iter().enumerate() {
-            let mut cells = Vec::with_capacity(ncols + show_gutter as usize);
-            if show_gutter {
-                cells.push(
-                    div()
-                        .w(px(gutter_px))
-                        .flex_shrink_0()
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .border_r_1()
-                        .border_color(line)
-                        .child(
-                            div()
-                                .id(("draft-remove", index))
-                                .cursor_pointer()
-                                // The svg inherits the parent's `text_color`, so the
-                                // hover recolour lands on the icon (a fixed-colour
-                                // `icons::icon` would ignore it).
-                                .text_color(faint)
-                                .hover(|s| s.text_color(accent))
-                                .child(
-                                    gpui::svg()
-                                        .path("icons/circle-x.svg")
-                                        .size(theme.scale(14.))
-                                        .flex_none(),
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.remove_draft_row(index, cx)
-                                })),
-                        )
-                        .into_any_element(),
-                );
-            }
+            let mut cells = Vec::with_capacity(ncols + 1);
+            cells.push(
+                div()
+                    .w(px(gutter_px))
+                    .flex_shrink_0()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .border_r_1()
+                    .border_color(line)
+                    .child(
+                        div()
+                            .id(("draft-remove", index))
+                            .cursor_pointer()
+                            // The svg inherits the parent's `text_color`, so the
+                            // hover recolour lands on the icon (a fixed-colour
+                            // `icons::icon` would ignore it).
+                            .text_color(faint)
+                            .hover(|s| s.text_color(accent))
+                            .child(
+                                gpui::svg()
+                                    .path("icons/circle-x.svg")
+                                    .size(theme.scale(14.))
+                                    .flex_none(),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_draft_row(index, cx)
+                            })),
+                    )
+                    .into_any_element(),
+            );
             for c in 0..ncols {
                 if let Some((di, dc, input)) = &draft_inline {
                     if *di == index && *dc == c {
