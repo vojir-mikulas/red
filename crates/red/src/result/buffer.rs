@@ -162,6 +162,21 @@ impl DisplayCell {
 /// scrolled out of view. Flattening here keeps the cell one line showing its head;
 /// the raw [`Value`] is untouched, so copy and the detail inspector still get the
 /// real multi-line content. Fast path: text with no control chars clones as-is.
+/// Case-insensitive substring test that allocates nothing. `needle` is already
+/// lower-cased (the find bar lowers it once); each haystack char is lowered on the
+/// fly and compared, so a search keystroke doesn't build a fresh `to_lowercase()`
+/// `String` for every resident cell. `char::to_lowercase` yields 1..n chars, so
+/// Unicode folding stays correct. O(n·m), but grid cells and search terms are short.
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.char_indices().any(|(i, _)| {
+        let mut hay = haystack[i..].chars().flat_map(char::to_lowercase);
+        needle.chars().all(|nc| hay.next() == Some(nc))
+    })
+}
+
 fn one_line(s: &str) -> SharedString {
     if s.chars().any(char::is_control) {
         s.chars()
@@ -586,7 +601,7 @@ impl GridBuffer {
         let mut out = Vec::new();
         let mut scan = |ord: usize, row: &Row| {
             for (c, cell) in row.display.iter().enumerate() {
-                if cell.text.to_lowercase().contains(term) {
+                if contains_ci(&cell.text, term) {
                     out.push((ord, c));
                 }
             }
@@ -888,6 +903,22 @@ mod window_tests {
             window_decision(total, max_base, WINDOW - 50, 30),
             (max_base, None)
         );
+    }
+}
+
+#[cfg(test)]
+mod ci_tests {
+    use super::contains_ci;
+
+    #[test]
+    fn matches_case_insensitively_without_allocating() {
+        assert!(contains_ci("Hello World", "hello")); // needle already lower-cased
+        assert!(contains_ci("Hello World", "world"));
+        assert!(contains_ci("Hello World", "o w"));
+        assert!(contains_ci("MÜNCHEN", "münchen")); // Unicode fold
+        assert!(contains_ci("anything", "")); // empty needle matches
+        assert!(!contains_ci("Hello", "world"));
+        assert!(!contains_ci("ab", "abc")); // needle longer than remaining
     }
 }
 

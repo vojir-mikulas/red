@@ -535,7 +535,10 @@ impl DatabaseDriver for ClickhouseDriver {
         let (columns, types, rows) = self.run_collect(base, &[], abort).await?;
         let cap = CellCap::resolve(&cap, &columns);
         Ok(ResultPage {
-            rows: rows.iter().map(|r| ch_row(r, &types, cap)).collect(),
+            // Drain the raw JSON rows as display rows are built, so the parsed
+            // `Vec<Vec<Json>>` frees incrementally instead of coexisting whole with
+            // the output `Vec<Vec<Value>>` (a page's worth of double residency).
+            rows: rows.into_iter().map(|r| ch_row(&r, &types, cap)).collect(),
             columns,
         })
     }
@@ -567,7 +570,7 @@ impl DatabaseDriver for ClickhouseDriver {
         let (columns, ctypes, rows) = self.run_collect(base, &ch_params(bound), abort).await?;
         let cap = CellCap::display(crate::key_positions(key, &columns));
         Ok(ResultPage {
-            rows: rows.iter().map(|r| ch_row(r, &ctypes, cap)).collect(),
+            rows: rows.into_iter().map(|r| ch_row(&r, &ctypes, cap)).collect(),
             columns,
         })
     }
@@ -595,7 +598,7 @@ impl DatabaseDriver for ClickhouseDriver {
         let (columns, ctypes, rows) = self.run_collect(base, &ch_params(from), abort).await?;
         let cap = CellCap::display(crate::key_positions(key, &columns));
         Ok(ResultPage {
-            rows: rows.iter().map(|r| ch_row(r, &ctypes, cap)).collect(),
+            rows: rows.into_iter().map(|r| ch_row(&r, &ctypes, cap)).collect(),
             columns,
         })
     }

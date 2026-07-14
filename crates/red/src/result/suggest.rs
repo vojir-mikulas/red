@@ -24,6 +24,12 @@ use crate::app::{AppState, Phase};
 /// the user filters within it client-side, or types an id outside it directly.
 const LOOKUP_LIMIT: usize = 500;
 
+/// Max distinct FK / enum targets cached per connection before an (arbitrary)
+/// entry is evicted. Both caches are rebuilt on demand, so this trades a rare
+/// re-fetch for a ceiling on what was otherwise a monotonic, never-freed
+/// per-connection cache (it only grows over a long session's editing).
+const FK_ENUM_CACHE_CAP: usize = 256;
+
 /// The open in-cell FK picker: the fetched id/label rows for one FK target, plus the
 /// live filter query and highlighted row. Single-instance app state (one editor open),
 /// held on [`AppState::cell_suggest`] beside the editor it decorates.
@@ -261,6 +267,15 @@ impl AppState {
     ) {
         let key = (table.schema.unwrap_or_default(), table.name);
         if let Some(active) = self.conn_mut(session) {
+            if active.enum_cache.len() >= FK_ENUM_CACHE_CAP && !active.enum_cache.contains_key(&key)
+            {
+                if let Some(victim) = active.enum_cache.keys().next().cloned() {
+                    active.enum_cache.remove(&victim);
+                    // Keep the "already requested" guard in sync, or the evicted
+                    // table's enums could never be re-fetched.
+                    active.enum_requested.remove(&victim);
+                }
+            }
             active.enum_cache.insert(key, columns);
         }
         if self.cell_suggest.is_none() {
@@ -305,6 +320,13 @@ impl AppState {
         let key = (target.schema.unwrap_or_default(), target.name);
         // Cache on the reply's own connection (it may be a background session).
         if let Some(active) = self.conn_mut(session) {
+            if active.lookup_cache.len() >= FK_ENUM_CACHE_CAP
+                && !active.lookup_cache.contains_key(&key)
+            {
+                if let Some(victim) = active.lookup_cache.keys().next().cloned() {
+                    active.lookup_cache.remove(&victim);
+                }
+            }
             active.lookup_cache.insert(key.clone(), rows.clone());
         }
         // The epoch is process-unique, so an epoch+target match is unambiguously this
