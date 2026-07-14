@@ -33,6 +33,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   visible keys by remaining expiry — Permanent (no TTL), ending in ≤ 3 minutes,
   or under an hour / day / week, or a week or more. It filters the loaded keys,
   so pair it with a prefix or type filter on very large keyspaces.
+- Redis key browser: filter the list to favourites only (a star toggle in the
+  toolbar) or to a single tag (a tag dropdown that appears once any key is
+  tagged). Both compose with the other filters.
+- Redis value inspector: a star button in the preview header favourites /
+  unfavourites the open key in place, without going back to the list's
+  right-click menu.
 - Redis key browser: auto-refresh is now a dedicated toolbar button — click to
   turn periodic re-scanning on/off (shown accent-tinted with its interval while
   live), and use its caret to pick the interval (Off / 2s / 5s / 10s / 30s). A
@@ -54,6 +60,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   their old behaviour. The placeholder and result count follow the mode. Every
   mode now filters as you type (debounced) — pressing Enter is an optional
   accelerator, no longer required for Exact or Value lookups.
+- Redis value inspector: in a narrow preview pane, the format-lens row
+  (Auto / Raw / JSON / Hex / MsgPack / …) now scrolls horizontally instead of
+  clipping the trailing lenses off-panel, and deleting a key is confirmed in a
+  centred modal rather than an inline banner whose buttons could overflow.
 - Redis key browser: the browse toolbar is decluttered — the keyspace size
   ("~N keys") moved to the status bar at the bottom (shown only while browsing,
   and always the stable unfiltered count), "Find biggest keys" moved into the

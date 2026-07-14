@@ -644,6 +644,8 @@ impl Render for AppState {
             .children(self.render_kv_create_modal(cx))
             // The Redis "Import keys" modal, likewise root-mounted.
             .children(self.render_kv_import_modal(cx))
+            // The Redis delete-key confirmation, likewise root-mounted.
+            .children(self.render_kv_delete_modal(cx))
             // The palette renders its own full-screen overlay; last = on top.
             .children(self.palette.as_ref().map(|(p, _)| p.clone()))
             // The result-grid dropdowns (cell / export / more) mount here, above

@@ -384,6 +384,25 @@ pub(crate) struct BrowseState {
     /// Whether the TTL-filter dropdown is showing its option list (Flint's
     /// `Select` is stateless, so the open flag lives here, like `type_filter_open`).
     pub(crate) ttl_filter_open: bool,
+    /// Show only favourited (starred) keys. Client-side over the loaded window,
+    /// like `ttl_filter`; membership comes from [`crate::key_meta::KeyMetaStore`]
+    /// (on `AppState`, not reachable here), so it's snapshot into `fav_set`.
+    pub(crate) fav_only: bool,
+    /// Restrict to keys carrying this tag (`None` = any tag). Client-side; the
+    /// matching keys are snapshot into `tag_set`.
+    pub(crate) tag_filter: Option<String>,
+    /// Whether the tag-filter dropdown is showing its option list.
+    pub(crate) tag_filter_open: bool,
+    /// Snapshot of the connection's favourite keys while `fav_only` is on (empty
+    /// otherwise). Refreshed by [`AppState::kv_refresh_meta_snapshots`] when the
+    /// filter or the annotation store changes; `meta_gen` bumps alongside so
+    /// `visible_rows`' cache invalidates.
+    fav_set: Rc<HashSet<String>>,
+    /// Snapshot of the keys matching `tag_filter` (empty when no tag filter).
+    tag_set: Rc<HashSet<String>>,
+    /// Bumped whenever `fav_set`/`tag_set` change, so the `visible_rows` cache
+    /// (keyed partly on this) recomputes.
+    meta_gen: u64,
     /// Rows accumulated this run, forward-only, oldest-evicted past the cap.
     /// Held behind an `Rc` so the per-frame render (and keyboard nav) share the
     /// buffer by a refcount bump instead of deep-cloning up to `MAX_RESIDENT_ROWS`
@@ -996,6 +1015,12 @@ impl BrowseState {
             type_filter_open: false,
             ttl_filter: None,
             ttl_filter_open: false,
+            fav_only: false,
+            tag_filter: None,
+            tag_filter_open: false,
+            fav_set: Rc::new(HashSet::new()),
+            tag_set: Rc::new(HashSet::new()),
+            meta_gen: 0,
             rows: Rc::new(Vec::new()),
             rows_gen: 0,
             visible_cache: RefCell::new(None),
@@ -1068,41 +1093,46 @@ impl BrowseState {
         };
         let fuzzy_active = fuzzy && !query.is_empty();
         let ttl = self.ttl_filter;
+        let meta_active = self.fav_only || self.tag_filter.is_some();
         // Fast path: nothing narrows the raw scan buffer, so share it by refcount.
-        if !fuzzy_active && ttl.is_none() {
+        if !fuzzy_active && ttl.is_none() && !meta_active {
             return Rc::clone(&self.rows);
         }
         if let Some(cached) = self.visible_cache.borrow().as_ref() {
-            if cached.query == query && cached.ttl == ttl && cached.gen == self.rows_gen {
+            if cached.query == query
+                && cached.ttl == ttl
+                && cached.gen == self.rows_gen
+                && cached.meta_gen == self.meta_gen
+            {
                 return Rc::clone(&cached.rows);
             }
         }
-        // The TTL predicate (if any) prunes first; a fuzzy query then scores and
-        // best-match-orders what's left, otherwise the surviving rows keep scan
-        // order.
-        let passes_ttl = |r: &KeyMeta| ttl.is_none_or(|t| t.matches(r.ttl));
+        // The TTL + favourite/tag predicates prune first; a fuzzy query then
+        // scores and best-match-orders what's left, otherwise the surviving rows
+        // keep scan order. `fav_set`/`tag_set` are `AppState`-supplied snapshots
+        // (see `kv_refresh_meta_snapshots`).
+        let passes = |r: &KeyMeta| {
+            ttl.is_none_or(|t| t.matches(r.ttl))
+                && (!self.fav_only || self.fav_set.contains(&r.key))
+                && (self.tag_filter.is_none() || self.tag_set.contains(&r.key))
+        };
         let result = if fuzzy_active {
             let mut scored: Vec<(i32, &KeyMeta)> = self
                 .rows
                 .iter()
-                .filter(|r| passes_ttl(r))
+                .filter(|r| passes(r))
                 .filter_map(|r| fuzzy_score(&query, &r.key).map(|s| (s, r)))
                 .collect();
             scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
             Rc::new(scored.into_iter().map(|(_, r)| r.clone()).collect::<Vec<_>>())
         } else {
-            Rc::new(
-                self.rows
-                    .iter()
-                    .filter(|r| passes_ttl(r))
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            )
+            Rc::new(self.rows.iter().filter(|r| passes(r)).cloned().collect::<Vec<_>>())
         };
         *self.visible_cache.borrow_mut() = Some(VisibleRowsCache {
             query,
             ttl,
             gen: self.rows_gen,
+            meta_gen: self.meta_gen,
             rows: Rc::clone(&result),
         });
         result
@@ -1110,11 +1140,13 @@ impl BrowseState {
 }
 
 /// Memoized [`BrowseState::visible_rows`] result (see that field). Valid while
-/// the fuzzy query, the TTL filter, and the row generation are all unchanged.
+/// the fuzzy query, the TTL filter, the favourite/tag snapshot generation, and
+/// the row generation are all unchanged.
 struct VisibleRowsCache {
     query: String,
     ttl: Option<TtlFilter>,
     gen: u64,
+    meta_gen: u64,
     rows: Rc<Vec<KeyMeta>>,
 }
 
@@ -1816,6 +1848,97 @@ impl AppState {
             .and_then(|v| v.active_browse_mut())
         {
             browse.ttl_filter_open = !browse.ttl_filter_open;
+            cx.notify();
+        }
+    }
+
+    /// Rebuild the active Browse tab's favourite/tag key snapshots from the
+    /// annotation store to match its current `fav_only`/`tag_filter`, bump
+    /// `meta_gen` (so `visible_rows`' cache recomputes) and clear the keyboard
+    /// cursor (the visible indices shift). Call after the filter *or* the store
+    /// changes (a star toggle, a tag edit). The store read and the `browse`
+    /// write are sequenced so their borrows of `self` don't overlap.
+    pub(crate) fn kv_refresh_meta_snapshots(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some((conn_id, fav_only, tag)) =
+            self.conn_mut(Some(session)).and_then(|a| {
+                let conn_id = a.conn_id.clone();
+                let b = a.kv_view.as_ref()?.active_browse()?;
+                Some((conn_id, b.fav_only, b.tag_filter.clone()))
+            })
+        else {
+            return;
+        };
+        let fav_set = if fav_only {
+            Rc::new(self.redis_key_meta.favorites(&conn_id))
+        } else {
+            Rc::new(HashSet::new())
+        };
+        let tag_set = match &tag {
+            Some(t) => Rc::new(self.redis_key_meta.keys_with_tag(&conn_id, t)),
+            None => Rc::new(HashSet::new()),
+        };
+        if let Some(b) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        {
+            b.fav_set = fav_set;
+            b.tag_set = tag_set;
+            b.meta_gen = b.meta_gen.wrapping_add(1);
+            b.nav_row = None;
+        }
+        cx.notify();
+    }
+
+    /// Toggle the "favourites only" browse filter (the toolbar star button), then
+    /// refresh the snapshot and chase more pages if under-matched.
+    pub(crate) fn kv_toggle_fav_only(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        {
+            browse.fav_only = !browse.fav_only;
+        } else {
+            return;
+        }
+        self.kv_refresh_meta_snapshots(session, cx);
+        self.kv_maybe_grow_pool(session, cx);
+    }
+
+    /// Set (or clear) the tag browse filter (the toolbar tag dropdown), then
+    /// refresh the snapshot and chase more pages if under-matched.
+    pub(crate) fn kv_set_tag_filter(
+        &mut self,
+        session: SessionId,
+        tag: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        else {
+            return;
+        };
+        browse.tag_filter_open = false;
+        if browse.tag_filter == tag {
+            cx.notify(); // same tag re-picked: just dismiss the dropdown
+            return;
+        }
+        browse.tag_filter = tag;
+        self.kv_refresh_meta_snapshots(session, cx);
+        self.kv_maybe_grow_pool(session, cx);
+    }
+
+    /// Open or dismiss the tag-filter dropdown's option list.
+    pub(crate) fn kv_toggle_tag_menu(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        {
+            browse.tag_filter_open = !browse.tag_filter_open;
             cx.notify();
         }
     }
@@ -2643,14 +2766,16 @@ impl AppState {
         if browse.loading || browse.exhausted {
             return;
         }
-        // The two client-side filters (fuzzy query, TTL bucket) narrow the
-        // resident window rather than the scan, so a short match set can hide
-        // matches that live deeper in the keyspace. While either is active and
+        // The client-side filters (fuzzy query, TTL bucket, favourite/tag) narrow
+        // the resident window rather than the scan, so a short match set can hide
+        // matches that live deeper in the keyspace. While any is active and
         // under-matched, chase more pages so the grid keeps filling.
         let query = browse.filter.read(cx).content().to_string();
         let fuzzy_active = browse.is_fuzzy() && !query.is_empty();
         let ttl = browse.ttl_filter;
-        if !fuzzy_active && ttl.is_none() {
+        let fav_only = browse.fav_only;
+        let tag_active = browse.tag_filter.is_some();
+        if !fuzzy_active && ttl.is_none() && !fav_only && !tag_active {
             return;
         }
         let matches = browse
@@ -2658,6 +2783,8 @@ impl AppState {
             .iter()
             .filter(|r| ttl.is_none_or(|t| t.matches(r.ttl)))
             .filter(|r| !fuzzy_active || fuzzy_score(&query, &r.key).is_some())
+            .filter(|r| !fav_only || browse.fav_set.contains(&r.key))
+            .filter(|r| !tag_active || browse.tag_set.contains(&r.key))
             .count();
         if matches >= FUZZY_MATCH_TARGET {
             return;
@@ -3610,6 +3737,8 @@ impl AppState {
             self.redis_key_meta.toggle_favorite(&conn_id, &key);
         }
         self.kv_close_key_menu(session, cx);
+        // Keep the favourites-only filter (if on) in sync with the new star state.
+        self.kv_refresh_meta_snapshots(session, cx);
         cx.notify();
     }
 
@@ -3662,6 +3791,8 @@ impl AppState {
         self.redis_key_meta
             .set_note_tags(&conn_id, &key, note, tags);
         self.kv_cancel_annotations(session, cx);
+        // The edited tags may change what the tag filter matches; resync it.
+        self.kv_refresh_meta_snapshots(session, cx);
     }
 
     /// Close the annotation editor without saving.
@@ -4432,6 +4563,8 @@ impl AppState {
             return;
         };
         inspector.confirm_delete = true;
+        // Focus the modal so Flint's `Modal` hears Esc/Enter (see `render.rs`).
+        self.focus_modal = true;
         cx.notify();
     }
 
@@ -6106,6 +6239,13 @@ impl AppState {
         let fuzzy_query = browse.filter.read(cx).content().to_string();
         let rows: Rc<Vec<KeyMeta>> = browse.visible_rows(cx);
 
+        // Favourite / tag filter state for the toolbar controls. The tag dropdown
+        // only appears when this connection actually has tagged keys.
+        let fav_only = browse.fav_only;
+        let tag_filter = browse.tag_filter.clone();
+        let tag_open = browse.tag_filter_open;
+        let all_tags = self.redis_key_meta.all_tags(&active.conn_id);
+
         // In tree mode the list is a flattened namespace trie (folders + keys);
         // in grid mode it's the raw key rows (no per-row allocation — the flat
         // grid's hot path). `disp` is `Some` only in tree mode.
@@ -6458,10 +6598,12 @@ impl AppState {
 
         // An empty key list gets a settled message instead of a blank grid, so
         // "no matches" reads as deliberate (mirrors the other panels' empties).
+        let meta_filter = browse.fav_only || browse.tag_filter.is_some();
         let has_filter = browse.pattern.is_some()
             || browse.type_filter.is_some()
             || browse.ttl_filter.is_some()
             || browse.value_needle.is_some()
+            || meta_filter
             || (browse.is_fuzzy() && !fuzzy_query.is_empty());
         let empty_msg = if browse.loading {
             "Scanning…"
@@ -6469,10 +6611,14 @@ impl AppState {
             "No key with that exact name"
         } else if browse.value_needle.is_some() {
             "No string values match this search"
-        } else if browse.ttl_filter.is_some() && !browse.exhausted {
-            // A client-side TTL filter only sees the loaded window; be explicit
-            // that a deeper match may exist rather than implying none do.
-            "No matching TTL among the loaded keys yet — still scanning, or narrow with a prefix"
+        } else if browse.fav_only && !browse.exhausted {
+            "No favourites among the loaded keys yet — still scanning, or narrow with a prefix"
+        } else if browse.fav_only {
+            "No favourite keys here yet — star keys from the preview or right-click menu"
+        } else if (browse.ttl_filter.is_some() || browse.tag_filter.is_some()) && !browse.exhausted {
+            // A client-side filter only sees the loaded window; be explicit that a
+            // deeper match may exist rather than implying none do.
+            "No match among the loaded keys yet — still scanning, or narrow with a prefix"
         } else if has_filter {
             "No keys match this filter"
         } else {
@@ -6763,6 +6909,68 @@ impl AppState {
                                     })
                                     .ok();
                             })
+                    })
+                    .children((!all_tags.is_empty()).then(|| {
+                        // Client-side tag filter (index 0 = "Any tag", 1.. the
+                        // connection's tags). Only shown when tags exist, to keep
+                        // the toolbar clean.
+                        let selected_ix = tag_filter
+                            .as_ref()
+                            .and_then(|t| all_tags.iter().position(|x| x == t))
+                            .map(|i| i + 1)
+                            .unwrap_or(0);
+                        let toggle_view = view.clone();
+                        let select_view = view.clone();
+                        let tag_opts = all_tags.clone();
+                        let mut select = Select::new("kv-tag-filter")
+                            .accent(false)
+                            .option("Any tag");
+                        for t in all_tags.iter() {
+                            select = select.option(t.clone());
+                        }
+                        select
+                            .selected(selected_ix)
+                            .open(tag_open)
+                            .on_toggle(move |_, cx| {
+                                toggle_view
+                                    .update(cx, |this, cx| this.kv_toggle_tag_menu(session, cx))
+                                    .ok();
+                            })
+                            .on_select(move |ix, _, cx| {
+                                let choice =
+                                    ix.checked_sub(1).and_then(|i| tag_opts.get(i).cloned());
+                                select_view
+                                    .update(cx, |this, cx| {
+                                        this.kv_set_tag_filter(session, choice, cx)
+                                    })
+                                    .ok();
+                            })
+                    }))
+                    .child({
+                        // Favourites-only toggle (star). Accent/gold while active,
+                        // mirroring the ★ prefix in the list.
+                        let fav_view = view.clone();
+                        IconButton::new(
+                            "kv-fav-toggle",
+                            crate::icons::icon(
+                                if fav_only { "star-filled" } else { "star" },
+                                theme.scale(14.),
+                                if fav_only { theme.yellow } else { theme.text_muted },
+                            ),
+                        )
+                        .size(IconButtonSize::Sm)
+                        .active(fav_only)
+                        .tooltip(if fav_only {
+                            "Showing favourites only — click to show all"
+                        } else {
+                            "Show favourites only"
+                        })
+                        .a11y_label("Toggle favourites-only filter")
+                        .on_click(move |_, _, cx| {
+                            fav_view
+                                .update(cx, |this, cx| this.kv_toggle_fav_only(session, cx))
+                                .ok();
+                        })
                     })
                     .children(new_key_button)
                     .child(auto_button)
@@ -7182,6 +7390,86 @@ impl AppState {
         )
     }
 
+    /// The delete-key confirmation (Flint [`Modal`], root-mounted like the New-key
+    /// and Import modals). Replaces the old inline confirm banner in the inspector
+    /// header, whose buttons overflowed a narrow preview pane. `None` unless the
+    /// focused Browse tab's inspector is awaiting delete confirmation.
+    pub(crate) fn render_kv_delete_modal(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let Phase::Connected(active) = &self.phase else {
+            return None;
+        };
+        let session = active.session;
+        let inspector = active.kv_view.as_ref()?.active_browse()?.inspector.as_ref()?;
+        if !inspector.confirm_delete {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        let view = cx.entity().downgrade();
+        let key = inspector.key.clone();
+
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_size(theme.scale(12.5))
+                    .text_color(theme.text)
+                    .child(format!("Delete \"{key}\"?")),
+            )
+            .child(
+                div()
+                    .text_size(theme.scale(11.))
+                    .text_color(theme.text_muted)
+                    .child("This can't be undone."),
+            );
+
+        let (confirm_view, cancel_view, close_view) = (view.clone(), view.clone(), view.clone());
+        let footer = div()
+            .flex()
+            .flex_1()
+            .justify_end()
+            .gap_2()
+            .child(
+                Button::new("kv-delete-cancel", "Cancel")
+                    .variant(ButtonVariant::Secondary)
+                    .size(ButtonSize::Sm)
+                    .on_click(move |_, _, cx| {
+                        cancel_view
+                            .update(cx, |this, cx| this.kv_cancel_delete(session, cx))
+                            .ok();
+                    }),
+            )
+            .child(
+                Button::new("kv-delete-confirm", "Delete")
+                    .variant(ButtonVariant::Danger)
+                    .size(ButtonSize::Sm)
+                    .on_click(move |_, _, cx| {
+                        confirm_view
+                            .update(cx, |this, cx| this.kv_confirm_delete(session, cx))
+                            .ok();
+                    }),
+            );
+
+        Some(
+            Modal::new("kv-delete-key")
+                .title("Delete key")
+                .width(px(380.))
+                .focus_handle(self.modal_focus.clone())
+                .on_close(move |_, cx| {
+                    close_view
+                        .update(cx, |this, cx| this.kv_cancel_delete(session, cx))
+                        .ok();
+                })
+                .footer(footer)
+                .child(body)
+                .into_any_element(),
+        )
+    }
+
     /// The "find biggest keys" sample's own table (see `BigKeysState`),
     /// replacing the live browse's table+inspector while it's active.
     fn render_big_keys(
@@ -7572,6 +7860,14 @@ impl AppState {
     ) -> impl IntoElement {
         let view = cx.entity().downgrade();
 
+        // Favourite state comes from the annotation store (the single active
+        // connection), keyed by conn id + key — not carried on the inspector.
+        let is_fav = if let Phase::Connected(a) = &self.phase {
+            self.redis_key_meta.is_favorite(&a.conn_id, &inspector.key)
+        } else {
+            false
+        };
+
         // --- key name; the rename affordance opens a popover (see the
         // `rename_popover` overlay on the panel root below) rather than swapping
         // the header inline. ---
@@ -7634,6 +7930,36 @@ impl AppState {
             }
         };
 
+        // Favourite (star) toggle, surfaced into the preview so a key can be
+        // starred without going back to the list's right-click menu.
+        let star_button = {
+            let fav_view = view.clone();
+            let key = inspector.key.clone();
+            IconButton::new(
+                "kv-inspector-fav",
+                crate::icons::icon(
+                    if is_fav { "star-filled" } else { "star" },
+                    theme.scale(13.),
+                    if is_fav { theme.yellow } else { theme.text_muted },
+                ),
+            )
+            .size(IconButtonSize::Sm)
+            .active(is_fav)
+            .tooltip(if is_fav {
+                "Unfavourite key"
+            } else {
+                "Favourite key"
+            })
+            .a11y_label("Toggle favourite")
+            .on_click(move |_, _, cx| {
+                fav_view
+                    .update(cx, |this, cx| {
+                        this.kv_toggle_key_favorite(session, key.clone(), cx)
+                    })
+                    .ok();
+            })
+        };
+
         let delete_button = writable.then(|| {
             let delete_view = view.clone();
             IconButton::new(
@@ -7663,6 +7989,7 @@ impl AppState {
             .child(key_row)
             .child(type_pill(&inspector.kv_type, theme))
             .child(ttl_row)
+            .child(star_button)
             .children(delete_button)
             .child(
                 IconButton::new(
@@ -7678,50 +8005,6 @@ impl AppState {
                         .ok();
                 }),
             );
-
-        let confirm_delete = inspector.confirm_delete.then(|| {
-            let (confirm_view, cancel_view) = (view.clone(), view.clone());
-            div()
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .py_1p5()
-                .bg(theme.red.opacity(0.1))
-                .border_b_1()
-                .border_color(theme.red)
-                .child(
-                    div()
-                        .flex_1()
-                        .text_size(theme.scale(11.))
-                        .text_color(theme.text)
-                        .child(format!(
-                            "Delete \"{}\"? This can't be undone.",
-                            inspector.key
-                        )),
-                )
-                .child(
-                    Button::new("kv-inspector-delete-confirm", "Delete")
-                        .variant(ButtonVariant::Danger)
-                        .size(ButtonSize::Sm)
-                        .on_click(move |_, _, cx| {
-                            confirm_view
-                                .update(cx, |this, cx| this.kv_confirm_delete(session, cx))
-                                .ok();
-                        }),
-                )
-                .child(
-                    Button::new("kv-inspector-delete-cancel", "Cancel")
-                        .variant(ButtonVariant::Secondary)
-                        .size(ButtonSize::Sm)
-                        .on_click(move |_, _, cx| {
-                            cancel_view
-                                .update(cx, |this, cx| this.kv_cancel_delete(session, cx))
-                                .ok();
-                        }),
-                )
-        });
 
         // Rename / expiry each open as a small popover card anchored under the
         // header, dismissed by an outside click on the panel-wide backdrop, the
@@ -7785,7 +8068,6 @@ impl AppState {
             .border_color(theme.border)
             .bg(theme.bg_panel)
             .child(header)
-            .children(confirm_delete)
             .child(body)
             .children(rename_popover)
             .children(ttl_popover)
@@ -7960,19 +8242,26 @@ impl AppState {
         use crate::inspector::ValueFormat;
         let opt = |id: &'static str, label: &'static str, fmt: ValueFormat| {
             let view = cx.entity().downgrade();
-            Button::new(id, label)
-                .variant(if current == fmt {
-                    ButtonVariant::Secondary
-                } else {
-                    ButtonVariant::Ghost
-                })
-                .size(ButtonSize::Sm)
-                .on_click(move |_, _, cx| {
-                    view.update(cx, |this, cx| this.kv_set_str_format(session, fmt, cx))
-                        .ok();
-                })
+            // Wrapped in a non-shrinking cell so the row overflows (and scrolls)
+            // instead of compressing the buttons when the inspector is narrow.
+            div().flex_shrink_0().child(
+                Button::new(id, label)
+                    .variant(if current == fmt {
+                        ButtonVariant::Secondary
+                    } else {
+                        ButtonVariant::Ghost
+                    })
+                    .size(ButtonSize::Sm)
+                    .on_click(move |_, _, cx| {
+                        view.update(cx, |this, cx| this.kv_set_str_format(session, fmt, cx))
+                            .ok();
+                    }),
+            )
         };
         div()
+            // A narrow inspector can't fit all ten lenses; scroll them
+            // horizontally rather than clipping the trailing ones off-panel.
+            .id("kv-str-lens")
             .flex_shrink_0()
             .flex()
             .items_center()
@@ -7981,6 +8270,7 @@ impl AppState {
             .py_1()
             .border_b_1()
             .border_color(theme.border)
+            .overflow_x_scroll()
             .child(opt("kv-fmt-auto", "Auto", ValueFormat::Auto))
             .child(opt("kv-fmt-raw", "Raw", ValueFormat::Raw))
             .child(opt("kv-fmt-json", "JSON", ValueFormat::Json))
