@@ -6436,7 +6436,7 @@ checksum = "03251193000f4bd3b042892be858ee50e8b3719f2b08e5833ac4353724632430"
 
 [[package]]
 name = "red"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "aes 0.8.4",
  "anyhow",
@@ -6466,7 +6466,7 @@ dependencies = [
 
 [[package]]
 name = "red-acp"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "agent-client-protocol",
  "red-core",
@@ -6480,7 +6480,7 @@ dependencies = [
 
 [[package]]
 name = "red-ai"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -6494,7 +6494,7 @@ dependencies = [
 
 [[package]]
 name = "red-config"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -6508,7 +6508,7 @@ dependencies = [
 
 [[package]]
 name = "red-core"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -6516,7 +6516,7 @@ dependencies = [
 
 [[package]]
 name = "red-driver"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -6535,7 +6535,7 @@ dependencies = [
 
 [[package]]
 name = "red-service"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "async-trait",
  "bytes",

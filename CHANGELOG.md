@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-14
+
 ### Added
 - Engine icons: the welcome screen's saved-connection cards and the connection
   form's engine picker now show each engine's own brand logo (PostgreSQL,
@@ -21,8 +23,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tab to keep it visible at the start of the strip no matter how far you've
   scrolled. The close-with-unsaved-work prompt gained a "Don't ask again"
   checkbox.
-
-### Added
 - Redis key browser: an Actions dropdown in the toolbar — Refresh keys (also
   ⌘/Ctrl+R), Find biggest keys, Import keys, and Expand all / Collapse all for
   the namespace tree.
