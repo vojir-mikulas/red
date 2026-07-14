@@ -901,11 +901,11 @@ mod row_tests {
     fn capped_text_is_flagged_and_renders_with_ellipsis() {
         let row = Row::new(vec![
             Value::Integer(1),
-            Value::Capped(CappedCell {
+            Value::Capped(Box::new(CappedCell {
                 head: "hello".into(),
                 len: 9000,
                 blob: false,
-            }),
+            })),
             Value::Text("small".into()),
         ]);
         assert!(row.is_truncated(1), "the capped text cell is flagged");
@@ -956,11 +956,11 @@ mod row_tests {
     /// A capped multi-line head is flattened too, before the ellipsis is appended.
     #[test]
     fn capped_multiline_head_flattens() {
-        let row = Row::new(vec![Value::Capped(CappedCell {
+        let row = Row::new(vec![Value::Capped(Box::new(CappedCell {
             head: "line one\nline two".into(),
             len: 9000,
             blob: false,
-        })]);
+        }))]);
         assert_eq!(row.display[0].text.as_ref(), "line one line two…");
     }
 }

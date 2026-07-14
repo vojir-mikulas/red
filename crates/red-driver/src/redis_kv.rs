@@ -34,6 +34,17 @@ const MAX_SCAN_NODE_RETRIES: u32 = 3;
 /// fetch, not a per-cell grid budget, so it gets its own constant.
 const STRING_PREVIEW_CAP: usize = 8 * 1024;
 
+/// Hard safety ceiling on a "load full value" ([`read_string_full`]) fetch. The
+/// preview cap above keeps the grid/inspector light; this is the much larger
+/// ceiling on the *explicit* whole-value load, so a pathological multi-hundred-MB
+/// Redis string (they can reach 512 MB) can't be pulled whole into the UI process
+/// and OOM it. Past this, the fetch returns a bounded `Value::Capped` prefix
+/// carrying the true length, exactly like an over-preview cell — which the edit
+/// path already refuses (it only edits whole `Value::Text`), so a too-large value
+/// can never be truncated on save. Covers essentially every real value in full;
+/// only abusive ones clip.
+const STRING_FULL_CAP: usize = 8 * 1024 * 1024;
+
 /// The total number of hash slots in a Redis Cluster (fixed by the protocol).
 const CLUSTER_SLOTS: u16 = 16384;
 
@@ -786,18 +797,52 @@ impl KvDriver for RedisDriver {
 
     async fn read_string_full(&self, key: &str) -> Result<Option<Value>> {
         let mut conn = self.route(key);
-        // A plain `GET` with no capping (unlike `read_value`'s `cap_string_value`):
-        // the caller asked for the whole thing. `nil` (key gone / not a string)
-        // reads as `None`; a non-UTF-8 body stays exact as a `Blob`.
-        let raw: Option<Vec<u8>> = redis::cmd("GET")
+        // The caller asked for the whole value (unlike `read_value`'s 8 KiB
+        // preview), but a Redis string can reach 512 MB; check the length first
+        // (`STRLEN`, O(1)) so a pathological value is never GET-ed whole into the
+        // process. `STRLEN` is 0 for a missing *or* empty key — both fall into the
+        // small path below, where a plain `GET` disambiguates them (`nil` → `None`).
+        let len: usize = redis::cmd("STRLEN")
             .arg(key)
             .query_async(&mut conn)
             .await
             .map_err(|e| RedError::Driver(e.to_string()))?;
-        Ok(raw.map(|bytes| match String::from_utf8(bytes) {
-            Ok(s) => Value::Text(s),
-            Err(e) => Value::Blob(e.into_bytes()),
-        }))
+        if len <= STRING_FULL_CAP {
+            // Under the ceiling: the whole thing, verbatim. `nil` (key gone / not a
+            // string) reads as `None`; a non-UTF-8 body stays exact as a `Blob`.
+            let raw: Option<Vec<u8>> = redis::cmd("GET")
+                .arg(key)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| RedError::Driver(e.to_string()))?;
+            return Ok(raw.map(|bytes| match String::from_utf8(bytes) {
+                Ok(s) => Value::Text(s),
+                Err(e) => Value::Blob(e.into_bytes()),
+            }));
+        }
+        // Over the ceiling: read only a bounded prefix (`GETRANGE 0..cap-1`) and
+        // return it as a `Value::Capped` carrying the true length, never the tail.
+        let window: Vec<u8> = redis::cmd("GETRANGE")
+            .arg(key)
+            .arg(0)
+            .arg(STRING_FULL_CAP as isize - 1)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        // Genuinely binary (an invalid byte, not just a codepoint sliced at the
+        // window edge) shows no text head, like a capped blob; large text keeps its
+        // prefix. Avoids a multi-MB U+FFFD-expanded head for a huge binary value.
+        let blob = matches!(std::str::from_utf8(&window), Err(e) if e.error_len().is_some());
+        let head = if blob {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&window).into_owned()
+        };
+        Ok(Some(Value::Capped(Box::new(red_core::CappedCell {
+            head,
+            len,
+            blob,
+        }))))
     }
 
     async fn read_collection_page(
@@ -1501,7 +1546,7 @@ fn cap_string_value(bytes: Vec<u8>) -> Value {
     if head.len() > STRING_PREVIEW_CAP {
         head.truncate(STRING_PREVIEW_CAP);
     }
-    Value::Capped(red_core::CappedCell { head, len, blob })
+    Value::Capped(Box::new(red_core::CappedCell { head, len, blob }))
 }
 
 /// Redis keys, set members, hash fields and list items are all binary-safe, so
@@ -2651,6 +2696,33 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn read_string_full_caps_an_over_ceiling_value() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, false).await.unwrap();
+        let mut conn = driver.conn.clone();
+        let huge = tag("str-full-huge");
+        // A value past the safety ceiling must come back bounded, carrying its true
+        // length, never the whole body — otherwise a 512 MB string OOMs the UI.
+        let total = STRING_FULL_CAP + 1024;
+        let huge_value = "y".repeat(total);
+        let _: () = redis::cmd("SET")
+            .arg(&huge)
+            .arg(&huge_value)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        match driver.read_string_full(&huge).await.unwrap().unwrap() {
+            Value::Capped(cell) => {
+                assert_eq!(cell.len, total, "reports the true length");
+                assert_eq!(cell.head.len(), STRING_FULL_CAP, "head is the bounded prefix");
+                assert!(!cell.blob);
+            }
+            other => panic!("expected a Capped value over the ceiling, got {other:?}"),
+        }
     }
 
     #[tokio::test]

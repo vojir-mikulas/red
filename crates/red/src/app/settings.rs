@@ -772,6 +772,17 @@ impl AppState {
         cx.notify();
     }
 
+    /// Set the clipboard copy ceiling. Clamped; a select-all copy past this is
+    /// clipped to it (with a warning toast), bounding the worst-case RAM spike.
+    pub(crate) fn set_copy_row_limit(&mut self, rows: usize, cx: &mut Context<Self>) {
+        self.settings.grid.copy_row_limit = rows.clamp(
+            crate::settings::MIN_COPY_ROW_LIMIT,
+            crate::settings::MAX_COPY_ROW_LIMIT,
+        );
+        self.save_settings();
+        cx.notify();
+    }
+
     /// Toggle the leading row-number gutter. The gutter is column `0` in the grid's
     /// coordinate system, so flipping it shifts the data-column offset; clear the
     /// active selection (stored in table-column coords) so it can't point off by one.

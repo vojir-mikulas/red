@@ -154,6 +154,22 @@ impl ChatMessage {
         self.selectable_theme = Some(theme_key);
     }
 
+    /// Drop this bubble's selectable leaves, freeing the live GPUI entity per
+    /// Markdown leaf. Used to keep only a trailing window of bubbles selectable in a
+    /// long chat; the bubble then repaints as plain, non-selectable text (the render
+    /// path already falls back to that when there are no leaves). The frame cache
+    /// (parsed Markdown) is deliberately kept — the transcript re-renders every
+    /// bubble each frame, so dropping it would force a re-parse rather than save
+    /// memory. No-op when nothing was held.
+    pub(super) fn shed_selectables(&mut self) -> bool {
+        if self.selectables.is_empty() {
+            return false;
+        }
+        self.selectables = Vec::new();
+        self.selectable_theme = None;
+        true
+    }
+
     /// Reparse/rescan only when `text` changed since the last fill. `blocks` being
     /// `Some` doubles as the "computed" flag (so a `None` SQL result still counts).
     fn refresh_cache(&self) {

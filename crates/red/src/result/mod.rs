@@ -1186,7 +1186,10 @@ pub(crate) enum CopyPlan {
 
 /// Assemble TSV from freshly re-fetched rows over data columns `dcol_lo..=dcol_hi`
 /// (NULL → empty); the [`CopyPlan::Refetch`] counterpart to the buffer path.
-pub(crate) fn rows_tsv(rows: &[Vec<Value>], dcol_lo: usize, dcol_hi: usize) -> String {
+/// Consumes `rows` so each row's `Vec<Value>` is freed as its text is appended,
+/// rather than holding the whole `Vec<Vec<Value>>` alongside the finished string
+/// (which doubled the peak on a large select-all copy).
+pub(crate) fn rows_tsv(rows: Vec<Vec<Value>>, dcol_lo: usize, dcol_hi: usize) -> String {
     let mut out = String::new();
     for row in rows {
         for (i, dcol) in (dcol_lo..=dcol_hi).enumerate() {
@@ -2388,6 +2391,17 @@ impl AppState {
                 dcol_lo,
                 dcol_hi,
             }) => {
+                // Bound the clipboard re-fetch so a select-all can't pull an
+                // arbitrarily large selection into one Vec/String; warn the user
+                // when it clips instead of silently copying a partial selection.
+                let capped = limit.min(self.settings.grid.copy_row_limit);
+                if capped < limit {
+                    self.notify(
+                        ToastVariant::Warning,
+                        format!("Copied the first {capped} of {limit} selected rows"),
+                        cx,
+                    );
+                }
                 let id = self.next_copy_id;
                 self.next_copy_id += 1;
                 self.pending_copy = Some(PendingCopy {
@@ -2397,7 +2411,7 @@ impl AppState {
                 });
                 self.send_active(Command::CopyRows {
                     offset,
-                    limit,
+                    limit: capped,
                     epoch,
                     id,
                 });
@@ -2426,7 +2440,7 @@ impl AppState {
         let Some(pending) = self.pending_copy.take_if(|p| p.id == id) else {
             return;
         };
-        let tsv = rows_tsv(&rows, pending.dcol_lo, pending.dcol_hi);
+        let tsv = rows_tsv(rows, pending.dcol_lo, pending.dcol_hi);
         cx.write_to_clipboard(ClipboardItem::new_string(tsv));
     }
 

@@ -696,7 +696,7 @@ impl AppState {
         // Otherwise read the resident window. Whole cells (under-cap, or the key
         // column) format straight away; they're bounded, so this is cheap.
         let state = match grid.cell_value(row, col) {
-            Some(Value::Capped(c)) => CellState::Capped(c),
+            Some(Value::Capped(c)) => CellState::Capped(*c),
             Some(v) => CellState::Ready(format_value(&v, fmt)),
             None => CellState::Evicted,
         };

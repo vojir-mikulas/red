@@ -182,6 +182,11 @@ pub struct GridSettings {
     /// full-scan) `count(distinct)` until the user explicitly asks for it, so
     /// selecting a column never silently launches a heavy query on a huge result.
     pub stats_distinct_max_rows: usize,
+    /// Ceiling on rows a select-all / whole-column copy pulls into the clipboard.
+    /// A clipboard is held whole in memory, so this bounds the worst-case spike of
+    /// a runaway copy; the copy path warns the user when a selection is clipped.
+    /// Clamped to a sane range on load.
+    pub copy_row_limit: usize,
 }
 
 impl Default for GridSettings {
@@ -193,6 +198,7 @@ impl Default for GridSettings {
             max_cell_chars: 4096,
             page_size: 200,
             stats_distinct_max_rows: 1_000_000,
+            copy_row_limit: 100_000,
         }
     }
 }
@@ -650,6 +656,10 @@ impl FileSettingsStore {
             .grid
             .max_cell_chars
             .clamp(MIN_CELL_CHARS, MAX_CELL_CHARS);
+        settings.grid.copy_row_limit = settings
+            .grid
+            .copy_row_limit
+            .clamp(MIN_COPY_ROW_LIMIT, MAX_COPY_ROW_LIMIT);
 
         LoadReport {
             settings,
@@ -696,6 +706,12 @@ pub const MAX_PAGE_SIZE: usize = 5_000;
 /// display page (export stays full-fidelity regardless).
 pub const MIN_CELL_CHARS: usize = 256;
 pub const MAX_CELL_CHARS: usize = 1_048_576;
+
+/// The clipboard copy ceiling (`grid.copy_row_limit`). The floor keeps a copy
+/// useful; the ceiling matches the backend's hard `MAX_COPY_ROWS` backstop so the
+/// user-facing limit can never ask for more than the service will hand back.
+pub const MIN_COPY_ROW_LIMIT: usize = 1_000;
+pub const MAX_COPY_ROW_LIMIT: usize = 1_000_000;
 
 fn clamp_font_size(size: f32) -> f32 {
     if size.is_finite() {
@@ -973,18 +989,23 @@ mod tests {
     fn clamps_grid_fetch_knobs() {
         // Out-of-range fetch knobs clamp to the floor / ceiling rather than thrash.
         let t = temp_store();
-        write(&t.store, "[grid]\npage_size = 0\nmax_cell_chars = 1\n");
+        write(
+            &t.store,
+            "[grid]\npage_size = 0\nmax_cell_chars = 1\ncopy_row_limit = 1\n",
+        );
         let g = t.store.load_report().settings.grid;
         assert_eq!(g.page_size, MIN_PAGE_SIZE);
         assert_eq!(g.max_cell_chars, MIN_CELL_CHARS);
+        assert_eq!(g.copy_row_limit, MIN_COPY_ROW_LIMIT);
 
         write(
             &t.store,
-            "[grid]\npage_size = 99999999\nmax_cell_chars = 999999999\n",
+            "[grid]\npage_size = 99999999\nmax_cell_chars = 999999999\ncopy_row_limit = 999999999\n",
         );
         let g = t.store.load_report().settings.grid;
         assert_eq!(g.page_size, MAX_PAGE_SIZE);
         assert_eq!(g.max_cell_chars, MAX_CELL_CHARS);
+        assert_eq!(g.copy_row_limit, MAX_COPY_ROW_LIMIT);
     }
 
     #[test]

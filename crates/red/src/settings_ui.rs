@@ -639,6 +639,24 @@ fn grid_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             distinct_view.update(cx, |this, cx| this.set_stats_distinct_max_rows(n, cx));
         });
 
+    // Clipboard copy ceiling presets; a custom value (set in the file) shows none.
+    const COPY_PRESETS: [usize; 4] = [10_000, 100_000, 500_000, 1_000_000];
+    let copy_sel = COPY_PRESETS
+        .iter()
+        .position(|&n| n == state.settings.grid.copy_row_limit)
+        .unwrap_or(usize::MAX);
+    let copy_view = view.clone();
+    let copy_limit = Segmented::new("set-copy-limit")
+        .segment("10K")
+        .segment("100K")
+        .segment("500K")
+        .segment("1M")
+        .selected(copy_sel)
+        .on_select(move |ix, _, cx| {
+            let n = COPY_PRESETS[ix.min(COPY_PRESETS.len() - 1)];
+            copy_view.update(cx, |this, cx| this.set_copy_row_limit(n, cx));
+        });
+
     settings_page_scaffold(
         "Result grid",
         div()
@@ -682,6 +700,13 @@ fn grid_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 "Result size past which the column-stats bar withholds count(distinct) \
                  until you click compute, so it never scans a huge table by accident.",
                 stats_distinct,
+                &theme,
+            ))
+            .child(setting_row(
+                "Copy row limit",
+                "Rows a select-all or whole-column copy pulls into the clipboard. \
+                 Larger copies are clipped to this (with a warning) to bound memory.",
+                copy_limit,
                 &theme,
             )),
         &theme,

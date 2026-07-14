@@ -882,7 +882,12 @@ pub enum Value {
     /// (over-cap text) or only the length (blob), so the full value was never
     /// materialized. Produced solely by capped fetch paths, never by `export` or
     /// a write path, where every cell is whole.
-    Capped(CappedCell),
+    ///
+    /// Boxed: it's the rare, cold variant, and inlining its `String`+`usize`+`bool`
+    /// (40 bytes) would widen *every* `Value` — including the common `Integer`/
+    /// `Text` cell — to that size across a whole resident window. The box keeps
+    /// `Value` at the `String`/`Vec` width (one indirection only on a capped cell).
+    Capped(Box<CappedCell>),
 }
 
 /// The payload of a [`Value::Capped`] cell: what the grid shows plus the true byte
@@ -912,22 +917,22 @@ impl Value {
         while !s.is_char_boundary(end) {
             end -= 1;
         }
-        Value::Capped(CappedCell {
+        Value::Capped(Box::new(CappedCell {
             head: s[..end].to_owned(),
             len: s.len(),
             blob: false,
-        })
+        }))
     }
 
     /// A blob reduced to its length for display; the bytes are never read. The
     /// grid only ever paints a blob as its `<N bytes>` summary; a copy/inspector
     /// re-fetches the real bytes on demand.
     pub fn capped_blob(len: usize) -> Value {
-        Value::Capped(CappedCell {
+        Value::Capped(Box::new(CappedCell {
             head: String::new(),
             len,
             blob: true,
-        })
+        }))
     }
 }
 
@@ -1730,6 +1735,26 @@ pub enum UpdateState {
     /// writable `/Applications/Red.app`: a dev build, Homebrew, a read-only
     /// volume). `url` links the GitHub release for a manual download.
     Unsupported { version: String, url: String },
+}
+
+#[cfg(test)]
+mod value_size_tests {
+    use super::*;
+
+    /// A resident result window holds one `Value` per cell (rows × columns), so the
+    /// enum's width is paid on every cell — including the common `Integer`/`Text`.
+    /// Keep it at the `String`/`Vec` width by boxing the cold `Capped` variant; if
+    /// someone inlines a fat field again this guard fails rather than silently
+    /// widening every cell. `CappedCell` itself is deliberately larger (40 bytes).
+    #[test]
+    fn value_stays_pointer_width() {
+        assert!(
+            std::mem::size_of::<Value>() <= 4 * std::mem::size_of::<usize>(),
+            "Value grew to {} bytes; a fat variant is inlined — box it",
+            std::mem::size_of::<Value>()
+        );
+        assert!(std::mem::size_of::<CappedCell>() > std::mem::size_of::<Value>());
+    }
 }
 
 #[cfg(test)]

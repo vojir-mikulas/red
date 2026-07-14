@@ -33,6 +33,13 @@ const REVEAL_TICK: Duration = Duration::from_millis(24);
 const REVEAL_DIVISOR: usize = 6;
 const REVEAL_MIN_STEP: usize = 2;
 
+/// How many trailing bubbles keep their selectable Markdown leaves resident. Each
+/// leaf is a live GPUI entity, so an unbounded conversation would otherwise grow
+/// thousands of them; older bubbles beyond this window shed theirs and repaint as
+/// plain text. Sized so a normal chat stays fully selectable and only a very long
+/// one sheds its distant history. See [`ChatMessage::shed_selectables`].
+const SELECTABLE_BUBBLE_WINDOW: usize = 60;
+
 impl AppState {
     /// Whether the AI assistant is enabled for the current context (M-S7): the
     /// active connection's `ai_enabled` override, falling back to the global
@@ -1093,7 +1100,17 @@ impl AppState {
             // The live (still-streaming) trailing assistant bubble isn't settled yet;
             // don't freeze selectables for it — it repaints as plain text until it ends.
             let last = chat.messages.len().saturating_sub(1);
+            // Only a trailing window of bubbles keeps its selectable leaves resident:
+            // each leaf is a live GPUI entity, so an unbounded chat would accumulate
+            // thousands. Older bubbles shed theirs (freed here) and repaint as plain,
+            // non-selectable text. Generous enough that a normal-length chat is wholly
+            // selectable; only a very long one sheds its distant history.
+            let keep_from = chat.messages.len().saturating_sub(SELECTABLE_BUBBLE_WINDOW);
             for (i, msg) in chat.messages.iter_mut().enumerate() {
+                if i < keep_from {
+                    msg.shed_selectables();
+                    continue;
+                }
                 if msg.text.trim().is_empty() || msg.selectables_current(theme_key) {
                     continue;
                 }
