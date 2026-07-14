@@ -103,8 +103,16 @@ impl ClickhouseDriver {
         } else {
             parsed.host
         };
-        let port = parsed.port.unwrap_or(8123);
-        let base_url = format!("http://{}/", host_authority(&host, port));
+        // TLS (a `clickhouses://` DSN, see `ConnectionConfig::parse_conn_str`)
+        // uses HTTPS on the secure interface's default port (8443); reqwest's
+        // rustls stack (already in the tree) handles the handshake.
+        let (scheme, default_port) = if parsed.tls {
+            ("https", 8443)
+        } else {
+            ("http", 8123)
+        };
+        let port = parsed.port.unwrap_or(default_port);
+        let base_url = format!("{scheme}://{}/", host_authority(&host, port));
         let user = if parsed.user.is_empty() {
             "default".to_string()
         } else {

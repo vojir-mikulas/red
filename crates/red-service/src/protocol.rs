@@ -12,6 +12,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use red_core::kv::{
+    ClientInfo, CollectionKind, KeyMeta, KvCollectionPage, KvEdit, KvScanPage, KvStreamActionReq,
+    KvStreamPage, KvValue, PendingEntry, RespValue, ScanBudget, ScanCursor, SlowlogEntry,
+    StreamAction, StreamConsumer, StreamGroup,
+};
 use red_core::{
     ActivityId, ActivityKind, ActivityStatus, AiLimits, AiTier, Column, ColumnMap, ColumnMeta,
     ColumnStats, ConnectionConfig, CopyMode, EditOp, ExportFormat, FkEdge, FkJoin, ImportFormat,
@@ -137,9 +142,208 @@ pub enum Command {
         id: u64,
     },
     /// Drop an open result (its query tab closed, or it was re-sorted into a new
-    /// epoch). Unknown epochs are a no-op.
+    /// epoch). Unknown epochs are a no-op. Also closes a `KvFetchScan` browse:
+    /// `epoch` is a shared id space (see `InFlight::abort_all`), so this
+    /// generically stops an in-flight Redis scan too, not just a SQL result.
     CloseResult {
         epoch: u64,
+    },
+    /// One page of a Redis keyspace scan (see docs/plans/redis.md's R1):
+    /// `SCAN` (looping, budgeted, optionally `MATCH`-filtered on `pattern` and
+    /// `TYPE`-filtered on `type_filter`, a type label like `"hash"`) plus a
+    /// pipelined metadata fetch, via the session's `KvDriver`. Stateless like
+    /// `FetchRun`: `cursor` is whatever `next_cursor` the previous
+    /// `KvScanPage` reply carried (`0` to start or restart on a new `pattern`/
+    /// `type_filter`); the service holds no scan position between calls, the
+    /// UI's grid buffer does. `epoch` scopes the reply and supersedes any prior
+    /// in-flight scan for the same epoch (a fast-retyped filter cancels the
+    /// stale request rather than racing it). Replied with `KvScanPage`, or
+    /// the global `Event::Error` on failure (not a SQL connection, or the
+    /// engine round-trip itself failed).
+    KvFetchScan {
+        epoch: u64,
+        pattern: Option<String>,
+        type_filter: Option<String>,
+        cursor: ScanCursor,
+        budget: ScanBudget,
+    },
+    /// Exact-key jump (see docs/plans/redis.md): resolve one key's metadata
+    /// directly, bypassing `SCAN`. Replied with `KvKeyProbed` carrying
+    /// `None` when the key doesn't exist — that's a normal outcome, not an
+    /// `Event::Error`.
+    KvProbeKey {
+        epoch: u64,
+        key: String,
+    },
+    /// The keyspace's total key count (`DBSIZE`), for the unfiltered browse's
+    /// header stat. Replied with `KvDbSizeReady`; failures are swallowed
+    /// (a missing header stat isn't worth a toast), like `LoadForeignKeys`.
+    KvDbSize {
+        epoch: u64,
+    },
+    /// One key's value, for the detail inspector opened by selecting a row in
+    /// the keyspace browser. `epoch` is the browse's epoch, used only to
+    /// scope the in-flight fetch for cancellation (a newer `KvReadValue`,
+    /// `KvReadCollectionPage`, or `KvReadListWindow` supersedes it); staleness
+    /// of the *reply* is instead checked UI-side by comparing `key`, since the
+    /// inspector can outlive a scan restart. Replied with `KvValueReady`.
+    KvReadValue {
+        epoch: u64,
+        key: String,
+    },
+    /// The full, uncapped bytes of a string key, for the inspector's "Load full
+    /// value" over a string `KvReadValue` returned capped (see
+    /// `KvDriver::read_string_full`). Replied with `KvValueReady` too (carrying
+    /// the whole `KvValue::Str`), so the UI's existing key-matched apply path
+    /// handles it with no new event; `epoch` scopes cancellation like
+    /// `KvReadValue`.
+    KvReadStringFull {
+        epoch: u64,
+        key: String,
+    },
+    /// One page of a big hash/set/zset's elements, for the inspector's
+    /// big-collection sub-grid (see docs/plans/redis.md). Stateless like
+    /// `KvFetchScan`: `cursor` is the caller-supplied `next_cursor` from the
+    /// previous `KvCollectionPageReady`. Replied with `KvCollectionPageReady`.
+    KvReadCollectionPage {
+        epoch: u64,
+        key: String,
+        kind: CollectionKind,
+        cursor: u64,
+        budget: ScanBudget,
+    },
+    /// A windowed slice of a big list, from the head or the tail (see
+    /// `KvDriver::read_list_window`'s docs on why not an arbitrary offset).
+    /// Replied with `KvListWindowReady`.
+    KvReadListWindow {
+        epoch: u64,
+        key: String,
+        from_head: bool,
+        count: usize,
+    },
+    /// One page of a big stream's entries, newest-first, for the inspector's
+    /// stream view (see docs/plans/redis.md's R4). Streams have no `*SCAN`
+    /// cursor, so unlike `KvReadCollectionPage` this pages by entry-ID range:
+    /// `before` is the previous `KvStreamPageReady`'s `next_before` (the oldest
+    /// ID loaded so far), or `None` to start at the newest entry. Replied with
+    /// `KvStreamPageReady`.
+    KvReadStreamPage {
+        epoch: u64,
+        key: String,
+        before: Option<String>,
+        count: usize,
+    },
+    /// A stream's consumer groups (`XINFO GROUPS`), for the inspector's
+    /// consumer-group management view (see docs/plans/redis.md's "stream
+    /// consumer-group management" gap). `epoch` scopes cancellation like the
+    /// other inspector reads; the reply's staleness is checked UI-side by
+    /// `key`. Replied with `KvStreamGroupsReady`.
+    KvStreamGroups {
+        epoch: u64,
+        key: String,
+    },
+    /// One group's consumers (`XINFO CONSUMERS`). Replied with
+    /// `KvStreamConsumersReady`.
+    KvStreamConsumers {
+        epoch: u64,
+        key: String,
+        group: String,
+    },
+    /// Up to `count` of a group's pending entries (`XPENDING ... - + count`).
+    /// Replied with `KvStreamPendingReady`.
+    KvStreamPending {
+        epoch: u64,
+        key: String,
+        group: String,
+        count: usize,
+    },
+    /// Acknowledge (`XACK`) or reassign (`XCLAIM`) pending entries in a group,
+    /// gated by `read_only` (checked service-side, defense in depth alongside
+    /// the driver's own refusal). `Claim` carries the target consumer and a
+    /// `min_idle` guard; `Ack` drops the entries from the PEL. Replied with
+    /// `KvStreamActionDone` (echoing `key`/`group` so the UI refreshes that
+    /// group's consumers+pending), or the global `Event::Error` on failure.
+    KvStreamAction {
+        epoch: u64,
+        key: String,
+        group: String,
+        action: KvStreamActionReq,
+    },
+    /// Run an arbitrary command through the console (see
+    /// docs/plans/redis.md). `epoch` scopes cancellation only; console
+    /// history is UI-side. A server-reported command error (WRONGTYPE, a
+    /// bad arity, ...) is normal console output via `KvCommandResult`'s
+    /// `RespValue::Error`, not `Event::Error` — that's reserved for a
+    /// genuine transport/connection failure or the read-only gate.
+    KvCommand {
+        epoch: u64,
+        argv: Vec<String>,
+    },
+    /// One in-grid edit (see `red_core::kv::KvEdit`), gated by `read_only`
+    /// (checked service-side, defense in depth alongside the driver's own
+    /// refusal) and, for a destructive shape, the UI's confirm prompt before
+    /// this is ever sent. Replied with `KvEditApplied`, echoing `edit` back,
+    /// or the global `Event::Error` on failure.
+    KvApplyEdit {
+        epoch: u64,
+        edit: KvEdit,
+    },
+    /// Start a live Pub/Sub pattern subscription (see docs/plans/redis.md's
+    /// R4). `epoch` identifies this subscription; messages stream back as
+    /// `KvMessage` until `CloseResult { epoch }` stops it (the same generic
+    /// epoch-scoped teardown every other open Kv/SQL thing uses — see that
+    /// command's doc comment).
+    KvSubscribe {
+        epoch: u64,
+        pattern: String,
+    },
+    /// Read the server's `notify-keyspace-events` setting, for the keyspace-
+    /// notification watcher (see docs/plans/redis.md's "keyspace-notification
+    /// live tooling" gap). Replied with `KvNotifyConfigReady`.
+    KvNotifyConfig {
+        epoch: u64,
+    },
+    /// Set `notify-keyspace-events` (enable/disable keyspace notifications),
+    /// gated by `read_only` (checked service-side, defense in depth alongside
+    /// the driver). On success the service re-reads and replies with a fresh
+    /// `KvNotifyConfigReady`.
+    KvSetNotifyConfig {
+        epoch: u64,
+        flags: String,
+    },
+    /// Fetch the server's slow-command log (see docs/plans/redis.md's "slowlog
+    /// viewer" gap). `epoch` scopes cancellation; replied with `KvSlowlogReady`.
+    KvSlowlog {
+        epoch: u64,
+        count: usize,
+    },
+    /// Clear the slow log (`SLOWLOG RESET`), gated by `read_only` (checked
+    /// service-side, defense in depth alongside the driver). On success the
+    /// service replies with an empty `KvSlowlogReady` so the UI updates without
+    /// a separate reply type.
+    KvSlowlogReset {
+        epoch: u64,
+    },
+    /// Start a live `MONITOR` firehose (see docs/plans/redis.md's "MONITOR-based
+    /// live command profiler" gap). Like `KvSubscribe`, `epoch` identifies the
+    /// stream and lines push back as `KvMonitorLine` until `CloseResult { epoch }`
+    /// tears it down.
+    KvMonitor {
+        epoch: u64,
+    },
+    /// Fetch the connected clients (`CLIENT LIST`) for the diagnostics panel's
+    /// clients viewer (see docs/plans/redis.md's "CLIENT LIST viewer" gap).
+    /// Replied with `KvClientListReady`.
+    KvClientList {
+        epoch: u64,
+    },
+    /// Disconnect a client by id (`CLIENT KILL ID <id>`), gated by `read_only`
+    /// (checked service-side, defense in depth alongside the driver). On success
+    /// the service refetches and replies with a fresh `KvClientListReady` so the
+    /// viewer updates without a separate reply type.
+    KvClientKill {
+        epoch: u64,
+        id: i64,
     },
     /// Compute a column's aggregate summary over the open result's *filtered* SQL
     /// (the column-stats bar): a single `count`/`distinct`/`min`/`max`(/`sum`/`avg`)
@@ -488,6 +692,147 @@ pub enum Event {
     /// `LoadForeignKeys`. Cached on the connected session for click-through.
     ForeignKeysLoaded {
         graph: Vec<FkEdge>,
+    },
+    /// One page of a Redis keyspace scan, in response to `KvFetchScan`.
+    /// `page.next_cursor`/`page.exhausted` are what the UI echoes back as the
+    /// next `KvFetchScan`'s `cursor` (see that command's docs for why the
+    /// service holds no scan position itself).
+    KvScanPage {
+        epoch: u64,
+        page: KvScanPage,
+    },
+    /// One key's metadata, in response to `KvProbeKey`. `meta: None` means
+    /// the key doesn't exist — a normal outcome the UI shows inline ("no
+    /// such key"), not an `Event::Error`.
+    KvKeyProbed {
+        epoch: u64,
+        key: String,
+        meta: Option<KeyMeta>,
+    },
+    /// The keyspace's total key count, in response to `KvDbSize`.
+    KvDbSizeReady {
+        epoch: u64,
+        count: u64,
+    },
+    /// One key's value, in response to `KvReadValue`. `value: None` means the
+    /// key doesn't exist (it may have been deleted between the browse's
+    /// `SCAN` and this fetch).
+    KvValueReady {
+        epoch: u64,
+        key: String,
+        value: Option<KvValue>,
+    },
+    /// Reading a key's value failed (a transport or `WRONGTYPE`-style error),
+    /// in response to `KvReadValue`. Surfaced inline in the inspector for the
+    /// matching key rather than only as a detached toast, so a stuck
+    /// "Loading…" can't outlive a failed read.
+    KvValueError {
+        epoch: u64,
+        key: String,
+        message: String,
+    },
+    /// One page of a big collection's elements, in response to
+    /// `KvReadCollectionPage`.
+    KvCollectionPageReady {
+        epoch: u64,
+        key: String,
+        page: KvCollectionPage,
+    },
+    /// A windowed slice of a big list, in response to `KvReadListWindow`.
+    KvListWindowReady {
+        epoch: u64,
+        key: String,
+        from_head: bool,
+        values: Vec<String>,
+    },
+    /// One page of a big stream's entries (newest-first), in response to
+    /// `KvReadStreamPage`. `page.next_before`/`page.exhausted` are what the UI
+    /// feeds back as the next `KvReadStreamPage`'s `before` to page further
+    /// back in time.
+    KvStreamPageReady {
+        epoch: u64,
+        key: String,
+        page: KvStreamPage,
+    },
+    /// A stream's consumer groups, in response to `KvStreamGroups`. `key`
+    /// lets the UI drop a reply for a key the inspector has since moved off.
+    KvStreamGroupsReady {
+        epoch: u64,
+        key: String,
+        groups: Vec<StreamGroup>,
+    },
+    /// One group's consumers, in response to `KvStreamConsumers`.
+    KvStreamConsumersReady {
+        epoch: u64,
+        key: String,
+        group: String,
+        consumers: Vec<StreamConsumer>,
+    },
+    /// One group's pending entries, in response to `KvStreamPending`.
+    KvStreamPendingReady {
+        epoch: u64,
+        key: String,
+        group: String,
+        pending: Vec<PendingEntry>,
+    },
+    /// An `XACK`/`XCLAIM` completed, in response to `KvStreamAction`. `count`
+    /// is how many entries it affected; `action` says which verb. The UI
+    /// re-requests the group's consumers+pending on this to reflect the change.
+    KvStreamActionDone {
+        epoch: u64,
+        key: String,
+        group: String,
+        action: StreamAction,
+        count: u64,
+    },
+    /// One console command's result, in response to `KvCommand`. Echoes
+    /// `argv` back so a console tracking several in-flight lines can match
+    /// the reply to its history entry.
+    KvCommandResult {
+        epoch: u64,
+        argv: Vec<String>,
+        result: RespValue,
+    },
+    /// An in-grid edit succeeded, in response to `KvApplyEdit`. Echoes
+    /// `edit` back so the UI can pattern-match what to update locally
+    /// (patch the inspector's loaded value, rename/remove a browse row, …)
+    /// without a round trip back through `KvReadValue`.
+    KvEditApplied {
+        epoch: u64,
+        edit: KvEdit,
+    },
+    /// One Pub/Sub message, pushed for as long as the `KvSubscribe { epoch,
+    /// .. }` that started it stays open.
+    KvMessage {
+        epoch: u64,
+        channel: String,
+        payload: String,
+    },
+    /// The `notify-keyspace-events` setting, in response to `KvNotifyConfig`
+    /// (or a `KvSetNotifyConfig` that then re-read it). Empty `value` means
+    /// keyspace notifications are disabled.
+    KvNotifyConfigReady {
+        epoch: u64,
+        value: String,
+    },
+    /// The slow-command log, in response to `KvSlowlog` (or an empty list in
+    /// response to a successful `KvSlowlogReset`). Newest entry first.
+    KvSlowlogReady {
+        epoch: u64,
+        entries: Vec<SlowlogEntry>,
+    },
+    /// One `MONITOR` line, pushed for as long as the `KvMonitor { epoch, .. }`
+    /// that started it stays open. `line` is the server's raw preformatted
+    /// firehose line.
+    KvMonitorLine {
+        epoch: u64,
+        line: String,
+    },
+    /// The connected clients, in response to `KvClientList` (or a `KvClientKill`
+    /// that then refetched).
+    KvClientListReady {
+        epoch: u64,
+        clients: Vec<ClientInfo>,
     },
     /// A result opened: its columns and total row count (for `OpenResult`).
     /// Echoes the open `epoch` so the grid can ignore a late reply for a result

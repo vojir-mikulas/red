@@ -347,6 +347,23 @@ impl AppState {
                 cx,
             );
         }
+    }
+
+    /// Show `path` selected in the OS file manager (best-effort). The export
+    /// toast's "Show in folder" action.
+    pub(crate) fn reveal_in_file_manager(
+        &mut self,
+        path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(e) = crate::app::reveal_in_file_manager(path) {
+            tracing::warn!("failed to reveal {}: {e}", path.display());
+            self.notify(
+                ToastVariant::Error,
+                format!("Couldn't show {} in the file manager: {e}", path.display()),
+                cx,
+            );
+        }
         cx.notify();
     }
 
@@ -700,6 +717,14 @@ impl AppState {
 
     pub(crate) fn set_confirm_destructive(&mut self, on: bool, cx: &mut Context<Self>) {
         self.settings.query.confirm_destructive = on;
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// The tab-close modal's "Don't ask again" checkbox: flips off the
+    /// unsaved-work confirmation for every future tab close.
+    pub(crate) fn set_confirm_close_tab(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.query.confirm_close_tab = on;
         self.save_settings();
         cx.notify();
     }

@@ -9,13 +9,56 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use red_core::AiTier;
-use red_driver::{AbortSignal, CancelToken, DatabaseDriver, QueryCursor};
+use red_driver::{AbortSignal, CancelToken, DatabaseDriver, KvDriver, QueryCursor};
 
 use crate::tunnel::Tunnel;
 use crate::{Event, SessionId};
 
 use super::paging::ResultMap;
 use super::{emit, lock, Events};
+
+/// A session's driver: either the SQL-shaped `DatabaseDriver` seam or the
+/// parallel `KvDriver` seam (Redis; see `docs/plans/redis.md`). Every SQL
+/// command handler needs the former and has no meaning for the latter, so
+/// [`SessionDriver::as_sql`] is how those handlers reject a KV session with a
+/// clean `Event::Error` instead of a type error or a silent no-op.
+#[derive(Clone)]
+pub(crate) enum SessionDriver {
+    Sql(Arc<dyn DatabaseDriver>),
+    Kv(Arc<dyn KvDriver>),
+}
+
+impl SessionDriver {
+    /// Borrow the SQL driver, or `None` on a KV (Redis) session. Every
+    /// SQL-only command handler (`Query`, `OpenResult`, `Execute`, …) calls
+    /// this first and emits `Event::Error` on `None` rather than assuming a
+    /// `DatabaseDriver` is always behind the session.
+    pub(crate) fn as_sql(&self) -> Option<&Arc<dyn DatabaseDriver>> {
+        match self {
+            SessionDriver::Sql(d) => Some(d),
+            SessionDriver::Kv(_) => None,
+        }
+    }
+
+    /// Borrow the KV driver, or `None` on a SQL session. Unused until R1's
+    /// `Kv*` command handlers land (see docs/plans/redis.md); R0 only needs
+    /// `as_sql`, to reject SQL commands on a KV session.
+    #[allow(dead_code)]
+    pub(crate) fn as_kv(&self) -> Option<&Arc<dyn KvDriver>> {
+        match self {
+            SessionDriver::Sql(_) => None,
+            SessionDriver::Kv(d) => Some(d),
+        }
+    }
+
+    /// Engine version string, whichever seam this session's driver is behind.
+    pub(crate) fn server_version(&self) -> String {
+        match self {
+            SessionDriver::Sql(d) => d.server_version(),
+            SessionDriver::Kv(d) => d.server_version(),
+        }
+    }
+}
 
 /// Backstop cap on open results retained per session. The UI evicts a superseded
 /// result (re-sort / filter / tab-close) by sending `CloseResult`, so the live
@@ -55,6 +98,41 @@ pub(crate) struct InFlight {
     pub(crate) stats: Option<AbortSignal>,
     /// The latest FK lookup-list fetch for this epoch (in-cell FK picker).
     pub(crate) lookup: Option<AbortSignal>,
+    /// The latest `KvFetchScan` for this epoch (Redis keyspace browse); a
+    /// fast-retyped filter pattern supersedes the in-flight scan the same
+    /// way a flung scrollbar supersedes a SQL page fetch.
+    pub(crate) kv_scan: Option<AbortSignal>,
+    /// The latest `KvReadValue`/`KvReadCollectionPage`/`KvReadListWindow` for
+    /// this epoch (the value inspector): opening a new key, or paging its
+    /// big-collection sub-grid, supersedes whatever the inspector was
+    /// fetching before.
+    pub(crate) kv_value: Option<AbortSignal>,
+    /// The latest `KvReadCollectionPage` for this epoch (the inspector's
+    /// big-collection sub-grid). Separate from `kv_value` so a sibling value
+    /// read (e.g. re-selecting the key) can't abort an in-progress page scan
+    /// and strand the sub-grid on "Loading…" — an interrupted collection scan
+    /// emits no event, and a stale page for another key is already filtered
+    /// out UI-side by its key.
+    pub(crate) kv_collection: Option<AbortSignal>,
+    /// The latest `KvStreamConsumers` fetch for this epoch (the inspector's
+    /// consumer-group view). Separate from `kv_value` so selecting a group
+    /// doesn't cancel the key's value read, and separate from
+    /// `kv_group_pending` so the paired consumers+pending fetches for one
+    /// group don't cancel each other.
+    pub(crate) kv_group_detail: Option<AbortSignal>,
+    /// The latest `KvStreamPending` fetch for this epoch (the inspector's
+    /// consumer-group pending list). See `kv_group_detail`.
+    pub(crate) kv_group_pending: Option<AbortSignal>,
+    /// A live `KvSubscribe` for this epoch (Redis Pub/Sub monitor). Unlike
+    /// every other slot here, this one is long-lived by design (it stays
+    /// armed for as long as the subscription panel is open) rather than
+    /// superseded by a follow-up request; it's torn down by `CloseResult`
+    /// when the panel closes.
+    pub(crate) kv_subscribe: Option<AbortSignal>,
+    /// A live `KvMonitor` firehose for this epoch (Redis MONITOR profiler).
+    /// Long-lived like `kv_subscribe`: it stays armed until `CloseResult`
+    /// stops it, rather than being superseded by a follow-up request.
+    pub(crate) kv_monitor: Option<AbortSignal>,
 }
 
 impl InFlight {
@@ -66,6 +144,13 @@ impl InFlight {
             self.build.as_ref(),
             self.stats.as_ref(),
             self.lookup.as_ref(),
+            self.kv_scan.as_ref(),
+            self.kv_value.as_ref(),
+            self.kv_collection.as_ref(),
+            self.kv_group_detail.as_ref(),
+            self.kv_group_pending.as_ref(),
+            self.kv_subscribe.as_ref(),
+            self.kv_monitor.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -93,7 +178,7 @@ pub(crate) struct ActiveQuery {
 /// idle eviction). Several of these stay warm at once, keyed by [`SessionId`], so
 /// switching between connections is instant: no reconnect, no schema reload.
 pub(crate) struct SessionState {
-    pub(crate) driver: Arc<dyn DatabaseDriver>,
+    pub(crate) driver: SessionDriver,
     /// This connection's optional AI policy overrides (M-S7), captured at connect
     /// from its [`ConnectionConfig`](red_core::ConnectionConfig). Layered over the
     /// global `[ai]` policy when a turn runs on this session, so a sensitive
@@ -161,7 +246,7 @@ pub(crate) struct AiOverride {
 
 impl SessionState {
     pub(crate) fn new(
-        driver: Arc<dyn DatabaseDriver>,
+        driver: SessionDriver,
         tunnel: Option<Tunnel>,
         ai_override: AiOverride,
         read_only: bool,
@@ -216,6 +301,18 @@ impl SessionState {
     }
 }
 
+impl Drop for SessionState {
+    /// Backstop the manual `teardown()` calls at each removal site: if any path
+    /// drops a session without calling it, still abort in-flight fetches —
+    /// including detached MONITOR/subscribe stream tasks, which loop until their
+    /// `AbortSignal` fires — and signal exports, so nothing leaks a driver clone
+    /// or a dedicated connection. Idempotent: `teardown` drains/clears, so a
+    /// prior explicit call makes this a no-op.
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
 /// The result of a spawned connect/probe, delivered back to the dispatch loop so
 /// the (single-threaded) loop owns every mutation of `sessions`. Dialing runs off
 /// the loop (see `CONNECT_TIMEOUT` and the `Connect` arm), so one slow connect
@@ -232,7 +329,7 @@ pub(crate) enum ConnectOutcome {
         ai_override: AiOverride,
         /// The connection's read-only posture, captured at connect for the AI policy.
         read_only: bool,
-        result: Result<(Arc<dyn DatabaseDriver>, Option<Tunnel>), ConnectFail>,
+        result: Result<(SessionDriver, Option<Tunnel>), ConnectFail>,
     },
     /// A session-less `TestConnection` finished; carries the server version on
     /// success, the error message otherwise.

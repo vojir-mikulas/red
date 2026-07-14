@@ -352,6 +352,13 @@ impl Render for AppState {
         let screen = match &self.phase {
             Phase::Disconnected => self.render_connect(window, cx).into_any_element(),
             Phase::Connecting(conn) => self.render_connecting(conn, window, cx).into_any_element(),
+            // Redis has no SQL surface at all yet (R0; keyspace browsing lands
+            // in R1, see docs/plans/redis.md) — a dedicated minimal shell
+            // instead of the SQL workspace's editor/grid/schema tree, which
+            // all assume a `DatabaseDriver` session.
+            Phase::Connected(active) if active.config.kind == red_core::DbKind::Redis => self
+                .render_redis_shell(active, window, cx)
+                .into_any_element(),
             Phase::Connected(active) => self.render_shell(active, window, cx).into_any_element(),
         };
 
@@ -369,6 +376,17 @@ impl Render for AppState {
             .confirm_close_tab
             .and_then(|i| self.tab_title(i))
             .map(|title| self.render_confirm_close(title, cx));
+
+        let confirm_kv_delete = self
+            .confirm_kv_delete
+            .as_ref()
+            .map(|(_, key)| key.clone())
+            .map(|key| self.render_kv_confirm_delete(key, cx));
+
+        let confirm_close_batch = self
+            .confirm_close_batch
+            .clone()
+            .map(|indices| self.render_confirm_close_batch(indices.len(), cx));
 
         let confirm_delete = self
             .confirm_delete_conn
@@ -401,6 +419,10 @@ impl Render for AppState {
         // of this fn doesn't hold `theme`'s borrow of `cx` across the dev-stats
         // block's mutable `cx` use below.
         let frame_border = theme.border;
+        // Same reasoning: copied out here so the autoscroll indicator built
+        // near the end of this fn doesn't extend `theme`'s borrow of `cx`
+        // across the mutable `cx` uses in the dropdown/overlay chain below.
+        let (autoscroll_bg, autoscroll_border) = (theme.accent_ghost, theme.accent);
         let root = div()
             .size_full()
             .relative()
@@ -487,7 +509,14 @@ impl Render for AppState {
                 this.open_external(crate::app::ISSUES_URL, cx)
             }))
             // --- staged grid editing (Track B6) ---
-            .on_action(cx.listener(|this, _: &BeginEdit, _, cx| this.begin_grid_edit(cx)))
+            // Enter/F2 in the "Table" context: on a Redis key list it opens the
+            // value inspector on the keyboard cursor; otherwise it begins an
+            // in-place SQL cell edit (the same binding, the right thing per pane).
+            .on_action(cx.listener(|this, _: &BeginEdit, window, cx| {
+                if !this.kv_activate_cursor(window, cx) {
+                    this.begin_grid_edit(cx);
+                }
+            }))
             // ⌘↵ in the grid submits staged changes; with nothing staged it falls
             // through to running the active query (so the key still does the
             // expected thing on a clean grid).
@@ -582,6 +611,8 @@ impl Render for AppState {
             .children(toast)
             .children(confirm)
             .children(confirm_close)
+            .children(confirm_kv_delete)
+            .children(confirm_close_batch)
             .children(confirm_delete)
             .children(settings)
             .children(shortcuts)
@@ -602,9 +633,24 @@ impl Render for AppState {
             .children(self.cell_menu.map(|pos| self.render_cell_menu(pos, cx)))
             .children(self.export_menu.map(|pos| self.render_export_menu(pos, cx)))
             .children(self.more_menu.map(|pos| self.render_more_menu(pos, cx)))
+            .children(
+                self.tab_context_menu
+                    .map(|(i, pos)| self.render_tab_menu(i, pos, cx)),
+            )
             // The in-cell FK suggestion dropdown (Track B8) anchors to the editor
             // cell but mounts here so it paints above the grid and escapes its clip.
-            .children(self.render_cell_suggest(window, cx));
+            .children(self.render_cell_suggest(window, cx))
+            // The middle-click autoscroll origin marker: rooted at the window
+            // (not the grid pane) so it positions from the click's window
+            // coordinates the same way the cell/export/more dropdowns do.
+            .children(self.autoscroll.as_ref().map(|a| {
+                floating(crate::result::autoscroll::indicator(
+                    autoscroll_bg,
+                    autoscroll_border,
+                ))
+                .offset(gpui::point(px(-7.), px(-7.)))
+                .at(a.origin)
+            }));
 
         // Dev perf HUD: register its toggle, overlay the panel last (on top), and
         // close the frame so the rings capture this render's cost.
@@ -723,8 +769,11 @@ impl AppState {
             };
 
             let weak = cx.entity().downgrade();
-            // Trailing controls: a copy button (plain toasts) and a close/cancel
-            // button (always). Export progress isn't worth copying.
+            // Trailing controls: a copy button (plain toasts only) and a
+            // close/cancel button (always). Export progress isn't worth copying,
+            // and a toast with its own call-to-action (export-finished's "Show in
+            // folder", the post-update "Show changelog") has nothing generic worth
+            // copying either — the action *is* the useful affordance.
             let close = IconButton::new(
                 ("toast-close", id),
                 crate::icons::icon("x", action_size, action_tone),
@@ -738,7 +787,7 @@ impl AppState {
                 }
             });
             let mut actions = div().flex().items_center().gap_1();
-            if n.export.is_none() {
+            if n.export.is_none() && n.action.is_none() {
                 let copy_text = match &n.detail {
                     Some(detail) => format!("{}\n{}", n.message, detail),
                     None => n.message.to_string(),
@@ -754,25 +803,42 @@ impl AppState {
                     }),
                 );
             }
-            // A call-to-action button (e.g. the post-update toast's "Show
-            // changelog"), accent-tinted to stand out from copy/close, ahead of the
-            // close button. Clicking opens the panel and dismisses this toast.
-            if let Some(crate::app::NotificationAction::ShowChangelog) = n.action {
-                let weak = weak.clone();
-                actions = actions.child(
-                    IconButton::new(
-                        ("toast-changelog", id),
-                        crate::icons::icon("view", action_size, theme.accent),
-                    )
-                    .size(IconButtonSize::Sm)
-                    .on_click(move |_, _, cx| {
-                        weak.update(cx, |this, cx| {
-                            this.close_notification(id, cx);
-                            this.open_whats_new(cx);
-                        })
-                        .ok();
-                    }),
-                );
+            // A call-to-action button, accent-tinted to stand out from copy/close,
+            // ahead of the close button.
+            match &n.action {
+                Some(crate::app::NotificationAction::ShowChangelog) => {
+                    let weak = weak.clone();
+                    actions = actions.child(
+                        IconButton::new(
+                            ("toast-changelog", id),
+                            crate::icons::icon("view", action_size, theme.accent),
+                        )
+                        .size(IconButtonSize::Sm)
+                        .on_click(move |_, _, cx| {
+                            weak.update(cx, |this, cx| {
+                                this.close_notification(id, cx);
+                                this.open_whats_new(cx);
+                            })
+                            .ok();
+                        }),
+                    );
+                }
+                Some(crate::app::NotificationAction::RevealInFileManager(path)) => {
+                    let path = std::path::PathBuf::from(path.to_string());
+                    let weak = weak.clone();
+                    actions = actions.child(
+                        IconButton::new(
+                            ("toast-reveal", id),
+                            crate::icons::icon("folder-open", action_size, theme.accent),
+                        )
+                        .size(IconButtonSize::Sm)
+                        .on_click(move |_, _, cx| {
+                            weak.update(cx, |this, cx| this.reveal_in_file_manager(&path, cx))
+                                .ok();
+                        }),
+                    );
+                }
+                None => {}
             }
             actions = actions.child(close);
 
@@ -831,7 +897,12 @@ impl AppState {
             );
         }
 
-        col
+        // Defer the whole stack so it paints in the late pass, above the modals
+        // (the connection form, settings, confirm dialogs) — which are plain
+        // `.absolute()` siblings and would otherwise cover toasts by tree order.
+        // Deferred, same-priority as Flint's `floating()` menus, so an open menu
+        // still paints above a toast (menus sit later in the root child list).
+        gpui::deferred(col)
     }
 
     /// The title of tab `index`, if it exists, for the close-confirm prompt.
@@ -848,9 +919,14 @@ impl AppState {
         let theme = cx.theme();
         let close_view = cx.entity().downgrade();
         let confirm_view = cx.entity().downgrade();
-        let body = div().text_color(theme.text_muted).child(format!(
-            "“{title}” has a query or result that will be lost. Close it?"
-        ));
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().text_color(theme.text_muted).child(format!(
+                "“{title}” has a query or result that will be lost. Close it?"
+            )))
+            .child(self.dont_ask_close_tab_checkbox(cx));
         let footer = div()
             .flex()
             .justify_end()
@@ -879,6 +955,80 @@ impl AppState {
                     .ok();
             })
             .child(body)
+    }
+
+    /// Confirmation before a bulk close (Close Others / Close All / Close Left /
+    /// Close Right) that would drop at least one tab's unsaved work. Mirrors
+    /// [`Self::render_confirm_close`]; `count` is the number of tabs the batch
+    /// would close.
+    fn render_confirm_close_batch(&self, count: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let close_view = cx.entity().downgrade();
+        let confirm_view = cx.entity().downgrade();
+        let noun = if count == 1 { "tab" } else { "tabs" };
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().text_color(theme.text_muted).child(format!(
+                "This closes {count} {noun}; some hold a query or result that will be lost. Continue?"
+            )))
+            .child(self.dont_ask_close_tab_checkbox(cx));
+        let footer = div()
+            .flex()
+            .justify_end()
+            .gap_2()
+            .child(
+                Button::new("close-batch-cancel", "Keep tabs")
+                    .variant(ButtonVariant::Secondary)
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel_close_batch(cx))),
+            )
+            .child(
+                Button::new("close-batch-confirm", format!("Close {count} {noun}"))
+                    .variant(ButtonVariant::Danger)
+                    .on_click(cx.listener(|this, _, _, cx| this.confirm_close_batch_accept(cx))),
+            );
+        Modal::new("confirm-close-tab-batch")
+            .title("Close tabs")
+            .width(px(420.))
+            .focus_handle(self.modal_focus.clone())
+            .footer(footer)
+            .on_close(move |_, cx| {
+                close_view
+                    .update(cx, |this, cx| this.cancel_close_batch(cx))
+                    .ok();
+            })
+            .on_confirm(move |_, cx| {
+                confirm_view
+                    .update(cx, |this, cx| this.confirm_close_batch_accept(cx))
+                    .ok();
+            })
+            .child(body)
+    }
+
+    /// The "Don't ask again" checkbox shared by the single- and batch-tab-close
+    /// confirmations: unticked whenever either modal is open (it can only open
+    /// while the setting is still on), and flips `query.confirm_close_tab` off
+    /// immediately on check so it applies to this close too.
+    fn dont_ask_close_tab_checkbox(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                Checkbox::new("close-tab-dont-ask", false)
+                    .mark(crate::icons::icon("check", px(12.), theme.on_accent))
+                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                        this.set_confirm_close_tab(!checked, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .text_size(theme.scale(12.))
+                    .text_color(theme.text_muted)
+                    .child("Don't ask again"),
+            )
     }
 
     /// Confirmation before deleting a saved connection. Deletion also drops the
@@ -917,6 +1067,67 @@ impl AppState {
             .on_confirm(move |_, cx| {
                 confirm_view
                     .update(cx, |this, cx| this.confirm_delete_connection(cx))
+                    .ok();
+            })
+            .child(body)
+    }
+
+    /// Confirmation modal for deleting a Redis key straight from a browse list's
+    /// right-click menu (see [`AppState::kv_request_delete_key`]). Enter deletes,
+    /// Esc / Cancel backs out — the destructive action gets an explicit prompt
+    /// rather than the inspector's quieter inline confirm bar.
+    fn render_kv_confirm_delete(&self, key: String, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let close_view = cx.entity().downgrade();
+        let confirm_view = cx.entity().downgrade();
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().text_color(theme.text_muted).child(
+                "This key and its value will be permanently deleted from Redis. This can't be undone.",
+            ))
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded(theme.radius_sm)
+                    .bg(theme.bg_panel)
+                    .border_1()
+                    .border_color(theme.border)
+                    .font_family(theme.mono_family.clone())
+                    .text_size(theme.scale(12.))
+                    .text_color(theme.text)
+                    .truncate()
+                    .child(key),
+            );
+        let footer = div()
+            .flex()
+            .justify_end()
+            .gap_2()
+            .child(
+                Button::new("kv-delete-cancel", "Cancel")
+                    .variant(ButtonVariant::Secondary)
+                    .on_click(cx.listener(|this, _, _, cx| this.kv_cancel_delete_key(cx))),
+            )
+            .child(
+                Button::new("kv-delete-confirm", "Delete key")
+                    .variant(ButtonVariant::Danger)
+                    .on_click(cx.listener(|this, _, _, cx| this.kv_confirm_delete_key(cx))),
+            );
+        Modal::new("confirm-kv-delete")
+            .title("Delete key")
+            .width(px(440.))
+            .focus_handle(self.modal_focus.clone())
+            .footer(footer)
+            .on_close(move |_, cx| {
+                close_view
+                    .update(cx, |this, cx| this.kv_cancel_delete_key(cx))
+                    .ok();
+            })
+            .on_confirm(move |_, cx| {
+                confirm_view
+                    .update(cx, |this, cx| this.kv_confirm_delete_key(cx))
                     .ok();
             })
             .child(body)

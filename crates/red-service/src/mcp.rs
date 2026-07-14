@@ -3,10 +3,10 @@
 //! name in `session/new`; the live run showed it advertises `mcp_capabilities`
 //! `http` (not `acp`), so Red *hosts* the server and the agent connects in.
 //!
-//! It serves the exact same four read-only tools the API-key path uses
-//! (`crate::ai::tool_catalog` / `run_tool`), bound to one session's
-//! `DatabaseDriver`, so the model browses the database through the same guards a
-//! human does and (in M1) cannot mutate anything.
+//! It serves the same read-only tools the API-key path uses (via
+//! `crate::ai::AiBackend`), bound to one session's driver — the SQL
+//! `DatabaseDriver` or the Redis `KvDriver` seam — so the model browses through
+//! the same guards a human does and cannot mutate anything over this path.
 //!
 //! Hardening: bound to loopback on a random port, gated by a per-session bearer
 //! nonce (handed to the agent via the MCP server's `Authorization` header), and
@@ -27,12 +27,11 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use red_ai::CancelToken;
 use red_core::AiPolicy;
-use red_driver::DatabaseDriver;
 use serde_json::{json, Value as Json};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
-use crate::ai::{run_tool, tool_catalog, ReportSink};
+use crate::ai::{AiBackend, ReportSink};
 
 /// A running MCP server, one per ACP conversation. Holds the URL + bearer nonce
 /// to put in `session/new.mcp_servers`; aborts its accept loop on `Drop`, so the
@@ -44,13 +43,13 @@ pub(crate) struct McpServer {
 }
 
 impl McpServer {
-    /// Bind a fresh loopback server backed by `driver`, gated by `policy`, and
-    /// start accepting. The policy (access tier + resource guards, M-S7) is
-    /// captured here and enforced on every `tools/list`/`tools/call`, so the
-    /// subscription agent sees exactly the catalog the tier allows and can't
-    /// exceed the limits, the same gate the API-key path runs under.
+    /// Bind a fresh loopback server backed by `backend` (the SQL or KV driver seam),
+    /// gated by `policy`, and start accepting. The policy (access tier + resource
+    /// guards, M-S7) is captured here and enforced on every `tools/list`/
+    /// `tools/call`, so the subscription agent sees exactly the catalog the tier
+    /// allows and can't exceed the limits, the same gate the API-key path runs under.
     pub(crate) async fn start(
-        driver: Arc<dyn DatabaseDriver>,
+        backend: AiBackend,
         policy: AiPolicy,
         report: ReportSink,
     ) -> std::io::Result<Self> {
@@ -72,7 +71,7 @@ impl McpServer {
                     Err(_) => break,
                 };
                 let io = TokioIo::new(stream);
-                let driver = driver.clone();
+                let backend = backend.clone();
                 let token = token_task.clone();
                 let calls = calls.clone();
                 let report = report.clone();
@@ -80,7 +79,7 @@ impl McpServer {
                     let service = service_fn(move |req| {
                         handle_request(
                             req,
-                            driver.clone(),
+                            backend.clone(),
                             token.clone(),
                             policy,
                             calls.clone(),
@@ -117,7 +116,7 @@ impl Drop for McpServer {
 /// failure is encoded as an HTTP status or a JSON-RPC error envelope.
 async fn handle_request(
     req: Request<Incoming>,
-    driver: Arc<dyn DatabaseDriver>,
+    backend: AiBackend,
     token: String,
     policy: AiPolicy,
     calls: Arc<AtomicUsize>,
@@ -148,7 +147,7 @@ async fn handle_request(
         return Ok(empty(StatusCode::ACCEPTED));
     };
 
-    let envelope = match dispatch(method, &params, &driver, policy, &calls, &report).await {
+    let envelope = match dispatch(method, &params, &backend, policy, &calls, &report).await {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
         Err((code, message)) => rpc_error(id, code, &message),
     };
@@ -160,7 +159,7 @@ async fn handle_request(
 async fn dispatch(
     method: &str,
     params: &Json,
-    driver: &Arc<dyn DatabaseDriver>,
+    backend: &AiBackend,
     policy: AiPolicy,
     calls: &AtomicUsize,
     report: &ReportSink,
@@ -186,9 +185,10 @@ async fn dispatch(
             // where per-statement approval is enforced in-process *before* the tool
             // runs. The MCP server can't verify the external agent actually prompted
             // the user, so it never offers (or runs) a mutating tool; reads only.
-            let tools: Vec<Json> = tool_catalog(&policy)
+            let tools: Vec<Json> = backend
+                .catalog(&policy)
                 .into_iter()
-                .filter(|t| !crate::ai::is_write_tool(&t.name))
+                .filter(|t| !backend.is_write_tool(&t.name))
                 .map(|t| {
                     json!({
                         "name": t.name,
@@ -207,12 +207,12 @@ async fn dispatch(
             // Writes never run over the subscription/MCP path (see tools/list): only
             // the in-process-gated API-key path may mutate. Refused in-band so the
             // model can recover (and before charging the budget).
-            if crate::ai::is_write_tool(name) {
+            if backend.is_write_tool(name) {
                 return Ok(json!({
                     "content": [ { "type": "text", "text":
-                        "error: this agent cannot modify data. Hand the user the SQL with \
-                        open_query so they can run it themselves, or tell them to use the \
-                        API-key agent, which gates each write behind explicit approval." } ],
+                        "error: this agent cannot modify data. Hand the change to the user so \
+                        they can run it themselves, or tell them to use the API-key agent, \
+                        which gates each write behind explicit approval." } ],
                     "isError": true,
                 }));
             }
@@ -243,8 +243,9 @@ async fn dispatch(
                 .unwrap_or_else(|| json!({}));
             // A fresh cancel token: the agent owns turn cancellation over ACP; a
             // single tool call is short and runs to completion here.
-            let (content, ok) =
-                run_tool(driver, name, &args, &policy, &CancelToken::new(), report).await;
+            let (content, ok) = backend
+                .run_tool(name, &args, &policy, &CancelToken::new(), report)
+                .await;
             Ok(json!({
                 "content": [ { "type": "text", "text": content } ],
                 "isError": !ok,
@@ -312,7 +313,7 @@ fn empty(status: StatusCode) -> Response<Full<Bytes>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use red_driver::SqliteDriver;
+    use red_driver::{DatabaseDriver, SqliteDriver};
 
     /// Spin up the server over a tiny fixture DB at `policy` and return
     /// `(server, client)`.
@@ -327,7 +328,7 @@ mod tests {
             .unwrap();
         }
         let driver: Arc<dyn DatabaseDriver> = Arc::new(SqliteDriver::new(path, true));
-        let server = McpServer::start(driver, policy, ReportSink::disabled())
+        let server = McpServer::start(AiBackend::Sql(driver), policy, ReportSink::disabled())
             .await
             .unwrap();
         (server, reqwest::Client::new())
@@ -512,7 +513,7 @@ mod tests {
         }
         let driver: Arc<dyn DatabaseDriver> = Arc::new(SqliteDriver::new(path, false));
         let server = McpServer::start(
-            driver,
+            AiBackend::Sql(driver),
             AiPolicy {
                 tier: red_core::AiTier::Write,
                 ..AiPolicy::default()
@@ -571,5 +572,299 @@ mod tests {
             .unwrap()
             .status();
         assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    /// A tiny scripted `KvDriver` for the KV MCP path: `command` answers `INFO`
+    /// with a canned reply so `kv_server_info` can run end-to-end; everything else
+    /// the KV MCP tests don't exercise is left unimplemented.
+    struct StubKv;
+
+    #[async_trait::async_trait]
+    impl red_driver::KvDriver for StubKv {
+        async fn ping(&self) -> red_core::Result<()> {
+            Ok(())
+        }
+        fn server_version(&self) -> String {
+            "7.2.0".into()
+        }
+        fn topology(&self) -> red_driver::KvTopology {
+            red_driver::KvTopology::Standalone
+        }
+        async fn db_size(&self) -> red_core::Result<u64> {
+            Ok(0)
+        }
+        async fn scan_keys(
+            &self,
+            _cursor: red_core::kv::ScanCursor,
+            _pattern: Option<&str>,
+            _type_filter: Option<&str>,
+            _budget: red_core::kv::ScanBudget,
+            _abort: &red_driver::AbortSignal,
+        ) -> red_core::Result<red_core::kv::KvScanPage> {
+            unimplemented!()
+        }
+        async fn probe_key(&self, _key: &str) -> red_core::Result<Option<red_core::kv::KeyMeta>> {
+            unimplemented!()
+        }
+        async fn read_value(&self, _key: &str) -> red_core::Result<Option<red_core::kv::KvValue>> {
+            unimplemented!()
+        }
+        async fn read_string_full(&self, _key: &str) -> red_core::Result<Option<red_core::Value>> {
+            unimplemented!()
+        }
+        async fn read_collection_page(
+            &self,
+            _key: &str,
+            _kind: red_core::kv::CollectionKind,
+            _cursor: u64,
+            _budget: red_core::kv::ScanBudget,
+            _abort: &red_driver::AbortSignal,
+        ) -> red_core::Result<red_core::kv::KvCollectionPage> {
+            unimplemented!()
+        }
+        async fn read_list_window(
+            &self,
+            _key: &str,
+            _from_head: bool,
+            _count: usize,
+        ) -> red_core::Result<Vec<String>> {
+            unimplemented!()
+        }
+        async fn read_stream_range(
+            &self,
+            _key: &str,
+            _before: Option<&str>,
+            _count: usize,
+        ) -> red_core::Result<red_core::kv::KvStreamPage> {
+            unimplemented!()
+        }
+        async fn stream_groups(
+            &self,
+            _key: &str,
+        ) -> red_core::Result<Vec<red_core::kv::StreamGroup>> {
+            unimplemented!()
+        }
+        async fn stream_consumers(
+            &self,
+            _key: &str,
+            _group: &str,
+        ) -> red_core::Result<Vec<red_core::kv::StreamConsumer>> {
+            unimplemented!()
+        }
+        async fn stream_pending(
+            &self,
+            _key: &str,
+            _group: &str,
+            _count: usize,
+        ) -> red_core::Result<Vec<red_core::kv::PendingEntry>> {
+            unimplemented!()
+        }
+        async fn stream_ack(
+            &self,
+            _key: &str,
+            _group: &str,
+            _ids: &[String],
+        ) -> red_core::Result<u64> {
+            unimplemented!()
+        }
+        async fn stream_claim(
+            &self,
+            _key: &str,
+            _group: &str,
+            _consumer: &str,
+            _min_idle: std::time::Duration,
+            _ids: &[String],
+        ) -> red_core::Result<u64> {
+            unimplemented!()
+        }
+        async fn command(&self, argv: &[String]) -> red_core::Result<red_core::kv::RespValue> {
+            if argv.first().map(String::as_str) == Some("INFO") {
+                return Ok(red_core::kv::RespValue::Bulk(
+                    "redis_version:7.2.0\r\nused_memory:1024\r\nconnected_clients:1\r\n".into(),
+                ));
+            }
+            unimplemented!()
+        }
+        async fn set_string(
+            &self,
+            _key: &str,
+            _value: String,
+            _ttl: red_core::kv::StringTtl,
+        ) -> red_core::Result<()> {
+            unimplemented!()
+        }
+        async fn set_field(
+            &self,
+            _key: &str,
+            _field: &str,
+            _value: String,
+        ) -> red_core::Result<()> {
+            unimplemented!()
+        }
+        async fn hash_delete(&self, _key: &str, _fields: &[String]) -> red_core::Result<u64> {
+            unimplemented!()
+        }
+        async fn set_add(&self, _key: &str, _members: &[String]) -> red_core::Result<u64> {
+            unimplemented!()
+        }
+        async fn set_remove(&self, _key: &str, _members: &[String]) -> red_core::Result<u64> {
+            unimplemented!()
+        }
+        async fn set_replace(&self, _key: &str, _old: &str, _new: &str) -> red_core::Result<()> {
+            unimplemented!()
+        }
+        async fn zset_add(&self, _key: &str, _member: &str, _score: f64) -> red_core::Result<()> {
+            unimplemented!()
+        }
+        async fn zset_remove(&self, _key: &str, _members: &[String]) -> red_core::Result<u64> {
+            unimplemented!()
+        }
+        async fn list_set(&self, _key: &str, _index: i64, _value: String) -> red_core::Result<()> {
+            unimplemented!()
+        }
+        async fn list_push(
+            &self,
+            _key: &str,
+            _value: String,
+            _head: bool,
+        ) -> red_core::Result<u64> {
+            unimplemented!()
+        }
+        async fn list_remove(
+            &self,
+            _key: &str,
+            _count: i64,
+            _value: String,
+        ) -> red_core::Result<u64> {
+            unimplemented!()
+        }
+        async fn set_ttl(
+            &self,
+            _key: &str,
+            _ttl: Option<std::time::Duration>,
+        ) -> red_core::Result<()> {
+            unimplemented!()
+        }
+        async fn rename_key(&self, _from: &str, _to: &str) -> red_core::Result<()> {
+            unimplemented!()
+        }
+        async fn delete_keys(&self, _keys: &[String]) -> red_core::Result<u64> {
+            unimplemented!()
+        }
+        async fn slowlog(
+            &self,
+            _count: usize,
+        ) -> red_core::Result<Vec<red_core::kv::SlowlogEntry>> {
+            unimplemented!()
+        }
+        async fn slowlog_reset(&self) -> red_core::Result<()> {
+            unimplemented!()
+        }
+        async fn client_list(&self) -> red_core::Result<Vec<red_core::kv::ClientInfo>> {
+            unimplemented!()
+        }
+        async fn client_kill(&self, _id: i64) -> red_core::Result<()> {
+            unimplemented!()
+        }
+        async fn monitor(&self) -> red_core::Result<red_driver::KvMonitorStream> {
+            unimplemented!()
+        }
+        async fn notify_config(&self) -> red_core::Result<String> {
+            unimplemented!()
+        }
+        async fn set_notify_config(&self, _flags: &str) -> red_core::Result<()> {
+            unimplemented!()
+        }
+        async fn subscribe(&self, _pattern: &str) -> red_core::Result<red_driver::KvSubscription> {
+            unimplemented!()
+        }
+    }
+
+    /// Spin up the server over a KV backend at `policy`.
+    async fn kv_fixture(policy: AiPolicy) -> (McpServer, reqwest::Client) {
+        let driver: Arc<dyn red_driver::KvDriver> = Arc::new(StubKv);
+        let server = McpServer::start(AiBackend::Kv(driver), policy, ReportSink::disabled())
+            .await
+            .unwrap();
+        (server, reqwest::Client::new())
+    }
+
+    #[tokio::test]
+    async fn kv_tools_list_exposes_reads_and_withholds_writes() {
+        // At the Write tier the KV catalog *includes* the mutating tools, so this
+        // proves the MCP path filters them out (writes never run over ACP), while
+        // still offering the `kv_*` reads.
+        let (server, client) = kv_fixture(AiPolicy {
+            tier: red_core::AiTier::Write,
+            ..AiPolicy::default()
+        })
+        .await;
+        let reply = call(
+            &server,
+            &client,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        )
+        .await;
+        let names: Vec<&str> = reply["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        // Read tools are offered…
+        assert!(names.contains(&"kv_server_info"), "got: {names:?}");
+        assert!(names.contains(&"kv_scan_keys"), "got: {names:?}");
+        // …and every mutating tool is withheld.
+        for w in ["kv_delete", "kv_expire", "kv_rename", "kv_config_set"] {
+            assert!(!names.contains(&w), "{w} must not be offered over MCP");
+        }
+        // The SQL catalog must not bleed into a KV backend.
+        assert!(!names.contains(&"run_select"), "got: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn kv_tools_call_routes_to_the_kv_driver() {
+        let (server, client) = kv_fixture(AiPolicy::default()).await;
+        let reply = call(
+            &server,
+            &client,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": "kv_server_info", "arguments": {} },
+            }),
+        )
+        .await;
+        let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("7.2.0"), "got: {text}");
+        assert_eq!(reply["result"]["isError"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn kv_write_tool_is_refused_over_mcp() {
+        // Even at the Write tier, calling a KV writer over the MCP path is refused
+        // in-band (writes are the API-key path's alone).
+        let (server, client) = kv_fixture(AiPolicy {
+            tier: red_core::AiTier::Write,
+            ..AiPolicy::default()
+        })
+        .await;
+        let reply = call(
+            &server,
+            &client,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": { "name": "kv_delete", "arguments": { "key": "user:1" } },
+            }),
+        )
+        .await;
+        assert_eq!(reply["result"]["isError"], json!(true));
+        assert!(reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("cannot modify data"));
     }
 }

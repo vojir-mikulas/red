@@ -432,7 +432,7 @@ pub(crate) async fn with_timeout<T>(
 #[cfg(test)]
 mod checkpoint_tests {
     use super::*;
-    use crate::dispatch::session::{AiOverride, SessionState, MAX_OPEN_RESULTS};
+    use crate::dispatch::session::{AiOverride, SessionDriver, SessionState, MAX_OPEN_RESULTS};
     use red_core::KeyKind;
     use red_driver::SqliteDriver;
 
@@ -535,7 +535,12 @@ mod checkpoint_tests {
     #[test]
     fn reap_excess_results_caps_to_the_lowest_epochs() {
         let (path, driver) = driver_with(1, "reap");
-        let mut state = SessionState::new(driver, None, AiOverride::default(), false);
+        let mut state = SessionState::new(
+            SessionDriver::Sql(driver),
+            None,
+            AiOverride::default(),
+            false,
+        );
 
         // Open one more than the cap, epochs 1..=MAX+1. Every epoch also has an
         // in-flight handle, so we can assert those are reaped in lockstep.

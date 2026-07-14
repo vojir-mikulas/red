@@ -208,7 +208,7 @@ fn save(path: &PathBuf, entries: &[HistoryEntry]) -> Result<()> {
 
 /// A short, human relative time ("just now", "5m ago", "3h ago", "2d ago") for a
 /// row's subline. Empty for a missing/future stamp (clock skew); no fake time.
-fn relative_time(unix: u64) -> String {
+pub(crate) fn relative_time(unix: u64) -> String {
     let now = crate::conversations::now_unix();
     if unix == 0 || now < unix {
         return String::new();

@@ -81,6 +81,7 @@ impl AppState {
             color: 3,
             // Read-only by default, RED's safe-by-default posture.
             read_only: true,
+            tls: false,
             editing: None,
             submitted: false,
             test: TestState::Idle,
@@ -88,6 +89,7 @@ impl AppState {
             ssh_auth: SshAuthMode::Agent,
             ai_allow_writes: false,
         });
+        self.refresh_engine_combo(cx);
         self.focus_name_field = true;
         cx.notify();
     }
@@ -147,6 +149,7 @@ impl AppState {
             kind: config.kind,
             color: config.color,
             read_only: config.read_only,
+            tls: config.tls,
             editing: Some(index),
             submitted: false,
             test: TestState::Idle,
@@ -154,6 +157,7 @@ impl AppState {
             ssh_auth: ssh_auth.unwrap_or(SshAuthMode::Agent),
             ai_allow_writes: config.ai_tier == Some(red_core::AiTier::Write),
         });
+        self.refresh_engine_combo(cx);
         self.focus_name_field = true;
         cx.notify();
     }
@@ -161,6 +165,18 @@ impl AppState {
     pub(crate) fn close_form(&mut self, cx: &mut Context<Self>) {
         self.form = None;
         cx.notify();
+    }
+
+    /// Point the engine dropdown at the open form's current engine (or the default
+    /// when no form is open). The option list is static, so this only moves the
+    /// selection — called on form open and whenever the engine changes out from
+    /// under the combo (a pasted connection string, the port-default reset path).
+    pub(crate) fn refresh_engine_combo(&mut self, cx: &mut Context<Self>) {
+        let kind = self.form.as_ref().map(|f| f.kind).unwrap_or_default();
+        let selected = DbKind::all().iter().position(|k| *k == kind);
+        self.engine_combo.update(cx, |c, cx| {
+            c.set_options(crate::connect::engine_combo_options(), selected, cx);
+        });
     }
 
     /// Read the form's inputs + state into a `ConnectionConfig`. Unused fields for
@@ -218,6 +234,7 @@ impl AppState {
             database: read(&self.database_input),
             color: form.color,
             read_only: form.read_only,
+            tls: form.tls && !form.kind.is_file(),
             ai_enabled,
             ai_tier,
             ssh,
@@ -238,13 +255,10 @@ impl AppState {
             if config.database.is_empty() {
                 errors.push((FormField::Database, "A database file path is required"));
             }
-        } else {
-            if config.host.is_empty() {
-                errors.push((FormField::Host, "Host is required"));
-            }
-            if config.kind == DbKind::Postgres && config.database.is_empty() {
-                errors.push((FormField::Database, "Database is required"));
-            }
+        } else if config.kind == DbKind::Postgres && config.database.is_empty() {
+            // A blank host is allowed: it falls back to `localhost` (see
+            // `ConnectionConfig::effective_host`), so we don't reject it here.
+            errors.push((FormField::Database, "Database is required"));
         }
         // `ssh` is `Some` only when the tunnel toggle is on, so these fire only then.
         if let Some(ssh) = &config.ssh {
@@ -444,6 +458,9 @@ impl AppState {
             .map(|p| p.to_string())
             .unwrap_or_default();
         self.port_input.update(cx, |i, cx| i.set_content(port, cx));
+        // Keep the engine dropdown's selection in step — this path also fires when a
+        // pasted connection string changes the scheme, not just a direct pick.
+        self.refresh_engine_combo(cx);
         // The scheme changed, so refresh the connection-string mirror.
         self.sync_conn_str_from_fields(cx);
         cx.notify();
@@ -489,6 +506,7 @@ impl AppState {
             .update(cx, |i, cx| i.set_content(parsed.database, cx));
         if let Some(form) = &mut self.form {
             form.kind = parsed.kind;
+            form.tls = parsed.tls;
             form.test = TestState::Idle;
         }
         cx.notify();
@@ -504,6 +522,13 @@ impl AppState {
     pub(crate) fn set_form_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
         if let Some(form) = &mut self.form {
             form.read_only = read_only;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn set_form_tls(&mut self, tls: bool, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.form {
+            form.tls = tls;
         }
         cx.notify();
     }

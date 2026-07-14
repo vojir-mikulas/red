@@ -131,6 +131,16 @@ pub fn spell(kind: DbKind, t: &NormType) -> String {
         DbKind::Postgres => spell_postgres(t),
         DbKind::Mysql => spell_mysql(t),
         DbKind::Clickhouse => spell_clickhouse(t),
+        // Redis has no column/DDL model at all (see docs/plans/redis.md); it
+        // isn't a `DatabaseDriver`, so it can never appear in a create-table or
+        // migration target picker (`write_caps().insert` is false, which the
+        // pickers filter on). Degrade to an empty type rather than panicking on
+        // the backend thread if that invariant ever regresses; debug builds still
+        // trip the assert.
+        DbKind::Redis => {
+            debug_assert!(false, "Redis has no column/DDL model");
+            String::new()
+        }
     }
 }
 
@@ -157,6 +167,8 @@ pub fn is_lossy(target: DbKind, t: &NormType) -> bool {
         DbKind::Postgres => false,
         // ClickHouse is never a create target; treat as lossy for completeness.
         DbKind::Clickhouse => true,
+        // Redis is never a create target either (no column/DDL model).
+        DbKind::Redis => true,
     }
 }
 
@@ -333,9 +345,17 @@ mod tests {
     fn unknown_passes_through_verbatim() {
         assert_eq!(normalize("tsvector"), NormType::Unknown("tsvector".into()));
         assert_eq!(normalize("text[]"), NormType::Unknown("text[]".into()));
-        // …and spells back out unchanged, on every engine.
-        for k in DbKind::all() {
-            assert_eq!(spell(*k, &NormType::Unknown("tsvector".into())), "tsvector");
+        // …and spells back out unchanged, on every engine with a column/DDL
+        // model at all. Not `DbKind::all()`: Redis has none (`spell` is
+        // `unreachable!()` for it), so it isn't "every engine" here even
+        // though the connection form lists it alongside these four.
+        for k in [
+            DbKind::Sqlite,
+            DbKind::Postgres,
+            DbKind::Mysql,
+            DbKind::Clickhouse,
+        ] {
+            assert_eq!(spell(k, &NormType::Unknown("tsvector".into())), "tsvector");
         }
     }
 

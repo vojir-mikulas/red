@@ -12,6 +12,10 @@ use red_core::DbKind;
 
 use crate::app::{AppState, ConnectSortField, FormField, FormState, SshAuthMode, TestState};
 
+/// How many saved-connection cards the welcome screen shows per page. Kept small
+/// so a long roster paginates into single screens instead of one tall scroll.
+const CONNECTIONS_PER_PAGE: usize = 8;
+
 /// The six label colors a connection can be tagged with, mapped onto semantic
 /// theme tokens so they track the active theme. A connection stores the index.
 pub(crate) fn label_color(index: u8, theme: &Theme) -> Hsla {
@@ -33,7 +37,32 @@ fn engine_tint(kind: DbKind, theme: &Theme) -> Hsla {
         DbKind::Sqlite => theme.cyan,
         DbKind::Mysql => theme.orange,
         DbKind::Clickhouse => theme.yellow,
+        // Redis leans into the app's red accent deliberately (the welcome-card
+        // badge is `Danger`/red to match); here `theme.red` is used as a colour,
+        // not to signal an error state.
+        DbKind::Redis => theme.red,
     }
+}
+
+/// The small tinted dot that marks an engine in the picker dropdown — drawn in the
+/// trigger for the current engine and on every option row. Shares the per-engine
+/// palette with the connection cards via [`engine_tint`].
+pub(crate) fn engine_dot(kind: DbKind, theme: &Theme) -> impl IntoElement {
+    div()
+        .size(px(8.))
+        .rounded_full()
+        .flex_none()
+        .bg(engine_tint(kind, theme))
+}
+
+/// The engine dropdown's option labels, in [`DbKind::all`] order so a row's index
+/// maps straight back to its `DbKind` (the picker's leading-dot factory and the
+/// `Select` handler both rely on this ordering).
+pub(crate) fn engine_combo_options() -> Vec<SharedString> {
+    DbKind::all()
+        .iter()
+        .map(|k| SharedString::from(k.to_string()))
+        .collect()
 }
 
 /// A connection's last-used time as a coarse relative label ("just now", "5m
@@ -111,10 +140,22 @@ impl AppState {
         // stored connection regardless of display order, while the keyboard
         // highlight (`connect_sel`) tracks the display position.
         let visible = self.visible_connections(cx);
-        let cards: Vec<AnyElement> = visible
+        // Paginate the list so a large roster stays a single screen rather than a
+        // long scroll. The shown page is derived from the keyboard selection, so
+        // ↑/↓ and the page controls stay in lockstep (the highlight always sits on
+        // the visible page); clicking a card connects immediately, so it never
+        // needs syncing. `display_ix` stays a global index into the visible list so
+        // the highlight comparison in `connection_card` lines up.
+        let total = visible.len();
+        let page_count = total.div_ceil(CONNECTIONS_PER_PAGE).max(1);
+        let page = self.connect_sel.min(total.saturating_sub(1)) / CONNECTIONS_PER_PAGE;
+        let start = page * CONNECTIONS_PER_PAGE;
+        let end = (start + CONNECTIONS_PER_PAGE).min(total);
+        let cards: Vec<AnyElement> = visible[start..end]
             .iter()
             .enumerate()
-            .map(|(display_ix, &orig_ix)| {
+            .map(|(offset, &orig_ix)| {
+                let display_ix = start + offset;
                 let stored = &self.connections[orig_ix];
                 self.connection_card(
                     display_ix,
@@ -127,6 +168,8 @@ impl AppState {
                 .into_any_element()
             })
             .collect();
+        let pagination =
+            (page_count > 1).then(|| self.connect_pagination(page, page_count, total, cx));
         let toolbar = (!self.connections.is_empty()).then(|| self.connect_toolbar(cx));
         let new_button = self.new_button(cx);
         let connections_header = self.connections_header(cx);
@@ -225,6 +268,7 @@ impl AppState {
             .child(connections_header)
             .children(toolbar)
             .child(saved)
+            .children(pagination)
             .child(new_button)
             .child(footer);
 
@@ -331,6 +375,53 @@ impl AppState {
             }
         });
         indices
+    }
+
+    /// The page controls beneath the saved-connection list: Previous / Next around
+    /// a "Page X of Y" label, shown only when the list spans more than one page.
+    /// Both buttons move the keyboard selection to the first card of the target
+    /// page, which is what drives the visible page (see [`Self::render_connect`]).
+    fn connect_pagination(
+        &self,
+        page: usize,
+        page_count: usize,
+        total: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // Cloned so the theme doesn't hold an immutable borrow of `cx` across the
+        // `cx.listener` calls on the buttons below.
+        let theme = cx.theme().clone();
+        div()
+            .pt_2()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(
+                Button::new("connect-prev-page", "Previous")
+                    .variant(ButtonVariant::Ghost)
+                    .disabled(page == 0)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.connect_sel = page.saturating_sub(1) * CONNECTIONS_PER_PAGE;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .text_size(theme.scale(12.))
+                    .text_color(theme.text_muted)
+                    .child(format!("Page {} of {page_count}", page + 1)),
+            )
+            .child(
+                Button::new("connect-next-page", "Next")
+                    .variant(ButtonVariant::Ghost)
+                    .disabled(page + 1 >= page_count)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.connect_sel =
+                            ((page + 1) * CONNECTIONS_PER_PAGE).min(total.saturating_sub(1));
+                        cx.notify();
+                    })),
+            )
     }
 
     /// The toolbar above the saved-connection list: a search box that filters the
@@ -491,6 +582,9 @@ impl AppState {
             DbKind::Postgres => (BadgeVariant::Special, "Postgres"),
             DbKind::Mysql => (BadgeVariant::Warning, "MySQL"),
             DbKind::Clickhouse => (BadgeVariant::Accent, "ClickHouse"),
+            // Redis gets a red badge (leaning into the app's accent) but keeps its
+            // own name; `Danger` here is used for its colour, not a status meaning.
+            DbKind::Redis => (BadgeVariant::Danger, "Redis"),
         };
         let group = SharedString::from(format!("connect-card-{orig_ix}"));
         // Accessible name: the connection's name, engine, and read-only state;
@@ -752,16 +846,12 @@ impl AppState {
                             .child(self.name_input.clone())
                             .children(field_error_line(theme, field_err(&errors, FormField::Name))),
                     )
-                    .child(
-                        labeled_field("Engine", theme)
-                            .child(self.render_engine_picker(form.kind, theme, cx)),
-                    )
+                    .child(labeled_field("Engine", theme).child(self.engine_combo.clone()))
                     .children(conn_str_field)
                     .child(self.render_connection_fields(form, is_file, &errors, theme))
                     .children(self.render_ssh_section(form, is_file, &errors, theme, cx))
                     .child(self.render_label_access_row(form, theme, cx))
-                    .children(self.render_ai_write_row(form, theme, cx))
-                    .children(self.render_form_status(form, cx)),
+                    .children(self.render_ai_write_row(form, theme, cx)),
             )
     }
 
@@ -1004,50 +1094,6 @@ impl AppState {
             .into_any_element()
     }
 
-    /// The engine segmented control: one cell per `DbKind`, with the engine tint
-    /// dot. Data-driven off `DbKind::all`, so a new driver appears automatically.
-    fn render_engine_picker(
-        &self,
-        selected: DbKind,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let cells = DbKind::all().iter().map(|&kind| {
-            let on = kind == selected;
-            let (bg, border, text) = if on {
-                (theme.accent_ghost, theme.accent, theme.text)
-            } else {
-                (theme.bg_input, theme.border_soft, theme.text_muted)
-            };
-            div()
-                .id(SharedString::from(format!("engine-{}", kind.url_scheme())))
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .gap_1p5()
-                .h(px(32.))
-                .rounded(theme.radius)
-                .bg(bg)
-                .border_1()
-                .border_color(border)
-                .text_size(theme.scale(12.))
-                .text_color(text)
-                .cursor_pointer()
-                .hover(|s| s.text_color(theme.text))
-                .child(
-                    div()
-                        .size(px(8.))
-                        .rounded_full()
-                        .flex_none()
-                        .bg(engine_tint(kind, theme)),
-                )
-                .child(kind.to_string())
-                .on_click(cx.listener(move |this, _, _, cx| this.set_form_kind(kind, cx)))
-        });
-        div().flex().gap_1p5().children(cells)
-    }
-
     /// The AI write opt-in (Feature B): lets the assistant propose INSERT/UPDATE/
     /// DELETE on this connection, each gated by per-statement approval. Shown only
     /// when the assistant is enabled and the connection is *writable*; write access
@@ -1188,14 +1234,46 @@ impl AppState {
                                     },
                                 ))
                                 .child("Read-only"),
-                        ),
+                        )
+                        // TLS toggle — network engines only (a file engine has no
+                        // wire to encrypt). See docs/plans/redis.md's TLS item.
+                        .when(!form.kind.is_file(), |row| {
+                            row.child(Toggle::new("tls", form.tls).label("TLS").on_change(
+                                cx.listener(|this, checked: &bool, _, cx| {
+                                    this.set_form_tls(*checked, cx)
+                                }),
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_size(theme.scale(12.5))
+                                    .text_color(if form.tls {
+                                        theme.accent
+                                    } else {
+                                        theme.text_muted
+                                    })
+                                    .child(crate::icons::icon(
+                                        "key-round",
+                                        theme.scale(12.),
+                                        if form.tls {
+                                            theme.accent
+                                        } else {
+                                            theme.text_muted
+                                        },
+                                    ))
+                                    .child("TLS"),
+                            )
+                        }),
                 ),
             )
     }
 
     /// The modal footer: the Test-connection action on the left, Cancel / Save /
-    /// Connect on the right. The test *result* renders in the full-width status row
-    /// above (see [`Self::render_form_status`]) so it has room to read.
+    /// Connect on the right. The button shows "Testing…" while a probe is in
+    /// flight; the result arrives as a toast (see the `TestSucceeded`/`TestFailed`
+    /// arms in `on_event`), not inline.
     fn render_form_footer(&self, form: &FormState, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let testing = matches!(form.test, TestState::Testing);
@@ -1245,41 +1323,6 @@ impl AppState {
                     ))
                     .on_click(cx.listener(|this, _, _, cx| this.save_form(true, cx))),
             )
-    }
-
-    /// The full-width status row beneath the form fields: the test-connection
-    /// result, in a tinted, wrapping panel so a long engine error stays readable
-    /// instead of being truncated next to the buttons. `None` while idle/testing.
-    fn render_form_status(&self, form: &FormState, cx: &Context<Self>) -> Option<gpui::Div> {
-        let theme = cx.theme();
-        let (msg, color, icon_name) = match &form.test {
-            TestState::Ok(msg) => (msg.clone(), theme.green, "check"),
-            TestState::Fail(msg) => (msg.clone(), theme.red, "close"),
-            TestState::Idle | TestState::Testing => return None,
-        };
-        Some(
-            div()
-                .flex()
-                .items_start()
-                .gap_2()
-                .w_full()
-                .p(px(9.))
-                .rounded(theme.radius)
-                .bg(color.opacity(0.10))
-                .child(div().flex_none().mt(px(1.)).child(crate::icons::icon(
-                    icon_name,
-                    theme.scale(13.),
-                    color,
-                )))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_size(theme.scale(12.))
-                        .text_color(theme.text)
-                        .child(msg),
-                ),
-        )
     }
 }
 

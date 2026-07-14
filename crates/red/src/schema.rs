@@ -15,7 +15,7 @@ use gpui::{div, prelude::*, px, App, Context, Entity, UniformListScrollHandle, W
 use red_core::{ColumnMeta, DbKind, ObjectKind, ResultFilter, SchemaMeta, TableDetail};
 use red_service::Command;
 
-use crate::app::{ActiveConn, AppState, Phase};
+use crate::app::{ActiveConn, AppState, Phase, TabWorkspace};
 
 /// A stable identity for a tree node, surviving re-render and filtering so
 /// expansion + selection track the right node regardless of row position.

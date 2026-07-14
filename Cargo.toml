@@ -25,7 +25,7 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "137e677a
 # gpui to the SAME rev as above; Cargo unifies the two git deps only at a
 # matching URL+rev, so bumping Flint is coordinated with the gpui pin. For local
 # Flint+RED work, override with a `[patch]` or a path dep.
-flint = { git = "https://github.com/vojir-mikulas/flint", rev = "b418caecaf9a6e9bb09ccae95f32039f745bb01e" }
+flint = { git = "https://github.com/vojir-mikulas/flint", rev = "c1704c7329eaeaf0755103e5da9be241e27ebeec" }
 
 # --- Async / backend bridge (mirrors Nyx: Tokio backend ↔ GPUI over channels) ---
 tokio = { version = "1", default-features = false }
@@ -42,6 +42,17 @@ futures-util = { version = "0.3", default-features = false }
 # SSH tunnels for jump-host DB connections — pure-Rust client (no system libssh),
 # bundles key parsing, known_hosts checks, and an ssh-agent client.
 russh = "0.61"
+# Redis/Valkey — the KvDriver seam (docs/plans/redis.md), not one more
+# DatabaseDriver arm. `tokio-rustls-comp` (not separate tokio-comp+tls-rustls
+# — that pair alone is missing the tokio-rustls glue and fails to build) gives
+# the async multiplexed connection plus TLS (`rediss://`) over the same
+# pure-Rust stack reqwest/mysql_async already use. cluster-async/sentinel land
+# with R1's cluster-aware scan cursor, not before.
+redis = { version = "1", default-features = false, features = ["tokio-rustls-comp"] }
+# Already in the tree via redis' own URL parsing; used by the Redis driver to
+# rebuild per-master cluster DSNs (host+port swap, credentials/scheme/TLS
+# preserved) without hand-rolling URL surgery.
+url = "2"
 
 # --- Subscription assistant via ACP (red-acp) ---
 # Drives Claude Code as an external agent over the Agent Client Protocol so the
@@ -134,4 +145,7 @@ opt-level = 2
 #
 #   [patch."https://github.com/vojir-mikulas/flint"]
 #   flint = { path = "../flint" }
+
+# [patch."https://github.com/vojir-mikulas/flint"]
+# flint = { path = "../flint" }
 

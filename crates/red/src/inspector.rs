@@ -20,6 +20,8 @@ use gpui::{
     ScrollHandle, SharedString,
 };
 use red_core::{CappedCell, Value};
+
+use crate::decode;
 use red_service::Command;
 
 use crate::app::{ActiveConn, AppState, EditContext, Phase};
@@ -47,6 +49,12 @@ pub(crate) enum ValueFormat {
     Json,
     /// A hex dump of the value's bytes (text or blob).
     Hex,
+    /// Decode the bytes as MessagePack (falls back to raw/hex when they aren't).
+    MsgPack,
+    /// Decode the bytes as schemaless Protocol Buffers.
+    Protobuf,
+    /// Decode the bytes as a Python pickle.
+    Pickle,
 }
 
 /// All the inspector's persistent state. Present iff the pane is open.
@@ -1018,6 +1026,14 @@ impl AppState {
             .child(opt("insp-fmt-raw", "Raw", ValueFormat::Raw, cx))
             .child(opt("insp-fmt-json", "JSON", ValueFormat::Json, cx))
             .child(opt("insp-fmt-hex", "Hex", ValueFormat::Hex, cx))
+            .child(opt("insp-fmt-msgpack", "MsgPack", ValueFormat::MsgPack, cx))
+            .child(opt(
+                "insp-fmt-protobuf",
+                "Protobuf",
+                ValueFormat::Protobuf,
+                cx,
+            ))
+            .child(opt("insp-fmt-pickle", "Pickle", ValueFormat::Pickle, cx))
             .into_any_element()
     }
 
@@ -1117,6 +1133,15 @@ impl AppState {
 /// whether it should soft-wrap. Pure and small: the RED-domain half of the inspector.
 /// `fmt` only affects text/blob (a scalar has one rendering); `Auto` is the per-value
 /// default (JSON pretty-printed, blob hex, text as prose).
+/// The formatted body text for `value` through `fmt`, for callers outside the
+/// inspector (the Redis string view) that reuse the same lens without the full
+/// `ValueView`. Returns `(body, summary, wrap)` — `wrap` mirrors the SQL
+/// inspector's soft-wrap choice (prose wraps; hex/JSON stay on fixed lines).
+pub(crate) fn format_value_body(value: &Value, fmt: ValueFormat) -> (String, String, bool) {
+    let v = format_value(value, fmt);
+    (v.body.to_string(), v.summary, v.wrap)
+}
+
 fn format_value(value: &Value, fmt: ValueFormat) -> ValueView {
     match value {
         Value::Null => ValueView {
@@ -1153,14 +1178,35 @@ fn format_value(value: &Value, fmt: ValueFormat) -> ValueView {
                 ValueFormat::Json => pretty_json(s).map(json).unwrap_or_else(raw),
                 // Default: JSON if it parses, else prose.
                 ValueFormat::Auto => pretty_json(s).map(json).unwrap_or_else(raw),
+                // Binary decoders over the string's bytes; fall back to raw text
+                // when the bytes aren't that format.
+                ValueFormat::MsgPack => {
+                    decoded_or(decode::decode_msgpack(s.as_bytes()), "MessagePack", raw)
+                }
+                ValueFormat::Protobuf => {
+                    decoded_or(decode::decode_protobuf(s.as_bytes()), "protobuf", raw)
+                }
+                ValueFormat::Pickle => {
+                    decoded_or(decode::decode_pickle(s.as_bytes()), "pickle", raw)
+                }
             }
         }
-        // A blob has no textual rendering; every lens shows its bytes as hex.
-        Value::Blob(b) => ValueView {
-            body: hex_dump(b, HEX_MAX).into(),
-            summary: format!("{} bytes · blob", group_digits(b.len())),
-            wrap: false,
-        },
+        // A blob has no textual rendering; the plain lenses show its bytes as
+        // hex, while the binary-decoder lenses try to decode the exact bytes and
+        // fall back to hex.
+        Value::Blob(b) => {
+            let hex = || ValueView {
+                body: hex_dump(b, HEX_MAX).into(),
+                summary: format!("{} bytes · blob", group_digits(b.len())),
+                wrap: false,
+            };
+            match fmt {
+                ValueFormat::MsgPack => decoded_or(decode::decode_msgpack(b), "MessagePack", hex),
+                ValueFormat::Protobuf => decoded_or(decode::decode_protobuf(b), "protobuf", hex),
+                ValueFormat::Pickle => decoded_or(decode::decode_pickle(b), "pickle", hex),
+                _ => hex(),
+            }
+        }
         // A capped value only reaches here if formatted directly (defensive; the
         // pane normally branches on `CellState::Capped` before formatting).
         Value::Capped(c) if c.blob => ValueView {
@@ -1240,6 +1286,24 @@ fn indent(out: &mut String, depth: usize) {
     out.push('\n');
     for _ in 0..depth {
         out.push_str("  ");
+    }
+}
+
+/// Wrap a binary decoder's result in a [`ValueView`], or fall back to
+/// `fallback` (raw text / hex) when the bytes weren't that format. `label`
+/// names the decoder for the one-line summary.
+fn decoded_or(
+    decoded: Option<String>,
+    label: &str,
+    fallback: impl FnOnce() -> ValueView,
+) -> ValueView {
+    match decoded {
+        Some(body) => ValueView {
+            summary: format!("{} · decoded", label),
+            body: body.into(),
+            wrap: false,
+        },
+        None => fallback(),
     }
 }
 

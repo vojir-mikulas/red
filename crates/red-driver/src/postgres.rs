@@ -104,6 +104,20 @@ impl PostgresDriver {
     /// Connect over the network, drive the connection in the background, apply the
     /// read-only posture, and read the server version.
     pub async fn connect(dsn: &str, read_only: bool) -> Result<Self> {
+        // TLS for Postgres isn't wired yet (the driver dials `NoTls`; adding it
+        // needs a rustls connector — tracked in `security-review-2026-07.md`).
+        // Rather than silently connect in cleartext when TLS is requested, refuse
+        // with an actionable message. Uses the same TLS detection as the DSN
+        // parser (`sslmode=`/`ssl=true`/`tls=true`/`require_ssl=true`), not a
+        // narrow `sslmode=require` substring match that a raw `?ssl=true` DSN
+        // would slip past into a silent cleartext connection.
+        if red_core::dsn_requests_tls(dsn) {
+            return Err(RedError::Connect(
+                "TLS for PostgreSQL isn't supported yet in this build — turn TLS off, \
+                 or tunnel the connection over SSH instead."
+                    .to_string(),
+            ));
+        }
         let (client, connection) = tokio_postgres::connect(dsn, NoTls)
             .await
             .map_err(map_connect_err)?;
@@ -1320,6 +1334,19 @@ mod tests {
         let driver = PostgresDriver::connect(&url, true).await.unwrap();
         assert!(!driver.server_version().is_empty());
         driver.ping().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_dsn_is_refused_not_silently_downgraded() {
+        // Postgres TLS isn't wired yet; a `sslmode=require` DSN must error rather
+        // than connect in cleartext. No server needed — it fails before dialing.
+        match PostgresDriver::connect("postgres://h:5432/db?sslmode=require", true).await {
+            Ok(_) => panic!("a TLS Postgres DSN should be refused, not connected"),
+            Err(e) => assert!(
+                e.to_string().to_lowercase().contains("tls"),
+                "expected a TLS-not-supported error, got {e}"
+            ),
+        }
     }
 
     /// The non-scalar types `pg_value` renders from their binary wire form must

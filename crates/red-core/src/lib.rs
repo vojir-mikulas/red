@@ -4,6 +4,7 @@
 
 use std::fmt;
 
+pub mod kv;
 pub mod typemap;
 
 /// Which database engine a connection targets. Drives driver selection and,
@@ -21,6 +22,11 @@ pub enum DbKind {
     /// transaction/rollback over a non-unique sort key, so its driver refuses
     /// `apply_edits` (see [`DbKind::write_caps`]).
     Clickhouse,
+    /// Redis/Valkey: a key-value store, not SQL-shaped at all. Reached through
+    /// the parallel `KvDriver` seam (`red-driver`'s `redis_kv` module), not
+    /// `DatabaseDriver` — see `docs/plans/redis.md`. Read-only in R0/R1;
+    /// `write_caps` reflects that until R3 lands in-grid editing.
+    Redis,
 }
 
 impl DbKind {
@@ -33,6 +39,7 @@ impl DbKind {
             DbKind::Sqlite,
             DbKind::Mysql,
             DbKind::Clickhouse,
+            DbKind::Redis,
         ]
     }
 
@@ -48,6 +55,7 @@ impl DbKind {
             DbKind::Postgres => Some(5432),
             DbKind::Mysql => Some(3306),
             DbKind::Clickhouse => Some(8123),
+            DbKind::Redis => Some(6379),
             DbKind::Sqlite => None,
         }
     }
@@ -59,6 +67,7 @@ impl DbKind {
             DbKind::Mysql => "mysql",
             DbKind::Sqlite => "sqlite",
             DbKind::Clickhouse => "clickhouse",
+            DbKind::Redis => "redis",
         }
     }
 
@@ -69,9 +78,21 @@ impl DbKind {
             "postgres" | "postgresql" => Some(DbKind::Postgres),
             "mysql" | "mariadb" => Some(DbKind::Mysql),
             "sqlite" | "sqlite3" | "file" => Some(DbKind::Sqlite),
-            "clickhouse" | "clickhouse-http" | "ch" => Some(DbKind::Clickhouse),
+            "clickhouse" | "clickhouse-http" | "ch" | "clickhouses" => Some(DbKind::Clickhouse),
+            // The TLS schemes (`rediss`/`clickhouses`) parse to the same engine;
+            // `parse_conn_str` reads the `tls` bit from the scheme separately.
+            "redis" | "rediss" => Some(DbKind::Redis),
             _ => None,
         }
+    }
+
+    /// Whether a URL scheme denotes a TLS connection (`rediss`/`clickhouses`),
+    /// so a pasted secure DSN pre-checks the form's TLS toggle.
+    fn scheme_is_tls(scheme: &str) -> bool {
+        matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "rediss" | "clickhouses"
+        )
     }
 
     /// What write operations this engine can honor, *independent* of the
@@ -98,8 +119,43 @@ impl DbKind {
                 guarded_edit: false,
                 best_effort_edit: false,
             },
+            // Redis: no write path exists yet (R0/R1 are read-only browsing).
+            // R3 (see docs/plans/redis.md) adds SET/HSET/EXPIRE/DEL through the
+            // KvDriver seam, not through this SQL-shaped capability set at all —
+            // this stays all-`false` so any UI affordance still gated on
+            // `write_caps` (rather than the connection kind) stays hidden.
+            DbKind::Redis => WriteCaps {
+                insert: false,
+                guarded_edit: false,
+                best_effort_edit: false,
+            },
         }
     }
+}
+
+/// Whether a DSN string requests TLS — by scheme (`rediss`/`clickhouses`) or a
+/// recognized query flag (`sslmode=<anything but disable>`, `require_ssl=true`,
+/// `ssl=true`, `tls=true`). The single source of truth for "is this a TLS DSN",
+/// shared by [`ConnectionConfig::parse_conn_str`] and the engine drivers'
+/// cleartext-refusal guard, so the two can't disagree on which spellings count
+/// (a driver matching only `sslmode=require` would silently connect in
+/// cleartext for `?ssl=true` or `?sslmode=prefer`).
+pub fn dsn_requests_tls(dsn: &str) -> bool {
+    let Some((scheme, rest)) = dsn.trim().split_once("://") else {
+        return false;
+    };
+    if DbKind::scheme_is_tls(scheme) {
+        return true;
+    }
+    let q = rest
+        .split(['?', '#'])
+        .nth(1)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    (q.contains("sslmode=") && !q.contains("sslmode=disable"))
+        || q.contains("require_ssl=true")
+        || q.contains("ssl=true")
+        || q.contains("tls=true")
 }
 
 /// The write operations an engine can honor, independent of a connection's
@@ -124,6 +180,7 @@ impl fmt::Display for DbKind {
             DbKind::Postgres => write!(f, "PostgreSQL"),
             DbKind::Mysql => write!(f, "MySQL/MariaDB"),
             DbKind::Clickhouse => write!(f, "ClickHouse"),
+            DbKind::Redis => write!(f, "Redis"),
         }
     }
 }
@@ -219,7 +276,16 @@ impl AiTier {
     pub fn allows_tool(self, tool: &str) -> bool {
         match self {
             AiTier::Off => false,
-            AiTier::Schema => matches!(tool, "list_schema" | "describe_table"),
+            // Structure-only tools, both backends. For Redis (KV) these read
+            // metadata (types/TTL/sizes/server info) but never a key's value.
+            AiTier::Schema => matches!(
+                tool,
+                "list_schema"
+                    | "describe_table"
+                    | "kv_server_info"
+                    | "kv_scan_keys"
+                    | "kv_key_info"
+            ),
             AiTier::Read => matches!(
                 tool,
                 "list_schema"
@@ -233,12 +299,30 @@ impl AiTier {
                     // Delegation grants no new capability — a subagent runs a
                     // read-only subset of this same tier — so it rides with Read.
                     | "spawn_subagent"
+                    // Redis (KV) read tools: the metadata tools from Schema plus
+                    // value/sample/diagnostic reads. All read-only.
+                    | "kv_server_info"
+                    | "kv_scan_keys"
+                    | "kv_key_info"
+                    | "kv_get_value"
+                    | "kv_biggest_keys"
+                    | "kv_analyze"
+                    | "kv_slowlog"
+                    | "kv_config_get"
             ),
-            // Write inherits the full read catalog and adds the gated write tools
-            // (a single statement, or a multi-statement transactional changeset).
+            // Write inherits the full read catalog and adds the gated write tools:
+            // SQL (a single statement or a transactional changeset) and Redis
+            // (gated key mutations). Every one rides the per-call approval gate.
             AiTier::Write => {
-                matches!(tool, "propose_write" | "propose_changeset")
-                    || AiTier::Read.allows_tool(tool)
+                matches!(
+                    tool,
+                    "propose_write"
+                        | "propose_changeset"
+                        | "kv_expire"
+                        | "kv_delete"
+                        | "kv_rename"
+                        | "kv_config_set"
+                ) || AiTier::Read.allows_tool(tool)
             }
         }
     }
@@ -478,6 +562,14 @@ pub struct ConnectionConfig {
     /// every write path is refused up front.
     #[cfg_attr(feature = "serde", serde(default))]
     pub read_only: bool,
+    /// Encrypt the connection with TLS. For Redis this dials `rediss://`; for
+    /// MySQL it requires SSL (`require_ssl`); for ClickHouse it uses HTTPS. (A
+    /// pasted `rediss://`/`clickhouses://` or an `sslmode=require`/`require_ssl`
+    /// DSN also sets this.) The connection form surfaces it as a checkbox — see
+    /// docs/plans/redis.md's "first-class TLS toggle" item and
+    /// `security-review-2026-07.md`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub tls: bool,
     /// Per-connection AI master-switch override. `None` inherits the global
     /// `[ai] enabled`; `Some(false)` is a true kill switch for *this* connection
     /// (no panel, no tools, no agent), e.g. a production database.
@@ -519,6 +611,7 @@ impl fmt::Debug for ConnectionConfig {
             .field("database", &self.database)
             .field("color", &self.color)
             .field("read_only", &self.read_only)
+            .field("tls", &self.tls)
             .field("ai_enabled", &self.ai_enabled)
             .field("ai_tier", &self.ai_tier)
             .field("ssh", &self.ssh)
@@ -527,6 +620,18 @@ impl fmt::Debug for ConnectionConfig {
 }
 
 impl ConnectionConfig {
+    /// The host to dial for a network engine, defaulting to `localhost` when the
+    /// field is left blank. A blank host is the common "just connect to my local
+    /// server" case, so we fill it in rather than reject it, matching the
+    /// convention of clients like `psql` and `redis-cli`.
+    pub fn effective_host(&self) -> &str {
+        if self.host.is_empty() {
+            "localhost"
+        } else {
+            &self.host
+        }
+    }
+
     /// The connection string handed to the driver. File engines yield the bare
     /// path; network engines compose `scheme://user:pass@host:port/database`, with
     /// the userinfo and database percent-encoded so credentials with reserved
@@ -535,8 +640,21 @@ impl ConnectionConfig {
         if self.kind.is_file() {
             return self.database.clone();
         }
-        let mut url = format!("{}://", self.kind.url_scheme());
-        if !self.user.is_empty() {
+        // TLS is spelled per engine: a dedicated scheme where the client keys
+        // off it (`rediss`/`clickhouses`), or a query flag the client honors
+        // (`sslmode=require` for Postgres, `require_ssl=true` for MySQL —
+        // `mysql_async` reads that natively).
+        let scheme = match (self.kind, self.tls) {
+            (DbKind::Redis, true) => "rediss",
+            (DbKind::Clickhouse, true) => "clickhouses",
+            _ => self.kind.url_scheme(),
+        };
+        let mut url = format!("{scheme}://");
+        // A username is optional even with a password set: Redis's classic
+        // `AUTH <password>` (pre-ACL) form is a password-only credential, which
+        // its URI convention spells as `redis://:password@host`. Emitting
+        // nothing here for that case would silently drop the password.
+        if !self.user.is_empty() || !self.password.is_empty() {
             url.push_str(&encode(&self.user));
             if !self.password.is_empty() {
                 url.push(':');
@@ -544,13 +662,21 @@ impl ConnectionConfig {
             }
             url.push('@');
         }
-        url.push_str(&bracket_host(&self.host));
+        url.push_str(&bracket_host(self.effective_host()));
         if let Some(port) = self.port {
             url.push(':');
             url.push_str(&port.to_string());
         }
         url.push('/');
         url.push_str(&encode(&self.database));
+        // Postgres/MySQL carry TLS as a query flag rather than a scheme.
+        if self.tls {
+            match self.kind {
+                DbKind::Postgres => url.push_str("?sslmode=require"),
+                DbKind::Mysql => url.push_str("?require_ssl=true"),
+                _ => {}
+            }
+        }
         url
     }
 
@@ -580,7 +706,7 @@ impl ConnectionConfig {
             s.push_str(&self.user);
             s.push('@');
         }
-        s.push_str(&bracket_host(&self.host));
+        s.push_str(&bracket_host(self.effective_host()));
         if let Some(port) = self.port {
             s.push(':');
             s.push_str(&port.to_string());
@@ -600,6 +726,9 @@ impl ConnectionConfig {
         let input = input.trim();
         let (scheme, rest) = input.split_once("://")?;
         let kind = DbKind::from_scheme(scheme).unwrap_or(DbKind::Postgres);
+        // TLS is signalled either by the scheme (`rediss`/`clickhouses`) or by a
+        // recognized query flag — read it before the query tail is dropped below.
+        let tls = dsn_requests_tls(input);
         // Drop any ?query / #fragment tail.
         let rest = rest
             .split(['?', '#'])
@@ -658,6 +787,7 @@ impl ConnectionConfig {
             user,
             password,
             database: decode(&database),
+            tls,
         })
     }
 }
@@ -672,6 +802,10 @@ pub struct ParsedDsn {
     pub user: String,
     pub password: String,
     pub database: String,
+    /// Whether the DSN signalled TLS (a `rediss`/`clickhouses` scheme or an
+    /// `sslmode`/`require_ssl`/`ssl=true` query flag), used to pre-check the
+    /// form's TLS toggle.
+    pub tls: bool,
 }
 
 impl ParsedDsn {
@@ -683,6 +817,7 @@ impl ParsedDsn {
             user: String::new(),
             password: String::new(),
             database: String::new(),
+            tls: false,
         }
     }
 }
@@ -1742,6 +1877,113 @@ mod conn_tests {
             cfg.dsn(),
             "postgres://postgres:p%40ss%3Aword@localhost:5432/analytics"
         );
+    }
+
+    #[test]
+    fn dsn_composes_password_only_auth() {
+        // Redis's classic `AUTH <password>` (pre-ACL, no username) must still
+        // reach the driver: dropping it here would silently connect
+        // unauthenticated instead of failing loudly.
+        let cfg = ConnectionConfig {
+            kind: DbKind::Redis,
+            host: "localhost".into(),
+            port: Some(6379),
+            password: "hunter2".into(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.dsn(), "redis://:hunter2@localhost:6379/");
+    }
+
+    #[test]
+    fn blank_host_falls_back_to_localhost() {
+        // Leaving the host empty is the common "connect to my local server" case;
+        // both the DSN and the display label fill in `localhost` rather than
+        // emitting an empty authority.
+        let cfg = ConnectionConfig {
+            kind: DbKind::Redis,
+            host: String::new(),
+            port: Some(6379),
+            ..Default::default()
+        };
+        assert_eq!(cfg.dsn(), "redis://localhost:6379/");
+        assert_eq!(cfg.display_target(), "localhost:6379");
+        assert_eq!(cfg.effective_host(), "localhost");
+    }
+
+    #[test]
+    fn dsn_encodes_tls_per_engine() {
+        let tls = |kind: DbKind| {
+            ConnectionConfig {
+                kind,
+                host: "h".into(),
+                port: Some(1),
+                tls: true,
+                ..Default::default()
+            }
+            .dsn()
+        };
+        assert_eq!(tls(DbKind::Redis), "rediss://h:1/");
+        assert_eq!(tls(DbKind::Clickhouse), "clickhouses://h:1/");
+        assert_eq!(tls(DbKind::Postgres), "postgres://h:1/?sslmode=require");
+        assert_eq!(tls(DbKind::Mysql), "mysql://h:1/?require_ssl=true");
+    }
+
+    #[test]
+    fn parse_detects_tls_from_scheme_and_query() {
+        assert!(
+            ConnectionConfig::parse_conn_str("rediss://h:6379/0")
+                .unwrap()
+                .tls
+        );
+        assert!(
+            ConnectionConfig::parse_conn_str("clickhouses://h:8443/db")
+                .unwrap()
+                .tls
+        );
+        assert!(
+            ConnectionConfig::parse_conn_str("postgres://h/db?sslmode=require")
+                .unwrap()
+                .tls
+        );
+        assert!(
+            ConnectionConfig::parse_conn_str("mysql://h/db?require_ssl=true")
+                .unwrap()
+                .tls
+        );
+        // Plain schemes and an explicitly-disabled sslmode are not TLS.
+        assert!(
+            !ConnectionConfig::parse_conn_str("redis://h:6379/0")
+                .unwrap()
+                .tls
+        );
+        assert!(
+            !ConnectionConfig::parse_conn_str("postgres://h/db?sslmode=disable")
+                .unwrap()
+                .tls
+        );
+    }
+
+    #[test]
+    fn tls_dsn_round_trips_through_parse() {
+        // A TLS config's DSN, re-parsed, keeps the tls bit for each engine.
+        for kind in [
+            DbKind::Redis,
+            DbKind::Clickhouse,
+            DbKind::Postgres,
+            DbKind::Mysql,
+        ] {
+            let cfg = ConnectionConfig {
+                kind,
+                host: "host".into(),
+                port: Some(5),
+                database: "db".into(),
+                tls: true,
+                ..Default::default()
+            };
+            let parsed = ConnectionConfig::parse_conn_str(&cfg.dsn()).unwrap();
+            assert!(parsed.tls, "{kind:?} lost tls through parse");
+            assert_eq!(parsed.kind, kind);
+        }
     }
 
     #[test]

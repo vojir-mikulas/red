@@ -8,11 +8,11 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Context, Hsla, Pixels, Point, SharedString, Window};
+use gpui::{div, prelude::*, px, Context, Hsla, MouseButton, Pixels, Point, SharedString, Window};
 use red_core::{DbKind, FkEdge, ObjectKind, SchemaMeta, TableDetail};
 use red_service::Command;
 
-use crate::app::{ActiveConn, AppState, Phase};
+use crate::app::{ActiveConn, AppState, Phase, TabCloseScope, TabWorkspace};
 use crate::sql::CompletionContext;
 
 /// How many candidates the popup ever shows; the editor renders at most 8, but
@@ -28,14 +28,14 @@ pub(crate) struct TabDrag(pub usize);
 /// The floating chip rendered under the cursor while a tab is being dragged.
 /// GPUI's `on_drag` wants an `Entity<impl Render>`, so the tab strip mints one
 /// of these with the dragged tab's label.
-struct TabDragPreview {
-    title: SharedString,
+pub(crate) struct TabDragPreview {
+    pub(crate) title: SharedString,
     /// Grab offset within the tab, so the chip tracks the pointer (not the
     /// tab's top-left, where GPUI anchors the preview).
-    offset: Point<Pixels>,
-    bg: Hsla,
-    border: Hsla,
-    text: Hsla,
+    pub(crate) offset: Point<Pixels>,
+    pub(crate) bg: Hsla,
+    pub(crate) border: Hsla,
+    pub(crate) text: Hsla,
 }
 
 impl Render for TabDragPreview {
@@ -612,9 +612,17 @@ impl AppState {
         // actual drag so a stale target never paints once the drag ends.
         let drop_target = active.tab_drop_target;
         let dragging = cx.has_active_drag();
-        let tabs = pane_indices.iter().map(|&i| {
+        // Pinned tabs render in their own fixed (non-scrolling) section ahead of
+        // the scrollable strip, so they stay on screen no matter how far the rest
+        // of the strip is scrolled; they keep their relative order otherwise.
+        let (pinned_indices, unpinned_indices): (Vec<usize>, Vec<usize>) = pane_indices
+            .iter()
+            .copied()
+            .partition(|&i| active.tabs[i].pinned);
+        let render_tab = |i: usize| {
             let t = &active.tabs[i];
             let is_active = Some(i) == active_idx;
+            let pinned = t.pinned;
             let (tab_bg, tab_text) = if is_active {
                 (bg_app, text)
             } else {
@@ -656,6 +664,24 @@ impl AppState {
                     this.set_split_focus(half, cx);
                     this.set_active_tab(i, cx);
                 }))
+                // Middle-click closes the tab, like a browser tab strip. Pinned
+                // tabs are protected: unpin (or use the context menu) to close.
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(move |this, _, _, cx| {
+                        if !pinned {
+                            this.request_close_tab(i, cx);
+                        }
+                    }),
+                )
+                // Right-click opens the Close/Pin context menu at the cursor.
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        this.tab_context_menu = Some((i, event.position));
+                        cx.notify();
+                    }),
+                )
                 // Drag this tab to reorder; the chip below tracks the cursor.
                 .on_drag(TabDrag(i), move |_, offset, _window, cx| {
                     let title = drag_title.clone();
@@ -728,12 +754,23 @@ impl AppState {
                 })
                 .child(
                     div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_1()
                         .min_w_0()
-                        .truncate()
-                        .font_family(ui_family.clone())
-                        .text_size(size_12)
-                        .text_color(tab_text)
-                        .child(t.title.clone()),
+                        .when(pinned, |d| {
+                            d.child(crate::icons::icon("pin", icon_close, faint))
+                        })
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .font_family(ui_family.clone())
+                                .text_size(size_12)
+                                .text_color(tab_text)
+                                .child(t.title.clone()),
+                        ),
                 )
                 // Close button: pinned to the right, revealed only on tab hover
                 // so it never crowds the centered title at rest. The outer div
@@ -765,7 +802,9 @@ impl AppState {
                                 .child(crate::icons::icon("close", icon_close, faint)),
                         ),
                 )
-        });
+        };
+        let pinned_tabs: Vec<_> = pinned_indices.iter().map(|&i| render_tab(i)).collect();
+        let unpinned_tabs: Vec<_> = unpinned_indices.iter().map(|&i| render_tab(i)).collect();
         let strip_drop_view = view.clone();
         let strip_move_view = view.clone();
         // The tabs live in a horizontally scrollable viewport, so a crowded
@@ -805,7 +844,18 @@ impl AppState {
                     .update(cx, |this, cx| this.drop_tab(from, half, cx))
                     .ok();
             })
-            .children(tabs);
+            .children(unpinned_tabs);
+        // Pinned tabs sit in their own fixed section ahead of the scrollable
+        // strip (not `overflow_x_scroll`), so they never leave view.
+        let pinned_strip = (!pinned_tabs.is_empty()).then(|| {
+            div()
+                .id("sql-tabstrip-pinned")
+                .flex_shrink_0()
+                .h_full()
+                .flex()
+                .items_stretch()
+                .children(pinned_tabs)
+        });
         // The "＋" stays pinned right of the scrolling tabs, always reachable.
         let tabstrip = div()
             .flex_shrink_0()
@@ -815,6 +865,7 @@ impl AppState {
             .bg(bg_panel)
             .border_b_1()
             .border_color(border)
+            .children(pinned_strip)
             .child(tab_viewport)
             .child(
                 div()
@@ -1024,6 +1075,12 @@ impl AppState {
     }
 
     fn run_editor_query_impl(&mut self, force_offset: Option<usize>, cx: &mut Context<Self>) {
+        // A Redis session has no SQL editor — its `query 1` tab is a phantom that
+        // is never rendered (the Redis shell replaces the editor). ⌘↵ / gutter-run
+        // must not construct and send a SQL statement against it.
+        if matches!(&self.phase, Phase::Connected(a) if a.kv_view.is_some()) {
+            return;
+        }
         let sql = match &self.phase {
             Phase::Connected(active) => match active.active() {
                 Some(tab) => {
@@ -1325,6 +1382,91 @@ impl AppState {
                 editor.set_decorations(decoration_provider(index), cx);
             });
         }
+    }
+
+    /// The tab strip's right-click menu: Pin/Unpin, then Close / Close Others /
+    /// Close Left / Close Right / Close All, resolved against `index`'s own
+    /// pane. Anchored at `pos` (the cursor); a full-cover backdrop dismisses it
+    /// on an outside click, mirroring `ResultGrid::render_cell_menu`.
+    pub(crate) fn render_tab_menu(
+        &self,
+        index: usize,
+        pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (pinned, has_left, has_right, has_others) = match &self.phase {
+            Phase::Connected(active) => match active.tabs.get(index) {
+                Some(t) => {
+                    let siblings = active.pane_tab_indices(t.pane);
+                    let p = siblings.iter().position(|&i| i == index).unwrap_or(0);
+                    (t.pinned, p > 0, p + 1 < siblings.len(), siblings.len() > 1)
+                }
+                None => (false, false, false, false),
+            },
+            _ => (false, false, false, false),
+        };
+        let pin_label = if pinned { "Unpin tab" } else { "Pin tab" };
+        let menu = ContextMenu::new("tab-context-menu")
+            .item(
+                ContextMenuItem::new("tab-pin", pin_label).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.tab_context_menu = None;
+                        this.toggle_tab_pin(index, cx);
+                    },
+                )),
+            )
+            .separator()
+            .item(
+                ContextMenuItem::new("tab-close", "Close").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.tab_context_menu = None;
+                        this.close_tab_group(index, TabCloseScope::One, cx);
+                    },
+                )),
+            )
+            .item(
+                ContextMenuItem::new("tab-close-others", "Close Others")
+                    .disabled(!has_others)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tab_context_menu = None;
+                        this.close_tab_group(index, TabCloseScope::Others, cx);
+                    })),
+            )
+            .item(
+                ContextMenuItem::new("tab-close-left", "Close Left")
+                    .disabled(!has_left)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tab_context_menu = None;
+                        this.close_tab_group(index, TabCloseScope::Left, cx);
+                    })),
+            )
+            .item(
+                ContextMenuItem::new("tab-close-right", "Close Right")
+                    .disabled(!has_right)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tab_context_menu = None;
+                        this.close_tab_group(index, TabCloseScope::Right, cx);
+                    })),
+            )
+            .item(
+                ContextMenuItem::new("tab-close-all", "Close All").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.tab_context_menu = None;
+                        this.close_tab_group(index, TabCloseScope::All, cx);
+                    },
+                )),
+            );
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.tab_context_menu = None;
+                    cx.notify();
+                }),
+            )
+            .child(floating(div().occlude().child(menu)).at(pos))
     }
 }
 

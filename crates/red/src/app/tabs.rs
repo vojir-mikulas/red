@@ -4,6 +4,23 @@
 
 use super::*;
 
+/// Next global tab index cycling within `pane_tabs` from `cur`, wrapping at the
+/// ends. `None` when there's nothing to switch to (≤1 tab). Shared by the SQL
+/// (`step_active_tab`) and Redis (`kv_step_tab`) tab-cycling so the wrap math
+/// lives in one place.
+pub(crate) fn cycle_tab_index(pane_tabs: &[usize], cur: usize, forward: bool) -> Option<usize> {
+    if pane_tabs.len() <= 1 {
+        return None;
+    }
+    let pos = pane_tabs.iter().position(|&g| g == cur).unwrap_or(0);
+    let n = pane_tabs.len();
+    Some(if forward {
+        pane_tabs[(pos + 1) % n]
+    } else {
+        pane_tabs[(pos + n - 1) % n]
+    })
+}
+
 impl AppState {
     // --- query tabs ---
 
@@ -186,6 +203,14 @@ impl AppState {
     /// nowhere. The palette path has no `Window` to move focus, but it cycles
     /// from the palette (not the editor), so there's nothing to follow.
     fn cycle_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // A Redis connection has no editor to chase focus for; step its tabs.
+        if let Phase::Connected(a) = &self.phase {
+            if a.kv_view.is_some() {
+                let session = a.session;
+                self.kv_step_tab(session, forward, cx);
+                return;
+            }
+        }
         let editor_focused = matches!(
             &self.phase,
             Phase::Connected(active)
@@ -210,16 +235,9 @@ impl AppState {
             // Cycle within the focused pane's own tabs (each half has its own set).
             let half = active.focused_half();
             let pane_tabs = active.pane_tab_indices(half);
-            if pane_tabs.len() <= 1 {
-                return false;
-            }
             let cur = active.focused_tab_index();
-            let pos = pane_tabs.iter().position(|&g| g == cur).unwrap_or(0);
-            let n = pane_tabs.len();
-            let next = if forward {
-                pane_tabs[(pos + 1) % n]
-            } else {
-                pane_tabs[(pos + n - 1) % n]
+            let Some(next) = cycle_tab_index(&pane_tabs, cur, forward) else {
+                return false;
             };
             active.set_focused_tab(next);
             active.tab_scroll.scroll_to_item(next);
@@ -232,6 +250,14 @@ impl AppState {
     /// Close the focused tab (the ⌘W binding); routes through the same
     /// pristine-or-confirm path as the tab's × button. No-op with no open tab.
     pub(crate) fn close_active_tab(&mut self, cx: &mut Context<Self>) {
+        // Redis: close the focused tab of the focused half.
+        if let Phase::Connected(a) = &self.phase {
+            if let Some(v) = &a.kv_view {
+                let (session, idx) = (a.session, v.focused_tab_index());
+                self.kv_close_tab(session, idx, cx);
+                return;
+            }
+        }
         let index = match &self.phase {
             Phase::Connected(active) if active.active().is_some() => active.active_tab,
             _ => return,
@@ -246,6 +272,14 @@ impl AppState {
 
     /// Open a blank query tab (the tab-strip "＋" action).
     pub(crate) fn new_query(&mut self, cx: &mut Context<Self>) {
+        // A Redis connection has no SQL editor; ⌘T opens a blank Redis tab.
+        if let Phase::Connected(a) = &self.phase {
+            if a.kv_view.is_some() {
+                let session = a.session;
+                self.kv_new_empty_tab(session, cx);
+                return;
+            }
+        }
         let tab = match &mut self.phase {
             Phase::Connected(active) => {
                 active.query_seq += 1;
@@ -260,7 +294,8 @@ impl AppState {
         cx.notify();
     }
 
-    /// The tab-strip "×": close immediately if pristine, else ask first.
+    /// The tab-strip "×" (and middle-click): close immediately if pristine or the
+    /// user opted out of the confirmation, else ask first.
     pub(crate) fn request_close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         let pristine = match &self.phase {
             Phase::Connected(active) => active
@@ -270,8 +305,8 @@ impl AppState {
                 .unwrap_or(true),
             _ => return,
         };
-        if pristine {
-            self.close_tab(index, cx);
+        if pristine || !self.settings.query.confirm_close_tab {
+            self.close_many(vec![index], cx);
         } else {
             self.confirm_close_tab = Some(index);
             // Focus the modal so its own Enter/Esc handling is heard.
@@ -283,7 +318,7 @@ impl AppState {
     /// Confirmation accepted: close the tab that was awaiting it.
     pub(crate) fn confirm_close(&mut self, cx: &mut Context<Self>) {
         if let Some(index) = self.confirm_close_tab.take() {
-            self.close_tab(index, cx);
+            self.close_many(vec![index], cx);
         }
         self.refocus_root = true;
         cx.notify();
@@ -295,13 +330,110 @@ impl AppState {
         cx.notify();
     }
 
-    /// Drop tab `index`, freeing its backend result. Closing the *last* tab is
-    /// allowed: the strip goes empty and the shell shows a placeholder pane (the
-    /// connection stays open, and the strip's ＋ opens a fresh query).
-    fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+    /// Request closing several tabs at once (the context menu's Close Others /
+    /// Close All / Close Left / Close Right). Closes immediately when every
+    /// target is pristine or the user opted out of the confirmation; otherwise
+    /// asks once for the whole batch.
+    pub(crate) fn request_close_many(&mut self, indices: Vec<usize>, cx: &mut Context<Self>) {
+        if indices.is_empty() {
+            return;
+        }
+        let any_dirty = match &self.phase {
+            Phase::Connected(active) => indices
+                .iter()
+                .any(|&i| active.tabs.get(i).is_some_and(|t| !t.is_pristine(cx))),
+            _ => return,
+        };
+        if any_dirty && self.settings.query.confirm_close_tab {
+            self.confirm_close_batch = Some(indices);
+            self.focus_modal = true;
+            cx.notify();
+        } else {
+            self.close_many(indices, cx);
+        }
+    }
+
+    /// Batch confirmation accepted: close the tabs that were awaiting it.
+    pub(crate) fn confirm_close_batch_accept(&mut self, cx: &mut Context<Self>) {
+        if let Some(indices) = self.confirm_close_batch.take() {
+            self.close_many(indices, cx);
+        }
+        self.refocus_root = true;
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_close_batch(&mut self, cx: &mut Context<Self>) {
+        self.confirm_close_batch = None;
+        self.refocus_root = true;
+        cx.notify();
+    }
+
+    /// The tab-strip right-click menu's Close / Close Others / Close All / Close
+    /// Left / Close Right, resolved against `index`'s own pane and skipping
+    /// pinned tabs (pinned tabs only close via the explicit "Close" item).
+    pub(crate) fn close_tab_group(
+        &mut self,
+        index: usize,
+        scope: TabCloseScope,
+        cx: &mut Context<Self>,
+    ) {
+        let Phase::Connected(active) = &self.phase else {
+            return;
+        };
+        if scope == TabCloseScope::One {
+            self.request_close_tab(index, cx);
+            return;
+        }
+        let Some(pane) = active.tabs.get(index).map(|t| t.pane) else {
+            return;
+        };
+        let siblings = active.pane_tab_indices(pane);
+        let Some(pos) = siblings.iter().position(|&i| i == index) else {
+            return;
+        };
+        let targets: Vec<usize> = match scope {
+            TabCloseScope::One => unreachable!(),
+            TabCloseScope::All => siblings.clone(),
+            TabCloseScope::Others => siblings.iter().copied().filter(|&i| i != index).collect(),
+            TabCloseScope::Left => siblings[..pos].to_vec(),
+            TabCloseScope::Right => siblings[pos + 1..].to_vec(),
+        };
+        let targets: Vec<usize> = targets
+            .into_iter()
+            .filter(|&i| !active.tabs[i].pinned)
+            .collect();
+        self.request_close_many(targets, cx);
+    }
+
+    /// Pin/unpin tab `index` (the tab-strip context menu's Pin item). A pinned
+    /// tab renders in a fixed section at the start of the strip, always visible
+    /// regardless of scroll, and is skipped by the bulk close actions.
+    pub(crate) fn toggle_tab_pin(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase {
+            if let Some(tab) = active.tabs.get_mut(index) {
+                tab.pinned = !tab.pinned;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Drop the tabs at `indices`, freeing each closed tab's backend result.
+    /// Closing every open tab is allowed: the strip goes empty and the shell
+    /// shows a placeholder pane (the connection stays open, and the strip's ＋
+    /// opens a fresh query).
+    fn close_many(&mut self, mut indices: Vec<usize>, cx: &mut Context<Self>) {
         self.confirm_close_tab = None;
-        let free_epoch = match &mut self.phase {
-            Phase::Connected(active) if index < active.tabs.len() => {
+        self.confirm_close_batch = None;
+        // Remove back-to-front so earlier indices in the batch stay valid.
+        indices.sort_unstable();
+        indices.dedup();
+        indices.reverse();
+        let mut free_epochs = Vec::new();
+        if let Phase::Connected(active) = &mut self.phase {
+            for index in indices {
+                if index >= active.tabs.len() {
+                    continue;
+                }
                 let removed = active.tabs.remove(index);
                 // Shift both panes' active indices left when they sat after the
                 // removed tab; `normalize_panes` then collapses the split if this
@@ -314,13 +446,16 @@ impl AppState {
                         s.secondary -= 1;
                     }
                 }
-                active.normalize_panes();
-                removed.result.map(|g| g.epoch)
+                if let Some(g) = removed.result {
+                    free_epochs.push(g.epoch);
+                }
             }
-            _ => return,
-        };
-        // Free the backend result that backed the closed tab's grid.
-        if let Some(epoch) = free_epoch {
+            active.normalize_panes();
+        } else {
+            return;
+        }
+        // Free the backend results that backed the closed tabs' grids.
+        for epoch in free_epochs {
             self.send_active(Command::CloseResult { epoch });
         }
         cx.notify();

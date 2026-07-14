@@ -8,12 +8,14 @@
 //! (cell rendering + the results-pane view), and this module ([`ResultGrid`]
 //! state plus the `AppState` command handlers that drive it).
 
+pub(crate) mod autoscroll;
 mod buffer;
 mod copy;
 mod edit;
 mod render;
 mod suggest;
 
+pub(crate) use autoscroll::Autoscroll;
 pub(crate) use edit::GridEdit;
 pub(crate) use suggest::CellSuggest;
 
@@ -35,10 +37,14 @@ use red_core::{
 use red_service::{Command, CommandSender, RunFetch, SessionId, SortKey};
 
 use crate::app::{
-    AppState, EditContext, ExportProgress, ForeignEdit, Notification, PendingImportPeek,
-    PendingWrite, Phase, TransferKind,
+    AppState, EditContext, ExportProgress, ForeignEdit, Notification, NotificationAction,
+    PendingImportPeek, PendingWrite, Phase, TransferKind, TOAST_AUTO_DISMISS,
 };
 
+/// Re-exported so `crate::kvbrowse` (the Redis keyspace browser) mints epochs
+/// from the same process-global counter as the SQL grid, without needing its
+/// own — see `buffer::next_epoch`'s doc comment.
+pub(crate) use buffer::next_epoch as next_kv_epoch;
 use buffer::{next_epoch, window_decision, BufferMode, GridBuffer, KeyedRun, WindowView, WINDOW};
 
 /// The resolved identity of an editable cell, `(row, data_col, pk_value, decl_type,
@@ -2048,7 +2054,9 @@ impl AppState {
         cx.notify();
     }
 
-    /// `ExportFinished`: drop the progress toast, leave an auto-dismissing success.
+    /// `ExportFinished`: drop the progress toast, leave an auto-dismissing success
+    /// with a "Show in folder" action instead of the generic copy button (the
+    /// file path is what's useful here, not a copy of the toast text).
     pub(crate) fn on_export_finished(
         &mut self,
         id: u64,
@@ -2059,9 +2067,20 @@ impl AppState {
         if let Some(nid) = self.export_notification_id(id) {
             self.dismiss(nid, cx);
         }
-        self.notify(
-            ToastVariant::Success,
-            format!("Exported {rows} row(s) to {path}"),
+        self.push_notification(
+            Notification {
+                id: 0,
+                variant: ToastVariant::Success,
+                message: format!("Exported {rows} row(s) to {path}").into(),
+                detail: None,
+                detail_label: None,
+                auto_dismiss: Some(TOAST_AUTO_DISMISS),
+                export: None,
+                expanded: false,
+                hovered: false,
+                dismiss_gen: 0,
+                action: Some(NotificationAction::RevealInFileManager(path.into())),
+            },
             cx,
         );
     }

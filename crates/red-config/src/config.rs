@@ -69,6 +69,10 @@ struct RawConnection {
     color: u8,
     #[serde(default)]
     read_only: bool,
+    /// Encrypt with TLS (`rediss`/HTTPS/`require_ssl`). Absent in pre-TLS
+    /// configs, where it defaults to off.
+    #[serde(default)]
+    tls: bool,
     /// Optional per-connection AI master-switch override (M-S7). Absent inherits
     /// the global `[ai] enabled`.
     #[serde(default)]
@@ -143,6 +147,7 @@ impl RawConnection {
             database: self.database,
             color: self.color,
             read_only: self.read_only,
+            tls: self.tls,
             ai_enabled: self.ai_enabled,
             ai_tier: self.ai_tier,
             ssh: self.ssh.and_then(RawSsh::into_config),
@@ -160,6 +165,7 @@ impl RawConnection {
                     config.user = p.user;
                     config.password = p.password;
                     config.database = p.database;
+                    config.tls = p.tls;
                 } else {
                     config.database = dsn;
                 }
@@ -194,6 +200,9 @@ struct WriteConnection {
     database: String,
     color: u8,
     read_only: bool,
+    /// TLS toggle; omitted when off so pre-TLS files round-trip byte-for-byte.
+    #[serde(skip_serializing_if = "is_false")]
+    tls: bool,
     /// Per-connection AI overrides (M-S7); omitted when unset so they inherit the
     /// global `[ai]` policy and pre-M-S7 files round-trip unchanged. Scalar keys,
     /// so they stay ahead of the `ssh` sub-table.
@@ -254,6 +263,7 @@ impl From<&StoredConnection> for WriteConnection {
             database: c.database.clone(),
             color: c.color,
             read_only: c.read_only,
+            tls: c.tls,
             ai_enabled: c.ai_enabled,
             ai_tier: c.ai_tier,
             last_accessed: s.last_accessed,
@@ -457,6 +467,7 @@ mod tests {
                     database: "analytics".into(),
                     color: 3,
                     read_only: false,
+                    tls: false,
                     // Per-connection AI overrides (M-S7) must round-trip; conn-a
                     // leaves them unset to confirm they're omitted and inherited.
                     ai_enabled: Some(false),

@@ -17,6 +17,19 @@ ignore = [
     # explicitly configures to their own jump host. Revisit when rsa ships a
     # constant-time fix (https://github.com/RustCrypto/RSA/issues/626).
     "RUSTSEC-2023-0071",
+    # RUSTSEC-2026-0194 / RUSTSEC-2026-0195 — DoS (quadratic attribute scan;
+    # unbounded namespace-declaration allocation) in `quick-xml` 0.39.x, fixed in
+    # 0.41.0. We can't take the fix: quick-xml is pulled in ONLY on Linux and ONLY
+    # transitively through the pinned Zed/GPUI git tree — via `wayland-scanner`
+    # (a build-time proc-macro parsing the system's own Wayland protocol XML) and
+    # `zbus_xml` (parsing D-Bus introspection XML from the session bus for the
+    # AccessKit accessibility bridge). Both pin `^0.39`, so 0.41 needs a Zed-rev
+    # bump, which is a cross-repo contract we don't move casually (see CLAUDE.md).
+    # Neither path parses attacker-controlled XML — the "attacker" would already be
+    # a local malicious compositor or D-Bus peer. Drop these once the Zed rev
+    # carries wayland/zbus crates on quick-xml >=0.41.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 [licenses]
@@ -42,6 +55,9 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "OpenSSL",
+    # xxhash-rust (via the redis driver) is BSL-1.0: a permissive, OSI-approved,
+    # FSF-free license.
+    "BSL-1.0",
 ]
 confidence-threshold = 0.8
 
