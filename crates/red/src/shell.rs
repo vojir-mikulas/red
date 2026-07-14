@@ -1520,6 +1520,7 @@ impl AppState {
         let kv_type = km.kv_type.clone();
         let ttl = km.ttl;
         let pos = km.pos;
+        let favorited = self.redis_key_meta.is_favorite(&active.conn_id, &key);
 
         let menu = ContextMenu::new("kv-key-context-menu")
             .item(
@@ -1545,6 +1546,27 @@ impl AppState {
                     move |this, _, _, cx| {
                         this.kv_key_menu_open_console(session, kv_type.clone(), key.clone(), cx)
                     }
+                })),
+            )
+            .separator()
+            .item(
+                ContextMenuItem::new(
+                    "kv-key-favorite",
+                    if favorited {
+                        "★ Unfavorite"
+                    } else {
+                        "☆ Favorite"
+                    },
+                )
+                .on_click(cx.listener({
+                    let key = key.clone();
+                    move |this, _, _, cx| this.kv_toggle_key_favorite(session, key.clone(), cx)
+                })),
+            )
+            .item(
+                ContextMenuItem::new("kv-key-annotate", "Note & tags…").on_click(cx.listener({
+                    let key = key.clone();
+                    move |this, _, _, cx| this.kv_open_annotations(session, key.clone(), cx)
                 })),
             )
             .separator()
@@ -1620,6 +1642,82 @@ impl AppState {
             .into_any_element()
     }
 
+    /// The "Note & tags" annotation editor popover (see
+    /// [`AppState::kv_open_annotations`]): a centered card with a note field and
+    /// a comma-separated tags field, Save persists to the key-meta store.
+    fn render_kv_annotate(
+        &self,
+        active: &ActiveConn,
+        ann: &crate::kvbrowse::AnnotateState,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let session = active.session;
+        let view = cx.entity().downgrade();
+        let (save_view, cancel_view) = (view.clone(), view.clone());
+
+        let card = div()
+            .occlude()
+            .w(px(340.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .bg(theme.bg_elevated)
+            .border_1()
+            .border_color(theme.border)
+            .rounded_md()
+            .shadow_lg()
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(theme.scale(10.5))
+                    .text_color(theme.text_muted)
+                    .child(format!("Note & tags · {}", ann.key)),
+            )
+            .child(ann.note.clone())
+            .child(ann.tags.clone())
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("kv-annotate-save", "Save")
+                            .variant(ButtonVariant::Primary)
+                            .size(ButtonSize::Sm)
+                            .on_click(move |_, _, cx| {
+                                save_view
+                                    .update(cx, |this, cx| this.kv_submit_annotations(session, cx))
+                                    .ok();
+                            }),
+                    )
+                    .child(
+                        Button::new("kv-annotate-cancel", "Cancel")
+                            .variant(ButtonVariant::Secondary)
+                            .size(ButtonSize::Sm)
+                            .on_click(move |_, _, cx| {
+                                cancel_view
+                                    .update(cx, |this, cx| this.kv_cancel_annotations(session, cx))
+                                    .ok();
+                            }),
+                    ),
+            );
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.kv_cancel_annotations(session, cx)),
+            )
+            .child(card)
+            .into_any_element()
+    }
+
     /// The connected shell for a Redis (KV) session: the same top bar as the
     /// SQL workspace: the keyspace browser (R1, see docs/plans/redis.md)
     /// instead of the editor/grid/schema tree, which all assume a
@@ -1649,6 +1747,11 @@ impl AppState {
             .as_ref()
             .and_then(|v| v.key_menu.as_ref())
             .map(|km| self.render_kv_key_menu(active, km, cx));
+        let annotate = active
+            .kv_view
+            .as_ref()
+            .and_then(|v| v.annotate.as_ref())
+            .map(|ann| self.render_kv_annotate(active, ann, cx));
 
         // Optional left History dock (⌘Y), mirroring the SQL shell's history
         // dock: a leading resizable SplitPane over the work area.
@@ -1864,6 +1967,7 @@ impl AppState {
             .child(statusbar)
             .children(menu)
             .children(key_menu)
+            .children(annotate)
     }
 
     /// The work area right of the schema dock: a single editor/result pane, or,

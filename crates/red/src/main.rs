@@ -24,6 +24,7 @@ mod history;
 mod icons;
 mod import;
 mod inspector;
+mod key_meta;
 mod keymap;
 mod keymap_config;
 mod kvbrowse;

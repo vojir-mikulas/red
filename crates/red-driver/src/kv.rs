@@ -194,6 +194,17 @@ pub trait KvDriver: Send + Sync {
         ids: &[String],
     ) -> Result<u64>;
 
+    /// `XADD key * field value [field value ...]` — append an entry with a
+    /// server-assigned id, returning that id. Creates the stream if absent (how
+    /// the "New key" popover creates a Stream). Refused on a read-only
+    /// connection. The default reports the operation unsupported.
+    async fn stream_add(&self, key: &str, fields: &[(String, String)]) -> Result<String> {
+        let _ = (key, fields);
+        Err(red_core::RedError::Driver(
+            "stream add is not supported by this engine".into(),
+        ))
+    }
+
     /// Run an arbitrary command (the console; see docs/plans/redis.md).
     /// `argv[0]` is the command name. Read-only enforcement and the
     /// destructive-command confirm are the caller's job

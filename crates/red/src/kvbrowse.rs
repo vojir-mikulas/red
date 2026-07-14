@@ -308,15 +308,17 @@ pub(crate) struct CreateKeyState {
     pub(crate) error: Option<String>,
 }
 
-/// The key types the "New key" popover can create, in menu order. Stream is
-/// omitted (no `XADD` edit exists), matching the element-edit path's coverage.
-fn kv_creatable_types() -> [KvType; 5] {
+/// The key types the "New key" popover can create, in menu order. A Stream is
+/// created by its first `XADD` (see [`KvEdit::StreamAdd`](red_core::kv::KvEdit));
+/// `Other` (module types) still can't be created here.
+fn kv_creatable_types() -> [KvType; 6] {
     [
         KvType::String,
         KvType::Hash,
         KvType::List,
         KvType::Set,
         KvType::ZSet,
+        KvType::Stream,
     ]
 }
 
@@ -435,6 +437,9 @@ pub(crate) struct RedisView {
     /// The key whose right-click context menu is open (from either the live
     /// browse list or the biggest-keys sample), anchored at the click position.
     pub(crate) key_menu: Option<KeyMenu>,
+    /// The "Note & tags" annotation editor, when open (see
+    /// [`AppState::kv_open_annotations`]). Connection-level like `key_menu`.
+    pub(crate) annotate: Option<AnnotateState>,
     /// Focus + highlighted choice for the blank-tab panel chooser, so it's
     /// keyboard-drivable (1–6 / arrows / Enter). One handle is enough: only the
     /// focused half's chooser binds it (see `render_kv_new_tab`).
@@ -460,6 +465,16 @@ pub(crate) struct KeyMenu {
 pub(crate) enum KeyMenuEdit {
     Rename,
     Ttl,
+}
+
+/// The open "Note & tags" annotation editor (see
+/// [`AppState::kv_open_annotations`]): the key it targets and two inputs — a
+/// free-text note and a comma-separated tag list — seeded from the saved
+/// annotation and written back to [`crate::key_meta::KeyMetaStore`] on save.
+pub(crate) struct AnnotateState {
+    pub(crate) key: String,
+    pub(crate) note: Entity<TextInput>,
+    pub(crate) tags: Entity<TextInput>,
 }
 
 /// Quote a Redis key for a redis-cli command line: bare when it is a simple
@@ -1011,6 +1026,7 @@ impl RedisView {
             split: None,
             tab_menu: None,
             key_menu: None,
+            annotate: None,
             new_tab_focus: cx.focus_handle(),
             new_tab_sel: 0,
         }
@@ -1997,6 +2013,35 @@ impl AppState {
         cx.notify();
     }
 
+    /// The session of the active connection when it's a Redis one, for the
+    /// Redis palette commands (which run against the focused connection).
+    pub(crate) fn kv_active_session(&self) -> Option<SessionId> {
+        match &self.phase {
+            Phase::Connected(a) if a.kv_view.is_some() => Some(a.session),
+            _ => None,
+        }
+    }
+
+    /// Open a specific Redis panel in a new tab (the palette's "redis: analyze /
+    /// console / …" commands), reusing the empty-tab + set-kind flow so the
+    /// panel's lazy first load fires just like the chooser.
+    pub(crate) fn kv_open_panel(
+        &mut self,
+        session: SessionId,
+        panel: KvPanel,
+        cx: &mut Context<Self>,
+    ) {
+        self.kv_new_empty_tab(session, cx);
+        let id = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .and_then(|v| v.tabs.last())
+            .map(|t| t.id);
+        if let Some(id) = id {
+            self.kv_set_tab_kind(session, id, panel, cx);
+        }
+    }
+
     /// Open a new blank tab in the focused half (the ＋ / ⌘T action). Its body
     /// shows the type chooser; picking a kind converts it in place via
     /// [`kv_set_tab_kind`]. Mirrors the SQL side's `new_query`.
@@ -2560,6 +2605,83 @@ impl AppState {
             KeyMenuEdit::Rename => self.kv_start_editing_key(session, cx),
             KeyMenuEdit::Ttl => self.kv_start_editing_ttl(session, cx),
         }
+    }
+
+    /// Menu action: toggle the key's favorite star (persisted immediately). A
+    /// favorited key shows a ★ in the browse list and tree.
+    pub(crate) fn kv_toggle_key_favorite(
+        &mut self,
+        session: SessionId,
+        key: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(conn_id) = self.conn_mut(Some(session)).map(|a| a.conn_id.clone()) {
+            self.redis_key_meta.toggle_favorite(&conn_id, &key);
+        }
+        self.kv_close_key_menu(session, cx);
+        cx.notify();
+    }
+
+    /// Menu action: open the "Note & tags" editor for `key`, seeded from the
+    /// saved annotation (a floating popover, like the "New key" one).
+    pub(crate) fn kv_open_annotations(
+        &mut self,
+        session: SessionId,
+        key: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.kv_close_key_menu(session, cx);
+        let conn_id = self.conn_mut(Some(session)).map(|a| a.conn_id.clone());
+        let (note_text, tags_text) = conn_id
+            .as_deref()
+            .and_then(|c| self.redis_key_meta.get(c, &key))
+            .map(|a| (a.note.clone(), a.tags.join(", ")))
+            .unwrap_or_default();
+        let note = cx.new(|cx| TextInput::new(cx).with_placeholder("note…"));
+        note.update(cx, |ti, cx| ti.set_content(note_text, cx));
+        let tags = cx.new(|cx| TextInput::new(cx).with_placeholder("tags, comma-separated…"));
+        tags.update(cx, |ti, cx| ti.set_content(tags_text, cx));
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            view.annotate = Some(AnnotateState { key, note, tags });
+        }
+        cx.notify();
+    }
+
+    /// Save the open annotation editor: note verbatim, tags split on commas
+    /// (empties dropped), persisted. Favorite is untouched.
+    pub(crate) fn kv_submit_annotations(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some((conn_id, key, note, tags)) = self.conn_mut(Some(session)).and_then(|a| {
+            let conn_id = a.conn_id.clone();
+            let ann = a.kv_view.as_ref()?.annotate.as_ref()?;
+            let note = ann.note.read(cx).content().to_string();
+            let tags = ann
+                .tags
+                .read(cx)
+                .content()
+                .split(',')
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>();
+            Some((conn_id, ann.key.clone(), note, tags))
+        }) else {
+            return;
+        };
+        self.redis_key_meta
+            .set_note_tags(&conn_id, &key, note, tags);
+        self.kv_cancel_annotations(session, cx);
+    }
+
+    /// Close the annotation editor without saving.
+    pub(crate) fn kv_cancel_annotations(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            view.annotate = None;
+        }
+        cx.notify();
     }
 
     /// Menu action: ask to delete `key`. Unlike the inspector (which has its own
@@ -3716,7 +3838,17 @@ impl AppState {
                     score,
                 }
             }
-            KvType::Stream | KvType::Other(_) => return,
+            KvType::Stream => {
+                if field.is_empty() {
+                    return self.kv_set_create_error(session, "Field name is required".into(), cx);
+                }
+                // First entry, one field/value pair; the id is server-assigned.
+                KvEdit::StreamAdd {
+                    key,
+                    fields: vec![(field, value)],
+                }
+            }
+            KvType::Other(_) => return,
         };
 
         if let Some(browse) = self
@@ -3999,6 +4131,10 @@ impl AppState {
                 }
                 browse.rows_mut().retain(|r| !keys.contains(&r.key));
             }
+            // A newly created stream: the inspector was already opened optimistically
+            // on it (see `kv_submit_create_key`), which fetches the entry fresh, so
+            // there's no local buffer to patch.
+            KvEdit::StreamAdd { .. } => {}
         }
         // A `SetString` replaced the string body (and cleared the edit); refresh
         // the selectable preview so it shows the just-written value.
@@ -4980,6 +5116,10 @@ impl AppState {
         let disp_render = disp.clone();
         let disp_select = disp.clone();
         let disp_menu = disp.clone();
+        // Starred keys for this connection: a ★ prefixes their name in the list.
+        let favorites: Rc<HashSet<String>> =
+            Rc::new(self.redis_key_meta.favorites(&active.conn_id));
+        let fav_render = favorites.clone();
         let visible_range_view = view.clone();
         let select_view = view.clone();
         let menu_view = view.clone();
@@ -5123,13 +5263,18 @@ impl AppState {
                             let Some(meta) = rows_render.get(*row) else {
                                 return Vec::new();
                             };
+                            let shown = if fav_render.contains(&meta.key) {
+                                format!("★ {label}")
+                            } else {
+                                label.clone()
+                            };
                             vec![
                                 div()
                                     .min_w_0()
                                     .truncate()
                                     .text_color(key_color)
                                     .pl(px(*depth as f32 * 14. + 16.))
-                                    .child(label.clone())
+                                    .child(shown)
                                     .into_any_element(),
                                 type_pill(&meta.kv_type, &row_theme).into_any_element(),
                                 div()
@@ -5154,12 +5299,17 @@ impl AppState {
                 let Some(row) = rows_render.get(ix) else {
                     return Vec::new();
                 };
+                let shown = if fav_render.contains(&row.key) {
+                    format!("★ {}", row.key)
+                } else {
+                    row.key.clone()
+                };
                 vec![
                     div()
                         .min_w_0()
                         .truncate()
                         .text_color(key_color)
-                        .child(row.key.clone())
+                        .child(shown)
                         .into_any_element(),
                     type_pill(&row.kv_type, &row_theme).into_any_element(),
                     div()
@@ -5427,7 +5577,8 @@ impl AppState {
                     .ok();
             });
 
-        let show_field = matches!(ck.kv_type, KvType::Hash);
+        // Hash and Stream both take a field name for the first field/value pair.
+        let show_field = matches!(ck.kv_type, KvType::Hash | KvType::Stream);
         let show_score = matches!(ck.kv_type, KvType::ZSet);
 
         let card = div()
@@ -6299,6 +6450,7 @@ impl AppState {
             .child(opt("kv-fmt-pickle", "Pickle", ValueFormat::Pickle))
             .child(opt("kv-fmt-timestamp", "Time", ValueFormat::Timestamp))
             .child(opt("kv-fmt-decompress", "Gzip", ValueFormat::Decompress))
+            .child(opt("kv-fmt-bits", "Bits", ValueFormat::Bits))
             .into_any_element()
     }
 

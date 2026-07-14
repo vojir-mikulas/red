@@ -1159,6 +1159,88 @@ fn dynamic_tables(r: &mut BitReader) -> Option<(Huffman, Huffman)> {
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Bitmap + HyperLogLog: Redis stores both as plain strings, so a value the
+// user knows is a bitmap/HLL otherwise renders as a wall of hex. These give a
+// bit view (with a local popcount — the `BITCOUNT`) and identify a HyperLogLog,
+// estimating its cardinality client-side for the dense encoding.
+// ---------------------------------------------------------------------------
+
+/// Total set bits across `bytes` — the `BITCOUNT` of a bitmap, computed locally
+/// (no round trip).
+pub fn count_set_bits(bytes: &[u8]) -> u64 {
+    bytes.iter().map(|b| b.count_ones() as u64).sum()
+}
+
+/// What [`hll_info`] learned about a HyperLogLog string.
+pub struct HllInfo {
+    /// `true` = dense encoding (fixed 16384×6-bit registers), `false` = sparse.
+    pub dense: bool,
+    /// Approximate cardinality. `Some` for a dense HLL (estimated from the
+    /// registers here); `None` for sparse (decode it with `PFCOUNT`) or a
+    /// truncated payload.
+    pub estimate: Option<u64>,
+}
+
+/// Redis HyperLogLog header size and register geometry (`hyperloglog.c`).
+const HLL_HDR: usize = 16;
+const HLL_REGISTERS: usize = 16_384;
+const HLL_BITS: usize = 6;
+const HLL_MAX: u8 = 63;
+
+/// Identify a Redis HyperLogLog by its `HYLL` magic and, for the dense encoding,
+/// estimate its cardinality. `None` when the bytes aren't a HyperLogLog.
+pub fn hll_info(bytes: &[u8]) -> Option<HllInfo> {
+    if bytes.len() < HLL_HDR || &bytes[0..4] != b"HYLL" {
+        return None;
+    }
+    // Header byte 4 is the encoding: 0 = dense, 1 = sparse.
+    let dense = bytes[4] == 0;
+    let estimate = dense
+        .then(|| hll_dense_estimate(&bytes[HLL_HDR..]))
+        .flatten();
+    Some(HllInfo { dense, estimate })
+}
+
+/// Read the 6-bit register `j` from a dense HLL's packed register array
+/// (little-endian bit packing, `HLL_DENSE_GET_REGISTER`).
+fn hll_register(regs: &[u8], j: usize) -> u8 {
+    let bit = j * HLL_BITS;
+    let byte = bit / 8;
+    let fb = bit % 8;
+    let b0 = regs.get(byte).copied().unwrap_or(0) as u16;
+    let b1 = regs.get(byte + 1).copied().unwrap_or(0) as u16;
+    (((b0 >> fb) | (b1 << (8 - fb))) & HLL_MAX as u16) as u8
+}
+
+/// Estimate a dense HLL's cardinality from its registers (the classic
+/// HyperLogLog estimator with linear-counting for the small range — close
+/// enough for a "roughly enough data" read; `PFCOUNT` is exact). `None` if the
+/// register array is truncated.
+fn hll_dense_estimate(regs: &[u8]) -> Option<u64> {
+    if regs.len() < HLL_REGISTERS * HLL_BITS / 8 {
+        return None;
+    }
+    let m = HLL_REGISTERS as f64;
+    let mut sum = 0.0f64;
+    let mut zeros = 0u32;
+    for j in 0..HLL_REGISTERS {
+        let r = hll_register(regs, j);
+        sum += 1.0 / (1u64 << r) as f64;
+        if r == 0 {
+            zeros += 1;
+        }
+    }
+    let alpha = 0.7213 / (1.0 + 1.079 / m);
+    let mut e = alpha * m * m / sum;
+    // Linear counting when the raw estimate is in the small range and some
+    // registers are still zero (matches Redis's low-cardinality correction).
+    if e <= 2.5 * m && zeros != 0 {
+        e = m * (m / zeros as f64).ln();
+    }
+    Some(e.round() as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1354,5 +1436,39 @@ mod tests {
         // Not an integer at all.
         assert!(decode_timestamp(b"hello").is_none());
         assert!(decode_timestamp(b"").is_none());
+    }
+
+    #[test]
+    fn count_set_bits_matches_bitcount() {
+        assert_eq!(count_set_bits(b""), 0);
+        assert_eq!(count_set_bits(&[0x00]), 0);
+        assert_eq!(count_set_bits(&[0xff]), 8);
+        assert_eq!(count_set_bits(&[0b1010_1010, 0b0000_0001]), 5);
+    }
+
+    #[test]
+    fn hll_info_detects_magic_and_encoding() {
+        // Not a HyperLogLog.
+        assert!(hll_info(b"just a string value").is_none());
+        assert!(hll_info(b"HYL").is_none()); // too short
+
+        // A well-formed dense HLL with all-zero registers: 16-byte header
+        // (magic + dense flag) then 12288 zero register bytes. Linear counting
+        // over an all-empty register set estimates 0.
+        let mut hll = Vec::new();
+        hll.extend_from_slice(b"HYLL");
+        hll.push(0); // dense
+        hll.extend_from_slice(&[0u8; 11]); // rest of the header
+        hll.extend_from_slice(&[0u8; HLL_REGISTERS * HLL_BITS / 8]);
+        let info = hll_info(&hll).unwrap();
+        assert!(info.dense);
+        assert_eq!(info.estimate, Some(0));
+
+        // Sparse encoding: identified, but not estimated here.
+        let mut sparse = hll.clone();
+        sparse[4] = 1; // sparse flag
+        let info = hll_info(&sparse).unwrap();
+        assert!(!info.dense);
+        assert_eq!(info.estimate, None);
     }
 }

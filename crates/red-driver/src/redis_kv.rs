@@ -1026,6 +1026,23 @@ impl KvDriver for RedisDriver {
         Ok(claimed.len() as u64)
     }
 
+    async fn stream_add(&self, key: &str, fields: &[(String, String)]) -> Result<String> {
+        self.check_writable()?;
+        if fields.is_empty() {
+            return Err(RedError::Query("a stream entry needs a field".into()));
+        }
+        let mut conn = self.route(key);
+        // `*` = server-assigned id (monotonic `<ms>-<seq>`).
+        let mut cmd = redis::cmd("XADD");
+        cmd.arg(key).arg("*");
+        for (field, value) in fields {
+            cmd.arg(field).arg(value);
+        }
+        cmd.query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
     async fn command(&self, argv: &[String]) -> Result<RespValue> {
         let Some(name) = argv.first() else {
             return Err(RedError::Query("empty command".into()));

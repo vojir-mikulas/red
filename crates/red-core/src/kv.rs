@@ -423,6 +423,13 @@ pub enum KvEdit {
     Delete {
         keys: Vec<String>,
     },
+    /// `XADD key * field value [field value ...]` — append an entry with a
+    /// server-assigned id (also creates the stream). The one write that creates
+    /// a stream, so the "New key" popover can offer Stream like the other types.
+    StreamAdd {
+        key: String,
+        fields: Vec<(String, String)>,
+    },
 }
 
 /// One entry of the server's slow-command log (`SLOWLOG GET`), for the

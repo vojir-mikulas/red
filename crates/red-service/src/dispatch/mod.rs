@@ -1745,7 +1745,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 });
             }
 
-            Command::KvCommand { epoch, argv } => {
+            Command::KvCommand { epoch, argv, req } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get_mut(&id) else {
                     emit(&events, session_id, Event::Error("not connected".into()));
@@ -1790,6 +1790,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                 epoch,
                                 argv,
                                 result,
+                                req,
                             },
                         ),
                         Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
@@ -1899,6 +1900,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                 );
                             }
                             done
+                        }
+                        KvEdit::StreamAdd { key, fields } => {
+                            driver.stream_add(key, fields).await.map(|_| ())
                         }
                     };
                     match result {

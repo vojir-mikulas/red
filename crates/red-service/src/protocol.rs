@@ -278,6 +278,10 @@ pub enum Command {
     KvCommand {
         epoch: u64,
         argv: Vec<String>,
+        /// A per-console monotonic request id, echoed back on `KvCommandResult`
+        /// so the console matches each reply to the exact command that issued it
+        /// (rather than the old best-effort match on `argv`).
+        req: u64,
     },
     /// One in-grid edit (see `red_core::kv::KvEdit`), gated by `read_only`
     /// (checked service-side, defense in depth alongside the driver's own
@@ -800,6 +804,9 @@ pub enum Event {
         epoch: u64,
         argv: Vec<String>,
         result: RespValue,
+        /// The `req` from the `KvCommand` that produced this reply, so the
+        /// console fills in the exact entry that issued it.
+        req: u64,
     },
     /// An in-grid edit succeeded, in response to `KvApplyEdit`. Echoes
     /// `edit` back so the UI can pattern-match what to update locally

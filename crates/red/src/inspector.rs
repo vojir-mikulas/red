@@ -60,6 +60,9 @@ pub(crate) enum ValueFormat {
     /// Decompress a gzip/zlib stream, then render the inflated payload
     /// (JSON if it parses, else text, else hex).
     Decompress,
+    /// View the value's bytes as a bitmap (bit grid + set-bit count), or, for a
+    /// HyperLogLog string, its estimated cardinality.
+    Bits,
 }
 
 /// All the inspector's persistent state. Present iff the pane is open.
@@ -573,7 +576,10 @@ impl AppState {
         // round-trip — editing their rendered form and saving would corrupt the
         // stored value — so an edit opens on the raw text instead.
         let edit_fmt = match self.inspector_format() {
-            ValueFormat::Hex | ValueFormat::Timestamp | ValueFormat::Decompress => ValueFormat::Raw,
+            ValueFormat::Hex
+            | ValueFormat::Timestamp
+            | ValueFormat::Decompress
+            | ValueFormat::Bits => ValueFormat::Raw,
             other => other,
         };
         let view = format_value(&ctx.original, edit_fmt);
@@ -1054,6 +1060,7 @@ impl AppState {
                 ValueFormat::Decompress,
                 cx,
             ))
+            .child(opt("insp-fmt-bits", "Bits", ValueFormat::Bits, cx))
             .into_any_element()
     }
 
@@ -1213,6 +1220,7 @@ fn format_value(value: &Value, fmt: ValueFormat) -> ValueView {
                     decoded_or(decode::decode_timestamp(s.as_bytes()), "timestamp", raw)
                 }
                 ValueFormat::Decompress => decompressed_view(s.as_bytes(), raw),
+                ValueFormat::Bits => bits_view(s.as_bytes()),
             }
         }
         // A blob has no textual rendering; the plain lenses show its bytes as
@@ -1230,6 +1238,7 @@ fn format_value(value: &Value, fmt: ValueFormat) -> ValueView {
                 ValueFormat::Pickle => decoded_or(decode::decode_pickle(b), "pickle", hex),
                 ValueFormat::Timestamp => decoded_or(decode::decode_timestamp(b), "timestamp", hex),
                 ValueFormat::Decompress => decompressed_view(b, hex),
+                ValueFormat::Bits => bits_view(b),
                 _ => hex(),
             }
         }
@@ -1354,6 +1363,68 @@ fn decompressed_view(bytes: &[u8], fallback: impl FnOnce() -> ValueView) -> Valu
             wrap: false,
         },
     }
+}
+
+/// Bytes rendered as a bit grid before it's cut with a "more bytes" note, so a
+/// megabyte bitmap doesn't lay out millions of bits. The popcount summary is
+/// always computed over the *whole* value regardless of this display cap.
+const BITS_MAX: usize = 512;
+
+/// The Bits lens: a HyperLogLog's estimated cardinality if the bytes are one,
+/// else the value as a bitmap — a bit grid plus its total set-bit count
+/// (`BITCOUNT`, computed locally).
+fn bits_view(bytes: &[u8]) -> ValueView {
+    if let Some(hll) = decode::hll_info(bytes) {
+        let body = match (hll.dense, hll.estimate) {
+            (true, Some(n)) => format!(
+                "HyperLogLog · dense\n≈ {} unique elements",
+                group_digits(n as usize)
+            ),
+            (true, None) => "HyperLogLog · dense (truncated payload)".to_string(),
+            (false, _) => {
+                "HyperLogLog · sparse\nRun PFCOUNT in the console for the count".to_string()
+            }
+        };
+        return ValueView {
+            body: body.into(),
+            summary: "HyperLogLog · decoded".into(),
+            wrap: true,
+        };
+    }
+    let set = decode::count_set_bits(bytes);
+    let total = bytes.len() * 8;
+    ValueView {
+        body: bit_grid(bytes, BITS_MAX).into(),
+        summary: format!(
+            "{} of {} bits set · bitmap",
+            group_digits(set as usize),
+            group_digits(total)
+        ),
+        wrap: false,
+    }
+}
+
+/// Render up to `max` bytes as a bit grid: an offset column then each byte's
+/// bits, MSB-first (matching `SETBIT`'s bit numbering — bit 0 is a byte's high
+/// bit). Six bytes per row keeps the line inside the pane.
+fn bit_grid(bytes: &[u8], max: usize) -> String {
+    const PER_ROW: usize = 6;
+    let show = bytes.len().min(max);
+    let mut out = String::new();
+    for (i, chunk) in bytes[..show].chunks(PER_ROW).enumerate() {
+        out.push_str(&format!("{:>6}  ", i * PER_ROW));
+        for b in chunk {
+            out.push_str(&format!("{b:08b} "));
+        }
+        out.push('\n');
+    }
+    if bytes.len() > show {
+        out.push_str(&format!(
+            "… {} more bytes\n",
+            group_digits(bytes.len() - show)
+        ));
+    }
+    out
 }
 
 /// A [`ValueView`] wrapping a hex dump of `bytes` (the Hex lens over any value): the

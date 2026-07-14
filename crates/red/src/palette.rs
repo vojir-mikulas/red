@@ -113,6 +113,15 @@ pub(crate) enum Cmd {
     FocusOtherHalf,
     /// Open the "What's New" changelog overlay.
     ShowChangelog,
+    // --- Redis (KV) commands, offered only on a Redis connection ---
+    /// Open a new (blank) Redis tab, showing the panel chooser.
+    KvNewTab,
+    /// Toggle the browse list between the flat grid and the namespace tree.
+    KvToggleTree,
+    /// Run the biggest-keys sampler in the active Browse tab.
+    KvFindBigKeys,
+    /// Open a specific Redis panel in a new tab (Analysis, Console, …).
+    KvOpenPanel(crate::kvbrowse::KvPanel),
 }
 
 /// Which free-text prompt the single palette slot is currently serving, so a
@@ -311,6 +320,26 @@ impl AppState {
             Cmd::SplitRight => self.split_right(cx),
             Cmd::Unsplit => self.unsplit(cx),
             Cmd::FocusOtherHalf => self.focus_other_half(cx),
+            Cmd::KvNewTab => {
+                if let Some(s) = self.kv_active_session() {
+                    self.kv_new_empty_tab(s, cx);
+                }
+            }
+            Cmd::KvToggleTree => {
+                if let Some(s) = self.kv_active_session() {
+                    self.kv_toggle_tree_mode(s, cx);
+                }
+            }
+            Cmd::KvFindBigKeys => {
+                if let Some(s) = self.kv_active_session() {
+                    self.kv_start_big_keys_sample(s, cx);
+                }
+            }
+            Cmd::KvOpenPanel(panel) => {
+                if let Some(s) = self.kv_active_session() {
+                    self.kv_open_panel(s, panel, cx);
+                }
+            }
         }
     }
 
@@ -348,6 +377,45 @@ impl AppState {
         let mut out: Vec<(PaletteItem, Cmd)> = Vec::new();
 
         match &self.phase {
+            // A Redis connection has its own workspace (panels/tabs, no SQL
+            // editor), so it gets its own command set instead of the query ones.
+            Phase::Connected(active) if active.kv_view.is_some() => {
+                use crate::kvbrowse::KvPanel;
+                out.push((
+                    PaletteItem::new("cmd:kv-new-tab", "redis: new tab").hint("⌘T"),
+                    Cmd::KvNewTab,
+                ));
+                out.push((
+                    PaletteItem::new("cmd:kv-tree", "redis: toggle namespace tree"),
+                    Cmd::KvToggleTree,
+                ));
+                out.push((
+                    PaletteItem::new("cmd:kv-bigkeys", "redis: find biggest keys"),
+                    Cmd::KvFindBigKeys,
+                ));
+                out.push((
+                    PaletteItem::new("cmd:kv-analyze", "redis: analyze keyspace"),
+                    Cmd::KvOpenPanel(KvPanel::Analysis),
+                ));
+                out.push((
+                    PaletteItem::new("cmd:kv-console", "redis: open console"),
+                    Cmd::KvOpenPanel(KvPanel::Console),
+                ));
+                out.push((
+                    PaletteItem::new("cmd:kv-monitor", "redis: open monitor (slow log · clients)"),
+                    Cmd::KvOpenPanel(KvPanel::Monitor),
+                ));
+                out.push((
+                    PaletteItem::new("cmd:kv-keyspace", "redis: watch keyspace notifications"),
+                    Cmd::KvOpenPanel(KvPanel::Keyspace),
+                ));
+                out.push((
+                    PaletteItem::new("cmd:kv-pubsub", "redis: open pub/sub"),
+                    Cmd::KvOpenPanel(KvPanel::PubSub),
+                ));
+                // Connection switching, settings, shortcuts, etc. come from the
+                // shared tail appended after this match.
+            }
             Phase::Connected(active) => {
                 out.push((
                     PaletteItem::new("cmd:run", "query: run").hint("⌘↵"),

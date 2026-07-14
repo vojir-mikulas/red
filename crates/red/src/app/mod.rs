@@ -1504,6 +1504,9 @@ pub struct AppState {
     /// loaded once at startup and seeded into a Redis view when it connects, so
     /// the inspector's browsing history survives a restart.
     pub(crate) redis_recent_keys: crate::recent_keys::RecentKeysStore,
+    /// Per-key annotations (favorite / note / tags) for the Redis browser,
+    /// persisted per connection (see `key_meta.rs`).
+    pub(crate) redis_key_meta: crate::key_meta::KeyMetaStore,
     /// App-managed local state (`state.json`): the last-seen version (for the
     /// update toast) and the per-agent config-selector cache that lets the
     /// assistant show its model/reasoning dropdowns before a chat opens a session.
@@ -2274,6 +2277,7 @@ impl AppState {
             query_history: crate::history::QueryHistory::load(),
             redis_analysis: crate::redis_analysis::AnalysisStore::load(),
             redis_recent_keys: crate::recent_keys::RecentKeysStore::load(),
+            redis_key_meta: crate::key_meta::KeyMetaStore::load(),
             local_state,
             switcher,
             parked: HashMap::new(),
@@ -2720,10 +2724,11 @@ impl AppState {
             }
             Event::KvCommandResult {
                 epoch,
-                argv,
+                argv: _,
                 result,
+                req,
             } => {
-                self.on_kv_command_result(session, epoch, argv, result, cx);
+                self.on_kv_command_result(session, epoch, req, result, cx);
             }
             Event::KvEditApplied { epoch, edit } => {
                 self.on_kv_edit_applied(session, epoch, edit, cx);
