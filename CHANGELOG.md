@@ -16,7 +16,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   scrolled. The close-with-unsaved-work prompt gained a "Don't ask again"
   checkbox.
 
+### Added
+- Redis key browser: an Actions dropdown in the toolbar — Refresh keys (also
+  ⌘/Ctrl+R), Expand all / Collapse all for the namespace tree, and an
+  Auto-refresh submenu (Off / 2s / 5s / 10s / 30s) that periodically re-scans the
+  keyspace. A new `[redis] auto_refresh_secs` setting (Settings → Behavior) sets
+  the interval new browse tabs start at.
+
 ### Changed
+- Redis key browser: the filter bar's fuzzy and value-search toggles are
+  replaced by a single query-mode dropdown at the head of the bar — Glob (`*`),
+  Prefix, Exact, Fuzzy, and Value. Prefix matches keys starting with the typed
+  text; Exact jumps straight to one key by name (no scan); Glob/Fuzzy/Value keep
+  their old behaviour. The placeholder and result count follow the mode.
+- Redis "New key": now a centred modal with a labelled, form-friendly layout and
+  a segmented type picker (String · Hash · List · Set · ZSet · Stream). The
+  fields adapt to the chosen type — a string gains an optional expiry (TTL), a
+  hash/stream a field, a sorted set a score, and a list a Head/Tail push choice.
 - AI assistant: pick which agent runs a chat from the panel itself. When more
   than one agent is set up, the agent name in the panel header becomes a dropdown
   (switch the current chat's agent), and the "+" button opens a "New chat with

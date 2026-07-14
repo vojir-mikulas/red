@@ -270,6 +270,19 @@ impl AppState {
         self.send_active(Command::LoadObjects);
     }
 
+    /// ⌘R: refresh whatever the active connection shows — a Redis key browse
+    /// re-scans its keyspace, a SQL connection reloads its schema objects.
+    pub(crate) fn refresh_active(&mut self, cx: &mut Context<Self>) {
+        if let Phase::Connected(a) = &self.phase {
+            if a.kv_view.is_some() {
+                let session = a.session;
+                self.kv_refresh_keys(session, cx);
+                return;
+            }
+        }
+        self.refresh_schema();
+    }
+
     /// Open a blank query tab (the tab-strip "＋" action).
     pub(crate) fn new_query(&mut self, cx: &mut Context<Self>) {
         // A Redis connection has no SQL editor; ⌘T opens a blank Redis tab.

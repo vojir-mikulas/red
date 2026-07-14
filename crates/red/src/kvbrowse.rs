@@ -84,6 +84,93 @@ fn non_empty(s: String) -> Option<String> {
     }
 }
 
+/// Escape Redis glob metacharacters (`* ? [ ] \`) so a piece of user text
+/// matches *literally* inside a `SCAN … MATCH` pattern. Used by
+/// [`QueryMode::Prefix`], where the box text is a literal prefix rather than a
+/// glob the user wrote themselves.
+fn glob_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(ch, '*' | '?' | '[' | ']' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// How the Browse filter box's text is interpreted — the query-mode dropdown at
+/// the head of the filter bar (replaces the old separate fuzzy / value-search
+/// toggles). `Glob` and `Prefix` push down to `SCAN … MATCH`; `Exact` resolves a
+/// single key via `probe_key` (no scan at all); `Fuzzy` and `Value` filter
+/// what the scan loads (see [`BrowseState::mode`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueryMode {
+    /// The box text is a raw `SCAN … MATCH` glob the user writes (`user:*`).
+    /// The default, and how the filter box always behaved before query modes.
+    Glob,
+    /// The box text is a literal prefix; scanned as `MATCH <escaped>*` so glob
+    /// metacharacters in it match literally.
+    Prefix,
+    /// The box text is one exact key name, resolved directly by `probe_key`
+    /// (bypasses `SCAN`) — the list shows the single hit, or nothing.
+    Exact,
+    /// Client-side fuzzy match over loaded keys, auto-growing the scan pool
+    /// while under-matched (see `kv_maybe_grow_fuzzy_pool`).
+    Fuzzy,
+    /// Substring search over string *values* (the driver reads scanned string
+    /// values); runs on Enter, not per keystroke.
+    Value,
+}
+
+impl QueryMode {
+    /// The modes in dropdown order.
+    const ALL: [QueryMode; 5] = [
+        QueryMode::Glob,
+        QueryMode::Prefix,
+        QueryMode::Exact,
+        QueryMode::Fuzzy,
+        QueryMode::Value,
+    ];
+
+    /// The dropdown label.
+    fn label(self) -> &'static str {
+        match self {
+            QueryMode::Glob => "Glob (*)",
+            QueryMode::Prefix => "Prefix",
+            QueryMode::Exact => "Exact",
+            QueryMode::Fuzzy => "Fuzzy",
+            QueryMode::Value => "Value",
+        }
+    }
+
+    /// The filter box's placeholder for this mode (nudges the user to what the
+    /// text now means).
+    fn placeholder(self) -> &'static str {
+        match self {
+            QueryMode::Glob => "Filter (MATCH pattern)…",
+            QueryMode::Prefix => "Key prefix…",
+            QueryMode::Exact => "Exact key name…",
+            QueryMode::Fuzzy => "Fuzzy search keys…",
+            QueryMode::Value => "Search values (Enter)…",
+        }
+    }
+
+    /// Build the server-side `SCAN … MATCH` pattern for this mode from the box
+    /// text. `None` for an empty box, or for modes that don't scan by pattern
+    /// (`Exact` probes; `Fuzzy`/`Value` filter what a plain scan loads).
+    fn scan_pattern(self, text: &str) -> Option<String> {
+        if text.is_empty() {
+            return None;
+        }
+        match self {
+            QueryMode::Glob => Some(text.to_string()),
+            QueryMode::Prefix => Some(format!("{}*", glob_escape(text))),
+            QueryMode::Exact | QueryMode::Fuzzy | QueryMode::Value => None,
+        }
+    }
+}
+
 /// The concrete Redis types the browse type-filter dropdown offers, in menu
 /// order after the leading "All types" entry. Each maps to a `SCAN ... TYPE`
 /// argument via [`KvType::label`]. `Other` is deliberately absent — the
@@ -253,14 +340,16 @@ pub(crate) struct BrowseState {
     /// current when the timer fires, so rapid typing coalesces into one
     /// backend round trip (see `AppState::kv_debounce_filter`).
     pub(crate) filter_gen: u64,
-    /// `true`: the filter box is a client-side fuzzy query over already-
-    /// loaded rows (see `fuzzy_score`), auto-continuing the scan in the
-    /// background while under-matched (`kv_maybe_grow_fuzzy_pool`) instead
-    /// of the server-side `SCAN ... MATCH` glob filter. Toggled by the
-    /// filter box's "fuzzy" button; switching it on drops any active `MATCH`
-    /// pattern and restarts unfiltered, since a glob-filtered pool would
-    /// silently hide keys the fuzzy query could otherwise have matched.
-    pub(crate) fuzzy: bool,
+    /// How the filter box's text is interpreted (the query-mode dropdown at the
+    /// head of the filter bar). `Glob`/`Prefix` push down to `SCAN … MATCH`;
+    /// `Exact` probes a single key; `Fuzzy` filters loaded rows client-side and
+    /// auto-grows the pool (`kv_maybe_grow_fuzzy_pool`); `Value` reads scanned
+    /// string values. Switching mode re-applies the box text under the new
+    /// meaning (see `kv_set_query_mode`).
+    pub(crate) mode: QueryMode,
+    /// Whether the query-mode dropdown is showing its option list (Flint's
+    /// `Select` is stateless, so the open flag lives here, like `type_filter_open`).
+    pub(crate) mode_open: bool,
     /// The value inspector opened by selecting a row, if any.
     pub(crate) inspector: Option<KvInspector>,
     /// `Some` while a "find biggest keys" sample is running or showing its
@@ -288,30 +377,80 @@ pub(crate) struct BrowseState {
     /// unchanged — building the trie over up to `MAX_RESIDENT_ROWS` keys every
     /// frame would be wasteful (mirrors the fuzzy `visible_cache`).
     tree_cache: RefCell<Option<TreeCache>>,
-    /// `true`: the filter box searches key *values* (a substring the driver reads
-    /// scanned string values for) instead of key names. Mutually exclusive with
-    /// fuzzy (a name search) — turning one on clears the other.
-    pub(crate) value_search: bool,
-    /// The active value-search needle, threaded into every `KvFetchScan` of the
-    /// current run so pagination keeps filtering. `None` = no value search.
+    /// The active value-search needle (only ever set in [`QueryMode::Value`]),
+    /// threaded into every `KvFetchScan` of the current run so pagination keeps
+    /// filtering. `None` = no value search.
     pub(crate) value_needle: Option<String>,
+    /// Auto-refresh interval: while `Some`, a background timer re-runs this tab's
+    /// scan every interval (see `kv_arm_auto_refresh`). `None` = off. Seeded from
+    /// the `redis.auto_refresh_secs` setting when the tab opens, and changed via
+    /// the browse toolbar's actions menu.
+    pub(crate) auto_refresh: Option<Duration>,
+    /// Bumped whenever the auto-refresh interval changes, so an in-flight timer
+    /// tick from a superseded interval no-ops instead of firing (the debounce
+    /// generation-check shape, per `kv_debounce_filter`).
+    auto_refresh_gen: u64,
 }
 
-/// The "New key" popover's state: a name, the chosen type, and the per-type
-/// seed inputs (a hash needs a field, a zset a score; everything else just a
-/// value/member). A new key is created by its first write — `SET`/`HSET`/
-/// `RPUSH`/`SADD`/`ZADD` — so this reuses the same [`KvEdit`](red_core::kv::KvEdit)
-/// path as element editing; stream creation (no `XADD` edit) isn't offered.
+/// The inputs a browse relaunch dispatches, produced by
+/// [`BrowseState::begin_relaunch`] and consumed by
+/// [`AppState::kv_dispatch_relaunch`].
+struct RelaunchPlan {
+    old_epoch: u64,
+    new_epoch: u64,
+    pattern: Option<String>,
+    type_filter: Option<String>,
+    value_needle: Option<String>,
+}
+
+impl BrowseState {
+    /// Whether the filter box is in client-side fuzzy mode.
+    pub(crate) fn is_fuzzy(&self) -> bool {
+        self.mode == QueryMode::Fuzzy
+    }
+
+    /// Reset this browse to a fresh, empty run under a new epoch and return the
+    /// [`RelaunchPlan`] to re-dispatch its scan with the current filters. Split
+    /// from the command send so the caller can drop the `&mut` borrow first.
+    fn begin_relaunch(&mut self) -> RelaunchPlan {
+        let old_epoch = self.epoch;
+        let new_epoch = crate::result::next_kv_epoch();
+        self.epoch = new_epoch;
+        self.rows_mut().clear();
+        self.evicted = false;
+        self.cursor = ScanCursor::START;
+        self.exhausted = false;
+        self.loading = true;
+        RelaunchPlan {
+            old_epoch,
+            new_epoch,
+            pattern: self.pattern.clone(),
+            type_filter: self.type_filter.as_ref().map(|t| t.label().to_string()),
+            value_needle: self.value_needle.clone(),
+        }
+    }
+}
+
+/// The "New key" modal's state: a name, the chosen type, and the per-type seed
+/// inputs the form shows/hides as the type changes (a hash/stream field, a zset
+/// score, a string TTL, a list push end). A new key is created by its first
+/// write — `SET`/`HSET`/`RPUSH`/`SADD`/`ZADD`/`XADD` — so this reuses the same
+/// [`KvEdit`](red_core::kv::KvEdit) path as element editing.
 pub(crate) struct CreateKeyState {
     pub(crate) name: Entity<TextInput>,
-    /// Hash field name (only shown/used when `kv_type` is `Hash`).
+    /// Hash/stream field name (shown when `kv_type` is `Hash` or `Stream`).
     pub(crate) field: Entity<TextInput>,
     /// The value, set member, list element, or zset member.
     pub(crate) value: Entity<TextInput>,
-    /// ZSet score (only shown/used when `kv_type` is `ZSet`).
+    /// ZSet score (shown when `kv_type` is `ZSet`).
     pub(crate) score: Entity<TextInput>,
+    /// Optional expiry in seconds for a new string (shown when `kv_type` is
+    /// `String`); blank = no TTL.
+    pub(crate) ttl: Entity<TextInput>,
     pub(crate) kv_type: KvType,
-    pub(crate) type_open: bool,
+    /// List push end: `true` = `LPUSH` (head), `false` = `RPUSH` (tail). Only
+    /// meaningful when `kv_type` is `List`.
+    pub(crate) list_head: bool,
     pub(crate) error: Option<String>,
 }
 
@@ -447,6 +586,10 @@ pub(crate) struct RedisView {
     /// The "Note & tags" annotation editor, when open (see
     /// [`AppState::kv_open_annotations`]). Connection-level like `key_menu`.
     pub(crate) annotate: Option<AnnotateState>,
+    /// The browse toolbar's actions dropdown (Refresh · Expand/Collapse all ·
+    /// Auto-refresh), anchored at the trigger's position while open. `None` =
+    /// closed. Mirrors the `tab_menu`/`key_menu` positioned-menu pattern.
+    pub(crate) actions_menu: Option<gpui::Point<gpui::Pixels>>,
     /// Focus + highlighted choice for the blank-tab panel chooser, so it's
     /// keyboard-drivable (1–6 / arrows / Enter). One handle is enough: only the
     /// focused half's chooser binds it (see `render_kv_new_tab`).
@@ -693,46 +836,50 @@ pub(crate) struct StreamGroupsState {
 
 impl BrowseState {
     pub(crate) fn new(session: SessionId, cx: &mut Context<AppState>) -> Self {
-        let filter = cx.new(|cx| TextInput::new(cx).with_placeholder("Filter (MATCH pattern)…"));
+        let filter =
+            cx.new(|cx| TextInput::new(cx).with_placeholder(QueryMode::Glob.placeholder()));
         cx.subscribe(&filter, move |this, input, event: &TextInputEvent, cx| {
             // Only the active (visible, focused) tab can receive input events
             // in the no-split shell, so routing to the active Browse tab is
             // unambiguous here (see docs/plans/redis-workflow-parity.md).
-            let (fuzzy, value_search) = this
+            let mode = this
                 .conn_mut(Some(session))
                 .and_then(|a| a.kv_view.as_ref())
                 .and_then(|v| v.active_browse())
-                .map(|b| (b.fuzzy, b.value_search))
-                .unwrap_or((false, false));
+                .map(|b| b.mode)
+                .unwrap_or(QueryMode::Glob);
+            let text = input.read(cx).content().to_string();
             match event {
-                // Value search is a costly per-key value read, so it runs only on
-                // Enter (never live on every keystroke); Change just repaints.
-                TextInputEvent::Submit if value_search => {
-                    let needle = input.read(cx).content().to_string();
-                    this.kv_set_value_needle(session, non_empty(needle), cx);
-                }
-                TextInputEvent::Change if value_search => {
-                    cx.notify();
-                }
-                // Enter restarts immediately, bypassing the debounce wait.
-                // No-op in fuzzy mode: there's no server round trip to fire
-                // early, filtering already happens live at render time.
-                TextInputEvent::Submit if !fuzzy => {
-                    let pattern = input.read(cx).content().to_string();
-                    this.kv_restart_scan(session, non_empty(pattern), cx);
-                }
-                TextInputEvent::Change if !fuzzy => {
-                    let pattern = input.read(cx).content().to_string();
-                    this.kv_debounce_filter(session, pattern, cx);
-                }
-                TextInputEvent::Change => {
-                    // Fuzzy filtering itself reads the input live at render
-                    // time (see `render_kv_browse`); this just needs to (a)
-                    // repaint and (b) keep the candidate pool growing if the
-                    // new query is under-matched.
-                    this.kv_maybe_grow_fuzzy_pool(session, cx);
-                    cx.notify();
-                }
+                // Enter applies the box text under the current mode immediately;
+                // Fuzzy has no server round trip to fire early (it filters live at
+                // render time), so Enter is a no-op there.
+                TextInputEvent::Submit => match mode {
+                    QueryMode::Glob | QueryMode::Prefix => {
+                        this.kv_restart_scan(session, mode.scan_pattern(&text), cx)
+                    }
+                    // Exact is a single `probe_key`, not a scan.
+                    QueryMode::Exact => this.kv_probe_exact(session, non_empty(text), cx),
+                    // Value search is a costly per-key value read, so it runs only
+                    // on Enter (never live on every keystroke).
+                    QueryMode::Value => this.kv_set_value_needle(session, non_empty(text), cx),
+                    QueryMode::Fuzzy => {}
+                },
+                TextInputEvent::Change => match mode {
+                    // Debounced scan restart under the current mode's pattern.
+                    QueryMode::Glob | QueryMode::Prefix => {
+                        this.kv_debounce_filter(session, text, cx)
+                    }
+                    // Fuzzy filtering reads the input live at render time (see
+                    // `render_kv_browse`); this just repaints and keeps the
+                    // candidate pool growing if the new query is under-matched.
+                    QueryMode::Fuzzy => {
+                        this.kv_maybe_grow_fuzzy_pool(session, cx);
+                        cx.notify();
+                    }
+                    // Exact/Value wait for Enter; a Change just repaints so the
+                    // typed text shows.
+                    QueryMode::Exact | QueryMode::Value => cx.notify(),
+                },
                 _ => {}
             }
         })
@@ -753,7 +900,8 @@ impl BrowseState {
             nav_row: None,
             filter,
             filter_gen: 0,
-            fuzzy: false,
+            mode: QueryMode::Glob,
+            mode_open: false,
             inspector: None,
             big_keys: None,
             create_key: None,
@@ -762,8 +910,11 @@ impl BrowseState {
             expanded: HashSet::new(),
             expand_gen: 0,
             tree_cache: RefCell::new(None),
-            value_search: false,
             value_needle: None,
+            // Seeded from the `redis.auto_refresh_secs` setting once the tab is
+            // wired to a session (see `kv_apply_auto_refresh_default`); off here.
+            auto_refresh: None,
+            auto_refresh_gen: 0,
         }
     }
 
@@ -802,7 +953,7 @@ impl BrowseState {
     /// subset is memoized on `(query, rows_gen)` so an unrelated re-render
     /// doesn't re-score and re-sort every loaded key.
     pub(crate) fn visible_rows(&self, cx: &App) -> Rc<Vec<KeyMeta>> {
-        if !self.fuzzy {
+        if !self.is_fuzzy() {
             return Rc::clone(&self.rows);
         }
         let query = self.filter.read(cx).content().to_string();
@@ -954,6 +1105,26 @@ fn flatten_trie(
     }
 }
 
+/// Every namespace-folder prefix in `rows`: each strict `:`-delimited ancestor
+/// of a key (so `a:b:c` contributes `a` and `a:b`, and a key with no `:`
+/// contributes none). The set the tree view's "Expand all" opens — it mirrors
+/// exactly the folders [`build_tree`] would create.
+fn all_tree_prefixes(rows: &[KeyMeta]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for meta in rows {
+        let segs: Vec<&str> = meta.key.split(':').collect();
+        let mut acc = String::new();
+        for seg in &segs[..segs.len().saturating_sub(1)] {
+            if !acc.is_empty() {
+                acc.push(':');
+            }
+            acc.push_str(seg);
+            out.insert(acc.clone());
+        }
+    }
+    out
+}
+
 impl AnalysisState {
     pub(crate) fn new() -> Self {
         Self {
@@ -1045,9 +1216,20 @@ impl RedisView {
             tab_menu: None,
             key_menu: None,
             annotate: None,
+            actions_menu: None,
             new_tab_focus: cx.focus_handle(),
             new_tab_sel: 0,
         }
+    }
+
+    /// The Browse tab with the given id, regardless of which tab is focused —
+    /// so an auto-refresh timer keeps ticking a specific tab even in split view
+    /// or after focus moves elsewhere (see `kv_arm_auto_refresh`).
+    pub(crate) fn browse_by_tab_id_mut(&mut self, id: u64) -> Option<&mut BrowseState> {
+        self.tabs.iter_mut().find_map(|t| match &mut t.state {
+            RedisTabState::Browse(b) if t.id == id => Some(&mut **b),
+            _ => None,
+        })
     }
 
     // --- split panes: the pane-routing + split-invariant logic is shared with
@@ -1252,6 +1434,8 @@ impl AppState {
             },
         );
         cx.notify();
+        // Seed the connection's first Browse tab with the auto-refresh default.
+        self.kv_apply_auto_refresh_default(session, cx);
     }
 
     /// The filter box changed via typing (not Enter): wait `FILTER_DEBOUNCE_MS`
@@ -1264,7 +1448,7 @@ impl AppState {
     pub(crate) fn kv_debounce_filter(
         &mut self,
         session: SessionId,
-        pattern: String,
+        text: String,
         cx: &mut Context<Self>,
     ) {
         let Some(active) = self.conn_mut(Some(session)) else {
@@ -1280,13 +1464,16 @@ impl AppState {
                 .timer(Duration::from_millis(FILTER_DEBOUNCE_MS))
                 .await;
             this.update(cx, |this, cx| {
-                let still_current = this
+                // Re-read the mode at fire time so the pattern honors it even if
+                // the user switched modes mid-debounce.
+                let current = this
                     .conn_mut(Some(session))
                     .and_then(|a| a.kv_view.as_ref())
                     .and_then(|v| v.active_browse())
-                    .is_some_and(|b| b.filter_gen == generation);
-                if still_current {
-                    this.kv_restart_scan(session, non_empty(pattern), cx);
+                    .filter(|b| b.filter_gen == generation)
+                    .map(|b| b.mode);
+                if let Some(mode) = current {
+                    this.kv_restart_scan(session, mode.scan_pattern(&text), cx);
                 }
             })
             .ok();
@@ -1452,6 +1639,171 @@ impl AppState {
         }
     }
 
+    /// Open the browse toolbar's actions dropdown at `pos` (Refresh · Expand /
+    /// Collapse all · Auto-refresh). Closes the other positioned menus first.
+    pub(crate) fn kv_open_actions_menu(
+        &mut self,
+        session: SessionId,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            view.tab_menu = None;
+            view.key_menu = None;
+            view.actions_menu = Some(pos);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn kv_close_actions_menu(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            if view.actions_menu.take().is_some() {
+                cx.notify();
+            }
+        }
+    }
+
+    /// Manually refresh the active Browse tab's key list (actions menu / ⌘R).
+    /// Re-runs whatever the current query mode does: a probe in Exact mode, a
+    /// full scan relaunch otherwise (keeping the pattern/type/value filters).
+    pub(crate) fn kv_refresh_keys(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        self.kv_close_actions_menu(session, cx);
+        let info = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .and_then(|v| v.active_browse())
+            .map(|b| (b.mode, b.filter.read(cx).content().to_string()));
+        match info {
+            Some((QueryMode::Exact, text)) => self.kv_probe_exact(session, non_empty(text), cx),
+            Some(_) => self.kv_relaunch_browse(session, cx),
+            None => {}
+        }
+    }
+
+    /// Expand every namespace folder in the active Browse tab's tree view.
+    pub(crate) fn kv_expand_all(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        self.kv_close_actions_menu(session, cx);
+        if let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        {
+            browse.expanded = all_tree_prefixes(&browse.rows);
+            browse.expand_gen = browse.expand_gen.wrapping_add(1);
+        }
+        cx.notify();
+    }
+
+    /// Collapse every namespace folder in the active Browse tab's tree view.
+    pub(crate) fn kv_collapse_all(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        self.kv_close_actions_menu(session, cx);
+        if let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        {
+            if !browse.expanded.is_empty() {
+                browse.expanded.clear();
+                browse.expand_gen = browse.expand_gen.wrapping_add(1);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Set the active Browse tab's auto-refresh interval (`None` = off) and,
+    /// when on, (re-)arm its timer. Driven by the actions-menu Auto-refresh
+    /// options.
+    pub(crate) fn kv_set_auto_refresh(
+        &mut self,
+        session: SessionId,
+        interval: Option<Duration>,
+        cx: &mut Context<Self>,
+    ) {
+        self.kv_close_actions_menu(session, cx);
+        let tab_id = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .and_then(|v| v.tabs.get(v.focused_tab_index()).map(|t| t.id));
+        if let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        {
+            browse.auto_refresh = interval;
+            // Bump the generation so any timer armed under the old interval stops.
+            browse.auto_refresh_gen = browse.auto_refresh_gen.wrapping_add(1);
+        }
+        cx.notify();
+        if interval.is_some() {
+            if let Some(id) = tab_id {
+                self.kv_arm_auto_refresh(session, id, cx);
+            }
+        }
+    }
+
+    /// Apply the `redis.auto_refresh_secs` default to the just-opened active
+    /// Browse tab (called from the tab-creation paths). No-op when the setting
+    /// is off.
+    pub(crate) fn kv_apply_auto_refresh_default(
+        &mut self,
+        session: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(interval) = self.settings.redis.auto_refresh_interval() {
+            self.kv_set_auto_refresh(session, Some(interval), cx);
+        }
+    }
+
+    /// Arm one auto-refresh tick for the Browse tab `tab_id`: after the tab's
+    /// interval elapses, relaunch its scan and re-arm — unless the interval was
+    /// changed/turned off (generation check) or the tab closed. Routed by tab id
+    /// (not the focused tab) so it survives tab switches and split view. An
+    /// Exact-mode tab skips the scan (a single pinned key), but stays armed.
+    fn kv_arm_auto_refresh(&mut self, session: SessionId, tab_id: u64, cx: &mut Context<Self>) {
+        let armed = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.browse_by_tab_id_mut(tab_id))
+            .and_then(|b| b.auto_refresh.map(|i| (i, b.auto_refresh_gen)));
+        let Some((interval, generation)) = armed else {
+            return;
+        };
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            cx.background_executor().timer(interval).await;
+            this.update(cx, |this, cx| {
+                let state = this
+                    .conn_mut(Some(session))
+                    .and_then(|a| a.kv_view.as_ref())
+                    .and_then(|v| v.tabs.iter().find(|t| t.id == tab_id))
+                    .and_then(|t| match &t.state {
+                        RedisTabState::Browse(b) => {
+                            Some((b.auto_refresh, b.auto_refresh_gen, b.mode))
+                        }
+                        _ => None,
+                    });
+                // Superseded (interval changed/off) or the tab is gone: stop.
+                let Some((cur, cur_gen, mode)) = state else {
+                    return;
+                };
+                if cur != Some(interval) || cur_gen != generation {
+                    return;
+                }
+                if mode != QueryMode::Exact {
+                    this.kv_relaunch_tab(session, tab_id, cx);
+                }
+                this.kv_arm_auto_refresh(session, tab_id, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Re-dispatch the browse scan from scratch under a fresh epoch with the
     /// browse's current `pattern` + `type_filter`. Shared by the pattern and
     /// type-filter changes: both mutate one field of the filter state, then
@@ -1466,26 +1818,48 @@ impl AppState {
         else {
             return;
         };
-        let old_epoch = browse.epoch;
-        let new_epoch = crate::result::next_kv_epoch();
-        browse.epoch = new_epoch;
-        browse.rows_mut().clear();
-        browse.evicted = false;
-        browse.cursor = ScanCursor::START;
-        browse.exhausted = false;
-        browse.loading = true;
-        let pattern = browse.pattern.clone();
-        let type_filter = browse.type_filter.as_ref().map(|t| t.label().to_string());
-        let value_needle = browse.value_needle.clone();
-        self.service
-            .send_to(session, Command::CloseResult { epoch: old_epoch });
+        let plan = browse.begin_relaunch();
+        self.kv_dispatch_relaunch(session, plan, cx);
+    }
+
+    /// Like [`Self::kv_relaunch_browse`] but for a specific tab id rather than
+    /// the focused one — the auto-refresh timer's path (see
+    /// [`Self::kv_arm_auto_refresh`]), so a background tab keeps refreshing.
+    fn kv_relaunch_tab(&mut self, session: SessionId, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.browse_by_tab_id_mut(tab_id))
+        else {
+            return;
+        };
+        let plan = browse.begin_relaunch();
+        self.kv_dispatch_relaunch(session, plan, cx);
+    }
+
+    /// Close the superseded scan and dispatch the fresh one described by a
+    /// [`RelaunchPlan`] (from [`BrowseState::begin_relaunch`]). Shared tail of
+    /// both relaunch paths, split out so the `self.service` calls don't overlap
+    /// the `&mut BrowseState` borrow.
+    fn kv_dispatch_relaunch(
+        &mut self,
+        session: SessionId,
+        plan: RelaunchPlan,
+        cx: &mut Context<Self>,
+    ) {
+        self.service.send_to(
+            session,
+            Command::CloseResult {
+                epoch: plan.old_epoch,
+            },
+        );
         self.service.send_to(
             session,
             Command::KvFetchScan {
-                epoch: new_epoch,
-                pattern,
-                type_filter,
-                value_needle,
+                epoch: plan.new_epoch,
+                pattern: plan.pattern,
+                type_filter: plan.type_filter,
+                value_needle: plan.value_needle,
                 cursor: ScanCursor::START,
                 budget: scan_budget(),
             },
@@ -1695,7 +2069,7 @@ impl AppState {
             // keyboard cursor with it to keep it on the same key. Only in the
             // plain scan view, where `visible_rows == rows`; fuzzy mode indexes a
             // re-scored subset, so a rows-delta wouldn't apply there.
-            if !browse.fuzzy {
+            if !browse.is_fuzzy() {
                 if let Some(n) = browse.nav_row.as_mut() {
                     *n = n.saturating_sub(drop);
                 }
@@ -1713,35 +2087,30 @@ impl AppState {
         }
     }
 
-    /// Toggle between the server-side `MATCH` glob filter and client-side
-    /// fuzzy filtering. Turning fuzzy on drops any active glob pattern and
-    /// restarts unfiltered: a glob-filtered pool would silently exclude keys
-    /// the fuzzy query could otherwise have matched.
-    pub(crate) fn kv_toggle_fuzzy(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(active) = self.conn_mut(Some(session)) else {
-            return;
-        };
-        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
-            return;
-        };
-        browse.fuzzy = !browse.fuzzy;
-        let had_pattern = browse.pattern.is_some();
-        let now_fuzzy = browse.fuzzy;
-        // Fuzzy (a name search) and value search are mutually exclusive.
-        if now_fuzzy {
-            browse.value_search = false;
-            browse.value_needle = None;
-        }
-        cx.notify();
-        if now_fuzzy && had_pattern {
-            self.kv_restart_scan(session, None, cx);
+    /// Open or dismiss the query-mode dropdown's option list.
+    pub(crate) fn kv_toggle_mode_menu(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        {
+            browse.mode_open = !browse.mode_open;
+            cx.notify();
         }
     }
 
-    /// Toggle the filter box between key-name matching and value search (see
-    /// [`BrowseState::value_search`]). Clears the other filters and resets the
-    /// scan; the user then types a substring and presses Enter to search values.
-    pub(crate) fn kv_toggle_value_search(&mut self, session: SessionId, cx: &mut Context<Self>) {
+    /// Switch the filter box's query mode (the dropdown at the head of the
+    /// filter bar) and re-apply the current box text under the new meaning:
+    /// `Glob`/`Prefix` restart the scan under a `MATCH` pattern, `Exact` probes a
+    /// single key, and `Fuzzy`/`Value` restart unfiltered (fuzzy filters the
+    /// loaded pool client-side; value search waits for Enter). Always dismisses
+    /// the dropdown.
+    pub(crate) fn kv_set_query_mode(
+        &mut self,
+        session: SessionId,
+        mode: QueryMode,
+        cx: &mut Context<Self>,
+    ) {
         let Some(browse) = self
             .conn_mut(Some(session))
             .and_then(|a| a.kv_view.as_mut())
@@ -1749,14 +2118,104 @@ impl AppState {
         else {
             return;
         };
-        browse.value_search = !browse.value_search;
-        // Entering value search drops the name-based filters (fuzzy + MATCH); the
-        // needle is empty until the user runs one. Leaving it drops the needle.
-        browse.fuzzy = false;
-        browse.pattern = None;
+        browse.mode_open = false;
+        if browse.mode == mode {
+            cx.notify(); // same mode re-picked: just dismiss the dropdown
+            return;
+        }
+        browse.mode = mode;
+        // A mode switch invalidates every mode-specific filter; the arm below
+        // re-derives whichever ones the new mode uses from the box text.
         browse.value_needle = None;
-        browse.filter.update(cx, |ti, cx| ti.set_content("", cx));
-        self.kv_relaunch_browse(session, cx);
+        browse.pattern = None;
+        browse.nav_row = None;
+        let text = browse.filter.read(cx).content().to_string();
+        browse
+            .filter
+            .update(cx, |ti, cx| ti.set_placeholder(mode.placeholder(), cx));
+        match mode {
+            QueryMode::Glob | QueryMode::Prefix => {
+                browse.pattern = mode.scan_pattern(&text);
+                self.kv_relaunch_browse(session, cx);
+            }
+            // Exact resolves a single key directly; no scan.
+            QueryMode::Exact => self.kv_probe_exact(session, non_empty(text), cx),
+            // Fuzzy filters the loaded pool; Value waits for Enter. Either way the
+            // scan itself is unfiltered so the whole keyspace is in play.
+            QueryMode::Fuzzy | QueryMode::Value => self.kv_relaunch_browse(session, cx),
+        }
+    }
+
+    /// Resolve one exact key by name via `probe_key` (bypassing `SCAN`) and show
+    /// it as the sole browse row, or an empty list when it doesn't exist. `None`
+    /// (an empty box) reverts to an unfiltered browse. Used by [`QueryMode::Exact`].
+    pub(crate) fn kv_probe_exact(
+        &mut self,
+        session: SessionId,
+        key: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(key) = key else {
+            // Empty box in Exact mode: fall back to a plain unfiltered browse.
+            self.kv_relaunch_browse(session, cx);
+            return;
+        };
+        let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        else {
+            return;
+        };
+        // Reset to a fresh, empty run under a new epoch so a superseded scan (or
+        // a previous probe) can't land into this one, then await the probe reply.
+        let old_epoch = browse.epoch;
+        let new_epoch = crate::result::next_kv_epoch();
+        browse.epoch = new_epoch;
+        browse.rows_mut().clear();
+        browse.evicted = false;
+        browse.cursor = ScanCursor::START;
+        browse.exhausted = true; // a single probe never paginates
+        browse.loading = true;
+        browse.nav_row = None;
+        self.service
+            .send_to(session, Command::CloseResult { epoch: old_epoch });
+        self.service.send_to(
+            session,
+            Command::KvProbeKey {
+                epoch: new_epoch,
+                key,
+            },
+        );
+        cx.notify();
+    }
+
+    /// `Event::KvKeyProbed`: place the probed key's metadata as the sole row of
+    /// the browse tab that owns `epoch` (or leave it empty when the key doesn't
+    /// exist). Only [`QueryMode::Exact`] issues a probe, so a stray reply for a
+    /// superseded epoch is simply dropped.
+    pub(crate) fn on_kv_key_probed(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: u64,
+        meta: Option<KeyMeta>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(browse) = self
+            .conn_mut(session)
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.browse_by_scan_epoch_mut(epoch))
+        else {
+            return; // superseded probe, or no tab owns this epoch
+        };
+        let rows = browse.rows_mut();
+        rows.clear();
+        if let Some(meta) = meta {
+            rows.push(meta);
+        }
+        browse.exhausted = true;
+        browse.loading = false;
+        cx.notify();
     }
 
     /// Apply (or clear) the value-search needle and relaunch the scan. `None`
@@ -1795,7 +2254,7 @@ impl AppState {
         let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
             return;
         };
-        if !browse.fuzzy || browse.loading || browse.exhausted {
+        if !browse.is_fuzzy() || browse.loading || browse.exhausted {
             return;
         }
         let query = browse.filter.read(cx).content().to_string();
@@ -3830,6 +4289,8 @@ impl AppState {
         sub(&value, cx);
         let score = cx.new(|cx| TextInput::new(cx).with_placeholder("score (e.g. 1.0)"));
         sub(&score, cx);
+        let ttl = cx.new(|cx| TextInput::new(cx).with_placeholder("seconds (optional)"));
+        sub(&ttl, cx);
 
         if let Some(browse) = self
             .conn_mut(Some(session))
@@ -3841,11 +4302,15 @@ impl AppState {
                 field,
                 value,
                 score,
+                ttl,
                 kv_type: KvType::String,
-                type_open: false,
+                list_head: false,
                 error: None,
             });
         }
+        // Focus the name field so the user can type immediately (see
+        // `render.rs`'s `focus_create_key` handling), like the connection form.
+        self.focus_create_key = true;
         cx.notify();
     }
 
@@ -3857,22 +4322,8 @@ impl AppState {
         {
             browse.create_key = None;
         }
-        cx.notify();
-    }
-
-    pub(crate) fn kv_toggle_create_type_menu(
-        &mut self,
-        session: SessionId,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(ck) = self
-            .conn_mut(Some(session))
-            .and_then(|a| a.kv_view.as_mut())
-            .and_then(|v| v.active_browse_mut())
-            .and_then(|b| b.create_key.as_mut())
-        {
-            ck.type_open = !ck.type_open;
-        }
+        // Return focus to the browse from the dismissed modal.
+        self.refocus_root = true;
         cx.notify();
     }
 
@@ -3889,8 +4340,24 @@ impl AppState {
             .and_then(|b| b.create_key.as_mut())
         {
             ck.kv_type = kv_type;
-            ck.type_open = false;
             ck.error = None;
+        }
+        cx.notify();
+    }
+
+    /// Flip a new list's push end (`LPUSH` head ↔ `RPUSH` tail).
+    pub(crate) fn kv_toggle_create_list_head(
+        &mut self,
+        session: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ck) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+            .and_then(|b| b.create_key.as_mut())
+        {
+            ck.list_head = !ck.list_head;
         }
         cx.notify();
     }
@@ -3912,7 +4379,7 @@ impl AppState {
     /// / a bad score report inline (`create_key.error`).
     pub(crate) fn kv_submit_create_key(&mut self, session: SessionId, cx: &mut Context<Self>) {
         use red_core::kv::KvEdit;
-        let Some((epoch, name, kv_type, field, value, score)) = self
+        let Some((epoch, name, kv_type, field, value, score, ttl, list_head)) = self
             .conn_mut(Some(session))
             .and_then(|a| a.kv_view.as_mut())
             .and_then(|v| v.active_browse_mut())
@@ -3926,6 +4393,8 @@ impl AppState {
                     ck.field.read(cx).content().to_string(),
                     ck.value.read(cx).content().to_string(),
                     ck.score.read(cx).content().to_string(),
+                    ck.ttl.read(cx).content().trim().to_string(),
+                    ck.list_head,
                 ))
             })
         else {
@@ -3936,11 +4405,29 @@ impl AppState {
         }
         let key = name.clone();
         let edit = match &kv_type {
-            KvType::String => KvEdit::SetString {
-                key,
-                value,
-                ttl: red_core::kv::StringTtl::Clear,
-            },
+            KvType::String => {
+                // An optional TTL in seconds; blank leaves the key persistent.
+                let ttl = if ttl.is_empty() {
+                    red_core::kv::StringTtl::Clear
+                } else {
+                    let Ok(secs) = ttl.parse::<f64>() else {
+                        return self.kv_set_create_error(
+                            session,
+                            "TTL must be a number of seconds".into(),
+                            cx,
+                        );
+                    };
+                    if secs <= 0.0 {
+                        return self.kv_set_create_error(
+                            session,
+                            "TTL must be greater than zero".into(),
+                            cx,
+                        );
+                    }
+                    red_core::kv::StringTtl::Set(Duration::from_secs_f64(secs))
+                };
+                KvEdit::SetString { key, value, ttl }
+            }
             KvType::Hash => {
                 if field.is_empty() {
                     return self.kv_set_create_error(session, "Field name is required".into(), cx);
@@ -3950,7 +4437,7 @@ impl AppState {
             KvType::List => KvEdit::ListPush {
                 key,
                 value,
-                head: false,
+                head: list_head,
             },
             KvType::Set => {
                 if value.is_empty() {
@@ -3994,6 +4481,9 @@ impl AppState {
         {
             browse.create_key = None;
         }
+        // The modal (and its focused input) is gone; return focus to the root so
+        // keyboard nav keeps working.
+        self.refocus_root = true;
         self.service
             .send_to(session, Command::KvApplyEdit { epoch, edit });
         // Show the freshly created key immediately.
@@ -5003,8 +5493,10 @@ impl AppState {
 
 /// The type column's short label + tint, mirroring `connect.rs`'s
 /// `engine_tint`/`label_color` per-kind lookup style.
-fn type_pill(kv_type: &KvType, theme: &Theme) -> impl IntoElement {
-    let color = match kv_type {
+/// The accent colour for a Redis type, shared by the browse [`type_pill`] and
+/// the New-key modal's segmented type picker so a type reads the same everywhere.
+fn kv_type_color(kv_type: &KvType, theme: &Theme) -> gpui::Hsla {
+    match kv_type {
         KvType::String => theme.blue,
         KvType::Hash => theme.orange,
         KvType::List => theme.green,
@@ -5012,7 +5504,35 @@ fn type_pill(kv_type: &KvType, theme: &Theme) -> impl IntoElement {
         KvType::ZSet => theme.yellow,
         KvType::Stream => theme.cyan,
         KvType::Other(_) => theme.text_muted,
-    };
+    }
+}
+
+/// A one-line description of what creating this type seeds, shown under the type
+/// picker in the New-key modal.
+fn kv_create_hint(kv_type: &KvType) -> &'static str {
+    match kv_type {
+        KvType::String => "A single string value (SET), with an optional expiry.",
+        KvType::Hash => "A hash seeded with one field → value pair (HSET).",
+        KvType::List => "A list seeded with one element (LPUSH / RPUSH).",
+        KvType::Set => "A set seeded with one member (SADD).",
+        KvType::ZSet => "A sorted set seeded with one scored member (ZADD).",
+        KvType::Stream => "A stream seeded with one entry's field → value (XADD).",
+        KvType::Other(_) => "",
+    }
+}
+
+/// The caption for the primary value input, which means something different per
+/// type (a value, a set member, a list element).
+fn kv_value_label(kv_type: &KvType) -> &'static str {
+    match kv_type {
+        KvType::List => "Element",
+        KvType::Set | KvType::ZSet => "Member",
+        _ => "Value",
+    }
+}
+
+fn type_pill(kv_type: &KvType, theme: &Theme) -> impl IntoElement {
+    let color = kv_type_color(kv_type, theme);
     div()
         .px(px(5.))
         .py(px(1.))
@@ -5198,38 +5718,61 @@ impl AppState {
             ""
         };
 
-        let header = if browse.fuzzy {
-            if fuzzy_query.is_empty() {
-                format!("{} keys loaded so far", browse.rows.len())
-            } else {
-                format!(
-                    "{} fuzzy match(es) of {} loaded{}",
-                    rows.len(),
-                    browse.rows.len(),
-                    if browse.exhausted {
-                        ""
-                    } else {
-                        ", still scanning…"
-                    }
-                )
-            }
-        } else {
-            let type_label = browse.type_filter.as_ref().map(|t| t.label());
-            match (&browse.pattern, type_label, db_size) {
-                // No filter at all: the cheap `DBSIZE` header stat.
-                (None, None, Some(n)) => {
-                    format!("~{} keys in db0", crate::result::group_digits(n as usize))
+        let still = |exhausted: bool| if exhausted { "" } else { ", still scanning…" };
+        let header = match browse.mode {
+            QueryMode::Fuzzy => {
+                if fuzzy_query.is_empty() {
+                    format!("{} keys loaded so far", browse.rows.len())
+                } else {
+                    format!(
+                        "{} fuzzy match(es) of {} loaded{}",
+                        rows.len(),
+                        browse.rows.len(),
+                        still(browse.exhausted)
+                    )
                 }
-                (None, None, None) => "counting keys…".into(),
-                // A pattern and/or type filter is active: there's no cheap
-                // filtered count, so report what's loaded so far.
-                (pattern, ty, _) => {
-                    let kind = ty.map(|t| format!("{t} ")).unwrap_or_default();
-                    match pattern {
-                        Some(p) => {
-                            format!("{} {kind}key(s) matching \"{p}\" so far", browse.rows.len())
+            }
+            QueryMode::Exact => {
+                if browse.loading {
+                    "looking up key…".into()
+                } else if fuzzy_query.is_empty() {
+                    "type an exact key name".into()
+                } else if browse.rows.is_empty() {
+                    "no such key".into()
+                } else {
+                    "1 key".into()
+                }
+            }
+            QueryMode::Value => match &browse.value_needle {
+                Some(n) => format!(
+                    "{} key(s) with a value containing \"{n}\"{}",
+                    browse.rows.len(),
+                    still(browse.exhausted)
+                ),
+                None => format!(
+                    "{} keys loaded — type a value substring, then Enter",
+                    browse.rows.len()
+                ),
+            },
+            QueryMode::Glob | QueryMode::Prefix => {
+                let type_label = browse.type_filter.as_ref().map(|t| t.label());
+                match (&browse.pattern, type_label, db_size) {
+                    // No filter at all: the cheap `DBSIZE` header stat.
+                    (None, None, Some(n)) => {
+                        format!("~{} keys in db0", crate::result::group_digits(n as usize))
+                    }
+                    (None, None, None) => "counting keys…".into(),
+                    // A pattern and/or type filter is active: there's no cheap
+                    // filtered count, so report what's loaded so far.
+                    (pattern, ty, _) => {
+                        let kind = ty.map(|t| format!("{t} ")).unwrap_or_default();
+                        match pattern {
+                            Some(p) => format!(
+                                "{} {kind}key(s) matching \"{p}\" so far",
+                                browse.rows.len()
+                            ),
+                            None => format!("{} {kind}key(s) so far", browse.rows.len()),
                         }
-                        None => format!("{} {kind}key(s) so far", browse.rows.len()),
                     }
                 }
             }
@@ -5240,7 +5783,6 @@ impl AppState {
         // in grid mode it's the raw key rows (no per-row allocation — the flat
         // grid's hot path). `disp` is `Some` only in tree mode.
         let tree_mode = browse.tree_mode;
-        let value_search = browse.value_search;
         let disp: Option<Rc<Vec<DispRow>>> = tree_mode.then(|| browse.tree_rows(&rows));
         let row_count = match &disp {
             Some(d) => d.len(),
@@ -5494,19 +6036,60 @@ impl AppState {
                 })
         });
 
-        let create_popover = browse
-            .create_key
-            .as_ref()
-            .map(|ck| self.render_kv_create_popover(session, ck, &theme, cx));
+        // The actions dropdown: Refresh · Expand/Collapse all · Auto-refresh.
+        // A button-shaped trigger (styled like the Secondary buttons) that opens
+        // a positioned `ContextMenu`; tinted + clock-badged while auto-refresh is
+        // on, so the toolbar shows the tab is live-refreshing.
+        let auto_on = browse.auto_refresh.is_some();
+        let actions_view = view.clone();
+        let actions_button = div()
+            .id("kv-actions-btn")
+            .flex()
+            .items_center()
+            .gap_1()
+            .h(px(24.))
+            .px_2()
+            .rounded(px(5.))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.bg_elevated)
+            .text_size(theme.scale(12.))
+            .text_color(if auto_on {
+                theme.accent
+            } else {
+                theme.text_muted
+            })
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.bg_hover))
+            .when(auto_on, |s| {
+                s.child(crate::icons::icon("clock", theme.scale(12.), theme.accent))
+            })
+            .child("Actions")
+            .child(crate::icons::icon(
+                "chevron-down",
+                theme.scale(12.),
+                theme.text_muted,
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                move |event: &gpui::MouseDownEvent, _, cx| {
+                    let pos = event.position;
+                    actions_view
+                        .update(cx, |this, cx| this.kv_open_actions_menu(session, pos, cx))
+                        .ok();
+                },
+            );
 
         // An empty key list gets a settled message instead of a blank grid, so
         // "no matches" reads as deliberate (mirrors the other panels' empties).
         let has_filter = browse.pattern.is_some()
             || browse.type_filter.is_some()
             || browse.value_needle.is_some()
-            || (browse.fuzzy && !fuzzy_query.is_empty());
+            || (browse.is_fuzzy() && !fuzzy_query.is_empty());
         let empty_msg = if browse.loading {
             "Scanning…"
+        } else if browse.mode == QueryMode::Exact && !fuzzy_query.is_empty() {
+            "No key with that exact name"
         } else if browse.value_needle.is_some() {
             "No string values match this search"
         } else if has_filter {
@@ -5571,31 +6154,41 @@ impl AppState {
                     .px_2()
                     .pt_2()
                     .pb_1()
-                    .child(div().flex_1().min_w(px(120.)).child(browse.filter.clone()))
                     .child({
-                        let fuzzy_view = view.clone();
-                        let fuzzy = browse.fuzzy;
-                        IconButton::new(
-                            "kv-fuzzy-toggle",
-                            crate::icons::icon(
-                                "sparkles",
-                                theme.scale(14.),
-                                if fuzzy { theme.accent } else { theme.text_muted },
-                            ),
-                        )
-                        .size(IconButtonSize::Sm)
-                        .tooltip(if fuzzy {
-                            "Fuzzy search (on): searches loaded keys and keeps scanning until enough match"
-                        } else {
-                            "Switch to fuzzy search"
-                        })
-                        .a11y_label("Toggle fuzzy search")
-                        .on_click(move |_, _, cx| {
-                            fuzzy_view
-                                .update(cx, |this, cx| this.kv_toggle_fuzzy(session, cx))
-                                .ok();
-                        })
+                        // Query-mode dropdown at the head of the filter bar: how
+                        // the box text is interpreted (Glob / Prefix / Exact /
+                        // Fuzzy / Value). Replaces the old separate fuzzy and
+                        // value-search toggles with one explicit control.
+                        let toggle_view = view.clone();
+                        let select_view = view.clone();
+                        let selected_ix = QueryMode::ALL
+                            .iter()
+                            .position(|m| *m == browse.mode)
+                            .unwrap_or(0);
+                        let mut select = Select::new("kv-query-mode").accent(false);
+                        for m in QueryMode::ALL.iter() {
+                            select = select.option(m.label().to_string());
+                        }
+                        select
+                            .selected(selected_ix)
+                            .open(browse.mode_open)
+                            .on_toggle(move |_, cx| {
+                                toggle_view
+                                    .update(cx, |this, cx| this.kv_toggle_mode_menu(session, cx))
+                                    .ok();
+                            })
+                            .on_select(move |ix, _, cx| {
+                                let Some(mode) = QueryMode::ALL.get(ix).copied() else {
+                                    return;
+                                };
+                                select_view
+                                    .update(cx, |this, cx| {
+                                        this.kv_set_query_mode(session, mode, cx)
+                                    })
+                                    .ok();
+                            })
                     })
+                    .child(div().flex_1().min_w(px(120.)).child(browse.filter.clone()))
                     .child({
                         // Namespace tree ↔ flat grid view toggle. Groups keys by
                         // their `:` hierarchy without a re-scan.
@@ -5605,7 +6198,11 @@ impl AppState {
                             crate::icons::icon(
                                 "schema",
                                 theme.scale(14.),
-                                if tree_mode { theme.accent } else { theme.text_muted },
+                                if tree_mode {
+                                    theme.accent
+                                } else {
+                                    theme.text_muted
+                                },
                             ),
                         )
                         .size(IconButtonSize::Sm)
@@ -5618,35 +6215,6 @@ impl AppState {
                         .on_click(move |_, _, cx| {
                             tree_view
                                 .update(cx, |this, cx| this.kv_toggle_tree_mode(session, cx))
-                                .ok();
-                        })
-                    })
-                    .child({
-                        // Value search: the filter box matches key *values* (a
-                        // server-read substring) instead of key names. Enter runs it.
-                        let value_view = view.clone();
-                        IconButton::new(
-                            "kv-value-search-toggle",
-                            crate::icons::icon(
-                                "search",
-                                theme.scale(14.),
-                                if value_search {
-                                    theme.accent
-                                } else {
-                                    theme.text_muted
-                                },
-                            ),
-                        )
-                        .size(IconButtonSize::Sm)
-                        .tooltip(if value_search {
-                            "Value search (on): type a substring, Enter to search string values"
-                        } else {
-                            "Search key values instead of names"
-                        })
-                        .a11y_label("Toggle value search")
-                        .on_click(move |_, _, cx| {
-                            value_view
-                                .update(cx, |this, cx| this.kv_toggle_value_search(session, cx))
                                 .ok();
                         })
                     })
@@ -5701,119 +6269,234 @@ impl AppState {
                             .child(header),
                     )
                     .children(new_key_button)
-                    .child(big_keys_button),
+                    .child(big_keys_button)
+                    .child(actions_button),
             )
             .child(main)
-            .children(create_popover)
     }
 
-    /// The "New key" popover card: name, a type dropdown, and the per-type seed
-    /// inputs (a hash field, a zset score), over a panel-wide backdrop that
-    /// dismisses on an outside click — the browse-level twin of
-    /// [`kv_edit_popover`].
-    fn render_kv_create_popover(
+    /// The "New key" modal (Flint [`Modal`] over a scrim): a name, a segmented
+    /// type picker, and the seed inputs the form shows/hides as the type changes
+    /// (a hash/stream field, a zset score, a string TTL, a list push end).
+    /// Rendered at the window root (see `app::render`) so it overlays the whole
+    /// shell; `None` when no browse tab has it open. Its writes reuse the same
+    /// [`KvEdit`](red_core::kv::KvEdit) path as inline element editing (see
+    /// [`AppState::kv_submit_create_key`]).
+    pub(crate) fn render_kv_create_modal(
         &self,
-        session: SessionId,
-        ck: &CreateKeyState,
-        theme: &Theme,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let view = cx.entity().downgrade();
-        let (save_view, cancel_view, backdrop_view) = (view.clone(), view.clone(), view.clone());
-        let (toggle_view, select_view) = (view.clone(), view.clone());
+    ) -> Option<gpui::AnyElement> {
+        use crate::connect::labeled_field;
 
+        let Phase::Connected(active) = &self.phase else {
+            return None;
+        };
+        let session = active.session;
+        let ck = active
+            .kv_view
+            .as_ref()?
+            .active_browse()?
+            .create_key
+            .as_ref()?;
+        let theme = cx.theme().clone();
+        let view = cx.entity().downgrade();
+
+        // Segmented type picker: choosing a type reshapes the fields below.
         let types = kv_creatable_types();
         let selected_ix = types.iter().position(|t| *t == ck.kv_type).unwrap_or(0);
-        let mut type_select = Select::new("kv-create-type").accent(false);
-        for t in types.iter() {
-            type_select = type_select.option(t.label().to_string());
-        }
-        let type_select = type_select
-            .selected(selected_ix)
-            .open(ck.type_open)
-            .on_toggle(move |_, cx| {
-                toggle_view
-                    .update(cx, |this, cx| this.kv_toggle_create_type_menu(session, cx))
-                    .ok();
+        let type_view = view.clone();
+        let type_picker = types
+            .iter()
+            .fold(Segmented::new("kv-create-type"), |seg, t| {
+                seg.segment(t.label().to_string())
             })
+            .selected(selected_ix)
             .on_select(move |ix, _, cx| {
                 let choice = kv_creatable_types()
                     .into_iter()
                     .nth(ix)
                     .unwrap_or(KvType::String);
-                select_view
+                type_view
                     .update(cx, |this, cx| this.kv_set_create_type(session, choice, cx))
                     .ok();
             });
+        let hint = div()
+            .text_size(theme.scale(11.))
+            .text_color(theme.text_muted)
+            .child(kv_create_hint(&ck.kv_type));
 
-        // Hash and Stream both take a field name for the first field/value pair.
+        // Per-type conditional fields.
         let show_field = matches!(ck.kv_type, KvType::Hash | KvType::Stream);
         let show_score = matches!(ck.kv_type, KvType::ZSet);
+        let show_ttl = matches!(ck.kv_type, KvType::String);
+        let list_end = matches!(ck.kv_type, KvType::List).then(|| {
+            let head = ck.list_head;
+            let toggle_view = view.clone();
+            labeled_field("Push to", &theme).child(
+                Segmented::new("kv-create-list-end")
+                    .segment("Head (LPUSH)")
+                    .segment("Tail (RPUSH)")
+                    .selected(if head { 0 } else { 1 })
+                    .on_select(move |ix, _, cx| {
+                        // Each segment sets its end; only flip when it changes.
+                        if (ix == 0) != head {
+                            toggle_view
+                                .update(cx, |this, cx| this.kv_toggle_create_list_head(session, cx))
+                                .ok();
+                        }
+                    }),
+            )
+        });
+        let error_line = ck.error.clone().map(|e| {
+            div()
+                .text_size(theme.scale(11.))
+                .text_color(theme.red)
+                .child(e)
+        });
 
-        let card = div()
-            .occlude()
-            .w(px(300.))
+        let body = div()
             .flex()
             .flex_col()
+            .gap_3()
+            .child(labeled_field("Key name", &theme).child(ck.name.clone()))
+            .child(labeled_field("Type", &theme).child(type_picker).child(hint))
+            .children(show_field.then(|| labeled_field("Field", &theme).child(ck.field.clone())))
+            .child(labeled_field(kv_value_label(&ck.kv_type), &theme).child(ck.value.clone()))
+            .children(show_score.then(|| labeled_field("Score", &theme).child(ck.score.clone())))
+            .children(show_ttl.then(|| labeled_field("Expiry (TTL)", &theme).child(ck.ttl.clone())))
+            .children(list_end)
+            .children(error_line);
+
+        let (save_view, cancel_view, close_view) = (view.clone(), view.clone(), view.clone());
+        let footer = div()
+            .flex()
+            .flex_1()
+            .justify_end()
             .gap_2()
-            .p_3()
-            .bg(theme.bg_elevated)
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md()
-            .shadow_lg()
             .child(
-                div()
-                    .text_size(theme.scale(10.5))
-                    .text_color(theme.text_muted)
-                    .child("New key"),
+                Button::new("kv-create-cancel", "Cancel")
+                    .variant(ButtonVariant::Secondary)
+                    .size(ButtonSize::Sm)
+                    .on_click(move |_, _, cx| {
+                        cancel_view
+                            .update(cx, |this, cx| this.kv_cancel_create_key(session, cx))
+                            .ok();
+                    }),
             )
-            .child(ck.name.clone())
-            .child(type_select)
-            .children(show_field.then(|| ck.field.clone()))
-            .child(ck.value.clone())
-            .children(show_score.then(|| ck.score.clone()))
-            .children(ck.error.clone().map(|e| {
-                div()
-                    .text_size(theme.scale(10.))
-                    .text_color(theme.red)
-                    .child(e)
-            }))
             .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        Button::new("kv-create-save", "Create")
-                            .variant(ButtonVariant::Primary)
-                            .size(ButtonSize::Sm)
-                            .on_click(move |_, _, cx| {
-                                save_view
-                                    .update(cx, |this, cx| this.kv_submit_create_key(session, cx))
-                                    .ok();
-                            }),
-                    )
-                    .child(
-                        Button::new("kv-create-cancel", "Cancel")
-                            .variant(ButtonVariant::Secondary)
-                            .size(ButtonSize::Sm)
-                            .on_click(move |_, _, cx| {
-                                cancel_view
-                                    .update(cx, |this, cx| this.kv_cancel_create_key(session, cx))
-                                    .ok();
-                            }),
-                    ),
+                Button::new("kv-create-save", "Create")
+                    .variant(ButtonVariant::Primary)
+                    .size(ButtonSize::Sm)
+                    .on_click(move |_, _, cx| {
+                        save_view
+                            .update(cx, |this, cx| this.kv_submit_create_key(session, cx))
+                            .ok();
+                    }),
             );
+
+        Some(
+            Modal::new("kv-create-key")
+                .title("New key")
+                .width(px(440.))
+                // The shared modal focus handle traps Tab and lets Esc close; the
+                // name field is focused on open (see `focus_create_key`).
+                .focus_handle(self.modal_focus.clone())
+                .on_close(move |_, cx| {
+                    close_view
+                        .update(cx, |this, cx| this.kv_cancel_create_key(session, cx))
+                        .ok();
+                })
+                .footer(footer)
+                .child(body)
+                .into_any_element(),
+        )
+    }
+
+    /// The browse toolbar's actions dropdown (see [`AppState::kv_open_actions_menu`]):
+    /// Refresh keys · Expand / Collapse all (tree mode) · an Auto-refresh submenu.
+    /// A positioned `ContextMenu` over a full-bleed dismiss catcher, mirroring the
+    /// tab/key menus.
+    pub(crate) fn render_kv_actions_menu(
+        &self,
+        active: &ActiveConn,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let session = active.session;
+        let browse = active.kv_view.as_ref().and_then(|v| v.active_browse());
+        let tree_mode = browse.map(|b| b.tree_mode).unwrap_or(false);
+        // Expand-all is meaningless without namespaced keys (a `:` to group on).
+        let has_folders = browse
+            .map(|b| b.rows.iter().any(|m| m.key.contains(':')))
+            .unwrap_or(false);
+        let auto = browse.and_then(|b| b.auto_refresh);
+
+        // Auto-refresh submenu: Off + the interval presets, a ✓ on the active one.
+        let mut submenu = Submenu::new("kv-auto-refresh", "Auto-refresh").item({
+            let off = ContextMenuItem::new("kv-auto-off", "Off").on_click(
+                cx.listener(move |this, _, _, cx| this.kv_set_auto_refresh(session, None, cx)),
+            );
+            if auto.is_none() {
+                off.shortcut("✓")
+            } else {
+                off
+            }
+        });
+        for secs in [2u64, 5, 10, 30] {
+            let dur = Duration::from_secs(secs);
+            let item = ContextMenuItem::new(
+                SharedString::from(format!("kv-auto-{secs}")),
+                SharedString::from(format!("Every {secs}s")),
+            )
+            .on_click(
+                cx.listener(move |this, _, _, cx| this.kv_set_auto_refresh(session, Some(dur), cx)),
+            );
+            submenu = submenu.item(if auto == Some(dur) {
+                item.shortcut("✓")
+            } else {
+                item
+            });
+        }
+
+        let menu = ContextMenu::new("kv-actions-menu")
+            .item(
+                ContextMenuItem::new("kv-act-refresh", "Refresh keys")
+                    .shortcut(crate::keymap::localize_hint("⌘R"))
+                    .on_click(cx.listener(move |this, _, _, cx| this.kv_refresh_keys(session, cx))),
+            )
+            .separator()
+            .item(
+                ContextMenuItem::new("kv-act-expand", "Expand all")
+                    .disabled(!tree_mode || !has_folders)
+                    .on_click(cx.listener(move |this, _, _, cx| this.kv_expand_all(session, cx))),
+            )
+            .item(
+                ContextMenuItem::new("kv-act-collapse", "Collapse all")
+                    .disabled(!tree_mode)
+                    .on_click(cx.listener(move |this, _, _, cx| this.kv_collapse_all(session, cx))),
+            )
+            .separator()
+            .submenu(submenu);
 
         div()
             .absolute()
             .inset_0()
-            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                backdrop_view
-                    .update(cx, |this, cx| this.kv_cancel_create_key(session, cx))
-                    .ok();
-            })
-            .child(floating(card).offset(point(px(8.), px(40.))))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.kv_close_actions_menu(session, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| this.kv_close_actions_menu(session, cx)),
+            )
+            .child(
+                div()
+                    .occlude()
+                    .absolute()
+                    .left(pos.x)
+                    .top(pos.y)
+                    .child(menu),
+            )
             .into_any_element()
     }
 
@@ -8002,6 +8685,40 @@ mod tests {
     }
 
     #[test]
+    fn glob_escape_neutralizes_scan_metacharacters() {
+        // A literal prefix containing glob metachars must match them literally.
+        assert_eq!(glob_escape("user:*"), "user:\\*");
+        assert_eq!(glob_escape("a?b[c]\\d"), "a\\?b\\[c\\]\\\\d");
+        // Plain text is untouched.
+        assert_eq!(glob_escape("user:1"), "user:1");
+    }
+
+    #[test]
+    fn query_mode_scan_pattern_per_mode() {
+        // Glob passes the box text through verbatim (the user writes the glob).
+        assert_eq!(
+            QueryMode::Glob.scan_pattern("user:*"),
+            Some("user:*".to_string())
+        );
+        // Prefix appends `*` and escapes any metachars in the literal prefix.
+        assert_eq!(
+            QueryMode::Prefix.scan_pattern("user:"),
+            Some("user:*".to_string())
+        );
+        assert_eq!(
+            QueryMode::Prefix.scan_pattern("a*b"),
+            Some("a\\*b*".to_string())
+        );
+        // Exact/Fuzzy/Value don't scan by pattern.
+        assert_eq!(QueryMode::Exact.scan_pattern("user:1"), None);
+        assert_eq!(QueryMode::Fuzzy.scan_pattern("usr"), None);
+        assert_eq!(QueryMode::Value.scan_pattern("hello"), None);
+        // An empty box never yields a pattern, in any mode.
+        assert_eq!(QueryMode::Glob.scan_pattern(""), None);
+        assert_eq!(QueryMode::Prefix.scan_pattern(""), None);
+    }
+
+    #[test]
     fn build_tree_groups_by_colon_and_honors_expansion() {
         let rows = vec![
             key_meta("user:1:name"),
@@ -8030,6 +8747,28 @@ mod tests {
         assert!(opened
             .iter()
             .any(|r| matches!(r, DispRow::Folder { prefix, .. } if prefix == "user:1")));
+    }
+
+    #[test]
+    fn all_tree_prefixes_are_every_strict_ancestor() {
+        let rows = vec![
+            key_meta("user:1:name"),
+            key_meta("user:2:name"),
+            key_meta("session:abc"),
+            key_meta("flat"),
+        ];
+        let prefixes = all_tree_prefixes(&rows);
+        // Strict ancestors only: `user`, `user:1`, `user:2`, `session`. A key with
+        // no `:` ("flat") and the full keys themselves are never folders.
+        let mut got: Vec<String> = prefixes.into_iter().collect();
+        got.sort();
+        assert_eq!(got, ["session", "user", "user:1", "user:2"]);
+        // Expanding all these opens every folder `build_tree` would create.
+        let mut expanded = HashSet::new();
+        expanded.extend(all_tree_prefixes(&rows));
+        assert!(!build_tree(&rows, &expanded)
+            .iter()
+            .any(|r| matches!(r, DispRow::Folder { expanded, .. } if !*expanded)));
     }
 
     #[test]

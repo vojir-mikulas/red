@@ -1137,6 +1137,7 @@ fn keystroke_glyphs(keystroke: &str) -> String {
 
 fn behavior_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     let theme = cx.theme().clone();
+    let view = cx.entity();
 
     let restore = Toggle::new(
         "set-restore-last-session",
@@ -1144,15 +1145,46 @@ fn behavior_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     )
     .on_change(cx.listener(|this, on: &bool, _, cx| this.set_restore_last_session(*on, cx)));
 
+    // Redis key auto-refresh default for new Browse tabs (0 = off). A preset
+    // segmented like the AI resource guards; a hand-edited off-preset value shows
+    // no selection rather than snapping.
+    const REFRESH_PRESETS: [u64; 5] = [0, 2, 5, 10, 30];
+    let refresh_sel = REFRESH_PRESETS
+        .iter()
+        .position(|&n| n == state.settings.redis.auto_refresh_secs)
+        .unwrap_or(usize::MAX);
+    let refresh_view = view.clone();
+    let redis_refresh = Segmented::new("set-redis-auto-refresh")
+        .segment("Off")
+        .segment("2s")
+        .segment("5s")
+        .segment("10s")
+        .segment("30s")
+        .selected(refresh_sel)
+        .on_select(move |ix, _, cx| {
+            let n = REFRESH_PRESETS[ix.min(REFRESH_PRESETS.len() - 1)];
+            refresh_view.update(cx, |this, cx| this.set_redis_auto_refresh_secs(n, cx));
+        });
+
     settings_page_scaffold(
         "Behavior",
-        div().flex().flex_col().child(setting_row(
-            "Restore last session",
-            "Reconnect to the most recently used connection on launch (credentials \
-             come from the keychain). Takes effect next launch.",
-            restore,
-            &theme,
-        )),
+        div()
+            .flex()
+            .flex_col()
+            .child(setting_row(
+                "Restore last session",
+                "Reconnect to the most recently used connection on launch (credentials \
+                 come from the keychain). Takes effect next launch.",
+                restore,
+                &theme,
+            ))
+            .child(setting_row(
+                "Redis: auto-refresh keys",
+                "How often a new Redis key-browser tab re-scans the keyspace. Off by \
+                 default; change it for an open tab from the browser's actions menu.",
+                redis_refresh,
+                &theme,
+            )),
         &theme,
     )
     .into_any_element()

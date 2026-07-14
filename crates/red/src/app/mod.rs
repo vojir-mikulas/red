@@ -1573,6 +1573,10 @@ pub struct AppState {
     /// field so the user can type straightaway (the form's `Window`-less opener
     /// can't focus directly).
     pub(crate) focus_name_field: bool,
+    /// Set when the Redis "New key" modal just opened: the next render focuses its
+    /// name field (the `Window`-less opener can't focus directly), like
+    /// `focus_name_field` for the connection form.
+    pub(crate) focus_create_key: bool,
     /// Set when the history popover just opened: the next render focuses it so its
     /// arrow-key navigation works.
     pub(crate) focus_history: bool,
@@ -2304,6 +2308,7 @@ impl AppState {
             },
             pending_focus: None,
             focus_name_field: false,
+            focus_create_key: false,
             focus_history: false,
             focus_search: false,
             focus_filter: false,
@@ -2679,10 +2684,9 @@ impl AppState {
             Event::KvDbSizeReady { epoch, count } => {
                 self.on_kv_db_size(session, epoch, count, cx);
             }
-            Event::KvKeyProbed { .. } => {
-                // Exact-key jump has no UI trigger yet (deferred past this R1
-                // slice); the command/event round-trip is wired and tested
-                // end to end at the driver layer, just not surfaced here.
+            Event::KvKeyProbed { epoch, meta, .. } => {
+                // The Exact query mode's single-key jump (see `kv_probe_exact`).
+                self.on_kv_key_probed(session, epoch, meta, cx);
             }
             Event::KvValueReady { key, value, .. } => {
                 self.on_kv_value_ready(session, key, value, cx);
@@ -3016,6 +3020,20 @@ impl AppState {
             || self.settings_open
             || self.form.is_some()
             || self.import_wizard.is_some()
+            || self.kv_create_key_open()
+    }
+
+    /// Whether the Redis "New key" modal is open on the active browse tab (a
+    /// keyboard-focused modal, so it joins `any_modal_open`'s focus-trap set).
+    pub(crate) fn kv_create_key_open(&self) -> bool {
+        let Phase::Connected(active) = &self.phase else {
+            return false;
+        };
+        active
+            .kv_view
+            .as_ref()
+            .and_then(|v| v.active_browse())
+            .is_some_and(|b| b.create_key.is_some())
     }
 
     /// Open or close the keyboard-shortcuts overlay (`⌘/` / palette command).

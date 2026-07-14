@@ -34,6 +34,7 @@ pub struct Settings {
     pub behavior: BehaviorSettings,
     pub update: UpdateSettings,
     pub ai: AiSettings,
+    pub redis: RedisSettings,
 }
 
 // --- appearance --------------------------------------------------------------
@@ -287,6 +288,29 @@ impl QuerySettings {
 #[serde(default)]
 pub struct BehaviorSettings {
     pub restore_last_session: bool,
+}
+
+// --- redis -------------------------------------------------------------------
+
+/// Redis key-browser behaviour. `auto_refresh_secs` is the interval a new Browse
+/// tab starts auto-refreshing its key scan at (`0` = off, the default); it can
+/// be changed per-tab from the browse toolbar's actions menu. Clamped to a small
+/// floor by [`Self::auto_refresh_interval`] so a hand-edited tiny value can't
+/// turn the scan into a tight loop.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RedisSettings {
+    pub auto_refresh_secs: u64,
+}
+
+impl RedisSettings {
+    /// The default auto-refresh interval as a `Duration`, or `None` when off
+    /// (`0`). A non-zero value is clamped to a 1-second floor so a stray tiny
+    /// setting can't spin the scanner.
+    pub fn auto_refresh_interval(&self) -> Option<std::time::Duration> {
+        (self.auto_refresh_secs > 0)
+            .then(|| std::time::Duration::from_secs(self.auto_refresh_secs.max(1)))
+    }
 }
 
 // --- update ------------------------------------------------------------------
@@ -636,6 +660,7 @@ impl FileSettingsStore {
             behavior: section(&value, "behavior", &mut warnings),
             update: section(&value, "update", &mut warnings),
             ai: ai_section(&value, &mut warnings),
+            redis: section(&value, "redis", &mut warnings),
         };
         let migrated = apply_legacy(&mut settings, &value);
 

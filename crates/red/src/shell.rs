@@ -1767,6 +1767,11 @@ impl AppState {
             .as_ref()
             .and_then(|v| v.annotate.as_ref())
             .map(|ann| self.render_kv_annotate(active, ann, cx));
+        let actions_menu = active
+            .kv_view
+            .as_ref()
+            .and_then(|v| v.actions_menu)
+            .map(|pos| self.render_kv_actions_menu(active, pos, cx));
 
         // Optional left History dock (⌘Y), mirroring the SQL shell's history
         // dock: a leading resizable SplitPane over the work area.
@@ -1983,6 +1988,7 @@ impl AppState {
             .children(menu)
             .children(key_menu)
             .children(annotate)
+            .children(actions_menu)
     }
 
     /// The work area right of the schema dock: a single editor/result pane, or,

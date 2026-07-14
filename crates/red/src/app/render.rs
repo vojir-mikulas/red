@@ -188,6 +188,22 @@ impl Render for AppState {
             window.focus(&self.name_input.focus_handle(cx), cx);
         }
 
+        // The Redis "New key" modal just opened; focus its name field.
+        if self.focus_create_key {
+            self.focus_create_key = false;
+            if let Phase::Connected(active) = &self.phase {
+                if let Some(name) = active
+                    .kv_view
+                    .as_ref()
+                    .and_then(|v| v.active_browse())
+                    .and_then(|b| b.create_key.as_ref())
+                    .map(|ck| ck.name.clone())
+                {
+                    window.focus(&name.focus_handle(cx), cx);
+                }
+            }
+        }
+
         // The history popover just opened: focus it so its arrow keys work.
         if self.focus_history {
             self.focus_history = false;
@@ -474,7 +490,7 @@ impl Render for AppState {
             .on_action(
                 cx.listener(|this, _: &ToggleColumnsPanel, _, cx| this.toggle_columns_panel(cx)),
             )
-            .on_action(cx.listener(|this, _: &RefreshSchema, _, _| this.refresh_schema()))
+            .on_action(cx.listener(|this, _: &RefreshSchema, _, cx| this.refresh_active(cx)))
             .on_action(cx.listener(|this, _: &SearchSchema, _, cx| {
                 this.focus_search = true;
                 cx.notify();
@@ -623,6 +639,9 @@ impl Render for AppState {
             // phase (the welcome screen *and* the connected shell, e.g. opened from
             // the switcher's "New connection…").
             .children(self.form.as_ref().map(|f| self.render_form(f, cx)))
+            // The Redis "New key" modal, rooted here so it overlays the whole
+            // shell (not just the browse pane) like the other modals.
+            .children(self.render_kv_create_modal(cx))
             // The palette renders its own full-screen overlay; last = on top.
             .children(self.palette.as_ref().map(|(p, _)| p.clone()))
             // The result-grid dropdowns (cell / export / more) mount here, above

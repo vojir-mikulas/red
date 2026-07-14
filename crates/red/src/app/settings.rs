@@ -804,6 +804,15 @@ impl AppState {
         cx.notify();
     }
 
+    /// The default Redis key auto-refresh interval for new Browse tabs, in
+    /// seconds (`0` = off). Persisted; applies to tabs opened afterwards, not
+    /// retroactively to open ones (change those from the browse actions menu).
+    pub(crate) fn set_redis_auto_refresh_secs(&mut self, secs: u64, cx: &mut Context<Self>) {
+        self.settings.redis.auto_refresh_secs = secs;
+        self.save_settings();
+        cx.notify();
+    }
+
     // --- settings: AI assistant ---
 
     /// Re-push the full AI config to the backend so a knob change (tier, limits,

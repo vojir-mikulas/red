@@ -1354,8 +1354,9 @@ fn field_error_line(theme: &Theme, message: Option<&str>) -> Option<gpui::Div> {
     })
 }
 
-/// A small uppercase field caption, matching the design's form labels.
-fn field_label(text: impl Into<String>, theme: &Theme) -> impl IntoElement {
+/// A small uppercase field caption, matching the design's form labels. Shared
+/// with the Redis "New key" modal (`kvbrowse`).
+pub(crate) fn field_label(text: impl Into<String>, theme: &Theme) -> impl IntoElement {
     div()
         .text_size(theme.scale(10.5))
         .font_weight(FontWeight::MEDIUM)
@@ -1363,8 +1364,9 @@ fn field_label(text: impl Into<String>, theme: &Theme) -> impl IntoElement {
         .child(text.into().to_uppercase())
 }
 
-/// A labeled form field column: the caption above its control (passed as a child).
-fn labeled_field(label: impl Into<String>, theme: &Theme) -> gpui::Div {
+/// A labeled form field column: the caption above its control (passed as a
+/// child). Shared with the Redis "New key" modal (`kvbrowse`).
+pub(crate) fn labeled_field(label: impl Into<String>, theme: &Theme) -> gpui::Div {
     div()
         .flex()
         .flex_col()
