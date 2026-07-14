@@ -1800,6 +1800,64 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 });
             }
 
+            Command::KvImport { epoch, commands } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                // A read-only connection can't import (every command that writes
+                // would be refused anyway); reject the whole batch up front.
+                if state.read_only {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("this connection is read-only".into()),
+                    );
+                    continue;
+                }
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    // Sequential so dependent commands (e.g. HSET after DEL) keep
+                    // their file order; the read/write gate + classifier apply
+                    // per command via `driver.command`.
+                    let (mut ok, mut failed) = (0usize, 0usize);
+                    let mut first_error = None;
+                    for argv in &commands {
+                        if argv.is_empty() {
+                            continue;
+                        }
+                        match driver.command(argv).await {
+                            Ok(_) => ok += 1,
+                            Err(e) => {
+                                failed += 1;
+                                if first_error.is_none() {
+                                    first_error = Some(format!("{}: {e}", argv.join(" ")));
+                                }
+                            }
+                        }
+                    }
+                    emit(
+                        &events,
+                        session_id,
+                        Event::KvImportDone {
+                            epoch,
+                            ok,
+                            failed,
+                            first_error,
+                        },
+                    );
+                });
+            }
+
             Command::KvApplyEdit { epoch, edit } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get_mut(&id) else {

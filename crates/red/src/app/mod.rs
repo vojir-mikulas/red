@@ -2128,7 +2128,7 @@ impl AppState {
 
         // The connection-form engine dropdown. Unlike the appearance combos its
         // option list is static (every `DbKind`), so it's filled once here; each
-        // row carries the engine's tint dot via `set_leading`, keyed by the option
+        // row carries the engine's brand glyph via `set_leading`, keyed by the option
         // index — which matches `DbKind::all` order. Full-width so it lines up with
         // the form's other inputs. `refresh_engine_combo` re-selects the current
         // engine when a form opens or its engine changes (e.g. a pasted DSN).
@@ -2139,7 +2139,8 @@ impl AppState {
             c.set_leading(
                 |ix, app| {
                     let kind = red_core::DbKind::all().get(ix).copied().unwrap_or_default();
-                    crate::connect::engine_dot(kind, app.theme()).into_any_element()
+                    crate::connect::engine_glyph(kind, gpui::px(14.), app.theme())
+                        .into_any_element()
                 },
                 cx,
             );
@@ -2751,6 +2752,14 @@ impl AppState {
             Event::KvKeysCopied { copied, failed } => {
                 self.on_kv_keys_copied(copied, failed, cx);
             }
+            Event::KvImportDone {
+                ok,
+                failed,
+                first_error,
+                ..
+            } => {
+                self.on_kv_import_done(session, ok, failed, first_error, cx);
+            }
             Event::KvMessage {
                 epoch,
                 channel,
@@ -3021,6 +3030,15 @@ impl AppState {
             || self.form.is_some()
             || self.import_wizard.is_some()
             || self.kv_create_key_open()
+            || self.kv_import_open()
+    }
+
+    /// Whether the Redis "Import keys" modal is open on the active connection.
+    pub(crate) fn kv_import_open(&self) -> bool {
+        let Phase::Connected(active) = &self.phase else {
+            return false;
+        };
+        active.kv_view.as_ref().is_some_and(|v| v.import.is_some())
     }
 
     /// Whether the Redis "New key" modal is open on the active browse tab (a

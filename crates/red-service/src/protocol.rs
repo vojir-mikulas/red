@@ -287,6 +287,16 @@ pub enum Command {
         /// (rather than the old best-effort match on `argv`).
         req: u64,
     },
+    /// Bulk-run a list of already-tokenized commands read from an import file
+    /// (see the browse actions menu's "Import keys"). Runs them in order through
+    /// the same `KvDriver::command` path as the console, so writes obey the
+    /// read-only gate and destructive-command classifier. Replied once with a
+    /// summary `KvImportDone` (not per-command output); `epoch` scopes it to the
+    /// browse tab that started it, for the follow-up refresh.
+    KvImport {
+        epoch: u64,
+        commands: Vec<Vec<String>>,
+    },
     /// One in-grid edit (see `red_core::kv::KvEdit`), gated by `read_only`
     /// (checked service-side, defense in depth alongside the driver's own
     /// refusal) and, for a destructive shape, the UI's confirm prompt before
@@ -819,6 +829,16 @@ pub enum Event {
         /// The `req` from the `KvCommand` that produced this reply, so the
         /// console fills in the exact entry that issued it.
         req: u64,
+    },
+    /// A bulk import finished (in response to `KvImport`): `ok` commands
+    /// succeeded, `failed` returned an error (server error or the read/write
+    /// gate). `first_error` is the first failure's message, for the summary
+    /// toast. `epoch` is the browse tab that started it, so the UI refreshes it.
+    KvImportDone {
+        epoch: u64,
+        ok: usize,
+        failed: usize,
+        first_error: Option<String>,
     },
     /// An in-grid edit succeeded, in response to `KvApplyEdit`. Echoes
     /// `edit` back so the UI can pattern-match what to update locally

@@ -590,6 +590,9 @@ pub(crate) struct RedisView {
     /// Auto-refresh), anchored at the trigger's position while open. `None` =
     /// closed. Mirrors the `tab_menu`/`key_menu` positioned-menu pattern.
     pub(crate) actions_menu: Option<gpui::Point<gpui::Pixels>>,
+    /// The "Import keys" modal, when open (see [`AppState::kv_open_import`]).
+    /// Connection-level (imports into the current DB), like `annotate`.
+    pub(crate) import: Option<ImportState>,
     /// Focus + highlighted choice for the blank-tab panel chooser, so it's
     /// keyboard-drivable (1–6 / arrows / Enter). One handle is enough: only the
     /// focused half's chooser binds it (see `render_kv_new_tab`).
@@ -615,6 +618,21 @@ pub(crate) struct KeyMenu {
 pub(crate) enum KeyMenuEdit {
     Rename,
     Ttl,
+}
+
+/// The "Import keys" modal's state (see [`AppState::kv_open_import`]): the chosen
+/// file and its parsed commands, or a parse/read error to show inline. Commands
+/// are tokenized up front so the modal can show a count and the Import button
+/// stays disabled until there's something to run.
+pub(crate) struct ImportState {
+    /// The chosen file's display path, or `None` before one is picked.
+    pub(crate) path: Option<String>,
+    /// The tokenized commands to run (blank/`#`-comment lines dropped).
+    pub(crate) commands: Vec<Vec<String>>,
+    /// A read/parse problem to surface inline (e.g. unreadable file, no commands).
+    pub(crate) error: Option<String>,
+    /// True once the import is in flight (buttons disabled until `KvImportDone`).
+    pub(crate) running: bool,
 }
 
 /// The open "Note & tags" annotation editor (see
@@ -1217,6 +1235,7 @@ impl RedisView {
             key_menu: None,
             annotate: None,
             actions_menu: None,
+            import: None,
             new_tab_focus: cx.focus_handle(),
             new_tab_sel: 0,
         }
@@ -1666,6 +1685,154 @@ impl AppState {
             if view.actions_menu.take().is_some() {
                 cx.notify();
             }
+        }
+    }
+
+    /// Open the "Import keys" modal (actions menu). The file is chosen inside it.
+    pub(crate) fn kv_open_import(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        self.kv_close_actions_menu(session, cx);
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            view.import = Some(ImportState {
+                path: None,
+                commands: Vec::new(),
+                error: None,
+                running: false,
+            });
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn kv_cancel_import(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let closed = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .map(|v| v.import.take().is_some())
+            .unwrap_or(false);
+        if closed {
+            self.refocus_root = true;
+            cx.notify();
+        }
+    }
+
+    /// Native file picker for the import modal: choose a file of Redis commands
+    /// (one per line, `#` comments and blanks skipped), read + tokenize it off
+    /// the UI thread, and store the parsed commands (or a read/parse error) on
+    /// the open `ImportState`.
+    pub(crate) fn kv_import_choose_file(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose import file".into()),
+        });
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            // Read + tokenize on the background executor: a large command file
+            // shouldn't stall the frame.
+            let parsed = cx
+                .background_executor()
+                .spawn(async move {
+                    std::fs::read_to_string(&path)
+                        .map(|text| {
+                            let commands: Vec<Vec<String>> = text
+                                .lines()
+                                .map(str::trim)
+                                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                                .map(red_core::kv::tokenize_command)
+                                .filter(|argv| !argv.is_empty())
+                                .collect();
+                            (path.display().to_string(), commands)
+                        })
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some(imp) = this
+                    .conn_mut(Some(session))
+                    .and_then(|a| a.kv_view.as_mut())
+                    .and_then(|v| v.import.as_mut())
+                {
+                    match parsed {
+                        Ok((path, commands)) => {
+                            imp.error = commands
+                                .is_empty()
+                                .then(|| "No commands found in this file".to_string());
+                            imp.path = Some(path);
+                            imp.commands = commands;
+                        }
+                        Err(e) => {
+                            imp.error = Some(format!("Couldn't read the file: {e}"));
+                            imp.path = None;
+                            imp.commands.clear();
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Run the chosen import: send the parsed commands to the backend as one
+    /// `KvImport` batch, marking the modal in-flight until `KvImportDone`.
+    pub(crate) fn kv_run_import(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        else {
+            return;
+        };
+        let epoch = view.active_browse().map(|b| b.epoch).unwrap_or(0);
+        let Some(imp) = view.import.as_mut() else {
+            return;
+        };
+        if imp.running || imp.commands.is_empty() {
+            return;
+        }
+        imp.running = true;
+        let commands = imp.commands.clone();
+        self.service
+            .send_to(session, Command::KvImport { epoch, commands });
+        cx.notify();
+    }
+
+    /// `Event::KvImportDone`: close the modal, toast a summary, and refresh the
+    /// key list so the imported keys show.
+    pub(crate) fn on_kv_import_done(
+        &mut self,
+        session: Option<SessionId>,
+        ok: usize,
+        failed: usize,
+        first_error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self.conn_mut(session).and_then(|a| a.kv_view.as_mut()) {
+            view.import = None;
+        }
+        self.refocus_root = true;
+        let (variant, msg) = if failed == 0 {
+            (ToastVariant::Success, format!("Imported {ok} command(s)"))
+        } else {
+            let detail = first_error
+                .map(|e| format!(" (first error — {e})"))
+                .unwrap_or_default();
+            (
+                ToastVariant::Warning,
+                format!("Imported {ok}, {failed} failed{detail}"),
+            )
+        };
+        self.notify(variant, msg, cx);
+        if let Some(session) = session {
+            self.kv_relaunch_browse(session, cx);
         }
     }
 
@@ -6112,21 +6279,79 @@ impl AppState {
         };
 
         let main = match &browse.big_keys {
-            None => div()
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .child(key_area)
-                .when_some(browse.inspector.as_ref(), |el, inspector| {
-                    el.child(self.render_kv_inspector(
+            // Live browse: the key list, plus — when a key is selected — the
+            // preview inspector docked right in a resizable split (the trailing
+            // pane carries the user-set width, like the SQL detail inspector).
+            None => {
+                let inspector_el = browse.inspector.as_ref().map(|inspector| {
+                    self.render_kv_inspector(
                         session,
                         inspector,
                         !active.config.read_only,
                         &theme,
                         cx,
-                    ))
-                })
-                .into_any_element(),
+                    )
+                });
+                match inspector_el {
+                    Some(inspector_el) => {
+                        let (start, resize, end) = (view.clone(), view.clone(), view.clone());
+                        div()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .child(
+                                SplitPane::new("kv-split-inspector", gpui::Axis::Horizontal)
+                                    .sized(SplitSide::Trailing)
+                                    .size(active.inspector_w)
+                                    .gutter(px(1.))
+                                    .drag(active.inspector_drag)
+                                    .min_first(px(240.))
+                                    .max_first(px(900.))
+                                    .on_drag_start(move |anchor, _, cx| {
+                                        start
+                                            .update(cx, |this, cx| {
+                                                if let Phase::Connected(a) = &mut this.phase {
+                                                    a.inspector_drag = Some(anchor);
+                                                }
+                                                cx.notify();
+                                            })
+                                            .ok();
+                                    })
+                                    .on_resize(move |size, _, cx| {
+                                        resize
+                                            .update(cx, |this, cx| {
+                                                if let Phase::Connected(a) = &mut this.phase {
+                                                    a.inspector_w = size;
+                                                }
+                                                cx.notify();
+                                            })
+                                            .ok();
+                                    })
+                                    .on_drag_end(move |_, cx| {
+                                        end.update(cx, |this, cx| {
+                                            if let Phase::Connected(a) = &mut this.phase {
+                                                a.inspector_drag = None;
+                                            }
+                                            cx.notify();
+                                        })
+                                        .ok();
+                                    })
+                                    // A flex wrapper so `key_area`'s `flex_1`
+                                    // stretches to the pane's full height (a plain
+                                    // block parent would leave the table at auto
+                                    // height — i.e. collapsed to 0).
+                                    .first(div().size_full().flex().min_h(px(0.)).child(key_area))
+                                    .second(inspector_el),
+                            )
+                            .into_any_element()
+                    }
+                    None => div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .flex()
+                        .child(key_area)
+                        .into_any_element(),
+                }
+            }
             Some(bk) => self
                 .render_big_keys(
                     session,
@@ -6423,6 +6648,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let session = active.session;
+        let writable = !active.config.read_only;
         let browse = active.kv_view.as_ref().and_then(|v| v.active_browse());
         let tree_mode = browse.map(|b| b.tree_mode).unwrap_or(false);
         // Expand-all is meaningless without namespaced keys (a `:` to group on).
@@ -6464,6 +6690,11 @@ impl AppState {
                     .shortcut(crate::keymap::localize_hint("⌘R"))
                     .on_click(cx.listener(move |this, _, _, cx| this.kv_refresh_keys(session, cx))),
             )
+            .item(
+                ContextMenuItem::new("kv-act-import", "Import keys…")
+                    .disabled(!writable)
+                    .on_click(cx.listener(move |this, _, _, cx| this.kv_open_import(session, cx))),
+            )
             .separator()
             .item(
                 ContextMenuItem::new("kv-act-expand", "Expand all")
@@ -6498,6 +6729,145 @@ impl AppState {
                     .child(menu),
             )
             .into_any_element()
+    }
+
+    /// The "Import keys" modal (Flint [`Modal`], root-mounted like the New-key
+    /// modal): choose a file of Redis commands, then run them as one batch (see
+    /// [`AppState::kv_open_import`]). `None` when no connection has it open.
+    pub(crate) fn render_kv_import_modal(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        use crate::connect::labeled_field;
+
+        let Phase::Connected(active) = &self.phase else {
+            return None;
+        };
+        let session = active.session;
+        let imp = active.kv_view.as_ref()?.import.as_ref()?;
+        let theme = cx.theme().clone();
+        let view = cx.entity().downgrade();
+
+        let count = imp.commands.len();
+        let can_import = count > 0 && !imp.running;
+
+        let choose_view = view.clone();
+        let choose_label = if imp.path.is_some() {
+            "Change file…"
+        } else {
+            "Choose file…"
+        };
+        let choose = Button::new("kv-import-choose", choose_label)
+            .variant(ButtonVariant::Secondary)
+            .size(ButtonSize::Sm)
+            .disabled(imp.running)
+            .on_click(move |_, _, cx| {
+                choose_view
+                    .update(cx, |this, cx| this.kv_import_choose_file(session, cx))
+                    .ok();
+            });
+
+        let file_row = labeled_field("File", &theme).child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(choose)
+                .children(imp.path.clone().map(|p| {
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_size(theme.scale(12.))
+                        .text_color(theme.text_muted)
+                        .child(p)
+                })),
+        );
+
+        // A count line once a file parses, or the inline error, or the running note.
+        let status = if imp.running {
+            Some(
+                div()
+                    .text_size(theme.scale(12.))
+                    .text_color(theme.text_muted)
+                    .child("Importing…"),
+            )
+        } else if let Some(e) = imp.error.clone() {
+            Some(
+                div()
+                    .text_size(theme.scale(12.))
+                    .text_color(theme.red)
+                    .child(e),
+            )
+        } else if count > 0 {
+            Some(
+                div()
+                    .text_size(theme.scale(12.))
+                    .text_color(theme.text)
+                    .child(format!("{count} command(s) ready to run")),
+            )
+        } else {
+            None
+        };
+
+        let hint = div()
+            .text_size(theme.scale(11.))
+            .text_color(theme.text_faint)
+            .child(
+                "A text file of Redis commands, one per line (e.g. SET user:1 alice). \
+                 Blank lines and lines starting with # are ignored. Commands run in order.",
+            );
+
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(hint)
+            .child(file_row)
+            .children(status);
+
+        let (run_view, cancel_view, close_view) = (view.clone(), view.clone(), view.clone());
+        let footer = div()
+            .flex()
+            .flex_1()
+            .justify_end()
+            .gap_2()
+            .child(
+                Button::new("kv-import-cancel", "Cancel")
+                    .variant(ButtonVariant::Secondary)
+                    .size(ButtonSize::Sm)
+                    .on_click(move |_, _, cx| {
+                        cancel_view
+                            .update(cx, |this, cx| this.kv_cancel_import(session, cx))
+                            .ok();
+                    }),
+            )
+            .child(
+                Button::new("kv-import-run", "Import")
+                    .variant(ButtonVariant::Primary)
+                    .size(ButtonSize::Sm)
+                    .disabled(!can_import)
+                    .on_click(move |_, _, cx| {
+                        run_view
+                            .update(cx, |this, cx| this.kv_run_import(session, cx))
+                            .ok();
+                    }),
+            );
+
+        Some(
+            Modal::new("kv-import")
+                .title("Import keys")
+                .width(px(460.))
+                .focus_handle(self.modal_focus.clone())
+                .on_close(move |_, cx| {
+                    close_view
+                        .update(cx, |this, cx| this.kv_cancel_import(session, cx))
+                        .ok();
+                })
+                .footer(footer)
+                .child(body)
+                .into_any_element(),
+        )
     }
 
     /// The "find biggest keys" sample's own table (see `BigKeysState`),
@@ -6638,7 +7008,11 @@ impl AppState {
                     .flex()
                     .child(div().flex_1().min_w(px(0.)).child(table))
                     .when_some(inspector, |el, inspector| {
-                        el.child(self.render_kv_inspector(session, inspector, writable, theme, cx))
+                        // The biggest-keys view keeps a fixed-width preview (no
+                        // resize here, unlike the live browse's split).
+                        el.child(div().flex_shrink_0().w(px(380.)).h_full().child(
+                            self.render_kv_inspector(session, inspector, writable, theme, cx),
+                        ))
                     }),
             )
     }
@@ -7086,10 +7460,12 @@ impl AppState {
 
         let body = self.render_kv_value(session, inspector, writable, theme, cx);
 
+        // Fills its parent's width so the caller controls sizing — a resizable
+        // split pane in the live browse (see `render_kv_browse`), a fixed-width
+        // wrapper in the biggest-keys view.
         div()
             .relative()
-            .flex_shrink_0()
-            .w(px(380.))
+            .w_full()
             .h_full()
             .flex()
             .flex_col()

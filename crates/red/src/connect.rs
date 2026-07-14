@@ -6,7 +6,7 @@
 use flint::prelude::*;
 use flint::Theme;
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, Role, SharedString, Window,
+    div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, Pixels, Role, SharedString, Window,
 };
 use red_core::DbKind;
 
@@ -30,7 +30,7 @@ pub(crate) fn label_color(index: u8, theme: &Theme) -> Hsla {
     palette[(index as usize).min(palette.len() - 1)]
 }
 
-/// The accent tint for an engine, used on the engine picker's dots and cards.
+/// The accent tint for an engine, used on the engine picker's glyphs and cards.
 fn engine_tint(kind: DbKind, theme: &Theme) -> Hsla {
     match kind {
         DbKind::Postgres => theme.blue,
@@ -44,15 +44,25 @@ fn engine_tint(kind: DbKind, theme: &Theme) -> Hsla {
     }
 }
 
-/// The small tinted dot that marks an engine in the picker dropdown — drawn in the
-/// trigger for the current engine and on every option row. Shares the per-engine
-/// palette with the connection cards via [`engine_tint`].
-pub(crate) fn engine_dot(kind: DbKind, theme: &Theme) -> impl IntoElement {
-    div()
-        .size(px(8.))
-        .rounded_full()
-        .flex_none()
-        .bg(engine_tint(kind, theme))
+/// The vendored brand icon for an engine (a Simple Icons silhouette under
+/// `assets/icons/db-*.svg`, monochrome templates like every other icon so they
+/// tint to the engine's accent). `db` is the generic fallback for any engine
+/// without a dedicated glyph.
+pub(crate) fn engine_icon(kind: DbKind) -> &'static str {
+    match kind {
+        DbKind::Postgres => "db-postgres",
+        DbKind::Sqlite => "db-sqlite",
+        DbKind::Mysql => "db-mysql",
+        DbKind::Clickhouse => "db-clickhouse",
+        DbKind::Redis => "db-redis",
+    }
+}
+
+/// The small brand glyph that marks an engine in the picker dropdown — drawn in
+/// the trigger for the current engine and on every option row. Shares the
+/// per-engine palette with the connection cards via [`engine_tint`].
+pub(crate) fn engine_glyph(kind: DbKind, size: Pixels, theme: &Theme) -> impl IntoElement {
+    crate::icons::icon(engine_icon(kind), size, engine_tint(kind, theme))
 }
 
 /// The engine dropdown's option labels, in [`DbKind::all`] order so a row's index
@@ -574,8 +584,9 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        // The tinted icon square is colored with the connection's label color (the
-        // engine is conveyed by the badge beside the name, not by the icon color).
+        // The icon square (its glyph, fill, border) and the selection border both
+        // track the connection's own label color; the engine is conveyed by the
+        // *shape* of the brand glyph, not by its color.
         let accent = label_color(config.color, theme);
         let (badge_variant, badge_label) = match config.kind {
             DbKind::Sqlite => (BadgeVariant::Info, "SQLite"),
@@ -636,7 +647,11 @@ impl AppState {
                     .bg(accent.opacity(0.12))
                     .border_1()
                     .border_color(accent.opacity(0.35))
-                    .child(crate::icons::icon("db", theme.scale(17.), accent)),
+                    .child(crate::icons::icon(
+                        engine_icon(config.kind),
+                        theme.scale(17.),
+                        accent,
+                    )),
             )
             .child(
                 div()

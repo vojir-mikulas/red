@@ -642,6 +642,8 @@ impl Render for AppState {
             // The Redis "New key" modal, rooted here so it overlays the whole
             // shell (not just the browse pane) like the other modals.
             .children(self.render_kv_create_modal(cx))
+            // The Redis "Import keys" modal, likewise root-mounted.
+            .children(self.render_kv_import_modal(cx))
             // The palette renders its own full-screen overlay; last = on top.
             .children(self.palette.as_ref().map(|(p, _)| p.clone()))
             // The result-grid dropdowns (cell / export / more) mount here, above

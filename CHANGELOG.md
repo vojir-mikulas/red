@@ -7,6 +7,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Engine icons: the welcome screen's saved-connection cards and the connection
+  form's engine picker now show each engine's own brand logo (PostgreSQL,
+  SQLite, MySQL, ClickHouse, Redis) in place of the generic database glyph. On
+  the welcome cards the logo takes the connection's own accent colour; in the
+  engine picker (trigger and every dropdown option) it takes the engine's
+  colour.
 - Welcome screen: the saved-connection list now paginates (8 per page) with
   Previous / Next controls, so a large roster stays a single screen instead of
   one long scroll. 
@@ -22,8 +28,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Auto-refresh submenu (Off / 2s / 5s / 10s / 30s) that periodically re-scans the
   keyspace. A new `[redis] auto_refresh_secs` setting (Settings → Behavior) sets
   the interval new browse tabs start at.
+- Redis key browser: Import keys (Actions → Import keys…) — choose a text file of
+  Redis commands (one per line, e.g. `SET user:1 alice`; blank lines and `#`
+  comments ignored) and run them in order against the current database, with a
+  summary of how many succeeded/failed. Disabled on read-only connections.
 
 ### Changed
+- Redis key browser: the value-preview panel is now resizable — drag the divider
+  between the key list and the preview to set its width (matching the SQL detail
+  inspector).
 - Redis key browser: the filter bar's fuzzy and value-search toggles are
   replaced by a single query-mode dropdown at the head of the bar — Glob (`*`),
   Prefix, Exact, Fuzzy, and Value. Prefix matches keys starting with the typed
