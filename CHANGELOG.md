@@ -9,7 +9,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - Welcome screen: the saved-connection list now paginates (8 per page) with
   Previous / Next controls, so a large roster stays a single screen instead of
-  one long scroll. ↑/↓ still walk the whole list and flip pages at the edges.
+  one long scroll. 
 - Tab strip: middle-click a tab to close it, right-click for a context menu
   (Close, Close Others, Close All, Close Left, Close Right, Pin tab), and pin a
   tab to keep it visible at the start of the strip no matter how far you've
@@ -17,6 +17,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checkbox.
 
 ### Changed
+- AI assistant: pick which agent runs a chat from the panel itself. When more
+  than one agent is set up, the agent name in the panel header becomes a dropdown
+  (switch the current chat's agent), and the "+" button opens a "New chat with
+  <agent>" menu so you choose the agent up front; the command palette gained the
+  same "agent: new chat with <name>" entries. A new chat starts on whichever
+  agent you last used. Settings → AI is now purely account management — sign in
+  or add API keys per agent; choosing the active agent no longer lives there.
 - Connection form: the host may now be left blank; it falls back to `localhost`
   (as `psql` and `redis-cli` do) instead of being rejected.
 - Redis connections now carry a red badge (matching the app's accent) while

@@ -1,14 +1,16 @@
 //! Small, app-managed local state that isn't a user *preference*; it lives apart
 //! from `settings.toml` (which the user edits) in `<config>/red/state.json`.
 //!
-//! Today it holds two facts: the last app version we showed the user, and the
-//! last set of session config selectors (model / reasoning / mode) each AI agent
-//! advertised. The version drives the one-shot "RED updated to X" toast (see
-//! `AppState::new`). The per-agent config cache lets the assistant show the
-//! model/reasoning dropdowns *before* a chat opens its session (the agent only
-//! advertises them once a session is live), so a returning user can preselect a
-//! model without sending a message first. The on-disk shape is a wrapper object
-//! so future app state can be added without breaking older files.
+//! Today it holds a few facts: the last app version we showed the user, the last
+//! set of session config selectors (model / reasoning / mode) each AI agent
+//! advertised, and the last agent a chat was started on. The version drives the
+//! one-shot "RED updated to X" toast (see `AppState::new`). The per-agent config
+//! cache lets the assistant show the model/reasoning dropdowns *before* a chat
+//! opens its session (the agent only advertises them once a session is live), so a
+//! returning user can preselect a model without sending a message first. The last
+//! agent is the new-chat default, so a fresh chat starts on whatever you last used.
+//! The on-disk shape is a wrapper object so future app state can be added without
+//! breaking older files.
 //!
 //! Persistence mirrors `history.rs`: a missing or corrupt file is simply empty
 //! state (never blocks startup), and writes go through a temp file + rename,
@@ -59,6 +61,11 @@ struct StateFile {
     /// until the first session of that agent has ever run.
     #[serde(default)]
     ai_config: HashMap<String, Vec<StoredConfigOption>>,
+    /// The agent id a new chat should start on: the last one the user actually ran
+    /// a chat on, so a fresh chat picks up where they left off (no settings
+    /// detour). Absent until they've picked one.
+    #[serde(default)]
+    last_agent: Option<String>,
 }
 
 /// The app-state store. Loaded once at startup; mutations persist immediately.
@@ -107,6 +114,22 @@ impl LocalState {
     /// open without a lookup per agent.
     pub(crate) fn ai_config_all(&self) -> &HashMap<String, Vec<StoredConfigOption>> {
         &self.file.ai_config
+    }
+
+    /// The agent id a new chat should default to (the last one used), or `None`
+    /// before the user has ever picked one.
+    pub(crate) fn last_agent(&self) -> Option<&str> {
+        self.file.last_agent.as_deref()
+    }
+
+    /// Record `agent` as the last one a chat was started on, persisting only when it
+    /// changed (so re-selecting the same agent does no disk write).
+    pub(crate) fn set_last_agent(&mut self, agent: &str) {
+        if self.file.last_agent.as_deref() == Some(agent) {
+            return;
+        }
+        self.file.last_agent = Some(agent.to_string());
+        self.persist();
     }
 
     /// Cache `options` as `agent`'s last-advertised selectors, persisting only when
@@ -208,10 +231,22 @@ mod tests {
         let json = serde_json::to_string_pretty(&StateFile {
             last_seen_version: Some("1.2.3".into()),
             ai_config: HashMap::new(),
+            last_agent: Some("codex".into()),
         })
         .unwrap();
         let back: StateFile = serde_json::from_str(&json).unwrap();
         assert_eq!(back.last_seen_version.as_deref(), Some("1.2.3"));
+        assert_eq!(back.last_agent.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn last_agent_records_and_updates() {
+        let mut s = in_memory();
+        assert_eq!(s.last_agent(), None);
+        s.set_last_agent("subscription");
+        assert_eq!(s.last_agent(), Some("subscription"));
+        s.set_last_agent("codex");
+        assert_eq!(s.last_agent(), Some("codex"));
     }
 
     /// An older/empty file (no keys) loads as absent, not an error; the
@@ -221,5 +256,6 @@ mod tests {
         let back: StateFile = serde_json::from_str("{}").unwrap();
         assert_eq!(back.last_seen_version, None);
         assert!(back.ai_config.is_empty());
+        assert_eq!(back.last_agent, None);
     }
 }

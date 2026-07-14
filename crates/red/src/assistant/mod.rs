@@ -30,7 +30,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use flint::{CodeEditor, TextInput};
-use gpui::{Entity, ScrollHandle, SharedString};
+use gpui::{Entity, Pixels, Point, ScrollHandle, SharedString};
 
 use text::extract_sql;
 
@@ -376,6 +376,15 @@ pub(super) struct HistoryRow {
     pub(super) draft: bool,
 }
 
+/// Which agent-menu the header has open: `Switch` re-binds the current draft to
+/// the picked agent (the header's agent label dropdown); `New` starts a fresh chat
+/// on it (the `+` button). Both anchor a `ContextMenu` at the click position.
+#[derive(Clone, Copy)]
+pub(crate) enum AgentMenuKind {
+    Switch,
+    New,
+}
+
 /// All the assistant panel's state. Present iff the panel is open.
 pub(crate) struct AssistantState {
     /// The prompt box, a multiline composer. Enter sends a turn on the active
@@ -409,6 +418,9 @@ pub(crate) struct AssistantState {
     /// Which config selector's dropdown is currently open (its `config_id`), if any.
     /// `flint::Select` is stateless, so the open state lives here.
     pub(crate) open_config: Option<String>,
+    /// The header's open agent menu (the agent-label switcher or the `+` new-chat
+    /// picker) and where it's anchored, or `None` when closed.
+    pub(crate) agent_menu: Option<(AgentMenuKind, Point<Pixels>)>,
     /// Each agent's most recent advertised selectors (model / reasoning / mode),
     /// keyed by agent id. An agent only advertises these once its session opens (on
     /// the first turn), so a brand-new chat has none yet; the composer renders the

@@ -1396,29 +1396,28 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 report_folder,
                 &theme,
             ))
-            .child(settings_header("Agents", &theme))
+            .child(settings_header("Accounts", &theme))
             .child(ai_agents_section(state, &theme, cx)),
         &theme,
     )
     .into_any_element()
 }
 
-/// The Agents list (Phase 5): every configured agent (the synthesized legacy
-/// built-ins, or an explicit `[[ai.agents]]` set). Click a row to make it the
-/// default new chats start on; the filled dot marks the current default. An API
-/// agent shows whether its key is set (the keyring), an ACP agent is always ready.
-/// Add/remove agents and edit their fields (command / base_url / model / API keys)
-/// in the settings file; the "Edit in settings file" button opens it.
+/// The Accounts list: every configured agent (the synthesized legacy built-ins,
+/// or an explicit `[[ai.agents]]` set) with its login/key controls. An API agent
+/// shows whether its key is set (the keyring) and offers Add/Change/Remove key; an
+/// ACP agent shows who's signed in and offers Sign in / switch / Sign out. Which
+/// agent runs a chat is chosen in the chat's own agent dropdown, not here.
+/// Add/remove agents and edit their fields (command / base_url / model) in the
+/// settings file; the "Edit in settings file" button opens it.
 fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>) -> AnyElement {
     let view = cx.entity();
     let agents = state.settings.ai.resolved_agents();
-    let default_id = state.settings.ai.resolved_default_agent();
     let usable: std::collections::HashSet<&str> =
         state.usable_agents.iter().map(|a| a.id.as_str()).collect();
 
     let mut list = div().flex().flex_col().gap_1();
     for a in &agents {
-        let is_default = a.id == default_id;
         let is_acp = a.kind.eq_ignore_ascii_case("acp");
         // The subscription agent's last-known sign-in, once checked (the AI tab asks
         // on open). API agents have no sign-in; they carry a key.
@@ -1437,14 +1436,6 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
         } else {
             ("no key".into(), theme.text_faint)
         };
-        let id = a.id.clone();
-        let row_view = view.clone();
-        let dot = div()
-            .size(px(8.))
-            .rounded_full()
-            .flex_none()
-            .when(is_default, |d| d.bg(theme.accent))
-            .when(!is_default, |d| d.border_1().border_color(theme.border));
         let kind_badge = div()
             .flex_none()
             .px_1p5()
@@ -1478,8 +1469,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                     theme.text_muted,
                 ))
                 .on_click(move |_, _, cx| {
-                    // Don't let the click fall through to the row (which would set
-                    // this agent as the default).
+                    // Keep the click on the button; the row itself isn't clickable.
                     cx.stop_propagation();
                     let id = signin_id.clone();
                     signin_view.update(cx, |this, cx| this.reauthenticate_agent(&id, cx));
@@ -1557,16 +1547,12 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
         list = list.child(
             div()
                 .id(SharedString::from(format!("agent-row-{}", a.id)))
-                .role(gpui::Role::Button)
                 .flex()
                 .items_center()
                 .gap_2()
                 .px_2()
                 .min_h(px(40.))
                 .rounded(theme.radius)
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.bg_elevated))
-                .child(dot)
                 // Name on top, the status/identity line beneath it, so a long
                 // sign-in identity (email · tier) never pushes the name into a wrap.
                 .child(
@@ -1593,23 +1579,9 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                         ),
                 )
                 .child(kind_badge)
-                .when(is_default, |row| {
-                    row.child(
-                        div()
-                            .flex_none()
-                            .whitespace_nowrap()
-                            .text_size(theme.scale(10.5))
-                            .text_color(theme.text_muted)
-                            .child("· default"),
-                    )
-                })
                 .when_some(key_btn, |row, b| row.child(b))
                 .when_some(signout, |row, b| row.child(b))
-                .when_some(signin, |row, b| row.child(b))
-                .on_click(move |_, _, cx| {
-                    let id = id.clone();
-                    row_view.update(cx, |this, cx| this.set_default_agent(&id, cx));
-                }),
+                .when_some(signin, |row, b| row.child(b)),
         );
 
         // Inline subscription sign-in (paste-code OAuth) for this agent, when active.
@@ -1664,13 +1636,13 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                 .text_size(theme.scale(12.))
                 .text_color(theme.text_muted)
                 .child(
-                    "Pick the agent new chats start on (click a row). Switch a chat's \
-                     agent before its first message from the panel. An API agent needs a \
+                    "Sign in or add API keys for the agents you use. An API agent needs a \
                      key; use “Add key” (stored in the OS keyring, never in the file). A \
                      subscription (ACP) agent signs in through your browser; use the key \
                      button to sign in or switch account, and “Sign out” to disconnect; the \
-                     row shows who's signed in. Add or remove agents and edit their command \
-                     / endpoint / model in the settings file.",
+                     row shows who's signed in. Choose which agent runs a chat from the \
+                     chat's agent dropdown. Add or remove agents and edit their command / \
+                     endpoint / model in the settings file.",
                 ),
         )
         .child(list)

@@ -850,18 +850,23 @@ pub(crate) struct QueryTab {
 impl QueryTab {
     pub(crate) fn new(title: String, cx: &mut Context<AppState>) -> Self {
         let editor = cx.new(|cx| {
+            // A play run marker in the gutter on each statement's first line.
+            // gpui's `svg()` paints only when the svg element's *own* `text_color`
+            // is set — it does not inherit the marker cell's colour — so we colour
+            // the icon (and its hover accent) here rather than leaning on the cell.
+            // The theme colours are captured at build; a live theme switch only
+            // affects tabs opened afterwards.
+            let (marker_fg, marker_accent) = (cx.theme().text_faint, cx.theme().accent);
             CodeEditor::new(cx)
                 .highlighter(crate::sql::tokenize)
-                // A play run marker in the gutter on each statement's first line.
-                // The svg inherits the marker cell's `currentColor`, so flint's
-                // hover recolour still lands on it (a fixed-colour `icons::icon`
-                // would ignore it).
                 .gutter_markers(crate::sql::statement_start_lines)
-                .gutter_marker_icon(|| {
+                .gutter_marker_icon(move || {
                     gpui::svg()
                         .path("icons/play.svg")
                         .size(px(11.))
                         .flex_none()
+                        .text_color(marker_fg)
+                        .hover(|s| s.text_color(marker_accent))
                         .into_any_element()
                 })
                 .corner_radius(px(0.))

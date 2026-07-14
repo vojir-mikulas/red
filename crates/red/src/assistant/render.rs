@@ -8,14 +8,17 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Animation, AnimationExt, AnyElement, Context, SharedString};
+use gpui::{
+    div, prelude::*, px, Animation, AnimationExt, AnyElement, Context, MouseButton, Pixels, Point,
+    SharedString,
+};
 
 use crate::app::{AppState, Phase};
 
 use super::text::{bubble_key, derive_title};
 use super::{
-    AssistantState, ChatMessage, ChatRole, ChatSession, HistoryRow, PendingPermission, QuickAction,
-    Rename, RowKey, RowStatus,
+    AgentMenuKind, AssistantState, ChatMessage, ChatRole, ChatSession, HistoryRow,
+    PendingPermission, QuickAction, Rename, RowKey, RowStatus,
 };
 
 impl AppState {
@@ -137,12 +140,14 @@ impl AppState {
 
         // Setup view: no agent usable yet (no API key, and no ACP agent configured).
         if !self.ai_configured {
-            return self.render_assistant_setup(state, header, &theme, cx);
+            let view = self.render_assistant_setup(state, header, &theme, cx);
+            return self.with_agent_menu(view, cx);
         }
 
         // The chat-list switcher replaces the transcript while open (M-S6).
         if state.show_list {
-            return self.render_assistant_list(state, header, &theme, cx);
+            let view = self.render_assistant_list(state, header, &theme, cx);
+            return self.with_agent_menu(view, cx);
         }
 
         // Transcript.
@@ -172,11 +177,8 @@ impl AppState {
                     .text_color(theme.text_muted)
                     .child(hint),
             );
-            // Before the first message, the chat's agent can still be switched:
-            // offer the picker when more than one agent is usable (M-S6).
-            if let Some(picker) = self.render_agent_picker(chat, &theme, cx) {
-                body = body.child(picker);
-            }
+            // The chat's agent is chosen in the composer's agent dropdown (shown on
+            // a draft when more than one agent is usable); no separate body picker.
         }
         // The trailing assistant bubble types out while the turn streams (or while
         // the reveal is still draining just after it finishes); the rest show whole.
@@ -278,7 +280,7 @@ impl AppState {
                     .child(action),
             );
 
-        div()
+        let view = div()
             .size_full()
             .flex()
             .flex_col()
@@ -297,6 +299,91 @@ impl AppState {
             .when_some(chat.last_usage, |col, usage| {
                 col.child(render_usage(&usage, &theme))
             })
+            .into_any_element();
+        self.with_agent_menu(view, cx)
+    }
+
+    /// Overlay the header's open agent menu (switch / new-chat picker) on top of the
+    /// panel `view`, or pass it through untouched when no menu is open. A relative,
+    /// full-size wrapper lets the menu's backdrop cover the whole panel to catch an
+    /// outside click.
+    fn with_agent_menu(&self, view: AnyElement, cx: &mut Context<Self>) -> AnyElement {
+        let Some((kind, pos)) = self.assistant.as_ref().and_then(|s| s.agent_menu) else {
+            return view;
+        };
+        div()
+            .relative()
+            .size_full()
+            .child(view)
+            .child(self.render_agent_menu(kind, pos, cx))
+            .into_any_element()
+    }
+
+    /// The header's agent menu: one row per usable agent. `Switch` re-binds the
+    /// current draft (or, if it's already sent, starts a fresh chat on the pick);
+    /// `New` always starts a fresh chat on the pick. Anchored at the click, with a
+    /// full-cover backdrop that dismisses it — mirroring the result cell menu.
+    fn render_agent_menu(
+        &self,
+        kind: AgentMenuKind,
+        pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let current = self
+            .assistant
+            .as_ref()
+            .map(|s| s.active().provider.clone())
+            .unwrap_or_default();
+        let mut menu = ContextMenu::new("ai-agent-menu");
+        for (i, agent) in self.usable_agents.iter().enumerate() {
+            let id = agent.id.clone();
+            let label = match kind {
+                AgentMenuKind::Switch => SharedString::from(agent.name.clone()),
+                AgentMenuKind::New => SharedString::from(format!("New chat with {}", agent.name)),
+            };
+            let mut item = ContextMenuItem::new(SharedString::from(format!("ai-agent-{i}")), label);
+            // Mark the chat's current agent when switching (no "current" on the
+            // new-chat picker, where every option makes a fresh chat).
+            if matches!(kind, AgentMenuKind::Switch) && agent.id == current {
+                item = item.shortcut("current");
+            }
+            item = item.on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(s) = this.assistant.as_mut() {
+                    s.agent_menu = None;
+                }
+                match kind {
+                    AgentMenuKind::Switch => {
+                        // A draft re-binds in place; a sent chat can't change agent,
+                        // so the pick opens a new chat on it instead.
+                        let draft = this
+                            .assistant
+                            .as_ref()
+                            .is_some_and(|s| s.active().is_draft());
+                        if draft {
+                            this.set_active_chat_provider(id.clone(), cx);
+                        } else {
+                            this.new_chat_with(id.clone(), cx);
+                        }
+                    }
+                    AgentMenuKind::New => this.new_chat_with(id.clone(), cx),
+                }
+                cx.notify();
+            }));
+            menu = menu.item(item);
+        }
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if let Some(s) = this.assistant.as_mut() {
+                        s.agent_menu = None;
+                    }
+                    cx.notify();
+                }),
+            )
+            .child(floating(div().occlude().child(menu)).at(pos))
             .into_any_element()
     }
 
@@ -309,6 +396,9 @@ impl AppState {
     ) -> AnyElement {
         let chat = state.active();
         let agent_name = self.agent_name(&chat.provider);
+        // A choice of agent exists only with more than one usable: the header agent
+        // label becomes a switcher and the `+` offers a per-agent new-chat menu.
+        let multi = self.usable_agents.len() > 1;
 
         let icon_btn = |id: &'static str, glyph: &'static str, tip: &'static str| {
             div()
@@ -373,9 +463,23 @@ impl AppState {
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_chat_list(cx)))
         });
 
+        // With one agent the `+` just starts a chat; with several it drops a
+        // "New chat with <agent>" menu so you pick the agent up front.
+        let new_chat_tip = if multi { "New chat with…" } else { "New chat" };
         let new_chat = self.ai_configured.then(|| {
-            icon_btn("assistant-new-chat", "plus", "New chat")
-                .on_click(cx.listener(|this, _, _, cx| this.new_chat(cx)))
+            icon_btn("assistant-new-chat", "plus", new_chat_tip).on_click(cx.listener(
+                move |this, ev: &gpui::ClickEvent, _, cx| {
+                    if this.usable_agents.len() > 1 {
+                        let pos = ev.position();
+                        if let Some(s) = this.assistant.as_mut() {
+                            s.agent_menu = Some((AgentMenuKind::New, pos));
+                        }
+                        cx.notify();
+                    } else {
+                        this.new_chat(cx);
+                    }
+                },
+            ))
         });
 
         // Copy the whole conversation as Markdown (pastes styled into Notion etc.);
@@ -395,6 +499,47 @@ impl AppState {
             .when_some(list_btn, |row, l| row.child(l))
             .when_some(new_chat, |row, n| row.child(n));
 
+        // The agent label: sparkles + name. With more than one usable agent it
+        // becomes a dropdown trigger (a chevron, hover, and a click that opens the
+        // switch menu at the cursor); a draft re-binds, a sent chat opens a new one.
+        let agent_inner = div()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .min_w(px(0.))
+            .child(crate::icons::icon("sparkles", theme.scale(14.), theme.accent))
+            .child(div().min_w_0().truncate().child(agent_name))
+            .when(multi, |d| {
+                d.child(crate::icons::icon(
+                    "chevron-down",
+                    theme.scale(13.),
+                    theme.text_muted,
+                ))
+            });
+        let agent_label: AnyElement = if multi {
+            div()
+                .id("assistant-agent-switch")
+                .flex()
+                .items_center()
+                .min_w(px(0.))
+                .px_1()
+                .rounded(px(4.))
+                .cursor_pointer()
+                .tooltip(flint::Tooltip::text("Switch agent"))
+                .hover(|s| s.bg(theme.bg_elevated))
+                .child(agent_inner)
+                .on_click(cx.listener(|this, ev: &gpui::ClickEvent, _, cx| {
+                    let pos = ev.position();
+                    if let Some(s) = this.assistant.as_mut() {
+                        s.agent_menu = Some((AgentMenuKind::Switch, pos));
+                    }
+                    cx.notify();
+                }))
+                .into_any_element()
+        } else {
+            agent_inner.into_any_element()
+        };
+
         div()
             .flex_shrink_0()
             .flex()
@@ -410,14 +555,10 @@ impl AppState {
                     .flex()
                     .items_center()
                     .gap_1p5()
+                    .min_w(px(0.))
                     .text_size(theme.scale(12.))
                     .text_color(theme.text)
-                    .child(crate::icons::icon(
-                        "sparkles",
-                        theme.scale(14.),
-                        theme.accent,
-                    ))
-                    .child(agent_name)
+                    .child(agent_label)
                     // A "writes" badge when this connection opted into the write tier
                     // (Feature B), so the user knows the agent can propose data changes
                     // (each one still gated by per-statement approval).
@@ -819,68 +960,6 @@ impl AppState {
         }
 
         el.into_any_element()
-    }
-
-    /// The empty-chat agent picker (M-S6): one selectable chip per usable agent, to
-    /// bind a new chat to an agent before its first message. Shown only when more
-    /// than one agent is usable (a single agent needs no choice). The chips wrap, so
-    /// a handful of agents lay out cleanly.
-    fn render_agent_picker(
-        &self,
-        chat: &ChatSession,
-        theme: &flint::Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if self.usable_agents.len() <= 1 {
-            return None;
-        }
-        let current = chat.provider.clone();
-        let chips =
-            self.usable_agents.iter().map(|agent| {
-                let on = agent.id == current;
-                let id = agent.id.clone();
-                div()
-                    .id(SharedString::from(format!("ai-pick-{}", agent.id)))
-                    .px_2()
-                    .h(px(24.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(5.))
-                    .border_1()
-                    .text_size(theme.scale(11.))
-                    .cursor_pointer()
-                    .when(on, |s| {
-                        s.border_color(theme.accent).text_color(theme.accent)
-                    })
-                    .when(!on, |s| {
-                        s.border_color(theme.border).text_color(theme.text_muted)
-                    })
-                    .child(SharedString::from(agent.name.clone()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_active_chat_provider(id.clone(), cx)
-                    }))
-            });
-        Some(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1p5()
-                .child(
-                    div()
-                        .text_size(theme.scale(10.5))
-                        .text_color(theme.text_muted)
-                        .child("Agent for this chat:"),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_1p5()
-                        .children(chips),
-                )
-                .into_any_element(),
-        )
     }
 
     /// The context-action chips (M-S4): "Explain error" when the active result

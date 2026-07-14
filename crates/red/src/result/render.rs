@@ -1040,16 +1040,17 @@ impl AppState {
                         div()
                             .id(("draft-remove", index))
                             .cursor_pointer()
-                            // The svg inherits the parent's `text_color`, so the
-                            // hover recolour lands on the icon (a fixed-colour
-                            // `icons::icon` would ignore it).
-                            .text_color(faint)
-                            .hover(|s| s.text_color(accent))
                             .child(
+                                // gpui's `svg()` paints only when the svg element's
+                                // *own* `text_color` is set — it does not inherit
+                                // from an ancestor div — so the base colour and the
+                                // hover recolour both live directly on the svg.
                                 gpui::svg()
                                     .path("icons/circle-x.svg")
                                     .size(theme.scale(14.))
-                                    .flex_none(),
+                                    .flex_none()
+                                    .text_color(faint)
+                                    .hover(|s| s.text_color(accent)),
                             )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.remove_draft_row(index, cx)

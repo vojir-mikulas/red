@@ -186,6 +186,7 @@ impl AppState {
                 renaming: None,
                 completion_commands,
                 open_config: None,
+                agent_menu: None,
                 provider_config_options,
                 subagent_collapse: std::collections::HashMap::new(),
                 selection_group: Rc::new(std::cell::Cell::new(0)),
@@ -196,12 +197,20 @@ impl AppState {
         cx.notify();
     }
 
-    /// The agent id a new chat starts on: the resolved default agent, falling back
-    /// to the first usable agent when the default isn't usable (e.g. an API default
-    /// with no key while an ACP agent is ready).
+    /// The agent id a new chat starts on: the last agent the user actually ran a
+    /// chat on (so a fresh chat picks up where they left off — no settings detour),
+    /// then the resolved default agent, then the first usable agent. Each candidate
+    /// is skipped unless it's currently usable (e.g. an API agent with no key while
+    /// an ACP agent is ready).
     fn default_ai_provider(&self) -> String {
+        let usable = |id: &str| self.usable_agents.iter().any(|a| a.id == id);
+        if let Some(last) = self.local_state.last_agent() {
+            if usable(last) {
+                return last.to_string();
+            }
+        }
         let default = self.settings.ai.resolved_default_agent();
-        if self.usable_agents.iter().any(|a| a.id == default) {
+        if usable(&default) {
             return default;
         }
         self.usable_agents
@@ -359,16 +368,26 @@ impl AppState {
 
     /// Go to the panel's single draft: the one chat with nothing sent yet (the
     /// "prepared prompt"). Reuses the existing empty chat if there is one rather
-    /// than spawning duplicates, so "new chat" always lands on the same draft.
+    /// than spawning duplicates, so "new chat" always lands on the same draft. Binds
+    /// a freshly-created draft to the new-chat default (the last-used agent); an
+    /// existing draft keeps its agent — switch it via the composer's agent dropdown.
     pub(crate) fn new_chat(&mut self, cx: &mut Context<Self>) {
         let provider = self.default_ai_provider();
-        self.new_chat_with(provider, cx);
+        self.go_to_draft(provider, false, cx);
     }
 
-    /// Go to the draft, binding it to `provider` if a fresh one is created. If a
-    /// draft already exists its provider is left as-is (change it via the empty
-    /// chat's provider picker); this just avoids piling up empty chats.
+    /// Go to the draft on a *specific* agent (the "New chat with <agent>" entry).
+    /// Rebinds an existing draft to `provider` too — it has nothing sent, so the
+    /// binding isn't locked — and records it as the new-chat default.
     pub(crate) fn new_chat_with(&mut self, provider: String, cx: &mut Context<Self>) {
+        self.go_to_draft(provider, true, cx);
+    }
+
+    /// Shared "go to the single draft" core. `rebind` re-points an existing draft at
+    /// `provider` (the explicit "New chat with …" path); the plain "+" leaves an
+    /// existing draft on whatever agent it was already on. Whichever agent the draft
+    /// ends up bound to becomes the remembered new-chat default.
+    fn go_to_draft(&mut self, provider: String, rebind: bool, cx: &mut Context<Self>) {
         self.stash_active_draft(cx);
         let id = self.next_conversation_id;
         let existing = self
@@ -376,10 +395,18 @@ impl AppState {
             .as_ref()
             .and_then(|s| s.chats.iter().position(|c| c.is_draft()));
         let mut created = false;
+        let mut bound: Option<String> = None;
         if let Some(state) = self.assistant.as_mut() {
             let idx = match existing {
-                Some(i) => i,
+                Some(i) => {
+                    if rebind {
+                        state.chats[i].provider = provider.clone();
+                        bound = Some(provider.clone());
+                    }
+                    i
+                }
                 None => {
+                    bound = Some(provider.clone());
                     state.chats.push(ChatSession::new(id, provider));
                     created = true;
                     state.chats.len() - 1
@@ -393,6 +420,9 @@ impl AppState {
         }
         if created {
             self.next_conversation_id += 1;
+        }
+        if let Some(agent) = bound {
+            self.local_state.set_last_agent(&agent);
         }
         self.sync_command_completions();
         self.focus_assistant = true;
@@ -496,11 +526,18 @@ impl AppState {
     /// binding is locked once a turn is sent (a backend conversation is bound to
     /// it). Drives the empty-chat provider picker (M-S6).
     pub(crate) fn set_active_chat_provider(&mut self, provider: String, cx: &mut Context<Self>) {
+        let mut picked = None;
         if let Some(state) = self.assistant.as_mut() {
             let chat = state.active_mut();
             if chat.messages.is_empty() {
-                chat.provider = provider;
+                chat.provider = provider.clone();
+                picked = Some(provider);
             }
+        }
+        // Remember the explicit choice as the new-chat default, so the next chat
+        // starts on it too.
+        if let Some(agent) = picked {
+            self.local_state.set_last_agent(&agent);
         }
         self.focus_assistant = true;
         cx.notify();

@@ -825,21 +825,6 @@ impl AppState {
         cx.notify();
     }
 
-    /// Set the agent new chats start on (`[ai] default_agent`). If the settings
-    /// still rely on the synthesized legacy built-ins (no explicit `[[ai.agents]]`),
-    /// materialize that list first so the choice has somewhere to persist. Re-pushed
-    /// so the panel's selector default updates immediately.
-    pub(crate) fn set_default_agent(&mut self, id: &str, cx: &mut Context<Self>) {
-        if self.settings.ai.agents.is_empty() {
-            self.settings.ai.agents = self.settings.ai.resolved_agents();
-        }
-        self.settings.ai.default_agent = id.to_string();
-        self.save_settings();
-        self.usable_agents = crate::app::usable_agents(&self.settings);
-        self.push_ai_config();
-        cx.notify();
-    }
-
     /// Open the inline key editor for an API agent's row (Settings → AI agents).
     /// Binds the shared `ai_key_input` to this agent id, clears it, and focuses it so
     /// the user types the key at once. A second click on the same row closes it.

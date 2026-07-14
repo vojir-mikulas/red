@@ -100,6 +100,9 @@ pub(crate) enum Cmd {
     AssistantHistory,
     /// Start a fresh assistant chat, saving the current one (M-S5).
     AssistantNewChat,
+    /// Start a fresh assistant chat on a specific agent, by index into
+    /// `usable_agents` (the "New chat with <agent>" entries).
+    AssistantNewChatWith(usize),
     /// Reveal the conversations directory in the OS file manager (M-S5).
     RevealConversationStorage,
     /// Open the side-by-side split (a second query pane on the right).
@@ -298,6 +301,12 @@ impl AppState {
             Cmd::AddRow => self.add_draft_row(cx),
             Cmd::AssistantHistory => self.open_history_sidebar(cx),
             Cmd::AssistantNewChat => self.new_chat(cx),
+            Cmd::AssistantNewChatWith(index) => {
+                if let Some(agent) = self.usable_agents.get(index) {
+                    let id = agent.id.clone();
+                    self.new_chat_with(id, cx);
+                }
+            }
             Cmd::RevealConversationStorage => self.reveal_conversation_storage(cx),
             Cmd::SplitRight => self.split_right(cx),
             Cmd::Unsplit => self.unsplit(cx),
@@ -510,6 +519,19 @@ impl AppState {
                         PaletteItem::new("cmd:ai-new-chat", "agent: new chat"),
                         Cmd::AssistantNewChat,
                     ));
+                    // With more than one agent configured, offer a direct
+                    // "new chat with <agent>" so you can pick without opening the
+                    // composer's agent dropdown.
+                    if self.usable_agents.len() > 1 {
+                        for (i, agent) in self.usable_agents.iter().enumerate() {
+                            let id =
+                                ElementId::from(SharedString::from(format!("cmd:ai-new-chat:{i}")));
+                            out.push((
+                                PaletteItem::new(id, format!("agent: new chat with {}", agent.name)),
+                                Cmd::AssistantNewChatWith(i),
+                            ));
+                        }
+                    }
                     out.push((
                         PaletteItem::new("cmd:ai-history", "agent: conversation history…"),
                         Cmd::AssistantHistory,
