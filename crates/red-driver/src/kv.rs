@@ -85,11 +85,17 @@ pub trait KvDriver: Send + Sync {
     /// driver holds open between calls — the caller (the service, then the UI's
     /// grid buffer) owns scan position, same as it owns a seek boundary key for
     /// the SQL grid.
+    ///
+    /// `value_needle`, when set, keeps only keys whose *value* contains it
+    /// (case-insensitive) — a value search Redis can't push down, so the driver
+    /// reads each scanned string key's value and filters client-side (bounded;
+    /// only string values are searched). Composes with `pattern`/`type_filter`.
     async fn scan_keys(
         &self,
         cursor: ScanCursor,
         pattern: Option<&str>,
         type_filter: Option<&str>,
+        value_needle: Option<&str>,
         budget: ScanBudget,
         abort: &AbortSignal,
     ) -> Result<KvScanPage>;
@@ -293,13 +299,22 @@ pub trait KvDriver: Send + Sync {
         Ok(None)
     }
 
-    /// `RESTORE key ttl payload`: recreate a key from a [`KvDriver::dump_key`]
-    /// snapshot (the recycle bin's undo). `ttl` is the remaining expiry to
-    /// re-apply (`None` = no expiry). Errors (Redis `BUSYKEY`) if the key exists
-    /// again, so undo never clobbers a key recreated in the meantime. Refused on
-    /// a read-only connection. The default reports the operation unsupported.
-    async fn restore_key(&self, key: &str, ttl: Option<Duration>, payload: &[u8]) -> Result<()> {
-        let _ = (key, ttl, payload);
+    /// `RESTORE key ttl payload [REPLACE]`: recreate a key from a
+    /// [`KvDriver::dump_key`] snapshot (the recycle bin's undo, and a
+    /// cross-server copy's write side). `ttl` is the remaining expiry to re-apply
+    /// (`None` = no expiry). `replace` overwrites an existing key (`REPLACE`);
+    /// without it, an existing key errors (`BUSYKEY`) — so an undo never clobbers
+    /// a key recreated meanwhile, while a copy can overwrite the target
+    /// deliberately. Refused on a read-only connection. The default reports the
+    /// operation unsupported.
+    async fn restore_key(
+        &self,
+        key: &str,
+        ttl: Option<Duration>,
+        payload: &[u8],
+        replace: bool,
+    ) -> Result<()> {
+        let _ = (key, ttl, payload, replace);
         Err(red_core::RedError::Driver(
             "restore is not supported by this engine".into(),
         ))

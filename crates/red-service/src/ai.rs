@@ -1530,7 +1530,7 @@ async fn kv_collect_keys(
             want: 200,
         };
         let page = driver
-            .scan_keys(cursor, pattern, None, budget, &abort)
+            .scan_keys(cursor, pattern, None, None, budget, &abort)
             .await?;
         out.extend(page.keys);
         cursor = page.next_cursor;

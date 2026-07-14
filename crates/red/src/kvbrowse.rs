@@ -288,6 +288,13 @@ pub(crate) struct BrowseState {
     /// unchanged — building the trie over up to `MAX_RESIDENT_ROWS` keys every
     /// frame would be wasteful (mirrors the fuzzy `visible_cache`).
     tree_cache: RefCell<Option<TreeCache>>,
+    /// `true`: the filter box searches key *values* (a substring the driver reads
+    /// scanned string values for) instead of key names. Mutually exclusive with
+    /// fuzzy (a name search) — turning one on clears the other.
+    pub(crate) value_search: bool,
+    /// The active value-search needle, threaded into every `KvFetchScan` of the
+    /// current run so pagination keeps filtering. `None` = no value search.
+    pub(crate) value_needle: Option<String>,
 }
 
 /// The "New key" popover's state: a name, the chosen type, and the per-type
@@ -691,13 +698,22 @@ impl BrowseState {
             // Only the active (visible, focused) tab can receive input events
             // in the no-split shell, so routing to the active Browse tab is
             // unambiguous here (see docs/plans/redis-workflow-parity.md).
-            let fuzzy = this
+            let (fuzzy, value_search) = this
                 .conn_mut(Some(session))
                 .and_then(|a| a.kv_view.as_ref())
                 .and_then(|v| v.active_browse())
-                .map(|b| b.fuzzy)
-                .unwrap_or(false);
+                .map(|b| (b.fuzzy, b.value_search))
+                .unwrap_or((false, false));
             match event {
+                // Value search is a costly per-key value read, so it runs only on
+                // Enter (never live on every keystroke); Change just repaints.
+                TextInputEvent::Submit if value_search => {
+                    let needle = input.read(cx).content().to_string();
+                    this.kv_set_value_needle(session, non_empty(needle), cx);
+                }
+                TextInputEvent::Change if value_search => {
+                    cx.notify();
+                }
                 // Enter restarts immediately, bypassing the debounce wait.
                 // No-op in fuzzy mode: there's no server round trip to fire
                 // early, filtering already happens live at render time.
@@ -746,6 +762,8 @@ impl BrowseState {
             expanded: HashSet::new(),
             expand_gen: 0,
             tree_cache: RefCell::new(None),
+            value_search: false,
+            value_needle: None,
         }
     }
 
@@ -1228,6 +1246,7 @@ impl AppState {
                 epoch,
                 pattern: None,
                 type_filter: None,
+                value_needle: None,
                 cursor: ScanCursor::START,
                 budget: scan_budget(),
             },
@@ -1457,6 +1476,7 @@ impl AppState {
         browse.loading = true;
         let pattern = browse.pattern.clone();
         let type_filter = browse.type_filter.as_ref().map(|t| t.label().to_string());
+        let value_needle = browse.value_needle.clone();
         self.service
             .send_to(session, Command::CloseResult { epoch: old_epoch });
         self.service.send_to(
@@ -1465,6 +1485,7 @@ impl AppState {
                 epoch: new_epoch,
                 pattern,
                 type_filter,
+                value_needle,
                 cursor: ScanCursor::START,
                 budget: scan_budget(),
             },
@@ -1502,6 +1523,7 @@ impl AppState {
         let epoch = browse.epoch;
         let pattern = browse.pattern.clone();
         let type_filter = browse.type_filter.as_ref().map(|t| t.label().to_string());
+        let value_needle = browse.value_needle.clone();
         let cursor = browse.cursor;
         self.service.send_to(
             session,
@@ -1509,6 +1531,7 @@ impl AppState {
                 epoch,
                 pattern,
                 type_filter,
+                value_needle,
                 cursor,
                 budget: scan_budget(),
             },
@@ -1704,10 +1727,55 @@ impl AppState {
         browse.fuzzy = !browse.fuzzy;
         let had_pattern = browse.pattern.is_some();
         let now_fuzzy = browse.fuzzy;
+        // Fuzzy (a name search) and value search are mutually exclusive.
+        if now_fuzzy {
+            browse.value_search = false;
+            browse.value_needle = None;
+        }
         cx.notify();
         if now_fuzzy && had_pattern {
             self.kv_restart_scan(session, None, cx);
         }
+    }
+
+    /// Toggle the filter box between key-name matching and value search (see
+    /// [`BrowseState::value_search`]). Clears the other filters and resets the
+    /// scan; the user then types a substring and presses Enter to search values.
+    pub(crate) fn kv_toggle_value_search(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        else {
+            return;
+        };
+        browse.value_search = !browse.value_search;
+        // Entering value search drops the name-based filters (fuzzy + MATCH); the
+        // needle is empty until the user runs one. Leaving it drops the needle.
+        browse.fuzzy = false;
+        browse.pattern = None;
+        browse.value_needle = None;
+        browse.filter.update(cx, |ti, cx| ti.set_content("", cx));
+        self.kv_relaunch_browse(session, cx);
+    }
+
+    /// Apply (or clear) the value-search needle and relaunch the scan. `None`
+    /// (an empty box) reverts to an unfiltered browse.
+    pub(crate) fn kv_set_value_needle(
+        &mut self,
+        session: SessionId,
+        needle: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        {
+            browse.value_needle = needle;
+            browse.pattern = None;
+        }
+        self.kv_relaunch_browse(session, cx);
     }
 
     /// While a fuzzy search is active and under-matched, keep requesting
@@ -1752,6 +1820,7 @@ impl AppState {
                 epoch,
                 pattern: None,
                 type_filter,
+                value_needle: None,
                 cursor,
                 budget: scan_budget(),
             },
@@ -1784,6 +1853,7 @@ impl AppState {
                 epoch,
                 pattern: None,
                 type_filter: None,
+                value_needle: None,
                 cursor: ScanCursor::START,
                 budget: scan_budget(),
             },
@@ -1831,6 +1901,7 @@ impl AppState {
                 epoch,
                 pattern: None,
                 type_filter: None,
+                value_needle: None,
                 cursor,
                 budget: scan_budget(),
             },
@@ -1908,6 +1979,7 @@ impl AppState {
                 epoch,
                 pattern: None,
                 type_filter: None,
+                value_needle: None,
                 cursor: ScanCursor::START,
                 budget: scan_budget(),
             },
@@ -1985,6 +2057,7 @@ impl AppState {
                     epoch,
                     pattern: None,
                     type_filter: None,
+                    value_needle: None,
                     cursor,
                     budget: scan_budget(),
                 },
@@ -2605,6 +2678,69 @@ impl AppState {
             KeyMenuEdit::Rename => self.kv_start_editing_key(session, cx),
             KeyMenuEdit::Ttl => self.kv_start_editing_ttl(session, cx),
         }
+    }
+
+    /// The other open Redis connections a key can be copied to: writable Redis
+    /// sessions other than `source` (the foreground one plus every warm parked
+    /// one), as `(session, name)`, sorted by name. Empty when there's nowhere to
+    /// copy to.
+    pub(crate) fn kv_copy_targets(&self, source: SessionId) -> Vec<(SessionId, String)> {
+        let mut out = Vec::new();
+        let mut consider = |a: &ActiveConn| {
+            if a.session != source
+                && a.config.kind == red_core::DbKind::Redis
+                && !a.config.read_only
+            {
+                out.push((a.session, a.config.name.clone()));
+            }
+        };
+        if let Phase::Connected(a) = &self.phase {
+            consider(a);
+        }
+        for a in self.parked.values() {
+            consider(a);
+        }
+        out.sort_by(|a, b| a.1.cmp(&b.1));
+        out
+    }
+
+    /// Menu action: copy `key` from `source` to another open Redis connection
+    /// (`DUMP` here → `RESTORE ... REPLACE` there, on the backend).
+    pub(crate) fn kv_copy_key_to(
+        &mut self,
+        source: SessionId,
+        key: String,
+        target: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        self.kv_close_key_menu(source, cx);
+        self.service.send_to(
+            source,
+            Command::KvCopyKeys {
+                keys: vec![key],
+                target_session: target,
+            },
+        );
+    }
+
+    /// `Event::KvKeysCopied`: a cross-server copy finished. Toast the outcome.
+    pub(crate) fn on_kv_keys_copied(&mut self, copied: u64, failed: u64, cx: &mut Context<Self>) {
+        let (variant, msg) = if failed == 0 {
+            (
+                ToastVariant::Success,
+                if copied == 1 {
+                    "Copied 1 key".to_string()
+                } else {
+                    format!("Copied {copied} keys")
+                },
+            )
+        } else {
+            (
+                ToastVariant::Warning,
+                format!("Copied {copied} key(s), {failed} failed"),
+            )
+        };
+        self.notify(variant, msg, cx);
     }
 
     /// Menu action: toggle the key's favorite star (persisted immediately). A
@@ -5104,6 +5240,7 @@ impl AppState {
         // in grid mode it's the raw key rows (no per-row allocation — the flat
         // grid's hot path). `disp` is `Some` only in tree mode.
         let tree_mode = browse.tree_mode;
+        let value_search = browse.value_search;
         let disp: Option<Rc<Vec<DispRow>>> = tree_mode.then(|| browse.tree_rows(&rows));
         let row_count = match &disp {
             Some(d) => d.len(),
@@ -5366,9 +5503,12 @@ impl AppState {
         // "no matches" reads as deliberate (mirrors the other panels' empties).
         let has_filter = browse.pattern.is_some()
             || browse.type_filter.is_some()
+            || browse.value_needle.is_some()
             || (browse.fuzzy && !fuzzy_query.is_empty());
         let empty_msg = if browse.loading {
             "Scanning…"
+        } else if browse.value_needle.is_some() {
+            "No string values match this search"
         } else if has_filter {
             "No keys match this filter"
         } else {
@@ -5478,6 +5618,35 @@ impl AppState {
                         .on_click(move |_, _, cx| {
                             tree_view
                                 .update(cx, |this, cx| this.kv_toggle_tree_mode(session, cx))
+                                .ok();
+                        })
+                    })
+                    .child({
+                        // Value search: the filter box matches key *values* (a
+                        // server-read substring) instead of key names. Enter runs it.
+                        let value_view = view.clone();
+                        IconButton::new(
+                            "kv-value-search-toggle",
+                            crate::icons::icon(
+                                "search",
+                                theme.scale(14.),
+                                if value_search {
+                                    theme.accent
+                                } else {
+                                    theme.text_muted
+                                },
+                            ),
+                        )
+                        .size(IconButtonSize::Sm)
+                        .tooltip(if value_search {
+                            "Value search (on): type a substring, Enter to search string values"
+                        } else {
+                            "Search key values instead of names"
+                        })
+                        .a11y_label("Toggle value search")
+                        .on_click(move |_, _, cx| {
+                            value_view
+                                .update(cx, |this, cx| this.kv_toggle_value_search(session, cx))
                                 .ok();
                         })
                     })

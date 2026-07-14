@@ -1522,7 +1522,7 @@ impl AppState {
         let pos = km.pos;
         let favorited = self.redis_key_meta.is_favorite(&active.conn_id, &key);
 
-        let menu = ContextMenu::new("kv-key-context-menu")
+        let mut menu = ContextMenu::new("kv-key-context-menu")
             .item(
                 ContextMenuItem::new("kv-key-open", "Open").on_click(cx.listener({
                     let key = key.clone();
@@ -1569,7 +1569,22 @@ impl AppState {
                     move |this, _, _, cx| this.kv_open_annotations(session, key.clone(), cx)
                 })),
             )
-            .separator()
+            .separator();
+
+        // Cross-server copy: one item per other open, writable Redis connection
+        // (DUMP here → RESTORE ... REPLACE there). Omitted when there's nowhere
+        // to copy to.
+        for (i, (target, name)) in self.kv_copy_targets(session).into_iter().enumerate() {
+            let key = key.clone();
+            let id = gpui::SharedString::from(format!("kv-key-copyto-{i}"));
+            menu = menu.item(
+                ContextMenuItem::new(id, format!("Copy to “{name}”")).on_click(cx.listener(
+                    move |this, _, _, cx| this.kv_copy_key_to(session, key.clone(), target, cx),
+                )),
+            );
+        }
+
+        let menu = menu
             .item(
                 ContextMenuItem::new("kv-key-rename", "Rename…")
                     .disabled(!writable)

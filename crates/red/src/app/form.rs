@@ -26,6 +26,9 @@ impl AppState {
             .update(cx, |i, cx| i.set_content(config.password.clone(), cx));
         self.database_input
             .update(cx, |i, cx| i.set_content(config.database.clone(), cx));
+        self.sentinel_master_input.update(cx, |i, cx| {
+            i.set_content(config.sentinel_master.clone(), cx)
+        });
         // Seed the connection-string mirror for network engines once host/db are
         // set (an empty new form leaves it blank so the placeholder shows).
         let conn_str = if config.kind.is_file() || config.host.is_empty() {
@@ -238,6 +241,13 @@ impl AppState {
             ai_enabled,
             ai_tier,
             ssh,
+            // A Sentinel master group only applies to Redis; other engines never
+            // carry one even if the input holds stale text from an engine switch.
+            sentinel_master: if form.kind == DbKind::Redis {
+                read(&self.sentinel_master_input)
+            } else {
+                String::new()
+            },
         })
     }
 

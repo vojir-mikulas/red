@@ -584,6 +584,13 @@ pub struct ConnectionConfig {
     /// through it (see [`SshConfig`]); `None` connects directly.
     #[cfg_attr(feature = "serde", serde(default))]
     pub ssh: Option<SshConfig>,
+    /// Redis Sentinel master group name. When set (Redis only), `host`/`port`
+    /// name a Sentinel and the driver resolves the current master via
+    /// `SENTINEL get-master-addr-by-name` (see `redis_kv.rs`'s `resolve_sentinel`);
+    /// [`Self::dsn`] carries it as the `?master=` query the driver reads. Empty =
+    /// a direct (non-Sentinel) connection.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub sentinel_master: String,
 }
 
 /// Render a secret for `Debug`: `<unset>` when empty, `<redacted>` otherwise, so
@@ -616,6 +623,7 @@ impl fmt::Debug for ConnectionConfig {
             .field("ai_enabled", &self.ai_enabled)
             .field("ai_tier", &self.ai_tier)
             .field("ssh", &self.ssh)
+            .field("sentinel_master", &self.sentinel_master)
             .finish()
     }
 }
@@ -677,6 +685,13 @@ impl ConnectionConfig {
                 DbKind::Mysql => url.push_str("?require_ssl=true"),
                 _ => {}
             }
+        }
+        // Redis Sentinel: `?master=<group>` tells the driver to treat host/port as
+        // a Sentinel and resolve the master. Redis spells TLS via the scheme, so
+        // this is always the sole query param (no `?`/`&` conflict).
+        if self.kind == DbKind::Redis && !self.sentinel_master.is_empty() {
+            url.push_str("?master=");
+            url.push_str(&encode(&self.sentinel_master));
         }
         url
     }
@@ -1923,6 +1938,30 @@ mod conn_tests {
             ..Default::default()
         };
         assert_eq!(cfg.dsn(), "redis://:hunter2@localhost:6379/");
+    }
+
+    #[test]
+    fn dsn_emits_sentinel_master_query_for_redis() {
+        let cfg = ConnectionConfig {
+            kind: DbKind::Redis,
+            host: "sentinel.local".into(),
+            port: Some(26379),
+            sentinel_master: "mymaster".into(),
+            ..Default::default()
+        };
+        assert_eq!(cfg.dsn(), "redis://sentinel.local:26379/?master=mymaster");
+        // TLS composes: the scheme flips to rediss, master stays the sole query.
+        let tls = ConnectionConfig {
+            tls: true,
+            ..cfg.clone()
+        };
+        assert_eq!(tls.dsn(), "rediss://sentinel.local:26379/?master=mymaster");
+        // A non-Redis engine never emits it, even if the field is set.
+        let pg = ConnectionConfig {
+            kind: DbKind::Postgres,
+            ..cfg
+        };
+        assert!(!pg.dsn().contains("master="));
     }
 
     #[test]

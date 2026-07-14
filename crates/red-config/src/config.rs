@@ -87,6 +87,10 @@ struct RawConnection {
     /// configs, where it defaults to unpinned.
     #[serde(default)]
     pinned: bool,
+    /// Redis Sentinel master group name. Absent (the common case) = a direct
+    /// connection.
+    #[serde(default)]
+    sentinel_master: String,
     /// Optional SSH jump host. Absent in pre-SSH configs; secrets are never here.
     #[serde(default)]
     ssh: Option<RawSsh>,
@@ -150,6 +154,7 @@ impl RawConnection {
             tls: self.tls,
             ai_enabled: self.ai_enabled,
             ai_tier: self.ai_tier,
+            sentinel_master: self.sentinel_master,
             ssh: self.ssh.and_then(RawSsh::into_config),
         };
         // Legacy migration: an old `dsn` with no structured fields populated. For a
@@ -215,6 +220,10 @@ struct WriteConnection {
     /// round-trip byte-for-byte.
     #[serde(skip_serializing_if = "is_false")]
     pinned: bool,
+    /// Redis Sentinel master group; omitted when empty so non-Sentinel files
+    /// round-trip byte-for-byte. A scalar key, so it stays ahead of `ssh`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    sentinel_master: String,
     /// Optional `[connection.ssh]` sub-table. Must stay the **last** field: TOML
     /// requires a table-valued key to follow all of a struct's scalar keys.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -268,6 +277,7 @@ impl From<&StoredConnection> for WriteConnection {
             ai_tier: c.ai_tier,
             last_accessed: s.last_accessed,
             pinned: s.pinned,
+            sentinel_master: c.sentinel_master.clone(),
             ssh: c.ssh.as_ref().map(WriteSsh::from_config),
         }
     }
@@ -473,6 +483,9 @@ mod tests {
                     ai_enabled: Some(false),
                     ai_tier: Some(AiTier::Schema),
                     ssh: None,
+                    // A Sentinel master must round-trip; conn-a leaves it empty to
+                    // confirm it's omitted from the file and reads back blank.
+                    sentinel_master: "mymaster".into(),
                 },
                 last_accessed: None,
                 pinned: false,
@@ -511,6 +524,9 @@ mod tests {
         assert_eq!(back[0].config.ai_tier, None);
         assert_eq!(back[1].config.ai_enabled, Some(false));
         assert_eq!(back[1].config.ai_tier, Some(AiTier::Schema));
+        // The Sentinel master round-trips; an empty one is omitted and reads back blank.
+        assert_eq!(back[0].config.sentinel_master, "");
+        assert_eq!(back[1].config.sentinel_master, "mymaster");
         // The pinned flag round-trips; an unpinned connection omits it and reads
         // back false.
         assert!(back[0].pinned);

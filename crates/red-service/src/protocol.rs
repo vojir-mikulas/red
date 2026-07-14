@@ -164,6 +164,10 @@ pub enum Command {
         epoch: u64,
         pattern: Option<String>,
         type_filter: Option<String>,
+        /// When set, keep only keys whose *value* contains this substring
+        /// (case-insensitive, string values only). A value search Redis can't
+        /// push down, so the driver reads scanned values and filters.
+        value_needle: Option<String>,
         cursor: ScanCursor,
         budget: ScanBudget,
     },
@@ -299,6 +303,14 @@ pub enum Command {
     KvRestoreKeys {
         epoch: u64,
         keys: Vec<RecycledKey>,
+    },
+    /// Copy keys from this (source) connection to another open Redis connection
+    /// (`DUMP` here, `RESTORE ... REPLACE` there — see `CopyToTable` for the
+    /// two-session shape). The envelope `SessionId` is the source; both ends are
+    /// pinned for the copy. Replied with `KvKeysCopied`.
+    KvCopyKeys {
+        keys: Vec<String>,
+        target_session: SessionId,
     },
     /// Start a live Pub/Sub pattern subscription (see docs/plans/redis.md's
     /// R4). `epoch` identifies this subscription; messages stream back as
@@ -829,6 +841,13 @@ pub enum Event {
     KvKeysRestored {
         epoch: u64,
         count: u64,
+    },
+    /// A cross-server copy finished, in response to `KvCopyKeys`. Emitted with a
+    /// `None` session so its toast survives a connection switch (the op spans
+    /// two connections). `failed` counts keys that vanished or couldn't restore.
+    KvKeysCopied {
+        copied: u64,
+        failed: u64,
     },
     /// One Pub/Sub message, pushed for as long as the `KvSubscribe { epoch,
     /// .. }` that started it stays open.

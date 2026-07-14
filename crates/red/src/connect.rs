@@ -1076,6 +1076,14 @@ impl AppState {
                     field_err(errors, FormField::Database),
                 )),
             )
+            // Redis Sentinel: naming a master group turns Host/Port into a
+            // Sentinel address the driver resolves the master from.
+            .when(form.kind == DbKind::Redis, |col| {
+                col.child(
+                    labeled_field("Sentinel master (optional)", theme)
+                        .child(self.sentinel_master_input.clone()),
+                )
+            })
             .child(
                 div()
                     .flex()

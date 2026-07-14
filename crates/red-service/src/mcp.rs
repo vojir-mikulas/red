@@ -598,6 +598,7 @@ mod tests {
             _cursor: red_core::kv::ScanCursor,
             _pattern: Option<&str>,
             _type_filter: Option<&str>,
+            _value_needle: Option<&str>,
             _budget: red_core::kv::ScanBudget,
             _abort: &red_driver::AbortSignal,
         ) -> red_core::Result<red_core::kv::KvScanPage> {

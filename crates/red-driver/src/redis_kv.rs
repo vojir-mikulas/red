@@ -34,6 +34,11 @@ const MAX_SCAN_NODE_RETRIES: u32 = 3;
 /// fetch, not a per-cell grid budget, so it gets its own constant.
 const STRING_PREVIEW_CAP: usize = 8 * 1024;
 
+/// How many leading bytes of a string value a value search reads (`GETRANGE 0
+/// CAP-1`). Bounds the cost of scanning values; a match past this offset in a
+/// very large value is missed (an accepted limitation for a bounded search).
+const VALUE_SEARCH_CAP: usize = 64 * 1024;
+
 /// Hard safety ceiling on a "load full value" ([`read_string_full`]) fetch. The
 /// preview cap above keeps the grid/inspector light; this is the much larger
 /// ceiling on the *explicit* whole-value load, so a pathological multi-hundred-MB
@@ -174,6 +179,48 @@ impl RedisDriver {
         } else {
             Ok(())
         }
+    }
+
+    /// Value search over a scanned page: keep only string keys whose value
+    /// contains `needle` (case-insensitive). Reads each string key's value with
+    /// `GETRANGE 0 CAP` (bounded — a match past [`VALUE_SEARCH_CAP`] is missed);
+    /// non-string keys are excluded (reading a whole collection per key would be
+    /// far too costly). Routed per key so it works standalone and under cluster.
+    async fn filter_keys_by_value(
+        &self,
+        keys: Vec<KeyMeta>,
+        needle: &str,
+        abort: &AbortSignal,
+    ) -> Result<Vec<KeyMeta>> {
+        let needle = needle.to_lowercase();
+        let mut out = Vec::new();
+        for k in keys {
+            if abort.is_aborted() {
+                return Err(RedError::Interrupted);
+            }
+            if k.kv_type != KvType::String {
+                continue;
+            }
+            let mut conn = self.route(&k.key);
+            // Bytes (not String) so a non-UTF8 value can't fail the read; matched
+            // lossily. A vanished/retyped key errors → excluded (`.ok()`).
+            let chunk: Option<Vec<u8>> = redis::cmd("GETRANGE")
+                .arg(&k.key)
+                .arg(0)
+                .arg(VALUE_SEARCH_CAP as i64 - 1)
+                .query_async(&mut conn)
+                .await
+                .ok();
+            if let Some(bytes) = chunk {
+                if String::from_utf8_lossy(&bytes)
+                    .to_lowercase()
+                    .contains(&needle)
+                {
+                    out.push(k);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Standalone/Sentinel scan: the budgeted `SCAN` loop on the sole
@@ -712,19 +759,27 @@ impl KvDriver for RedisDriver {
         cursor: ScanCursor,
         pattern: Option<&str>,
         type_filter: Option<&str>,
+        value_needle: Option<&str>,
         budget: ScanBudget,
         abort: &AbortSignal,
     ) -> Result<KvScanPage> {
-        match &self.cluster {
+        let mut page = match &self.cluster {
             Some(cl) => {
                 self.scan_cluster(cl, cursor, pattern, type_filter, budget, abort)
-                    .await
+                    .await?
             }
             None => {
                 self.scan_standalone(cursor, pattern, type_filter, budget, abort)
-                    .await
+                    .await?
             }
+        };
+        // A value search reads each scanned string key's value and keeps only
+        // matches — the cursor already advanced, so a page may shrink (like a
+        // MATCH glob), and the caller pages on via `next_cursor` for more.
+        if let Some(needle) = value_needle.filter(|n| !n.is_empty()) {
+            page.keys = self.filter_keys_by_value(page.keys, needle, abort).await?;
         }
+        Ok(page)
     }
 
     async fn probe_key(&self, key: &str) -> Result<Option<KeyMeta>> {
@@ -1404,17 +1459,24 @@ impl KvDriver for RedisDriver {
         Ok(Some((payload, ttl)))
     }
 
-    async fn restore_key(&self, key: &str, ttl: Option<Duration>, payload: &[u8]) -> Result<()> {
+    async fn restore_key(
+        &self,
+        key: &str,
+        ttl: Option<Duration>,
+        payload: &[u8],
+        replace: bool,
+    ) -> Result<()> {
         self.check_writable()?;
         let mut conn = self.route(key);
-        // RESTORE's ttl is milliseconds, 0 = no expiry. No REPLACE: a BUSYKEY
-        // error (the key was recreated meanwhile) surfaces rather than clobbering.
+        // RESTORE's ttl is milliseconds, 0 = no expiry. `REPLACE` overwrites an
+        // existing key (a copy); without it a BUSYKEY error surfaces (an undo).
         let ttl_ms = ttl.map(|d| d.as_millis() as u64).unwrap_or(0);
-        redis::cmd("RESTORE")
-            .arg(key)
-            .arg(ttl_ms)
-            .arg(payload)
-            .query_async::<()>(&mut conn)
+        let mut cmd = redis::cmd("RESTORE");
+        cmd.arg(key).arg(ttl_ms).arg(payload);
+        if replace {
+            cmd.arg("REPLACE");
+        }
+        cmd.query_async::<()>(&mut conn)
             .await
             .map_err(|e| RedError::Driver(e.to_string()))
     }
@@ -2463,7 +2525,14 @@ mod tests {
         let mut cursor = ScanCursor::START;
         loop {
             let page = driver
-                .scan_keys(cursor, Some(&format!("{prefix}:*")), None, budget(), &abort)
+                .scan_keys(
+                    cursor,
+                    Some(&format!("{prefix}:*")),
+                    None,
+                    None,
+                    budget(),
+                    &abort,
+                )
                 .await
                 .unwrap();
             for k in &page.keys {
@@ -2509,6 +2578,7 @@ mod tests {
                 .scan_keys(
                     cursor,
                     Some(&format!("{prefix}:*")),
+                    None,
                     None,
                     ScanBudget {
                         count_hint: 5,
@@ -2564,6 +2634,7 @@ mod tests {
                 ScanCursor::START,
                 Some(&format!("{prefix}:*")),
                 None,
+                None,
                 budget(),
                 &abort,
             )
@@ -2616,6 +2687,7 @@ mod tests {
                     cursor,
                     Some(&format!("{prefix}:*")),
                     Some("hash"),
+                    None,
                     budget(),
                     &abort,
                 )

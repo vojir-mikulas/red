@@ -1235,6 +1235,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 epoch,
                 pattern,
                 type_filter,
+                value_needle,
                 cursor,
                 budget,
             } => {
@@ -1266,6 +1267,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             cursor,
                             pattern.as_deref(),
                             type_filter.as_deref(),
+                            value_needle.as_deref(),
                             budget,
                             &abort,
                         )
@@ -1938,7 +1940,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 tokio::spawn(async move {
                     let mut restored = 0u64;
                     for k in &keys {
-                        match driver.restore_key(&k.key, k.ttl, &k.payload).await {
+                        match driver.restore_key(&k.key, k.ttl, &k.payload, false).await {
                             Ok(()) => restored += 1,
                             // A single failure (e.g. BUSYKEY — the key was
                             // recreated meanwhile) surfaces but doesn't abort the
@@ -1954,6 +1956,78 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             count: restored,
                         },
                     );
+                });
+            }
+
+            Command::KvCopyKeys {
+                keys,
+                target_session,
+            } => {
+                let Some(source_sid) = session_id else {
+                    continue;
+                };
+                let Some(src_state) = sessions.get(&source_sid) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(src) = src_state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("source isn't a Redis connection".into()),
+                    );
+                    continue;
+                };
+                let src_busy = src_state.busy.clone();
+                let Some(dst_state) = sessions.get(&target_session) else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("target connection isn't open".into()),
+                    );
+                    continue;
+                };
+                // Defense in depth alongside the UI's writable-target filter.
+                if dst_state.read_only {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("target connection is read-only".into()),
+                    );
+                    continue;
+                }
+                let Some(dst) = dst_state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("target isn't a Redis connection".into()),
+                    );
+                    continue;
+                };
+                let dst_busy = dst_state.busy.clone();
+                let events = events.clone();
+                tokio::spawn(async move {
+                    // Pin both ends so neither is idle-evicted mid-copy.
+                    let _src_pin = PinGuard::new(src_busy);
+                    let _dst_pin = PinGuard::new(dst_busy);
+                    let mut copied = 0u64;
+                    let mut failed = 0u64;
+                    for k in &keys {
+                        // DUMP on the source, RESTORE ... REPLACE on the target: a
+                        // vanished key or a failed restore counts as a failure but
+                        // never aborts the batch.
+                        match src.dump_key(k).await {
+                            Ok(Some((payload, ttl))) => {
+                                match dst.restore_key(k, ttl, &payload, true).await {
+                                    Ok(()) => copied += 1,
+                                    Err(_) => failed += 1,
+                                }
+                            }
+                            _ => failed += 1,
+                        }
+                    }
+                    // Global (None) session so the toast survives a ⌘P switch.
+                    emit(&events, None, Event::KvKeysCopied { copied, failed });
                 });
             }
 

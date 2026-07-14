@@ -1202,6 +1202,9 @@ pub struct AppState {
     pub(crate) user_input: Entity<TextInput>,
     pub(crate) password_input: Entity<TextInput>,
     pub(crate) database_input: Entity<TextInput>,
+    /// Redis Sentinel master-group name (shown only for a Redis engine). Empty =
+    /// a direct connection.
+    pub(crate) sentinel_master_input: Entity<TextInput>,
     pub(crate) conn_str_input: Entity<TextInput>,
     /// SSH-tunnel fields, shown when the form's `ssh_enabled` is on (network
     /// engines only). The two secret inputs are obscured.
@@ -1808,6 +1811,7 @@ impl AppState {
         // connection-string field right below, so masking it here buys nothing.
         let password_input = cx.new(TextInput::new);
         let database_input = cx.new(|cx| TextInput::new(cx).with_placeholder("analytics_prod"));
+        let sentinel_master_input = cx.new(|cx| TextInput::new(cx).with_placeholder("mymaster"));
         let conn_str_input =
             cx.new(|cx| TextInput::new(cx).with_placeholder("postgres://user:pass@host:5432/db"));
 
@@ -2175,6 +2179,7 @@ impl AppState {
             user_input,
             password_input,
             database_input,
+            sentinel_master_input,
             conn_str_input,
             ssh_host_input,
             ssh_port_input,
@@ -2738,6 +2743,9 @@ impl AppState {
             }
             Event::KvKeysRestored { epoch, count } => {
                 self.on_kv_keys_restored(session, epoch, count, cx);
+            }
+            Event::KvKeysCopied { copied, failed } => {
+                self.on_kv_keys_copied(copied, failed, cx);
             }
             Event::KvMessage {
                 epoch,
