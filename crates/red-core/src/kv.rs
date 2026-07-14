@@ -301,6 +301,20 @@ pub enum KvValue {
     Unsupported(KvType),
 }
 
+/// A key captured just before deletion, for the recycle bin's undo (see
+/// `KvDriver::dump_key`/`restore_key`): its serialized value (`DUMP`) and the
+/// expiry to re-apply (`PTTL`). Held by the UI after a delete and sent back in
+/// `Command::KvRestoreKeys` on undo. The payload is opaque `RESTORE` wire bytes,
+/// never inspected — only round-tripped through the same server.
+#[derive(Debug, Clone)]
+pub struct RecycledKey {
+    pub key: String,
+    /// Remaining expiry to re-apply on restore; `None` = no expiry.
+    pub ttl: Option<Duration>,
+    /// The `DUMP` serialization, fed verbatim to `RESTORE`.
+    pub payload: Vec<u8>,
+}
+
 /// One in-grid edit (see `KvDriver::set_string`/`set_field`/`set_ttl`/
 /// `rename_key`/`delete_keys`), carried through `Command::KvApplyEdit` and
 /// echoed back on `Event::KvEditApplied` so the UI can pattern-match what

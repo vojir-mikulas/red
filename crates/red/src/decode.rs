@@ -762,6 +762,403 @@ fn opaque(v: &Decoded) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Timestamp lens: a Unix-epoch integer → a human UTC datetime.
+// ---------------------------------------------------------------------------
+
+/// Render a Unix-epoch integer as a UTC datetime, auto-detecting the unit
+/// (seconds / milliseconds / microseconds / nanoseconds) by magnitude. Accepts
+/// the value as ASCII digits (a Redis string like `"1700000000"`) or as a 4- or
+/// 8-byte big-endian integer blob. `None` when the bytes aren't a plausible
+/// timestamp (below ~1973), so the lens falls back to raw/hex rather than
+/// dressing up an ordinary small integer as a date.
+pub fn decode_timestamp(bytes: &[u8]) -> Option<String> {
+    let raw = parse_epoch_int(bytes)?;
+    let (secs, unit) = epoch_to_seconds(raw)?;
+    let secs = i64::try_from(secs).ok()?;
+    let when = format_unix_utc(secs)?;
+    Some(format!("{when}\n(unix {unit}: {raw})"))
+}
+
+/// Parse the value as a signed integer, from ASCII digits or a 4-/8-byte
+/// big-endian blob. `None` when it isn't a bare integer.
+fn parse_epoch_int(bytes: &[u8]) -> Option<i128> {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        let t = s.trim();
+        let digits_only = !t.is_empty()
+            && t.bytes()
+                .enumerate()
+                .all(|(i, b)| b.is_ascii_digit() || (i == 0 && b == b'-'));
+        if digits_only {
+            return t.parse::<i128>().ok();
+        }
+    }
+    match bytes.len() {
+        4 => Some(u32::from_be_bytes(bytes.try_into().ok()?) as i128),
+        8 => Some(i64::from_be_bytes(bytes.try_into().ok()?) as i128),
+        _ => None,
+    }
+}
+
+/// Detect the epoch unit by magnitude and normalise to seconds. The lower bound
+/// (~1e8 s ≈ 1973) rejects small integers that merely happen to be numbers.
+fn epoch_to_seconds(v: i128) -> Option<(i128, &'static str)> {
+    match v {
+        v if v >= 1_000_000_000_000_000_000 => Some((v / 1_000_000_000, "nanos")),
+        v if v >= 1_000_000_000_000_000 => Some((v / 1_000_000, "micros")),
+        v if v >= 1_000_000_000_000 => Some((v / 1_000, "millis")),
+        v if v >= 100_000_000 => Some((v, "seconds")),
+        _ => None,
+    }
+}
+
+/// Format Unix seconds as `YYYY-MM-DD HH:MM:SS UTC`. Pure/allocation-light so
+/// the timestamp lens needs no date crate (the project ships none).
+fn format_unix_utc(secs: i64) -> Option<String> {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, mi, s) = (rem / 3_600, (rem % 3_600) / 60, rem % 60);
+    let (y, m, d) = civil_from_days(days);
+    Some(format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC"))
+}
+
+/// Days-since-1970 → `(year, month, day)`, via Howard Hinnant's `civil_from_days`
+/// (proleptic Gregorian, exact, branch-light).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+// ---------------------------------------------------------------------------
+// Decompression lens: gzip (RFC 1952) / zlib (RFC 1950) over DEFLATE (RFC 1951).
+// Hand-rolled inflate (a `puff.c`-style bit-at-a-time Huffman decoder), so a
+// compressed cache value shows its payload instead of a wall of hex — with no
+// new dependency (a C `zstd`/`flate2` would break the dependency-free rule).
+// zstd/LZ4 are deliberately out of scope: they can't be hand-rolled as compactly.
+// ---------------------------------------------------------------------------
+
+/// Cap on inflate output, guarding against a decompression bomb (a tiny blob
+/// that expands to gigabytes). Far above any value the inspector previews.
+const INFLATE_MAX: usize = 16 * 1024 * 1024;
+
+/// Detect and decompress a gzip or zlib stream, returning the inflated bytes.
+/// `None` when the input isn't a recognised/valid compressed stream, or would
+/// expand past [`INFLATE_MAX`]. Raw headerless DEFLATE is intentionally not
+/// probed (no header to detect → too many false positives on arbitrary bytes).
+pub fn decompress(bytes: &[u8]) -> Option<Vec<u8>> {
+    if let Some(rest) = strip_gzip_header(bytes) {
+        return inflate(rest);
+    }
+    if is_zlib(bytes) {
+        // zlib: 2-byte header, then DEFLATE (skip the 4-byte FDICT id if set).
+        let start = if bytes[1] & 0x20 != 0 { 6 } else { 2 };
+        return inflate(bytes.get(start..)?);
+    }
+    None
+}
+
+/// Strip a gzip header (magic `1f 8b`, CM=deflate, optional FEXTRA/FNAME/
+/// FCOMMENT/FHCRC), returning the DEFLATE stream that follows. `None` if it
+/// isn't gzip or the header runs off the end.
+fn strip_gzip_header(b: &[u8]) -> Option<&[u8]> {
+    if b.len() < 10 || b[0] != 0x1f || b[1] != 0x8b || b[2] != 0x08 {
+        return None;
+    }
+    let flg = b[3];
+    let mut pos = 10;
+    if flg & 0x04 != 0 {
+        // FEXTRA: 2-byte length then that many bytes.
+        let xlen = *b.get(pos)? as usize | ((*b.get(pos + 1)? as usize) << 8);
+        pos += 2 + xlen;
+    }
+    for mask in [0x08, 0x10] {
+        // FNAME, FCOMMENT: NUL-terminated strings.
+        if flg & mask != 0 {
+            while *b.get(pos)? != 0 {
+                pos += 1;
+            }
+            pos += 1;
+        }
+    }
+    if flg & 0x02 != 0 {
+        pos += 2; // FHCRC
+    }
+    b.get(pos..)
+}
+
+/// A zlib header: CM=deflate (low nibble 8), window ≤ 32K (CINFO ≤ 7), and the
+/// 2-byte header a multiple of 31 (the zlib check).
+fn is_zlib(b: &[u8]) -> bool {
+    b.len() >= 2
+        && (b[0] & 0x0f) == 8
+        && (b[0] >> 4) <= 7
+        && ((b[0] as u16) << 8 | b[1] as u16).is_multiple_of(31)
+}
+
+/// An LSB-first bit reader over a DEFLATE stream.
+struct BitReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    buf: u32,
+    nbits: u32,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        BitReader {
+            data,
+            pos: 0,
+            buf: 0,
+            nbits: 0,
+        }
+    }
+
+    /// Read `n` (≤ 16) bits, LSB-first. `None` on end of input.
+    fn bits(&mut self, n: u32) -> Option<u32> {
+        while self.nbits < n {
+            let byte = *self.data.get(self.pos)?;
+            self.pos += 1;
+            self.buf |= (byte as u32) << self.nbits;
+            self.nbits += 8;
+        }
+        let mask = if n == 0 { 0 } else { (1u32 << n) - 1 };
+        let val = self.buf & mask;
+        self.buf >>= n;
+        self.nbits -= n;
+        Some(val)
+    }
+
+    /// Drop to the next byte boundary (before a stored block's length header).
+    fn align(&mut self) {
+        let drop = self.nbits % 8;
+        self.buf >>= drop;
+        self.nbits -= drop;
+    }
+
+    /// Take a whole byte (buffered bits first, then the underlying stream).
+    fn take_byte(&mut self) -> Option<u8> {
+        if self.nbits >= 8 {
+            let b = (self.buf & 0xff) as u8;
+            self.buf >>= 8;
+            self.nbits -= 8;
+            Some(b)
+        } else {
+            let b = *self.data.get(self.pos)?;
+            self.pos += 1;
+            Some(b)
+        }
+    }
+}
+
+/// A canonical Huffman table built from per-symbol code lengths, decoded
+/// bit-at-a-time (the `puff.c` algorithm — compact and allocation-light).
+struct Huffman {
+    counts: [u16; 16],
+    symbols: Vec<u16>,
+}
+
+impl Huffman {
+    fn new(lengths: &[u8]) -> Huffman {
+        let mut counts = [0u16; 16];
+        for &l in lengths {
+            counts[l as usize] += 1;
+        }
+        counts[0] = 0;
+        let mut offsets = [0u16; 16];
+        let mut sum = 0u16;
+        for len in 1..16 {
+            offsets[len] = sum;
+            sum += counts[len];
+        }
+        let mut symbols = vec![0u16; sum as usize];
+        for (sym, &l) in lengths.iter().enumerate() {
+            if l != 0 {
+                symbols[offsets[l as usize] as usize] = sym as u16;
+                offsets[l as usize] += 1;
+            }
+        }
+        Huffman { counts, symbols }
+    }
+
+    fn decode(&self, r: &mut BitReader) -> Option<u16> {
+        let mut code = 0i32;
+        let mut first = 0i32;
+        let mut index = 0i32;
+        for len in 1..16 {
+            code |= r.bits(1)? as i32;
+            let count = self.counts[len] as i32;
+            if code - first < count {
+                return self.symbols.get((index + (code - first)) as usize).copied();
+            }
+            index += count;
+            first = (first + count) << 1;
+            code <<= 1;
+        }
+        None
+    }
+}
+
+/// Length codes 257..=285: base length and extra bits (RFC 1951 §3.2.5).
+const LENGTH_BASE: [u16; 29] = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258,
+];
+const LENGTH_EXTRA: [u8; 29] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+];
+/// Distance codes 0..=29: base distance and extra bits.
+const DIST_BASE: [u16; 30] = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+];
+const DIST_EXTRA: [u8; 30] = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+    13,
+];
+
+/// Inflate a raw DEFLATE stream (block loop over stored / fixed / dynamic
+/// Huffman blocks). `None` on malformed input or an output over [`INFLATE_MAX`].
+fn inflate(data: &[u8]) -> Option<Vec<u8>> {
+    let mut r = BitReader::new(data);
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let bfinal = r.bits(1)?;
+        match r.bits(2)? {
+            0 => inflate_stored(&mut r, &mut out)?,
+            1 => inflate_block(&mut r, &mut out, &fixed_lit(), &fixed_dist())?,
+            2 => {
+                let (lit, dist) = dynamic_tables(&mut r)?;
+                inflate_block(&mut r, &mut out, &lit, &dist)?;
+            }
+            _ => return None, // reserved BTYPE 3
+        }
+        if out.len() > INFLATE_MAX {
+            return None;
+        }
+        if bfinal == 1 {
+            return Some(out);
+        }
+    }
+}
+
+fn inflate_stored(r: &mut BitReader, out: &mut Vec<u8>) -> Option<()> {
+    r.align();
+    let len = r.take_byte()? as usize | ((r.take_byte()? as usize) << 8);
+    let _nlen = (r.take_byte()?, r.take_byte()?); // one's-complement of len; unchecked
+    for _ in 0..len {
+        out.push(r.take_byte()?);
+        if out.len() > INFLATE_MAX {
+            return None;
+        }
+    }
+    Some(())
+}
+
+fn inflate_block(
+    r: &mut BitReader,
+    out: &mut Vec<u8>,
+    lit: &Huffman,
+    dist: &Huffman,
+) -> Option<()> {
+    loop {
+        let sym = lit.decode(r)?;
+        match sym {
+            256 => return Some(()), // end of block
+            0..=255 => out.push(sym as u8),
+            257..=285 => {
+                let s = (sym - 257) as usize;
+                let len = LENGTH_BASE[s] as usize + r.bits(LENGTH_EXTRA[s] as u32)? as usize;
+                let dsym = dist.decode(r)? as usize;
+                if dsym >= DIST_BASE.len() {
+                    return None;
+                }
+                let d = DIST_BASE[dsym] as usize + r.bits(DIST_EXTRA[dsym] as u32)? as usize;
+                if d == 0 || d > out.len() {
+                    return None;
+                }
+                let start = out.len() - d;
+                for i in 0..len {
+                    out.push(out[start + i]); // overlapping copy (LZ77 run) is intentional
+                }
+            }
+            _ => return None, // symbols 286/287 are reserved
+        }
+        if out.len() > INFLATE_MAX {
+            return None;
+        }
+    }
+}
+
+/// The fixed literal/length code lengths (RFC 1951 §3.2.6).
+fn fixed_lit() -> Huffman {
+    let mut lengths = [0u8; 288];
+    lengths[0..144].fill(8);
+    lengths[144..256].fill(9);
+    lengths[256..280].fill(7);
+    lengths[280..288].fill(8);
+    Huffman::new(&lengths)
+}
+
+/// The fixed distance code lengths: 30 codes of 5 bits each.
+fn fixed_dist() -> Huffman {
+    Huffman::new(&[5u8; 30])
+}
+
+/// Read a dynamic block's literal/length and distance Huffman tables from the
+/// code-length code (RFC 1951 §3.2.7).
+fn dynamic_tables(r: &mut BitReader) -> Option<(Huffman, Huffman)> {
+    const ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
+    let hlit = r.bits(5)? as usize + 257;
+    let hdist = r.bits(5)? as usize + 1;
+    let hclen = r.bits(4)? as usize + 4;
+    if hlit > 286 || hdist > 30 {
+        return None;
+    }
+    let mut cl_lengths = [0u8; 19];
+    for &slot in ORDER.iter().take(hclen) {
+        cl_lengths[slot] = r.bits(3)? as u8;
+    }
+    let cl = Huffman::new(&cl_lengths);
+    let total = hlit + hdist;
+    let mut lengths: Vec<u8> = Vec::with_capacity(total);
+    while lengths.len() < total {
+        match cl.decode(r)? {
+            sym @ 0..=15 => lengths.push(sym as u8),
+            16 => {
+                let prev = *lengths.last()?;
+                let rep = r.bits(2)? as usize + 3;
+                lengths.resize(lengths.len() + rep, prev);
+            }
+            17 => {
+                let rep = r.bits(3)? as usize + 3;
+                lengths.resize(lengths.len() + rep, 0);
+            }
+            18 => {
+                let rep = r.bits(7)? as usize + 11;
+                lengths.resize(lengths.len() + rep, 0);
+            }
+            _ => return None,
+        }
+    }
+    if lengths.len() != total {
+        return None; // a repeat ran past the declared table sizes
+    }
+    Some((
+        Huffman::new(&lengths[..hlit]),
+        Huffman::new(&lengths[hlit..]),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,5 +1298,61 @@ mod tests {
             inner = wrapped;
         }
         let _ = decode_protobuf(&inner); // must not stack-overflow
+    }
+
+    /// Decode an ASCII-hex string into bytes (test helper for real fixtures).
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn decompress_inflates_a_real_gzip_stream() {
+        // `printf 'hello, redis world! hello, redis world!' | gzip -n`
+        let gz = unhex("1f8b0800000000000003cb48cdc9c9d751284a4dc92c5628cf2fca495154c8c014030020f4948827000000");
+        let out = decompress(&gz).unwrap();
+        assert_eq!(out, b"hello, redis world! hello, redis world!");
+    }
+
+    #[test]
+    fn decompress_inflates_a_real_zlib_stream() {
+        // `zlib.compress(b'hello, redis world! hello, redis world!')`
+        let zl = unhex("789ccb48cdc9c9d751284a4dc92c5628cf2fca495154c8c014030018180de1");
+        let out = decompress(&zl).unwrap();
+        assert_eq!(out, b"hello, redis world! hello, redis world!");
+    }
+
+    #[test]
+    fn decompress_rejects_non_compressed_bytes() {
+        assert!(decompress(b"not compressed at all").is_none());
+        assert!(decompress(b"").is_none());
+        // A gzip magic with a truncated body must not panic — just fail.
+        assert!(decompress(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xff").is_none());
+    }
+
+    #[test]
+    fn timestamp_detects_units_and_renders_utc() {
+        // 1700000000 s = 2023-11-14 22:13:20 UTC.
+        let s = decode_timestamp(b"1700000000").unwrap();
+        assert!(s.starts_with("2023-11-14 22:13:20 UTC"), "{s}");
+        assert!(s.contains("seconds"), "{s}");
+        // Same instant in milliseconds.
+        let ms = decode_timestamp(b"1700000000000").unwrap();
+        assert!(ms.starts_with("2023-11-14 22:13:20 UTC"), "{ms}");
+        assert!(ms.contains("millis"), "{ms}");
+        // The Unix epoch itself, as an 8-byte big-endian blob.
+        let epoch = decode_timestamp(&1_700_000_000i64.to_be_bytes()).unwrap();
+        assert!(epoch.starts_with("2023-11-14"), "{epoch}");
+    }
+
+    #[test]
+    fn timestamp_rejects_small_or_non_integers() {
+        // Too small to be a plausible epoch (pre-1973).
+        assert!(decode_timestamp(b"42").is_none());
+        // Not an integer at all.
+        assert!(decode_timestamp(b"hello").is_none());
+        assert!(decode_timestamp(b"").is_none());
     }
 }

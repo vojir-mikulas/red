@@ -9,6 +9,7 @@
 //! needs, no windowing/eviction/margin machinery.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -20,12 +21,15 @@ use gpui::{
 };
 use red_core::kv::{
     CollectionKind, KeyMeta, KvCollection, KvCollectionPage, KvElement, KvStreamActionReq,
-    KvStreamPage, KvType, KvValue, PendingEntry, ScanBudget, ScanCursor, StreamAction,
+    KvStreamPage, KvType, KvValue, PendingEntry, RecycledKey, ScanBudget, ScanCursor, StreamAction,
     StreamConsumer, StreamEntry, StreamGroup,
 };
 use red_service::{Command, SessionId};
 
-use crate::app::{ActiveConn, AppState, Phase, SplitHalf, SplitState, TabWorkspace, WorkspaceTab};
+use crate::app::{
+    ActiveConn, AppState, Notification, NotificationAction, Phase, RecycleBatch, SplitHalf,
+    SplitState, TabWorkspace, WorkspaceTab, RECYCLE_BIN_CAP,
+};
 
 /// The `SCAN ... COUNT` hint per round trip (default `10` is far too low for
 /// a large keyspace; see docs/plans/redis.md item 3).
@@ -268,6 +272,22 @@ pub(crate) struct BrowseState {
     /// oldest scanned keys, so the header can say the view is windowed rather
     /// than silently dropping keys off the top.
     pub(crate) evicted: bool,
+    /// `true`: render the loaded keys as a collapsible namespace tree (grouped
+    /// by the `:` delimiter, Redis's near-universal key hierarchy) instead of
+    /// the flat grid. A per-tab view toggle; keyboard nav is grid-only, so the
+    /// tree relies on click/scroll.
+    pub(crate) tree_mode: bool,
+    /// The namespace prefixes currently expanded in tree mode (full `a:b:c`
+    /// paths). A prefix absent here is collapsed. Kept across a mode toggle so
+    /// switching to grid and back preserves the open branches.
+    pub(crate) expanded: HashSet<String>,
+    /// Bumped on every expand/collapse so the flattened-tree cache
+    /// ([`BrowseState::tree_rows`]) knows to rebuild.
+    expand_gen: u64,
+    /// Memoized flattened tree, valid while the row buffer and `expand_gen` are
+    /// unchanged — building the trie over up to `MAX_RESIDENT_ROWS` keys every
+    /// frame would be wasteful (mirrors the fuzzy `visible_cache`).
+    tree_cache: RefCell<Option<TreeCache>>,
 }
 
 /// The "New key" popover's state: a name, the chosen type, and the per-type
@@ -707,7 +727,30 @@ impl BrowseState {
             big_keys: None,
             create_key: None,
             evicted: false,
+            tree_mode: false,
+            expanded: HashSet::new(),
+            expand_gen: 0,
+            tree_cache: RefCell::new(None),
         }
+    }
+
+    /// The flattened namespace tree over `rows` (grouped by `:`), honoring the
+    /// expanded set. Memoized on `(rows identity, expand_gen)` so it rebuilds
+    /// only when the loaded keys or the open/closed branches change.
+    fn tree_rows(&self, rows: &Rc<Vec<KeyMeta>>) -> Rc<Vec<DispRow>> {
+        let ptr = Rc::as_ptr(rows);
+        if let Some(cached) = self.tree_cache.borrow().as_ref() {
+            if cached.rows_ptr == ptr && cached.expand_gen == self.expand_gen {
+                return Rc::clone(&cached.disp);
+            }
+        }
+        let disp = Rc::new(build_tree(rows, &self.expanded));
+        *self.tree_cache.borrow_mut() = Some(TreeCache {
+            rows_ptr: ptr,
+            expand_gen: self.expand_gen,
+            disp: Rc::clone(&disp),
+        });
+        disp
     }
 
     /// Mutable access to the loaded rows. Bumps the generation counter so the
@@ -764,6 +807,118 @@ struct VisibleRowsCache {
     query: String,
     gen: u64,
     rows: Rc<Vec<KeyMeta>>,
+}
+
+/// One rendered line in the key list. In grid mode it's always a `Key`; in tree
+/// mode the list is a depth-first flattening of the namespace trie into `Folder`
+/// (a `:`-delimited prefix, expandable) and `Leaf` (a concrete key) lines.
+#[derive(Clone)]
+pub(crate) enum DispRow {
+    /// A concrete key row: an index into the browse's visible-rows buffer, plus
+    /// the display label (the last path segment in tree mode, the full key in
+    /// grid mode) and its indent depth.
+    Key {
+        row: usize,
+        label: String,
+        depth: usize,
+    },
+    /// A namespace node: the full prefix path (`a:b`), the segment label to show,
+    /// how many keys live under it, whether it's expanded, and its indent depth.
+    Folder {
+        prefix: String,
+        label: String,
+        count: usize,
+        expanded: bool,
+        depth: usize,
+    },
+}
+
+/// Memoized flattened namespace tree (see [`BrowseState::tree_rows`]). Keyed by
+/// the row buffer's pointer identity (stable while the `Rc` isn't re-`make_mut`ed)
+/// and the expand generation.
+struct TreeCache {
+    rows_ptr: *const Vec<KeyMeta>,
+    expand_gen: u64,
+    disp: Rc<Vec<DispRow>>,
+}
+
+/// A node in the namespace trie built from the loaded keys. Children are a
+/// `BTreeMap` so siblings render in stable, sorted order; `leaf` marks a node
+/// that is itself a concrete key (a prefix can be both a key and a namespace).
+#[derive(Default)]
+struct TrieNode {
+    children: std::collections::BTreeMap<String, TrieNode>,
+    /// Index into the rows buffer if a concrete key terminates exactly here.
+    leaf: Option<usize>,
+    /// Number of concrete keys anywhere in this subtree (the folder count).
+    count: usize,
+}
+
+/// Build the flattened namespace tree from `rows`, splitting each key on `:`
+/// and honoring `expanded` (a collapsed folder hides its subtree). Grid indent
+/// is expressed as a per-row `depth`.
+fn build_tree(rows: &[KeyMeta], expanded: &HashSet<String>) -> Vec<DispRow> {
+    let mut root = TrieNode::default();
+    for (idx, meta) in rows.iter().enumerate() {
+        let mut node = &mut root;
+        node.count += 1;
+        for seg in meta.key.split(':') {
+            node = node.children.entry(seg.to_string()).or_default();
+            node.count += 1;
+        }
+        node.leaf = Some(idx);
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    flatten_trie(&root, String::new(), 0, expanded, &mut out);
+    out
+}
+
+/// Depth-first flatten of the trie into [`DispRow`]s, recursing into a folder
+/// only when it's in `expanded`.
+fn flatten_trie(
+    node: &TrieNode,
+    path: String,
+    depth: usize,
+    expanded: &HashSet<String>,
+    out: &mut Vec<DispRow>,
+) {
+    for (seg, child) in &node.children {
+        let full = if path.is_empty() {
+            seg.clone()
+        } else {
+            format!("{path}:{seg}")
+        };
+        if child.children.is_empty() {
+            // Pure leaf: a node with no children is always a concrete key.
+            if let Some(row) = child.leaf {
+                out.push(DispRow::Key {
+                    row,
+                    label: seg.clone(),
+                    depth,
+                });
+            }
+        } else {
+            let is_expanded = expanded.contains(&full);
+            out.push(DispRow::Folder {
+                prefix: full.clone(),
+                label: seg.clone(),
+                count: child.count,
+                expanded: is_expanded,
+                depth,
+            });
+            if is_expanded {
+                // A prefix that is *also* an exact key shows that key first.
+                if let Some(row) = child.leaf {
+                    out.push(DispRow::Key {
+                        row,
+                        label: format!("{seg} (self)"),
+                        depth: depth + 1,
+                    });
+                }
+                flatten_trie(child, full, depth + 1, expanded, out);
+            }
+        }
+    }
 }
 
 impl AnalysisState {
@@ -1152,6 +1307,44 @@ impl AppState {
         self.kv_relaunch_browse(session, cx);
     }
 
+    /// Toggle the active Browse tab between the flat grid and the collapsible
+    /// namespace tree. Purely a view change — no re-scan; the same loaded rows
+    /// render either way. Clears the grid keyboard cursor (meaningless in tree
+    /// mode).
+    pub(crate) fn kv_toggle_tree_mode(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        {
+            browse.tree_mode = !browse.tree_mode;
+            browse.nav_row = None;
+        }
+        cx.notify();
+    }
+
+    /// Expand or collapse one namespace folder in the tree view (`prefix` is the
+    /// full `a:b:c` path). Bumps the tree cache generation so the flattened list
+    /// rebuilds.
+    pub(crate) fn kv_toggle_tree_node(
+        &mut self,
+        session: SessionId,
+        prefix: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_browse_mut())
+        {
+            if !browse.expanded.remove(&prefix) {
+                browse.expanded.insert(prefix);
+            }
+            browse.expand_gen = browse.expand_gen.wrapping_add(1);
+        }
+        cx.notify();
+    }
+
     /// Drill an Analysis type row into a new Browse tab filtered to that type.
     pub(crate) fn kv_drill_type(
         &mut self,
@@ -1330,6 +1523,12 @@ impl AppState {
         else {
             return;
         };
+        // Tree mode is click-driven: its list indices are folder/leaf display
+        // rows, not `visible_rows`, so keyboard nav (which moves `nav_row` over
+        // `visible_rows`) doesn't apply.
+        if browse.tree_mode {
+            return;
+        }
         let rows = browse.visible_rows(cx);
         if rows.is_empty() {
             return;
@@ -3809,6 +4008,97 @@ impl AppState {
         cx.notify();
     }
 
+    /// `Event::KvKeysRecycled`: a delete captured these keys' `DUMP` snapshots.
+    /// Hold them in the recycle bin and raise an "Undo" toast that restores them
+    /// (see [`Self::kv_undo_delete`]). Emitted just before the matching
+    /// `KvEditApplied` that removes the rows.
+    pub(crate) fn on_kv_keys_recycled(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: u64,
+        keys: Vec<RecycledKey>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = session else { return };
+        if keys.is_empty() {
+            return;
+        }
+        let n = keys.len();
+        let id = self.next_recycle_id;
+        self.next_recycle_id += 1;
+        self.recycle_bin.push(RecycleBatch {
+            id,
+            session,
+            epoch,
+            keys,
+        });
+        // Evict the oldest batches beyond the cap (a session-scoped, bounded bin).
+        if self.recycle_bin.len() > RECYCLE_BIN_CAP {
+            let overflow = self.recycle_bin.len() - RECYCLE_BIN_CAP;
+            self.recycle_bin.drain(0..overflow);
+        }
+        let msg = if n == 1 {
+            "Deleted 1 key".to_string()
+        } else {
+            format!("Deleted {n} keys")
+        };
+        // A persistent (no auto-dismiss) toast: the restore button is the undo
+        // affordance, so it must stay until the user acts or closes it.
+        self.push_notification(
+            Notification {
+                id: 0,
+                variant: ToastVariant::Info,
+                message: msg.into(),
+                detail: Some("Restore to undo".into()),
+                detail_label: None,
+                auto_dismiss: None,
+                export: None,
+                expanded: false,
+                hovered: false,
+                dismiss_gen: 0,
+                action: Some(NotificationAction::UndoDelete(id)),
+            },
+            cx,
+        );
+    }
+
+    /// `Event::KvKeysRestored`: an undo finished. Confirm it and re-scan the
+    /// active browse so the restored keys reappear.
+    pub(crate) fn on_kv_keys_restored(
+        &mut self,
+        session: Option<SessionId>,
+        _epoch: u64,
+        count: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let msg = if count == 1 {
+            "Restored 1 key".to_string()
+        } else {
+            format!("Restored {count} keys")
+        };
+        self.notify(ToastVariant::Success, msg, cx);
+        if let Some(session) = session {
+            self.kv_relaunch_browse(session, cx);
+        }
+    }
+
+    /// The "Undo" toast action: `RESTORE` a recycle batch's keys on the server
+    /// (see `Command::KvRestoreKeys`), consuming the batch.
+    pub(crate) fn kv_undo_delete(&mut self, batch_id: u64, cx: &mut Context<Self>) {
+        let Some(pos) = self.recycle_bin.iter().position(|b| b.id == batch_id) else {
+            return; // already restored, evicted, or on another window
+        };
+        let batch = self.recycle_bin.remove(pos);
+        self.service.send_to(
+            batch.session,
+            Command::KvRestoreKeys {
+                epoch: batch.epoch,
+                keys: batch.keys,
+            },
+        );
+        cx.notify();
+    }
+
     /// `Event::KvValueReady`: apply it if the inspector is still open on this
     /// key (a `key` comparison, not the browse's epoch, since the inspector
     /// can outlive a filter-triggered scan restart). A `Large` collection
@@ -4674,24 +4964,44 @@ impl AppState {
         };
         let header = format!("{header}{evicted_note}");
 
+        // In tree mode the list is a flattened namespace trie (folders + keys);
+        // in grid mode it's the raw key rows (no per-row allocation — the flat
+        // grid's hot path). `disp` is `Some` only in tree mode.
+        let tree_mode = browse.tree_mode;
+        let disp: Option<Rc<Vec<DispRow>>> = tree_mode.then(|| browse.tree_rows(&rows));
+        let row_count = match &disp {
+            Some(d) => d.len(),
+            None => rows.len(),
+        };
+
         let rows_render = rows.clone();
         let rows_select = rows.clone();
         let rows_menu = rows.clone();
-        let row_count = rows.len();
+        let disp_render = disp.clone();
+        let disp_select = disp.clone();
+        let disp_menu = disp.clone();
         let visible_range_view = view.clone();
         let select_view = view.clone();
         let menu_view = view.clone();
         let nav_view = view.clone();
         let list_focus = browse.list_focus.clone();
 
-        // The keyboard cursor drives the highlight once the list has been
-        // touched; before that it falls back to the inspected key.
-        let selected_ix = browse.nav_row.filter(|&i| i < row_count).or_else(|| {
-            browse
-                .inspector
-                .as_ref()
-                .and_then(|i| rows.iter().position(|r| r.key == i.key))
-        });
+        // The keyboard cursor drives the grid highlight once the list has been
+        // touched; before that (and always in tree mode, where nav is disabled)
+        // it falls back to the inspected key's row.
+        let selected_ix = match &disp {
+            Some(d) => browse.inspector.as_ref().and_then(|insp| {
+                d.iter().position(
+                    |r| matches!(r, DispRow::Key { row, .. } if rows.get(*row).is_some_and(|m| m.key == insp.key)),
+                )
+            }),
+            None => browse.nav_row.filter(|&i| i < row_count).or_else(|| {
+                browse
+                    .inspector
+                    .as_ref()
+                    .and_then(|i| rows.iter().position(|r| r.key == i.key))
+            }),
+        };
 
         let columns = vec![
             Column::new("Key").flex(),
@@ -4705,6 +5015,8 @@ impl AppState {
         let dim_color = theme.text_muted;
         let cell_size = theme.scale(12.);
         let row_theme = theme.clone();
+        // Per-depth indent; leaves align one chevron-width past their folder.
+        let indent = |depth: usize| px(depth as f32 * 14.);
 
         let table = Table::<()>::new("kv-browse", columns)
             .row_count(row_count)
@@ -4714,35 +5026,60 @@ impl AppState {
             .selected(selected_ix)
             .focus_handle(list_focus)
             .on_nav(move |nav, _extend, _window, cx| {
+                // No-op in tree mode (see `kv_browse_nav`): the tree is click-driven.
                 nav_view
                     .update(cx, |this, cx| this.kv_browse_nav(session, nav, cx))
                     .ok();
             })
             .on_select(move |ix, _click, window, cx| {
-                let Some(row) = rows_select.get(ix) else {
-                    return;
+                // A folder toggles; a key (tree leaf or grid row) opens the inspector.
+                let key_row = match &disp_select {
+                    Some(d) => match d.get(ix) {
+                        Some(DispRow::Folder { prefix, .. }) => {
+                            let prefix = prefix.clone();
+                            select_view
+                                .update(cx, |this, cx| {
+                                    this.kv_toggle_tree_node(session, prefix, cx)
+                                })
+                                .ok();
+                            return;
+                        }
+                        Some(DispRow::Key { row, .. }) => rows_select.get(*row),
+                        None => return,
+                    },
+                    None => rows_select.get(ix),
                 };
+                let Some(row) = key_row else { return };
                 let (key, ttl, kv_type) = (row.key.clone(), row.ttl, row.kv_type.clone());
+                let grid_ix = disp_select.is_none().then_some(ix);
                 select_view
                     .update(cx, |this, cx| {
-                        // Clicking a row also plants the keyboard cursor there and
-                        // focuses the list, so arrows continue from the click.
-                        if let Some(b) = this
-                            .conn_mut(Some(session))
-                            .and_then(|a| a.kv_view.as_mut())
-                            .and_then(|v| v.active_browse_mut())
-                        {
-                            b.nav_row = Some(ix);
-                            window.focus(&b.list_focus, cx);
+                        // A grid click plants the keyboard cursor and focuses the
+                        // list so arrows continue from it; the tree has no cursor.
+                        if let Some(gi) = grid_ix {
+                            if let Some(b) = this
+                                .conn_mut(Some(session))
+                                .and_then(|a| a.kv_view.as_mut())
+                                .and_then(|v| v.active_browse_mut())
+                            {
+                                b.nav_row = Some(gi);
+                                window.focus(&b.list_focus, cx);
+                            }
                         }
                         this.kv_open_inspector(session, key, ttl, kv_type, cx)
                     })
                     .ok();
             })
             .on_secondary(move |ix, pos, _window, cx| {
-                let Some(row) = rows_menu.get(ix) else {
-                    return;
+                // Folders carry no context menu; keys do (rename / TTL / delete / …).
+                let key_row = match &disp_menu {
+                    Some(d) => match d.get(ix) {
+                        Some(DispRow::Key { row, .. }) => rows_menu.get(*row),
+                        _ => None,
+                    },
+                    None => rows_menu.get(ix),
                 };
+                let Some(row) = key_row else { return };
                 let (key, kv_type, ttl) = (row.key.clone(), row.kv_type.clone(), row.ttl);
                 menu_view
                     .update(cx, |this, cx| {
@@ -4751,6 +5088,69 @@ impl AppState {
                     .ok();
             })
             .render_row(move |ix, _window, _cx| {
+                // Tree mode: render a folder or an indented leaf.
+                if let Some(d) = &disp_render {
+                    return match d.get(ix) {
+                        Some(DispRow::Folder {
+                            label,
+                            count,
+                            expanded,
+                            depth,
+                            ..
+                        }) => {
+                            let chevron = if *expanded { "chevron-down" } else { "chevron" };
+                            vec![
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .pl(indent(*depth))
+                                    .child(crate::icons::icon(chevron, cell_size, dim_color))
+                                    .child(div().text_color(key_color).child(label.clone()))
+                                    .into_any_element(),
+                                div().into_any_element(),
+                                div().into_any_element(),
+                                div()
+                                    .text_color(dim_color)
+                                    .child(format!("{count}"))
+                                    .into_any_element(),
+                                div().into_any_element(),
+                            ]
+                        }
+                        Some(DispRow::Key { row, label, depth }) => {
+                            let Some(meta) = rows_render.get(*row) else {
+                                return Vec::new();
+                            };
+                            vec![
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(key_color)
+                                    .pl(px(*depth as f32 * 14. + 16.))
+                                    .child(label.clone())
+                                    .into_any_element(),
+                                type_pill(&meta.kv_type, &row_theme).into_any_element(),
+                                div()
+                                    .text_color(dim_color)
+                                    .child(fmt_ttl(meta.ttl))
+                                    .into_any_element(),
+                                div()
+                                    .text_color(dim_color)
+                                    .child(fmt_bytes(meta.approx_bytes))
+                                    .into_any_element(),
+                                div()
+                                    .text_color(dim_color)
+                                    .truncate()
+                                    .child(meta.encoding.clone())
+                                    .into_any_element(),
+                            ]
+                        }
+                        None => Vec::new(),
+                    };
+                }
+                // Grid mode: the raw key row (unchanged hot path).
                 let Some(row) = rows_render.get(ix) else {
                     return Vec::new();
                 };
@@ -4903,6 +5303,31 @@ impl AppState {
                         .on_click(move |_, _, cx| {
                             fuzzy_view
                                 .update(cx, |this, cx| this.kv_toggle_fuzzy(session, cx))
+                                .ok();
+                        })
+                    })
+                    .child({
+                        // Namespace tree ↔ flat grid view toggle. Groups keys by
+                        // their `:` hierarchy without a re-scan.
+                        let tree_view = view.clone();
+                        IconButton::new(
+                            "kv-tree-toggle",
+                            crate::icons::icon(
+                                "schema",
+                                theme.scale(14.),
+                                if tree_mode { theme.accent } else { theme.text_muted },
+                            ),
+                        )
+                        .size(IconButtonSize::Sm)
+                        .tooltip(if tree_mode {
+                            "Namespace tree (on): keys grouped by their : hierarchy"
+                        } else {
+                            "Group keys into a namespace tree"
+                        })
+                        .a11y_label("Toggle namespace tree")
+                        .on_click(move |_, _, cx| {
+                            tree_view
+                                .update(cx, |this, cx| this.kv_toggle_tree_mode(session, cx))
                                 .ok();
                         })
                     })
@@ -5872,6 +6297,8 @@ impl AppState {
             .child(opt("kv-fmt-msgpack", "MsgPack", ValueFormat::MsgPack))
             .child(opt("kv-fmt-protobuf", "Protobuf", ValueFormat::Protobuf))
             .child(opt("kv-fmt-pickle", "Pickle", ValueFormat::Pickle))
+            .child(opt("kv-fmt-timestamp", "Time", ValueFormat::Timestamp))
+            .child(opt("kv-fmt-decompress", "Gzip", ValueFormat::Decompress))
             .into_any_element()
     }
 
@@ -7242,6 +7669,61 @@ fn render_string_preview(value: &red_core::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key_meta(key: &str) -> KeyMeta {
+        KeyMeta {
+            key: key.to_string(),
+            kv_type: KvType::String,
+            ttl: None,
+            encoding: String::new(),
+            approx_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn build_tree_groups_by_colon_and_honors_expansion() {
+        let rows = vec![
+            key_meta("user:1:name"),
+            key_meta("user:2:name"),
+            key_meta("session:abc"),
+            key_meta("flat"),
+        ];
+        // All collapsed: only the top-level folders + the flat leaf show, in
+        // BTreeMap (alphabetical) order: flat (leaf), session, user.
+        let collapsed = build_tree(&rows, &HashSet::new());
+        assert_eq!(collapsed.len(), 3);
+        assert!(matches!(&collapsed[0], DispRow::Key { label, .. } if label == "flat"));
+        assert!(
+            matches!(&collapsed[1], DispRow::Folder { prefix, count, .. } if prefix == "session" && *count == 1)
+        );
+        assert!(
+            matches!(&collapsed[2], DispRow::Folder { prefix, count, .. } if prefix == "user" && *count == 2)
+        );
+
+        // Expand `user`: its two `:name`-terminated branches surface as sub-folders.
+        let mut expanded = HashSet::new();
+        expanded.insert("user".to_string());
+        let opened = build_tree(&rows, &expanded);
+        // session(folder), user(folder), user:1(folder), user:2(folder), flat(leaf)
+        assert_eq!(opened.len(), 5);
+        assert!(opened
+            .iter()
+            .any(|r| matches!(r, DispRow::Folder { prefix, .. } if prefix == "user:1")));
+    }
+
+    #[test]
+    fn build_tree_expands_leaves_fully() {
+        let rows = vec![key_meta("a:b:c")];
+        let mut expanded = HashSet::new();
+        expanded.insert("a".to_string());
+        expanded.insert("a:b".to_string());
+        let disp = build_tree(&rows, &expanded);
+        // a(folder) → a:b(folder) → c(leaf), indented by depth.
+        assert_eq!(disp.len(), 3);
+        assert!(
+            matches!(&disp[2], DispRow::Key { label, depth, .. } if label == "c" && *depth == 2)
+        );
+    }
 
     #[test]
     fn fuzzy_score_requires_an_in_order_subsequence() {

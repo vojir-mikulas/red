@@ -55,6 +55,11 @@ pub(crate) enum ValueFormat {
     Protobuf,
     /// Decode the bytes as a Python pickle.
     Pickle,
+    /// Interpret the value as a Unix-epoch integer and show the UTC datetime.
+    Timestamp,
+    /// Decompress a gzip/zlib stream, then render the inflated payload
+    /// (JSON if it parses, else text, else hex).
+    Decompress,
 }
 
 /// All the inspector's persistent state. Present iff the pane is open.
@@ -564,8 +569,11 @@ impl AppState {
         // doesn't first flatten the formatting the user was just reading. A NULL opens
         // empty (an empty save sets NULL back). The Hex lens has no text round-trip, so
         // it seeds the raw text instead (editing bytes-as-hex would mis-coerce on save).
+        // Hex and the decoder-only lenses (timestamp/decompress) have no text
+        // round-trip — editing their rendered form and saving would corrupt the
+        // stored value — so an edit opens on the raw text instead.
         let edit_fmt = match self.inspector_format() {
-            ValueFormat::Hex => ValueFormat::Raw,
+            ValueFormat::Hex | ValueFormat::Timestamp | ValueFormat::Decompress => ValueFormat::Raw,
             other => other,
         };
         let view = format_value(&ctx.original, edit_fmt);
@@ -1034,6 +1042,18 @@ impl AppState {
                 cx,
             ))
             .child(opt("insp-fmt-pickle", "Pickle", ValueFormat::Pickle, cx))
+            .child(opt(
+                "insp-fmt-timestamp",
+                "Time",
+                ValueFormat::Timestamp,
+                cx,
+            ))
+            .child(opt(
+                "insp-fmt-decompress",
+                "Gzip",
+                ValueFormat::Decompress,
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -1189,6 +1209,10 @@ fn format_value(value: &Value, fmt: ValueFormat) -> ValueView {
                 ValueFormat::Pickle => {
                     decoded_or(decode::decode_pickle(s.as_bytes()), "pickle", raw)
                 }
+                ValueFormat::Timestamp => {
+                    decoded_or(decode::decode_timestamp(s.as_bytes()), "timestamp", raw)
+                }
+                ValueFormat::Decompress => decompressed_view(s.as_bytes(), raw),
             }
         }
         // A blob has no textual rendering; the plain lenses show its bytes as
@@ -1204,6 +1228,8 @@ fn format_value(value: &Value, fmt: ValueFormat) -> ValueView {
                 ValueFormat::MsgPack => decoded_or(decode::decode_msgpack(b), "MessagePack", hex),
                 ValueFormat::Protobuf => decoded_or(decode::decode_protobuf(b), "protobuf", hex),
                 ValueFormat::Pickle => decoded_or(decode::decode_pickle(b), "pickle", hex),
+                ValueFormat::Timestamp => decoded_or(decode::decode_timestamp(b), "timestamp", hex),
+                ValueFormat::Decompress => decompressed_view(b, hex),
                 _ => hex(),
             }
         }
@@ -1304,6 +1330,29 @@ fn decoded_or(
             wrap: false,
         },
         None => fallback(),
+    }
+}
+
+/// The Decompress lens: inflate a gzip/zlib stream, then render the payload the
+/// way Auto would (JSON if it parses, else prose, else a hex dump for binary
+/// output). Falls back to `fallback` (raw text / hex of the *compressed* bytes)
+/// when the input isn't a recognised compressed stream.
+fn decompressed_view(bytes: &[u8], fallback: impl FnOnce() -> ValueView) -> ValueView {
+    let Some(raw) = decode::decompress(bytes) else {
+        return fallback();
+    };
+    let n = group_digits(raw.len());
+    match String::from_utf8(raw) {
+        Ok(text) => ValueView {
+            body: pretty_json(&text).unwrap_or(text).into(),
+            summary: format!("{n} bytes · decompressed"),
+            wrap: false,
+        },
+        Err(e) => ValueView {
+            body: hex_dump(e.as_bytes(), HEX_MAX).into(),
+            summary: format!("{n} bytes · decompressed (binary)"),
+            wrap: false,
+        },
     }
 }
 

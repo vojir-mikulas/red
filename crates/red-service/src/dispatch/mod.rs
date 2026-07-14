@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::UnboundedSender;
 use futures::StreamExt;
-use red_core::kv::KvEdit;
+use red_core::kv::{KvEdit, RecycledKey};
 use red_core::{
     coerce_edit_value, Column, ColumnMap, ColumnMeta, CopyMode, FkEdge, ImportFormat, KeyKind,
     KeySpec, QueryOptions, RedError, ResultFilter, TableRef, Value,
@@ -1872,12 +1872,84 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         }
                         KvEdit::SetTtl { key, ttl } => driver.set_ttl(key, *ttl).await,
                         KvEdit::Rename { from, to } => driver.rename_key(from, to).await,
-                        KvEdit::Delete { keys } => driver.delete_keys(keys).await.map(|_| ()),
+                        KvEdit::Delete { keys } => {
+                            // Snapshot each key (DUMP + PTTL) before removing it,
+                            // so the delete can be undone from the recycle bin.
+                            // Best-effort: a key that can't be dumped just isn't
+                            // recoverable; the delete still proceeds.
+                            let mut recycled = Vec::new();
+                            for k in keys {
+                                if let Ok(Some((payload, ttl))) = driver.dump_key(k).await {
+                                    recycled.push(RecycledKey {
+                                        key: k.clone(),
+                                        ttl,
+                                        payload,
+                                    });
+                                }
+                            }
+                            let done = driver.delete_keys(keys).await.map(|_| ());
+                            if done.is_ok() && !recycled.is_empty() {
+                                emit(
+                                    &events,
+                                    session_id,
+                                    Event::KvKeysRecycled {
+                                        epoch,
+                                        keys: recycled,
+                                    },
+                                );
+                            }
+                            done
+                        }
                     };
                     match result {
                         Ok(()) => emit(&events, session_id, Event::KvEditApplied { epoch, edit }),
                         Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
                     }
+                });
+            }
+
+            Command::KvRestoreKeys { epoch, keys } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                if state.read_only {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("this connection is read-only".into()),
+                    );
+                    continue;
+                }
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let mut restored = 0u64;
+                    for k in &keys {
+                        match driver.restore_key(&k.key, k.ttl, &k.payload).await {
+                            Ok(()) => restored += 1,
+                            // A single failure (e.g. BUSYKEY — the key was
+                            // recreated meanwhile) surfaces but doesn't abort the
+                            // rest of the batch.
+                            Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                        }
+                    }
+                    emit(
+                        &events,
+                        session_id,
+                        Event::KvKeysRestored {
+                            epoch,
+                            count: restored,
+                        },
+                    );
                 });
             }
 

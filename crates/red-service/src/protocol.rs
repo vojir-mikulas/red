@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use red_core::kv::{
     ClientInfo, CollectionKind, KeyMeta, KvCollectionPage, KvEdit, KvScanPage, KvStreamActionReq,
-    KvStreamPage, KvValue, PendingEntry, RespValue, ScanBudget, ScanCursor, SlowlogEntry,
-    StreamAction, StreamConsumer, StreamGroup,
+    KvStreamPage, KvValue, PendingEntry, RecycledKey, RespValue, ScanBudget, ScanCursor,
+    SlowlogEntry, StreamAction, StreamConsumer, StreamGroup,
 };
 use red_core::{
     ActivityId, ActivityKind, ActivityStatus, AiLimits, AiTier, Column, ColumnMap, ColumnMeta,
@@ -287,6 +287,14 @@ pub enum Command {
     KvApplyEdit {
         epoch: u64,
         edit: KvEdit,
+    },
+    /// Restore keys captured before a delete (the recycle bin's undo). Each
+    /// `RecycledKey` carries its `DUMP` payload + expiry; the service `RESTORE`s
+    /// them and replies with `KvKeysRestored` (or the global `Event::Error`).
+    /// Gated by `read_only` like any other write.
+    KvRestoreKeys {
+        epoch: u64,
+        keys: Vec<RecycledKey>,
     },
     /// Start a live Pub/Sub pattern subscription (see docs/plans/redis.md's
     /// R4). `epoch` identifies this subscription; messages stream back as
@@ -800,6 +808,20 @@ pub enum Event {
     KvEditApplied {
         epoch: u64,
         edit: KvEdit,
+    },
+    /// Keys were captured into the recycle bin just before a delete succeeded
+    /// (in response to a `KvApplyEdit` with `KvEdit::Delete`). The UI holds these
+    /// for undo and offers a "restore" toast; sends them back via
+    /// `KvRestoreKeys`. Emitted just before the matching `KvEditApplied`.
+    KvKeysRecycled {
+        epoch: u64,
+        keys: Vec<RecycledKey>,
+    },
+    /// A recycle-bin restore finished, in response to `KvRestoreKeys`. `count`
+    /// is how many keys came back; the UI re-scans the browse to show them.
+    KvKeysRestored {
+        epoch: u64,
+        count: u64,
     },
     /// One Pub/Sub message, pushed for as long as the `KvSubscribe { epoch,
     /// .. }` that started it stays open.

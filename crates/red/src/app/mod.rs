@@ -34,6 +34,7 @@ use gpui::{
     prelude::*, px, AsyncApp, Context, ElementId, Entity, FocusHandle, Focusable, Hsla,
     PathPromptOptions, Pixels, ScrollHandle, SharedString, WeakEntity, Window, WindowAppearance,
 };
+use red_core::kv::RecycledKey;
 use red_core::{
     Column, ColumnMap, ColumnMeta, ConnectionConfig, CopyMode, DbKind, EditOp, FkEdge,
     ImportFormat, TableRef, UpdateState,
@@ -816,7 +817,26 @@ pub(crate) enum NotificationAction {
     /// Reveal the written file in the OS file manager (Finder / Explorer / the
     /// platform's file manager), selected. Carries the file's full path.
     RevealInFileManager(SharedString),
+    /// Restore the keys a delete just captured into the recycle bin (the
+    /// "Undo" button on the post-delete toast). Carries the recycle batch id.
+    UndoDelete(u64),
 }
+
+/// One deleted batch held in the recycle bin for undo (see the Redis recycle
+/// bin, `Command::KvRestoreKeys`): the keys' `DUMP` snapshots plus the session
+/// and scan epoch they were deleted under, so an "Undo" can `RESTORE` them and
+/// re-scan the right browse. Session-scoped and capped ([`RECYCLE_BIN_CAP`]);
+/// not persisted across restarts (a lighter contract than a disk recycle bin).
+pub(crate) struct RecycleBatch {
+    pub id: u64,
+    pub session: SessionId,
+    pub epoch: u64,
+    pub keys: Vec<RecycledKey>,
+}
+
+/// How many recent delete batches the recycle bin keeps before evicting the
+/// oldest. A soft cap so a long session of deletes can't grow the bin unbounded.
+pub(crate) const RECYCLE_BIN_CAP: usize = 25;
 
 /// The default editor text a fresh query tab opens with. A tab still holding
 /// exactly this (and no result) is "pristine"; closing it needs no confirmation.
@@ -1203,6 +1223,11 @@ pub struct AppState {
     /// Monotonic id source for notifications, so a timer / close / export update
     /// targets the right toast regardless of stack churn.
     pub(crate) next_notification_id: u64,
+    /// The Redis recycle bin: recent delete batches held for undo (newest last),
+    /// capped at [`RECYCLE_BIN_CAP`]. An "Undo" toast references a batch by id.
+    pub(crate) recycle_bin: Vec<RecycleBatch>,
+    /// Monotonic id source for recycle batches (matched by the undo toast).
+    pub(crate) next_recycle_id: u64,
     /// Monotonic id source for exports, so progress / finished / cancelled events
     /// and a `CancelExport` route to the right in-flight export.
     pub(crate) next_export_id: u64,
@@ -2159,6 +2184,8 @@ impl AppState {
             form: None,
             notifications: Vec::new(),
             next_notification_id: 0,
+            recycle_bin: Vec::new(),
+            next_recycle_id: 0,
             next_export_id: 0,
             next_copy_id: 0,
             pending_copy: None,
@@ -2700,6 +2727,12 @@ impl AppState {
             }
             Event::KvEditApplied { epoch, edit } => {
                 self.on_kv_edit_applied(session, epoch, edit, cx);
+            }
+            Event::KvKeysRecycled { epoch, keys } => {
+                self.on_kv_keys_recycled(session, epoch, keys, cx);
+            }
+            Event::KvKeysRestored { epoch, count } => {
+                self.on_kv_keys_restored(session, epoch, count, cx);
             }
             Event::KvMessage {
                 epoch,

@@ -465,7 +465,11 @@ impl AppState {
 
         // With one agent the `+` just starts a chat; with several it drops a
         // "New chat with <agent>" menu so you pick the agent up front.
-        let new_chat_tip = if multi { "New chat with…" } else { "New chat" };
+        let new_chat_tip = if multi {
+            "New chat with…"
+        } else {
+            "New chat"
+        };
         let new_chat = self.ai_configured.then(|| {
             icon_btn("assistant-new-chat", "plus", new_chat_tip).on_click(cx.listener(
                 move |this, ev: &gpui::ClickEvent, _, cx| {
@@ -507,7 +511,11 @@ impl AppState {
             .items_center()
             .gap_1p5()
             .min_w(px(0.))
-            .child(crate::icons::icon("sparkles", theme.scale(14.), theme.accent))
+            .child(crate::icons::icon(
+                "sparkles",
+                theme.scale(14.),
+                theme.accent,
+            ))
             .child(div().min_w_0().truncate().child(agent_name))
             .when(multi, |d| {
                 d.child(crate::icons::icon(

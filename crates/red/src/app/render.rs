@@ -838,6 +838,24 @@ impl AppState {
                         }),
                     );
                 }
+                Some(crate::app::NotificationAction::UndoDelete(batch)) => {
+                    let batch = *batch;
+                    let weak = weak.clone();
+                    actions = actions.child(
+                        IconButton::new(
+                            ("toast-undo", id),
+                            crate::icons::icon("restore", action_size, theme.accent),
+                        )
+                        .size(IconButtonSize::Sm)
+                        .on_click(move |_, _, cx| {
+                            weak.update(cx, |this, cx| {
+                                this.close_notification(id, cx);
+                                this.kv_undo_delete(batch, cx);
+                            })
+                            .ok();
+                        }),
+                    );
+                }
                 None => {}
             }
             actions = actions.child(close);

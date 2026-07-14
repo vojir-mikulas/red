@@ -527,7 +527,10 @@ impl AppState {
                             let id =
                                 ElementId::from(SharedString::from(format!("cmd:ai-new-chat:{i}")));
                             out.push((
-                                PaletteItem::new(id, format!("agent: new chat with {}", agent.name)),
+                                PaletteItem::new(
+                                    id,
+                                    format!("agent: new chat with {}", agent.name),
+                                ),
                                 Cmd::AssistantNewChatWith(i),
                             ));
                         }

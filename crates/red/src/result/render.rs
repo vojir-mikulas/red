@@ -1052,9 +1052,9 @@ impl AppState {
                                     .text_color(faint)
                                     .hover(|s| s.text_color(accent)),
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.remove_draft_row(index, cx)
-                            })),
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.remove_draft_row(index, cx)),
+                            ),
                     )
                     .into_any_element(),
             );

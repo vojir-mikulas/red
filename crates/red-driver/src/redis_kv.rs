@@ -1365,6 +1365,43 @@ impl KvDriver for RedisDriver {
             .map_err(|e| RedError::Driver(e.to_string()))
     }
 
+    async fn dump_key(&self, key: &str) -> Result<Option<(Vec<u8>, Option<Duration>)>> {
+        let mut conn = self.route(key);
+        // DUMP + PTTL in one pipeline: the serialized value and its remaining
+        // expiry, atomic enough for a snapshot (a value edit between the two is
+        // a non-issue — undo restores whatever DUMP saw).
+        let (payload, pttl): (Option<Vec<u8>>, i64) = redis::pipe()
+            .cmd("DUMP")
+            .arg(key)
+            .cmd("PTTL")
+            .arg(key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        // A missing key DUMPs to nil — nothing to recycle.
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        // PTTL: -1 = no expiry, -2 = key gone (treat as no expiry).
+        let ttl = (pttl > 0).then(|| Duration::from_millis(pttl as u64));
+        Ok(Some((payload, ttl)))
+    }
+
+    async fn restore_key(&self, key: &str, ttl: Option<Duration>, payload: &[u8]) -> Result<()> {
+        self.check_writable()?;
+        let mut conn = self.route(key);
+        // RESTORE's ttl is milliseconds, 0 = no expiry. No REPLACE: a BUSYKEY
+        // error (the key was recreated meanwhile) surfaces rather than clobbering.
+        let ttl_ms = ttl.map(|d| d.as_millis() as u64).unwrap_or(0);
+        redis::cmd("RESTORE")
+            .arg(key)
+            .arg(ttl_ms)
+            .arg(payload)
+            .query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
     async fn slowlog(&self, count: usize) -> Result<Vec<SlowlogEntry>> {
         let mut conn = self.conn.clone();
         let reply: redis::Value = redis::cmd("SLOWLOG")
@@ -2718,7 +2755,11 @@ mod tests {
         match driver.read_string_full(&huge).await.unwrap().unwrap() {
             Value::Capped(cell) => {
                 assert_eq!(cell.len, total, "reports the true length");
-                assert_eq!(cell.head.len(), STRING_FULL_CAP, "head is the bounded prefix");
+                assert_eq!(
+                    cell.head.len(),
+                    STRING_FULL_CAP,
+                    "head is the bounded prefix"
+                );
                 assert!(!cell.blob);
             }
             other => panic!("expected a Capped value over the ceiling, got {other:?}"),

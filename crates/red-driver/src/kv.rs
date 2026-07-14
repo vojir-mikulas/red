@@ -272,6 +272,28 @@ pub trait KvDriver: Send + Sync {
     /// on a read-only connection.
     async fn delete_keys(&self, keys: &[String]) -> Result<u64>;
 
+    /// `DUMP key` + its `PTTL`: the key's serialized value and remaining expiry,
+    /// captured just before a delete so the value can be restored (the recycle
+    /// bin's undo). `Ok(None)` when the key doesn't exist. A read (no write
+    /// gate). The default returns `None` — an engine with no serialize/restore
+    /// support simply can't offer undo.
+    async fn dump_key(&self, key: &str) -> Result<Option<(Vec<u8>, Option<Duration>)>> {
+        let _ = key;
+        Ok(None)
+    }
+
+    /// `RESTORE key ttl payload`: recreate a key from a [`KvDriver::dump_key`]
+    /// snapshot (the recycle bin's undo). `ttl` is the remaining expiry to
+    /// re-apply (`None` = no expiry). Errors (Redis `BUSYKEY`) if the key exists
+    /// again, so undo never clobbers a key recreated in the meantime. Refused on
+    /// a read-only connection. The default reports the operation unsupported.
+    async fn restore_key(&self, key: &str, ttl: Option<Duration>, payload: &[u8]) -> Result<()> {
+        let _ = (key, ttl, payload);
+        Err(red_core::RedError::Driver(
+            "restore is not supported by this engine".into(),
+        ))
+    }
+
     /// The server's slow-command log (`SLOWLOG GET <count>`), newest first,
     /// for the diagnostics panel (see docs/plans/redis.md's "slowlog viewer"
     /// gap). Under a cluster this reports the seed node's log only (the slow
