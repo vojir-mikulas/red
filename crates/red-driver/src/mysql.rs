@@ -952,7 +952,7 @@ fn to_my(value: &Value) -> MyValue {
         Value::Null | Value::Capped(_) => MyValue::NULL,
         Value::Integer(n) => MyValue::Int(*n),
         Value::Real(x) => MyValue::Double(*x),
-        Value::Text(s) => MyValue::Bytes(s.clone().into_bytes()),
+        Value::Text(s) => MyValue::Bytes(s.as_bytes().to_vec()),
         Value::Blob(b) => MyValue::Bytes(b.clone()),
     }
 }
@@ -1001,16 +1001,16 @@ fn my_value(value: Option<&MyValue>, col: &MyColumn, max: Option<usize>) -> Valu
         // ceiling so the true digits survive rather than a wrapped number.
         Some(MyValue::UInt(n)) => match i64::try_from(*n) {
             Ok(i) => Value::Integer(i),
-            Err(_) => Value::Text(n.to_string()),
+            Err(_) => Value::Text(n.to_string().into()),
         },
         Some(MyValue::Float(f)) => Value::Real(*f as f64),
         Some(MyValue::Double(f)) => Value::Real(*f),
         Some(MyValue::Bytes(bytes)) => bytes_value(bytes, col, max),
         Some(MyValue::Date(y, mo, d, h, mi, s, us)) => {
-            Value::Text(fmt_datetime(*y, *mo, *d, *h, *mi, *s, *us))
+            Value::Text(fmt_datetime(*y, *mo, *d, *h, *mi, *s, *us).into())
         }
         Some(MyValue::Time(neg, days, h, mi, s, us)) => {
-            Value::Text(fmt_time(*neg, *days, *h, *mi, *s, *us))
+            Value::Text(fmt_time(*neg, *days, *h, *mi, *s, *us).into())
         }
     }
 }
@@ -1031,7 +1031,7 @@ fn bytes_value(bytes: &[u8], col: &MyColumn, max: Option<usize>) -> Value {
     } else {
         match max {
             Some(max) => Value::capped_text(&String::from_utf8_lossy(bytes), max),
-            None => Value::Text(String::from_utf8_lossy(bytes).into_owned()),
+            None => Value::Text(String::from_utf8_lossy(bytes).into_owned().into()),
         }
     }
 }

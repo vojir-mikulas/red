@@ -662,7 +662,7 @@ fn to_sqlite(value: &Value) -> rusqlite::types::Value {
         Value::Null => Sq::Null,
         Value::Integer(n) => Sq::Integer(*n),
         Value::Real(x) => Sq::Real(*x),
-        Value::Text(s) => Sq::Text(s.clone()),
+        Value::Text(s) => Sq::Text(s.to_string()),
         Value::Blob(b) => Sq::Blob(b.clone()),
         Value::Capped(_) => Sq::Null,
     }
@@ -1079,7 +1079,7 @@ fn extract_row(
             ValueRef::Real(x) => Value::Real(x),
             ValueRef::Text(s) => match max {
                 Some(max) => Value::capped_text(&String::from_utf8_lossy(s), max),
-                None => Value::Text(String::from_utf8_lossy(s).into_owned()),
+                None => Value::Text(String::from_utf8_lossy(s).into_owned().into()),
             },
             ValueRef::Blob(b) => match max {
                 Some(_) => Value::capped_blob(b.len()),

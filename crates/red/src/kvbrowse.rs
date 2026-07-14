@@ -2806,7 +2806,7 @@ impl AppState {
             .and_then(|v| v.active_browse())
             .and_then(|b| b.inspector.as_ref())
             .and_then(|i| match i.value.as_ref()? {
-                KvValue::Str(red_core::Value::Text(s)) => Some(s.clone()),
+                KvValue::Str(red_core::Value::Text(s)) => Some(s.to_string()),
                 KvValue::Str(red_core::Value::Capped(c)) => Some(c.head.clone()),
                 KvValue::Str(other) => Some(format!("{other:?}")),
                 _ => None,
@@ -3562,7 +3562,7 @@ impl AppState {
             KvEdit::SetString { key, value, ttl } => {
                 if let Some(inspector) = &mut browse.inspector {
                     if inspector.key == key {
-                        inspector.value = Some(KvValue::Str(red_core::Value::Text(value)));
+                        inspector.value = Some(KvValue::Str(red_core::Value::Text(value.into())));
                         inspector.editing_value = false;
                     }
                 }
@@ -7231,7 +7231,7 @@ fn collection_row_actions(
 /// shows its prefix plus a "… (N bytes total)" note.
 fn render_string_preview(value: &red_core::Value) -> String {
     match value {
-        red_core::Value::Text(s) => s.clone(),
+        red_core::Value::Text(s) => s.to_string(),
         red_core::Value::Capped(cell) => {
             format!("{}\n\n… ({} bytes total, truncated)", cell.head, cell.len)
         }

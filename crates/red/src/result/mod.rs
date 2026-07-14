@@ -1235,7 +1235,7 @@ fn cell_string(value: &Value) -> String {
         Value::Null => String::new(),
         Value::Integer(n) => n.to_string(),
         Value::Real(x) => x.to_string(),
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         Value::Blob(b) => format!("<{} bytes>", b.len()),
         // A capped blob copies as its summary; a capped text would re-fetch full
         // before reaching here (`copy_plan`), so its head is only a defensive form.

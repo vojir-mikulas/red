@@ -179,7 +179,7 @@ impl AppState {
             let items = values
                 .into_iter()
                 .map(|v| LookupRow {
-                    id: Value::Text(v),
+                    id: Value::Text(v.into()),
                     label: None,
                 })
                 .collect();

@@ -295,7 +295,7 @@ pub(crate) fn csv_cell(value: &Value) -> String {
         Value::Null => String::new(),
         Value::Integer(n) => n.to_string(),
         Value::Real(x) => x.to_string(),
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         Value::Blob(b) => format!("<{} bytes>", b.len()),
         // Export never caps, so a `Capped` can't reach here; rendered for totality.
         Value::Capped(_) => value.to_string(),
@@ -399,9 +399,9 @@ mod tests {
             String::new(),
         )
         .unwrap();
-        w.write_row(&[Value::Text("<script>".to_string()), Value::Null])
+        w.write_row(&[Value::Text("<script>".into()), Value::Null])
             .unwrap();
-        w.write_row(&[Value::Text("a & b".to_string()), Value::Integer(7)])
+        w.write_row(&[Value::Text("a & b".into()), Value::Integer(7)])
             .unwrap();
         let rows = w.finish().unwrap();
         assert_eq!(rows, 2);
@@ -436,7 +436,7 @@ mod tests {
             "users".to_string(),
         )
         .unwrap();
-        w.write_row(&[Value::Integer(1), Value::Text("O'Brien".to_string())])
+        w.write_row(&[Value::Integer(1), Value::Text("O'Brien".into())])
             .unwrap();
         w.write_row(&[Value::Integer(2), Value::Null]).unwrap();
         let rows = w.finish().unwrap();

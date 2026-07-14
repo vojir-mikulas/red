@@ -117,10 +117,16 @@ impl DisplayCell {
                 } else {
                     CellKind::Text
                 };
-                DisplayCell {
-                    text: one_line(s),
-                    kind,
-                }
+                // Single-line text (the common case) shares the raw value's `Arc<str>`
+                // buffer — a refcount bump, not a second copy — so a resident text
+                // cell is stored once. Only a value with embedded control chars needs
+                // a fresh flattened string (`one_line`).
+                let text = if s.chars().any(char::is_control) {
+                    one_line(s)
+                } else {
+                    SharedString::from(s.clone())
+                };
+                DisplayCell { text, kind }
             }
             Value::Blob(b) => DisplayCell {
                 text: format!("<{} bytes>", b.len()).into(),
@@ -971,7 +977,7 @@ mod keyed_run_tests {
 
     /// A run row whose key (column 0) is `id`.
     fn row(id: i64) -> Vec<Value> {
-        vec![Value::Integer(id), Value::Text(format!("row {id}"))]
+        vec![Value::Integer(id), Value::Text(format!("row {id}").into())]
     }
 
     fn rows(ids: impl IntoIterator<Item = i64>) -> Vec<Vec<Value>> {

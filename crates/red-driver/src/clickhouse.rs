@@ -1064,7 +1064,7 @@ fn ch_json_cell(v: &Value) -> Json {
         Value::Null => Json::Null,
         Value::Integer(n) => Json::from(*n),
         Value::Real(x) => Json::from(*x),
-        Value::Text(s) => Json::from(s.as_str()),
+        Value::Text(s) => Json::from(&**s),
         Value::Blob(b) => Json::from(String::from_utf8_lossy(b).into_owned()),
         Value::Capped(c) => Json::from(c.head.as_str()),
     }
@@ -1198,7 +1198,7 @@ fn ch_value(v: &Json, ch_type: &str, max: Option<usize>) -> Value {
 fn text_value(s: &str, max: Option<usize>) -> Value {
     match max {
         Some(m) => Value::capped_text(s, m),
-        None => Value::Text(s.to_string()),
+        None => Value::Text(s.into()),
     }
 }
 
@@ -1263,7 +1263,7 @@ fn ch_params(bound: &[Value]) -> Vec<(String, String)> {
             let text = match v {
                 Value::Integer(n) => n.to_string(),
                 Value::Real(x) => x.to_string(),
-                Value::Text(s) => s.clone(),
+                Value::Text(s) => s.to_string(),
                 _ => String::new(),
             };
             (format!("param_p{i}"), text)

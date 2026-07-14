@@ -1021,7 +1021,7 @@ fn pg_params(bound: Option<&[Value]>) -> Result<Vec<Box<dyn ToSql + Sync + Send>
             Ok(match v {
                 Value::Integer(n) => Box::new(*n),
                 Value::Real(x) => Box::new(*x),
-                Value::Text(s) => Box::new(s.clone()),
+                Value::Text(s) => Box::new(s.to_string()),
                 Value::Blob(b) => Box::new(b.clone()),
                 Value::Null | Value::Capped(_) => {
                     return Err(RedError::Query("null seek bound".into()))
@@ -1098,7 +1098,7 @@ fn pg_value(row: &Row, i: usize, max: Option<usize>) -> Value {
             Ok(None) => Value::Null,
             Ok(Some(s)) => match max {
                 Some(max) => Value::capped_text(s, max),
-                None => Value::Text(s.to_string()),
+                None => Value::Text(s.into()),
             },
             Err(_) => raw_text_fallback(row, i, max),
         },
@@ -1154,7 +1154,7 @@ fn decode_raw(
         .and_then(|b| f(&b.0))
         .map(|s| match max {
             Some(m) => Value::capped_text(&s, m),
-            None => Value::Text(s),
+            None => Value::Text(s.into()),
         })
         .unwrap_or(Value::Null)
 }
@@ -1323,7 +1323,7 @@ mod tests {
             .await
             .unwrap();
         match &page.rows[0][0] {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => s.to_string(),
             other => panic!("current_schema() returned {other:?}"),
         }
     }
@@ -1372,7 +1372,7 @@ mod tests {
             .unwrap();
         let row = &page.rows[0];
         let text = |v: &Value| match v {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => s.to_string(),
             other => panic!("expected text, got {other:?}"),
         };
         assert_eq!(text(&row[0]), "1234.567");
@@ -1798,7 +1798,7 @@ mod tests {
             .await
             .unwrap();
         let text = |v: &Value| match v {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => s.to_string(),
             other => panic!("expected text, got {other:?}"),
         };
         let row = &page.rows[0];

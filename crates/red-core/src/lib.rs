@@ -3,6 +3,7 @@
 //! `nyx-core` in the Nyx codebase.
 
 use std::fmt;
+use std::sync::Arc;
 
 pub mod kv;
 pub mod typemap;
@@ -876,7 +877,12 @@ pub enum Value {
     Null,
     Integer(i64),
     Real(f64),
-    Text(String),
+    /// Text is an `Arc<str>`, not a `String`, so the display path can share the
+    /// same buffer (a refcount bump) instead of copying the bytes a second time
+    /// into the grid's `SharedString` cell — a resident text cell is stored once,
+    /// not twice. `Arc<str>` is also narrower (16 vs 24 bytes). No UI/runtime dep:
+    /// `Arc<str>` is std, and gpui's `SharedString` wraps it zero-copy.
+    Text(Arc<str>),
     Blob(Vec<u8>),
     /// A cell the *display* fetch path capped: only a bounded prefix was read
     /// (over-cap text) or only the length (blob), so the full value was never
@@ -911,7 +917,7 @@ impl Value {
     /// never copied into the value, which is the point on the display fetch path.
     pub fn capped_text(s: &str, max_bytes: usize) -> Value {
         if s.len() <= max_bytes {
-            return Value::Text(s.to_owned());
+            return Value::Text(Arc::from(s));
         }
         let mut end = max_bytes;
         while !s.is_char_boundary(end) {
@@ -1190,7 +1196,7 @@ pub fn coerce_edit_value(
             .map(Value::Real)
             .map_err(|_| format!("‘{text}’ is not a valid number"));
     }
-    Ok(Value::Text(text.to_string()))
+    Ok(Value::Text(Arc::from(text)))
 }
 
 /// A query execution plan (Track B4: EXPLAIN). A small, fully-materialized tree

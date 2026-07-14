@@ -36,7 +36,7 @@ impl PkKey {
     pub(crate) fn from_value(v: &Value) -> Option<PkKey> {
         match v {
             Value::Integer(n) => Some(PkKey::Int(*n)),
-            Value::Text(s) => Some(PkKey::Text(s.clone())),
+            Value::Text(s) => Some(PkKey::Text(s.to_string())),
             _ => None,
         }
     }

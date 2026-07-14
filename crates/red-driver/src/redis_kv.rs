@@ -816,7 +816,7 @@ impl KvDriver for RedisDriver {
                 .await
                 .map_err(|e| RedError::Driver(e.to_string()))?;
             return Ok(raw.map(|bytes| match String::from_utf8(bytes) {
-                Ok(s) => Value::Text(s),
+                Ok(s) => Value::Text(s.into()),
                 Err(e) => Value::Blob(e.into_bytes()),
             }));
         }
@@ -1528,7 +1528,7 @@ fn cap_string_value(bytes: Vec<u8>) -> Value {
     let len = bytes.len();
     if len <= STRING_PREVIEW_CAP {
         return match String::from_utf8(bytes) {
-            Ok(s) => Value::Text(s),
+            Ok(s) => Value::Text(s.into()),
             Err(e) => Value::Blob(e.into_bytes()),
         };
     }
@@ -2654,7 +2654,7 @@ mod tests {
             .unwrap();
 
         match driver.read_value(&small).await.unwrap().unwrap() {
-            KvValue::Str(Value::Text(s)) => assert_eq!(s, "hello"),
+            KvValue::Str(Value::Text(s)) => assert_eq!(s.as_ref(), "hello"),
             other => panic!("expected an uncapped Text value, got {other:?}"),
         }
         match driver.read_value(&big).await.unwrap().unwrap() {
@@ -2688,7 +2688,7 @@ mod tests {
             other => panic!("expected a Capped value from read_value, got {other:?}"),
         }
         match driver.read_string_full(&big).await.unwrap().unwrap() {
-            Value::Text(s) => assert_eq!(s, big_value),
+            Value::Text(s) => assert_eq!(s.as_ref(), big_value.as_str()),
             other => panic!("expected the full Text value, got {other:?}"),
         }
         assert!(driver

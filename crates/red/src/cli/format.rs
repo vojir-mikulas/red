@@ -179,7 +179,7 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Null => J::Null,
         Value::Integer(n) => J::from(*n),
         Value::Real(x) => serde_json::Number::from_f64(*x).map_or(J::Null, J::Number),
-        Value::Text(s) => J::from(s.clone()),
+        Value::Text(s) => J::from(s.as_ref()),
         Value::Blob(b) => J::from(STANDARD.encode(b)),
         Value::Capped(c) if c.blob => J::from(format!("<{} bytes>", c.len)),
         Value::Capped(c) => J::from(format!("{}…", c.head)),
