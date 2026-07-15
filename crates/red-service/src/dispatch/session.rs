@@ -162,6 +162,10 @@ pub(crate) struct InFlight {
     /// Long-lived like `kv_subscribe`: it stays armed until `CloseResult`
     /// stops it, rather than being superseded by a follow-up request.
     pub(crate) kv_monitor: Option<AbortSignal>,
+    /// The latest `DocFetchPage` for this epoch (the MongoDB browse grid):
+    /// selecting a new collection, or paging the current one, supersedes the
+    /// in-flight `find` the same way a flung scrollbar supersedes a SQL page.
+    pub(crate) doc_page: Option<AbortSignal>,
 }
 
 impl InFlight {
@@ -180,6 +184,7 @@ impl InFlight {
             self.kv_group_pending.as_ref(),
             self.kv_subscribe.as_ref(),
             self.kv_monitor.as_ref(),
+            self.doc_page.as_ref(),
         ]
         .into_iter()
         .flatten()

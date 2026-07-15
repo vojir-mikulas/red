@@ -41,6 +41,7 @@ fn engine_tint(kind: DbKind, theme: &Theme) -> Hsla {
         // badge is `Danger`/red to match); here `theme.red` is used as a colour,
         // not to signal an error state.
         DbKind::Redis => theme.red,
+        DbKind::Mongo => theme.green,
     }
 }
 
@@ -55,6 +56,7 @@ pub(crate) fn engine_icon(kind: DbKind) -> &'static str {
         DbKind::Mysql => "db-mysql",
         DbKind::Clickhouse => "db-clickhouse",
         DbKind::Redis => "db-redis",
+        DbKind::Mongo => "db-mongo",
     }
 }
 
@@ -592,6 +594,7 @@ impl AppState {
             // Redis gets a red badge (leaning into the app's accent) but keeps its
             // own name; `Danger` here is used for its colour, not a status meaning.
             DbKind::Redis => (BadgeVariant::Danger, "Redis"),
+            DbKind::Mongo => (BadgeVariant::Success, "MongoDB"),
         };
         let group = SharedString::from(format!("connect-card-{orig_ix}"));
         // Accessible name: the connection's name, engine, and read-only state;

@@ -477,7 +477,7 @@ impl AppState {
     /// settings gear · window controls), shared by [`Self::render_shell`] (the
     /// SQL workspace) and [`Self::render_redis_shell`] (the KV placeholder) —
     /// it's engine-agnostic chrome, not part of the SQL-specific work area.
-    fn render_topbar(
+    pub(crate) fn render_topbar(
         &self,
         theme: &Theme,
         view: &WeakEntity<Self>,

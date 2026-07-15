@@ -63,6 +63,11 @@ const MAX_CONCURRENT_IMPORTS: usize = 2;
 /// together without fanning out an unbounded number of pinned connections.
 const MAX_CONCURRENT_COPIES: usize = 2;
 
+/// Documents per `DocFetchPage` window (the MongoDB browse grid). One window is
+/// resident at a time; the browser pages by `skip`, so this bounds the `find`
+/// batch and the event payload, mirroring the SQL grid's page size.
+const DOC_PAGE_ROWS: usize = 100;
+
 /// Rows per source window / insert chunk in a table copy (the driver re-clamps the
 /// insert to its bound-parameter cap). Keeps the copy one-chunk-resident regardless
 /// of how many rows move; a `[copy]` knob is a later refinement, like import's.
@@ -2661,6 +2666,159 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 });
             }
 
+            Command::DocListDatabases { epoch } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_doc().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a MongoDB connection".into()),
+                    );
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver.list_databases().await {
+                        Ok(databases) => emit(
+                            &events,
+                            session_id,
+                            Event::DocDatabases { epoch, databases },
+                        ),
+                        Err(e) => emit(
+                            &events,
+                            session_id,
+                            Event::DocError {
+                                epoch,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
+                });
+            }
+
+            Command::DocListCollections { epoch, db } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_doc().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a MongoDB connection".into()),
+                    );
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver.list_collections(&db).await {
+                        Ok(collections) => emit(
+                            &events,
+                            session_id,
+                            Event::DocCollections {
+                                epoch,
+                                db,
+                                collections,
+                            },
+                        ),
+                        Err(e) => emit(
+                            &events,
+                            session_id,
+                            Event::DocError {
+                                epoch,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
+                });
+            }
+
+            Command::DocFetchPage {
+                epoch,
+                db,
+                coll,
+                skip,
+            } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_doc().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a MongoDB connection".into()),
+                    );
+                    continue;
+                };
+                // A new page (or a new collection selection) supersedes the
+                // in-flight `find`, like a flung SQL scrollbar.
+                let entry = state.inflight.entry(epoch).or_default();
+                if let Some(prev) = entry.doc_page.take() {
+                    prev.abort();
+                }
+                let abort = AbortSignal::new();
+                entry.doc_page = Some(abort.clone());
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let query = red_core::doc::FindQuery {
+                        db: db.clone(),
+                        coll: coll.clone(),
+                        filter: None,
+                        projection: None,
+                        sort: None,
+                        skip,
+                        limit: None,
+                        batch: DOC_PAGE_ROWS,
+                    };
+                    let page = match driver.find(&query, &abort).await {
+                        Ok(page) => page,
+                        // A superseded fetch emits nothing; a real failure surfaces.
+                        Err(red_core::RedError::Interrupted) => return,
+                        Err(e) => {
+                            emit(
+                                &events,
+                                session_id,
+                                Event::DocError {
+                                    epoch,
+                                    message: e.to_string(),
+                                },
+                            );
+                            return;
+                        }
+                    };
+                    if abort.is_aborted() {
+                        return;
+                    }
+                    // Only the first window pays for the total count; later pages
+                    // reuse it. A count failure just leaves the total unknown.
+                    let total = if skip == 0 {
+                        driver.count(&db, &coll, None).await.ok()
+                    } else {
+                        None
+                    };
+                    emit(
+                        &events,
+                        session_id,
+                        Event::DocPageReady {
+                            epoch,
+                            db,
+                            coll,
+                            skip,
+                            docs: page.docs,
+                            exhausted: page.exhausted,
+                            total,
+                        },
+                    );
+                });
+            }
+
             Command::ColumnStats {
                 epoch,
                 column,
@@ -3548,6 +3706,9 @@ fn resolve_ai_tool_ctx(
     let backend = match &state.driver {
         SessionDriver::Sql(d) => crate::ai::AiBackend::Sql(d.clone()),
         SessionDriver::Kv(d) => crate::ai::AiBackend::Kv(d.clone()),
+        // Document-seam AI grounding lands in D3 (see docs/plans/todo/doc-driver.md);
+        // until then a Mongo session has no AI backend, so tool context is absent.
+        SessionDriver::Doc(_) => return None,
     };
     let mut effective = ai_policy.with_overrides(state.ai_override.enabled, state.ai_override.tier);
     effective.read_only = state.read_only;

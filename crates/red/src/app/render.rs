@@ -374,6 +374,12 @@ impl Render for AppState {
             Phase::Connected(active) if active.config.kind == red_core::DbKind::Redis => self
                 .render_redis_shell(active, window, cx)
                 .into_any_element(),
+            // MongoDB is a document store, not SQL: a dedicated browse/inspector
+            // shell instead of the editor/grid/schema workspace (which assumes a
+            // `DatabaseDriver` session). See docs/plans/todo/doc-driver.md.
+            Phase::Connected(active) if active.config.kind == red_core::DbKind::Mongo => self
+                .render_mongo_shell(active, window, cx)
+                .into_any_element(),
             Phase::Connected(active) => self.render_shell(active, window, cx).into_any_element(),
         };
 

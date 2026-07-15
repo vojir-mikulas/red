@@ -334,9 +334,10 @@ fn reject_kv(
     source: &red_core::ConnectionConfig,
     target: &red_core::ConnectionConfig,
 ) -> Option<u8> {
-    if source.kind == DbKind::Redis || target.kind == DbKind::Redis {
+    let is_non_sql = |k: DbKind| matches!(k, DbKind::Redis | DbKind::Mongo);
+    if is_non_sql(source.kind) || is_non_sql(target.kind) {
         return Some(usage(
-            "copy/migrate isn't supported for Redis connections yet".into(),
+            "copy/migrate isn't supported for Redis or MongoDB connections yet".into(),
         ));
     }
     None
@@ -352,9 +353,12 @@ fn default_schema(kind: DbKind, database: &str) -> Option<String> {
         DbKind::Sqlite => Some("main".into()),
         DbKind::Postgres => Some("public".into()),
         DbKind::Mysql | DbKind::Clickhouse => (!database.is_empty()).then(|| database.to_string()),
-        // `red copy`/`red migrate` are SQL-shaped (SELECT/INSERT); the CLI
-        // never routes a Redis connection into them (see docs/plans/redis.md).
-        DbKind::Redis => unreachable!("Redis isn't a copy/migrate SQL source or target"),
+        // `red copy`/`red migrate` are SQL-shaped (SELECT/INSERT); the CLI never
+        // routes a Redis or MongoDB connection into them (they aren't SQL sources
+        // or targets; see docs/plans/redis.md and docs/plans/todo/doc-driver.md).
+        DbKind::Redis | DbKind::Mongo => {
+            unreachable!("{kind} isn't a copy/migrate SQL source or target")
+        }
     }
 }
 

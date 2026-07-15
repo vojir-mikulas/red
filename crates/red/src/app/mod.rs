@@ -1697,6 +1697,32 @@ impl AppState {
                 self.on_kv_notify_config_ready(session, epoch, value, cx);
             }
 
+            // --- MongoDB document browser (see docs/plans/todo/doc-driver.md) ---
+            Event::DocDatabases { epoch, databases } => {
+                self.on_doc_databases(session, epoch, databases, cx);
+            }
+            Event::DocCollections {
+                epoch,
+                db,
+                collections,
+            } => {
+                self.on_doc_collections(session, epoch, db, collections, cx);
+            }
+            Event::DocPageReady {
+                epoch,
+                db,
+                coll,
+                skip,
+                docs,
+                exhausted,
+                total,
+            } => {
+                self.on_doc_page(session, epoch, db, coll, skip, docs, exhausted, total, cx);
+            }
+            Event::DocError { epoch, message } => {
+                self.on_doc_error(session, epoch, message, cx);
+            }
+
             // --- result grid ---
             Event::ResultReady {
                 columns,

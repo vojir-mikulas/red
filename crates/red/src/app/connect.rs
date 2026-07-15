@@ -122,6 +122,7 @@ impl AppState {
             // Invalidate any pending backoff timer from a prior attempt.
             self.connect_gen += 1;
             let is_redis = conn.config.kind == red_core::DbKind::Redis;
+            let is_mongo = conn.config.kind == red_core::DbKind::Mongo;
             let conn_id = conn.conn_id.clone();
             self.phase = Phase::Connected(Box::new(ActiveConn::new(
                 id,
@@ -139,6 +140,11 @@ impl AppState {
                 // browser's first scan + header stat instead (R1, see
                 // docs/plans/redis.md).
                 self.kv_start_browse(id, cx);
+            } else if is_mongo {
+                // MongoDB has no SQL schema either; kick off the document
+                // browser's first load (the databases list). See
+                // docs/plans/todo/doc-driver.md.
+                self.doc_start_browse(id, cx);
             } else {
                 // Kick off the schema-tree skeleton load for the sidebar, and
                 // background-prefetch the FK graph (Track B7) so grid FK columns can be

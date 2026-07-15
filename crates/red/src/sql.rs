@@ -282,7 +282,10 @@ pub fn functions_for(kind: DbKind) -> Vec<(&'static str, &'static str, &'static 
         DbKind::Mysql => Some(MY),
         DbKind::Sqlite => Some(SL),
         DbKind::Clickhouse => Some(CH),
-        DbKind::Redis => None,
+        // Neither Redis nor MongoDB has a SQL editor surface, so no bit names
+        // them; `functions_for` returns empty rather than reaching an
+        // `unreachable!()` for a non-SQL connection.
+        DbKind::Redis | DbKind::Mongo => None,
     }) else {
         return Vec::new();
     };

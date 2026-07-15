@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use red_core::diff::{DiffColumnPlan, DiffRow, DiffSummary};
+use red_core::doc::{CollectionInfo, DbInfo, Document};
 use red_core::kv::{
     ClientInfo, CollectionKind, KeyMeta, KvCollectionPage, KvEdit, KvScanPage, KvStreamActionReq,
     KvStreamPage, KvType, KvValue, PendingEntry, RecycledKey, RespValue, ScanBudget, ScanCursor,
@@ -509,6 +510,29 @@ pub enum Command {
     KvClientKill {
         epoch: Epoch,
         id: i64,
+    },
+    /// List the databases on a MongoDB deployment (`listDatabases`), the top of
+    /// the document browser's `db -> collection` tree (see
+    /// docs/plans/todo/doc-driver.md). Replied with `DocDatabases`; failures
+    /// surface as `DocError`. Rejected on a non-document session.
+    DocListDatabases {
+        epoch: Epoch,
+    },
+    /// List one database's collections (`listCollections` + cheap stats), the
+    /// second tree level. Replied with `DocCollections` keyed by `db`.
+    DocListCollections {
+        epoch: Epoch,
+        db: String,
+    },
+    /// One window of a collection's documents (`find` with `skip`, page-sized),
+    /// the browse grid's read. `skip == 0` also asks for the collection's total
+    /// count so the grid can show it. Replied with `DocPageReady`; cancellable
+    /// and epoch-superseded like a SQL page fetch.
+    DocFetchPage {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        skip: u64,
     },
     /// Compute a column's aggregate summary over the open result's *filtered* SQL
     /// (the column-stats bar): a single `count`/`distinct`/`min`/`max`(/`sum`/`avg`)
@@ -1088,6 +1112,37 @@ pub enum Event {
     KvClientListReady {
         epoch: Epoch,
         clients: Vec<ClientInfo>,
+    },
+    /// The MongoDB deployment's databases, in response to `DocListDatabases`.
+    DocDatabases {
+        epoch: Epoch,
+        databases: Vec<DbInfo>,
+    },
+    /// One database's collections, in response to `DocListCollections`. Keyed by
+    /// `db` so the browser drops it into the right tree branch.
+    DocCollections {
+        epoch: Epoch,
+        db: String,
+        collections: Vec<CollectionInfo>,
+    },
+    /// One window of a collection's documents, in response to `DocFetchPage`.
+    /// Echoes `db`/`coll`/`skip` so a late page for a superseded selection is
+    /// discarded; `total` is the collection count, present only for the first
+    /// page (`skip == 0`). `exhausted` marks the last window.
+    DocPageReady {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        skip: u64,
+        docs: Vec<Document>,
+        exhausted: bool,
+        total: Option<u64>,
+    },
+    /// A document browse operation failed (list/find), in response to a `Doc*`
+    /// command. Surfaced inline in the browser rather than only as a toast.
+    DocError {
+        epoch: Epoch,
+        message: String,
     },
     /// A result opened: its columns and total row count (for `OpenResult`).
     /// Echoes the open `epoch` so the grid can ignore a late reply for a result

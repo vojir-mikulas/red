@@ -1058,6 +1058,10 @@ pub(crate) struct ActiveConn {
     /// default Browse tab's filter `TextInput`); `on_connected` fires that
     /// tab's initial `KvDbSize`/`KvFetchScan` once the session is live.
     pub kv_view: Option<crate::kvbrowse::RedisView>,
+    /// The MongoDB document browser (see [`crate::docbrowse`]); `Some` only for a
+    /// `DbKind::Mongo` session, mirroring `kv_view`. `None` for every other
+    /// engine. `on_connected` fires its first `DocListDatabases` once live.
+    pub doc_view: Option<crate::docbrowse::MongoView>,
 }
 
 impl ActiveConn {
@@ -1071,6 +1075,8 @@ impl ActiveConn {
         let tab = QueryTab::new("query 1".to_string(), cx);
         let kv_view =
             (config.kind == DbKind::Redis).then(|| crate::kvbrowse::RedisView::new(session, cx));
+        let doc_view =
+            (config.kind == DbKind::Mongo).then(|| crate::docbrowse::MongoView::new(session, cx));
         let history_search = cx.new(|cx| TextInput::new(cx).with_placeholder("Search history…"));
         // Re-render so the search narrows the dock live as the user types.
         cx.subscribe(
@@ -1119,6 +1125,7 @@ impl ActiveConn {
             er: None,
             diff: None,
             kv_view,
+            doc_view,
         }
     }
 
