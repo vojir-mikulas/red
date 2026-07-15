@@ -27,6 +27,9 @@ uuid.workspace = true
 # Redis driver — the KvDriver seam, see kv.rs/redis_kv.rs.
 redis.workspace = true
 url.workspace = true
+# MongoDB driver — the DocDriver seam, see doc.rs/mongo.rs. Isolated to this
+# crate; `bson` rides in as `mongodb::bson` (no separate BSON version).
+mongodb.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }

@@ -53,6 +53,14 @@ redis = { version = "1", default-features = false, features = ["tokio-rustls-com
 # rebuild per-master cluster DSNs (host+port swap, credentials/scheme/TLS
 # preserved) without hand-rolling URL surgery.
 url = "2"
+# MongoDB — the DocDriver seam (docs/plans/todo/doc-driver.md), the one place the
+# minimal-dependency instinct is knowingly relaxed: OP_MSG + BSON + SCRAM + SRV
+# discovery aren't hand-rollable the way RESP was. Isolated behind the `DocDriver`
+# trait, so `mongodb`/`bson` never leak past `red-driver` (the `DocValue` mirror is
+# the firewall). Default features (bson-2, dns-resolver, rustls-tls) match the
+# pure-Rust rustls stack the rest of the tree already uses; `bson` re-exported as
+# `mongodb::bson`, so no second BSON version enters the tree.
+mongodb = "3"
 
 # --- Subscription assistant via ACP (red-acp) ---
 # Drives Claude Code as an external agent over the Agent Client Protocol so the

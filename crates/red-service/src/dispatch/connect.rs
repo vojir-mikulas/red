@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use red_core::{ConnectionConfig, DbKind, RedError};
 use red_driver::{
-    ClickhouseDriver, DatabaseDriver, MysqlDriver, PostgresDriver, RedisDriver, SqliteDriver,
+    ClickhouseDriver, DatabaseDriver, MongoDriver, MysqlDriver, PostgresDriver, RedisDriver,
+    SqliteDriver,
 };
 
 use crate::proxy::Proxy;
@@ -108,6 +109,13 @@ async fn connect(config: &ConnectionConfig) -> red_core::Result<(SessionDriver, 
         // engine's database segment.
         DbKind::Redis => SessionDriver::Kv(Arc::new(
             RedisDriver::connect(&dsn, config.read_only).await?,
+        )),
+        // The third seam — a document store, neither SQL nor KV (see
+        // docs/plans/todo/doc-driver.md). Like Redis, no schema-scoping: a Mongo
+        // connection addresses databases/collections by name through `DocDriver`,
+        // and its default database (when the DSN names one) rides in `dsn`.
+        DbKind::Mongo => SessionDriver::Doc(Arc::new(
+            MongoDriver::connect(&dsn, config.read_only).await?,
         )),
         DbKind::Sqlite => unreachable!("handled above"),
     };

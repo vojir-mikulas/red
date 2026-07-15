@@ -22,9 +22,11 @@ use tokio::sync::mpsc::UnboundedSender;
 mod clickhouse;
 #[cfg(test)]
 mod conformance;
+mod doc;
 mod format;
 mod import;
 mod kv;
+mod mongo;
 mod mysql;
 mod pg_text;
 mod plan;
@@ -32,9 +34,11 @@ mod postgres;
 mod redis_kv;
 mod sqlite;
 pub use clickhouse::ClickhouseDriver;
+pub use doc::DocDriver;
 pub use format::html_escape;
 pub use import::ImportReader;
 pub use kv::{KvDriver, KvMonitorStream, KvSubscription, KvTopology};
+pub use mongo::MongoDriver;
 pub use mysql::MysqlDriver;
 pub use postgres::PostgresDriver;
 pub use redis_kv::{RedisDriver, SentinelMaster, sentinel_masters};
@@ -378,6 +382,12 @@ pub(crate) fn create_table_sql(
                     // rather than panic on the backend thread if that ever breaks.
                     DbKind::Redis => {
                         debug_assert!(false, "Redis has no column/DDL model");
+                        format!("{} {}", quote(&c.name), spell(kind, &nt))
+                    }
+                    // Schemaless document store, no `DatabaseDriver`/DDL model, so
+                    // this never sees `DbKind::Mongo` (see `typemap::spell`).
+                    DbKind::Mongo => {
+                        debug_assert!(false, "MongoDB has no column/DDL model");
                         format!("{} {}", quote(&c.name), spell(kind, &nt))
                     }
                 }

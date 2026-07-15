@@ -141,6 +141,14 @@ pub fn spell(kind: DbKind, t: &NormType) -> String {
             debug_assert!(false, "Redis has no column/DDL model");
             String::new()
         }
+        // MongoDB is schemaless and rides the `DocDriver` seam, not
+        // `DatabaseDriver`; it can never be a create-table/migration target
+        // (`write_caps().insert` is false, which the pickers filter on). Degrade
+        // like Redis rather than panic on the backend thread if that regresses.
+        DbKind::Mongo => {
+            debug_assert!(false, "MongoDB has no column/DDL model");
+            String::new()
+        }
     }
 }
 
@@ -169,6 +177,8 @@ pub fn is_lossy(target: DbKind, t: &NormType) -> bool {
         DbKind::Clickhouse => true,
         // Redis is never a create target either (no column/DDL model).
         DbKind::Redis => true,
+        // MongoDB is never a create target either (schemaless, no DDL model).
+        DbKind::Mongo => true,
     }
 }
 

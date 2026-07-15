@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use red_core::AiTier;
-use red_driver::{AbortSignal, CancelToken, DatabaseDriver, KvDriver, QueryCursor};
+use red_driver::{AbortSignal, CancelToken, DatabaseDriver, DocDriver, KvDriver, QueryCursor};
 
 use crate::protocol::OpId;
 use crate::proxy::Proxy;
@@ -33,15 +33,17 @@ pub(crate) enum Forward {
     Proxy(Proxy),
 }
 
-/// A session's driver: either the SQL-shaped `DatabaseDriver` seam or the
-/// parallel `KvDriver` seam (Redis; see `docs/plans/redis.md`). Every SQL
-/// command handler needs the former and has no meaning for the latter, so
-/// [`SessionDriver::as_sql`] is how those handlers reject a KV session with a
-/// clean `Event::Error` instead of a type error or a silent no-op.
+/// A session's driver: the SQL-shaped `DatabaseDriver` seam, the Redis-shaped
+/// `KvDriver` seam (`docs/plans/redis.md`), or the document-shaped `DocDriver`
+/// seam (MongoDB; `docs/plans/todo/doc-driver.md`). Every SQL command handler
+/// needs the first and has no meaning for the others, so [`SessionDriver::as_sql`]
+/// is how those handlers reject a non-SQL session with a clean `Event::Error`
+/// instead of a type error or a silent no-op.
 #[derive(Clone)]
 pub(crate) enum SessionDriver {
     Sql(Arc<dyn DatabaseDriver>),
     Kv(Arc<dyn KvDriver>),
+    Doc(Arc<dyn DocDriver>),
 }
 
 impl SessionDriver {
@@ -52,18 +54,28 @@ impl SessionDriver {
     pub(crate) fn as_sql(&self) -> Option<&Arc<dyn DatabaseDriver>> {
         match self {
             SessionDriver::Sql(d) => Some(d),
-            SessionDriver::Kv(_) => None,
+            SessionDriver::Kv(_) | SessionDriver::Doc(_) => None,
         }
     }
 
-    /// Borrow the KV driver, or `None` on a SQL session. Unused until R1's
-    /// `Kv*` command handlers land (see docs/plans/redis.md); R0 only needs
-    /// `as_sql`, to reject SQL commands on a KV session.
+    /// Borrow the KV driver, or `None` on a non-KV session. Used by the `Kv*`
+    /// command handlers (see docs/plans/redis.md) to reject a mismatched session.
     #[allow(dead_code)]
     pub(crate) fn as_kv(&self) -> Option<&Arc<dyn KvDriver>> {
         match self {
-            SessionDriver::Sql(_) => None,
             SessionDriver::Kv(d) => Some(d),
+            SessionDriver::Sql(_) | SessionDriver::Doc(_) => None,
+        }
+    }
+
+    /// Borrow the document driver, or `None` on a non-document session. Used by
+    /// the `Doc*` command handlers (see docs/plans/todo/doc-driver.md) to reject a
+    /// mismatched session, the same way `as_sql`/`as_kv` do.
+    #[allow(dead_code)]
+    pub(crate) fn as_doc(&self) -> Option<&Arc<dyn DocDriver>> {
+        match self {
+            SessionDriver::Doc(d) => Some(d),
+            SessionDriver::Sql(_) | SessionDriver::Kv(_) => None,
         }
     }
 
@@ -72,6 +84,7 @@ impl SessionDriver {
         match self {
             SessionDriver::Sql(d) => d.server_version(),
             SessionDriver::Kv(d) => d.server_version(),
+            SessionDriver::Doc(d) => d.server_version(),
         }
     }
 }

@@ -6,6 +6,7 @@ use std::fmt;
 use std::sync::Arc;
 
 pub mod diff;
+pub mod doc;
 pub mod kv;
 pub mod typemap;
 
@@ -29,6 +30,12 @@ pub enum DbKind {
     /// `DatabaseDriver` — see `docs/plans/redis.md`. Read-only in R0/R1;
     /// `write_caps` reflects that until R3 lands in-grid editing.
     Redis,
+    /// MongoDB: a document store, neither SQL- nor Redis-shaped. Reached through
+    /// the third `DocDriver` seam (`red-driver`'s `doc` module), a
+    /// `server → databases → collections → documents` hierarchy of nested BSON
+    /// trees — see `docs/plans/todo/doc-driver.md`. Writes ride the seam, not the
+    /// SQL `WriteCaps` set, so `write_caps` stays all-`false` like Redis.
+    Mongo,
 }
 
 impl DbKind {
@@ -42,6 +49,7 @@ impl DbKind {
             DbKind::Mysql,
             DbKind::Clickhouse,
             DbKind::Redis,
+            DbKind::Mongo,
         ]
     }
 
@@ -58,6 +66,7 @@ impl DbKind {
             DbKind::Mysql => Some(3306),
             DbKind::Clickhouse => Some(8123),
             DbKind::Redis => Some(6379),
+            DbKind::Mongo => Some(27017),
             DbKind::Sqlite => None,
         }
     }
@@ -70,6 +79,7 @@ impl DbKind {
             DbKind::Sqlite => "sqlite",
             DbKind::Clickhouse => "clickhouse",
             DbKind::Redis => "redis",
+            DbKind::Mongo => "mongodb",
         }
     }
 
@@ -84,6 +94,9 @@ impl DbKind {
             // The TLS schemes (`rediss`/`clickhouses`) parse to the same engine;
             // `parse_conn_str` reads the `tls` bit from the scheme separately.
             "redis" | "rediss" => Some(DbKind::Redis),
+            // Both the plain and the SRV/DNS-seedlist spelling map to one engine;
+            // `mongodb+srv` implies TLS, which the driver reads off the scheme.
+            "mongodb" | "mongodb+srv" => Some(DbKind::Mongo),
             _ => None,
         }
     }
@@ -127,6 +140,15 @@ impl DbKind {
             // this stays all-`false` so any UI affordance still gated on
             // `write_caps` (rather than the connection kind) stays hidden.
             DbKind::Redis => WriteCaps {
+                insert: false,
+                guarded_edit: false,
+                best_effort_edit: false,
+            },
+            // MongoDB: like Redis, every write rides its own seam (`DocDriver`),
+            // not this SQL capability set, so any affordance gated on `write_caps`
+            // (rather than the connection kind) stays hidden. See
+            // `docs/plans/todo/doc-driver.md`.
+            DbKind::Mongo => WriteCaps {
                 insert: false,
                 guarded_edit: false,
                 best_effort_edit: false,
@@ -183,6 +205,7 @@ impl fmt::Display for DbKind {
             DbKind::Mysql => write!(f, "MySQL/MariaDB"),
             DbKind::Clickhouse => write!(f, "ClickHouse"),
             DbKind::Redis => write!(f, "Redis"),
+            DbKind::Mongo => write!(f, "MongoDB"),
         }
     }
 }
@@ -781,6 +804,8 @@ impl ConnectionConfig {
             match self.kind {
                 DbKind::Postgres => url.push_str("?sslmode=require"),
                 DbKind::Mysql => url.push_str("?require_ssl=true"),
+                // The `mongodb` crate reads `tls=true` from the URI query.
+                DbKind::Mongo => url.push_str("?tls=true"),
                 _ => {}
             }
         }
