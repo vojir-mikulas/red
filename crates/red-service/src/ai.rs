@@ -18,13 +18,17 @@ use std::time::Duration;
 use red_ai::{
     AiProvider, CancelToken, ContentBlock, Message, Role, StopReason, ToolDef, TurnRequest,
 };
+use red_core::doc::{
+    CollKind, DocOpClass, DocPlan, DocSchema, DocUpdate, DocValue, DocWrite, Document, FindQuery,
+    IndexInfo, IndexSpec, classify_doc_op,
+};
 use red_core::kv::{
     KeyMeta, KvCollection, KvValue, RespValue, ScanBudget, ScanCursor, analyze_keyspace,
 };
 use red_core::{
     ActivityKind, ActivityStatus, AiLimits, AiPolicy, AiTier, RedError, TableRef, Value,
 };
-use red_driver::{AbortSignal, DatabaseDriver, KvDriver, PageCap};
+use red_driver::{AbortSignal, DatabaseDriver, DocDriver, KvDriver, PageCap};
 use serde_json::{Value as Json, json};
 use tokio::sync::oneshot;
 
@@ -41,15 +45,17 @@ use crate::{Event, SessionId};
 pub(crate) enum AiBackend {
     Sql(Arc<dyn DatabaseDriver>),
     Kv(Arc<dyn KvDriver>),
+    Doc(Arc<dyn DocDriver>),
 }
 
 impl AiBackend {
     /// The tier-filtered tool catalog this backend offers under `policy`. Routes to
-    /// the SQL schema/query tools or the Redis `kv_*` tools.
+    /// the SQL schema/query tools, the Redis `kv_*` tools, or the MongoDB doc tools.
     pub(crate) fn catalog(&self, policy: &AiPolicy) -> Vec<ToolDef> {
         match self {
             AiBackend::Sql(_) => tool_catalog(policy),
             AiBackend::Kv(_) => kv_tool_catalog(policy),
+            AiBackend::Doc(_) => doc_tool_catalog(policy),
         }
     }
 
@@ -58,6 +64,7 @@ impl AiBackend {
         match self {
             AiBackend::Sql(_) => system_prompt(ctx, policy),
             AiBackend::Kv(_) => kv_system_prompt(ctx, policy),
+            AiBackend::Doc(_) => doc_system_prompt(ctx, policy),
         }
     }
 
@@ -87,6 +94,7 @@ impl AiBackend {
         match self {
             AiBackend::Sql(d) => run_tool(d, name, input, policy, cancel, report).await,
             AiBackend::Kv(d) => kv_run_tool(d, name, input, policy, cancel, report).await,
+            AiBackend::Doc(d) => doc_run_tool(d, name, input, policy, cancel, report).await,
         }
     }
 }
@@ -593,6 +601,9 @@ pub(crate) async fn run_turn(
                 AiBackend::Kv(driver) => {
                     kv_run_tool(driver, name, input, &policy, &cancel, &report).await
                 }
+                AiBackend::Doc(driver) => {
+                    doc_run_tool(driver, name, input, &policy, &cancel, &report).await
+                }
             };
             emit(
                 &events,
@@ -684,6 +695,10 @@ async fn run_subagent(
     let (tools, system) = match backend {
         AiBackend::Sql(_) => (subagent_catalog(policy), subagent_system_prompt(task)),
         AiBackend::Kv(_) => (kv_subagent_catalog(policy), kv_subagent_system_prompt(task)),
+        AiBackend::Doc(_) => (
+            doc_subagent_catalog(policy),
+            doc_subagent_system_prompt(task),
+        ),
     };
     let mut messages = vec![Message::user_text(task.to_string())];
     let mut answer = String::new();
@@ -772,6 +787,7 @@ async fn run_subagent(
                 match backend {
                     AiBackend::Sql(d) => run_tool(d, name, input, policy, cancel, report).await,
                     AiBackend::Kv(d) => kv_run_tool(d, name, input, policy, cancel, report).await,
+                    AiBackend::Doc(d) => doc_run_tool(d, name, input, policy, cancel, report).await,
                 }
             };
             emit(
@@ -2492,6 +2508,21 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "kv_analyze",
     "kv_slowlog",
     "kv_config_get",
+    // MongoDB (doc) read tools: pure reads through the `DocDriver` seam. The
+    // signature tools (`profile_collection`/`audit_collection`/`index_advice`)
+    // are host-side compositions over the read methods, so they're reads too.
+    "doc_server_info",
+    "list_collections",
+    "describe_collection",
+    "profile_collection",
+    "sample_documents",
+    "find",
+    "aggregate",
+    "count",
+    "distinct",
+    "explain_query",
+    "index_advice",
+    "audit_collection",
 ];
 
 /// Whether `name` is a mutating tool: it never auto-runs and never auto-allows;
@@ -2550,6 +2581,9 @@ pub(crate) fn assess_write(name: &str, input: &Json, policy: &AiPolicy) -> Write
     }
     if is_kv_write_tool(name) {
         return assess_kv_write(name, input);
+    }
+    if is_doc_write_tool(name) {
+        return assess_doc_write(name, input);
     }
     if name == "propose_changeset" {
         return assess_changeset(input);
@@ -3502,6 +3536,1082 @@ fn write_plan_node(out: &mut String, node: &red_core::PlanNode, depth: usize) {
     }
 }
 
+// ============================================================================
+// MongoDB (document) agent — the `DocDriver` backend's tools, mirroring the
+// SQL and Redis (`kv_*`) catalogs. Read tools auto-run (they're in
+// `READ_ONLY_TOOLS`); the `propose_*` writes ride the per-call approval gate.
+// The signature tools (`profile_collection`/`audit_collection`/`index_advice`)
+// are host-side compositions over the driver's read methods — no new seam.
+// ============================================================================
+
+/// The doc backend's mutating tools; each rides the same per-call approval gate
+/// as a SQL/Redis write. Their complement (the reads) is the `doc_*`/`find`/…
+/// set listed in [`READ_ONLY_TOOLS`].
+const DOC_WRITE_TOOLS: &[&str] = &[
+    "propose_doc_write",
+    "propose_index",
+    "propose_collection_op",
+];
+
+fn is_doc_write_tool(name: &str) -> bool {
+    DOC_WRITE_TOOLS.contains(&name)
+}
+
+/// The tier-filtered MongoDB tool catalog. Same shape as `kv_tool_catalog`: an
+/// array of every def, then a tier + read-only filter.
+pub(crate) fn doc_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
+    let coll_args = |extra: Json| {
+        // `{ db, coll }` plus tool-specific properties merged in.
+        let mut props = serde_json::Map::new();
+        props.insert(
+            "db".into(),
+            json!({ "type": "string", "description": "Database name." }),
+        );
+        props.insert(
+            "coll".into(),
+            json!({ "type": "string", "description": "Collection name." }),
+        );
+        if let Json::Object(m) = extra {
+            props.extend(m);
+        }
+        json!({
+            "type": "object",
+            "properties": props,
+            "required": ["db", "coll"],
+            "additionalProperties": false,
+        })
+    };
+    let all = [
+        ToolDef {
+            name: "doc_server_info".into(),
+            description: "Summarize the deployment: server version, topology \
+                (standalone/replica-set/sharded), and the databases with their sizes. Call this \
+                first to understand what you're connected to."
+                .into(),
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "list_collections".into(),
+            description: "The catalog: collections in a database (or every database when `db` is \
+                omitted), with estimated document counts and view/time-series/capped kind."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "db": { "type": "string", "description": "Database to list; omit for all." } },
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "describe_collection".into(),
+            description: "One collection's DISCOVERED schema (sampled field paths with per-type \
+                frequency and present-ratio) plus its indexes. The schema is inferred from a \
+                sample, not declared — a field can legitimately be several types."
+                .into(),
+            input_schema: coll_args(json!({})),
+        },
+        ToolDef {
+            name: "profile_collection".into(),
+            description: "The signature data-quality tool: sample the collection and report, per \
+                field path, its type distribution and how often it is present — surfacing schema \
+                drift (a field that's string here and int there) and optional fields. Never \
+                returns raw documents."
+                .into(),
+            input_schema: coll_args(
+                json!({ "sample": { "type": "integer", "description": "Documents to sample (default 200)." } }),
+            ),
+        },
+        ToolDef {
+            name: "sample_documents".into(),
+            description: "Return N random documents ($sample) so you can see the real shape before \
+                writing a filter — the cheap 'show me what this looks like' a schemaless store needs."
+                .into(),
+            input_schema: coll_args(
+                json!({ "n": { "type": "integer", "description": "How many to sample (default 5)." } }),
+            ),
+        },
+        ToolDef {
+            name: "find".into(),
+            description: "Run a read-only find. `filter`/`projection`/`sort` are JSON documents \
+                (extended JSON, e.g. { \"status\": \"active\" }); rows are capped. The only way to \
+                read actual documents."
+                .into(),
+            input_schema: coll_args(json!({
+                "filter": { "type": "object", "description": "Match document (empty = all)." },
+                "projection": { "type": "object", "description": "Fields to include/exclude." },
+                "sort": { "type": "object", "description": "Sort spec, e.g. { \"age\": -1 }." },
+                "limit": { "type": "integer", "description": "Max documents to return." },
+            })),
+        },
+        ToolDef {
+            name: "aggregate".into(),
+            description: "Run a read-only aggregation pipeline (a JSON array of stages). Write \
+                stages ($out/$merge) are rejected. This is Mongo's analytical engine — group, \
+                bucket, lookup, facet — well past what a plain find can express."
+                .into(),
+            input_schema: coll_args(
+                json!({ "pipeline": { "type": "array", "description": "Array of aggregation stage documents." } }),
+            ),
+        },
+        ToolDef {
+            name: "count".into(),
+            description: "Count documents matching an optional filter — cheap cardinality without \
+                pulling documents."
+                .into(),
+            input_schema: coll_args(json!({ "filter": { "type": "object", "description": "Match document (empty = all)." } })),
+        },
+        ToolDef {
+            name: "distinct".into(),
+            description: "The distinct values of one field over documents matching an optional filter."
+                .into(),
+            input_schema: coll_args(json!({
+                "field": { "type": "string", "description": "Field path." },
+                "filter": { "type": "object", "description": "Match document (empty = all)." },
+            })),
+        },
+        ToolDef {
+            name: "explain_query".into(),
+            description: "Explain a find: the winning plan, the index used, docs-examined vs \
+                returned, and an explicit COLLSCAN flag. The flag turns 'slow query' into 'here's \
+                the missing index'."
+                .into(),
+            input_schema: coll_args(json!({ "filter": { "type": "object", "description": "The find filter to explain." } })),
+        },
+        ToolDef {
+            name: "index_advice".into(),
+            description: "Given a find filter, is it index-covered? If it's a collection scan, \
+                suggest the index key to add. Does NOT create it — that's a gated write."
+                .into(),
+            input_schema: coll_args(json!({ "filter": { "type": "object", "description": "The find filter to advise on." } })),
+        },
+        ToolDef {
+            name: "audit_collection".into(),
+            description: "Roll a sample into a health report: schema drift (mixed-type fields), \
+                optional/sparse fields, and index coverage. The 'what's wrong in here' answer."
+                .into(),
+            input_schema: coll_args(json!({})),
+        },
+        report_tool_def(),
+        spawn_subagent_tool_def(),
+        // --- gated writes (Write tier, writable connection only) ---
+        ToolDef {
+            name: "propose_doc_write".into(),
+            description: "Propose ONE write (insert/update/replace/delete) for the user to approve. \
+                `update`/`delete` require a non-empty `filter`; `many:true` (affect all matches) is \
+                shown explicitly in the approval. Read/find first to know what you'll affect."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "op": { "type": "string", "enum": ["insert", "update", "replace", "delete"] },
+                    "db": { "type": "string" },
+                    "coll": { "type": "string" },
+                    "filter": { "type": "object", "description": "Match document (required for update/replace/delete)." },
+                    "document": { "type": "object", "description": "The document to insert, or the replacement (insert/replace)." },
+                    "update": { "type": "object", "description": "The $set-style patch fields (update)." },
+                    "many": { "type": "boolean", "description": "Affect all matches, not just one (update/delete)." },
+                },
+                "required": ["op", "db", "coll"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "propose_index".into(),
+            description: "Propose creating an index for the user to approve. Building an index \
+                loads the server; the user approves."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "db": { "type": "string" },
+                    "coll": { "type": "string" },
+                    "keys": {
+                        "type": "object",
+                        "description": "Index key spec, e.g. { \"email\": 1, \"createdAt\": -1 }.",
+                    },
+                    "unique": { "type": "boolean" },
+                },
+                "required": ["db", "coll", "keys"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "propose_collection_op".into(),
+            description: "Propose creating or dropping a collection for the user to approve. \
+                Dropping is destructive and always requires explicit confirmation."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "op": { "type": "string", "enum": ["create", "drop"] },
+                    "db": { "type": "string" },
+                    "coll": { "type": "string" },
+                },
+                "required": ["op", "db", "coll"],
+                "additionalProperties": false,
+            }),
+        },
+    ];
+    all.into_iter()
+        .filter(|t| {
+            policy.tier.allows_tool(&t.name) && !(policy.read_only && is_write_tool(&t.name))
+        })
+        .collect()
+}
+
+/// The doc subagent's tool subset: the parent's doc catalog minus writes and
+/// `spawn_subagent` (no mutation, no recursion), like `kv_subagent_catalog`.
+fn doc_subagent_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
+    doc_tool_catalog(policy)
+        .into_iter()
+        .filter(|t| t.name != "spawn_subagent" && !is_write_tool(&t.name))
+        .collect()
+}
+
+fn doc_subagent_system_prompt(task: &str) -> String {
+    format!(
+        "You are a focused sub-investigator working for a parent AI agent on ONE task against a \
+         MongoDB deployment. You have read-only document tools (doc_server_info, list_collections, \
+         describe_collection, profile_collection, sample_documents, find, aggregate, count, \
+         distinct, explain_query, index_advice, audit_collection); you cannot write or delegate \
+         further. Collections are schemaless — infer the shape before you filter. Do the task, then \
+         reply with a concise report of your findings the parent can use directly. Do not ask \
+         questions; you cannot receive answers.\n\nTask: {task}"
+    )
+}
+
+/// The MongoDB agent's grounding prompt (the doc analogue of `kv_system_prompt`).
+pub(crate) fn doc_system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
+    let tools_line = match policy.tier {
+        AiTier::Off => {
+            "You have NO MongoDB tools available; the assistant is limited to general conversation."
+        }
+        AiTier::Schema => {
+            "You have metadata-only MongoDB tools: doc_server_info, list_collections, and \
+             describe_collection. You can see the catalog and each collection's inferred schema and \
+             indexes, but cannot read documents."
+        }
+        AiTier::Read => {
+            "You have read-only MongoDB tools: doc_server_info, list_collections, \
+             describe_collection, profile_collection (per-field type/drift stats), sample_documents, \
+             find, aggregate ($out/$merge rejected), count, distinct, explain_query, index_advice, \
+             audit_collection, and generate_report. Ground every answer in the live deployment."
+        }
+        AiTier::Write => {
+            "You have the read-only MongoDB tools (doc_server_info, list_collections, \
+             describe_collection, profile_collection, sample_documents, find, aggregate, count, \
+             distinct, explain_query, index_advice, audit_collection) AND gated write tools: \
+             propose_doc_write, propose_index, and propose_collection_op. Every write requires the \
+             user's explicit Allow; update/delete require a non-empty filter, and dropping a \
+             collection always confirms."
+        }
+    };
+    let mut s = format!(
+        "You are Red's MongoDB agent, embedded in a native database explorer. You help the user \
+         explore and understand the MongoDB deployment they are connected to.\n\n\
+         {tools_line}\n\n\
+         MongoDB is SCHEMALESS: a collection has no declared columns, and a field can be several \
+         types across documents. So ORIENT before you act — doc_server_info to see the deployment, \
+         list_collections for the catalog, describe_collection/profile_collection to learn the \
+         discovered schema, sample_documents to see real shape — THEN find/aggregate to read, and \
+         explain_query/index_advice/audit_collection to reason about performance and health. \
+         Queries are filter documents and aggregation pipelines (extended JSON), never SQL. Be \
+         concise: lead with the answer, then the detail.\n",
+    );
+    if !ctx.connection.is_empty() {
+        s.push_str(&format!("\nConnected to: {}", ctx.connection));
+    }
+    if ctx.read_only {
+        s.push_str("\nThis connection is READ-ONLY.");
+    }
+    s
+}
+
+/// Vet a doc write tool for the approval gate: build the human-readable operation
+/// shown in Allow/Deny, and hard-block the footguns (an unfiltered update/delete)
+/// even with approval. Tier + read-only were already checked by [`assess_write`].
+fn assess_doc_write(name: &str, input: &Json) -> WriteAssessment {
+    let s = |k: &str| {
+        input
+            .get(k)
+            .and_then(Json::as_str)
+            .filter(|v| !v.is_empty())
+    };
+    // A filter is "present" only if it's a non-empty JSON object — the doc-seam
+    // analog of "UPDATE/DELETE need a WHERE".
+    let has_filter = input
+        .get("filter")
+        .and_then(Json::as_object)
+        .is_some_and(|o| !o.is_empty());
+    let ns = format!("{}.{}", s("db").unwrap_or("?"), s("coll").unwrap_or("?"));
+    let filter_txt = input
+        .get("filter")
+        .map(|f| f.to_string())
+        .unwrap_or_else(|| "{}".into());
+    match name {
+        "propose_doc_write" => {
+            let op = s("op").unwrap_or("");
+            let many = input.get("many").and_then(Json::as_bool).unwrap_or(false);
+            let many_note = if many { " (many: ALL matches)" } else { "" };
+            match op {
+                "insert" => WriteAssessment::NeedsApproval {
+                    sql: format!("INSERT one document into {ns}"),
+                },
+                "replace" => {
+                    if !has_filter {
+                        return WriteAssessment::Reject(
+                            "replace requires a non-empty filter (e.g. { _id: ... })".into(),
+                        );
+                    }
+                    WriteAssessment::NeedsApproval {
+                        sql: format!("REPLACE document in {ns} matching {filter_txt}"),
+                    }
+                }
+                "update" => {
+                    if !has_filter {
+                        return WriteAssessment::Reject(
+                            "update requires a non-empty filter (refusing an unfiltered update)"
+                                .into(),
+                        );
+                    }
+                    WriteAssessment::NeedsApproval {
+                        sql: format!("UPDATE {ns} matching {filter_txt}{many_note}"),
+                    }
+                }
+                "delete" => {
+                    if !has_filter {
+                        return WriteAssessment::Reject(
+                            "delete requires a non-empty filter (refusing an unfiltered delete)"
+                                .into(),
+                        );
+                    }
+                    WriteAssessment::NeedsApproval {
+                        sql: format!("DELETE from {ns} matching {filter_txt}{many_note}"),
+                    }
+                }
+                other => WriteAssessment::Reject(format!(
+                    "propose_doc_write `op` must be insert/update/replace/delete, not `{other}`"
+                )),
+            }
+        }
+        "propose_index" => {
+            let keys = input
+                .get("keys")
+                .map(|k| k.to_string())
+                .unwrap_or_else(|| "{}".into());
+            let unique = input.get("unique").and_then(Json::as_bool).unwrap_or(false);
+            let unique_note = if unique { " UNIQUE" } else { "" };
+            WriteAssessment::NeedsApproval {
+                sql: format!("CREATE{unique_note} INDEX on {ns} keys {keys}"),
+            }
+        }
+        "propose_collection_op" => match s("op").unwrap_or("") {
+            "create" => WriteAssessment::NeedsApproval {
+                sql: format!("CREATE collection {ns}"),
+            },
+            "drop" => WriteAssessment::NeedsApproval {
+                sql: format!("DROP collection {ns} — destructive, cannot be undone"),
+            },
+            other => WriteAssessment::Reject(format!(
+                "propose_collection_op `op` must be create/drop, not `{other}`"
+            )),
+        },
+        other => WriteAssessment::Reject(format!("unknown doc write tool `{other}`")),
+    }
+}
+
+/// Run one MongoDB tool call against `driver`. Read tools compose the driver's
+/// read methods; the `propose_*` writes execute only after the turn loop's
+/// approval (re-vetted here as defense in depth).
+pub(crate) async fn doc_run_tool(
+    driver: &Arc<dyn DocDriver>,
+    name: &str,
+    input: &Json,
+    policy: &AiPolicy,
+    _cancel: &CancelToken,
+    report: &ReportSink,
+) -> (String, bool) {
+    if !policy.tier.allows_tool(name) {
+        return (
+            format!("error: the `{name}` tool is not available at this access tier"),
+            false,
+        );
+    }
+    // Defense in depth: re-run the write gate here so a destructive shape can't
+    // slip through even if the turn loop's check were ever bypassed.
+    if is_doc_write_tool(name)
+        && let WriteAssessment::Reject(why) = assess_doc_write(name, input)
+    {
+        return (format!("error: {why}"), false);
+    }
+    let limits = &policy.limits;
+    let abort = AbortSignal::new();
+    let db = || input.get("db").and_then(Json::as_str).unwrap_or("");
+    let coll = || input.get("coll").and_then(Json::as_str).unwrap_or("");
+
+    let (content, ok) = match name {
+        "doc_server_info" => match driver.list_databases().await {
+            Ok(dbs) => {
+                let mut out = format!(
+                    "MongoDB {}, topology: {:?}\nDatabases:\n",
+                    driver.server_version(),
+                    driver.topology()
+                );
+                for d in &dbs {
+                    out.push_str(&format!(
+                        "  {} ({} bytes on disk)\n",
+                        d.name, d.size_on_disk
+                    ));
+                }
+                (out, true)
+            }
+            Err(e) => (format!("error: {e}"), false),
+        },
+        "list_collections" => {
+            let dbs: Vec<String> = match input.get("db").and_then(Json::as_str) {
+                Some(d) if !d.is_empty() => vec![d.to_string()],
+                _ => match driver.list_databases().await {
+                    Ok(list) => list.into_iter().map(|d| d.name).collect(),
+                    Err(e) => return (format!("error: {e}"), false),
+                },
+            };
+            let mut out = String::new();
+            for d in &dbs {
+                match driver.list_collections(d).await {
+                    Ok(colls) => {
+                        out.push_str(&format!("{d}:\n"));
+                        for c in &colls {
+                            let kind = match c.kind {
+                                CollKind::Collection => "",
+                                CollKind::View => " (view)",
+                                CollKind::Timeseries => " (timeseries)",
+                            };
+                            let capped = if c.capped { " capped" } else { "" };
+                            out.push_str(&format!(
+                                "  {} — ~{} docs{kind}{capped}\n",
+                                c.name, c.est_count
+                            ));
+                        }
+                    }
+                    Err(e) => out.push_str(&format!("{d}: error: {e}\n")),
+                }
+            }
+            (out, true)
+        }
+        "describe_collection" => {
+            let sample = 200;
+            let schema = match driver.infer_schema(db(), coll(), sample, &abort).await {
+                Ok(s) => s,
+                Err(e) => return (format!("error: {e}"), false),
+            };
+            let indexes = driver.indexes(db(), coll()).await.unwrap_or_default();
+            let out = format!(
+                "{}\nIndexes:\n{}",
+                fmt_doc_schema(&schema),
+                fmt_doc_indexes(&indexes)
+            );
+            (cap_result_bytes(out, limits.max_result_bytes), true)
+        }
+        "profile_collection" => {
+            let sample = input
+                .get("sample")
+                .and_then(Json::as_u64)
+                .map(|n| n as usize)
+                .unwrap_or(200);
+            match driver.infer_schema(db(), coll(), sample, &abort).await {
+                Ok(schema) => (
+                    cap_result_bytes(fmt_doc_profile(&schema), limits.max_result_bytes),
+                    true,
+                ),
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "sample_documents" => {
+            let n = input
+                .get("n")
+                .and_then(Json::as_u64)
+                .map(|n| n as usize)
+                .unwrap_or(5)
+                .min(limits.max_rows.max(1));
+            let pipeline = vec![DocValue::Document(vec![(
+                "$sample".into(),
+                DocValue::Document(vec![("size".into(), DocValue::Int64(n as i64))]),
+            )])];
+            match driver.aggregate(db(), coll(), &pipeline, n, &abort).await {
+                Ok(page) => (
+                    cap_result_bytes(fmt_doc_list(&page.docs), limits.max_result_bytes),
+                    true,
+                ),
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "find" => {
+            let cap = input
+                .get("limit")
+                .and_then(Json::as_u64)
+                .map(|l| l as usize)
+                .unwrap_or(limits.max_rows)
+                .min(limits.max_rows.max(1));
+            let filter = match doc_arg_value(driver, input, "filter") {
+                Ok(v) => v,
+                Err(e) => return (format!("error: {e}"), false),
+            };
+            let projection = doc_arg_value(driver, input, "projection").ok().flatten();
+            let sort = doc_arg_value(driver, input, "sort").ok().flatten();
+            let query = FindQuery {
+                db: db().to_string(),
+                coll: coll().to_string(),
+                filter,
+                projection,
+                sort,
+                skip: 0,
+                limit: Some(cap as u64),
+                batch: cap,
+            };
+            match driver.find(&query, &abort).await {
+                Ok(page) => (
+                    cap_result_bytes(fmt_doc_list(&page.docs), limits.max_result_bytes),
+                    true,
+                ),
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "aggregate" => {
+            let stages = match doc_arg_value(driver, input, "pipeline") {
+                Ok(Some(DocValue::Array(s))) => s,
+                Ok(_) => {
+                    return (
+                        "error: `pipeline` must be a JSON array of stages".into(),
+                        false,
+                    );
+                }
+                Err(e) => return (format!("error: {e}"), false),
+            };
+            if let Some(bad) = pipeline_write_stage(&stages) {
+                return (
+                    format!("error: write stage `{bad}` is not allowed in a read-only aggregate"),
+                    false,
+                );
+            }
+            match driver
+                .aggregate(db(), coll(), &stages, limits.max_rows.max(1), &abort)
+                .await
+            {
+                Ok(page) => (
+                    cap_result_bytes(fmt_doc_list(&page.docs), limits.max_result_bytes),
+                    true,
+                ),
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "count" => {
+            let filter = match doc_arg_value(driver, input, "filter") {
+                Ok(v) => v,
+                Err(e) => return (format!("error: {e}"), false),
+            };
+            match driver.count(db(), coll(), filter.as_ref()).await {
+                Ok(n) => (format!("{n} documents"), true),
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "distinct" => {
+            let field = input.get("field").and_then(Json::as_str).unwrap_or("");
+            if field.is_empty() {
+                return ("error: `field` is required".into(), false);
+            }
+            let filter = doc_arg_value(driver, input, "filter").ok().flatten();
+            match driver.distinct(db(), coll(), field, filter.as_ref()).await {
+                Ok(values) => {
+                    let rendered: Vec<String> = values
+                        .iter()
+                        .take(limits.max_rows.max(1))
+                        .map(DocValue::to_extended_json)
+                        .collect();
+                    (
+                        cap_result_bytes(
+                            format!(
+                                "{} distinct value(s):\n{}",
+                                values.len(),
+                                rendered.join(", ")
+                            ),
+                            limits.max_result_bytes,
+                        ),
+                        true,
+                    )
+                }
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "explain_query" => {
+            let filter = doc_arg_value(driver, input, "filter").ok().flatten();
+            let query = FindQuery {
+                db: db().to_string(),
+                coll: coll().to_string(),
+                filter,
+                projection: None,
+                sort: None,
+                skip: 0,
+                limit: None,
+                batch: 1,
+            };
+            match driver.explain(&query).await {
+                Ok(plan) => (fmt_doc_plan(&plan), true),
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "index_advice" => doc_index_advice(driver, input).await,
+        "audit_collection" => doc_audit_collection(driver, input, limits).await,
+        "generate_report" => run_generate_report(input, report),
+        // Gated writes — the approval already happened in the turn loop.
+        "propose_doc_write" => doc_apply_write(driver, input).await,
+        "propose_index" => match doc_index_spec(input) {
+            Ok(spec) => match driver.create_index(db(), coll(), &spec).await {
+                Ok(()) => ("index created".into(), true),
+                Err(e) => (format!("error: {e}"), false),
+            },
+            Err(e) => (format!("error: {e}"), false),
+        },
+        "propose_collection_op" => match input.get("op").and_then(Json::as_str).unwrap_or("") {
+            "create" => match driver.create_collection(db(), coll()).await {
+                Ok(()) => (format!("created collection {}.{}", db(), coll()), true),
+                Err(e) => (format!("error: {e}"), false),
+            },
+            "drop" => match driver.drop_collection(db(), coll()).await {
+                Ok(()) => (format!("dropped collection {}.{}", db(), coll()), true),
+                Err(e) => (format!("error: {e}"), false),
+            },
+            other => (format!("error: unknown collection op `{other}`"), false),
+        },
+        other => (format!("error: unknown tool `{other}`"), false),
+    };
+    (content, ok)
+}
+
+/// Parse a tool-input value (`filter`/`projection`/`sort`/`pipeline`) into a
+/// [`DocValue`] via the driver's extended-JSON parser. The model may pass it as a
+/// JSON object/array (the usual case) or as an extended-JSON string.
+fn doc_arg_value(
+    driver: &Arc<dyn DocDriver>,
+    input: &Json,
+    key: &str,
+) -> Result<Option<DocValue>, String> {
+    match input.get(key) {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::String(s)) if s.trim().is_empty() => Ok(None),
+        Some(Json::String(s)) => driver
+            .parse_ext_json(s)
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        Some(other) => driver
+            .parse_ext_json(&other.to_string())
+            .map(Some)
+            .map_err(|e| e.to_string()),
+    }
+}
+
+/// The first write stage (`$out`/`$merge`) in a pipeline, if any — rejected in a
+/// read-only aggregate.
+fn pipeline_write_stage(stages: &[DocValue]) -> Option<&'static str> {
+    for stage in stages {
+        if let DocValue::Document(fields) = stage {
+            for (k, _) in fields {
+                if k == "$out" {
+                    return Some("$out");
+                }
+                if k == "$merge" {
+                    return Some("$merge");
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Build an [`IndexSpec`] from a `propose_index` input (`keys` object of
+/// field → direction).
+fn doc_index_spec(input: &Json) -> Result<IndexSpec, String> {
+    let keys = input
+        .get("keys")
+        .and_then(Json::as_object)
+        .ok_or("`keys` must be an object, e.g. { \"email\": 1 }")?;
+    if keys.is_empty() {
+        return Err("`keys` must name at least one field".into());
+    }
+    let keys = keys
+        .iter()
+        .map(|(field, dir)| {
+            let d = dir.as_i64().unwrap_or(1);
+            (field.clone(), if d < 0 { -1 } else { 1 })
+        })
+        .collect();
+    Ok(IndexSpec {
+        keys,
+        unique: input.get("unique").and_then(Json::as_bool).unwrap_or(false),
+        name: input.get("name").and_then(Json::as_str).map(str::to_string),
+    })
+}
+
+/// Execute an approved `propose_doc_write` by building the [`DocWrite`] and
+/// dispatching to the driver.
+async fn doc_apply_write(driver: &Arc<dyn DocDriver>, input: &Json) -> (String, bool) {
+    let db = input
+        .get("db")
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_string();
+    let coll = input
+        .get("coll")
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_string();
+    let op = input.get("op").and_then(Json::as_str).unwrap_or("");
+    let many = input.get("many").and_then(Json::as_bool).unwrap_or(false);
+
+    let parse = |key: &str| doc_arg_value(driver, input, key);
+    let write = match op {
+        "insert" => match parse("document") {
+            Ok(Some(v)) => match Document::from_doc_value(v) {
+                Some(doc) => DocWrite::Insert {
+                    db,
+                    coll,
+                    docs: vec![doc],
+                },
+                None => return ("error: `document` must be a JSON object".into(), false),
+            },
+            _ => return ("error: insert needs a `document` object".into(), false),
+        },
+        "update" => {
+            let Ok(Some(filter)) = parse("filter") else {
+                return ("error: update needs a `filter`".into(), false);
+            };
+            let Ok(Some(patch)) = parse("update") else {
+                return (
+                    "error: update needs an `update` (the $set fields)".into(),
+                    false,
+                );
+            };
+            DocWrite::Update {
+                db,
+                coll,
+                filter,
+                change: DocUpdate::Patch(patch),
+                many,
+            }
+        }
+        "replace" => {
+            let Ok(Some(filter)) = parse("filter") else {
+                return ("error: replace needs a `filter`".into(), false);
+            };
+            let id = match &filter {
+                DocValue::Document(fields) => fields
+                    .iter()
+                    .find(|(k, _)| k == "_id")
+                    .map(|(_, v)| v.clone()),
+                _ => None,
+            };
+            let Some(id) = id else {
+                return ("error: replace `filter` must pin `_id`".into(), false);
+            };
+            match parse("document") {
+                Ok(Some(v)) => match Document::from_doc_value(v) {
+                    Some(doc) => DocWrite::Replace { db, coll, id, doc },
+                    None => return ("error: `document` must be a JSON object".into(), false),
+                },
+                _ => return ("error: replace needs a `document` object".into(), false),
+            }
+        }
+        "delete" => {
+            let Ok(Some(filter)) = parse("filter") else {
+                return ("error: delete needs a `filter`".into(), false);
+            };
+            DocWrite::Delete {
+                db,
+                coll,
+                filter,
+                many,
+            }
+        }
+        other => return (format!("error: unknown op `{other}`"), false),
+    };
+    // Defense in depth: never run a destructive shape the classifier flags,
+    // even though the approval gate already prompted.
+    if classify_doc_op(&write) == DocOpClass::Destructive
+        && let WriteAssessment::Reject(why) = assess_doc_write("propose_doc_write", input)
+    {
+        return (format!("error: {why}"), false);
+    }
+    match doc_execute_write(driver, write).await {
+        Ok(summary) => (summary, true),
+        Err(e) => (format!("error: {e}"), false),
+    }
+}
+
+/// Dispatch a [`DocWrite`] to the driver, returning a short summary.
+async fn doc_execute_write(
+    driver: &Arc<dyn DocDriver>,
+    write: DocWrite,
+) -> Result<String, RedError> {
+    match write {
+        DocWrite::Insert { db, coll, docs } => {
+            let n = driver.insert(&db, &coll, &docs).await?;
+            Ok(format!("inserted {n} document(s)"))
+        }
+        DocWrite::Update {
+            db,
+            coll,
+            filter,
+            change,
+            many,
+        } => {
+            let n = driver.update(&db, &coll, &filter, &change, many).await?;
+            Ok(format!("updated {n} document(s)"))
+        }
+        DocWrite::Replace { db, coll, id, doc } => {
+            driver.replace(&db, &coll, &id, &doc).await?;
+            Ok("document replaced".into())
+        }
+        DocWrite::Delete {
+            db,
+            coll,
+            filter,
+            many,
+        } => {
+            let n = driver.delete(&db, &coll, &filter, many).await?;
+            Ok(format!("deleted {n} document(s)"))
+        }
+        // The DDL writes ride their own tools; not reachable from propose_doc_write.
+        DocWrite::CreateCollection { .. }
+        | DocWrite::DropCollection { .. }
+        | DocWrite::CreateIndex { .. } => Ok("unsupported write".into()),
+    }
+}
+
+/// `index_advice`: explain the filter, then report coverage / suggest a key.
+async fn doc_index_advice(driver: &Arc<dyn DocDriver>, input: &Json) -> (String, bool) {
+    let db = input.get("db").and_then(Json::as_str).unwrap_or("");
+    let coll = input.get("coll").and_then(Json::as_str).unwrap_or("");
+    let filter = doc_arg_value(driver, input, "filter").ok().flatten();
+    let fields: Vec<String> = match &filter {
+        Some(DocValue::Document(f)) => f
+            .iter()
+            .map(|(k, _)| k.clone())
+            .filter(|k| !k.starts_with('$'))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let query = FindQuery {
+        db: db.to_string(),
+        coll: coll.to_string(),
+        filter,
+        projection: None,
+        sort: None,
+        skip: 0,
+        limit: None,
+        batch: 1,
+    };
+    match driver.explain(&query).await {
+        Ok(plan) => {
+            if !plan.collscan {
+                let idx = plan.index_used.as_deref().unwrap_or("an index");
+                (
+                    format!("Covered: the query uses {idx}. No new index needed."),
+                    true,
+                )
+            } else if fields.is_empty() {
+                (
+                    "COLLSCAN, but the filter has no fields to index (it matches everything)."
+                        .into(),
+                    true,
+                )
+            } else {
+                let spec = fields
+                    .iter()
+                    .map(|f| format!("\"{f}\": 1"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (
+                    format!(
+                        "COLLSCAN — no index covers this filter. Suggested index on {db}.{coll}: \
+                         {{ {spec} }}. Propose it with propose_index if the user wants it."
+                    ),
+                    true,
+                )
+            }
+        }
+        Err(e) => (format!("error: {e}"), false),
+    }
+}
+
+/// `audit_collection`: sample the schema + read indexes, roll into a health report.
+async fn doc_audit_collection(
+    driver: &Arc<dyn DocDriver>,
+    input: &Json,
+    limits: &AiLimits,
+) -> (String, bool) {
+    let db = input.get("db").and_then(Json::as_str).unwrap_or("");
+    let coll = input.get("coll").and_then(Json::as_str).unwrap_or("");
+    let abort = AbortSignal::new();
+    let schema = match driver.infer_schema(db, coll, 200, &abort).await {
+        Ok(s) => s,
+        Err(e) => return (format!("error: {e}"), false),
+    };
+    let indexes = driver.indexes(db, coll).await.unwrap_or_default();
+    let count = driver.count(db, coll, None).await.ok();
+
+    let drift: Vec<String> = schema
+        .fields
+        .iter()
+        .filter(|f| f.types.len() > 1)
+        .map(|f| {
+            let types = f
+                .types
+                .iter()
+                .map(|(t, _)| t.label())
+                .collect::<Vec<_>>()
+                .join("/");
+            format!("{} ({types})", f.path)
+        })
+        .collect();
+    let sparse: Vec<String> = schema
+        .fields
+        .iter()
+        .filter(|f| f.present_ratio < 0.9 && f.path != "_id")
+        .map(|f| format!("{} ({:.0}%)", f.path, f.present_ratio * 100.0))
+        .collect();
+
+    let mut out = format!("Health report for {db}.{coll}");
+    if let Some(n) = count {
+        out.push_str(&format!(" (~{n} documents)"));
+    }
+    out.push_str(":\n");
+    out.push_str(&format!(
+        "- Schema drift (mixed-type fields): {}\n",
+        if drift.is_empty() {
+            "none".into()
+        } else {
+            drift.join(", ")
+        }
+    ));
+    out.push_str(&format!(
+        "- Optional/sparse fields (present <90%): {}\n",
+        if sparse.is_empty() {
+            "none".into()
+        } else {
+            sparse.join(", ")
+        }
+    ));
+    let secondary = indexes.iter().filter(|ix| ix.name != "_id_").count();
+    out.push_str(&format!(
+        "- Indexes: {} ({} secondary){}\n",
+        indexes.len(),
+        secondary,
+        if secondary == 0 {
+            " — only the default _id index; unindexed filters will collection-scan"
+        } else {
+            ""
+        }
+    ));
+    (cap_result_bytes(out, limits.max_result_bytes), true)
+}
+
+/// Render an inferred schema for `describe_collection`.
+fn fmt_doc_schema(schema: &DocSchema) -> String {
+    let mut out = format!("Inferred schema ({} documents sampled):\n", schema.sampled);
+    for f in &schema.fields {
+        out.push_str(&format!("  {} — {}\n", f.path, fmt_doc_types(f)));
+    }
+    out
+}
+
+/// Render an inferred schema as a profile (emphasizing drift + presence).
+fn fmt_doc_profile(schema: &DocSchema) -> String {
+    let mut out = format!("Field profile ({} documents sampled):\n", schema.sampled);
+    for f in &schema.fields {
+        out.push_str(&format!(
+            "  {} — {} · present {:.0}%\n",
+            f.path,
+            fmt_doc_types(f),
+            f.present_ratio * 100.0
+        ));
+    }
+    out
+}
+
+/// A field's type distribution as `string 82%, int 18%`.
+fn fmt_doc_types(f: &red_core::doc::FieldStat) -> String {
+    let total: u64 = f.types.iter().map(|(_, c)| c).sum();
+    f.types
+        .iter()
+        .map(|(t, c)| {
+            let pct = (c * 100).checked_div(total).unwrap_or(0);
+            format!("{} {pct}%", t.label())
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Render an index list.
+fn fmt_doc_indexes(indexes: &[IndexInfo]) -> String {
+    if indexes.is_empty() {
+        return "  (none)".into();
+    }
+    indexes
+        .iter()
+        .map(|ix| {
+            let keys = ix
+                .keys
+                .iter()
+                .map(|(f, o)| format!("{f}: {o}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut props = Vec::new();
+            if ix.unique {
+                props.push("unique");
+            }
+            if ix.sparse {
+                props.push("sparse");
+            }
+            if ix.partial {
+                props.push("partial");
+            }
+            let ttl = ix.ttl.map(|t| format!(" ttl={t}s")).unwrap_or_default();
+            format!("  {} {{ {keys} }} {}{ttl}", ix.name, props.join(","))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Render a list of documents as one extended-JSON line each.
+fn fmt_doc_list(docs: &[Document]) -> String {
+    if docs.is_empty() {
+        return "(no documents)".into();
+    }
+    docs.iter()
+        .map(|d| d.to_doc_value().to_extended_json())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Render an explain plan.
+fn fmt_doc_plan(plan: &DocPlan) -> String {
+    let mut out = String::new();
+    if plan.collscan {
+        out.push_str("COLLSCAN — no index used\n");
+    } else if let Some(ix) = &plan.index_used {
+        out.push_str(&format!("uses index {ix}\n"));
+    }
+    if let (Some(e), Some(r)) = (plan.docs_examined, plan.n_returned) {
+        out.push_str(&format!("examined {e}, returned {r}\n"));
+    }
+    let stages = plan
+        .stages
+        .iter()
+        .map(|s| s.stage.clone())
+        .collect::<Vec<_>>()
+        .join(" > ");
+    out.push_str(&format!("winning plan: {stages}"));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4389,6 +5499,134 @@ mod tests {
                 "{t} must not be gated as a write"
             );
         }
+    }
+
+    #[test]
+    fn doc_read_tools_are_not_gated_as_writes() {
+        // Every doc read tool must be in READ_ONLY_TOOLS, else the write gate
+        // would reject it at Read tier.
+        let read = AiPolicy::default();
+        for t in [
+            "doc_server_info",
+            "list_collections",
+            "describe_collection",
+            "profile_collection",
+            "sample_documents",
+            "find",
+            "aggregate",
+            "count",
+            "distinct",
+            "explain_query",
+            "index_advice",
+            "audit_collection",
+        ] {
+            assert!(!is_write_tool(t), "{t} must be read-only");
+            assert!(
+                matches!(
+                    assess_write(t, &json!({}), &read),
+                    WriteAssessment::NotWrite
+                ),
+                "{t} must not be gated as a write"
+            );
+        }
+    }
+
+    #[test]
+    fn doc_catalog_offers_writes_only_at_write_tier_and_not_read_only() {
+        let names = |p: AiPolicy| {
+            doc_tool_catalog(&p)
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+        };
+        // Read tier: the reads (incl. the signature tools), no write tools.
+        let read = names(AiPolicy::default());
+        assert!(read.iter().any(|n| n == "find"));
+        assert!(read.iter().any(|n| n == "profile_collection"));
+        assert!(read.iter().all(|n| n != "propose_doc_write"));
+        // Write tier offers the gated writes…
+        let write = names(AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        });
+        assert!(write.iter().any(|n| n == "propose_doc_write"));
+        assert!(write.iter().any(|n| n == "propose_collection_op"));
+        // …but withholds them on a read-only connection.
+        let write_ro = names(AiPolicy {
+            tier: AiTier::Write,
+            read_only: true,
+            ..AiPolicy::default()
+        });
+        assert!(write_ro.iter().all(|n| n != "propose_doc_write"));
+        assert!(write_ro.iter().any(|n| n == "find"));
+    }
+
+    #[test]
+    fn doc_write_gate_requires_filter_and_confirms_drop() {
+        let write = AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        };
+        // An unfiltered update/delete is refused outright, even with approval.
+        assert!(matches!(
+            assess_write(
+                "propose_doc_write",
+                &json!({ "op": "delete", "db": "d", "coll": "c" }),
+                &write
+            ),
+            WriteAssessment::Reject(_)
+        ));
+        // A filtered delete prompts.
+        assert!(matches!(
+            assess_write(
+                "propose_doc_write",
+                &json!({ "op": "delete", "db": "d", "coll": "c", "filter": { "_id": 1 } }),
+                &write
+            ),
+            WriteAssessment::NeedsApproval { .. }
+        ));
+        // An insert prompts without a filter (nothing to over-match).
+        assert!(matches!(
+            assess_write(
+                "propose_doc_write",
+                &json!({ "op": "insert", "db": "d", "coll": "c" }),
+                &write
+            ),
+            WriteAssessment::NeedsApproval { .. }
+        ));
+        // Dropping a collection prompts (the approval string carries the warning).
+        assert!(matches!(
+            assess_write(
+                "propose_collection_op",
+                &json!({ "op": "drop", "db": "d", "coll": "c" }),
+                &write
+            ),
+            WriteAssessment::NeedsApproval { .. }
+        ));
+        // Below Write tier, every doc write is rejected without a prompt.
+        let read = AiPolicy::default();
+        assert!(matches!(
+            assess_write(
+                "propose_doc_write",
+                &json!({ "op": "insert", "db": "d", "coll": "c" }),
+                &read
+            ),
+            WriteAssessment::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn doc_subagent_catalog_is_read_only_and_non_recursive() {
+        let doc: Vec<String> = doc_subagent_catalog(&AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        })
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+        assert!(!doc.iter().any(|n| n == "propose_doc_write"));
+        assert!(!doc.iter().any(|n| n == "spawn_subagent"));
+        assert!(doc.iter().any(|n| n == "find"));
     }
 
     #[test]

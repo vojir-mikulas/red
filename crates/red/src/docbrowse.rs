@@ -1000,11 +1000,59 @@ impl AppState {
         let view = cx.entity().downgrade();
         let topbar = self.render_topbar(&theme, &view, window, cx);
 
-        let body = active
+        let workspace = active
             .doc_view
             .as_ref()
             .map(|v| self.render_doc_body(v, &theme, &view))
             .unwrap_or_else(|| div().into_any_element());
+
+        // Dock the assistant to the right of the workspace when it's open, the
+        // same resizable split the SQL/Redis shells use. `render_assistant` is
+        // engine-agnostic (a chat over `AiTurn` events); the doc backend grounds
+        // the turn (see the doc AI tools).
+        let body = if self.assistant.is_some() {
+            let start = view.clone();
+            let resize = view.clone();
+            let end = view.clone();
+            let panel = self.render_assistant(cx);
+            div().flex_1().min_h(px(0.)).child(
+                SplitPane::new("doc-split-assistant", gpui::Axis::Horizontal)
+                    .sized(SplitSide::Trailing)
+                    .size(self.assistant_w)
+                    .gutter(px(1.))
+                    .drag(self.assistant_drag)
+                    .min_first(px(320.))
+                    .max_first(px(760.))
+                    .on_drag_start(move |anchor, _, cx| {
+                        start
+                            .update(cx, |this, cx| {
+                                this.assistant_drag = Some(anchor);
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+                    .on_resize(move |size, _, cx| {
+                        resize
+                            .update(cx, |this, cx| {
+                                this.assistant_w = size;
+                                cx.notify();
+                            })
+                            .ok();
+                    })
+                    .on_drag_end(move |_, cx| {
+                        end.update(cx, |this, cx| {
+                            this.assistant_drag = None;
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .first(workspace)
+                    .second(panel),
+            )
+        } else {
+            div().flex_1().min_h(px(0.)).flex().child(workspace)
+        }
+        .into_any_element();
 
         // A destructive write awaiting confirmation overlays everything.
         let confirm = active

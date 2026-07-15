@@ -566,23 +566,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         let backend = match &session_driver {
                             session::SessionDriver::Sql(d) => crate::ai::AiBackend::Sql(d.clone()),
                             session::SessionDriver::Kv(d) => crate::ai::AiBackend::Kv(d.clone()),
-                            // The document seam's AI grounding isn't wired yet
-                            // (see docs/plans/todo/doc-driver.md); until then,
-                            // refuse cleanly rather than pretend a Mongo session
-                            // is SQL.
-                            session::SessionDriver::Doc(_) => {
-                                emit(
-                                    &events,
-                                    session_id,
-                                    Event::AiError {
-                                        conversation_id,
-                                        message: "The AI assistant isn't available on MongoDB \
-                                                  connections yet."
-                                            .into(),
-                                    },
-                                );
-                                continue;
-                            }
+                            session::SessionDriver::Doc(d) => crate::ai::AiBackend::Doc(d.clone()),
                         };
                         let cancel = red_ai::CancelToken::new();
                         lock(&ai_state).register(conversation_id, cancel.clone());
@@ -604,24 +588,12 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     AiProfileRuntime::Acp { command } => {
                         // The external ACP agent grounds through Red's loopback MCP
                         // server, which hosts whichever seam this session holds (SQL
-                        // schema/query tools or the Redis `kv_*` tools).
+                        // schema/query tools, the Redis `kv_*` tools, or the MongoDB
+                        // doc tools).
                         let backend = match &session_driver {
                             session::SessionDriver::Sql(d) => crate::ai::AiBackend::Sql(d.clone()),
                             session::SessionDriver::Kv(d) => crate::ai::AiBackend::Kv(d.clone()),
-                            // ACP doc grounding isn't wired yet, like the native arm.
-                            session::SessionDriver::Doc(_) => {
-                                emit(
-                                    &events,
-                                    session_id,
-                                    Event::AiError {
-                                        conversation_id,
-                                        message: "The AI assistant isn't available on MongoDB \
-                                                  connections yet."
-                                            .into(),
-                                    },
-                                );
-                                continue;
-                            }
+                            session::SessionDriver::Doc(d) => crate::ai::AiBackend::Doc(d.clone()),
                         };
                         let command = command.clone();
                         // The agent loads its own config (and login) from cwd; use
@@ -4226,9 +4198,7 @@ fn resolve_ai_tool_ctx(
     let backend = match &state.driver {
         SessionDriver::Sql(d) => crate::ai::AiBackend::Sql(d.clone()),
         SessionDriver::Kv(d) => crate::ai::AiBackend::Kv(d.clone()),
-        // Document-seam AI grounding isn't wired yet (see docs/plans/todo/doc-driver.md);
-        // until then a Mongo session has no AI backend, so tool context is absent.
-        SessionDriver::Doc(_) => return None,
+        SessionDriver::Doc(d) => crate::ai::AiBackend::Doc(d.clone()),
     };
     let mut effective = ai_policy.with_overrides(state.ai_override.enabled, state.ai_override.tier);
     effective.read_only = state.read_only;

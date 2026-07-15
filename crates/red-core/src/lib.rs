@@ -369,6 +369,11 @@ impl AiTier {
                     | "kv_server_info"
                     | "kv_scan_keys"
                     | "kv_key_info"
+                    // MongoDB (doc) metadata tools: catalog + inferred schema, no
+                    // document reads.
+                    | "doc_server_info"
+                    | "list_collections"
+                    | "describe_collection"
             ),
             AiTier::Read => matches!(
                 tool,
@@ -393,6 +398,20 @@ impl AiTier {
                     | "kv_analyze"
                     | "kv_slowlog"
                     | "kv_config_get"
+                    // MongoDB (doc) read tools: the metadata tools from Schema plus
+                    // document/sample/analytical reads. All read-only.
+                    | "doc_server_info"
+                    | "list_collections"
+                    | "describe_collection"
+                    | "profile_collection"
+                    | "sample_documents"
+                    | "find"
+                    | "aggregate"
+                    | "count"
+                    | "distinct"
+                    | "explain_query"
+                    | "index_advice"
+                    | "audit_collection"
             ),
             // Write inherits the full read catalog and adds the gated write tools:
             // SQL (a single statement or a transactional changeset) and Redis
@@ -406,6 +425,10 @@ impl AiTier {
                         | "kv_delete"
                         | "kv_rename"
                         | "kv_config_set"
+                        // MongoDB (doc) gated writes.
+                        | "propose_doc_write"
+                        | "propose_index"
+                        | "propose_collection_op"
                 ) || AiTier::Read.allows_tool(tool)
             }
         }
