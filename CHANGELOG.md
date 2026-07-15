@@ -7,6 +7,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Redis batch console: the command console has a new Line / Batch toggle. Batch
+  mode is a multi-line composer that runs many commands at once with per-command
+  output streamed back into the log, a live "running N / M" progress readout, and
+  a Stop button that cancels between commands. A destructive command anywhere in
+  the batch is counted and confirmed once up front rather than one prompt per
+  line, and each command still passes the read-only and destructive gates. Load a
+  `.redis`/`.txt` file into the composer or save the buffer back out.
 - Connect through a proxy: the connection form has a new "Connect via proxy"
   section (network engines) for reaching a database via a SOCKS5 or HTTP CONNECT
   proxy, with optional proxy-auth username and password. The proxy password is

@@ -180,6 +180,23 @@ pub(crate) struct KvConsoleEntry {
     pub(crate) result: Option<Result<RespValue, String>>,
 }
 
+/// The console's input surface: a single-line prompt, or a multi-line **Batch**
+/// composer that runs many commands with per-line output and mid-run cancel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConsoleMode {
+    Line,
+    Batch,
+}
+
+/// Progress of an in-flight `KvBatch` (the composer's "Run all"). Drives the
+/// progress row and Stop button; `None` when no batch is running.
+pub(crate) struct BatchRun {
+    pub(crate) total: usize,
+    pub(crate) done: usize,
+    pub(crate) ok: usize,
+    pub(crate) failed: usize,
+}
+
 pub(crate) struct KvConsole {
     pub(crate) epoch: red_service::Epoch,
     pub(crate) input: Entity<TextInput>,
@@ -194,6 +211,16 @@ pub(crate) struct KvConsole {
     /// commands, `None` when editing a fresh line. Reset when a command runs.
     pub(crate) recall: Option<usize>,
     pub(crate) scroll: ScrollHandle,
+    /// Line vs Batch input surface (the segmented toggle above the input).
+    pub(crate) mode: ConsoleMode,
+    /// The multi-line Batch composer (the same Flint `CodeEditor` SQL uses —
+    /// paste-of-many, gutter, selection). ⌘↵ runs the whole buffer.
+    pub(crate) batch_input: Entity<CodeEditor>,
+    /// `Some` while a batch runs: drives the progress row + Stop button.
+    pub(crate) batch: Option<BatchRun>,
+    /// A batch parked behind the destructive pre-scan confirm bar (its parsed
+    /// commands), awaiting an explicit "Run" before it's sent.
+    pub(crate) pending_batch: Option<Vec<Vec<String>>>,
 }
 
 impl KvConsole {
@@ -209,6 +236,20 @@ impl KvConsole {
             }
         })
         .detach();
+        let batch_input = cx.new(|cx| {
+            CodeEditor::new(cx)
+                .soft_wrap(false)
+                .placeholder(
+                    "One command per line. # comments and blanks are skipped. ⌘↵ runs all.",
+                )
+                .a11y_label("Redis batch composer")
+        });
+        cx.subscribe(&batch_input, move |this, _, event: &CodeEditorEvent, cx| {
+            if matches!(event, CodeEditorEvent::Run) {
+                this.kv_console_run_batch(session, cx);
+            }
+        })
+        .detach();
         Self {
             epoch: crate::result::next_kv_epoch(),
             input,
@@ -217,8 +258,23 @@ impl KvConsole {
             pending_confirm: None,
             recall: None,
             scroll: ScrollHandle::new(),
+            mode: ConsoleMode::Line,
+            batch_input,
+            batch: None,
+            pending_batch: None,
         }
     }
+}
+
+/// Parse a Batch composer buffer into tokenized commands, reusing import's exact
+/// rules: trim each line, drop blanks and `#` comments, tokenize the rest.
+fn parse_batch(text: &str) -> Vec<Vec<String>> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(tokenize_command)
+        .filter(|argv| !argv.is_empty())
+        .collect()
 }
 
 impl AppState {
@@ -309,6 +365,307 @@ impl AppState {
         self.service
             .send_to(session, Command::KvCommand { epoch, argv, req });
         cx.notify();
+    }
+
+    /// Switch the console between the single-line prompt and the Batch composer.
+    pub(crate) fn kv_console_set_mode(
+        &mut self,
+        session: SessionId,
+        mode: ConsoleMode,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(console) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_console_mut())
+        {
+            console.mode = mode;
+        }
+        cx.notify();
+    }
+
+    /// "Run all" (⌘↵ in the composer): parse the buffer, and either park it
+    /// behind the destructive pre-scan confirm bar or send it straight away.
+    /// A pre-scan counts destructive lines once for the whole script instead of
+    /// parking each command the way the interactive prompt does.
+    pub(crate) fn kv_console_run_batch(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(console) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_console_mut())
+        else {
+            return;
+        };
+        if console.batch.is_some() {
+            return; // already running
+        }
+        let commands = parse_batch(&console.batch_input.read(cx).content());
+        if commands.is_empty() {
+            return;
+        }
+        let destructive = commands
+            .iter()
+            .filter(|a| classify_command(a) == CommandClass::Destructive)
+            .count();
+        if destructive > 0 {
+            console.pending_batch = Some(commands);
+            cx.notify();
+            return;
+        }
+        self.kv_console_send_batch(session, commands, cx);
+    }
+
+    /// Confirm a batch parked by the destructive pre-scan, and send it.
+    pub(crate) fn kv_console_confirm_batch(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(commands) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_console_mut())
+            .and_then(|c| c.pending_batch.take())
+        else {
+            return;
+        };
+        self.kv_console_send_batch(session, commands, cx);
+    }
+
+    /// Dismiss a batch parked by the destructive pre-scan without running it.
+    pub(crate) fn kv_console_cancel_batch(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(console) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_console_mut())
+        {
+            console.pending_batch = None;
+        }
+        cx.notify();
+    }
+
+    /// Pre-seed one log entry per command (so `KvBatchLine` results slot in by
+    /// `req`), record the lines in the shared history store, then send the
+    /// streaming `KvBatch`.
+    fn kv_console_send_batch(
+        &mut self,
+        session: SessionId,
+        commands: Vec<Vec<String>>,
+        cx: &mut Context<Self>,
+    ) {
+        let conn_id = self
+            .conn_mut(Some(session))
+            .map(|a| a.conn_id.clone())
+            .unwrap_or_default();
+        if !conn_id.is_empty() {
+            for argv in &commands {
+                self.query_history.record(&conn_id, &argv.join(" "));
+            }
+        }
+        let Some(console) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.active_console_mut())
+        else {
+            return;
+        };
+        let epoch = console.epoch;
+        console.recall = None;
+        let req_base = console.next_req;
+        for argv in &commands {
+            let req = console.next_req;
+            console.next_req += 1;
+            console.history.push(KvConsoleEntry {
+                argv: argv.clone(),
+                req,
+                result: None,
+            });
+        }
+        if console.history.len() > MAX_CONSOLE_HISTORY {
+            let drop = console.history.len() - MAX_CONSOLE_HISTORY;
+            console.history.drain(0..drop);
+        }
+        console.batch = Some(BatchRun {
+            total: commands.len(),
+            done: 0,
+            ok: 0,
+            failed: 0,
+        });
+        self.service.send_to(
+            session,
+            Command::KvBatch {
+                epoch,
+                req_base,
+                commands,
+            },
+        );
+        cx.notify();
+    }
+
+    /// Stop a running batch (the Stop button): cancels it between commands
+    /// server-side; a `KvBatchDone { aborted: true }` clears the running state.
+    pub(crate) fn kv_console_stop_batch(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let epoch = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .and_then(|v| v.active_console())
+            .filter(|c| c.batch.is_some())
+            .map(|c| c.epoch);
+        if let Some(epoch) = epoch {
+            self.service
+                .send_to(session, Command::KvBatchStop { epoch });
+        }
+        cx.notify();
+    }
+
+    /// Load a `.redis`/`.txt` file of commands into the Batch composer (the
+    /// folded "Import keys" path — now with visible per-command output + cancel).
+    pub(crate) fn kv_console_load_batch_file(
+        &mut self,
+        session: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Load batch file".into()),
+        });
+        cx.spawn(
+            async move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let Ok(Ok(Some(paths))) = paths.await else {
+                    return;
+                };
+                let Some(path) = paths.into_iter().next() else {
+                    return;
+                };
+                let text = cx
+                    .background_executor()
+                    .spawn(async move { std::fs::read_to_string(&path).map_err(|e| e.to_string()) })
+                    .await;
+                this.update(cx, |this, cx| match text {
+                    Ok(text) => {
+                        if let Some(console) = this
+                            .conn_mut(Some(session))
+                            .and_then(|a| a.kv_view.as_mut())
+                            .and_then(|v| v.active_console_mut())
+                        {
+                            console.mode = ConsoleMode::Batch;
+                            let editor = console.batch_input.clone();
+                            editor.update(cx, |ed, cx| ed.set_content(text, cx));
+                        }
+                        cx.notify();
+                    }
+                    Err(e) => {
+                        this.notify(ToastVariant::Error, format!("Couldn't read file: {e}"), cx);
+                    }
+                })
+                .ok();
+            },
+        )
+        .detach();
+    }
+
+    /// Save the Batch composer buffer to a `.redis` file (round-trips with
+    /// "Load batch file"). A no-op when the composer is empty.
+    pub(crate) fn kv_console_save_batch_file(
+        &mut self,
+        session: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(text) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .and_then(|v| v.active_console())
+            .map(|c| c.batch_input.read(cx).content())
+            .filter(|t| !t.trim().is_empty())
+        else {
+            return;
+        };
+        let dir = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let path = cx.prompt_for_new_path(&dir, Some("batch.redis"));
+        cx.spawn(
+            async move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let Ok(Ok(Some(path))) = path.await else {
+                    return;
+                };
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { std::fs::write(&path, text).map_err(|e| e.to_string()) })
+                    .await;
+                this.update(cx, |this, cx| {
+                    match result {
+                        Ok(()) => this.notify(ToastVariant::Success, "Batch saved", cx),
+                        Err(e) => {
+                            this.notify(ToastVariant::Error, format!("Couldn't save: {e}"), cx)
+                        }
+                    };
+                })
+                .ok();
+            },
+        )
+        .detach();
+    }
+
+    /// `Event::KvBatchLine`: fill in the pre-seeded entry whose `req` matches and
+    /// advance the progress counters.
+    pub(crate) fn on_kv_batch_line(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: red_service::Epoch,
+        req: u64,
+        result: RespValue,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(console) = self
+            .conn_mut(session)
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.console_by_epoch_mut(epoch))
+        else {
+            return;
+        };
+        let is_err = matches!(result, RespValue::Error(_));
+        if let Some(entry) = console.history.iter_mut().find(|e| e.req == req) {
+            entry.result = Some(Ok(result));
+        }
+        if let Some(run) = console.batch.as_mut() {
+            run.done += 1;
+            if is_err {
+                run.failed += 1;
+            } else {
+                run.ok += 1;
+            }
+        }
+        cx.notify();
+    }
+
+    /// `Event::KvBatchDone`: clear the running state and toast a summary.
+    pub(crate) fn on_kv_batch_done(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: red_service::Epoch,
+        ok: usize,
+        failed: usize,
+        aborted: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(console) = self
+            .conn_mut(session)
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.console_by_epoch_mut(epoch))
+        {
+            console.batch = None;
+        }
+        let (variant, msg) = match (aborted, failed) {
+            (true, _) => (
+                ToastVariant::Warning,
+                format!("Batch stopped — {ok} ok, {failed} failed"),
+            ),
+            (false, 0) => (ToastVariant::Success, format!("Batch ran {ok} command(s)")),
+            (false, _) => (
+                ToastVariant::Warning,
+                format!("Batch: {ok} ok, {failed} failed"),
+            ),
+        };
+        self.notify(variant, msg, cx);
     }
 
     /// Walk command history in the input line: `prev` (Up) steps to older
@@ -569,9 +926,182 @@ impl AppState {
                 )
         });
 
+        let mode = console.mode;
+        // Line / Batch toggle, plus (in Batch) file load/save. A running batch
+        // pins the toggle so the composer can't be swapped away mid-run.
+        let running = console.batch.is_some();
+        let mode_view = view.clone();
+        let mut header = div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                Segmented::new("kv-console-mode")
+                    .segment("Line")
+                    .segment("Batch")
+                    .selected(if mode == ConsoleMode::Batch { 1 } else { 0 })
+                    .on_select(move |i, _w, cx| {
+                        let m = if i == 1 {
+                            ConsoleMode::Batch
+                        } else {
+                            ConsoleMode::Line
+                        };
+                        mode_view
+                            .update(cx, |this, cx| this.kv_console_set_mode(session, m, cx))
+                            .ok();
+                    }),
+            );
+        if mode == ConsoleMode::Batch {
+            let load_view = view.clone();
+            let save_view = view.clone();
+            header = header.child(div().flex_1()).child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(
+                        Button::new("kv-batch-load", "Load file…")
+                            .size(ButtonSize::Sm)
+                            .on_click(move |_, _, cx| {
+                                load_view
+                                    .update(cx, |this, cx| {
+                                        this.kv_console_load_batch_file(session, cx)
+                                    })
+                                    .ok();
+                            }),
+                    )
+                    .child(
+                        Button::new("kv-batch-save", "Save…")
+                            .size(ButtonSize::Sm)
+                            .on_click(move |_, _, cx| {
+                                save_view
+                                    .update(cx, |this, cx| {
+                                        this.kv_console_save_batch_file(session, cx)
+                                    })
+                                    .ok();
+                            }),
+                    ),
+            );
+        }
+
+        // Batch destructive pre-scan confirm bar (counts destructive lines once
+        // for the whole script rather than parking each command).
+        let batch_confirm = console.pending_batch.as_ref().map(|commands| {
+            let destructive = commands
+                .iter()
+                .filter(|a| classify_command(a) == CommandClass::Destructive)
+                .count();
+            let confirm_view = view.clone();
+            let cancel_view = view.clone();
+            div()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1p5()
+                .bg(theme.red.opacity(0.1))
+                .border_t_1()
+                .border_color(theme.red)
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(theme.scale(11.5))
+                        .text_color(theme.text)
+                        .child(format!(
+                            "This batch contains {destructive} destructive command(s). Run all {} line(s)?",
+                            commands.len()
+                        )),
+                )
+                .child(
+                    Button::new("kv-batch-confirm", "Run all")
+                        .variant(ButtonVariant::Danger)
+                        .size(ButtonSize::Sm)
+                        .on_click(move |_, _, cx| {
+                            confirm_view
+                                .update(cx, |this, cx| this.kv_console_confirm_batch(session, cx))
+                                .ok();
+                        }),
+                )
+                .child(
+                    Button::new("kv-batch-cancel", "Cancel")
+                        .size(ButtonSize::Sm)
+                        .on_click(move |_, _, cx| {
+                            cancel_view
+                                .update(cx, |this, cx| this.kv_console_cancel_batch(session, cx))
+                                .ok();
+                        }),
+                )
+        });
+
+        // Batch composer footer (mode == Batch): the multi-line editor plus a
+        // Run all / Stop row and a progress readout while running.
+        let batch_footer = (mode == ConsoleMode::Batch).then(|| {
+            let run_view = view.clone();
+            let stop_view = view.clone();
+            let progress = console.batch.as_ref().map(|b| {
+                div()
+                    .text_size(theme.scale(10.5))
+                    .text_color(dim)
+                    .child(format!("Running {} / {}", b.done, b.total))
+            });
+            let action = if running {
+                Button::new("kv-batch-stop", "Stop")
+                    .variant(ButtonVariant::Danger)
+                    .size(ButtonSize::Sm)
+                    .on_click(move |_, _, cx| {
+                        stop_view
+                            .update(cx, |this, cx| this.kv_console_stop_batch(session, cx))
+                            .ok();
+                    })
+            } else {
+                Button::new("kv-batch-run", "Run all")
+                    .variant(ButtonVariant::Primary)
+                    .size(ButtonSize::Sm)
+                    .on_click(move |_, _, cx| {
+                        run_view
+                            .update(cx, |this, cx| this.kv_console_run_batch(session, cx))
+                            .ok();
+                    })
+            };
+            div()
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .border_t_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .h(px(160.))
+                        .min_h(px(0.))
+                        .child(console.batch_input.clone()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1p5()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .children(progress)
+                        .child(div().flex_1())
+                        .child(action),
+                )
+        });
+
         // First-token command completions for the current input, as a strip of
-        // clickable chips above the input (Tab accepts the first).
-        let completions = command_completions(&console.input.read(cx).content());
+        // clickable chips above the input (Tab accepts the first). Line mode only.
+        let completions = if mode == ConsoleMode::Line {
+            command_completions(&console.input.read(cx).content())
+        } else {
+            Vec::new()
+        };
         let completion_strip = (!completions.is_empty()).then(|| {
             let mut strip = div()
                 .flex_shrink_0()
@@ -614,6 +1144,33 @@ impl AppState {
             )
         });
 
+        // Line-mode single-line prompt (hidden in Batch mode).
+        let line_footer = (mode == ConsoleMode::Line).then(|| {
+            div()
+                .flex_shrink_0()
+                .flex()
+                .px_2()
+                .py_1p5()
+                .border_t_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(120.))
+                        // Up/Down recall past commands; Tab accepts the top
+                        // completion. The single-line input uses neither.
+                        .on_key_down(cx.listener(move |this, ev: &gpui::KeyDownEvent, _w, cx| {
+                            match ev.keystroke.key.as_str() {
+                                "up" => this.kv_console_recall(session, true, cx),
+                                "down" => this.kv_console_recall(session, false, cx),
+                                "tab" => this.kv_console_complete_top(session, cx),
+                                _ => {}
+                            }
+                        }))
+                        .child(console.input.clone()),
+                )
+        });
+
         div()
             .flex_1()
             .min_h(px(0.))
@@ -621,34 +1178,11 @@ impl AppState {
             .flex_col()
             .child(history)
             .children(confirm_bar)
+            .child(header)
+            .children(batch_confirm)
+            .children(batch_footer)
             .children(completion_strip)
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .flex()
-                    .px_2()
-                    .py_1p5()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(120.))
-                            // Up/Down recall past commands; Tab accepts the top
-                            // completion. The single-line input uses neither.
-                            .on_key_down(cx.listener(
-                                move |this, ev: &gpui::KeyDownEvent, _w, cx| {
-                                    match ev.keystroke.key.as_str() {
-                                        "up" => this.kv_console_recall(session, true, cx),
-                                        "down" => this.kv_console_recall(session, false, cx),
-                                        "tab" => this.kv_console_complete_top(session, cx),
-                                        _ => {}
-                                    }
-                                },
-                            ))
-                            .child(console.input.clone()),
-                    ),
-            )
+            .children(line_footer)
     }
 }
 
@@ -669,5 +1203,36 @@ mod tests {
         assert!(command_completions("GET foo").is_empty());
         // Empty line: nothing.
         assert!(command_completions("   ").is_empty());
+    }
+
+    #[test]
+    fn parse_batch_skips_blanks_and_comments_and_tokenizes() {
+        let commands = parse_batch(
+            "# a comment\n\
+             SET foo bar\n\
+             \n\
+               # indented comment\n\
+             GET \"quoted key\"\n\
+             DEL x y z\n",
+        );
+        assert_eq!(
+            commands,
+            vec![
+                vec!["SET".to_string(), "foo".into(), "bar".into()],
+                vec!["GET".to_string(), "quoted key".into()],
+                vec!["DEL".to_string(), "x".into(), "y".into(), "z".into()],
+            ]
+        );
+    }
+
+    #[test]
+    fn destructive_pre_scan_counts_only_destructive_lines() {
+        let commands = parse_batch("GET a\nDEL a\nSET b 1\nFLUSHDB\n");
+        let destructive = commands
+            .iter()
+            .filter(|a| classify_command(a) == CommandClass::Destructive)
+            .count();
+        // DEL and FLUSHDB are destructive; GET and SET are not.
+        assert_eq!(destructive, 2);
     }
 }

@@ -1641,6 +1641,22 @@ impl AppState {
             } => {
                 self.on_kv_import_done(session, ok, failed, first_error, cx);
             }
+            Event::KvBatchLine {
+                epoch,
+                req,
+                argv: _,
+                result,
+            } => {
+                self.on_kv_batch_line(session, epoch, req, result, cx);
+            }
+            Event::KvBatchDone {
+                epoch,
+                ok,
+                failed,
+                aborted,
+            } => {
+                self.on_kv_batch_done(session, epoch, ok, failed, aborted, cx);
+            }
             Event::KvMessage {
                 epoch,
                 channel,

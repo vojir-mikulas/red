@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
-use red_core::kv::{KvEdit, RecycledKey};
+use red_core::kv::{KvEdit, RecycledKey, RespValue};
 use red_core::{
     Column, ColumnMeta, KeyKind, KeySpec, QueryOptions, RedError, ResultFilter, Value,
     coerce_edit_value,
@@ -1787,6 +1787,108 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         },
                     );
                 });
+            }
+
+            Command::KvBatch {
+                epoch,
+                req_base,
+                commands,
+            } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                // Register an abort under the epoch so a `KvBatchStop` can cancel
+                // between commands — the streaming counterpart to the console's
+                // per-command `kv_value` slot (import registers none).
+                let read_only = state.read_only;
+                let entry = state.inflight.entry(epoch).or_default();
+                if let Some(prev) = entry.kv_value.take() {
+                    prev.abort();
+                }
+                let abort = AbortSignal::new();
+                entry.kv_value = Some(abort.clone());
+                let events = events.clone();
+                tokio::spawn(async move {
+                    // Sequential (order matters for dependent commands, like
+                    // import), streaming one `KvBatchLine` per command so the
+                    // console fills in progressively. Abort is checked before
+                    // each command so a Stop lands between lines, not mid-write.
+                    let (mut ok, mut failed) = (0usize, 0usize);
+                    let mut aborted = false;
+                    for (index, argv) in commands.iter().enumerate() {
+                        if abort.is_aborted() {
+                            aborted = true;
+                            break;
+                        }
+                        if argv.is_empty() {
+                            continue;
+                        }
+                        // Defense in depth alongside the driver's own refusal:
+                        // a read-only connection turns each write into a failed
+                        // line (visible per-command) rather than reaching the
+                        // engine, mirroring the console's service-side gate.
+                        let result = if read_only
+                            && red_core::kv::classify_command(argv)
+                                != red_core::kv::CommandClass::Read
+                        {
+                            failed += 1;
+                            RespValue::Error("this connection is read-only".into())
+                        } else {
+                            match driver.command(argv).await {
+                                Ok(v) => {
+                                    ok += 1;
+                                    v
+                                }
+                                Err(e) => {
+                                    failed += 1;
+                                    RespValue::Error(e.to_string())
+                                }
+                            }
+                        };
+                        emit(
+                            &events,
+                            session_id,
+                            Event::KvBatchLine {
+                                epoch,
+                                req: req_base + index as u64,
+                                argv: argv.clone(),
+                                result,
+                            },
+                        );
+                    }
+                    emit(
+                        &events,
+                        session_id,
+                        Event::KvBatchDone {
+                            epoch,
+                            ok,
+                            failed,
+                            aborted,
+                        },
+                    );
+                });
+            }
+
+            Command::KvBatchStop { epoch } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    continue;
+                };
+                if let Some(entry) = state.inflight.get(&epoch)
+                    && let Some(sig) = &entry.kv_value
+                {
+                    sig.abort();
+                }
             }
 
             Command::KvApplyEdit { epoch, edit } => {

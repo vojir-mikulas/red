@@ -1466,6 +1466,12 @@ impl RedisView {
             _ => None,
         }
     }
+    pub(crate) fn active_console(&self) -> Option<&crate::kvconsole::KvConsole> {
+        match self.active_state()? {
+            RedisTabState::Console(c) => Some(c),
+            _ => None,
+        }
+    }
     pub(crate) fn active_console_mut(&mut self) -> Option<&mut crate::kvconsole::KvConsole> {
         match self.active_state_mut()? {
             RedisTabState::Console(c) => Some(c),

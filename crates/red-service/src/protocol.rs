@@ -407,6 +407,26 @@ pub enum Command {
         epoch: Epoch,
         commands: Vec<Vec<String>>,
     },
+    /// Run a list of already-tokenized commands from the console's Batch
+    /// composer, streaming **one `KvBatchLine` per command** (unlike `KvImport`,
+    /// which replies once with a summary) so the console fills in results
+    /// progressively. Registers an `AbortSignal` under the epoch so a mid-run
+    /// `KvBatchStop` can cancel between commands. Commands run sequentially so
+    /// dependent lines keep their order; each rides the same `KvDriver::command`
+    /// read/write gate + destructive classifier as the interactive console.
+    /// `req_base` seeds the per-line request ids (`req = req_base + index`) that
+    /// match each `KvBatchLine` to its pre-seeded console entry.
+    KvBatch {
+        epoch: Epoch,
+        req_base: u64,
+        commands: Vec<Vec<String>>,
+    },
+    /// Cancel an in-flight `KvBatch` for `epoch`: aborts the batch's
+    /// `AbortSignal` so the dispatch loop stops before the next command and
+    /// emits `KvBatchDone { aborted: true }` with the counts so far.
+    KvBatchStop {
+        epoch: Epoch,
+    },
     /// One in-grid edit (see `red_core::kv::KvEdit`), gated by `read_only`
     /// (checked service-side, defense in depth alongside the driver's own
     /// refusal) and, for a destructive shape, the UI's confirm prompt before
@@ -948,6 +968,25 @@ pub enum Event {
         ok: usize,
         failed: usize,
         first_error: Option<String>,
+    },
+    /// One command in a `KvBatch` completed. `req` (= the batch's `req_base` +
+    /// this command's index) matches the pre-seeded console entry to fill in;
+    /// `result` is the RESP reply, or a `RespValue::Error` for a server error /
+    /// the read-only gate (a failed line, not a transport `Event::Error`).
+    KvBatchLine {
+        epoch: Epoch,
+        req: u64,
+        argv: Vec<String>,
+        result: RespValue,
+    },
+    /// A `KvBatch` finished (or was stopped): `ok`/`failed` count the commands
+    /// run so far, `aborted` is true when a `KvBatchStop` cut it short. The UI
+    /// clears the running/progress state and shows a summary toast.
+    KvBatchDone {
+        epoch: Epoch,
+        ok: usize,
+        failed: usize,
+        aborted: bool,
     },
     /// An in-grid edit succeeded, in response to `KvApplyEdit`. Echoes
     /// `edit` back so the UI can pattern-match what to update locally
