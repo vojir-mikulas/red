@@ -17,12 +17,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 // `Context as _` brings anyhow's `.context()` into scope without taking the
 // `Context` name, which `gpui::Context` (used by `render_history`) needs.
 use anyhow::{Context as _, Result};
-use flint::prelude::*;
-use gpui::{Context, KeyDownEvent, SharedString, div, prelude::*, px};
+use gpui::{Context, KeyDownEvent, prelude::*};
 use serde::{Deserialize, Serialize};
 
 use crate::app::{ActiveConn, AppState};
@@ -222,219 +222,137 @@ pub(crate) fn relative_time(unix: u64) -> String {
     }
 }
 
+/// The rolling time bucket a history entry falls into: index 0 = Today
+/// (< 24h ago, plus any clock-skewed future/zero stamp), 1 = Yesterday
+/// (24–48h), 2 = Earlier. Uses the same `now - ran` clock as [`relative_time`].
+fn bucket_index(now: u64, ran: u64) -> usize {
+    if ran == 0 || now < ran {
+        return 0;
+    }
+    match now - ran {
+        0..86_400 => 0,
+        86_400..172_800 => 1,
+        _ => 2,
+    }
+}
+
 impl AppState {
-    /// The History panel for the left dock: a header (title · clear · close) over a
-    /// scrollable list of this connection's past queries, newest first. Clicking a
-    /// row loads it into the active editor; hovering a row reveals a ✕ to delete it.
+    /// The History panel for the left dock: this connection's past queries,
+    /// newest first, grouped into collapsible Today/Yesterday/Earlier buckets
+    /// with a search box on top. Clicking a row loads it into the active editor;
+    /// hovering a row reveals a ✕ to delete it. Pure adapter over the shared
+    /// [`crate::history_panel`] renderer.
     pub(crate) fn render_history(
         &self,
         active: &ActiveConn,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let theme = cx.theme().clone();
-        let view = cx.entity().downgrade();
+        use crate::history_panel::{HistoryNav, HistoryPanelSpec, HistoryRow, HistorySection};
 
         let entries = self.query_history.for_conn(&active.conn_id);
-        let selected = active.history_sel;
-        let count = entries.len();
+        let total = entries.len();
+        let query = active
+            .history_search
+            .read(cx)
+            .content()
+            .trim()
+            .to_lowercase();
+        let searching = !query.is_empty();
+        let now = crate::conversations::now_unix();
 
-        // Snapshot the tokens used inside the per-row map (all `Copy` or cheap
-        // clones) so the rows build without holding a borrow of `cx`.
-        let bg_panel = theme.bg_panel;
-        let border = theme.border;
-        let (text, muted, faint) = (theme.text, theme.text_muted, theme.text_faint);
-        let (bg_hover, bg_elevated) = (theme.bg_hover, theme.bg_elevated);
-        let ui_family = theme.font_family.clone();
-        let mono = theme.mono_family.clone();
-        let (size_12, size_11, size_10) = (theme.scale(12.), theme.scale(11.), theme.scale(10.));
-        let icon_x = theme.scale(11.);
+        // Bucket the (already newest-first) entries. `nav_index` stays the row's
+        // flat position so the existing ↑/↓ nav — which indexes the full list —
+        // keeps landing on the right entry across the bucket headers.
+        let mut buckets: [Vec<HistoryRow>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        for (i, entry) in entries.into_iter().enumerate() {
+            if searching && !entry.sql.to_lowercase().contains(&query) {
+                continue;
+            }
+            let sql = entry.sql.clone();
+            let id = entry.id;
+            let idx = bucket_index(now, entry.ran_unix);
+            buckets[idx].push(HistoryRow {
+                primary: crate::editor::history_label(&entry.sql).into(),
+                secondary: relative_time(entry.ran_unix).into(),
+                badge: None,
+                nav_index: Some(i),
+                activate: Rc::new(move |this: &mut AppState, replace, cx| {
+                    this.open_history(sql.clone(), replace, cx)
+                }),
+                delete: Some(Rc::new(move |this: &mut AppState, cx| {
+                    this.delete_history(id, cx)
+                })),
+            });
+        }
 
-        // --- header: title · clear · close ---
-        let clear_btn = (count > 0).then(|| {
-            div()
-                .id("history-clear")
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(18.))
-                .rounded(px(3.))
-                .cursor_pointer()
-                .text_color(faint)
-                .hover(|s| s.bg(bg_elevated).text_color(text))
-                .tooltip(Tooltip::text("Clear history"))
-                .child(crate::icons::icon("trash", icon_x, faint))
-                .on_click(cx.listener(|this, _, _, cx| this.clear_history(cx)))
-        });
+        const LABELS: [(&str, &str); 3] = [
+            ("today", "Today"),
+            ("yesterday", "Yesterday"),
+            ("earlier", "Earlier"),
+        ];
+        let sections: Vec<HistorySection> = buckets
+            .into_iter()
+            .zip(LABELS)
+            .filter(|(rows, _)| !rows.is_empty())
+            .map(|(rows, (key, title))| HistorySection {
+                key,
+                title: Some(title.into()),
+                // A live search force-expands every bucket so matches always show.
+                collapsed: !searching && active.history_bucket_collapsed.contains(key),
+                toggle: Some(Rc::new(move |this: &mut AppState, cx| {
+                    this.history_toggle_bucket(key, cx)
+                })),
+                rows,
+            })
+            .collect();
 
-        let close_btn = div()
-            .id("history-hide")
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(18.))
-            .rounded(px(3.))
-            .cursor_pointer()
-            .text_color(faint)
-            .hover(|s| s.bg(bg_elevated).text_color(text))
-            .tooltip(Tooltip::text(crate::keymap::localize_hint(
-                "Hide history  ⌘Y",
-            )))
-            .child(crate::icons::icon("x", icon_x, faint))
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx)));
-
-        let header = div()
-            .flex_shrink_0()
-            .h(px(28.))
-            .flex()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .bg(bg_panel)
-            .border_b_1()
-            .border_color(border)
-            .font_family(ui_family)
-            .text_size(size_11)
-            .text_color(muted)
-            .child(div().flex_1().min_w_0().truncate().child("History"))
-            .children(clear_btn)
-            .child(close_btn);
-
-        // --- list (or empty state) ---
-        let list = if entries.is_empty() {
-            div()
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .px_4()
-                .text_size(size_11)
-                .text_color(faint)
-                .child("No queries yet")
-                .into_any_element()
-        } else {
-            div()
-                .id("history-list")
-                .key_context("History")
-                // The list owns the focus handle so ↑/↓ move the highlight, Enter
-                // loads the entry, and Esc returns focus to the editor.
-                .track_focus(&active.history_focus)
-                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _w, cx| {
-                    // Vim navigation (when enabled) layers hjkl/g/G onto the arrow
-                    // keys the dock already handles; both paths drive the same moves.
-                    let vim = this.vim_mode();
-                    match event.keystroke.key.as_str() {
-                        "up" => this.history_move(-1, cx),
-                        "down" => this.history_move(1, cx),
-                        "k" if vim => this.history_move(-1, cx),
-                        "j" if vim => this.history_move(1, cx),
-                        // Half-range deltas jump to the ends without overflowing the
-                        // `history_sel + delta` sum (`history_move` clamps the rest).
-                        "g" if vim => this.history_move(isize::MIN / 2, cx),
-                        "G" if vim => this.history_move(isize::MAX / 2, cx),
-                        "enter" => this.history_accept(cx),
-                        "l" if vim => this.history_accept(cx),
-                        "escape" => {
-                            this.pending_focus = Some(crate::app::Pane::Editor);
-                            cx.notify();
-                        }
-                        "h" if vim => {
-                            this.pending_focus = Some(crate::app::Pane::Editor);
-                            cx.notify();
-                        }
-                        _ => return,
+        // Keyboard nav: same key map the dock has always had (arrows + optional
+        // vim hjkl/g/G), now routed through the shared renderer.
+        let on_key = Rc::new(
+            |this: &mut AppState, event: &KeyDownEvent, cx: &mut Context<AppState>| -> bool {
+                let vim = this.vim_mode();
+                match event.keystroke.key.as_str() {
+                    "up" => this.history_move(-1, cx),
+                    "down" => this.history_move(1, cx),
+                    "k" if vim => this.history_move(-1, cx),
+                    "j" if vim => this.history_move(1, cx),
+                    // Half-range deltas jump to the ends without overflowing the
+                    // `history_sel + delta` sum (`history_move` clamps the rest).
+                    "g" if vim => this.history_move(isize::MIN / 2, cx),
+                    "G" if vim => this.history_move(isize::MAX / 2, cx),
+                    "enter" => this.history_accept(cx),
+                    "l" if vim => this.history_accept(cx),
+                    "escape" => {
+                        this.pending_focus = Some(crate::app::Pane::Editor);
+                        cx.notify();
                     }
-                    cx.stop_propagation();
-                }))
-                .flex_1()
-                .min_h(px(0.))
-                .overflow_y_scroll()
-                .children(entries.into_iter().enumerate().map(|(i, entry)| {
-                    let load_view = view.clone();
-                    let del_view = view.clone();
-                    let sql = entry.sql.clone();
-                    let id = entry.id;
-                    let is_sel = i == selected;
-                    let group = SharedString::from(format!("hrow-{i}"));
-                    let label = crate::editor::history_label(&entry.sql);
-                    let when = relative_time(entry.ran_unix);
-                    let mono = mono.clone();
-                    div()
-                        .id(("hrow", i))
-                        .group(group.clone())
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .px_2()
-                        .py_1p5()
-                        .when(is_sel, |d| d.bg(bg_hover))
-                        .hover(move |s| s.bg(bg_hover))
-                        .child(
-                            // The label/subline column fills the row and is the load
-                            // hitbox; it clips so a long query never shoves the ✕ off.
-                            div()
-                                .id(("hrow-load", i))
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .gap_0p5()
-                                .cursor_pointer()
-                                .on_click(move |event, _, cx| {
-                                    // Plain click opens the entry in a new tab;
-                                    // ⌘/Ctrl-click replaces the current tab instead.
-                                    let replace = event.modifiers().secondary();
-                                    let sql = sql.clone();
-                                    load_view
-                                        .update(cx, |this, cx| this.open_history(sql, replace, cx))
-                                        .ok();
-                                })
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .font_family(mono)
-                                        .text_size(size_12)
-                                        .text_color(text)
-                                        .child(label),
-                                )
-                                .child(div().text_size(size_10).text_color(faint).child(when)),
-                        )
-                        .child(
-                            // Hover-revealed per-row delete, like the tab close button.
-                            div()
-                                .id(("hrow-del", i))
-                                .flex_shrink_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .size(px(16.))
-                                .rounded(px(3.))
-                                .invisible()
-                                .group_hover(group, |s| s.visible())
-                                .cursor_pointer()
-                                .text_color(faint)
-                                .hover(|s| s.bg(bg_elevated).text_color(text))
-                                .on_click(move |_, _, cx| {
-                                    del_view
-                                        .update(cx, |this, cx| this.delete_history(id, cx))
-                                        .ok();
-                                })
-                                .child(crate::icons::icon("x", icon_x, faint)),
-                        )
-                }))
-                .into_any_element()
-        };
+                    "h" if vim => {
+                        this.pending_focus = Some(crate::app::Pane::Editor);
+                        cx.notify();
+                    }
+                    _ => return false,
+                }
+                true
+            },
+        );
 
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(bg_panel)
-            .child(header)
-            .child(list)
+        let spec = HistoryPanelSpec {
+            sections,
+            empty_text: if searching {
+                "No matches".into()
+            } else {
+                "No queries yet".into()
+            },
+            show_clear: total > 0,
+            on_clear: Rc::new(|this: &mut AppState, cx| this.clear_history(cx)),
+            search: Some(active.history_search.clone()),
+            nav: Some(HistoryNav {
+                focus: active.history_focus.clone(),
+                on_key,
+            }),
+            selected: Some(active.history_sel),
+        };
+        self.render_history_panel(spec, cx)
     }
 }
 

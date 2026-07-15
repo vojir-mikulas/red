@@ -561,6 +561,7 @@ fn kv_creatable_types() -> [KvType; 6] {
 /// One entry in a connection's "recently viewed keys" list — browser-history
 /// for the keyspace (see docs/plans/redis-workflow-parity.md Part 2). In-memory,
 /// newest-first, capped; recorded whenever the inspector opens on a key.
+#[derive(Clone)]
 pub(crate) struct RecentKey {
     pub(crate) key: String,
     pub(crate) kv_type: KvType,
@@ -693,6 +694,10 @@ pub(crate) struct RedisView {
     /// focused half's chooser binds it (see `render_kv_new_tab`).
     pub(crate) new_tab_focus: FocusHandle,
     pub(crate) new_tab_sel: usize,
+    /// History-dock section collapse (in-memory, reset per session). Default
+    /// expanded. See [`crate::history_panel`].
+    pub(crate) recent_keys_collapsed: bool,
+    pub(crate) commands_collapsed: bool,
 }
 
 /// The open key context menu: which key it targets (with the type/TTL captured
@@ -1384,6 +1389,8 @@ impl RedisView {
             import: None,
             new_tab_focus: cx.focus_handle(),
             new_tab_sel: 0,
+            recent_keys_collapsed: false,
+            commands_collapsed: false,
         }
     }
 

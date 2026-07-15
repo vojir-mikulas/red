@@ -7,6 +7,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Searchable, grouped History dock: the left History panel (both the SQL and
+  Redis shells) now has a search box that narrows the list live and collapsible
+  grouped sections. SQL history groups into Today / Yesterday / Earlier time
+  buckets; the Redis dock's "Recently viewed keys" and "Commands" sections each
+  collapse. Each section shows its row count, and a match force-expands its
+  section. The two docks now share one renderer instead of duplicating the chrome.
 - Compare tables (data diff): a new "table: compare against…" command picks two
   tables in a connection and reports which rows are added, removed, or changed,
   aligned by the left table's primary key. The result is a full-screen read-only

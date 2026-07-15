@@ -1021,6 +1021,13 @@ pub(crate) struct ActiveConn {
     /// the keyboard-highlighted entry within it.
     pub history_focus: FocusHandle,
     pub history_sel: usize,
+    /// Live search box for the History dock (both SQL and Redis shells). Owned
+    /// here so it survives re-renders; the adapter reads its text to narrow the
+    /// list. See [`crate::history_panel`].
+    pub history_search: Entity<TextInput>,
+    /// Which SQL history time-buckets ("today"/"yesterday"/"earlier") are
+    /// collapsed. In-memory (reset per session); empty means all expanded.
+    pub history_bucket_collapsed: std::collections::HashSet<&'static str>,
     /// Width of the History side-panel (the leftmost left-dock column, sitting to
     /// the left of the schema). Retained while it's closed so toggling it back
     /// restores the previous width.
@@ -1064,6 +1071,13 @@ impl ActiveConn {
         let tab = QueryTab::new("query 1".to_string(), cx);
         let kv_view =
             (config.kind == DbKind::Redis).then(|| crate::kvbrowse::RedisView::new(session, cx));
+        let history_search = cx.new(|cx| TextInput::new(cx).with_placeholder("Search history…"));
+        // Re-render so the search narrows the dock live as the user types.
+        cx.subscribe(
+            &history_search,
+            |_this, _input, _evt: &TextInputEvent, cx| cx.notify(),
+        )
+        .detach();
         Self {
             session,
             conn_id,
@@ -1094,6 +1108,8 @@ impl ActiveConn {
             history_open: false,
             history_focus: cx.focus_handle(),
             history_sel: 0,
+            history_search,
+            history_bucket_collapsed: std::collections::HashSet::new(),
             history_w: px(240.),
             history_drag: None,
             columns_open: false,

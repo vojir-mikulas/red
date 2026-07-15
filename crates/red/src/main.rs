@@ -22,6 +22,7 @@ mod er;
 mod filter;
 mod find;
 mod history;
+mod history_panel;
 mod icons;
 mod import;
 mod inspector;

@@ -239,6 +239,29 @@ impl AppState {
         self.kv_open_inspector(session, key, ttl, kv_type, cx);
     }
 
+    /// Toggle the History dock's "Recently viewed keys" section collapsed/open
+    /// (in-memory, reset per session).
+    pub(crate) fn kv_toggle_recent_keys(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            view.recent_keys_collapsed = !view.recent_keys_collapsed;
+            cx.notify();
+        }
+    }
+
+    /// Toggle the History dock's "Commands" section collapsed/open (in-memory).
+    pub(crate) fn kv_toggle_commands(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+        {
+            view.commands_collapsed = !view.commands_collapsed;
+            cx.notify();
+        }
+    }
+
     /// Clear the connection's recently-viewed keys (the History dock's trash).
     pub(crate) fn kv_clear_recent_keys(&mut self, session: SessionId, cx: &mut Context<Self>) {
         if let Some(view) = self

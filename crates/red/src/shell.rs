@@ -15,6 +15,8 @@ pub(crate) const TITLEBAR_LEFT_INSET: f32 = 88.;
 #[cfg(not(target_os = "macos"))]
 pub(crate) const TITLEBAR_LEFT_INSET: f32 = 12.;
 
+use std::rc::Rc;
+
 use crate::app::{ActiveConn, AppState, Phase, SplitHalf, TabWorkspace};
 
 impl AppState {
@@ -1102,282 +1104,125 @@ impl AppState {
             .child(cards)
     }
 
-    /// The Redis History dock (left, ⌘Y): a Keys section (recently-viewed keys,
-    /// browser-history for the keyspace) over a Commands section (past console
-    /// commands). Keys re-open the inspector; commands seed the console. Reuses
-    /// the same `query_history` store + `relative_time` helper as the SQL dock.
+    /// The Redis History dock (left, ⌘Y): a collapsible "Recently viewed keys"
+    /// section (browser-history for the keyspace) over a "Commands" section
+    /// (past console commands), with a search box on top. Keys re-open the
+    /// inspector; commands seed the console. Pure adapter over the shared
+    /// [`crate::history_panel`] renderer, sharing the `query_history` store.
     fn render_kv_history(
         &self,
         active: &ActiveConn,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let theme = cx.theme().clone();
-        let session = active.session;
-        let bg_panel = theme.bg_panel;
-        let border = theme.border;
-        let (text, muted, faint) = (theme.text, theme.text_muted, theme.text_faint);
-        let (bg_hover, bg_elevated) = (theme.bg_hover, theme.bg_elevated);
-        let ui_family = theme.font_family.clone();
-        let mono = theme.mono_family.clone();
-        let (size_12, size_11, size_10) = (theme.scale(12.), theme.scale(11.), theme.scale(10.));
-        let icon_x = theme.scale(11.);
+        use crate::history_panel::{HistoryPanelSpec, HistoryRow, HistorySection};
 
+        let session = active.session;
         let commands = self.query_history.for_conn(&active.conn_id);
-        #[allow(clippy::type_complexity)]
-        let keys: Vec<(
-            String,
-            red_core::kv::KvType,
-            Option<std::time::Duration>,
-            u64,
-        )> = active
+        let keys: Vec<crate::kvbrowse::RecentKey> = active
             .kv_view
             .as_ref()
-            .map(|v| {
-                v.recent_keys
-                    .iter()
-                    .map(|r| (r.key.clone(), r.kv_type.clone(), r.ttl, r.viewed_unix))
-                    .collect()
-            })
+            .map(|v| v.recent_keys.clone())
             .unwrap_or_default();
-        let has_keys = !keys.is_empty();
-        let has_cmds = !commands.is_empty();
-        let has_any = has_keys || has_cmds;
+        let (keys_collapsed, cmds_collapsed) = active
+            .kv_view
+            .as_ref()
+            .map(|v| (v.recent_keys_collapsed, v.commands_collapsed))
+            .unwrap_or((false, false));
+        let has_any = !keys.is_empty() || !commands.is_empty();
 
-        let clear_btn = has_any.then(|| {
-            div()
-                .id("kv-history-clear")
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(18.))
-                .rounded(px(3.))
-                .cursor_pointer()
-                .text_color(faint)
-                .hover(|s| s.bg(bg_elevated).text_color(text))
-                .tooltip(Tooltip::text("Clear history"))
-                .child(crate::icons::icon("trash", icon_x, faint))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.clear_history(cx);
-                    this.kv_clear_recent_keys(session, cx);
-                }))
-        });
-        let close_btn = div()
-            .id("kv-history-hide")
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(18.))
-            .rounded(px(3.))
-            .cursor_pointer()
-            .text_color(faint)
-            .hover(|s| s.bg(bg_elevated).text_color(text))
-            .tooltip(Tooltip::text(crate::keymap::localize_hint(
-                "Hide history  ⌘Y",
-            )))
-            .child(crate::icons::icon("x", icon_x, faint))
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx)));
-        let header = div()
-            .flex_shrink_0()
-            .h(px(28.))
-            .flex()
-            .items_center()
-            .gap_1()
-            .px_2()
-            .bg(bg_panel)
-            .border_b_1()
-            .border_color(border)
-            .font_family(ui_family.clone())
-            .text_size(size_11)
-            .text_color(muted)
-            .child(div().flex_1().min_w_0().truncate().child("History"))
-            .children(clear_btn)
-            .child(close_btn);
+        let query = active
+            .history_search
+            .read(cx)
+            .content()
+            .trim()
+            .to_lowercase();
+        let searching = !query.is_empty();
 
-        // A dimmed section label between the two lists.
-        let section = |label: &str| {
-            div()
-                .flex_shrink_0()
-                .px_2()
-                .pt_2()
-                .pb_1()
-                .font_family(ui_family.clone())
-                .text_size(size_10)
-                .text_color(faint)
-                .child(label.to_string())
-        };
-
-        let key_rows = keys
+        // Recently-viewed keys → rows (badged with the value type).
+        let key_rows: Vec<HistoryRow> = keys
             .into_iter()
-            .enumerate()
-            .map(|(i, (key, kv_type, ttl, when))| {
-                let label = key.clone();
-                let remove_key = key.clone();
-                let type_label = kv_type.label().to_string();
-                let sub = crate::history::relative_time(when);
-                let mono = mono.clone();
-                let group = SharedString::from(format!("kv-key-{i}"));
-                div()
-                    .id(("kv-key-row", i))
-                    .group(group.clone())
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .py_1p5()
-                    .hover(move |s| s.bg(bg_hover))
-                    .child(
-                        div()
-                            .id(("kv-key-open", i))
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_0p5()
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.kv_open_recent_key(
-                                    session,
-                                    key.clone(),
-                                    kv_type.clone(),
-                                    ttl,
-                                    cx,
-                                );
-                            }))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .font_family(mono)
-                                    .text_size(size_12)
-                                    .text_color(text)
-                                    .child(label),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_1()
-                                    .text_size(size_10)
-                                    .text_color(faint)
-                                    .child(type_label)
-                                    .child(sub),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id(("kv-key-del", i))
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(16.))
-                            .rounded(px(3.))
-                            .invisible()
-                            .group_hover(group, |s| s.visible())
-                            .cursor_pointer()
-                            .text_color(faint)
-                            .tooltip(Tooltip::text("Remove from history"))
-                            .hover(|s| s.bg(bg_elevated).text_color(text))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.kv_remove_recent_key(session, remove_key.clone(), cx);
-                            }))
-                            .child(crate::icons::icon("x", icon_x, faint)),
-                    )
+            .filter(|r| !searching || r.key.to_lowercase().contains(&query))
+            .map(|r| {
+                let (key, kv_type, ttl) = (r.key.clone(), r.kv_type.clone(), r.ttl);
+                let remove_key = r.key.clone();
+                HistoryRow {
+                    primary: r.key.into(),
+                    secondary: crate::history::relative_time(r.viewed_unix).into(),
+                    badge: Some(kv_type.label().to_string().into()),
+                    nav_index: None,
+                    activate: Rc::new(move |this: &mut AppState, _replace, cx| {
+                        this.kv_open_recent_key(session, key.clone(), kv_type.clone(), ttl, cx);
+                    }),
+                    delete: Some(Rc::new(move |this: &mut AppState, cx| {
+                        this.kv_remove_recent_key(session, remove_key.clone(), cx);
+                    })),
+                }
+            })
+            .collect();
+
+        // Past console commands → rows.
+        let cmd_rows: Vec<HistoryRow> = commands
+            .into_iter()
+            .filter(|e| !searching || e.sql.to_lowercase().contains(&query))
+            .map(|entry| {
+                let cmd = entry.sql.clone();
+                let id = entry.id;
+                HistoryRow {
+                    primary: crate::editor::history_label(&entry.sql).into(),
+                    secondary: crate::history::relative_time(entry.ran_unix).into(),
+                    badge: None,
+                    nav_index: None,
+                    activate: Rc::new(move |this: &mut AppState, _replace, cx| {
+                        this.kv_seed_console(session, cmd.clone(), cx);
+                    }),
+                    delete: Some(Rc::new(move |this: &mut AppState, cx| {
+                        this.delete_history(id, cx)
+                    })),
+                }
+            })
+            .collect();
+
+        let mut sections: Vec<HistorySection> = Vec::new();
+        if !key_rows.is_empty() {
+            sections.push(HistorySection {
+                key: "recent-keys",
+                title: Some("Recently viewed keys".into()),
+                collapsed: !searching && keys_collapsed,
+                toggle: Some(Rc::new(move |this: &mut AppState, cx| {
+                    this.kv_toggle_recent_keys(session, cx)
+                })),
+                rows: key_rows,
             });
+        }
+        if !cmd_rows.is_empty() {
+            sections.push(HistorySection {
+                key: "commands",
+                title: Some("Commands".into()),
+                collapsed: !searching && cmds_collapsed,
+                toggle: Some(Rc::new(move |this: &mut AppState, cx| {
+                    this.kv_toggle_commands(session, cx)
+                })),
+                rows: cmd_rows,
+            });
+        }
 
-        let cmd_rows = commands.into_iter().enumerate().map(|(i, entry)| {
-            let cmd = entry.sql.clone();
-            let id = entry.id;
-            let label = crate::editor::history_label(&entry.sql);
-            let sub = crate::history::relative_time(entry.ran_unix);
-            let group = SharedString::from(format!("kv-cmd-{i}"));
-            let mono = mono.clone();
-            div()
-                .id(("kv-cmd-row", i))
-                .group(group.clone())
-                .flex()
-                .items_center()
-                .gap_1()
-                .px_2()
-                .py_1p5()
-                .hover(move |s| s.bg(bg_hover))
-                .child(
-                    div()
-                        .id(("kv-cmd-load", i))
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .gap_0p5()
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.kv_seed_console(session, cmd.clone(), cx);
-                        }))
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .font_family(mono)
-                                .text_size(size_12)
-                                .text_color(text)
-                                .child(label),
-                        )
-                        .child(div().text_size(size_10).text_color(faint).child(sub)),
-                )
-                .child(
-                    div()
-                        .id(("kv-cmd-del", i))
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .size(px(16.))
-                        .rounded(px(3.))
-                        .invisible()
-                        .group_hover(group, |s| s.visible())
-                        .cursor_pointer()
-                        .text_color(faint)
-                        .hover(|s| s.bg(bg_elevated).text_color(text))
-                        .on_click(cx.listener(move |this, _, _, cx| this.delete_history(id, cx)))
-                        .child(crate::icons::icon("x", icon_x, faint)),
-                )
-        });
-
-        let body = if !has_any {
-            div()
-                .flex_1()
-                .min_h(px(0.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .px_4()
-                .text_size(size_11)
-                .text_color(faint)
-                .child("Nothing yet")
-                .into_any_element()
-        } else {
-            div()
-                .id("kv-history-list")
-                .flex_1()
-                .min_h(px(0.))
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                .when(has_keys, |d| d.child(section("Recently viewed keys")))
-                .children(key_rows)
-                .when(has_cmds, |d| d.child(section("Commands")))
-                .children(cmd_rows)
-                .into_any_element()
+        let spec = HistoryPanelSpec {
+            sections,
+            empty_text: if searching {
+                "No matches".into()
+            } else {
+                "Nothing yet".into()
+            },
+            show_clear: has_any,
+            on_clear: Rc::new(move |this: &mut AppState, cx| {
+                this.clear_history(cx);
+                this.kv_clear_recent_keys(session, cx);
+            }),
+            search: Some(active.history_search.clone()),
+            nav: None,
+            selected: None,
         };
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(bg_panel)
-            .child(header)
-            .child(body)
+        self.render_history_panel(spec, cx)
     }
 
     /// The tab right-click context menu (Pin/Unpin · Close · Move to other pane).

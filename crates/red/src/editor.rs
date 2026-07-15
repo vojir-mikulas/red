@@ -1257,6 +1257,17 @@ impl AppState {
         cx.notify();
     }
 
+    /// Toggle a SQL history time-bucket (Today/Yesterday/Earlier) between
+    /// collapsed and expanded. In-memory only (reset per session).
+    pub(crate) fn history_toggle_bucket(&mut self, key: &'static str, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase {
+            if !active.history_bucket_collapsed.remove(key) {
+                active.history_bucket_collapsed.insert(key);
+            }
+            cx.notify();
+        }
+    }
+
     /// Move the History panel's keyboard highlight (↑/↓). No-op with empty history.
     pub(crate) fn history_move(&mut self, delta: isize, cx: &mut Context<Self>) {
         let len = match &self.phase {
