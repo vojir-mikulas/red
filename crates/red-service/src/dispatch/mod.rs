@@ -25,6 +25,7 @@ use crate::{Command, Envelope, Event, OpId, RunFetch, SessionId};
 
 mod connect;
 mod paging;
+mod schema_cmds;
 mod session;
 
 // The dispatch loop's command arms reference these by their bare names; glob
@@ -671,85 +672,15 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 }
             }
 
-            Command::LoadObjects => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_sql().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a SQL connection".into()),
-                    );
-                    continue;
-                };
-                match driver.list_objects().await {
-                    Ok(schemas) => emit(&events, session_id, Event::ObjectsLoaded { schemas }),
-                    Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
-                }
-            }
-
+            Command::LoadObjects => schema_cmds::load_objects(&sessions, session_id, &events).await,
             Command::LoadForeignKeys => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get(&id) else {
-                    continue;
-                };
-                // Swallow errors: FK navigation is optional, so a failed or
-                // unsupported introspection (including a KV session, which has
-                // no SQL driver at all) leaves the graph empty rather than
-                // toasting the user on every connect.
-                let Some(driver) = state.driver.as_sql().cloned() else {
-                    continue;
-                };
-                if let Ok(graph) = driver.foreign_keys().await {
-                    emit(&events, session_id, Event::ForeignKeysLoaded { graph });
-                }
+                schema_cmds::load_foreign_keys(&sessions, session_id, &events).await
             }
-
             Command::LoadEnums { table } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get(&id) else {
-                    continue;
-                };
-                // Optional, like the FK graph: a failed/unsupported enum lookup
-                // (including a KV session) just leaves the picker without enum
-                // suggestions rather than toasting.
-                let Some(driver) = state.driver.as_sql().cloned() else {
-                    continue;
-                };
-                if let Ok(columns) = driver.enum_columns(&table).await {
-                    emit(&events, session_id, Event::EnumsLoaded { table, columns });
-                }
+                schema_cmds::load_enums(&sessions, session_id, &events, table).await
             }
-
             Command::DescribeTable { schema, table } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_sql().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a SQL connection".into()),
-                    );
-                    continue;
-                };
-                match driver.describe_table(&schema, &table).await {
-                    Ok(detail) => emit(
-                        &events,
-                        session_id,
-                        Event::TableDescribed {
-                            schema,
-                            table,
-                            detail,
-                        },
-                    ),
-                    Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
-                }
+                schema_cmds::describe_table(&sessions, session_id, &events, schema, table).await
             }
 
             Command::OpenResult {
