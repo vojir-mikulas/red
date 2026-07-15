@@ -21,6 +21,7 @@ mod audit;
 mod dispatch;
 mod mcp;
 mod protocol;
+mod proxy;
 #[cfg(test)]
 mod tests;
 mod tunnel;

@@ -797,6 +797,36 @@ impl AppState {
         cx.notify();
     }
 
+    /// Turn vim-style navigation on or off (the `[keymap] vim_mode` setting). Live:
+    /// the grid and history dock read the flag at render time, so a `cx.notify()`
+    /// re-render is all it takes for the new bindings to apply, no restart.
+    pub(crate) fn set_vim_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.keymap.vim_mode = on;
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Flip vim mode (the palette command). Toasts the new state so the change is
+    /// legible when triggered without the Settings toggle in view.
+    pub(crate) fn toggle_vim_mode(&mut self, cx: &mut Context<Self>) {
+        let on = !self.settings.keymap.vim_mode;
+        self.set_vim_mode(on, cx);
+        self.notify(
+            ToastVariant::Info,
+            if on {
+                "Vim navigation on"
+            } else {
+                "Vim navigation off"
+            },
+            cx,
+        );
+    }
+
+    /// Whether vim-style navigation is active, read by the grid/history key handlers.
+    pub(crate) fn vim_mode(&self) -> bool {
+        self.settings.keymap.vim_mode
+    }
+
     /// The default Redis key auto-refresh interval for new Browse tabs, in
     /// seconds (`0` = off). Persisted; applies to tabs opened afterwards, not
     /// retroactively to open ones (change those from the browse actions menu).
@@ -1227,5 +1257,55 @@ impl AppState {
                 cx,
             );
         }
+    }
+
+    // --- remove all RED data (factory reset) ---
+
+    /// Arm the "Remove all RED data" confirmation modal. The destructive work runs
+    /// only from [`confirm_reset`](Self::confirm_reset_run) after the user accepts.
+    pub(crate) fn open_reset_confirm(&mut self, cx: &mut Context<Self>) {
+        self.confirm_reset = true;
+        cx.notify();
+    }
+
+    /// Dismiss the reset confirmation without doing anything.
+    pub(crate) fn cancel_reset(&mut self, cx: &mut Context<Self>) {
+        self.confirm_reset = false;
+        cx.notify();
+    }
+
+    /// The user confirmed: wipe every RED directory and keychain secret off the UI
+    /// thread (the keychain calls block), then act on the result. A clean run quits
+    /// the app — continuing in a half-wiped process is asking for trouble — while a
+    /// run with per-step errors keeps the process alive and surfaces them so the
+    /// user can retry.
+    pub(crate) fn confirm_reset_run(&mut self, cx: &mut Context<Self>) {
+        self.confirm_reset = false;
+        cx.notify();
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let report = cx
+                .background_executor()
+                .spawn(async { crate::reset::remove_all_data() })
+                .await;
+            this.update(cx, |this, cx| {
+                if report.errors.is_empty() {
+                    // Everything's gone; there's nothing left to run against.
+                    cx.quit();
+                } else {
+                    let detail = report.errors.join("\n");
+                    this.notify_detail(
+                        ToastVariant::Error,
+                        format!(
+                            "Reset finished with {} problem(s); some data may remain",
+                            report.errors.len()
+                        ),
+                        detail,
+                        cx,
+                    );
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 }

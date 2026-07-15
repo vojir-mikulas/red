@@ -114,6 +114,7 @@ pub fn import(dir: &Path) -> Result<ImportReport> {
                 ai_enabled: None,
                 ai_tier: None,
                 ssh,
+                proxy: None,
                 sentinel_master: String::new(),
             },
             source_name: name,

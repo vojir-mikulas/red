@@ -25,7 +25,7 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "137e677a
 # gpui to the SAME rev as above; Cargo unifies the two git deps only at a
 # matching URL+rev, so bumping Flint is coordinated with the gpui pin. For local
 # Flint+RED work, override with a `[patch]` or a path dep.
-flint = { git = "https://github.com/vojir-mikulas/flint", rev = "77c90a87c7bc35fdecf2fc21e8c69c9adbccdbcb" }
+flint = { git = "https://github.com/vojir-mikulas/flint", rev = "407f2b6564867972f0a17efddf3d65877a5db6f0" }
 
 # --- Async / backend bridge (mirrors Nyx: Tokio backend ↔ GPUI over channels) ---
 tokio = { version = "1", default-features = false }
@@ -108,6 +108,10 @@ sha2 = "0.10"
 hmac = "0.12"
 base64 = "0.22"
 hex = "0.4"
+# Read-only XML DOM for the DataGrip importer (dataSources.xml). Tiny and
+# single-purpose; already present transitively, so it adds no new supply-chain
+# surface. See crates/red/src/import/datagrip.rs.
+roxmltree = "0.20"
 # Wipes cached plaintext credentials from memory on drop (see secrets.rs cache).
 zeroize = "1"
 

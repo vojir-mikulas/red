@@ -24,6 +24,9 @@ pub fn detect() -> Vec<Found> {
     let mut found = Vec::new();
     found.extend(detect_dbeaver());
     found.extend(detect_dbgate());
+    found.extend(detect_datagrip());
+    found.extend(detect_redisinsight());
+    found.extend(detect_credential_files());
     found
 }
 
@@ -87,6 +90,79 @@ fn detect_dbgate() -> Vec<Found> {
         .collect()
 }
 
+/// DataGrip / IntelliJ: `<JetBrains config>/DataGrip<ver>/options/dataSources.xml`
+/// (and the same under an `IntelliJIdea<ver>` with the database plugin). The
+/// JetBrains config root is the platform config dir on every OS (macOS
+/// `~/Library/Application Support`, Linux `~/.config`, Windows `%APPDATA%`), which
+/// is exactly what [`dirs::config_dir`] returns.
+fn detect_datagrip() -> Vec<Found> {
+    let mut out = Vec::new();
+    let Some(base) = dirs::config_dir().map(|d| d.join("JetBrains")) else {
+        return out;
+    };
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("DataGrip") || name.starts_with("IntelliJIdea")) {
+            continue;
+        }
+        let dir = entry.path().join("options");
+        if dir.join("dataSources.xml").is_file() {
+            out.push(Found {
+                source: ImportSource::DataGrip,
+                dir,
+                label: format!("DataGrip ({name})"),
+            });
+        }
+    }
+    out
+}
+
+/// RedisInsight keeps its SQLite store in `~/.redisinsight-v2/` (v2) or the older
+/// `~/.redisinsight-app/`. Probe both native and Flatpak homes.
+fn detect_redisinsight() -> Vec<Found> {
+    let mut out = Vec::new();
+    let mut homes: Vec<(PathBuf, &str)> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        homes.push((home, "RedisInsight"));
+    }
+    for home in flatpak_homes() {
+        homes.push((home, "RedisInsight (Flatpak)"));
+    }
+    for (home, tag) in homes {
+        for sub in [".redisinsight-v2", ".redisinsight-app"] {
+            let dir = home.join(sub);
+            if super::redisinsight::dir_has_store(&dir) {
+                out.push(Found {
+                    source: ImportSource::RedisInsight,
+                    dir,
+                    label: tag.to_string(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Plain credential files live directly in the home directory. One `Found` when
+/// any of the three is present, pointing at the home dir the parser reads from.
+fn detect_credential_files() -> Vec<Found> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    if super::plain::dir_has_any(&home) {
+        vec![Found {
+            source: ImportSource::CredentialFiles,
+            dir: home,
+            label: "Credential files".to_string(),
+        }]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Every `DBeaverData` root to probe: the native one plus each Flatpak sandbox's
 /// (paired with a short tag for the label; `None` for the native install).
 fn dbeaver_roots() -> Vec<(PathBuf, Option<&'static str>)> {
@@ -137,5 +213,8 @@ pub fn looks_valid(source: ImportSource, dir: &Path) -> bool {
     match source {
         ImportSource::DBeaver => dir.join("data-sources.json").is_file(),
         ImportSource::DBGate => dir.join("connections.jsonl").is_file(),
+        ImportSource::DataGrip => dir.join("dataSources.xml").is_file(),
+        ImportSource::RedisInsight => super::redisinsight::dir_has_store(dir),
+        ImportSource::CredentialFiles => super::plain::dir_has_any(dir),
     }
 }

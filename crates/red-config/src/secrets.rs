@@ -58,6 +58,11 @@ fn ssh_passphrase_account(id: &str) -> String {
     format!("{id}#ssh-key")
 }
 
+/// Keychain account for a connection's proxy-auth password.
+fn proxy_password_account(id: &str) -> String {
+    format!("{id}#proxy-pw")
+}
+
 /// Read a secret by keychain account, or `None` when there's no entry (which
 /// simply means "ask the user"). Served from [`CACHE`] when present so only the
 /// first read per account touches the OS keychain.
@@ -142,6 +147,21 @@ pub fn delete_ssh_passphrase(id: &str) -> Result<()> {
     remove(&ssh_passphrase_account(id))
 }
 
+/// Fetch a connection's stored proxy-auth password, or `None`.
+pub fn get_proxy_password(id: &str) -> Result<Option<String>> {
+    read(&proxy_password_account(id))
+}
+
+/// Store (or replace) a connection's proxy-auth password.
+pub fn set_proxy_password(id: &str, secret: &str) -> Result<()> {
+    write(&proxy_password_account(id), secret)
+}
+
+/// Remove a connection's proxy-auth password. Idempotent.
+pub fn delete_proxy_password(id: &str) -> Result<()> {
+    remove(&proxy_password_account(id))
+}
+
 /// Keychain account for the AI assistant provider's API key. App-global (not
 /// per-connection), namespaced by provider so multiple providers can coexist.
 fn ai_key_account(provider: &str) -> String {
@@ -161,18 +181,29 @@ pub fn set_ai_key(provider: &str, key: &str) -> Result<()> {
 }
 
 /// Remove the AI provider's API key. Idempotent. The symmetric remove of the
-/// set/get/delete trio, kept for the settings "remove key" path.
-#[allow(dead_code)]
+/// set/get/delete trio, used by the settings "remove key" path and the
+/// "Remove all RED data" reset.
 pub fn delete_ai_key(provider: &str) -> Result<()> {
     remove(&ai_key_account(provider))
 }
 
-/// Remove every secret filed under a connection id (DB password plus both SSH
-/// secrets) so deleting a connection never orphans a credential. Idempotent.
+/// Drop every cached plaintext secret from the in-memory [`CACHE`], zeroizing
+/// each value on the way out (the `Zeroizing` wrapper wipes it on `Drop`). The
+/// keychain is untouched; this only forgets what this process has read, so no
+/// plaintext lingers in memory for the rest of the run. Used by the "Remove all
+/// RED data" reset after it deletes the underlying keychain entries.
+pub fn clear_cache() {
+    cache().clear();
+}
+
+/// Remove every secret filed under a connection id (DB password, both SSH secrets,
+/// and the proxy password) so deleting a connection never orphans a credential.
+/// Idempotent.
 pub fn delete_all(id: &str) -> Result<()> {
     remove(id)?;
     remove(&ssh_password_account(id))?;
     remove(&ssh_passphrase_account(id))?;
+    remove(&proxy_password_account(id))?;
     Ok(())
 }
 

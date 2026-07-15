@@ -2631,7 +2631,7 @@ dependencies = [
 [[package]]
 name = "flint"
 version = "0.1.0"
-source = "git+https://github.com/vojir-mikulas/flint?rev=77c90a87c7bc35fdecf2fc21e8c69c9adbccdbcb#77c90a87c7bc35fdecf2fc21e8c69c9adbccdbcb"
+source = "git+https://github.com/vojir-mikulas/flint?rev=407f2b6564867972f0a17efddf3d65877a5db6f0#407f2b6564867972f0a17efddf3d65877a5db6f0"
 dependencies = [
  "gpui",
  "unicode-segmentation",
@@ -6454,6 +6454,8 @@ dependencies = [
  "red-config",
  "red-core",
  "red-service",
+ "roxmltree",
+ "rusqlite",
  "rust-embed",
  "serde",
  "serde_json",

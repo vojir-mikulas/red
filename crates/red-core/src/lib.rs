@@ -241,6 +241,65 @@ impl fmt::Debug for SshConfig {
     }
 }
 
+/// The kind of proxy a [`ProxyConfig`] speaks: a SOCKS5 proxy (RFC 1928, with
+/// optional RFC 1929 user/pass auth) or an HTTP `CONNECT` proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum ProxyKind {
+    #[default]
+    Socks5,
+    HttpConnect,
+}
+
+impl ProxyKind {
+    /// Every kind, in the order a picker lists them.
+    pub const fn all() -> &'static [ProxyKind] {
+        &[ProxyKind::Socks5, ProxyKind::HttpConnect]
+    }
+
+    /// The picker label for this kind.
+    pub const fn label(self) -> &'static str {
+        match self {
+            ProxyKind::Socks5 => "SOCKS5",
+            ProxyKind::HttpConnect => "HTTP CONNECT",
+        }
+    }
+}
+
+/// Reach the database *through* a forward proxy (SOCKS5 or HTTP `CONNECT`). Like
+/// [`SshConfig`], when a [`ConnectionConfig`] carries one of these the service
+/// resolves a local forward and points the driver at `127.0.0.1:<port>`; the
+/// connection's `host`/`port` are the target reached *through the proxy*. A simpler
+/// forward than SSH: no host-key dance, just the proxy handshake. The auth
+/// `password` is keychain-backed and never persisted, hence the redacting `Debug`
+/// and the `serde(skip)`.
+#[derive(Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ProxyConfig {
+    pub kind: ProxyKind,
+    pub host: String,
+    pub port: u16,
+    /// Optional proxy-auth username; empty means unauthenticated.
+    pub user: String,
+    /// Proxy-auth password; empty when unauthenticated. Keychain-backed, never
+    /// serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub password: String,
+}
+
+impl fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("kind", &self.kind)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &redact(&self.password))
+            .finish()
+    }
+}
+
 /// How much of the connected database the AI assistant's tools may reach. The
 /// tier is enforced where the MCP tool catalog is *constructed*: a tool above
 /// the tier simply isn't offered, so the model (on either the API-key or the
@@ -615,6 +674,12 @@ pub struct ConnectionConfig {
     /// through it (see [`SshConfig`]); `None` connects directly.
     #[cfg_attr(feature = "serde", serde(default))]
     pub ssh: Option<SshConfig>,
+    /// Optional forward proxy (SOCKS5 / HTTP CONNECT). When set, the service
+    /// resolves a local forward through it (see [`ProxyConfig`]); `None` connects
+    /// directly. Mutually exclusive with [`ssh`](Self::ssh) in v1 (rejected up
+    /// front by the connect path).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub proxy: Option<ProxyConfig>,
     /// Redis Sentinel master group name. When set (Redis only), `host`/`port`
     /// name a Sentinel and the driver resolves the current master via
     /// `SENTINEL get-master-addr-by-name` (see `redis_kv.rs`'s `resolve_sentinel`);
@@ -654,6 +719,7 @@ impl fmt::Debug for ConnectionConfig {
             .field("ai_enabled", &self.ai_enabled)
             .field("ai_tier", &self.ai_tier)
             .field("ssh", &self.ssh)
+            .field("proxy", &self.proxy)
             .field("sentinel_master", &self.sentinel_master)
             .finish()
     }
@@ -737,6 +803,7 @@ impl ConnectionConfig {
             host: host.to_string(),
             port: Some(port),
             ssh: None,
+            proxy: None,
             ..self.clone()
         }
         .dsn()

@@ -862,13 +862,24 @@ fn keymap_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
         );
     }
 
+    let vim_toggle = Toggle::new("set-vim-mode", state.settings.keymap.vim_mode)
+        .on_change(cx.listener(|this, on: &bool, _, cx| this.set_vim_mode(*on, cx)));
+
     settings_page_scaffold(
         "Keymap",
         div()
             .flex()
             .flex_col()
+            .child(setting_row(
+                "Vim navigation",
+                "Adds hjkl / g / G / Ctrl-d / Ctrl-u motions to the result grid and the \
+                 history dock, alongside the arrow keys. Off by default; applies live.",
+                vim_toggle,
+                &theme,
+            ))
             .child(
                 div()
+                    .pt_3()
                     .pb_2()
                     .text_size(theme.scale(12.))
                     .text_color(theme.text_muted)
@@ -1179,6 +1190,17 @@ fn behavior_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 "How often a new Redis key-browser tab re-scans the keyspace. Off by \
                  default; change it for an open tab from the browser's actions menu.",
                 redis_refresh,
+                &theme,
+            ))
+            .child(setting_row(
+                "Remove all RED data",
+                "Permanently delete RED's config and cached-data directories and every \
+                 keychain secret (connection passwords, SSH keys, AI keys). Irreversible; \
+                 does not touch the RED binary. RED quits when it's done.",
+                Button::new("reset-open", "Remove all RED data…")
+                    .variant(ButtonVariant::Danger)
+                    .size(ButtonSize::Sm)
+                    .on_click(cx.listener(|this, _, _, cx| this.open_reset_confirm(cx))),
                 &theme,
             )),
         &theme,

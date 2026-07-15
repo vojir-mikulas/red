@@ -6,6 +6,28 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Connect through a proxy: the connection form has a new "Connect via proxy"
+  section (network engines) for reaching a database via a SOCKS5 or HTTP CONNECT
+  proxy, with optional proxy-auth username and password. The proxy password is
+  stored in the OS keychain like every other secret. A connection uses either a
+  proxy or an SSH tunnel, not both.
+- Import connections from more tools: alongside DBeaver and DBGate, the import
+  wizard now reads JetBrains DataGrip / IntelliJ (`dataSources.xml`),
+  RedisInsight (its saved-databases store), and plain credential files
+  (`~/.pgpass`, `~/.my.cnf`, `~/.pg_service.conf`). Passwords held in a tool's
+  own encrypted store are imported when they're recoverable and otherwise flagged
+  so you can re-enter them, never silently dropped.
+- Vim navigation: an optional keymap setting (Settings -> Keymap, or the
+  "keymap: turn on vim navigation" command) adds `hjkl`, `g`/`G`, `0`/`$`, and
+  `Ctrl-d`/`Ctrl-u` motions to the result grid, the schema tree, and the history
+  dock, alongside the existing arrow keys. Off by default; applies live.
+- Remove all RED data: a "Remove all RED data" action (Settings -> Behavior, the
+  command palette, or `red reset` on the command line) deletes RED's config and
+  cached-data directories and every secret it stored in the OS keychain
+  (connection passwords, SSH keys, AI keys) in one step. It shows exactly what
+  will be removed, is irreversible, and does not touch the RED application binary.
+
 ## [0.17.0] - 2026-07-14
 
 ### Added

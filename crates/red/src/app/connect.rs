@@ -330,6 +330,17 @@ impl AppState {
                 _ => {}
             }
         }
+        // The proxy auth password lives in the keychain too; hydrate it before
+        // dialing for the same reason as the SSH secret above.
+        if let Some(proxy) = config.proxy.as_mut()
+            && proxy.password.is_empty()
+        {
+            match crate::secrets::get_proxy_password(&id) {
+                Ok(Some(pw)) => proxy.password = pw,
+                Ok(None) => {}
+                Err(e) => tracing::warn!("failed to read proxy password from keychain: {e}"),
+            }
+        }
         self.start_connect(id, config, cx);
     }
 

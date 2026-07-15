@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use red_core::{AiTier, ConnectionConfig, DbKind, SshAuth, SshConfig};
+use red_core::{AiTier, ConnectionConfig, DbKind, ProxyConfig, ProxyKind, SshAuth, SshConfig};
 use serde::{Deserialize, Serialize};
 
 /// A saved connection plus a recency stamp for "recent" ordering. The in-memory
@@ -94,6 +94,45 @@ struct RawConnection {
     /// Optional SSH jump host. Absent in pre-SSH configs; secrets are never here.
     #[serde(default)]
     ssh: Option<RawSsh>,
+    /// Optional forward proxy. Absent in pre-proxy configs; the auth secret is
+    /// never here (keychain, keyed by id).
+    #[serde(default)]
+    proxy: Option<RawProxy>,
+}
+
+/// On-disk proxy config: flat scalars round-tripping as a `[connection.proxy]`
+/// sub-table. The auth password is never stored here (keychain-backed by id).
+#[derive(Default, Deserialize)]
+struct RawProxy {
+    /// `socks5` (default) | `http`.
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    port: u16,
+    #[serde(default)]
+    user: String,
+}
+
+impl RawProxy {
+    /// Decode into a [`ProxyConfig`], or `None` when no proxy host is named.
+    fn into_config(self) -> Option<ProxyConfig> {
+        if self.host.trim().is_empty() {
+            return None;
+        }
+        let kind = match self.kind.as_str() {
+            "http" | "http_connect" | "https" => ProxyKind::HttpConnect,
+            _ => ProxyKind::Socks5,
+        };
+        Some(ProxyConfig {
+            kind,
+            host: self.host,
+            port: self.port,
+            user: self.user,
+            password: String::new(),
+        })
+    }
 }
 
 /// On-disk SSH config: flat scalars (no enum) so it round-trips through TOML
@@ -156,6 +195,7 @@ impl RawConnection {
             ai_tier: self.ai_tier,
             sentinel_master: self.sentinel_master,
             ssh: self.ssh.and_then(RawSsh::into_config),
+            proxy: self.proxy.and_then(RawProxy::into_config),
         };
         // Legacy migration: an old `dsn` with no structured fields populated. For a
         // file engine the DSN *is* the path; otherwise parse it back into fields.
@@ -225,10 +265,14 @@ struct WriteConnection {
     /// round-trip byte-for-byte. A scalar key, so it stays ahead of `ssh`.
     #[serde(skip_serializing_if = "String::is_empty")]
     sentinel_master: String,
-    /// Optional `[connection.ssh]` sub-table. Must stay the **last** field: TOML
-    /// requires a table-valued key to follow all of a struct's scalar keys.
+    /// Optional `[connection.ssh]` sub-table. Table-valued, so it must follow all
+    /// scalar keys (TOML requirement); it and `proxy` are the trailing tables.
     #[serde(skip_serializing_if = "Option::is_none")]
     ssh: Option<WriteSsh>,
+    /// Optional `[connection.proxy]` sub-table. Must stay the **last** field, after
+    /// every scalar key and after `ssh`, for the same TOML table-ordering reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proxy: Option<WriteProxy>,
 }
 
 /// On-disk SSH config (save side): mirror of [`RawSsh`], password-free. `auth`
@@ -260,6 +304,31 @@ impl WriteSsh {
     }
 }
 
+/// On-disk proxy config (save side): mirror of [`RawProxy`], password-free.
+#[derive(Serialize)]
+struct WriteProxy {
+    kind: &'static str,
+    host: String,
+    port: u16,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    user: String,
+}
+
+impl WriteProxy {
+    fn from_config(p: &ProxyConfig) -> Self {
+        let kind = match p.kind {
+            ProxyKind::Socks5 => "socks5",
+            ProxyKind::HttpConnect => "http",
+        };
+        WriteProxy {
+            kind,
+            host: p.host.clone(),
+            port: p.port,
+            user: p.user.clone(),
+        }
+    }
+}
+
 impl From<&StoredConnection> for WriteConnection {
     fn from(s: &StoredConnection) -> Self {
         let c = &s.config;
@@ -280,6 +349,7 @@ impl From<&StoredConnection> for WriteConnection {
             pinned: s.pinned,
             sentinel_master: c.sentinel_master.clone(),
             ssh: c.ssh.as_ref().map(WriteSsh::from_config),
+            proxy: c.proxy.as_ref().map(WriteProxy::from_config),
         }
     }
 }
@@ -484,6 +554,15 @@ mod tests {
                     ai_enabled: Some(false),
                     ai_tier: Some(AiTier::Schema),
                     ssh: None,
+                    // A forward proxy must round-trip (secret excluded); conn-a
+                    // leaves it None to confirm it's omitted and reads back absent.
+                    proxy: Some(ProxyConfig {
+                        kind: ProxyKind::Socks5,
+                        host: "socks.internal".into(),
+                        port: 1080,
+                        user: "puser".into(),
+                        password: "proxypw".into(),
+                    }),
                     // A Sentinel master must round-trip; conn-a leaves it empty to
                     // confirm it's omitted from the file and reads back blank.
                     sentinel_master: "mymaster".into(),
@@ -528,6 +607,16 @@ mod tests {
         // The Sentinel master round-trips; an empty one is omitted and reads back blank.
         assert_eq!(back[0].config.sentinel_master, "");
         assert_eq!(back[1].config.sentinel_master, "mymaster");
+        // The proxy round-trips its non-secret fields; conn-a has none.
+        assert!(back[0].config.proxy.is_none());
+        let proxy = back[1].config.proxy.as_ref().expect("proxy round-trips");
+        assert_eq!(proxy.kind, ProxyKind::Socks5);
+        assert_eq!(proxy.host, "socks.internal");
+        assert_eq!(proxy.port, 1080);
+        assert_eq!(proxy.user, "puser");
+        // The proxy password is never persisted; it comes back empty.
+        assert_eq!(proxy.password, "");
+        assert!(!text.contains("proxypw"), "proxy password leaked into file");
         // The pinned flag round-trips; an unpinned connection omits it and reads
         // back false.
         assert!(back[0].pinned);

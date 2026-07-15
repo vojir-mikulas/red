@@ -484,6 +484,9 @@ impl AppState {
             // table, and arrow/Home/End/Page/⌘-arrow intents drive the selection.
             // Each split half has its own handle so focus never lands on both.
             .focus_handle(active.grid_focus_for(half).clone())
+            // Vim motions (hjkl/g/G/0/$/Ctrl-d/Ctrl-u) ride alongside the arrow keys
+            // when the user has turned vim navigation on.
+            .vim_nav(self.vim_mode())
             .on_nav(move |nav, extend, _window, cx| {
                 nav_view
                     .update(cx, |this, cx| this.result_cursor_move(nav, extend, cx))

@@ -105,6 +105,16 @@ enum Verb {
     Copy(copy::CopyArgs),
     /// Migrate whole tables into another connection (create-fresh, FK-ordered).
     Migrate(copy::MigrateArgs),
+    /// Remove all RED data: config + data directories and every keychain secret
+    /// (connection passwords, SSH secrets, AI keys). Does not touch the binary.
+    Reset(ResetArgs),
+}
+
+#[derive(Args)]
+struct ResetArgs {
+    /// Skip the confirmation prompt (for scripts / CI teardown).
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Args)]
@@ -162,7 +172,15 @@ pub fn run() -> Option<u8> {
     // leading global flag like `--quiet` doesn't hide it), or a help/version flag
     // is present. A bare launch (or a stray token like macOS's `-psn_…`) falls
     // through to the GUI untouched.
-    const VERBS: &[&str] = &["connections", "test", "query", "exec", "copy", "migrate"];
+    const VERBS: &[&str] = &[
+        "connections",
+        "test",
+        "query",
+        "exec",
+        "copy",
+        "migrate",
+        "reset",
+    ];
     let args: Vec<String> = std::env::args().skip(1).collect();
     let first_positional = args.iter().find(|a| !a.starts_with('-'));
     let is_verb = first_positional.is_some_and(|a| VERBS.contains(&a.as_str()) || a == "help");
@@ -195,6 +213,7 @@ pub fn run() -> Option<u8> {
         Verb::Exec(a) => cmd_exec(a),
         Verb::Copy(a) => copy::cmd_copy(a),
         Verb::Migrate(a) => copy::cmd_migrate(a),
+        Verb::Reset(a) => cmd_reset(a),
     })
 }
 
@@ -394,6 +413,57 @@ fn cmd_exec(args: ExecArgs) -> u8 {
     EXIT_OK
 }
 
+/// `red reset [--yes]`: wipe every RED directory and keychain secret. Prompts for
+/// confirmation on an interactive terminal unless `--yes`; prints the report and
+/// exits non-zero if any step failed. Runs the shared `crate::reset` teardown
+/// directly (no backend needed — it's pure filesystem + keychain work).
+fn cmd_reset(args: ResetArgs) -> u8 {
+    if !args.yes {
+        if !std::io::stdin().is_terminal() {
+            eprintln!("refusing to reset without confirmation; pass --yes to proceed");
+            return EXIT_USAGE;
+        }
+        eprint!(
+            "This removes ALL RED data — config, cached data, and every keychain \
+             secret (connection passwords, SSH secrets, AI keys). It does not touch \
+             the RED binary. This is irreversible.\nContinue? [y/N] "
+        );
+        let _ = std::io::stderr().flush();
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err()
+            || !matches!(answer.trim(), "y" | "Y" | "yes" | "Yes")
+        {
+            eprintln!("aborted");
+            return EXIT_OK;
+        }
+    }
+
+    let report = crate::reset::remove_all_data();
+    note!(
+        "removed {} connection secret-set(s), {} AI key(s); config dir {}, data dir {}",
+        report.connections_cleared,
+        report.ai_keys_cleared,
+        if report.config_dir_removed {
+            "removed"
+        } else {
+            "not removed"
+        },
+        if report.data_dir_removed {
+            "removed"
+        } else {
+            "not removed"
+        },
+    );
+    if report.errors.is_empty() {
+        EXIT_OK
+    } else {
+        for e in &report.errors {
+            eprintln!("reset: {e}");
+        }
+        EXIT_QUERY
+    }
+}
+
 // ---- service pump ----------------------------------------------------------
 
 /// Spawn the backend and take its event stream.
@@ -543,6 +613,12 @@ fn hydrate_secrets(id: &str, config: &mut ConnectionConfig) {
             }
             _ => {}
         }
+    }
+    if let Some(proxy) = config.proxy.as_mut()
+        && proxy.password.is_empty()
+        && let Ok(Some(pw)) = red_config::secrets::get_proxy_password(id)
+    {
+        proxy.password = pw;
     }
 }
 

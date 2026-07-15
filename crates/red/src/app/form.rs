@@ -4,7 +4,7 @@
 
 use flint::prelude::*;
 use gpui::{Context, Entity};
-use red_core::{ConnectionConfig, DbKind, SshAuth, SshConfig};
+use red_core::{ConnectionConfig, DbKind, ProxyConfig, ProxyKind, SshAuth, SshConfig};
 use red_service::Command;
 
 use crate::config::StoredConnection;
@@ -39,6 +39,27 @@ impl AppState {
         self.conn_str_input
             .update(cx, |i, cx| i.set_content(conn_str, cx));
         self.fill_ssh_inputs(config.ssh.as_ref(), cx);
+        self.fill_proxy_inputs(config.proxy.as_ref(), cx);
+    }
+
+    /// Set the proxy text inputs from a config's optional proxy. A `None` clears
+    /// them so a reused form doesn't show a prior proxy's data.
+    fn fill_proxy_inputs(&mut self, proxy: Option<&ProxyConfig>, cx: &mut Context<Self>) {
+        let default = ProxyConfig::default();
+        let proxy = proxy.unwrap_or(&default);
+        let port = if proxy.port == 0 {
+            String::new()
+        } else {
+            proxy.port.to_string()
+        };
+        self.proxy_host_input
+            .update(cx, |i, cx| i.set_content(proxy.host.clone(), cx));
+        self.proxy_port_input
+            .update(cx, |i, cx| i.set_content(port, cx));
+        self.proxy_user_input
+            .update(cx, |i, cx| i.set_content(proxy.user.clone(), cx));
+        self.proxy_password_input
+            .update(cx, |i, cx| i.set_content(proxy.password.clone(), cx));
     }
 
     /// Set the SSH text inputs from a config's optional tunnel. A `None` (direct
@@ -90,6 +111,8 @@ impl AppState {
             test: TestState::Idle,
             ssh_enabled: false,
             ssh_auth: SshAuthMode::Agent,
+            proxy_enabled: false,
+            proxy_kind: ProxyKind::default(),
             ai_allow_writes: false,
         });
         self.refresh_engine_combo(cx);
@@ -140,6 +163,21 @@ impl AppState {
                 _ => {}
             }
         }
+        // Materialize the proxy auth password from the keychain, like the DB and
+        // SSH secrets, so the form shows it and Test/Save reuse it.
+        let proxy_kind = config.proxy.as_ref().map(|p| p.kind);
+        if let Some(proxy) = &mut config.proxy
+            && proxy.password.is_empty()
+        {
+            match crate::secrets::get_proxy_password(&id) {
+                Ok(Some(pw)) => proxy.password = pw,
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("failed to read proxy password from keychain: {e}");
+                    keychain_err = keychain_err.or(Some(e));
+                }
+            }
+        }
         self.fill_form_inputs(&config, cx);
         if keychain_err.is_some() {
             self.notify(
@@ -158,6 +196,8 @@ impl AppState {
             test: TestState::Idle,
             ssh_enabled: config.ssh.is_some(),
             ssh_auth: ssh_auth.unwrap_or(SshAuthMode::Agent),
+            proxy_enabled: config.proxy.is_some(),
+            proxy_kind: proxy_kind.unwrap_or_default(),
             ai_allow_writes: config.ai_tier == Some(red_core::AiTier::Write),
         });
         self.refresh_engine_combo(cx);
@@ -208,6 +248,20 @@ impl AppState {
                 passphrase: self.ssh_passphrase_input.read(cx).content().to_string(),
             }
         });
+        // The proxy, likewise offered only for network engines. SSH and proxy are
+        // mutually exclusive; the form's toggles enforce that, and the connect path
+        // rejects a config that still carries both.
+        let proxy = (form.proxy_enabled && !form.kind.is_file()).then(|| {
+            let proxy_port = read(&self.proxy_port_input).parse::<u16>().unwrap_or(0);
+            ProxyConfig {
+                kind: form.proxy_kind,
+                host: read(&self.proxy_host_input),
+                port: proxy_port,
+                user: read(&self.proxy_user_input),
+                // The secret keeps any surrounding spaces; don't trim.
+                password: self.proxy_password_input.read(cx).content().to_string(),
+            }
+        });
         // Per-connection AI overrides (M-S7). `ai_enabled` and a stricter
         // `off`/`schema` tier are still hand-set in connections.toml; carry the
         // editing connection's values through so a save doesn't drop them. The
@@ -241,6 +295,7 @@ impl AppState {
             ai_enabled,
             ai_tier,
             ssh,
+            proxy,
             // A Sentinel master group only applies to Redis; other engines never
             // carry one even if the input holds stale text from an engine switch.
             sentinel_master: if form.kind == DbKind::Redis {
@@ -284,6 +339,12 @@ impl AppState {
                 errors.push((FormField::SshKeyPath, "Key file path is required"));
             }
         }
+        // `proxy` is `Some` only when its toggle is on; a proxy needs a host.
+        if let Some(proxy) = &config.proxy
+            && proxy.host.is_empty()
+        {
+            errors.push((FormField::ProxyHost, "Proxy host is required"));
+        }
         errors
     }
 
@@ -322,6 +383,10 @@ impl AppState {
                 std::mem::take(&mut s.passphrase),
             )
         });
+        let proxy_secret = config
+            .proxy
+            .as_mut()
+            .map(|p| std::mem::take(&mut p.password));
         let is_file = config.kind.is_file();
 
         let editing = self.form.as_ref().and_then(|f| f.editing);
@@ -343,6 +408,7 @@ impl AppState {
 
         self.store_credential(index, &password, is_file, cx);
         self.store_ssh_credentials(index, ssh_secrets, cx);
+        self.store_proxy_credential(index, proxy_secret, cx);
 
         self.form = None;
         self.persist(cx);
@@ -417,6 +483,28 @@ impl AppState {
         );
     }
 
+    /// Route the proxy auth password to the keychain, keyed by connection id.
+    /// `secret` is `None` when the proxy is off, which clears the entry; an empty
+    /// secret (unauthenticated proxy) also clears it. Reuses [`Self::store_ssh_secret`]
+    /// so a keychain failure warns without blocking the save.
+    ///
+    /// `pub(crate)` so the connection importer reuses it (see [`crate::app::import_ui`]).
+    pub(crate) fn store_proxy_credential(
+        &mut self,
+        index: usize,
+        secret: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.connections[index].id.clone();
+        self.store_ssh_secret(
+            crate::secrets::set_proxy_password,
+            crate::secrets::delete_proxy_password,
+            &id,
+            &secret.unwrap_or_default(),
+            cx,
+        );
+    }
+
     /// Store one SSH secret (or clear it when empty), warning on a keychain error.
     /// Generic over the set/delete pair so the password and passphrase share it.
     fn store_ssh_secret(
@@ -433,10 +521,10 @@ impl AppState {
             set(id, secret)
         };
         if let Err(e) = result {
-            tracing::warn!("failed to store SSH secret in keychain: {e}");
+            tracing::warn!("failed to store secret in keychain: {e}");
             self.notify(
                 ToastVariant::Error,
-                "Couldn't save an SSH secret to the OS keychain, so it won't be remembered.",
+                "Couldn't save a secret to the OS keychain, so it won't be remembered.",
                 cx,
             );
         }
@@ -445,6 +533,10 @@ impl AppState {
     pub(crate) fn set_form_ssh_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if let Some(form) = &mut self.form {
             form.ssh_enabled = enabled;
+            // SSH and proxy are mutually exclusive; enabling one disables the other.
+            if enabled {
+                form.proxy_enabled = false;
+            }
             form.test = TestState::Idle;
         }
         cx.notify();
@@ -453,6 +545,26 @@ impl AppState {
     pub(crate) fn set_form_ssh_auth(&mut self, mode: SshAuthMode, cx: &mut Context<Self>) {
         if let Some(form) = &mut self.form {
             form.ssh_auth = mode;
+            form.test = TestState::Idle;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn set_form_proxy_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.form {
+            form.proxy_enabled = enabled;
+            // Mutually exclusive with the SSH tunnel (see [`set_form_ssh_enabled`]).
+            if enabled {
+                form.ssh_enabled = false;
+            }
+            form.test = TestState::Idle;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn set_form_proxy_kind(&mut self, kind: ProxyKind, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.form {
+            form.proxy_kind = kind;
             form.test = TestState::Idle;
         }
         cx.notify();

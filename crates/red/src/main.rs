@@ -40,6 +40,7 @@ mod plan;
 mod queries;
 mod recent_keys;
 mod redis_analysis;
+mod reset;
 mod result;
 mod sample;
 mod schema;

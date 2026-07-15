@@ -19,7 +19,13 @@ use super::AppState;
 /// The tools the wizard can import from, probed in this order. Only the ones
 /// actually detected on this machine make it into the wizard — a tool that isn't
 /// installed here is never shown.
-const PROVIDERS: [ImportSource; 2] = [ImportSource::DBeaver, ImportSource::DBGate];
+const PROVIDERS: [ImportSource; 5] = [
+    ImportSource::DBeaver,
+    ImportSource::DBGate,
+    ImportSource::DataGrip,
+    ImportSource::RedisInsight,
+    ImportSource::CredentialFiles,
+];
 
 /// A provider row in the wizard's source step: the tool, the on-disk sources
 /// auto-detection found for it (never empty — undetected tools are dropped), and

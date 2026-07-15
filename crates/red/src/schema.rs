@@ -393,6 +393,7 @@ impl AppState {
             // Keyboard navigation: the sidebar's focus handle lives on the tree,
             // and ↑/↓ / ←/→ / Enter intents drive selection, expansion, and preview.
             .focus_handle(active.schema_focus.clone())
+            .vim_nav(self.vim_mode())
             .on_nav(move |nav, _window, cx| {
                 nv.update(cx, |this, cx| this.schema_nav(nav, cx)).ok();
             })

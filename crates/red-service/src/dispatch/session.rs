@@ -12,11 +12,26 @@ use red_core::AiTier;
 use red_driver::{AbortSignal, CancelToken, DatabaseDriver, KvDriver, QueryCursor};
 
 use crate::protocol::OpId;
+use crate::proxy::Proxy;
 use crate::tunnel::Tunnel;
 use crate::{Event, SessionId};
 
 use super::paging::ResultMap;
 use super::{Events, emit, lock};
+
+/// A live local forward a session rides, held only to keep it alive for the
+/// session's lifetime: an SSH jump-host [`Tunnel`] or a SOCKS5/HTTP-CONNECT
+/// [`Proxy`]. Dropping it (on teardown/eviction) closes the forward. `None` for a
+/// direct connection. Both variants resolve to a `127.0.0.1:<port>` the driver
+/// dials, so the driver stays transport-unaware either way.
+#[allow(
+    dead_code,
+    reason = "held only for its Drop, to keep the forward alive for the session; the inner value is never read"
+)]
+pub(crate) enum Forward {
+    Ssh(Tunnel),
+    Proxy(Proxy),
+}
 
 /// A session's driver: either the SQL-shaped `DatabaseDriver` seam or the
 /// parallel `KvDriver` seam (Redis; see `docs/plans/redis.md`). Every SQL
@@ -190,10 +205,10 @@ pub(crate) struct SessionState {
     /// policy so the write tool (`AiTier::Write`) is withheld on a read-only
     /// connection, the same guard the human write path is held to.
     pub(crate) read_only: bool,
-    /// The SSH tunnel this connection rides, if any. Held only to keep it alive
-    /// for the session's lifetime: dropping it (on teardown/eviction) closes the
-    /// forward and the SSH session. `None` for a direct connection.
-    _tunnel: Option<Tunnel>,
+    /// The local forward this connection rides (SSH tunnel or proxy), if any. Held
+    /// only to keep it alive for the session's lifetime: dropping it (on
+    /// teardown/eviction) closes the forward. `None` for a direct connection.
+    _forward: Option<Forward>,
     /// The streaming `Query`/`FetchMore` cursor. Single-active per session; this
     /// path is legacy/test-only (the UI drives results via `OpenResult`).
     pub(crate) active: Option<ActiveQuery>,
@@ -248,7 +263,7 @@ pub(crate) struct AiOverride {
 impl SessionState {
     pub(crate) fn new(
         driver: SessionDriver,
-        tunnel: Option<Tunnel>,
+        forward: Option<Forward>,
         ai_override: AiOverride,
         read_only: bool,
     ) -> Self {
@@ -256,7 +271,7 @@ impl SessionState {
             driver,
             ai_override,
             read_only,
-            _tunnel: tunnel,
+            _forward: forward,
             active: None,
             results: Arc::new(Mutex::new(HashMap::new())),
             inflight: HashMap::new(),
@@ -330,7 +345,7 @@ pub(crate) enum ConnectOutcome {
         ai_override: AiOverride,
         /// The connection's read-only posture, captured at connect for the AI policy.
         read_only: bool,
-        result: Result<(SessionDriver, Option<Tunnel>), ConnectFail>,
+        result: Result<(SessionDriver, Option<Forward>), ConnectFail>,
     },
     /// A session-less `TestConnection` finished; carries the server version on
     /// success, the error message otherwise.
@@ -379,11 +394,11 @@ pub(crate) fn apply_connect_outcome(
                 return;
             }
             match result {
-                Ok((driver, tunnel)) => {
+                Ok((driver, forward)) => {
                     let version = driver.server_version();
                     sessions.insert(
                         id,
-                        SessionState::new(driver, tunnel, ai_override, read_only),
+                        SessionState::new(driver, forward, ai_override, read_only),
                     );
                     // Evict any ACP conversation still bound to this id: it grounds in
                     // the prior connection's driver. The reconnect already fired an

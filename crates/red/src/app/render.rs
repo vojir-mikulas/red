@@ -409,6 +409,8 @@ impl Render for AppState {
             .map(|c| c.config.name.clone())
             .map(|name| self.render_confirm_delete(name, cx));
 
+        let confirm_reset = self.confirm_reset.then(|| self.render_confirm_reset(cx));
+
         let settings = self
             .settings_open
             .then(|| self.render_settings(cx).into_any_element());
@@ -629,6 +631,7 @@ impl Render for AppState {
             .children(confirm_kv_delete)
             .children(confirm_close_batch)
             .children(confirm_delete)
+            .children(confirm_reset)
             .children(settings)
             .children(shortcuts)
             .children(whats_new)
@@ -1119,6 +1122,75 @@ impl AppState {
             .on_confirm(move |_, cx| {
                 confirm_view
                     .update(cx, |this, cx| this.confirm_delete_connection(cx))
+                    .ok();
+            })
+            .child(body)
+    }
+
+    /// Confirmation modal for "Remove all RED data" — the factory reset. Spells out
+    /// exactly what's about to go (the two directories, the connection + AI-key
+    /// secret sets, that the binary is untouched) and that it can't be undone, so a
+    /// destructive irreversible action is never one stray click away.
+    fn render_confirm_reset(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let close_view = cx.entity().downgrade();
+        let confirm_view = cx.entity().downgrade();
+        let conn_count = self.connections.len();
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().text_color(theme.text_muted).child(
+                "This permanently removes everything RED stored on this machine and \
+                 can't be undone:",
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .pl_2()
+                    .text_color(theme.text_muted)
+                    .child(div().child(format!(
+                        "• {conn_count} saved connection(s) and their keychain secrets \
+                         (passwords, SSH keys)"
+                    )))
+                    .child(div().child("• AI provider API keys in the keychain"))
+                    .child(div().child(
+                        "• the config and cached-data directories (settings, history, \
+                         saved queries, themes)",
+                    )),
+            )
+            .child(
+                div()
+                    .text_color(theme.text_muted)
+                    .child("The RED application binary itself is not removed."),
+            );
+        let footer = div()
+            .flex()
+            .justify_end()
+            .gap_2()
+            .child(
+                Button::new("reset-cancel", "Cancel")
+                    .variant(ButtonVariant::Secondary)
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel_reset(cx))),
+            )
+            .child(
+                Button::new("reset-confirm", "Remove all RED data")
+                    .variant(ButtonVariant::Danger)
+                    .on_click(cx.listener(|this, _, _, cx| this.confirm_reset_run(cx))),
+            );
+        Modal::new("confirm-reset")
+            .title("Remove all RED data")
+            .width(px(460.))
+            .focus_handle(self.modal_focus.clone())
+            .footer(footer)
+            .on_close(move |_, cx| {
+                close_view.update(cx, |this, cx| this.cancel_reset(cx)).ok();
+            })
+            .on_confirm(move |_, cx| {
+                confirm_view
+                    .update(cx, |this, cx| this.confirm_reset_run(cx))
                     .ok();
             })
             .child(body)

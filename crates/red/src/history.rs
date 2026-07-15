@@ -322,11 +322,25 @@ impl AppState {
                 // loads the entry, and Esc returns focus to the editor.
                 .track_focus(&active.history_focus)
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, _w, cx| {
+                    // Vim navigation (when enabled) layers hjkl/g/G onto the arrow
+                    // keys the dock already handles; both paths drive the same moves.
+                    let vim = this.vim_mode();
                     match event.keystroke.key.as_str() {
                         "up" => this.history_move(-1, cx),
                         "down" => this.history_move(1, cx),
+                        "k" if vim => this.history_move(-1, cx),
+                        "j" if vim => this.history_move(1, cx),
+                        // Half-range deltas jump to the ends without overflowing the
+                        // `history_sel + delta` sum (`history_move` clamps the rest).
+                        "g" if vim => this.history_move(isize::MIN / 2, cx),
+                        "G" if vim => this.history_move(isize::MAX / 2, cx),
                         "enter" => this.history_accept(cx),
+                        "l" if vim => this.history_accept(cx),
                         "escape" => {
+                            this.pending_focus = Some(crate::app::Pane::Editor);
+                            cx.notify();
+                        }
+                        "h" if vim => {
                             this.pending_focus = Some(crate::app::Pane::Editor);
                             cx.notify();
                         }

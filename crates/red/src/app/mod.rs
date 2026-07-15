@@ -75,6 +75,12 @@ pub struct AppState {
     pub(crate) ssh_key_path_input: Entity<TextInput>,
     pub(crate) ssh_password_input: Entity<TextInput>,
     pub(crate) ssh_passphrase_input: Entity<TextInput>,
+    /// Proxy fields, shown when the form's `proxy_enabled` is on (network engines
+    /// only). The auth password input is obscured.
+    pub(crate) proxy_host_input: Entity<TextInput>,
+    pub(crate) proxy_port_input: Entity<TextInput>,
+    pub(crate) proxy_user_input: Entity<TextInput>,
+    pub(crate) proxy_password_input: Entity<TextInput>,
     /// Numeric steppers for the two font sizes in the Appearance panel. Stateful
     /// (they own an editable field), so the panel renders these rather than
     /// rebuilding them per frame; `Change` writes straight through to settings.
@@ -240,6 +246,9 @@ pub struct AppState {
     pub(crate) tab_context_menu: Option<(usize, gpui::Point<gpui::Pixels>)>,
     /// A saved connection the user asked to delete, awaiting confirmation.
     pub(crate) confirm_delete_conn: Option<usize>,
+    /// The user asked to remove all RED data (config + data dirs + keychain
+    /// secrets); the irreversible-action confirm modal is armed while this is set.
+    pub(crate) confirm_reset: bool,
     /// Persisted UI preferences (theme, grid, query, the safety rail) + their store.
     pub(crate) settings: Settings,
     pub(crate) settings_store: Option<FileSettingsStore>,
@@ -690,6 +699,13 @@ impl AppState {
         let ssh_password_input = cx.new(|cx| TextInput::new(cx).obscured());
         let ssh_passphrase_input = cx.new(|cx| TextInput::new(cx).obscured());
 
+        let proxy_host_input =
+            cx.new(|cx| TextInput::new(cx).with_placeholder("proxy.example.com"));
+        let proxy_port_input = cx.new(|cx| TextInput::new(cx).with_placeholder("1080"));
+        let proxy_user_input = cx.new(|cx| TextInput::new(cx).with_placeholder("optional"));
+        // The proxy auth password is obscured, like the SSH secrets.
+        let proxy_password_input = cx.new(|cx| TextInput::new(cx).obscured());
+
         // Live two-way sync: editing any structured field rebuilds the connection
         // string, and editing the string parses it back into the fields. Only user
         // edits emit `Change`; the programmatic `set_content` used by the sync does
@@ -1052,6 +1068,10 @@ impl AppState {
             ssh_key_path_input,
             ssh_password_input,
             ssh_passphrase_input,
+            proxy_host_input,
+            proxy_port_input,
+            proxy_user_input,
+            proxy_password_input,
             ui_font_size_input,
             editor_font_size_input,
             form: None,
@@ -1105,6 +1125,7 @@ impl AppState {
             confirm_close_batch: None,
             tab_context_menu: None,
             confirm_delete_conn: None,
+            confirm_reset: false,
             settings,
             settings_store,
             settings_open: false,

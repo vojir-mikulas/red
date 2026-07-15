@@ -14,7 +14,7 @@ use gpui::{Context, Entity, FocusHandle, Pixels, ScrollHandle, SharedString, pre
 use red_core::kv::RecycledKey;
 use red_core::{
     Column, ColumnMap, ColumnMeta, ConnectionConfig, CopyMode, DbKind, EditOp, FkEdge,
-    ImportFormat, TableRef,
+    ImportFormat, ProxyKind, TableRef,
 };
 use red_service::{OpId, SessionId};
 
@@ -500,6 +500,11 @@ pub(crate) struct FormState {
     /// Which SSH auth method the form has selected. The key path and the secrets
     /// live in the shared SSH inputs; this only tracks the choice.
     pub ssh_auth: SshAuthMode,
+    /// Reach the connection through a forward proxy. Off by default; only offered
+    /// for network engines, and mutually exclusive with `ssh_enabled` in v1.
+    pub proxy_enabled: bool,
+    /// Which proxy protocol the form has selected (SOCKS5 / HTTP CONNECT).
+    pub proxy_kind: ProxyKind,
     /// Opt this connection into the AI **write** tier (Feature B): the assistant may
     /// propose INSERT/UPDATE/DELETE, each gated by per-statement approval. Off by
     /// default; ignored on a read-only connection. Maps to `ai_tier = "write"`.
@@ -541,6 +546,7 @@ pub(crate) enum FormField {
     SshHost,
     SshUser,
     SshKeyPath,
+    ProxyHost,
 }
 
 /// A write awaiting the confirm modal (Track B5 generalized the destructive-confirm

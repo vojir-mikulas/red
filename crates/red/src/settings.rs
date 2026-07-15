@@ -35,6 +35,20 @@ pub struct Settings {
     pub update: UpdateSettings,
     pub ai: AiSettings,
     pub redis: RedisSettings,
+    pub keymap: KeymapSettings,
+}
+
+// --- keymap ------------------------------------------------------------------
+
+/// Keyboard-behaviour settings. `vim_mode` layers vim-style navigation
+/// (`hjkl`, `g`/`G`, `Ctrl-d`/`Ctrl-u`) onto the result grid and the history dock
+/// on top of the existing arrow-key navigation; off by default so modality is
+/// never imposed on anyone who didn't ask for it. Live-applied, so flipping it
+/// takes effect without a restart. (Per-key rebinds still live in `keymap.toml`.)
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeymapSettings {
+    pub vim_mode: bool,
 }
 
 // --- appearance --------------------------------------------------------------
@@ -661,6 +675,7 @@ impl FileSettingsStore {
             update: section(&value, "update", &mut warnings),
             ai: ai_section(&value, &mut warnings),
             redis: section(&value, "redis", &mut warnings),
+            keymap: section(&value, "keymap", &mut warnings),
         };
         let migrated = apply_legacy(&mut settings, &value);
 

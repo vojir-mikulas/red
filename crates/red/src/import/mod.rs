@@ -26,15 +26,24 @@ use std::path::Path;
 use anyhow::Result;
 use red_core::ConnectionConfig;
 
+pub mod datagrip;
 pub mod dbeaver;
 pub mod dbgate;
 pub mod discover;
+pub mod plain;
+pub mod redisinsight;
 
 /// A tool RED can import connections from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportSource {
     DBeaver,
     DBGate,
+    /// JetBrains DataGrip / IntelliJ (`dataSources.xml`).
+    DataGrip,
+    /// RedisInsight (its SQLite `redisinsight.db` store).
+    RedisInsight,
+    /// Plain credential files (`~/.pgpass`, `~/.my.cnf`, `~/.pg_service.conf`).
+    CredentialFiles,
 }
 
 impl ImportSource {
@@ -43,6 +52,9 @@ impl ImportSource {
         match self {
             ImportSource::DBeaver => "DBeaver",
             ImportSource::DBGate => "DBGate",
+            ImportSource::DataGrip => "DataGrip",
+            ImportSource::RedisInsight => "RedisInsight",
+            ImportSource::CredentialFiles => "Credential files (.pgpass, .my.cnf)",
         }
     }
 }
@@ -89,6 +101,11 @@ impl ImportReport {
 ///   `credentials-config.json`).
 /// - `DBGate`: `dir` is the `.dbgate` folder (holding `connections.jsonl` +
 ///   `.key`).
+/// - `DataGrip`: `dir` holds a `dataSources.xml` (a JetBrains `options/` dir or a
+///   project `.idea/`).
+/// - `RedisInsight`: `dir` holds the `redisinsight.db` SQLite store.
+/// - `CredentialFiles`: `dir` is a home directory holding any of `.pgpass`,
+///   `.my.cnf`, `.pg_service.conf`.
 ///
 /// Returns a report; per-connection failures land in `skipped` rather than
 /// aborting the whole import. Errors are reserved for "couldn't read the source at
@@ -97,5 +114,8 @@ pub fn run(source: ImportSource, dir: &Path) -> Result<ImportReport> {
     match source {
         ImportSource::DBeaver => dbeaver::import(dir),
         ImportSource::DBGate => dbgate::import(dir),
+        ImportSource::DataGrip => datagrip::import(dir),
+        ImportSource::RedisInsight => redisinsight::import(dir),
+        ImportSource::CredentialFiles => plain::import(dir),
     }
 }

@@ -8,7 +8,7 @@ use flint::prelude::*;
 use gpui::{
     AnyElement, Context, FontWeight, Hsla, Pixels, Role, SharedString, Window, div, prelude::*, px,
 };
-use red_core::DbKind;
+use red_core::{DbKind, ProxyKind};
 
 use crate::app::{AppState, ConnectSortField, FormField, FormState, SshAuthMode, TestState};
 
@@ -865,6 +865,7 @@ impl AppState {
                     .children(conn_str_field)
                     .child(self.render_connection_fields(form, is_file, &errors, theme))
                     .children(self.render_ssh_section(form, is_file, &errors, theme, cx))
+                    .children(self.render_proxy_section(form, is_file, &errors, theme, cx))
                     .child(self.render_label_access_row(form, theme, cx))
                     .children(self.render_ai_write_row(form, theme, cx)),
             )
@@ -994,6 +995,135 @@ impl AppState {
                 .children(secret_row)
                 .into_any_element(),
         )
+    }
+
+    /// The proxy section: a toggle, then the kind picker and proxy fields. `None`
+    /// for file engines. Mirrors [`Self::render_ssh_section`]; the two are mutually
+    /// exclusive, enforced by their setters.
+    fn render_proxy_section(
+        &self,
+        form: &FormState,
+        is_file: bool,
+        errors: &[(FormField, &'static str)],
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if is_file {
+            return None;
+        }
+
+        let toggle = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                Toggle::new("proxy-enabled", form.proxy_enabled)
+                    .label("Connect via proxy")
+                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                        this.set_form_proxy_enabled(*checked, cx)
+                    })),
+            )
+            .child(
+                div()
+                    .text_size(theme.scale(12.5))
+                    .text_color(if form.proxy_enabled {
+                        theme.accent
+                    } else {
+                        theme.text_muted
+                    })
+                    .child("Connect via proxy"),
+            );
+
+        if !form.proxy_enabled {
+            return Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(toggle)
+                    .into_any_element(),
+            );
+        }
+
+        let kind_row = labeled_field("Proxy type", theme).child(self.render_proxy_kind_picker(
+            form.proxy_kind,
+            theme,
+            cx,
+        ));
+
+        let host_row = div()
+            .flex()
+            .items_start()
+            .gap_3()
+            .child(
+                labeled_field("Proxy host", theme)
+                    .flex_1()
+                    .child(self.proxy_host_input.clone())
+                    .children(field_error_line(
+                        theme,
+                        field_err(errors, FormField::ProxyHost),
+                    )),
+            )
+            .child(
+                labeled_field("Proxy port", theme)
+                    .w(px(88.))
+                    .flex_none()
+                    .child(self.proxy_port_input.clone()),
+            );
+
+        let user_row =
+            labeled_field("Proxy user (optional)", theme).child(self.proxy_user_input.clone());
+        let secret_row = labeled_field("Proxy password (optional)", theme)
+            .child(self.proxy_password_input.clone());
+
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(toggle)
+                .child(kind_row)
+                .child(host_row)
+                .child(user_row)
+                .child(secret_row)
+                .into_any_element(),
+        )
+    }
+
+    /// The proxy-kind segmented control (SOCKS5 / HTTP CONNECT), mirroring the SSH
+    /// auth picker's look.
+    fn render_proxy_kind_picker(
+        &self,
+        selected: ProxyKind,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let cells = ProxyKind::all().iter().map(|&kind| {
+            let on = kind == selected;
+            let (bg, border, text) = if on {
+                (theme.accent_ghost, theme.accent, theme.text)
+            } else {
+                (theme.bg_input, theme.border_soft, theme.text_muted)
+            };
+            div()
+                .id(SharedString::from(format!("proxy-kind-{}", kind.label())))
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(32.))
+                .rounded(theme.radius)
+                .bg(bg)
+                .border_1()
+                .border_color(border)
+                .text_size(theme.scale(12.))
+                .text_color(text)
+                .cursor_pointer()
+                .hover(|s| s.text_color(theme.text))
+                .child(kind.label())
+                .on_click(cx.listener(move |this, _, _, cx| this.set_form_proxy_kind(kind, cx)))
+        });
+        div().flex().gap_1p5().children(cells)
     }
 
     /// The SSH auth-mode segmented control (Agent / Password / Key), mirroring the

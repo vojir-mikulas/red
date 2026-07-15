@@ -28,6 +28,10 @@ pub(crate) enum Cmd {
     OpenDefaultSettings,
     /// Open `keymap.toml` to customize keybindings (file-first workflow).
     OpenKeymapFile,
+    /// Open the "Remove all RED data" factory-reset confirmation.
+    RemoveAllData,
+    /// Toggle vim-style navigation (the `[keymap] vim_mode` setting).
+    ToggleVimMode,
     /// Connect to the saved connection at this index (disconnected phase).
     Connect(usize),
     /// Open the connection switcher popover (the ⌘P switcher).
@@ -261,6 +265,8 @@ impl AppState {
             Cmd::OpenSettingsFile => self.open_settings_file(cx),
             Cmd::OpenDefaultSettings => self.open_default_settings(cx),
             Cmd::OpenKeymapFile => self.open_keymap_file(cx),
+            Cmd::RemoveAllData => self.open_reset_confirm(cx),
+            Cmd::ToggleVimMode => self.toggle_vim_mode(cx),
             Cmd::Connect(index) => self.connect(index, cx),
             // The switcher's `toggle` needs a `Window` to focus its field; defer
             // to the next render (drained there), like the pane-focus jumps.
@@ -664,6 +670,21 @@ impl AppState {
         out.push((
             PaletteItem::new("cmd:keymap-file", "keymap: customize keybindings"),
             Cmd::OpenKeymapFile,
+        ));
+        out.push((
+            PaletteItem::new(
+                "cmd:vim-mode",
+                if self.settings.keymap.vim_mode {
+                    "keymap: turn off vim navigation"
+                } else {
+                    "keymap: turn on vim navigation"
+                },
+            ),
+            Cmd::ToggleVimMode,
+        ));
+        out.push((
+            PaletteItem::new("cmd:remove-all-data", "danger: remove all RED data…"),
+            Cmd::RemoveAllData,
         ));
 
         // The hints above are written as macOS glyphs; localize them to the host

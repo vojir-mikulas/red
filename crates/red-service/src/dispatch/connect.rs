@@ -10,9 +10,10 @@ use red_driver::{
     ClickhouseDriver, DatabaseDriver, MysqlDriver, PostgresDriver, RedisDriver, SqliteDriver,
 };
 
+use crate::proxy::Proxy;
 use crate::tunnel::Tunnel;
 
-use super::session::{ConnectFail, HostKeyPrompt, SessionDriver};
+use super::session::{ConnectFail, Forward, HostKeyPrompt, SessionDriver};
 
 /// Cap on how long one connect attempt may run before the backend gives up and
 /// reports a timeout. Bounds a hung connect (a black-hole host) so the dispatch
@@ -24,7 +25,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// error like any other failure, so the UI's retry/backoff path handles it.
 pub(crate) async fn attempt_connect(
     config: &ConnectionConfig,
-) -> Result<(SessionDriver, Option<Tunnel>), ConnectFail> {
+) -> Result<(SessionDriver, Option<Forward>), ConnectFail> {
     match tokio::time::timeout(CONNECT_TIMEOUT, connect(config)).await {
         Ok(result) => result.map_err(classify_connect_err),
         Err(_) => Err(ConnectFail {
@@ -64,31 +65,18 @@ fn classify_connect_err(e: RedError) -> ConnectFail {
     }
 }
 
-async fn connect(config: &ConnectionConfig) -> red_core::Result<(SessionDriver, Option<Tunnel>)> {
-    // SQLite is a local file (no network), so SSH never applies.
+async fn connect(config: &ConnectionConfig) -> red_core::Result<(SessionDriver, Option<Forward>)> {
+    // SQLite is a local file (no network), so a tunnel/proxy never applies.
     if let DbKind::Sqlite = config.kind {
         let driver = SqliteDriver::new(config.dsn(), config.read_only);
         driver.ping().await?;
         return Ok((SessionDriver::Sql(Arc::new(driver)), None));
     }
 
-    // For a network engine, stand up the SSH tunnel first (when configured) and
-    // dial the local forwarded port instead of the real host. `dsn` is what the
-    // driver connects to; `tunnel` must outlive it, so it rides into the session.
-    let (dsn, tunnel) = match &config.ssh {
-        Some(ssh) => {
-            let port = config
-                .port
-                .or_else(|| config.kind.default_port())
-                .unwrap_or(0);
-            let tunnel = Tunnel::open(ssh, config.effective_host(), port).await?;
-            (
-                config.local_dsn("127.0.0.1", tunnel.local_addr().port()),
-                Some(tunnel),
-            )
-        }
-        None => (config.dsn(), None),
-    };
+    // For a network engine, stand up the forward first (when configured) and dial
+    // the local forwarded port instead of the real host. `dsn` is what the driver
+    // connects to; `forward` must outlive it, so it rides into the session.
+    let (dsn, forward) = resolve_forward(config).await?;
 
     let driver = match config.kind {
         DbKind::Postgres => SessionDriver::Sql(Arc::new(
@@ -123,5 +111,34 @@ async fn connect(config: &ConnectionConfig) -> red_core::Result<(SessionDriver, 
         )),
         DbKind::Sqlite => unreachable!("handled above"),
     };
-    Ok((driver, tunnel))
+    Ok((driver, forward))
+}
+
+/// Resolve the transport a network connection rides: an SSH [`Tunnel`], a
+/// [`Proxy`], or a direct dial. Returns the DSN the driver should connect to
+/// (`127.0.0.1:<port>` when forwarded, else the real target) plus the forward to
+/// keep alive. SSH and proxy are mutually exclusive in v1 (the double-forward is
+/// rare and adds real complexity), so a config carrying both is rejected up front
+/// with a clear, correctable message.
+async fn resolve_forward(config: &ConnectionConfig) -> red_core::Result<(String, Option<Forward>)> {
+    let target_port = config
+        .port
+        .or_else(|| config.kind.default_port())
+        .unwrap_or(0);
+    match (&config.ssh, &config.proxy) {
+        (Some(_), Some(_)) => Err(RedError::Connect(
+            "a connection can use an SSH tunnel or a proxy, not both; remove one".into(),
+        )),
+        (Some(ssh), None) => {
+            let tunnel = Tunnel::open(ssh, config.effective_host(), target_port).await?;
+            let dsn = config.local_dsn("127.0.0.1", tunnel.local_addr().port());
+            Ok((dsn, Some(Forward::Ssh(tunnel))))
+        }
+        (None, Some(proxy)) => {
+            let forward = Proxy::open(proxy, config.effective_host(), target_port).await?;
+            let dsn = config.local_dsn("127.0.0.1", forward.local_addr().port());
+            Ok((dsn, Some(Forward::Proxy(forward))))
+        }
+        (None, None) => Ok((config.dsn(), None)),
+    }
 }
