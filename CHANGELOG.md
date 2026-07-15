@@ -19,7 +19,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   collection has a Schema panel that samples documents to show every field's
   path, its type distribution (e.g. "string 82% / int 18%"), and how often it is
   present, plus an Indexes panel listing keys and unique / sparse / ttl / partial
-  properties.
+  properties. A Query panel runs an aggregation pipeline (extended JSON, Cmd+Enter)
+  into a results grid, and an Explain button on the document view reports the
+  winning plan, whether it is a collection scan, the index used, and the
+  documents-examined / returned counts.
 - Searchable, grouped History dock: the left History panel (both the SQL and
   Redis shells) now has a search box that narrows the list live and collapsible
   grouped sections. SQL history groups into Today / Yesterday / Earlier time

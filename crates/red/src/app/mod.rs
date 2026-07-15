@@ -1735,6 +1735,22 @@ impl AppState {
             } => {
                 self.on_doc_indexes(session, epoch, db, coll, indexes, cx);
             }
+            Event::DocAggregateReady {
+                epoch,
+                db,
+                coll,
+                docs,
+            } => {
+                self.on_doc_aggregate(session, epoch, db, coll, docs, cx);
+            }
+            Event::DocPlanReady {
+                epoch,
+                db,
+                coll,
+                plan,
+            } => {
+                self.on_doc_plan(session, epoch, db, coll, plan, cx);
+            }
             Event::DocError { epoch, message } => {
                 self.on_doc_error(session, epoch, message, cx);
             }

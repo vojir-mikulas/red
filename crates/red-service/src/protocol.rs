@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use red_core::diff::{DiffColumnPlan, DiffRow, DiffSummary};
-use red_core::doc::{CollectionInfo, DbInfo, DocSchema, Document, IndexInfo};
+use red_core::doc::{CollectionInfo, DbInfo, DocPlan, DocSchema, Document, IndexInfo};
 use red_core::kv::{
     ClientInfo, CollectionKind, KeyMeta, KvCollectionPage, KvEdit, KvScanPage, KvStreamActionReq,
     KvStreamPage, KvType, KvValue, PendingEntry, RecycledKey, RespValue, ScanBudget, ScanCursor,
@@ -549,6 +549,25 @@ pub enum Command {
         epoch: Epoch,
         db: String,
         coll: String,
+    },
+    /// Run a read-only aggregation `pipeline` (extended-JSON array of stages) into
+    /// the grid — the Query panel's run. Parse/run failures reply `DocError`;
+    /// success replies `DocAggregateReady`. Cancellable/epoch-superseded like a
+    /// page fetch.
+    DocAggregate {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        pipeline: String,
+    },
+    /// `explain` the current find `filter` (extended-JSON, `None` = match all),
+    /// for the Documents panel's plan readout. Replied with `DocPlanReady`, or
+    /// `DocError` on a parse/run failure.
+    DocExplain {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        filter: Option<String>,
     },
     /// Compute a column's aggregate summary over the open result's *filtered* SQL
     /// (the column-stats bar): a single `count`/`distinct`/`min`/`max`(/`sum`/`avg`)
@@ -1167,6 +1186,20 @@ pub enum Event {
         db: String,
         coll: String,
         indexes: Vec<IndexInfo>,
+    },
+    /// One window of aggregation results, in response to `DocAggregate`.
+    DocAggregateReady {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        docs: Vec<Document>,
+    },
+    /// A query's explain plan, in response to `DocExplain`.
+    DocPlanReady {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        plan: DocPlan,
     },
     /// A document browse operation failed (list/find/schema/indexes), in response
     /// to a `Doc*` command. Surfaced inline in the browser rather than only as a

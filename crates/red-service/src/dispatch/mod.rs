@@ -2924,6 +2924,163 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 });
             }
 
+            Command::DocAggregate {
+                epoch,
+                db,
+                coll,
+                pipeline,
+            } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_doc().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a MongoDB connection".into()),
+                    );
+                    continue;
+                };
+                // Parse + validate the pipeline shape up front so a bad pipeline is
+                // a clean `DocError` rather than a failed aggregate in the spawn.
+                let stages = match driver.parse_ext_json(&pipeline) {
+                    Ok(red_core::doc::DocValue::Array(stages)) => stages,
+                    Ok(_) => {
+                        emit(
+                            &events,
+                            session_id,
+                            Event::DocError {
+                                epoch,
+                                message: "pipeline must be a JSON array of stages".into(),
+                            },
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        emit(
+                            &events,
+                            session_id,
+                            Event::DocError {
+                                epoch,
+                                message: e.to_string(),
+                            },
+                        );
+                        continue;
+                    }
+                };
+                // Share the browse's abort slot: only one read runs at a time, so a
+                // new aggregate (or a page fetch) supersedes the prior in-flight one.
+                let entry = state.inflight.entry(epoch).or_default();
+                if let Some(prev) = entry.doc_page.take() {
+                    prev.abort();
+                }
+                let abort = AbortSignal::new();
+                entry.doc_page = Some(abort.clone());
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver
+                        .aggregate(&db, &coll, &stages, DOC_PAGE_ROWS, &abort)
+                        .await
+                    {
+                        Ok(page) => {
+                            if abort.is_aborted() {
+                                return;
+                            }
+                            emit(
+                                &events,
+                                session_id,
+                                Event::DocAggregateReady {
+                                    epoch,
+                                    db,
+                                    coll,
+                                    docs: page.docs,
+                                },
+                            );
+                        }
+                        Err(red_core::RedError::Interrupted) => {}
+                        Err(e) => emit(
+                            &events,
+                            session_id,
+                            Event::DocError {
+                                epoch,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
+                });
+            }
+
+            Command::DocExplain {
+                epoch,
+                db,
+                coll,
+                filter,
+            } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_doc().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a MongoDB connection".into()),
+                    );
+                    continue;
+                };
+                let filter = match filter.as_deref().map(|f| driver.parse_ext_json(f)) {
+                    Some(Ok(f)) => Some(f),
+                    Some(Err(e)) => {
+                        emit(
+                            &events,
+                            session_id,
+                            Event::DocError {
+                                epoch,
+                                message: e.to_string(),
+                            },
+                        );
+                        continue;
+                    }
+                    None => None,
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let query = red_core::doc::FindQuery {
+                        db: db.clone(),
+                        coll: coll.clone(),
+                        filter,
+                        projection: None,
+                        sort: None,
+                        skip: 0,
+                        limit: None,
+                        batch: DOC_PAGE_ROWS,
+                    };
+                    match driver.explain(&query).await {
+                        Ok(plan) => emit(
+                            &events,
+                            session_id,
+                            Event::DocPlanReady {
+                                epoch,
+                                db,
+                                coll,
+                                plan,
+                            },
+                        ),
+                        Err(e) => emit(
+                            &events,
+                            session_id,
+                            Event::DocError {
+                                epoch,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
+                });
+            }
+
             Command::ColumnStats {
                 epoch,
                 column,

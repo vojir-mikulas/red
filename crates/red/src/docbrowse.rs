@@ -16,7 +16,9 @@ use gpui::{
     Context, Entity, FocusHandle, SharedString, UniformListScrollHandle, WeakEntity, Window, div,
     prelude::*, px,
 };
-use red_core::doc::{CollKind, CollectionInfo, DbInfo, DocSchema, DocValue, Document, IndexInfo};
+use red_core::doc::{
+    CollKind, CollectionInfo, DbInfo, DocPlan, DocSchema, DocValue, Document, IndexInfo,
+};
 use red_service::{Command, Epoch, SessionId};
 
 use crate::app::{ActiveConn, AppState, Phase};
@@ -26,6 +28,8 @@ use crate::app::{ActiveConn, AppState, Phase};
 enum DocPanel {
     /// The document grid (with the filter bar) — the default.
     Documents,
+    /// The aggregation-pipeline editor and its results.
+    Query,
     /// The inferred-schema table (per-field type distribution + present-ratio).
     Schema,
     /// The collection's indexes.
@@ -34,8 +38,9 @@ enum DocPanel {
 
 impl DocPanel {
     /// The panels in toolbar order, with their segment labels.
-    const ALL: [(DocPanel, &'static str); 3] = [
+    const ALL: [(DocPanel, &'static str); 4] = [
         (DocPanel::Documents, "Documents"),
+        (DocPanel::Query, "Query"),
         (DocPanel::Schema, "Schema"),
         (DocPanel::Indexes, "Indexes"),
     ];
@@ -106,6 +111,17 @@ struct CollView {
     schema: Option<DocSchema>,
     /// The collection's indexes, lazily fetched the first time Indexes opens.
     indexes: Option<Vec<IndexInfo>>,
+    /// The explain plan for the current filter, shown as a dismissible readout
+    /// on the Documents panel; `None` when not requested / dismissed.
+    explain: Option<DocPlan>,
+    /// The aggregation-pipeline editor (Query panel).
+    query_editor: Entity<CodeEditor>,
+    /// The Query panel's last result window, its sampled columns, and whether a
+    /// run is in flight.
+    query_docs: Vec<Document>,
+    query_columns: Vec<String>,
+    query_loading: bool,
+    query_scroll: UniformListScrollHandle,
     scroll: UniformListScrollHandle,
     list_focus: FocusHandle,
 }
@@ -131,6 +147,30 @@ impl CollView {
             }
         })
         .detach();
+        let query_editor = cx.new(|cx| {
+            CodeEditor::new(cx)
+                .soft_wrap(false)
+                .placeholder(
+                    "Aggregation pipeline, e.g. [ { \"$group\": … } ]. \u{2318}\u{21b5} runs.",
+                )
+                .a11y_label("MongoDB aggregation pipeline")
+        });
+        cx.subscribe(
+            &query_editor,
+            |this, _editor, event: &CodeEditorEvent, cx| {
+                if !matches!(event, CodeEditorEvent::Run) {
+                    return;
+                }
+                let session = match &this.phase {
+                    Phase::Connected(active) => active.doc_view.as_ref().map(|v| v.session),
+                    _ => None,
+                };
+                if let Some(session) = session {
+                    this.doc_run_aggregate(session, cx);
+                }
+            },
+        )
+        .detach();
         Self {
             db,
             coll,
@@ -146,6 +186,12 @@ impl CollView {
             filter: None,
             schema: None,
             indexes: None,
+            explain: None,
+            query_editor,
+            query_docs: Vec::new(),
+            query_columns: Vec::new(),
+            query_loading: false,
+            query_scroll: UniformListScrollHandle::new(),
             scroll: UniformListScrollHandle::new(),
             list_focus: cx.focus_handle(),
         }
@@ -285,6 +331,7 @@ impl AppState {
         }
         if let Some(current) = view.current.as_mut() {
             current.loading = false;
+            current.query_loading = false;
         }
         view.error = Some(message);
         cx.notify();
@@ -507,6 +554,131 @@ impl AppState {
             && current.coll == coll
         {
             current.indexes = Some(indexes);
+            cx.notify();
+        }
+    }
+
+    /// Run the Query panel's pipeline (the `CodeEditor` text) into the results
+    /// grid. Parsing/validation happens service-side, so an empty pipeline just
+    /// runs the identity aggregation.
+    fn doc_run_aggregate(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+        else {
+            return;
+        };
+        let epoch = view.epoch;
+        let Some(current) = view.current.as_mut() else {
+            return;
+        };
+        let pipeline = current.query_editor.read(cx).content();
+        let pipeline = if pipeline.trim().is_empty() {
+            "[]".to_string()
+        } else {
+            pipeline
+        };
+        current.query_loading = true;
+        let (db, coll) = (current.db.clone(), current.coll.clone());
+        self.service.send_to(
+            session,
+            Command::DocAggregate {
+                epoch,
+                db,
+                coll,
+                pipeline,
+            },
+        );
+        cx.notify();
+    }
+
+    /// Run `explain` on the current filter and show the plan readout.
+    fn doc_run_explain(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+        else {
+            return;
+        };
+        let epoch = view.epoch;
+        let Some(current) = view.current.as_ref() else {
+            return;
+        };
+        let (db, coll, filter) = (
+            current.db.clone(),
+            current.coll.clone(),
+            current.filter.clone(),
+        );
+        self.service.send_to(
+            session,
+            Command::DocExplain {
+                epoch,
+                db,
+                coll,
+                filter,
+            },
+        );
+        cx.notify();
+    }
+
+    /// Dismiss the explain readout.
+    fn doc_dismiss_explain(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(current) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+            .and_then(|v| v.current.as_mut())
+        {
+            current.explain = None;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn on_doc_aggregate(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        docs: Vec<Document>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.conn_mut(session).and_then(|a| a.doc_view.as_mut()) else {
+            return;
+        };
+        if view.epoch != epoch {
+            return;
+        }
+        if let Some(current) = view.current.as_mut()
+            && current.db == db
+            && current.coll == coll
+        {
+            current.query_columns = sample_columns(&docs);
+            current.query_docs = docs;
+            current.query_loading = false;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn on_doc_plan(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        plan: DocPlan,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.conn_mut(session).and_then(|a| a.doc_view.as_mut()) else {
+            return;
+        };
+        if view.epoch != epoch {
+            return;
+        }
+        if let Some(current) = view.current.as_mut()
+            && current.db == db
+            && current.coll == coll
+        {
+            current.explain = Some(plan);
             cx.notify();
         }
     }
@@ -743,6 +915,7 @@ impl AppState {
         let header = self.render_doc_header(v.session, current, theme, view);
         let body = match current.panel {
             DocPanel::Documents => self.render_doc_documents(v.session, current, theme, view),
+            DocPanel::Query => self.render_doc_query(v.session, current, theme, view),
             DocPanel::Schema => render_doc_schema_panel(current, theme),
             DocPanel::Indexes => render_doc_indexes_panel(current, theme),
         };
@@ -820,6 +993,7 @@ impl AppState {
             };
 
             let run_view = view.clone();
+            let explain_view = view.clone();
             let prev_view = view.clone();
             let next_view = view.clone();
             row = row
@@ -836,6 +1010,16 @@ impl AppState {
                         .on_click(move |_, _, cx| {
                             run_view
                                 .update(cx, |this, cx| this.doc_apply_filter(session, cx))
+                                .ok();
+                        }),
+                )
+                .child(
+                    Button::new("doc-explain", "Explain")
+                        .size(ButtonSize::Sm)
+                        .variant(ButtonVariant::Ghost)
+                        .on_click(move |_, _, cx| {
+                            explain_view
+                                .update(cx, |this, cx| this.doc_run_explain(session, cx))
                                 .ok();
                         }),
                 )
@@ -873,8 +1057,8 @@ impl AppState {
         row.into_any_element()
     }
 
-    /// The Documents panel: the sampled-column grid, with the inspector docked
-    /// right when a row is open.
+    /// The Documents panel: the explain readout (when requested) over the
+    /// sampled-column grid, with the inspector docked right when a row is open.
     fn render_doc_documents(
         &self,
         session: SessionId,
@@ -883,7 +1067,7 @@ impl AppState {
         view: &WeakEntity<AppState>,
     ) -> gpui::AnyElement {
         let grid = self.render_doc_grid(session, current, theme, view);
-        if let Some(sel) = current.inspector.and_then(|i| current.docs.get(i)) {
+        let grid_area = if let Some(sel) = current.inspector.and_then(|i| current.docs.get(i)) {
             div()
                 .flex()
                 .flex_1()
@@ -901,7 +1085,91 @@ impl AppState {
                 .into_any_element()
         } else {
             div().flex_1().min_h(px(0.)).child(grid).into_any_element()
-        }
+        };
+
+        let explain = current
+            .explain
+            .as_ref()
+            .map(|plan| render_explain_box(session, plan, theme, view));
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
+            .children(explain)
+            .child(grid_area)
+            .into_any_element()
+    }
+
+    /// The Query panel: the aggregation-pipeline editor over its results grid.
+    fn render_doc_query(
+        &self,
+        session: SessionId,
+        current: &CollView,
+        theme: &Theme,
+        view: &WeakEntity<AppState>,
+    ) -> gpui::AnyElement {
+        let run_view = view.clone();
+        let toolbar = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .child(
+                div()
+                    .flex_1()
+                    .text_color(theme.text_muted)
+                    .child("Aggregation pipeline (extended JSON array of stages)"),
+            )
+            .child(
+                Button::new("doc-run-agg", "Run")
+                    .size(ButtonSize::Sm)
+                    .variant(ButtonVariant::Primary)
+                    .disabled(current.query_loading)
+                    .on_click(move |_, _, cx| {
+                        run_view
+                            .update(cx, |this, cx| this.doc_run_aggregate(session, cx))
+                            .ok();
+                    }),
+            );
+
+        let editor = div()
+            .h(px(160.))
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(current.query_editor.clone());
+
+        let results = if current.query_docs.is_empty() {
+            doc_centered_hint(
+                if current.query_loading {
+                    "Running..."
+                } else {
+                    "Run a pipeline to see results."
+                },
+                theme,
+            )
+        } else {
+            render_docs_table(
+                "doc-query-grid",
+                &current.query_docs,
+                &current.query_columns,
+                &current.query_scroll,
+                theme,
+            )
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
+            .child(toolbar)
+            .child(editor)
+            .child(results)
+            .into_any_element()
     }
 
     fn render_doc_grid(
@@ -1201,6 +1469,131 @@ fn render_doc_indexes_panel(current: &CollView, theme: &Theme) -> gpui::AnyEleme
         .text_size(theme.scale(12.))
         .child(doc_row3("Index", "Keys", "Properties", theme, true))
         .children(rows)
+        .into_any_element()
+}
+
+/// A read-only sampled-column table over a document window, used by the Query
+/// results panel. (The browse grid is `render_doc_grid`, which additionally
+/// drives the inspector selection.)
+fn render_docs_table(
+    id: &'static str,
+    docs: &[Document],
+    columns: &[String],
+    scroll: &UniformListScrollHandle,
+    theme: &Theme,
+) -> gpui::AnyElement {
+    let cols: Vec<Column> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            if i == 0 {
+                Column::new(name.clone()).width(px(220.))
+            } else {
+                Column::new(name.clone()).flex()
+            }
+        })
+        .collect();
+    let render_docs = Rc::new(docs.to_vec());
+    let render_cols = Rc::new(columns.to_vec());
+    let text = theme.text;
+    let faint = theme.text_faint;
+    Table::<()>::new(id, cols)
+        .row_count(docs.len())
+        .grid_lines(true)
+        .text_size(theme.scale(12.))
+        .track_scroll(scroll)
+        .render_row(move |ix, _, _| {
+            let Some(doc) = render_docs.get(ix) else {
+                return Vec::new();
+            };
+            render_cols
+                .iter()
+                .map(|col| match cell_string(doc, col) {
+                    Some(t) => div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(text)
+                        .child(t)
+                        .into_any_element(),
+                    None => div().text_color(faint).child("\u{2014}").into_any_element(),
+                })
+                .collect()
+        })
+        .into_any_element()
+}
+
+/// The explain readout strip: a headline that flags a `COLLSCAN` (red) or names
+/// the index used (green), the examined/returned counts, the winning-plan stage
+/// chain, and a Close button.
+fn render_explain_box(
+    session: SessionId,
+    plan: &DocPlan,
+    theme: &Theme,
+    view: &WeakEntity<AppState>,
+) -> gpui::AnyElement {
+    let (headline, color) = if plan.collscan {
+        ("COLLSCAN - no index used".to_string(), theme.red)
+    } else if let Some(ix) = &plan.index_used {
+        (format!("uses index {ix}"), theme.green)
+    } else {
+        ("indexed plan".to_string(), theme.text)
+    };
+    let stats = match (plan.docs_examined, plan.n_returned) {
+        (Some(e), Some(r)) => format!("examined {e}, returned {r}"),
+        (Some(e), None) => format!("examined {e}"),
+        _ => String::new(),
+    };
+    let stage_line = plan
+        .stages
+        .iter()
+        .map(|s| match &s.detail {
+            Some(detail) => format!("{}({detail})", s.stage),
+            None => s.stage.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join("  \u{203a}  ");
+
+    let close_view = view.clone();
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .px_3()
+        .py_2()
+        .flex_shrink_0()
+        .bg(theme.bg_panel)
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(color)
+                        .child(headline),
+                )
+                .child(div().flex_1())
+                .child(div().text_color(theme.text_muted).child(stats))
+                .child(
+                    Button::new("doc-explain-close", "Close")
+                        .size(ButtonSize::Sm)
+                        .variant(ButtonVariant::Ghost)
+                        .on_click(move |_, _, cx| {
+                            close_view
+                                .update(cx, |this, cx| this.doc_dismiss_explain(session, cx))
+                                .ok();
+                        }),
+                ),
+        )
+        .child(
+            div()
+                .text_color(theme.text_muted)
+                .text_size(theme.scale(11.))
+                .child(stage_line),
+        )
         .into_any_element()
 }
 
