@@ -21,3 +21,6 @@ reqwest.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+
+[lints]
+workspace = true

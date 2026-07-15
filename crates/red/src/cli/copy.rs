@@ -14,18 +14,18 @@ use std::collections::HashSet;
 
 use clap::{Args, ValueEnum};
 use red_core::{Column, ColumnMap, ColumnMeta, CopyMode, DbKind, ObjectKind, TableRef};
-use red_service::{Command, Event};
+use red_service::{Command, Event, OpId};
 
 use super::{
-    backend_gone, connect_session, note, progress, recv, resolve, shutdown, start, EventRx,
-    EXIT_OK, EXIT_QUERY, EXIT_USAGE, PRIMARY, TARGET,
+    EXIT_OK, EXIT_QUERY, EXIT_USAGE, EventRx, PRIMARY, TARGET, backend_gone, connect_session, note,
+    progress, recv, resolve, shutdown, start,
 };
 use crate::schema::quote_ident;
 
 /// Correlation id for the single copy/migrate job a CLI invocation runs.
-const JOB_ID: u64 = 1;
+const JOB_ID: OpId = OpId::new(1);
 /// Epoch for the source result the copy opens.
-const SOURCE_EPOCH: u64 = 1;
+const SOURCE_EPOCH: red_service::Epoch = red_service::Epoch::new(1);
 
 #[derive(Args)]
 pub struct CopyArgs {
@@ -547,7 +547,7 @@ fn target_table_names(
                     .flat_map(|s| s.objects.iter())
                     .filter(|o| matches!(o.kind, ObjectKind::Table))
                     .map(|o| o.name.to_ascii_lowercase())
-                    .collect())
+                    .collect());
             }
             Some(Event::Error(e)) => {
                 eprintln!("cannot inspect target: {e}");

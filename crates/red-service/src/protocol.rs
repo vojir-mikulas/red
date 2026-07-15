@@ -14,14 +14,14 @@ use std::time::Duration;
 
 use red_core::kv::{
     ClientInfo, CollectionKind, KeyMeta, KvCollectionPage, KvEdit, KvScanPage, KvStreamActionReq,
-    KvStreamPage, KvValue, PendingEntry, RecycledKey, RespValue, ScanBudget, ScanCursor,
+    KvStreamPage, KvType, KvValue, PendingEntry, RecycledKey, RespValue, ScanBudget, ScanCursor,
     SlowlogEntry, StreamAction, StreamConsumer, StreamGroup,
 };
 use red_core::{
     ActivityId, ActivityKind, ActivityStatus, AiLimits, AiTier, Column, ColumnMap, ColumnMeta,
     ColumnStats, ConnectionConfig, CopyMode, EditOp, ExportFormat, FkEdge, FkJoin, ImportFormat,
     KeySpec, LookupRow, PlanStep, QueryOptions, QueryPlan, ResultFilter, RowWindow, SchemaMeta,
-    TableDetail, TableRef, UpdateState, Value,
+    SortDirection, StatsFlags, TableDetail, TableRef, UpdateState, Value,
 };
 
 /// Identifies one keep-alive backend session. Minted UI-side at connect start so
@@ -30,7 +30,114 @@ use red_core::{
 /// workspace identity doesn't churn. The service keys its `HashMap<SessionId,
 /// SessionState>` by this; the UI keys its parked-workspace map by it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SessionId(pub u64);
+pub struct SessionId(u64);
+
+impl SessionId {
+    /// Name/mint a session by its raw id. `const` so the CLI's fixed PRIMARY/TARGET
+    /// slots and tests can stay compile-time constants.
+    pub const fn new(raw: u64) -> SessionId {
+        SessionId(raw)
+    }
+    /// The raw id, for tracing/display and the channel envelope's routing key.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Correlates one long-running job — an export, a cross-table copy, a whole-schema
+/// migration, or an import — with its progress and completion events. Minted UI-side
+/// per job; a distinct id-space from a result [`SessionId`] and from a paging epoch,
+/// so a job map can't be keyed by the wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct OpId(u64);
+
+impl OpId {
+    /// Mint an id from a raw counter value.
+    pub const fn new(raw: u64) -> OpId {
+        OpId(raw)
+    }
+    /// The raw value, for tracing/display.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Identifies one assistant chat. Minted UI-side per chat; the backend keys its
+/// per-conversation state (message history, cancel token, pending permission) by
+/// it. A distinct id-space from a result epoch and from [`OpId`], so those maps
+/// can't be cross-keyed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ConversationId(u64);
+
+impl ConversationId {
+    /// Mint an id from a raw counter value.
+    pub const fn new(raw: u64) -> ConversationId {
+        ConversationId(raw)
+    }
+    /// The raw value, for tracing/display.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ConversationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// One result/browse generation. Minted monotonically by `next_epoch`; the UI
+/// stamps it into the `Command` that opens the work and the backend echoes it on
+/// every reply, so a stale reply (tab closed / re-sorted / scrollbar flung) is
+/// recognised and dropped. A supersede token — compared for equality and used as a
+/// map key, never arithmetic. A distinct id-space from [`SessionId`]/[`OpId`]/
+/// [`ConversationId`], so those maps can't be cross-keyed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct Epoch(u64);
+
+impl Epoch {
+    /// The sentinel "before any result" value some UI state initialises to.
+    pub const ZERO: Epoch = Epoch(0);
+    /// Mint/name an epoch from a raw counter value.
+    pub const fn new(raw: u64) -> Epoch {
+        Epoch(raw)
+    }
+    /// The raw value, for tracing/display.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for Epoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Identifies one write-approval prompt awaiting the user's Allow/Deny. Minted by
+/// the permission-parking path; the UI echoes it back on `AiPermission` so the
+/// right decision sink fires. Keys the `pending_perms`/`pending` maps — a distinct
+/// id-space from [`ConversationId`] (a request lives within a conversation but
+/// isn't one), so the two can't be transposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RequestId(u64);
+
+impl RequestId {
+    /// Mint an id from a raw counter value.
+    pub const fn new(raw: u64) -> RequestId {
+        RequestId(raw)
+    }
+    /// The raw value, for tracing/display.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// UI → service. Routed to a session by the channel envelope's [`SessionId`]
 /// (see the module docs). `Connect` *creates* the session its envelope names;
@@ -98,13 +205,13 @@ pub enum Command {
     /// `joins` (Track B7, inline FK expansion) decorates a table browse with extra,
     /// dotted-aliased columns pulled from referenced tables: the backend wraps the
     /// (already-filtered) base in `SELECT _red_base.*, <ref cols> FROM (base) AS
-    /// _red_base LEFT JOIN …` (see [`DatabaseDriver::fk_join_wrap`]). Base columns
+    /// _red_base LEFT JOIN …` (see `DatabaseDriver::fk_join_wrap`). Base columns
     /// stay first, so their positions/key/sort are unaffected; the unique-target gate
     /// keeps the row count identical, so count/keyset/paging are unchanged. Empty for
     /// an unexpanded browse, editor SQL, or an engine without relational FKs.
     OpenResult {
         sql: String,
-        epoch: u64,
+        epoch: Epoch,
         table: Option<(String, String)>,
         sort: Option<SortKey>,
         filter: Option<ResultFilter>,
@@ -116,14 +223,14 @@ pub enum Command {
     FetchPage {
         offset: usize,
         limit: usize,
-        epoch: u64,
+        epoch: Epoch,
     },
     /// Fetch one run window of a keyset-keyed open result: extend the
     /// grid's resident run from a boundary key, or jump to an ordinal. Replied
     /// with `ResultRunLoaded`, echoing `fetch`/`seq` so the grid can drop a
     /// reply its buffer has moved past.
     FetchRun {
-        epoch: u64,
+        epoch: Epoch,
         fetch: RunFetch,
         limit: usize,
         seq: u64,
@@ -138,15 +245,15 @@ pub enum Command {
     CopyRows {
         offset: usize,
         limit: usize,
-        epoch: u64,
-        id: u64,
+        epoch: Epoch,
+        id: OpId,
     },
     /// Drop an open result (its query tab closed, or it was re-sorted into a new
     /// epoch). Unknown epochs are a no-op. Also closes a `KvFetchScan` browse:
     /// `epoch` is a shared id space (see `InFlight::abort_all`), so this
     /// generically stops an in-flight Redis scan too, not just a SQL result.
     CloseResult {
-        epoch: u64,
+        epoch: Epoch,
     },
     /// One page of a Redis keyspace scan (see docs/plans/redis.md's R1):
     /// `SCAN` (looping, budgeted, optionally `MATCH`-filtered on `pattern` and
@@ -161,9 +268,12 @@ pub enum Command {
     /// the global `Event::Error` on failure (not a SQL connection, or the
     /// engine round-trip itself failed).
     KvFetchScan {
-        epoch: u64,
+        epoch: Epoch,
         pattern: Option<String>,
-        type_filter: Option<String>,
+        /// The `TYPE`-filter as the typed enum, not a re-stringified label: the
+        /// driver maps it to the wire `TYPE` arg at the seam (see the dispatch
+        /// handler), so an invalid label can never reach the wire.
+        type_filter: Option<KvType>,
         /// When set, keep only keys whose *value* contains this substring
         /// (case-insensitive, string values only). A value search Redis can't
         /// push down, so the driver reads scanned values and filters.
@@ -176,14 +286,14 @@ pub enum Command {
     /// `None` when the key doesn't exist — that's a normal outcome, not an
     /// `Event::Error`.
     KvProbeKey {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
     },
     /// The keyspace's total key count (`DBSIZE`), for the unfiltered browse's
     /// header stat. Replied with `KvDbSizeReady`; failures are swallowed
     /// (a missing header stat isn't worth a toast), like `LoadForeignKeys`.
     KvDbSize {
-        epoch: u64,
+        epoch: Epoch,
     },
     /// One key's value, for the detail inspector opened by selecting a row in
     /// the keyspace browser. `epoch` is the browse's epoch, used only to
@@ -192,7 +302,7 @@ pub enum Command {
     /// of the *reply* is instead checked UI-side by comparing `key`, since the
     /// inspector can outlive a scan restart. Replied with `KvValueReady`.
     KvReadValue {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
     },
     /// The full, uncapped bytes of a string key, for the inspector's "Load full
@@ -202,7 +312,7 @@ pub enum Command {
     /// handles it with no new event; `epoch` scopes cancellation like
     /// `KvReadValue`.
     KvReadStringFull {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
     },
     /// One page of a big hash/set/zset's elements, for the inspector's
@@ -210,7 +320,7 @@ pub enum Command {
     /// `KvFetchScan`: `cursor` is the caller-supplied `next_cursor` from the
     /// previous `KvCollectionPageReady`. Replied with `KvCollectionPageReady`.
     KvReadCollectionPage {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
         kind: CollectionKind,
         cursor: u64,
@@ -220,7 +330,7 @@ pub enum Command {
     /// `KvDriver::read_list_window`'s docs on why not an arbitrary offset).
     /// Replied with `KvListWindowReady`.
     KvReadListWindow {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
         from_head: bool,
         count: usize,
@@ -232,7 +342,7 @@ pub enum Command {
     /// ID loaded so far), or `None` to start at the newest entry. Replied with
     /// `KvStreamPageReady`.
     KvReadStreamPage {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
         before: Option<String>,
         count: usize,
@@ -243,20 +353,20 @@ pub enum Command {
     /// other inspector reads; the reply's staleness is checked UI-side by
     /// `key`. Replied with `KvStreamGroupsReady`.
     KvStreamGroups {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
     },
     /// One group's consumers (`XINFO CONSUMERS`). Replied with
     /// `KvStreamConsumersReady`.
     KvStreamConsumers {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
         group: String,
     },
     /// Up to `count` of a group's pending entries (`XPENDING ... - + count`).
     /// Replied with `KvStreamPendingReady`.
     KvStreamPending {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
         group: String,
         count: usize,
@@ -268,7 +378,7 @@ pub enum Command {
     /// `KvStreamActionDone` (echoing `key`/`group` so the UI refreshes that
     /// group's consumers+pending), or the global `Event::Error` on failure.
     KvStreamAction {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
         group: String,
         action: KvStreamActionReq,
@@ -280,7 +390,7 @@ pub enum Command {
     /// `RespValue::Error`, not `Event::Error` — that's reserved for a
     /// genuine transport/connection failure or the read-only gate.
     KvCommand {
-        epoch: u64,
+        epoch: Epoch,
         argv: Vec<String>,
         /// A per-console monotonic request id, echoed back on `KvCommandResult`
         /// so the console matches each reply to the exact command that issued it
@@ -294,7 +404,7 @@ pub enum Command {
     /// summary `KvImportDone` (not per-command output); `epoch` scopes it to the
     /// browse tab that started it, for the follow-up refresh.
     KvImport {
-        epoch: u64,
+        epoch: Epoch,
         commands: Vec<Vec<String>>,
     },
     /// One in-grid edit (see `red_core::kv::KvEdit`), gated by `read_only`
@@ -303,7 +413,7 @@ pub enum Command {
     /// this is ever sent. Replied with `KvEditApplied`, echoing `edit` back,
     /// or the global `Event::Error` on failure.
     KvApplyEdit {
-        epoch: u64,
+        epoch: Epoch,
         edit: KvEdit,
     },
     /// Restore keys captured before a delete (the recycle bin's undo). Each
@@ -311,7 +421,7 @@ pub enum Command {
     /// them and replies with `KvKeysRestored` (or the global `Event::Error`).
     /// Gated by `read_only` like any other write.
     KvRestoreKeys {
-        epoch: u64,
+        epoch: Epoch,
         keys: Vec<RecycledKey>,
     },
     /// Copy keys from this (source) connection to another open Redis connection
@@ -328,27 +438,27 @@ pub enum Command {
     /// epoch-scoped teardown every other open Kv/SQL thing uses — see that
     /// command's doc comment).
     KvSubscribe {
-        epoch: u64,
+        epoch: Epoch,
         pattern: String,
     },
     /// Read the server's `notify-keyspace-events` setting, for the keyspace-
     /// notification watcher (see docs/plans/redis.md's "keyspace-notification
     /// live tooling" gap). Replied with `KvNotifyConfigReady`.
     KvNotifyConfig {
-        epoch: u64,
+        epoch: Epoch,
     },
     /// Set `notify-keyspace-events` (enable/disable keyspace notifications),
     /// gated by `read_only` (checked service-side, defense in depth alongside
     /// the driver). On success the service re-reads and replies with a fresh
     /// `KvNotifyConfigReady`.
     KvSetNotifyConfig {
-        epoch: u64,
+        epoch: Epoch,
         flags: String,
     },
     /// Fetch the server's slow-command log (see docs/plans/redis.md's "slowlog
     /// viewer" gap). `epoch` scopes cancellation; replied with `KvSlowlogReady`.
     KvSlowlog {
-        epoch: u64,
+        epoch: Epoch,
         count: usize,
     },
     /// Clear the slow log (`SLOWLOG RESET`), gated by `read_only` (checked
@@ -356,27 +466,27 @@ pub enum Command {
     /// service replies with an empty `KvSlowlogReady` so the UI updates without
     /// a separate reply type.
     KvSlowlogReset {
-        epoch: u64,
+        epoch: Epoch,
     },
     /// Start a live `MONITOR` firehose (see docs/plans/redis.md's "MONITOR-based
     /// live command profiler" gap). Like `KvSubscribe`, `epoch` identifies the
     /// stream and lines push back as `KvMonitorLine` until `CloseResult { epoch }`
     /// tears it down.
     KvMonitor {
-        epoch: u64,
+        epoch: Epoch,
     },
     /// Fetch the connected clients (`CLIENT LIST`) for the diagnostics panel's
     /// clients viewer (see docs/plans/redis.md's "CLIENT LIST viewer" gap).
     /// Replied with `KvClientListReady`.
     KvClientList {
-        epoch: u64,
+        epoch: Epoch,
     },
     /// Disconnect a client by id (`CLIENT KILL ID <id>`), gated by `read_only`
     /// (checked service-side, defense in depth alongside the driver). On success
     /// the service refetches and replies with a fresh `KvClientListReady` so the
     /// viewer updates without a separate reply type.
     KvClientKill {
-        epoch: u64,
+        epoch: Epoch,
         id: i64,
     },
     /// Compute a column's aggregate summary over the open result's *filtered* SQL
@@ -389,10 +499,9 @@ pub enum Command {
     /// with `ColumnStatsReady` (or the pane-scoped `ColumnStatsFailed`); cancellable
     /// and epoch-superseded like a page fetch.
     ColumnStats {
-        epoch: u64,
+        epoch: Epoch,
         column: String,
-        numeric: bool,
-        distinct: bool,
+        flags: StatsFlags,
     },
     /// Fetch a bounded list of a referenced table's existing ids (+ an optional label
     /// column) for the in-cell foreign-key picker (Track B8). `epoch` scopes the reply
@@ -402,7 +511,7 @@ pub enum Command {
     /// columns caches each list separately. Only identifiers reach the SQL; the picker
     /// searches this page client-side. Superseded/cancellable like a page fetch.
     FetchLookup {
-        epoch: u64,
+        epoch: Epoch,
         target: TableRef,
         id_column: String,
         label_column: Option<String>,
@@ -427,7 +536,7 @@ pub enum Command {
     /// `BatchApplied` (then the UI patches/refetches) or `BatchFailed` (scoped to the
     /// result pane), never a global error toast.
     ApplyBatch {
-        epoch: u64,
+        epoch: Epoch,
         ops: Vec<EditOp>,
     },
     /// Run `EXPLAIN` (or `EXPLAIN ANALYZE` when `analyze`) for `sql` and report a
@@ -437,7 +546,7 @@ pub enum Command {
     Explain {
         sql: String,
         analyze: bool,
-        epoch: u64,
+        epoch: Epoch,
     },
     /// Stream an open result to `path` in `format`, row-by-row. `epoch` selects
     /// which open result (the active tab's grid); `id` identifies the export so
@@ -446,13 +555,13 @@ pub enum Command {
     Export {
         format: ExportFormat,
         path: PathBuf,
-        epoch: u64,
-        id: u64,
+        epoch: Epoch,
+        id: OpId,
     },
     /// Abort an in-flight export by `id` (the toast's Cancel). The partial file is
     /// removed so no truncated CSV/JSON is left behind.
     CancelExport {
-        id: u64,
+        id: OpId,
     },
     /// Stream a CSV/JSONL file at `path` into `target`, projecting each source row's
     /// cells to the target columns per `mapping`, inserting in chunks of `chunk_size`
@@ -467,12 +576,12 @@ pub enum Command {
         target: TableRef,
         mapping: Vec<ColumnMap>,
         chunk_size: usize,
-        id: u64,
+        id: OpId,
     },
     /// Abort an in-flight import by `id` (the toast's Cancel). Rows committed in
     /// earlier chunks remain.
     CancelImport {
-        id: u64,
+        id: OpId,
     },
     /// Describe a copy **target** table's columns (name + declared type) so the UI
     /// can auto-map a source result's columns onto it by name before any write,
@@ -481,7 +590,7 @@ pub enum Command {
     /// for a cross-connection copy). `id` correlates the `CopyTargetColumns` reply;
     /// a describe failure comes back as `CopyFailed`.
     CopyTargetColumns {
-        id: u64,
+        id: OpId,
         target: TableRef,
     },
     /// Stream a (filtered/sorted) open result straight into another table: the
@@ -503,8 +612,8 @@ pub enum Command {
     /// no-op if the table already exists. `None` requires the target to pre-exist (the
     /// original same-shape copy).
     CopyToTable {
-        id: u64,
-        source_epoch: u64,
+        id: OpId,
+        source_epoch: Epoch,
         target: TableRef,
         target_session: SessionId,
         mapping: Vec<ColumnMap>,
@@ -514,7 +623,7 @@ pub enum Command {
     /// Abort an in-flight copy by `id` (the toast's Cancel). Rows committed in
     /// earlier chunks remain (per-chunk commit, like import).
     CancelCopy {
-        id: u64,
+        id: OpId,
     },
     /// Migrate **many** tables in one job: the whole-database headline. The
     /// envelope's [`SessionId`] is the **source** session; `source_schema` names the
@@ -526,7 +635,7 @@ pub enum Command {
     /// job's lifetime; it reuses the `Copy*` progress/terminal events and a
     /// `CancelCopy { id }`. One window resident at a time, committing per chunk.
     MigrateTables {
-        id: u64,
+        id: OpId,
         source_schema: Option<String>,
         tables: Vec<String>,
         target_session: SessionId,
@@ -540,7 +649,7 @@ pub enum Command {
     ImportColumns {
         path: PathBuf,
         format: ImportFormat,
-        id: u64,
+        id: OpId,
     },
     /// Abort the active query / drop its cursor.
     Cancel,
@@ -586,14 +695,14 @@ pub enum Command {
     /// rather than every turn following one global provider. An empty or unknown id
     /// resolves to the default agent / a clear `AiError`.
     AiTurn {
-        conversation_id: u64,
+        conversation_id: ConversationId,
         agent: String,
         message: String,
         context: AiContext,
     },
     /// Abort an in-flight assistant turn by `conversation_id` (the panel's Stop).
     AiCancel {
-        conversation_id: u64,
+        conversation_id: ConversationId,
     },
     /// Forget all per-conversation backend state when the UI closes or deletes a
     /// conversation: the API-key path's running history/cancel/tool tally and the
@@ -601,14 +710,14 @@ pub enum Command {
     /// session (a reopened conversation comes back under a fresh id, re-seeded), so
     /// this keeps the backend's memory bounded by what's actually open.
     AiForget {
-        conversation_id: u64,
+        conversation_id: ConversationId,
     },
     /// Answer a pending agent tool-permission prompt (M-S2, subscription path).
     /// `allow` runs the tool; otherwise it's denied. Routed to the parked request
     /// by `request_id` so a stale answer for a superseded prompt is dropped.
     AiPermission {
-        conversation_id: u64,
-        request_id: u64,
+        conversation_id: ConversationId,
+        request_id: RequestId,
         allow: bool,
     },
     /// Start an interactive subscription sign-in (or account switch) for an ACP
@@ -650,7 +759,7 @@ pub enum Command {
     /// `AiConfigOptionsAvailable`. The agent re-advertises the refreshed set, which
     /// comes back as another `AiConfigOptionsAvailable`. A no-op on the API-key path.
     AiSetConfigOption {
-        conversation_id: u64,
+        conversation_id: ConversationId,
         config_id: String,
         value: String,
     },
@@ -732,27 +841,27 @@ pub enum Event {
     /// next `KvFetchScan`'s `cursor` (see that command's docs for why the
     /// service holds no scan position itself).
     KvScanPage {
-        epoch: u64,
+        epoch: Epoch,
         page: KvScanPage,
     },
     /// One key's metadata, in response to `KvProbeKey`. `meta: None` means
     /// the key doesn't exist — a normal outcome the UI shows inline ("no
     /// such key"), not an `Event::Error`.
     KvKeyProbed {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
         meta: Option<KeyMeta>,
     },
     /// The keyspace's total key count, in response to `KvDbSize`.
     KvDbSizeReady {
-        epoch: u64,
+        epoch: Epoch,
         count: u64,
     },
     /// One key's value, in response to `KvReadValue`. `value: None` means the
     /// key doesn't exist (it may have been deleted between the browse's
     /// `SCAN` and this fetch).
     KvValueReady {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
         value: Option<KvValue>,
     },
@@ -761,20 +870,20 @@ pub enum Event {
     /// matching key rather than only as a detached toast, so a stuck
     /// "Loading…" can't outlive a failed read.
     KvValueError {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
         message: String,
     },
     /// One page of a big collection's elements, in response to
     /// `KvReadCollectionPage`.
     KvCollectionPageReady {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
         page: KvCollectionPage,
     },
     /// A windowed slice of a big list, in response to `KvReadListWindow`.
     KvListWindowReady {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
         from_head: bool,
         values: Vec<String>,
@@ -784,27 +893,27 @@ pub enum Event {
     /// feeds back as the next `KvReadStreamPage`'s `before` to page further
     /// back in time.
     KvStreamPageReady {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
         page: KvStreamPage,
     },
     /// A stream's consumer groups, in response to `KvStreamGroups`. `key`
     /// lets the UI drop a reply for a key the inspector has since moved off.
     KvStreamGroupsReady {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
         groups: Vec<StreamGroup>,
     },
     /// One group's consumers, in response to `KvStreamConsumers`.
     KvStreamConsumersReady {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
         group: String,
         consumers: Vec<StreamConsumer>,
     },
     /// One group's pending entries, in response to `KvStreamPending`.
     KvStreamPendingReady {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
         group: String,
         pending: Vec<PendingEntry>,
@@ -813,7 +922,7 @@ pub enum Event {
     /// is how many entries it affected; `action` says which verb. The UI
     /// re-requests the group's consumers+pending on this to reflect the change.
     KvStreamActionDone {
-        epoch: u64,
+        epoch: Epoch,
         key: String,
         group: String,
         action: StreamAction,
@@ -823,7 +932,7 @@ pub enum Event {
     /// `argv` back so a console tracking several in-flight lines can match
     /// the reply to its history entry.
     KvCommandResult {
-        epoch: u64,
+        epoch: Epoch,
         argv: Vec<String>,
         result: RespValue,
         /// The `req` from the `KvCommand` that produced this reply, so the
@@ -835,7 +944,7 @@ pub enum Event {
     /// gate). `first_error` is the first failure's message, for the summary
     /// toast. `epoch` is the browse tab that started it, so the UI refreshes it.
     KvImportDone {
-        epoch: u64,
+        epoch: Epoch,
         ok: usize,
         failed: usize,
         first_error: Option<String>,
@@ -845,7 +954,7 @@ pub enum Event {
     /// (patch the inspector's loaded value, rename/remove a browse row, …)
     /// without a round trip back through `KvReadValue`.
     KvEditApplied {
-        epoch: u64,
+        epoch: Epoch,
         edit: KvEdit,
     },
     /// Keys were captured into the recycle bin just before a delete succeeded
@@ -853,13 +962,13 @@ pub enum Event {
     /// for undo and offers a "restore" toast; sends them back via
     /// `KvRestoreKeys`. Emitted just before the matching `KvEditApplied`.
     KvKeysRecycled {
-        epoch: u64,
+        epoch: Epoch,
         keys: Vec<RecycledKey>,
     },
     /// A recycle-bin restore finished, in response to `KvRestoreKeys`. `count`
     /// is how many keys came back; the UI re-scans the browse to show them.
     KvKeysRestored {
-        epoch: u64,
+        epoch: Epoch,
         count: u64,
     },
     /// A cross-server copy finished, in response to `KvCopyKeys`. Emitted with a
@@ -872,7 +981,7 @@ pub enum Event {
     /// One Pub/Sub message, pushed for as long as the `KvSubscribe { epoch,
     /// .. }` that started it stays open.
     KvMessage {
-        epoch: u64,
+        epoch: Epoch,
         channel: String,
         payload: String,
     },
@@ -880,26 +989,26 @@ pub enum Event {
     /// (or a `KvSetNotifyConfig` that then re-read it). Empty `value` means
     /// keyspace notifications are disabled.
     KvNotifyConfigReady {
-        epoch: u64,
+        epoch: Epoch,
         value: String,
     },
     /// The slow-command log, in response to `KvSlowlog` (or an empty list in
     /// response to a successful `KvSlowlogReset`). Newest entry first.
     KvSlowlogReady {
-        epoch: u64,
+        epoch: Epoch,
         entries: Vec<SlowlogEntry>,
     },
     /// One `MONITOR` line, pushed for as long as the `KvMonitor { epoch, .. }`
     /// that started it stays open. `line` is the server's raw preformatted
     /// firehose line.
     KvMonitorLine {
-        epoch: u64,
+        epoch: Epoch,
         line: String,
     },
     /// The connected clients, in response to `KvClientList` (or a `KvClientKill`
     /// that then refetched).
     KvClientListReady {
-        epoch: u64,
+        epoch: Epoch,
         clients: Vec<ClientInfo>,
     },
     /// A result opened: its columns and total row count (for `OpenResult`).
@@ -910,7 +1019,7 @@ pub enum Event {
     ResultReady {
         columns: Vec<Column>,
         total: usize,
-        epoch: u64,
+        epoch: Epoch,
         key: Option<KeySpec>,
     },
     /// One page of the open result. Echoes `offset` so the grid drops it into the
@@ -919,7 +1028,7 @@ pub enum Event {
     ResultPageLoaded {
         offset: usize,
         rows: Vec<Vec<red_core::Value>>,
-        epoch: u64,
+        epoch: Epoch,
     },
     /// One run window of a keyset result, in response to `FetchRun`. Echoes the
     /// request (`fetch`, `seq`) so the grid can match it against its in-flight
@@ -927,7 +1036,7 @@ pub enum Event {
     /// interpolation; its ordinals are approximate until the run touches a
     /// true end of the result.
     ResultRunLoaded {
-        epoch: u64,
+        epoch: Epoch,
         fetch: RunFetch,
         rows: Vec<Vec<red_core::Value>>,
         estimated: bool,
@@ -936,42 +1045,42 @@ pub enum Event {
     /// The full rows for a `CopyRows` request. Echoes `id` so the UI matches it
     /// to the pending copy and writes the untruncated selection to the clipboard.
     CopyRowsLoaded {
-        id: u64,
+        id: OpId,
         rows: Vec<Vec<red_core::Value>>,
     },
     /// A `FetchRun` failed (the error itself is also surfaced via `Error`).
     /// Echoed so the grid can free its in-flight slot; without this a single
     /// failed seek would wedge the run buffer and freeze all further fetching.
     ResultRunFailed {
-        epoch: u64,
+        epoch: Epoch,
         seq: u64,
     },
     /// A column's aggregate summary, in response to `ColumnStats`. Echoes `epoch`
     /// and the `column` name so the grid routes it to the right result and column
     /// (a re-sort/re-filter bumps the epoch and supersedes an in-flight summary).
     ColumnStatsReady {
-        epoch: u64,
+        epoch: Epoch,
         column: String,
         stats: ColumnStats,
     },
     /// A `ColumnStats` request failed; scoped to the stats bar (shown as "stats
     /// unavailable") rather than a global error toast, like `PlanFailed`.
     ColumnStatsFailed {
-        epoch: u64,
+        epoch: Epoch,
         column: String,
     },
     /// A foreign-key lookup list, in response to `FetchLookup`. Echoes `epoch` and the
     /// `target` table so the grid caches it per FK target (dropping a reply for a
     /// superseded epoch). `rows` is the bounded, distinct id/label list.
     LookupReady {
-        epoch: u64,
+        epoch: Epoch,
         target: TableRef,
         rows: Vec<LookupRow>,
     },
     /// A `FetchLookup` failed; pane-scoped (the picker just shows no suggestions and
     /// the user types the id), not a global toast, like `ColumnStatsFailed`.
     LookupFailed {
-        epoch: u64,
+        epoch: Epoch,
         target: TableRef,
     },
     /// The enum columns of a table, in response to `LoadEnums`: `{ column → [variant,
@@ -989,7 +1098,7 @@ pub enum Event {
     /// `epoch` so the UI patches/refetches the right result (and drops a reply for a
     /// superseded one). `applied` is the total ops committed.
     BatchApplied {
-        epoch: u64,
+        epoch: Epoch,
         applied: u64,
     },
     /// A guarded edit batch failed (engine error, or an op touched ≠1 row) and the
@@ -998,101 +1107,101 @@ pub enum Event {
     /// change. Scoped to the result pane by `epoch` (shown there, not as a global
     /// toast), like `PlanFailed`.
     BatchFailed {
-        epoch: u64,
+        epoch: Epoch,
         failed_index: Option<usize>,
         message: String,
     },
     /// An `Explain` produced a plan. Echoes `epoch` so the UI drops a plan for a
     /// result it has already replaced.
     PlanReady {
-        epoch: u64,
+        epoch: Epoch,
         plan: QueryPlan,
     },
     /// An `Explain` failed (bad SQL, unsupported statement). Scoped to the plan
     /// pane by `epoch`; shown there rather than as a global error toast.
     PlanFailed {
-        epoch: u64,
+        epoch: Epoch,
         message: String,
     },
     /// A streamed export made progress: `rows` rows written so far (throttled,
     /// not per-row). `id` selects the export's toast.
     ExportProgress {
-        id: u64,
+        id: OpId,
         rows: usize,
     },
     /// A streamed export finished: `rows` rows written to `path`. `id` selects the
     /// export's toast.
     ExportFinished {
-        id: u64,
+        id: OpId,
         path: String,
         rows: usize,
     },
     /// An in-flight export was cancelled (its partial file removed). `id` selects
     /// the export's toast.
     ExportCancelled {
-        id: u64,
+        id: OpId,
     },
     /// A streamed import made progress: `rows` rows committed so far (throttled).
     /// `id` selects the import's toast.
     ImportProgress {
-        id: u64,
+        id: OpId,
         rows: usize,
     },
     /// A streamed import finished: `rows` rows committed into the target. `id`
     /// selects the import's toast.
     ImportFinished {
-        id: u64,
+        id: OpId,
         rows: usize,
     },
     /// An import failed (file open, parse, coercion, or engine error). `rows` rows
     /// committed in earlier chunks remain (per-chunk commit). `id` selects the toast.
     ImportFailed {
-        id: u64,
+        id: OpId,
         rows: usize,
         message: String,
     },
     /// An in-flight import was cancelled. Rows committed in earlier chunks remain.
     /// `id` selects the import's toast.
     ImportCancelled {
-        id: u64,
+        id: OpId,
         rows: usize,
     },
     /// The source column names from an `ImportColumns` peek. `id` correlates it to
     /// the pending UI request, which builds the name-based mapping + confirm dialog.
     ImportColumns {
-        id: u64,
+        id: OpId,
         columns: Vec<String>,
     },
     /// A copy target table's columns (name + declared type), in response to
     /// `CopyTargetColumns`. `id` correlates it to the pending copy; the UI maps the
     /// source result's columns onto these by name and raises the copy confirm.
     CopyTargetColumns {
-        id: u64,
+        id: OpId,
         columns: Vec<Column>,
     },
     /// A streamed copy made progress: `rows` rows committed so far (throttled). `id`
     /// selects the copy's transfer toast.
     CopyProgress {
-        id: u64,
+        id: OpId,
         rows: usize,
     },
     /// A streamed copy finished: `rows` rows committed into the target. `id` selects
     /// the copy's toast.
     CopyFinished {
-        id: u64,
+        id: OpId,
         rows: usize,
     },
     /// A copy failed (target describe, source read, coercion, truncate, or engine
     /// error). `rows` rows committed in earlier chunks remain. `id` selects the toast.
     CopyFailed {
-        id: u64,
+        id: OpId,
         rows: usize,
         message: String,
     },
     /// An in-flight copy was cancelled. Rows committed in earlier chunks remain. `id`
     /// selects the copy's toast.
     CopyCancelled {
-        id: u64,
+        id: OpId,
         rows: usize,
     },
     /// The self-updater's state changed (Phases 3–4). Global (`None` session);
@@ -1101,19 +1210,19 @@ pub enum Event {
     /// A streamed increment of an assistant turn. Echoes `conversation_id` so the
     /// panel appends it to the right thread.
     AiDelta {
-        conversation_id: u64,
+        conversation_id: ConversationId,
         delta: AiDelta,
     },
     /// An assistant turn completed normally; `usage` is its token accounting.
     AiTurnFinished {
-        conversation_id: u64,
+        conversation_id: ConversationId,
         usage: AiUsage,
     },
     /// An assistant turn failed (no provider, auth, network, refusal, cancel).
     /// Scoped to its conversation so the panel shows it inline, not as a global
     /// toast.
     AiError {
-        conversation_id: u64,
+        conversation_id: ConversationId,
         message: String,
     },
     /// The subscription agent wants to run a tool Red didn't auto-allow (M-S2):
@@ -1121,8 +1230,8 @@ pub enum Event {
     /// `title` is what the agent intends to do; `detail` is a compact rendering of
     /// the tool's input, if any. Scoped to its conversation, shown inline.
     AiPermissionRequest {
-        conversation_id: u64,
-        request_id: u64,
+        conversation_id: ConversationId,
+        request_id: RequestId,
         title: String,
         detail: Option<String>,
     },
@@ -1130,7 +1239,7 @@ pub enum Event {
     /// surfaces it as a card in the originating conversation (with an "Open" button)
     /// rather than auto-opening it. `title` is the model's report title, if any.
     AiReportReady {
-        conversation_id: u64,
+        conversation_id: ConversationId,
         path: String,
         title: Option<String>,
     },
@@ -1139,14 +1248,14 @@ pub enum Event {
     /// a read-only SELECT; anything else is left for the user to run (so the write
     /// path's own confirmation still applies).
     AiOpenQuery {
-        conversation_id: u64,
+        conversation_id: ConversationId,
         sql: String,
     },
     /// The agent asked to persist `sql` as a reusable saved query under `name` (with
     /// an optional `description`). The UI writes it to the saved-queries directory so
     /// the user can reopen it later (⇧⌘O); nothing executes.
     AiSaveQuery {
-        conversation_id: u64,
+        conversation_id: ConversationId,
         name: String,
         description: Option<String>,
         sql: String,
@@ -1156,14 +1265,14 @@ pub enum Event {
     /// `/`-command picker can offer them. May arrive more than once (the agent can
     /// re-advertise); the latest list replaces the previous.
     AiCommandsAvailable {
-        conversation_id: u64,
+        conversation_id: ConversationId,
         commands: Vec<AiCommand>,
     },
     /// The subscription agent advertised (or updated) its session config selectors:
     /// model / reasoning dropdowns. Scoped to the conversation; the panel renders
     /// them next to the Send button. The latest list replaces the previous.
     AiConfigOptionsAvailable {
-        conversation_id: u64,
+        conversation_id: ConversationId,
         options: Vec<AiConfigOption>,
     },
     /// An interactive subscription sign-in opened the browser to `url` (paste-code
@@ -1473,7 +1582,7 @@ pub struct SortKey {
     pub position: usize,
     /// The sort column's name, for resolving the composite `(sort_col, pk)` key.
     pub column: String,
-    pub descending: bool,
+    pub direction: SortDirection,
 }
 
 /// One `FetchRun` shape: how to extend or relocate the grid's resident run of

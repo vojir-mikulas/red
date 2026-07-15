@@ -42,12 +42,12 @@ pub fn augment_path_for_gui_launch() {
     // and only put it on `PATH` from a login/interactive shell. If the well-known
     // dirs didn't turn up a `node`, ask the login shell what its `PATH` is and
     // merge in anything new. Only paid by users the static dirs didn't already fix.
-    if !resolves(&entries, "node") {
-        if let Some(shell_path) = login_shell_path() {
-            for dir in shell_path.split(':').filter(|s| !s.is_empty()) {
-                if !entries.iter().any(|e| e == dir) {
-                    entries.push(dir.to_string());
-                }
+    if !resolves(&entries, "node")
+        && let Some(shell_path) = login_shell_path()
+    {
+        for dir in shell_path.split(':').filter(|s| !s.is_empty()) {
+            if !entries.iter().any(|e| e == dir) {
+                entries.push(dir.to_string());
             }
         }
     }
@@ -56,7 +56,13 @@ pub fn augment_path_for_gui_launch() {
     // SAFETY: called from `main` before any other thread (the GPUI platform, the
     // backend runtime) is spawned, so no other thread can be reading the
     // environment concurrently.
-    unsafe { std::env::set_var("PATH", &path) };
+    #[allow(
+        unsafe_code,
+        reason = "single-threaded startup env mutation; see SAFETY note"
+    )]
+    unsafe {
+        std::env::set_var("PATH", &path)
+    };
 }
 
 /// Whether `program` resolves to an executable file in one of `dirs`.

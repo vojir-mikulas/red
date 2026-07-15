@@ -34,76 +34,73 @@ impl AppState {
         });
         self.appearance_sub = Some(sub);
 
-        if let Some(store) = &self.settings_store {
-            if let Some((watcher, mut rx)) =
+        if let Some(store) = &self.settings_store
+            && let Some((watcher, mut rx)) =
                 crate::settings_watch::SettingsWatcher::start(store.path().to_path_buf())
-            {
-                self.settings_watcher = Some(watcher);
-                cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                    while rx.next().await.is_some() {
-                        if this
-                            .update(cx, |this, cx| this.reload_settings(cx))
-                            .is_err()
-                        {
-                            break; // view dropped (window closed)
-                        }
+        {
+            self.settings_watcher = Some(watcher);
+            cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                while rx.next().await.is_some() {
+                    if this
+                        .update(cx, |this, cx| this.reload_settings(cx))
+                        .is_err()
+                    {
+                        break; // view dropped (window closed)
                     }
-                })
-                .detach();
-            }
+                }
+            })
+            .detach();
         }
 
         // A second watcher over `keymap.toml`, reusing the same debounce + self-
         // write suppression. A hand-edit re-applies the whole keymap live.
-        if let Some(store) = &self.keymap_store {
-            if let Some((watcher, mut rx)) =
+        if let Some(store) = &self.keymap_store
+            && let Some((watcher, mut rx)) =
                 crate::settings_watch::SettingsWatcher::start(store.path().to_path_buf())
-            {
-                self.keymap_watcher = Some(watcher);
-                cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                    while rx.next().await.is_some() {
-                        if this.update(cx, |this, cx| this.reload_keymap(cx)).is_err() {
-                            break; // view dropped (window closed)
-                        }
+        {
+            self.keymap_watcher = Some(watcher);
+            cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                while rx.next().await.is_some() {
+                    if this.update(cx, |this, cx| this.reload_keymap(cx)).is_err() {
+                        break; // view dropped (window closed)
                     }
-                })
-                .detach();
-            }
+                }
+            })
+            .detach();
         }
 
         // A third watcher over `connections.toml`, so editing the saved-connection
         // file by hand (the welcome screen's "Edit file" affordance) re-reads the
         // list live; the same debounce + self-write suppression as the others.
-        if let Some(path) = crate::config::config_path() {
-            if let Some((watcher, mut rx)) = crate::settings_watch::SettingsWatcher::start(path) {
-                self.connections_watcher = Some(watcher);
-                cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-                    while rx.next().await.is_some() {
-                        if this
-                            .update(cx, |this, cx| this.reload_connections(cx))
-                            .is_err()
-                        {
-                            break; // view dropped (window closed)
-                        }
+        if let Some(path) = crate::config::config_path()
+            && let Some((watcher, mut rx)) = crate::settings_watch::SettingsWatcher::start(path)
+        {
+            self.connections_watcher = Some(watcher);
+            cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                while rx.next().await.is_some() {
+                    if this
+                        .update(cx, |this, cx| this.reload_connections(cx))
+                        .is_err()
+                    {
+                        break; // view dropped (window closed)
                     }
-                })
-                .detach();
-            }
+                }
+            })
+            .detach();
         }
 
         // Reconnect to the most recently used connection on launch, when the user
         // opted in. The list arrives recency-sorted (newest first), so the first
         // entry that's actually been opened is the one to restore; credentials come
         // from the keychain inside `connect`.
-        if self.settings.behavior.restore_last_session && matches!(self.phase, Phase::Disconnected)
-        {
-            if let Some(index) = self
+        if self.settings.behavior.restore_last_session
+            && matches!(self.phase, Phase::Disconnected)
+            && let Some(index) = self
                 .connections
                 .iter()
                 .position(|c| c.last_accessed.is_some())
-            {
-                self.connect(index, cx);
-            }
+        {
+            self.connect(index, cx);
         }
     }
 
@@ -594,11 +591,7 @@ impl AppState {
     /// The currently-selected theme name for a family, which drives the pickers.
     pub(crate) fn selected_theme(&self, light: bool) -> String {
         let (_, l, d) = self.theme_decompose();
-        if light {
-            l
-        } else {
-            d
-        }
+        if light { l } else { d }
     }
 
     /// Store a full `(mode, light, dark)` pair, apply it, and persist.
@@ -645,11 +638,11 @@ impl AppState {
             prompt: Some("Import theme".into()),
         });
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            if let Ok(Ok(Some(paths))) = paths.await {
-                if let Some(path) = paths.into_iter().next() {
-                    this.update(cx, |this, cx| this.finish_import(&path, cx))
-                        .ok();
-                }
+            if let Ok(Ok(Some(paths))) = paths.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                this.update(cx, |this, cx| this.finish_import(&path, cx))
+                    .ok();
             }
         })
         .detach();
@@ -788,10 +781,10 @@ impl AppState {
     /// active selection (stored in table-column coords) so it can't point off by one.
     pub(crate) fn set_row_numbers(&mut self, on: bool, cx: &mut Context<Self>) {
         self.settings.grid.row_numbers = on;
-        if let Phase::Connected(active) = &mut self.phase {
-            if let Some(grid) = active.active_result_mut() {
-                grid.clear_selection();
-            }
+        if let Phase::Connected(active) = &mut self.phase
+            && let Some(grid) = active.active_result_mut()
+        {
+            grid.clear_selection();
         }
         self.save_settings();
         cx.notify();
@@ -1007,12 +1000,12 @@ impl AppState {
         url: String,
         cx: &mut Context<Self>,
     ) {
-        if let Some(flow) = self.ai_login.as_mut() {
-            if flow.agent_id == agent_id {
-                flow.url = Some(url);
-                self.focus_login_code = true;
-                cx.notify();
-            }
+        if let Some(flow) = self.ai_login.as_mut()
+            && flow.agent_id == agent_id
+        {
+            flow.url = Some(url);
+            self.focus_login_code = true;
+            cx.notify();
         }
     }
 
@@ -1112,15 +1105,15 @@ impl AppState {
             prompt: Some("Choose report folder".into()),
         });
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            if let Ok(Ok(Some(paths))) = paths.await {
-                if let Some(path) = paths.into_iter().next() {
-                    this.update(cx, |this, cx| {
-                        this.settings.ai.report_dir = path.display().to_string();
-                        this.save_settings();
-                        cx.notify();
-                    })
-                    .ok();
-                }
+            if let Ok(Ok(Some(paths))) = paths.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                this.update(cx, |this, cx| {
+                    this.settings.ai.report_dir = path.display().to_string();
+                    this.save_settings();
+                    cx.notify();
+                })
+                .ok();
             }
         })
         .detach();
@@ -1207,10 +1200,10 @@ impl AppState {
         let Some(store) = &self.settings_store else {
             return;
         };
-        if let Some(watcher) = &self.settings_watcher {
-            if let Ok(serialized) = toml::to_string_pretty(&self.settings) {
-                watcher.note_self_write(&serialized);
-            }
+        if let Some(watcher) = &self.settings_watcher
+            && let Ok(serialized) = toml::to_string_pretty(&self.settings)
+        {
+            watcher.note_self_write(&serialized);
         }
         if let Err(e) = store.save(&self.settings) {
             tracing::warn!("failed to save settings: {e}");
@@ -1221,10 +1214,10 @@ impl AppState {
     /// are announced to the watcher first so this UI-driven save doesn't echo back
     /// through `connections.toml` as a reload (mirrors [`Self::save_settings`]).
     pub(crate) fn persist(&mut self, cx: &mut Context<Self>) {
-        if let Some(watcher) = &self.connections_watcher {
-            if let Ok(text) = config::serialize(&self.connections) {
-                watcher.note_self_write(&text);
-            }
+        if let Some(watcher) = &self.connections_watcher
+            && let Ok(text) = config::serialize(&self.connections)
+        {
+            watcher.note_self_write(&text);
         }
         if let Err(e) = config::save(&self.connections) {
             tracing::warn!("failed to save connections: {e}");

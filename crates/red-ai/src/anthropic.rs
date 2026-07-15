@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use serde_json::{json, Value as Json};
+use serde_json::{Value as Json, json};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::types::{
@@ -484,10 +484,10 @@ mod tests {
         // The first delta we streamed should be the tool-use start or text.
         let mut saw_text = false;
         while let Ok(d) = rx.try_recv() {
-            if let Delta::Text(t) = d {
-                if t == "Hello" {
-                    saw_text = true;
-                }
+            if let Delta::Text(t) = d
+                && t == "Hello"
+            {
+                saw_text = true;
             }
         }
         assert!(saw_text);

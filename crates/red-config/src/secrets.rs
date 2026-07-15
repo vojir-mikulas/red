@@ -9,7 +9,7 @@
 //! These calls are sync and blocking, and on macOS each keychain *item* read can
 //! pop a system "allow" dialog. To keep that to **one prompt per connection per
 //! app run** (rather than one per connect, painful with reconnect-on-switch), a
-//! process-wide in-memory [`CACHE`] answers repeat reads: the keychain is hit on
+//! process-wide in-memory `CACHE` answers repeat reads: the keychain is hit on
 //! the first read of an id, and every later read of the same id is served from
 //! memory. RED accepts UI-thread reads here because the keychain is touched at
 //! most once per id and is sub-millisecond once granted.
@@ -33,6 +33,13 @@ const SERVICE: &str = "red";
 static CACHE: LazyLock<Mutex<HashMap<String, Zeroizing<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Lock the secret cache, recovering the guard if a prior holder panicked. The
+/// cache is a plain read-through map with no cross-entry invariant, so a poisoned
+/// lock carries no torn state worth propagating a panic for — recover and go on.
+fn cache() -> std::sync::MutexGuard<'static, HashMap<String, Zeroizing<String>>> {
+    CACHE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Build a keychain entry for a secret, keyed by its `account` string. A
 /// connection's DB password uses the bare connection id; its SSH secrets use
 /// suffixed accounts (see [`ssh_password_account`]/[`ssh_passphrase_account`]),
@@ -55,15 +62,12 @@ fn ssh_passphrase_account(id: &str) -> String {
 /// simply means "ask the user"). Served from [`CACHE`] when present so only the
 /// first read per account touches the OS keychain.
 fn read(account: &str) -> Result<Option<String>> {
-    if let Some(cached) = CACHE.lock().unwrap().get(account) {
+    if let Some(cached) = cache().get(account) {
         return Ok(Some(cached.to_string()));
     }
     match entry(account)?.get_password() {
         Ok(secret) => {
-            CACHE
-                .lock()
-                .unwrap()
-                .insert(account.to_string(), Zeroizing::new(secret.clone()));
+            cache().insert(account.to_string(), Zeroizing::new(secret.clone()));
             Ok(Some(secret))
         }
         Err(keyring::Error::NoEntry) => Ok(None),
@@ -77,17 +81,14 @@ fn write(account: &str, secret: &str) -> Result<()> {
     entry(account)?
         .set_password(secret)
         .context("write keychain secret")?;
-    CACHE
-        .lock()
-        .unwrap()
-        .insert(account.to_string(), Zeroizing::new(secret.to_string()));
+    cache().insert(account.to_string(), Zeroizing::new(secret.to_string()));
     Ok(())
 }
 
 /// Remove a secret by keychain account and drop any cached copy (zeroizing it).
 /// Idempotent: a missing entry is success.
 fn remove(account: &str) -> Result<()> {
-    CACHE.lock().unwrap().remove(account);
+    cache().remove(account);
     match entry(account)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(anyhow::Error::new(e).context("delete keychain secret")),

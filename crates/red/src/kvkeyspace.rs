@@ -9,7 +9,7 @@
 //! offers to enable them before nothing would otherwise arrive.
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Context, Window};
+use gpui::{Context, Window, div, prelude::*, px};
 use red_core::kv::{KeyspaceEvent, KeyspaceScope};
 use red_service::{Command, SessionId};
 
@@ -27,7 +27,7 @@ pub(crate) struct KvKeyspace {
     /// A dedicated subscription epoch (distinct from the Pub/Sub monitor's), so
     /// both can watch at once and each tears down independently via
     /// `CloseResult`.
-    pub(crate) epoch: u64,
+    pub(crate) epoch: red_service::Epoch,
     pub(crate) scope: KeyspaceScope,
     /// `true` while a subscription is live (Start pressed, not yet Stopped).
     pub(crate) watching: bool,
@@ -182,7 +182,7 @@ impl AppState {
     pub(crate) fn on_kv_notify_config_ready(
         &mut self,
         session: Option<SessionId>,
-        epoch: u64,
+        epoch: red_service::Epoch,
         value: String,
         cx: &mut Context<Self>,
     ) {
@@ -204,7 +204,7 @@ impl AppState {
     pub(crate) fn on_kv_keyspace_message(
         &mut self,
         session: Option<SessionId>,
-        epoch: u64,
+        epoch: red_service::Epoch,
         channel: String,
         payload: String,
         cx: &mut Context<Self>,
@@ -248,7 +248,7 @@ impl AppState {
         tab_idx: usize,
         _window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
         let session = active.session;
         let writable = !active.config.read_only;

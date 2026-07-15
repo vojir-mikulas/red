@@ -7,8 +7,8 @@
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use red_core::{
@@ -21,8 +21,8 @@ use rusqlite::{Connection, ErrorCode, OpenFlags};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::format::{strip_trailing, ExportWriter, ProgressThrottle};
-use crate::{driver_err, AbortSignal, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor};
+use crate::format::{ExportWriter, ProgressThrottle, strip_trailing};
+use crate::{AbortSignal, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor, driver_err};
 
 /// A SQLite connection target: a file path (or `:memory:`) plus the read-only
 /// posture. Cheap to clone; it holds no live handle.
@@ -184,14 +184,13 @@ impl DatabaseDriver for SqliteDriver {
         &self,
         sql: &str,
         column: &str,
-        numeric: bool,
-        distinct: bool,
+        flags: red_core::StatsFlags,
         abort: &AbortSignal,
     ) -> Result<red_core::ColumnStats> {
         let path = self.path.clone();
         let read_only = self.read_only;
         let abort = abort.clone();
-        let sql = crate::stats_sql(sql, column, numeric, distinct, quote_ident);
+        let sql = crate::stats_sql(sql, column, flags, quote_ident);
         tokio::task::spawn_blocking(move || {
             let conn = SqliteDriver::open(&path, read_only)?;
             let _guard = arm_interrupt(&conn, &abort);
@@ -206,7 +205,7 @@ impl DatabaseDriver for SqliteDriver {
                 Some(row) => extract_row(row, column_count, None)?,
                 None => return Err(RedError::Driver("stats query returned no row".into())),
             };
-            Ok(crate::parse_stats(&cells, numeric, distinct))
+            Ok(crate::parse_stats(&cells, flags))
         })
         .await
         .map_err(driver_err)?
@@ -240,7 +239,7 @@ impl DatabaseDriver for SqliteDriver {
         sql: &str,
         key: &KeySpec,
         bound: Option<&[Value]>,
-        descending: bool,
+        scroll: red_core::SortDirection,
         limit: usize,
         abort: &AbortSignal,
     ) -> Result<ResultPage> {
@@ -249,9 +248,7 @@ impl DatabaseDriver for SqliteDriver {
         let base = strip_trailing(sql);
         let bound_len = bound.map_or(0, <[Value]>::len);
         let (where_clause, order_by) =
-            crate::seek_clauses(key, bound_len, descending, false, quote_ident, |_| {
-                "?".into()
-            });
+            crate::seek_clauses(key, bound_len, scroll, false, quote_ident, |_| "?".into());
         let sql = format!("SELECT * FROM ({base}) {where_clause}ORDER BY {order_by} LIMIT {limit}");
         let params: Vec<rusqlite::types::Value> =
             bound.into_iter().flatten().map(to_sqlite).collect();
@@ -281,8 +278,14 @@ impl DatabaseDriver for SqliteDriver {
         let bound_len = from.map_or(0, <[Value]>::len);
         // The lower bound walks forward in sort order (inclusive); `skip`/`limit`
         // are `usize`, so inlining them can't inject.
-        let (where_clause, order_by) =
-            crate::seek_clauses(key, bound_len, false, true, quote_ident, |_| "?".into());
+        let (where_clause, order_by) = crate::seek_clauses(
+            key,
+            bound_len,
+            red_core::SortDirection::Asc,
+            true,
+            quote_ident,
+            |_| "?".into(),
+        );
         let sql = format!(
             "SELECT * FROM ({base}) {where_clause}ORDER BY {order_by} LIMIT {limit} OFFSET {skip}"
         );
@@ -726,12 +729,11 @@ fn list_objects_blocking(path: &Path, read_only: bool) -> Result<Vec<SchemaMeta>
 
     let schema_names: Vec<String> = {
         let mut stmt = conn.prepare("PRAGMA database_list").map_err(driver_err)?;
-        let names = stmt
-            .query_map([], |row| row.get::<_, String>(1))
+
+        stmt.query_map([], |row| row.get::<_, String>(1))
             .map_err(driver_err)?
             .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(driver_err)?;
-        names
+            .map_err(driver_err)?
     };
 
     let mut schemas = Vec::with_capacity(schema_names.len());
@@ -806,15 +808,15 @@ fn describe_table_blocking(
             .map_err(driver_err)?;
         // A *sole* `INTEGER PRIMARY KEY` column is SQLite's rowid alias and
         // auto-increments, detectable only after the columns are gathered.
-        if rows.iter().filter(|c| c.primary_key).count() == 1 {
-            if let Some(c) = rows.iter_mut().find(|c| {
+        if rows.iter().filter(|c| c.primary_key).count() == 1
+            && let Some(c) = rows.iter_mut().find(|c| {
                 c.primary_key
                     && c.type_name
                         .as_deref()
                         .is_some_and(|t| t.eq_ignore_ascii_case("integer"))
-            }) {
-                c.auto_increment = true;
-            }
+            })
+        {
+            c.auto_increment = true;
         }
         rows
     };
@@ -824,19 +826,18 @@ fn describe_table_blocking(
         let mut stmt = conn
             .prepare(&format!("PRAGMA {sq}.foreign_key_list({tq})"))
             .map_err(driver_err)?;
-        let rows = stmt
-            .query_map([], |row| {
-                let ref_column: Option<String> = row.get(4)?;
-                Ok(ForeignKeyMeta {
-                    column: row.get(3)?,
-                    ref_table: row.get(2)?,
-                    ref_column: ref_column.unwrap_or_default(),
-                })
+
+        stmt.query_map([], |row| {
+            let ref_column: Option<String> = row.get(4)?;
+            Ok(ForeignKeyMeta {
+                column: row.get(3)?,
+                ref_table: row.get(2)?,
+                ref_column: ref_column.unwrap_or_default(),
             })
-            .map_err(driver_err)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(driver_err)?;
-        rows
+        })
+        .map_err(driver_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(driver_err)?
     };
 
     // index_list: seq, name, unique, origin, partial
@@ -844,15 +845,14 @@ fn describe_table_blocking(
         let mut stmt = conn
             .prepare(&format!("PRAGMA {sq}.index_list({tq})"))
             .map_err(driver_err)?;
-        let rows = stmt
-            .query_map([], |row| {
-                let unique: i64 = row.get(2)?;
-                Ok((row.get::<_, String>(1)?, unique != 0))
-            })
-            .map_err(driver_err)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(driver_err)?;
-        rows
+
+        stmt.query_map([], |row| {
+            let unique: i64 = row.get(2)?;
+            Ok((row.get::<_, String>(1)?, unique != 0))
+        })
+        .map_err(driver_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(driver_err)?
     };
 
     // index_info: seqno, cid, name (name is NULL for an expression column).
@@ -894,12 +894,11 @@ fn foreign_keys_blocking(path: &Path, read_only: bool) -> Result<Vec<FkEdge>> {
     // Namespaces: main / temp / any attached DB (PRAGMA database_list col 1 = name).
     let schema_names: Vec<String> = {
         let mut stmt = conn.prepare("PRAGMA database_list").map_err(driver_err)?;
-        let names = stmt
-            .query_map([], |row| row.get::<_, String>(1))
+
+        stmt.query_map([], |row| row.get::<_, String>(1))
             .map_err(driver_err)?
             .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(driver_err)?;
-        names
+            .map_err(driver_err)?
     };
 
     let mut edges: Vec<FkEdge> = Vec::new();
@@ -912,12 +911,11 @@ fn foreign_keys_blocking(path: &Path, read_only: bool) -> Result<Vec<FkEdge>> {
                  WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name"
             );
             let mut stmt = conn.prepare(&sql).map_err(driver_err)?;
-            let names = stmt
-                .query_map([], |row| row.get::<_, String>(0))
+
+            stmt.query_map([], |row| row.get::<_, String>(0))
                 .map_err(driver_err)?
                 .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(driver_err)?;
-            names
+                .map_err(driver_err)?
         };
 
         for table in tables {
@@ -1049,7 +1047,7 @@ fn fetch_window(
                 return Ok(RowWindow {
                     rows: out,
                     exhausted: true,
-                })
+                });
             }
             Err(e) => return Err(map_step_err(e)),
         }
@@ -1095,10 +1093,10 @@ fn extract_row(
 /// it to the distinct `Interrupted` variant so the service can tell a cancel from
 /// a genuine query failure.
 fn map_step_err(e: rusqlite::Error) -> RedError {
-    if let rusqlite::Error::SqliteFailure(ffi, _) = &e {
-        if ffi.code == ErrorCode::OperationInterrupted {
-            return RedError::Interrupted;
-        }
+    if let rusqlite::Error::SqliteFailure(ffi, _) = &e
+        && ffi.code == ErrorCode::OperationInterrupted
+    {
+        return RedError::Interrupted;
     }
     driver_err(e)
 }
@@ -1415,10 +1413,10 @@ mod tests {
             column_type: None,
             tiebreak: Some("id".into()),
             tiebreak_type: None,
-            descending: false,
+            direction: red_core::SortDirection::Asc,
         };
         let key_desc = KeySpec {
-            descending: true,
+            direction: red_core::SortDirection::Desc,
             ..key_asc.clone()
         };
         battery::seeks_composite_sorted(&driver, "SELECT * FROM g", &key_asc, &key_desc, 30).await;

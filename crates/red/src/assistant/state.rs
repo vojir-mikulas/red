@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use flint::prelude::*;
 use flint::{CodeEditor, CodeEditorEvent, TextInput, TextInputEvent};
-use gpui::{prelude::*, AsyncApp, Context, SharedString, WeakEntity, Window};
+use gpui::{AsyncApp, Context, SharedString, WeakEntity, Window, prelude::*};
 
 use crate::app::{ActiveConn, AppState, Phase};
 
@@ -102,7 +102,7 @@ impl AppState {
             // can't be reopened; the action's owner is no longer in the focus path).
             window.focus(&self.root_focus, cx);
         } else {
-            let conversation_id = self.next_conversation_id;
+            let conversation_id = red_service::ConversationId::new(self.next_conversation_id);
             self.next_conversation_id += 1;
             // Shared mirror of the active chat's slash commands, read by the
             // composer's completion provider (a closure with no access to state).
@@ -162,12 +162,11 @@ impl AppState {
             });
             // A Change on the search box re-renders the filtered list.
             let search_sub = cx.subscribe(&list_search, |this, _, e: &TextInputEvent, cx| {
-                if matches!(e, TextInputEvent::Change) {
-                    if let Some(state) = this.assistant.as_ref() {
-                        if state.show_list {
-                            cx.notify();
-                        }
-                    }
+                if matches!(e, TextInputEvent::Change)
+                    && let Some(state) = this.assistant.as_ref()
+                    && state.show_list
+                {
+                    cx.notify();
                 }
             });
             let provider = self.default_ai_provider();
@@ -211,10 +210,10 @@ impl AppState {
     /// an ACP agent is ready).
     fn default_ai_provider(&self) -> String {
         let usable = |id: &str| self.usable_agents.iter().any(|a| a.id == id);
-        if let Some(last) = self.local_state.last_agent() {
-            if usable(last) {
-                return last.to_string();
-            }
+        if let Some(last) = self.local_state.last_agent()
+            && usable(last)
+        {
+            return last.to_string();
         }
         let default = self.settings.ai.resolved_default_agent();
         if usable(&default) {
@@ -274,7 +273,7 @@ impl AppState {
     /// chats on different agents each route correctly.
     fn dispatch_turn(
         &mut self,
-        conversation_id: u64,
+        conversation_id: red_service::ConversationId,
         agent: String,
         message: String,
         cx: &mut Context<Self>,
@@ -339,7 +338,7 @@ impl AppState {
     /// chat matches.
     fn with_chat_mut<R>(
         &mut self,
-        conversation_id: u64,
+        conversation_id: red_service::ConversationId,
         f: impl FnOnce(&mut ChatSession) -> R,
     ) -> Option<R> {
         self.assistant
@@ -383,7 +382,7 @@ impl AppState {
         self.go_to_draft(provider, false, cx);
     }
 
-    /// Go to the draft on a *specific* agent (the "New chat with <agent>" entry).
+    /// Go to the draft on a *specific* agent (the "New chat with \<agent\>" entry).
     /// Rebinds an existing draft to `provider` too — it has nothing sent, so the
     /// binding isn't locked — and records it as the new-chat default.
     pub(crate) fn new_chat_with(&mut self, provider: String, cx: &mut Context<Self>) {
@@ -396,7 +395,7 @@ impl AppState {
     /// ends up bound to becomes the remembered new-chat default.
     fn go_to_draft(&mut self, provider: String, rebind: bool, cx: &mut Context<Self>) {
         self.stash_active_draft(cx);
-        let id = self.next_conversation_id;
+        let id = red_service::ConversationId::new(self.next_conversation_id);
         let existing = self
             .assistant
             .as_ref()
@@ -494,14 +493,18 @@ impl AppState {
     /// the open set bounded without deleting the saved file; it's still reopenable
     /// from history. If it was the last chat, a fresh empty one takes its place so
     /// the panel always has an active conversation.
-    pub(crate) fn close_chat(&mut self, conversation_id: u64, cx: &mut Context<Self>) {
+    pub(crate) fn close_chat(
+        &mut self,
+        conversation_id: red_service::ConversationId,
+        cx: &mut Context<Self>,
+    ) {
         // Tell the backend to drop this conversation's history/agent (M-S5) so its
         // state doesn't linger for the whole session. Session-less: it's keyed by
         // conversation_id on the shared AI state, and works even while disconnected.
         self.service
             .send_global(red_service::Command::AiForget { conversation_id });
         // Mint a replacement id up front to avoid borrowing `self` twice.
-        let replacement_id = self.next_conversation_id;
+        let replacement_id = red_service::ConversationId::new(self.next_conversation_id);
         let replacement_provider = self.default_ai_provider();
         if let Some(state) = self.assistant.as_mut() {
             let Some(idx) = state
@@ -560,18 +563,17 @@ impl AppState {
             return;
         };
         // Already open? Switch to it rather than opening a duplicate.
-        if let Some(state) = self.assistant.as_ref() {
-            if let Some(i) = state
+        if let Some(state) = self.assistant.as_ref()
+            && let Some(i) = state
                 .chats
                 .iter()
                 .position(|c| c.file_stem.as_deref() == Some(conv.stem.as_str()))
-            {
-                self.switch_chat(i, cx);
-                return;
-            }
+        {
+            self.switch_chat(i, cx);
+            return;
         }
         self.stash_active_draft(cx);
-        let id = self.next_conversation_id;
+        let id = red_service::ConversationId::new(self.next_conversation_id);
         self.next_conversation_id += 1;
         let seed = render_transcript(&conv.messages);
         if let Some(state) = self.assistant.as_mut() {
@@ -633,11 +635,11 @@ impl AppState {
         }
         if let RowKey::Open(id) = key {
             // Clear the stem first so closing doesn't re-save the deleted file.
-            if let Some(state) = self.assistant.as_mut() {
-                if let Some(chat) = state.find_mut(id) {
-                    chat.file_stem = None;
-                    chat.messages.clear();
-                }
+            if let Some(state) = self.assistant.as_mut()
+                && let Some(chat) = state.find_mut(id)
+            {
+                chat.file_stem = None;
+                chat.messages.clear();
             }
             self.close_chat(id, cx);
         }
@@ -678,13 +680,13 @@ impl AppState {
         if !title.is_empty() {
             match &rename.key {
                 RowKey::Open(id) => {
-                    if let Some(state) = self.assistant.as_mut() {
-                        if let Some(chat) = state.find_mut(*id) {
-                            chat.title = Some(title.clone());
-                            // Rewrite the saved file's title if it's been saved.
-                            if chat.file_stem.is_some() {
-                                persist_chat(chat);
-                            }
+                    if let Some(state) = self.assistant.as_mut()
+                        && let Some(chat) = state.find_mut(*id)
+                    {
+                        chat.title = Some(title.clone());
+                        // Rewrite the saved file's title if it's been saved.
+                        if chat.file_stem.is_some() {
+                            persist_chat(chat);
                         }
                     }
                 }
@@ -782,10 +784,10 @@ impl AppState {
 
     /// Insert a model-suggested SQL snippet into the active editor tab.
     pub(crate) fn ai_insert_sql(&mut self, sql: String, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &self.phase {
-            if let Some(tab) = active.active() {
-                tab.editor.update(cx, |e, cx| e.set_content(sql, cx));
-            }
+        if let Phase::Connected(active) = &self.phase
+            && let Some(tab) = active.active()
+        {
+            tab.editor.update(cx, |e, cx| e.set_content(sql, cx));
         }
         cx.notify();
     }
@@ -801,11 +803,11 @@ impl AppState {
             return;
         }
         self.new_query(cx);
-        if let Phase::Connected(active) = &self.phase {
-            if let Some(tab) = active.active() {
-                tab.editor
-                    .update(cx, |e, cx| e.set_content(sql.clone(), cx));
-            }
+        if let Phase::Connected(active) = &self.phase
+            && let Some(tab) = active.active()
+        {
+            tab.editor
+                .update(cx, |e, cx| e.set_content(sql.clone(), cx));
         }
         if crate::sql::is_read_only(&sql) {
             self.run_editor_query(cx);
@@ -816,7 +818,7 @@ impl AppState {
     /// The agent's `open_query` tool fired: open the SQL in a new query tab.
     pub(crate) fn on_ai_open_query(
         &mut self,
-        _conversation_id: u64,
+        _conversation_id: red_service::ConversationId,
         sql: String,
         cx: &mut Context<Self>,
     ) {
@@ -827,7 +829,7 @@ impl AppState {
     /// toast the outcome so the user knows it landed (they reopen it with ⇧⌘O).
     pub(crate) fn on_ai_save_query(
         &mut self,
-        _conversation_id: u64,
+        _conversation_id: red_service::ConversationId,
         name: String,
         description: Option<String>,
         sql: String,
@@ -852,7 +854,7 @@ impl AppState {
     /// the composer's command mirror if it's the active chat, so `/` offers them.
     pub(crate) fn on_ai_commands_available(
         &mut self,
-        conversation_id: u64,
+        conversation_id: red_service::ConversationId,
         commands: Vec<red_service::AiCommand>,
         cx: &mut Context<Self>,
     ) {
@@ -870,7 +872,7 @@ impl AppState {
     /// user's last-chosen model/reasoning without retroactively touching other chats.
     pub(crate) fn on_ai_config_options_available(
         &mut self,
-        conversation_id: u64,
+        conversation_id: red_service::ConversationId,
         options: Vec<red_service::AiConfigOption>,
         cx: &mut Context<Self>,
     ) {
@@ -910,7 +912,11 @@ impl AppState {
     /// differs from the agent's current pick, send a set so the new chat lands on the
     /// user's last choice. Guarded by `config_defaults_applied` so a later
     /// `ConfigOptionUpdate` doesn't re-apply over a mid-chat manual change.
-    fn apply_default_config(&mut self, conversation_id: u64, cx: &mut Context<Self>) {
+    fn apply_default_config(
+        &mut self,
+        conversation_id: red_service::ConversationId,
+        cx: &mut Context<Self>,
+    ) {
         let model = self.settings.ai.subscription_model.clone();
         let reasoning = self.settings.ai.subscription_reasoning.clone();
         let mode = self.settings.ai.subscription_mode.clone();
@@ -1000,7 +1006,7 @@ impl AppState {
     /// callers decide whether this is a user choice or a default being applied).
     fn send_set_config_option(
         &mut self,
-        conversation_id: u64,
+        conversation_id: red_service::ConversationId,
         config_id: String,
         value: String,
         _cx: &mut Context<Self>,
@@ -1079,7 +1085,11 @@ impl AppState {
     /// user turn. Idempotent: a message already built for the current theme is
     /// skipped, and an empty/streaming bubble is left alone (the live bubble renders
     /// as plain `StyledText`). Called when a turn settles and when a chat is restored.
-    fn build_chat_selectables(&mut self, conversation_id: u64, cx: &mut Context<Self>) {
+    fn build_chat_selectables(
+        &mut self,
+        conversation_id: red_service::ConversationId,
+        cx: &mut Context<Self>,
+    ) {
         let theme = cx.theme().clone();
         let theme_key = theme.text;
         let Some(state) = self.assistant.as_mut() else {
@@ -1166,7 +1176,7 @@ impl AppState {
 
     pub(crate) fn on_ai_delta(
         &mut self,
-        conversation_id: u64,
+        conversation_id: red_service::ConversationId,
         delta: red_service::AiDelta,
         cx: &mut Context<Self>,
     ) {
@@ -1199,7 +1209,7 @@ impl AppState {
                     };
                     let bubble = chat.assistant_bubble();
                     match parent
-                        .as_deref()
+                        .as_ref()
                         .and_then(|p| find_activity_mut(&mut bubble.activity, p))
                     {
                         Some(parent_node) => parent_node.children.push(node),
@@ -1245,7 +1255,11 @@ impl AppState {
     /// there's text waiting to be revealed. The ticker reschedules itself until the
     /// reveal catches up to the received text (see `tick_reveal`); a later burst
     /// restarts it. Cheap to call on every delta.
-    fn ensure_reveal_ticker(&mut self, conversation_id: u64, cx: &mut Context<Self>) {
+    fn ensure_reveal_ticker(
+        &mut self,
+        conversation_id: red_service::ConversationId,
+        cx: &mut Context<Self>,
+    ) {
         let started = self
             .with_chat_mut(conversation_id, |chat| {
                 if chat.revealing || chat.revealed >= chat.streaming_text_chars() {
@@ -1258,8 +1272,8 @@ impl AppState {
         if !started {
             return;
         }
-        cx.spawn(
-            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| loop {
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            loop {
                 cx.background_executor().timer(REVEAL_TICK).await;
                 let keep_going = this
                     .update(cx, |this, cx| this.tick_reveal(conversation_id, cx))
@@ -1267,15 +1281,19 @@ impl AppState {
                 if !keep_going {
                     break;
                 }
-            },
-        )
+            }
+        })
         .detach();
     }
 
     /// One reveal step: uncover more of the streaming bubble and repaint. Returns
     /// whether the ticker should fire again (false once it's caught up; a new burst
     /// will restart it via `ensure_reveal_ticker`).
-    fn tick_reveal(&mut self, conversation_id: u64, cx: &mut Context<Self>) -> bool {
+    fn tick_reveal(
+        &mut self,
+        conversation_id: red_service::ConversationId,
+        cx: &mut Context<Self>,
+    ) -> bool {
         // Returns (advanced?, keep_going?); `advanced` gates the repaint so a
         // no-op tick (chat gone, or already caught up) doesn't churn a frame.
         let (advanced, keep) = self
@@ -1305,7 +1323,7 @@ impl AppState {
 
     pub(crate) fn on_ai_finished(
         &mut self,
-        conversation_id: u64,
+        conversation_id: red_service::ConversationId,
         usage: red_service::AiUsage,
         cx: &mut Context<Self>,
     ) {
@@ -1355,7 +1373,7 @@ impl AppState {
 
     pub(crate) fn on_ai_error(
         &mut self,
-        conversation_id: u64,
+        conversation_id: red_service::ConversationId,
         message: String,
         cx: &mut Context<Self>,
     ) {
@@ -1385,8 +1403,8 @@ impl AppState {
     /// on its originating chat (the switcher flags a background one).
     pub(crate) fn on_ai_permission_request(
         &mut self,
-        conversation_id: u64,
-        request_id: u64,
+        conversation_id: red_service::ConversationId,
+        request_id: red_service::RequestId,
         title: String,
         detail: Option<String>,
         cx: &mut Context<Self>,
@@ -1412,7 +1430,7 @@ impl AppState {
     /// via [`open_report`](Self::open_report).
     pub(crate) fn on_ai_report_ready(
         &mut self,
-        conversation_id: u64,
+        conversation_id: red_service::ConversationId,
         path: String,
         title: Option<String>,
         cx: &mut Context<Self>,
@@ -1421,7 +1439,7 @@ impl AppState {
             .with_chat_mut(conversation_id, |chat| {
                 let bubble = chat.assistant_bubble();
                 bubble.activity.push(red_core::ActivityNode {
-                    id: format!("report-{path}"),
+                    id: format!("report-{path}").into(),
                     kind: red_core::ActivityKind::Report {
                         path: path.clone(),
                         title,
@@ -1503,7 +1521,11 @@ impl AppState {
     /// agent decision sink instead of leaving the agent blocked on it. A no-op once
     /// disconnected (the sink is dropped → denied on teardown) or if the id was
     /// already resolved (the backend treats an unknown id as a no-op).
-    fn deny_stranded_permission(&self, conversation_id: u64, request_id: u64) {
+    fn deny_stranded_permission(
+        &self,
+        conversation_id: red_service::ConversationId,
+        request_id: red_service::RequestId,
+    ) {
         if let Phase::Connected(active) = &self.phase {
             self.service.send_to(
                 active.session,
@@ -1539,18 +1561,17 @@ impl AppState {
         );
         let current_tab = active.active().map(|t| {
             let mut s = format!("\"{}\"", t.title);
-            if reads_allowed {
-                if let Some(grid) = t.result.as_ref() {
-                    if let Some((rows, cols)) = grid.status_counts() {
-                        let names: Vec<String> = (0..cols)
-                            .filter_map(|c| grid.column_meta(c).map(|(name, _)| name))
-                            .collect();
-                        s.push_str(&format!(
-                            ", showing a result of {rows} row(s) × {cols} column(s): {}",
-                            names.join(", ")
-                        ));
-                    }
-                }
+            if reads_allowed
+                && let Some(grid) = t.result.as_ref()
+                && let Some((rows, cols)) = grid.status_counts()
+            {
+                let names: Vec<String> = (0..cols)
+                    .filter_map(|c| grid.column_meta(c).map(|(name, _)| name))
+                    .collect();
+                s.push_str(&format!(
+                    ", showing a result of {rows} row(s) × {cols} column(s): {}",
+                    names.join(", ")
+                ));
             }
             s
         });
@@ -1599,10 +1620,10 @@ fn follow_if_at_bottom(chat: &ChatSession) {
 /// subagent. Ids are unique within a turn, so the first match is the one.
 fn find_activity_mut<'a>(
     nodes: &'a mut [red_core::ActivityNode],
-    id: &str,
+    id: &red_core::ActivityId,
 ) -> Option<&'a mut red_core::ActivityNode> {
     for node in nodes {
-        if node.id == id {
+        if node.id == *id {
             return Some(node);
         }
         if let Some(found) = find_activity_mut(&mut node.children, id) {

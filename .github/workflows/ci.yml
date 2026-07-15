@@ -37,6 +37,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Catches broken/dangling intra-doc links (see [workspace.lints.rustdoc]).
+      # RUSTDOCFLAGS is the rustdoc twin of the global RUSTFLAGS=-D warnings above;
+      # --no-deps keeps it to our crates.
+      - name: Docs
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
       - name: Test
         run: cargo test --workspace
 

@@ -1347,16 +1347,16 @@ fn referenced_tables_ranged(stmt: &str) -> Vec<(String, Option<String>, String, 
             }
             // Optional alias: `AS x` or a bare following identifier.
             let mut alias = None;
-            if let Some(Atom::Word(w, _)) = atoms.get(i) {
-                if w.eq_ignore_ascii_case("as") {
-                    i += 1;
-                }
+            if let Some(Atom::Word(w, _)) = atoms.get(i)
+                && w.eq_ignore_ascii_case("as")
+            {
+                i += 1;
             }
-            if let Some(Atom::Word(w, _)) = atoms.get(i) {
-                if !is_keyword(w) {
-                    alias = Some(w.clone());
-                    i += 1;
-                }
+            if let Some(Atom::Word(w, _)) = atoms.get(i)
+                && !is_keyword(w)
+            {
+                alias = Some(w.clone());
+                i += 1;
             }
             let key = alias.unwrap_or_else(|| table.clone()).to_lowercase();
             out.push((key, schema, table, table_range));
@@ -1522,10 +1522,11 @@ fn as_aliases(stmt: &str) -> HashSet<String> {
     let atoms = atomize(stmt);
     let mut names = HashSet::new();
     for w in atoms.windows(2) {
-        if let (Atom::Word(kw, _), Atom::Word(name, _)) = (&w[0], &w[1]) {
-            if kw.eq_ignore_ascii_case("as") && !is_keyword(name) {
-                names.insert(name.to_lowercase());
-            }
+        if let (Atom::Word(kw, _), Atom::Word(name, _)) = (&w[0], &w[1])
+            && kw.eq_ignore_ascii_case("as")
+            && !is_keyword(name)
+        {
+            names.insert(name.to_lowercase());
         }
     }
     names
@@ -1556,10 +1557,10 @@ fn diagnose_statement(stmt: &str, base: usize, schema: &dyn SchemaView, out: &mu
         }
         // Qualified by a schema we don't know (a cross-database reference we haven't
         // loaded) → can't validate the table, so leave it alone rather than flag it.
-        if let Some(q) = qualifier {
-            if !schema.has_schema(&q.to_lowercase()) {
-                continue;
-            }
+        if let Some(q) = qualifier
+            && !schema.has_schema(&q.to_lowercase())
+        {
+            continue;
         }
         out.push(Diagnostic {
             range: base + range.start..base + range.end,
@@ -1604,23 +1605,24 @@ fn diagnose_statement(stmt: &str, base: usize, schema: &dyn SchemaView, out: &mu
 
         if qualified {
             // `qualifier.word`: resolve the qualifier to a table, check the column.
+            #[allow(
+                clippy::expect_used,
+                reason = "qualified path implies a previous token"
+            )]
             let (pr, _) = prev.expect("qualified implies a previous token");
             let q = stmt[pr.clone()].to_lowercase();
             let table = alias_map
                 .get(&q)
                 .cloned()
                 .or_else(|| schema.has_table(&q).then(|| q.clone()));
-            if let Some(table) = table {
-                if let Some(cols) = schema.columns(&table) {
-                    if !cols.contains(&word.to_lowercase()) {
-                        out.push(Diagnostic {
-                            range: base + range.start..base + range.end,
-                            message: format!(
-                                "No column \u{201c}{word}\u{201d} on \u{201c}{table}\u{201d}"
-                            ),
-                        });
-                    }
-                }
+            if let Some(table) = table
+                && let Some(cols) = schema.columns(&table)
+                && !cols.contains(&word.to_lowercase())
+            {
+                out.push(Diagnostic {
+                    range: base + range.start..base + range.end,
+                    message: format!("No column \u{201c}{word}\u{201d} on \u{201c}{table}\u{201d}"),
+                });
             }
             continue;
         }
@@ -1638,6 +1640,10 @@ fn diagnose_statement(stmt: &str, base: usize, schema: &dyn SchemaView, out: &mu
             {
                 continue;
             }
+            #[allow(
+                clippy::expect_used,
+                reason = "single_table implies its columns are loaded"
+            )]
             let cols = schema
                 .columns(table)
                 .expect("single_table implies loaded columns");
@@ -1877,8 +1883,8 @@ mod tests {
         assert!(is_read_only("EXPLAIN SELECT * FROM t"));
         assert!(is_read_only("VALUES (1), (2)"));
         assert!(is_read_only("SELECT * FROM t;")); // a single trailing terminator is fine
-                                                   // A write word appearing only inside a string literal or a quoted identifier
-                                                   // is blanked before the scan, so a legitimate read isn't rejected.
+        // A write word appearing only inside a string literal or a quoted identifier
+        // is blanked before the scan, so a legitimate read isn't rejected.
         assert!(is_read_only("SELECT 'delete me' AS note FROM t"));
         assert!(is_read_only("SELECT \"delete\" FROM t"));
         // `updated_at` must not match the `update` write token (whole-word only).
@@ -2160,11 +2166,13 @@ mod tests {
         let s = TestSchema::new();
         // A SELECT-list output alias referenced later in the same statement (ORDER
         // BY, GROUP BY, HAVING) must not read as an unknown column.
-        assert!(diag_pairs(
-            "SELECT name, COUNT(*) AS total FROM users GROUP BY name ORDER BY total DESC",
-            &s
-        )
-        .is_empty());
+        assert!(
+            diag_pairs(
+                "SELECT name, COUNT(*) AS total FROM users GROUP BY name ORDER BY total DESC",
+                &s
+            )
+            .is_empty()
+        );
         // A genuinely unknown name in ORDER BY is still flagged.
         assert_eq!(
             diag_pairs(

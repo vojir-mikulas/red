@@ -12,7 +12,7 @@ impl AppState {
     /// Mint a fresh `SessionId` for a new connect.
     pub(crate) fn mint_session(&mut self) -> SessionId {
         self.next_session_id += 1;
-        SessionId(self.next_session_id)
+        SessionId::new(self.next_session_id)
     }
 
     /// The live `ActiveConn` for `session`: the foreground one (in `phase`) or a
@@ -20,10 +20,10 @@ impl AppState {
     /// that workspace is backgrounded (its query is still populating).
     pub(crate) fn conn_mut(&mut self, session: Option<SessionId>) -> Option<&mut ActiveConn> {
         let id = session?;
-        if self.foreground_session == Some(id) {
-            if let Phase::Connected(active) = &mut self.phase {
-                return Some(active);
-            }
+        if self.foreground_session == Some(id)
+            && let Phase::Connected(active) = &mut self.phase
+        {
+            return Some(active);
         }
         self.parked.get_mut(&id).map(|b| b.as_mut())
     }
@@ -51,20 +51,19 @@ impl AppState {
     /// switching back to it is instant. Leaves `phase` `Disconnected`; the caller
     /// installs the next phase. A connecting/disconnected foreground parks nothing.
     pub(crate) fn park_foreground(&mut self) -> Option<SessionId> {
-        if matches!(self.phase, Phase::Connected(_)) {
-            if let Phase::Connected(mut active) =
+        if matches!(self.phase, Phase::Connected(_))
+            && let Phase::Connected(mut active) =
                 std::mem::replace(&mut self.phase, Phase::Disconnected)
-            {
-                let id = active.session;
-                // Stamp the just-foregrounded conn as the most-recently-used, then
-                // make room: if parking would exceed the cap, evict the LRU parked
-                // session first (never this one; it has the freshest stamp).
-                self.next_active_seq += 1;
-                active.last_active_seq = self.next_active_seq;
-                self.evict_lru_parked();
-                self.parked.insert(id, active);
-                return Some(id);
-            }
+        {
+            let id = active.session;
+            // Stamp the just-foregrounded conn as the most-recently-used, then
+            // make room: if parking would exceed the cap, evict the LRU parked
+            // session first (never this one; it has the freshest stamp).
+            self.next_active_seq += 1;
+            active.last_active_seq = self.next_active_seq;
+            self.evict_lru_parked();
+            self.parked.insert(id, active);
+            return Some(id);
         }
         None
     }
@@ -233,10 +232,11 @@ impl AppState {
         // Secrets live in the keychain keyed by the *source* id (the config carries
         // them empty), so hydrate them here to re-store under the new id.
         let mut password = config.password.clone();
-        if password.is_empty() && !is_file {
-            if let Ok(Some(pw)) = crate::secrets::get_password(&source_id) {
-                password = pw;
-            }
+        if password.is_empty()
+            && !is_file
+            && let Ok(Some(pw)) = crate::secrets::get_password(&source_id)
+        {
+            password = pw;
         }
         let ssh_secrets = config.ssh.as_ref().map(|ssh| {
             let mut pw = ssh.password.clone();

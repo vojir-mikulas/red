@@ -62,8 +62,8 @@ static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 /// mints epochs from this same counter too, one open scan per epoch exactly
 /// like one open SQL result per epoch — different `Command`/`Event` shapes,
 /// same "distinguish this open thing from a superseded one" job.
-pub(crate) fn next_epoch() -> u64 {
-    NEXT_EPOCH.fetch_add(1, Ordering::Relaxed)
+pub(crate) fn next_epoch() -> red_service::Epoch {
+    red_service::Epoch::new(NEXT_EPOCH.fetch_add(1, Ordering::Relaxed))
 }
 
 /// The value kind a result cell is painted as. Classified once when the row
@@ -396,7 +396,7 @@ impl KeyedRun {
         }
     }
 
-    fn issue(&mut self, fetch: RunFetch, epoch: u64, sender: &CommandSender) {
+    fn issue(&mut self, fetch: RunFetch, epoch: red_service::Epoch, sender: &CommandSender) {
         self.seq += 1;
         self.pending = Some(self.seq);
         sender.send(Command::FetchRun {
@@ -412,7 +412,12 @@ impl KeyedRun {
     /// issues an **exact** jump that bypasses key-space interpolation, landing on
     /// the true row with non-estimated ordinals. The pending mark it sets stops
     /// `request` from racing an interpolated jump in before the reply lands.
-    pub(super) fn jump_exact(&mut self, ordinal: usize, epoch: u64, sender: &CommandSender) {
+    pub(super) fn jump_exact(
+        &mut self,
+        ordinal: usize,
+        epoch: red_service::Epoch,
+        sender: &CommandSender,
+    ) {
         self.rows.clear();
         self.at_start = false;
         self.at_end = false;
@@ -431,7 +436,13 @@ impl KeyedRun {
     /// Issue (at most) one fetch toward covering `range` plus its margins. One
     /// request in flight at a time; a seek's start is the previous reply's
     /// boundary key, so they can't pipeline anyway.
-    fn request(&mut self, range: Range<usize>, total: usize, epoch: u64, sender: &CommandSender) {
+    fn request(
+        &mut self,
+        range: Range<usize>,
+        total: usize,
+        epoch: red_service::Epoch,
+        sender: &CommandSender,
+    ) {
         if self.pending.is_some() || self.halted {
             return;
         }
@@ -669,11 +680,11 @@ impl GridBuffer {
     /// The in-flight run fetch failed: free the slot so fetching can resume,
     /// but hold off until the viewport moves (see `KeyedRun::halted`).
     pub(super) fn run_failed(&mut self, seq: u64) {
-        if let BufferMode::Keyed(run) = &mut self.mode {
-            if run.pending == Some(seq) {
-                run.pending = None;
-                run.halted = true;
-            }
+        if let BufferMode::Keyed(run) = &mut self.mode
+            && run.pending == Some(seq)
+        {
+            run.pending = None;
+            run.halted = true;
         }
     }
 
@@ -713,7 +724,7 @@ impl GridBuffer {
         &mut self,
         range: Range<usize>,
         total: usize,
-        epoch: u64,
+        epoch: red_service::Epoch,
         sender: &CommandSender,
     ) -> bool {
         let margin = MARGIN_PAGES * self.page;
@@ -735,10 +746,11 @@ impl GridBuffer {
         }
 
         // A failed fetch halts re-issuing; movement is the retry signal.
-        if let BufferMode::Keyed(run) = &mut self.mode {
-            if run.halted && self.last_start != Some(range.start) {
-                run.halted = false;
-            }
+        if let BufferMode::Keyed(run) = &mut self.mode
+            && run.halted
+            && self.last_start != Some(range.start)
+        {
+            run.halted = false;
         }
 
         // While the viewport is flying past rows the user won't dwell on, don't
@@ -762,7 +774,13 @@ impl GridBuffer {
 
 impl OffsetPages {
     /// Request any missing pages covering `range` (the offset path).
-    fn request(&mut self, range: Range<usize>, total: usize, epoch: u64, sender: &CommandSender) {
+    fn request(
+        &mut self,
+        range: Range<usize>,
+        total: usize,
+        epoch: red_service::Epoch,
+        sender: &CommandSender,
+    ) {
         let size = self.page;
         let first = range.start / size;
         let last = (range.end - 1) / size;

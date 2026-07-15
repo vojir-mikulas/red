@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Context, Hsla, MouseButton, Pixels, Point, SharedString, Window};
+use gpui::{Context, Hsla, MouseButton, Pixels, Point, SharedString, Window, div, prelude::*, px};
 use red_core::{DbKind, FkEdge, ObjectKind, SchemaMeta, TableDetail};
 use red_service::Command;
 
@@ -309,18 +309,18 @@ fn hover_provider(
 
         // A column of a table the statement references → its type.
         for (_, table) in crate::sql::referenced_tables_at(content, offset) {
-            if let Some(cols) = index.columns_by_table.get(&table.to_lowercase()) {
-                if let Some(c) = cols.iter().find(|c| c.name.to_lowercase() == wl) {
-                    let ty = if c.ty.is_empty() {
-                        "column".to_string()
-                    } else {
-                        c.ty.to_string()
-                    };
-                    return Some(SharedString::from(format!(
-                        "{}  {}\nin {}",
-                        c.name, ty, table
-                    )));
-                }
+            if let Some(cols) = index.columns_by_table.get(&table.to_lowercase())
+                && let Some(c) = cols.iter().find(|c| c.name.to_lowercase() == wl)
+            {
+                let ty = if c.ty.is_empty() {
+                    "column".to_string()
+                } else {
+                    c.ty.to_string()
+                };
+                return Some(SharedString::from(format!(
+                    "{}  {}\nin {}",
+                    c.name, ty, table
+                )));
             }
         }
         None
@@ -570,7 +570,7 @@ impl AppState {
         half: crate::app::SplitHalf,
         is_focused: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         // Owned (not borrowed from `cx`) so the agent-tab branch below can call a
         // `&mut cx` render method without clashing with the theme tokens this fn
         // snapshots throughout.
@@ -1298,10 +1298,10 @@ impl AppState {
             Phase::Connected(active) => self.query_history.count_for_conn(&active.conn_id),
             _ => 0,
         };
-        if let Phase::Connected(active) = &mut self.phase {
-            if active.history_sel >= len {
-                active.history_sel = len.saturating_sub(1);
-            }
+        if let Phase::Connected(active) = &mut self.phase
+            && active.history_sel >= len
+        {
+            active.history_sel = len.saturating_sub(1);
         }
         cx.notify();
     }
@@ -1393,7 +1393,7 @@ impl AppState {
         index: usize,
         pos: Point<Pixels>,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let (pinned, has_left, has_right, has_others) = match &self.phase {
             Phase::Connected(active) => match active.tabs.get(index) {
                 Some(t) => {
@@ -1509,8 +1509,8 @@ fn resolve_in_catalog(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_index, completion_provider, hover_provider, join_items, resolve_in_catalog,
-        CompletionIndex,
+        CompletionIndex, build_index, completion_provider, hover_provider, join_items,
+        resolve_in_catalog,
     };
     use red_core::{ColumnMeta, DbKind, FkEdge, ObjectKind, ObjectMeta, SchemaMeta, TableDetail};
     use std::collections::HashMap;

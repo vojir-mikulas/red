@@ -6,8 +6,8 @@
 use std::time::Duration;
 
 use gpui::{
-    point, prelude::*, px, AsyncApp, Context, Hsla, Pixels, Point, ScrollHandle, Styled,
-    UniformListScrollHandle, WeakEntity,
+    AsyncApp, Context, Hsla, Pixels, Point, ScrollHandle, Styled, UniformListScrollHandle,
+    WeakEntity, point, prelude::*, px,
 };
 
 use crate::app::AppState;
@@ -71,8 +71,8 @@ impl AppState {
             epoch,
         });
         cx.notify();
-        cx.spawn(
-            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| loop {
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            loop {
                 cx.background_executor().timer(TICK).await;
                 let alive = this
                     .update(cx, |this, cx| this.autoscroll_tick(epoch, cx))
@@ -80,8 +80,8 @@ impl AppState {
                 if !alive {
                     break;
                 }
-            },
-        )
+            }
+        })
         .detach();
     }
 

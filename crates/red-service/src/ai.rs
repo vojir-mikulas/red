@@ -19,17 +19,17 @@ use red_ai::{
     AiProvider, CancelToken, ContentBlock, Message, Role, StopReason, ToolDef, TurnRequest,
 };
 use red_core::kv::{
-    analyze_keyspace, KeyMeta, KvCollection, KvValue, RespValue, ScanBudget, ScanCursor,
+    KeyMeta, KvCollection, KvValue, RespValue, ScanBudget, ScanCursor, analyze_keyspace,
 };
 use red_core::{
     ActivityKind, ActivityStatus, AiLimits, AiPolicy, AiTier, RedError, TableRef, Value,
 };
 use red_driver::{AbortSignal, DatabaseDriver, KvDriver, PageCap};
-use serde_json::{json, Value as Json};
+use serde_json::{Value as Json, json};
 use tokio::sync::oneshot;
 
-use crate::dispatch::{emit, Events};
-use crate::protocol::{AiContext, AiDelta, AiUsage, ReportTheme};
+use crate::dispatch::{Events, emit};
+use crate::protocol::{AiContext, AiDelta, AiUsage, ConversationId, ReportTheme, RequestId};
 use crate::{Event, SessionId};
 
 /// Which engine the agent turn is grounded in. The model→tool loop, streaming,
@@ -101,7 +101,7 @@ impl AiBackend {
 pub(crate) struct ReportSink {
     events: Option<Events>,
     session: Option<SessionId>,
-    conversation_id: u64,
+    conversation_id: ConversationId,
     /// The active app theme, so `generate_report` can paint the report in Red's
     /// colors. Captured when the sink is built (per turn on the API-key path; at
     /// conversation start on the subscription path).
@@ -115,7 +115,7 @@ impl ReportSink {
     pub(crate) fn new(
         events: Events,
         session: Option<SessionId>,
-        conversation_id: u64,
+        conversation_id: ConversationId,
         theme: Option<ReportTheme>,
         report_dir: Option<PathBuf>,
     ) -> Self {
@@ -134,7 +134,7 @@ impl ReportSink {
         Self {
             events: None,
             session: None,
-            conversation_id: 0,
+            conversation_id: ConversationId::new(0),
             theme: None,
             report_dir: None,
         }
@@ -221,14 +221,14 @@ const MAX_TOOL_STEPS: usize = 16;
 /// conversation, not just one turn).
 #[derive(Default)]
 pub(crate) struct AiState {
-    histories: HashMap<u64, Vec<Message>>,
-    cancels: HashMap<u64, CancelToken>,
-    tool_calls: HashMap<u64, usize>,
+    histories: HashMap<ConversationId, Vec<Message>>,
+    cancels: HashMap<ConversationId, CancelToken>,
+    tool_calls: HashMap<ConversationId, usize>,
     /// Write-tool approval prompts (Feature B) awaiting the user's Allow/Deny, keyed
     /// by request id. The turn task parks a decision sink here; `AiPermission` takes
     /// it back out and fires it, the API-key analogue of the ACP path's
     /// `AcpManager.pending`.
-    pending_perms: HashMap<u64, oneshot::Sender<bool>>,
+    pending_perms: HashMap<RequestId, oneshot::Sender<bool>>,
     /// Monotonic counter for the request ids handed out by [`Self::park_permission`].
     /// Handed-out ids are offset by [`AI_REQUEST_BASE`] so they never collide with
     /// the ACP manager's (which counts up from 0); `AiPermission` can then resolve
@@ -254,17 +254,17 @@ const MAX_REPORT_BYTES: usize = 4 * 1024 * 1024;
 
 impl AiState {
     /// Record an in-flight turn's cancel token so `AiCancel` can reach it.
-    pub(crate) fn register(&mut self, conversation_id: u64, token: CancelToken) {
+    pub(crate) fn register(&mut self, conversation_id: ConversationId, token: CancelToken) {
         self.cancels.insert(conversation_id, token);
     }
 
     /// Park a write-approval decision sink and return the request id to surface, or
     /// `None` (deny) when too many are already outstanding.
-    fn park_permission(&mut self, decide: oneshot::Sender<bool>) -> Option<u64> {
+    fn park_permission(&mut self, decide: oneshot::Sender<bool>) -> Option<RequestId> {
         if self.pending_perms.len() >= MAX_PENDING_PERMS {
             return None;
         }
-        let id = AI_REQUEST_BASE + self.next_request;
+        let id = RequestId::new(AI_REQUEST_BASE + self.next_request);
         self.next_request += 1;
         self.pending_perms.insert(id, decide);
         Some(id)
@@ -273,14 +273,14 @@ impl AiState {
     /// Answer a parked write-approval prompt (the panel's Allow/Deny). A stale id
     /// (already resolved, or owned by the ACP path) is a no-op. Also used to forget a
     /// prompt abandoned on cancel (`allow` is irrelevant then; the receiver is gone).
-    pub(crate) fn resolve_permission(&mut self, request_id: u64, allow: bool) {
+    pub(crate) fn resolve_permission(&mut self, request_id: RequestId, allow: bool) {
         if let Some(decide) = self.pending_perms.remove(&request_id) {
             let _ = decide.send(allow);
         }
     }
 
     /// Flip the cancel token for an in-flight turn, if any (the panel's Stop).
-    pub(crate) fn cancel(&self, conversation_id: u64) {
+    pub(crate) fn cancel(&self, conversation_id: ConversationId) {
         if let Some(tok) = self.cancels.get(&conversation_id) {
             tok.cancel();
         }
@@ -292,7 +292,7 @@ impl AiState {
     /// any in-flight turn first so its task winds down. (A turn still racing to its
     /// final history write can re-insert one entry; that's bounded, unlike the prior
     /// unconditional growth.)
-    pub(crate) fn forget(&mut self, conversation_id: u64) {
+    pub(crate) fn forget(&mut self, conversation_id: ConversationId) {
         if let Some(tok) = self.cancels.remove(&conversation_id) {
             tok.cancel();
         }
@@ -303,7 +303,7 @@ impl AiState {
     /// Charge one tool call against the conversation's cumulative budget. Returns
     /// `false` once the budget (`max`, `0` = unlimited) is exhausted, so the loop
     /// can stop a runaway agent instead of letting it spin tools forever.
-    fn charge_tool_call(&mut self, conversation_id: u64, max: usize) -> bool {
+    fn charge_tool_call(&mut self, conversation_id: ConversationId, max: usize) -> bool {
         let count = self.tool_calls.entry(conversation_id).or_default();
         if max != 0 && *count >= max {
             return false;
@@ -327,7 +327,7 @@ pub(crate) async fn run_turn(
     events: Events,
     state: Arc<Mutex<AiState>>,
     session: Option<SessionId>,
-    conversation_id: u64,
+    conversation_id: ConversationId,
     model: String,
     show_thinking: bool,
     policy: AiPolicy,
@@ -469,7 +469,7 @@ pub(crate) async fn run_turn(
                     Event::AiDelta {
                         conversation_id,
                         delta: AiDelta::ActivityStarted {
-                            id: id.clone(),
+                            id: id.clone().into(),
                             parent: None,
                             kind: ActivityKind::Subagent {
                                 task: truncate_summary(&task, 120),
@@ -501,7 +501,7 @@ pub(crate) async fn run_turn(
                     Event::AiDelta {
                         conversation_id,
                         delta: AiDelta::ActivityUpdated {
-                            id: id.clone(),
+                            id: id.clone().into(),
                             status: Some(if ok {
                                 ActivityStatus::Ok
                             } else {
@@ -551,7 +551,7 @@ pub(crate) async fn run_turn(
                             Event::AiDelta {
                                 conversation_id,
                                 delta: AiDelta::ActivityStarted {
-                                    id: id.clone(),
+                                    id: id.clone().into(),
                                     parent: None,
                                     kind: ActivityKind::Write { sql: sql.clone() },
                                     status: ActivityStatus::Denied,
@@ -576,7 +576,7 @@ pub(crate) async fn run_turn(
                 Event::AiDelta {
                     conversation_id,
                     delta: AiDelta::ActivityStarted {
-                        id: id.clone(),
+                        id: id.clone().into(),
                         parent: None,
                         kind: ActivityKind::Tool {
                             name: name.clone(),
@@ -600,7 +600,7 @@ pub(crate) async fn run_turn(
                 Event::AiDelta {
                     conversation_id,
                     delta: AiDelta::ActivityUpdated {
-                        id: id.clone(),
+                        id: id.clone().into(),
                         status: Some(if ok {
                             ActivityStatus::Ok
                         } else {
@@ -672,7 +672,7 @@ async fn run_subagent(
     events: &Events,
     state: &Arc<Mutex<AiState>>,
     session: Option<SessionId>,
-    conversation_id: u64,
+    conversation_id: ConversationId,
     model: &str,
     policy: &AiPolicy,
     report: &ReportSink,
@@ -743,8 +743,8 @@ async fn run_subagent(
                 Event::AiDelta {
                     conversation_id,
                     delta: AiDelta::ActivityStarted {
-                        id: id.clone(),
-                        parent: Some(parent_id.to_string()),
+                        id: id.clone().into(),
+                        parent: Some(parent_id.to_string().into()),
                         kind: ActivityKind::Tool {
                             name: name.clone(),
                             args_summary: summarize_tool_args(name, input),
@@ -780,7 +780,7 @@ async fn run_subagent(
                 Event::AiDelta {
                     conversation_id,
                     delta: AiDelta::ActivityUpdated {
-                        id: id.clone(),
+                        id: id.clone().into(),
                         status: Some(if ok {
                             ActivityStatus::Ok
                         } else {
@@ -868,7 +868,7 @@ async fn await_write_approval(
     state: &Arc<Mutex<AiState>>,
     events: &Events,
     session: Option<SessionId>,
-    conversation_id: u64,
+    conversation_id: ConversationId,
     sql: &str,
     cancel: &CancelToken,
 ) -> bool {
@@ -1563,10 +1563,10 @@ pub(crate) async fn kv_run_tool(
     // Defense in depth: run_turn already vetted and prompted, but re-run the
     // catastrophic-shape guard here so no caller (a subagent, a future path) can
     // execute a keyspace-wide write that assess_kv_write would refuse.
-    if is_kv_write_tool(name) {
-        if let WriteAssessment::Reject(why) = assess_kv_write(name, input) {
-            return (format!("error: {why}"), false);
-        }
+    if is_kv_write_tool(name)
+        && let WriteAssessment::Reject(why) = assess_kv_write(name, input)
+    {
+        return (format!("error: {why}"), false);
     }
     let limits = &policy.limits;
     let (content, ok) = match name {
@@ -1822,21 +1822,20 @@ pub(crate) async fn kv_run_tool(
                 targets.extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
             }
             let mut note = "";
-            if targets.is_empty() {
-                if let Some(pattern) = input
+            if targets.is_empty()
+                && let Some(pattern) = input
                     .get("pattern")
                     .and_then(Json::as_str)
                     .filter(|p| !p.is_empty())
-                {
-                    match kv_collect_keys(driver, Some(pattern), KV_BULK_MAX).await {
-                        Ok((keys, exhausted)) => {
-                            targets = keys.into_iter().map(|k| k.key).collect();
-                            if !exhausted {
-                                note = " (bound hit; run again for the rest)";
-                            }
+            {
+                match kv_collect_keys(driver, Some(pattern), KV_BULK_MAX).await {
+                    Ok((keys, exhausted)) => {
+                        targets = keys.into_iter().map(|k| k.key).collect();
+                        if !exhausted {
+                            note = " (bound hit; run again for the rest)";
                         }
-                        Err(e) => return (format!("error: {e}"), false),
                     }
+                    Err(e) => return (format!("error: {e}"), false),
                 }
             }
             if targets.is_empty() {
@@ -2615,7 +2614,7 @@ fn assess_kv_write(name: &str, input: &Json) -> WriteAssessment {
                     format!("all keys matching `{p}`")
                 }
                 (None, None) => {
-                    return WriteAssessment::Reject("kv_expire needs `key` or `pattern`".into())
+                    return WriteAssessment::Reject("kv_expire needs `key` or `pattern`".into());
                 }
             };
             let action = match seconds {
@@ -3097,7 +3096,17 @@ fn strip_scripts(html: &str) -> String {
                 None => break,
             }
         }
-        let ch = html[i..].chars().next().expect("char at boundary");
+        // `i` advances only by whole chars (`ch.len_utf8()` below) or past a
+        // matched ASCII `</script>`, so it always sits on a UTF-8 boundary inside
+        // the `i < html.len()` guard — there is always a next char.
+        #[allow(
+            clippy::expect_used,
+            reason = "i is maintained on a char boundary; see comment"
+        )]
+        let ch = html[i..]
+            .chars()
+            .next()
+            .expect("i sits on a char boundary within bounds");
         out.push(ch);
         i += ch.len_utf8();
     }
@@ -3288,7 +3297,15 @@ async fn profile_table(
         let stats = guard_timeout(
             limits.statement_timeout_ms,
             &abort,
-            driver.column_stats(&base_sql, &col.name, numeric, want_distinct, &abort),
+            driver.column_stats(
+                &base_sql,
+                &col.name,
+                red_core::StatsFlags {
+                    numeric,
+                    distinct: want_distinct,
+                },
+                &abort,
+            ),
         )
         .await;
         match stats {
@@ -3950,7 +3967,7 @@ mod tests {
         let db = std::env::temp_dir().join(format!("red-sq-{}.db", uuid::Uuid::new_v4().simple()));
         let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let sink = ReportSink::new(tx, None, 42, None, None);
+        let sink = ReportSink::new(tx, None, ConversationId::new(42), None, None);
 
         let (content, ok) = run_tool(
             &driver,
@@ -3978,7 +3995,7 @@ mod tests {
         else {
             panic!("expected AiSaveQuery, got {event:?}");
         };
-        assert_eq!(conversation_id, 42);
+        assert_eq!(conversation_id.get(), 42);
         assert_eq!(name, "Monthly revenue");
         assert_eq!(description.as_deref(), Some("Revenue for a given :month"));
         assert!(sql.contains(":month"));
@@ -4006,7 +4023,7 @@ mod tests {
         let db = std::env::temp_dir().join(format!("red-gr-{}.db", uuid::Uuid::new_v4().simple()));
         let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let sink = ReportSink::new(tx, None, 7, None, None);
+        let sink = ReportSink::new(tx, None, ConversationId::new(7), None, None);
 
         let (content, ok) = run_tool(
             &driver,
@@ -4033,7 +4050,7 @@ mod tests {
         else {
             panic!("expected AiReportReady");
         };
-        assert_eq!(conversation_id, 7);
+        assert_eq!(conversation_id.get(), 7);
         let html = std::fs::read_to_string(&path).unwrap();
         assert!(html.starts_with("<!doctype html>"));
         // The model's body is present and the title is carried through.
@@ -4071,7 +4088,7 @@ mod tests {
         let out =
             std::env::temp_dir().join(format!("red-reports-{}", uuid::Uuid::new_v4().simple()));
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let sink = ReportSink::new(tx, None, 21, None, Some(out.clone()));
+        let sink = ReportSink::new(tx, None, ConversationId::new(21), None, Some(out.clone()));
 
         let (_content, ok) = run_tool(
             &driver,
@@ -4107,7 +4124,7 @@ mod tests {
         let db = std::env::temp_dir().join(format!("red-grc-{}.db", uuid::Uuid::new_v4().simple()));
         let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let sink = ReportSink::new(tx, None, 11, None, None);
+        let sink = ReportSink::new(tx, None, ConversationId::new(11), None, None);
 
         let (content, ok) = run_tool(
             &driver,
@@ -4162,7 +4179,7 @@ mod tests {
         let db = std::env::temp_dir().join(format!("red-grd-{}.db", uuid::Uuid::new_v4().simple()));
         let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let sink = ReportSink::new(tx, None, 13, None, None);
+        let sink = ReportSink::new(tx, None, ConversationId::new(13), None, None);
 
         let (content, ok) = run_tool(
             &driver,
@@ -4207,7 +4224,7 @@ mod tests {
         let db = std::env::temp_dir().join(format!("red-grf-{}.db", uuid::Uuid::new_v4().simple()));
         let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let sink = ReportSink::new(tx, None, 17, None, None);
+        let sink = ReportSink::new(tx, None, ConversationId::new(17), None, None);
 
         let (content, ok) = run_tool(
             &driver,
@@ -4314,9 +4331,11 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         // Read tier never offers the write tool.
-        assert!(names(AiPolicy::default())
-            .iter()
-            .all(|n| n != "propose_write"));
+        assert!(
+            names(AiPolicy::default())
+                .iter()
+                .all(|n| n != "propose_write")
+        );
         // Write tier offers it…
         let write = AiPolicy {
             tier: AiTier::Write,
@@ -4445,12 +4464,12 @@ mod tests {
         let (tx, mut rx) = oneshot::channel();
         let id = st.park_permission(tx).expect("a fresh prompt parks");
         // Ids are offset so they never collide with the ACP manager's id space.
-        assert!(id >= AI_REQUEST_BASE);
+        assert!(id.get() >= AI_REQUEST_BASE);
         st.resolve_permission(id, true);
         assert_eq!(rx.try_recv(), Ok(true));
         // Resolving a stale/unknown id is a harmless no-op.
         st.resolve_permission(id, false);
-        st.resolve_permission(424242, false);
+        st.resolve_permission(RequestId::new(424242), false);
     }
 
     /// A scripted `AiProvider`: the first turn requests `propose_write` with `sql`,
@@ -4546,7 +4565,7 @@ mod tests {
             tx,
             state.clone(),
             None,
-            1,
+            ConversationId::new(1),
             "m".into(),
             false,
             policy,
@@ -4563,9 +4582,11 @@ mod tests {
                 Event::AiPermissionRequest {
                     request_id, detail, ..
                 } => {
-                    assert!(detail
-                        .unwrap_or_default()
-                        .contains("UPDATE t SET name = 'after'"));
+                    assert!(
+                        detail
+                            .unwrap_or_default()
+                            .contains("UPDATE t SET name = 'after'")
+                    );
                     request_id
                 }
                 _ => panic!("the write must prompt before doing anything"),
@@ -4598,13 +4619,13 @@ mod tests {
     fn tool_call_budget_is_per_conversation_and_capped() {
         let mut state = AiState::default();
         // A cap of 2 admits two calls, then refuses the third on the same conversation.
-        assert!(state.charge_tool_call(1, 2));
-        assert!(state.charge_tool_call(1, 2));
-        assert!(!state.charge_tool_call(1, 2));
+        assert!(state.charge_tool_call(ConversationId::new(1), 2));
+        assert!(state.charge_tool_call(ConversationId::new(1), 2));
+        assert!(!state.charge_tool_call(ConversationId::new(1), 2));
         // A different conversation has its own fresh budget.
-        assert!(state.charge_tool_call(2, 2));
+        assert!(state.charge_tool_call(ConversationId::new(2), 2));
         // `0` means unlimited.
-        assert!(state.charge_tool_call(3, 0));
-        assert!(state.charge_tool_call(3, 0));
+        assert!(state.charge_tool_call(ConversationId::new(3), 0));
+        assert!(state.charge_tool_call(ConversationId::new(3), 0));
     }
 }

@@ -173,8 +173,13 @@ async fn run_login_inner(
         .spawn()
         .map_err(|e| format!("could not start sign-in ({program}): {e}"))?;
 
+    // All three were configured `Stdio::piped()` on the command above, so the
+    // child always exposes them.
+    #[allow(clippy::expect_used, reason = "stdio was configured piped() above")]
     let stdout = child.stdout.take().expect("piped stdout");
+    #[allow(clippy::expect_used, reason = "stdio was configured piped() above")]
     let mut stdin = child.stdin.take().expect("piped stdin");
+    #[allow(clippy::expect_used, reason = "stdio was configured piped() above")]
     let stderr = child.stderr.take().expect("piped stderr");
 
     // Drain stderr into a capped buffer so a failed exchange can be explained.
@@ -236,6 +241,12 @@ async fn run_login_inner(
         }
         // Fallback: feed the pasted code, then wait for the CLI to exchange it.
         None => {
+            // This arm is reached only when `cancelled` is false, which the caller
+            // guarantees means a pasted code is present.
+            #[allow(
+                clippy::expect_used,
+                reason = "non-cancelled path always carries a code"
+            )]
             let code = pasted_code.expect("a code or cancellation");
             stdin
                 .write_all(format!("{}\n", code.trim()).as_bytes())

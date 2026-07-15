@@ -71,3 +71,6 @@ gpui_platform = { workspace = true, features = ["font-kit"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui = { workspace = true, features = ["x11", "wayland"] }
 gpui_platform = { workspace = true, features = ["x11", "wayland"] }
+
+[lints]
+workspace = true

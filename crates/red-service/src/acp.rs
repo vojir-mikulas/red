@@ -18,12 +18,12 @@ use red_acp::{
 use red_core::AiPolicy;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::ai::{user_turn, AiBackend, ReportSink};
-use crate::dispatch::{emit, Events};
+use crate::ai::{AiBackend, ReportSink, user_turn};
+use crate::dispatch::{Events, emit};
 use crate::mcp::McpServer;
 use crate::protocol::{
     AiAuthStatus, AiCommand, AiConfigCategory, AiConfigChoice, AiConfigOption, AiContext, AiDelta,
-    AiUsage, ReportTheme,
+    AiUsage, ConversationId, ReportTheme, RequestId,
 };
 use crate::{Event, SessionId};
 
@@ -65,18 +65,18 @@ struct Conversation {
 /// the command pump without wedging it.
 #[derive(Default)]
 pub(crate) struct AcpManager {
-    conversations: HashMap<u64, Conversation>,
+    conversations: HashMap<ConversationId, Conversation>,
     /// Permission prompts (M-S2) awaiting the user's answer, keyed by request id.
     /// The relay task parks the agent's decision sink here; `AiPermission` takes
     /// it back out and fires it. Capped so a runaway agent can't grow it forever.
-    pending: HashMap<u64, oneshot::Sender<bool>>,
+    pending: HashMap<RequestId, oneshot::Sender<bool>>,
     /// Monotonic id handed to each surfaced permission prompt.
     next_request_id: u64,
     /// Crash-restart bookkeeping per conversation, so a reliably-crashing agent
     /// can't be re-spawned on every turn (see [`AcpManager::allow_restart`]). Kept
     /// after the `Conversation` itself is dropped, and that's the point: it has to
     /// outlive the dead agent to bound how often it comes back.
-    restarts: HashMap<u64, RestartTracker>,
+    restarts: HashMap<ConversationId, RestartTracker>,
     /// In-flight interactive sign-ins (paste-code OAuth), keyed by agent id. The
     /// login relay parks the CLI's code sink here; `AiSubmitLoginCode` takes it out
     /// and fires it. Bounded by the number of agents. The `u64` token lets a login
@@ -110,7 +110,7 @@ struct RestartTracker {
 
 impl AcpManager {
     /// Cancel the in-flight turn for a conversation, if it exists.
-    pub(crate) fn cancel(&self, conversation_id: u64) {
+    pub(crate) fn cancel(&self, conversation_id: ConversationId) {
         if let Some(c) = self.conversations.get(&conversation_id) {
             c.agent.cancel();
         }
@@ -119,7 +119,10 @@ impl AcpManager {
     /// The live agent handle for a conversation, if it's been started. Cloned so the
     /// caller can issue a request (e.g. a config change) without holding the manager
     /// lock across the await.
-    pub(crate) fn conversation_agent(&self, conversation_id: u64) -> Option<AcpConversation> {
+    pub(crate) fn conversation_agent(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Option<AcpConversation> {
         self.conversations
             .get(&conversation_id)
             .map(|c| c.agent.clone())
@@ -127,11 +130,11 @@ impl AcpManager {
 
     /// Park a permission decision sink and return the request id to surface, or
     /// `None` (deny by dropping `decide`) when too many are already outstanding.
-    fn park_permission(&mut self, decide: oneshot::Sender<bool>) -> Option<u64> {
+    fn park_permission(&mut self, decide: oneshot::Sender<bool>) -> Option<RequestId> {
         if self.pending.len() >= MAX_PENDING_PERMISSIONS {
             return None;
         }
-        let id = self.next_request_id;
+        let id = RequestId::new(self.next_request_id);
         self.next_request_id += 1;
         self.pending.insert(id, decide);
         Some(id)
@@ -142,7 +145,7 @@ impl AcpManager {
     /// caller refuses the turn instead of re-spawning, so a crash-on-every-prompt
     /// agent can't thrash a subprocess + MCP bind on each send; the window rolls
     /// over on its own, so a later genuine retry isn't blocked forever.
-    fn allow_restart(&mut self, conversation_id: u64) -> bool {
+    fn allow_restart(&mut self, conversation_id: ConversationId) -> bool {
         let now = Instant::now();
         let tracker = self
             .restarts
@@ -171,7 +174,7 @@ impl AcpManager {
 
     /// Answer a parked permission prompt (the panel's Allow/Deny). A stale id (the
     /// prompt was already resolved or the agent went away) is a no-op.
-    pub(crate) fn resolve_permission(&mut self, request_id: u64, allow: bool) {
+    pub(crate) fn resolve_permission(&mut self, request_id: RequestId, allow: bool) {
         if let Some(decide) = self.pending.remove(&request_id) {
             let _ = decide.send(allow);
         }
@@ -212,7 +215,7 @@ impl AcpManager {
 
     /// Mark a turn finished: clear the in-flight guard and reset the idle clock so
     /// the conversation stays warm for [`IDLE_TEARDOWN`] after each reply.
-    fn finish_turn(&mut self, conversation_id: u64) {
+    fn finish_turn(&mut self, conversation_id: ConversationId) {
         if let Some(c) = self.conversations.get_mut(&conversation_id) {
             c.active = false;
             c.last_used = Instant::now();
@@ -267,7 +270,7 @@ impl AcpManager {
     /// Tear down a conversation the UI has closed or deleted (M-S5), freeing its
     /// agent subprocess and MCP port now rather than waiting for the idle sweep.
     /// Dropping the `Conversation` unwinds the same way as [`Self::evict_session`].
-    pub(crate) fn forget(&mut self, conversation_id: u64) {
+    pub(crate) fn forget(&mut self, conversation_id: ConversationId) {
         self.restarts.remove(&conversation_id);
         if self.conversations.remove(&conversation_id).is_some() {
             tracing::debug!("forgetting closed ACP conversation {conversation_id}");
@@ -305,7 +308,7 @@ pub(crate) async fn run_turn(
     cwd: PathBuf,
     events: Events,
     session: Option<SessionId>,
-    conversation_id: u64,
+    conversation_id: ConversationId,
     policy: AiPolicy,
     user_message: String,
     context: AiContext,
@@ -404,7 +407,7 @@ pub(crate) async fn run_turn(
             // stops after delegating (e.g. `EndTurn` right after spawning subagents,
             // with no final synthesis) is diagnosable rather than a silent mystery.
             tracing::debug!(
-                conversation_id,
+                conversation_id = %conversation_id,
                 stop = ?result.stop,
                 "acp: turn ended"
             );
@@ -556,7 +559,7 @@ async fn ensure_conversation(
     cwd: PathBuf,
     events: Events,
     session: Option<SessionId>,
-    conversation_id: u64,
+    conversation_id: ConversationId,
     policy: AiPolicy,
     theme: Option<ReportTheme>,
     report_dir: Option<PathBuf>,
@@ -666,6 +669,7 @@ async fn ensure_conversation(
         );
     }
 
+    #[allow(clippy::expect_used, reason = "conversation was just inserted above")]
     let entry = guard
         .conversations
         .get_mut(&conversation_id)
@@ -687,7 +691,7 @@ async fn permission_relay(
     manager: Arc<tokio::sync::Mutex<AcpManager>>,
     events: Events,
     session: Option<SessionId>,
-    conversation_id: u64,
+    conversation_id: ConversationId,
     mut perm_rx: mpsc::UnboundedReceiver<AcpPermission>,
 ) {
     while let Some(perm) = perm_rx.recv().await {
@@ -720,7 +724,7 @@ async fn permission_relay(
 async fn commands_relay(
     events: Events,
     session: Option<SessionId>,
-    conversation_id: u64,
+    conversation_id: ConversationId,
     mut cmd_rx: mpsc::UnboundedReceiver<Vec<AcpCommand>>,
 ) {
     while let Some(commands) = cmd_rx.recv().await {
@@ -748,7 +752,7 @@ async fn commands_relay(
 async fn config_relay(
     events: Events,
     session: Option<SessionId>,
-    conversation_id: u64,
+    conversation_id: ConversationId,
     mut cfg_rx: mpsc::UnboundedReceiver<Vec<AcpConfigOption>>,
 ) {
     while let Some(options) = cfg_rx.recv().await {
@@ -772,7 +776,7 @@ pub(crate) async fn set_config_option(
     manager: Arc<tokio::sync::Mutex<AcpManager>>,
     events: Events,
     session: Option<SessionId>,
-    conversation_id: u64,
+    conversation_id: ConversationId,
     config_id: String,
     value: String,
 ) {

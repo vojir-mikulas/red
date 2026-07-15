@@ -26,14 +26,14 @@ impl AppState {
 
     /// Focus tab `index`. Its editor and result become the visible ones.
     pub(crate) fn set_active_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase {
-            if index < active.tabs.len() {
-                // Load the tab into the focused half; when split, picking the tab the
-                // other half already shows swaps the two (see `set_focused_tab`).
-                active.set_focused_tab(index);
-                // Selecting a partly off-screen tab scrolls it fully into view.
-                active.tab_scroll.scroll_to_item(index);
-            }
+        if let Phase::Connected(active) = &mut self.phase
+            && index < active.tabs.len()
+        {
+            // Load the tab into the focused half; when split, picking the tab the
+            // other half already shows swaps the two (see `set_focused_tab`).
+            active.set_focused_tab(index);
+            // Selecting a partly off-screen tab scrolls it fully into view.
+            active.tab_scroll.scroll_to_item(index);
         }
         cx.notify();
     }
@@ -42,21 +42,21 @@ impl AppState {
     /// while a tab drag hovers the strip. Notifies only on change to keep the
     /// per-move churn cheap.
     pub(crate) fn set_tab_drop_target(&mut self, gap: usize, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase {
-            if active.tab_drop_target != Some(gap) {
-                active.tab_drop_target = Some(gap);
-                cx.notify();
-            }
+        if let Phase::Connected(active) = &mut self.phase
+            && active.tab_drop_target != Some(gap)
+        {
+            active.tab_drop_target = Some(gap);
+            cx.notify();
         }
     }
 
     /// Drop the drop indicator (cursor left the tab strip mid-drag). Notifies
     /// only when something was showing.
     pub(crate) fn clear_tab_drop_target(&mut self, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase {
-            if active.tab_drop_target.take().is_some() {
-                cx.notify();
-            }
+        if let Phase::Connected(active) = &mut self.phase
+            && active.tab_drop_target.take().is_some()
+        {
+            cx.notify();
         }
     }
 
@@ -65,41 +65,36 @@ impl AppState {
     /// the tab in `half` and focuses it; `normalize_panes` collapses the split if the
     /// drag emptied the source half. Clears the indicator regardless.
     pub(crate) fn drop_tab(&mut self, from: usize, half: SplitHalf, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase {
-            if let Some(gap) = active.tab_drop_target.take() {
-                if from < active.tabs.len() {
-                    // The dragged tab now belongs to the strip it was dropped on.
-                    active.tabs[from].pane = half;
-                    // `gap` indexes the pre-removal strip; shift left when the
-                    // dragged tab sat before the gap.
-                    let dest = if from < gap { gap - 1 } else { gap };
-                    let dest = dest.min(active.tabs.len() - 1);
-                    let tab = active.tabs.remove(from);
-                    active.tabs.insert(dest, tab);
-                    // Remap the other pane's active index across remove(from)+insert(dest)
-                    // so it keeps pointing at its tab; the dropped half is aimed at
-                    // the moved tab (its new home, `dest`), and `normalize_panes` then
-                    // repairs anything stale (and collapses an emptied half).
-                    let remap = |idx: usize| -> usize {
-                        if idx == from {
-                            return dest;
-                        }
-                        let j = if idx > from { idx - 1 } else { idx };
-                        if j >= dest {
-                            j + 1
-                        } else {
-                            j
-                        }
-                    };
-                    active.active_tab = remap(active.active_tab);
-                    if let Some(s) = &mut active.split {
-                        s.secondary = remap(s.secondary);
-                        s.focus = half;
-                    }
-                    active.set_pane_active(half, dest);
-                    active.normalize_panes();
+        if let Phase::Connected(active) = &mut self.phase
+            && let Some(gap) = active.tab_drop_target.take()
+            && from < active.tabs.len()
+        {
+            // The dragged tab now belongs to the strip it was dropped on.
+            active.tabs[from].pane = half;
+            // `gap` indexes the pre-removal strip; shift left when the
+            // dragged tab sat before the gap.
+            let dest = if from < gap { gap - 1 } else { gap };
+            let dest = dest.min(active.tabs.len() - 1);
+            let tab = active.tabs.remove(from);
+            active.tabs.insert(dest, tab);
+            // Remap the other pane's active index across remove(from)+insert(dest)
+            // so it keeps pointing at its tab; the dropped half is aimed at
+            // the moved tab (its new home, `dest`), and `normalize_panes` then
+            // repairs anything stale (and collapses an emptied half).
+            let remap = |idx: usize| -> usize {
+                if idx == from {
+                    return dest;
                 }
+                let j = if idx > from { idx - 1 } else { idx };
+                if j >= dest { j + 1 } else { j }
+            };
+            active.active_tab = remap(active.active_tab);
+            if let Some(s) = &mut active.split {
+                s.secondary = remap(s.secondary);
+                s.focus = half;
             }
+            active.set_pane_active(half, dest);
+            active.normalize_panes();
         }
         cx.notify();
     }
@@ -204,12 +199,12 @@ impl AppState {
     /// from the palette (not the editor), so there's nothing to follow.
     fn cycle_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         // A Redis connection has no editor to chase focus for; step its tabs.
-        if let Phase::Connected(a) = &self.phase {
-            if a.kv_view.is_some() {
-                let session = a.session;
-                self.kv_step_tab(session, forward, cx);
-                return;
-            }
+        if let Phase::Connected(a) = &self.phase
+            && a.kv_view.is_some()
+        {
+            let session = a.session;
+            self.kv_step_tab(session, forward, cx);
+            return;
         }
         let editor_focused = matches!(
             &self.phase,
@@ -219,10 +214,10 @@ impl AppState {
         if !self.step_active_tab(forward, cx) || !editor_focused {
             return;
         }
-        if let Phase::Connected(active) = &self.phase {
-            if let Some(handle) = active.active().map(|t| t.editor.focus_handle(cx)) {
-                window.focus(&handle, cx);
-            }
+        if let Phase::Connected(active) = &self.phase
+            && let Some(handle) = active.active().map(|t| t.editor.focus_handle(cx))
+        {
+            window.focus(&handle, cx);
         }
     }
 
@@ -251,12 +246,12 @@ impl AppState {
     /// pristine-or-confirm path as the tab's × button. No-op with no open tab.
     pub(crate) fn close_active_tab(&mut self, cx: &mut Context<Self>) {
         // Redis: close the focused tab of the focused half.
-        if let Phase::Connected(a) = &self.phase {
-            if let Some(v) = &a.kv_view {
-                let (session, idx) = (a.session, v.focused_tab_index());
-                self.kv_close_tab(session, idx, cx);
-                return;
-            }
+        if let Phase::Connected(a) = &self.phase
+            && let Some(v) = &a.kv_view
+        {
+            let (session, idx) = (a.session, v.focused_tab_index());
+            self.kv_close_tab(session, idx, cx);
+            return;
         }
         let index = match &self.phase {
             Phase::Connected(active) if active.active().is_some() => active.active_tab,
@@ -273,12 +268,12 @@ impl AppState {
     /// ⌘R: refresh whatever the active connection shows — a Redis key browse
     /// re-scans its keyspace, a SQL connection reloads its schema objects.
     pub(crate) fn refresh_active(&mut self, cx: &mut Context<Self>) {
-        if let Phase::Connected(a) = &self.phase {
-            if a.kv_view.is_some() {
-                let session = a.session;
-                self.kv_refresh_keys(session, cx);
-                return;
-            }
+        if let Phase::Connected(a) = &self.phase
+            && a.kv_view.is_some()
+        {
+            let session = a.session;
+            self.kv_refresh_keys(session, cx);
+            return;
         }
         self.refresh_schema();
     }
@@ -286,12 +281,12 @@ impl AppState {
     /// Open a blank query tab (the tab-strip "＋" action).
     pub(crate) fn new_query(&mut self, cx: &mut Context<Self>) {
         // A Redis connection has no SQL editor; ⌘T opens a blank Redis tab.
-        if let Phase::Connected(a) = &self.phase {
-            if a.kv_view.is_some() {
-                let session = a.session;
-                self.kv_new_empty_tab(session, cx);
-                return;
-            }
+        if let Phase::Connected(a) = &self.phase
+            && a.kv_view.is_some()
+        {
+            let session = a.session;
+            self.kv_new_empty_tab(session, cx);
+            return;
         }
         let tab = match &mut self.phase {
             Phase::Connected(active) => {
@@ -405,7 +400,9 @@ impl AppState {
             return;
         };
         let targets: Vec<usize> = match scope {
-            TabCloseScope::One => unreachable!(),
+            // `One` is handled by the early return above, so it never reaches
+            // this match.
+            TabCloseScope::One => unreachable!("TabCloseScope::One handled before match"),
             TabCloseScope::All => siblings.clone(),
             TabCloseScope::Others => siblings.iter().copied().filter(|&i| i != index).collect(),
             TabCloseScope::Left => siblings[..pos].to_vec(),
@@ -422,10 +419,10 @@ impl AppState {
     /// tab renders in a fixed section at the start of the strip, always visible
     /// regardless of scroll, and is skipped by the bulk close actions.
     pub(crate) fn toggle_tab_pin(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase {
-            if let Some(tab) = active.tabs.get_mut(index) {
-                tab.pinned = !tab.pinned;
-            }
+        if let Phase::Connected(active) = &mut self.phase
+            && let Some(tab) = active.tabs.get_mut(index)
+        {
+            tab.pinned = !tab.pinned;
         }
         cx.notify();
     }
@@ -454,10 +451,11 @@ impl AppState {
                 if active.active_tab >= index && active.active_tab > 0 {
                     active.active_tab -= 1;
                 }
-                if let Some(s) = &mut active.split {
-                    if s.secondary >= index && s.secondary > 0 {
-                        s.secondary -= 1;
-                    }
+                if let Some(s) = &mut active.split
+                    && s.secondary >= index
+                    && s.secondary > 0
+                {
+                    s.secondary -= 1;
                 }
                 if let Some(g) = removed.result {
                     free_epochs.push(g.epoch);

@@ -4,7 +4,7 @@ members = ["crates/*"]
 
 [workspace.package]
 version = "0.17.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.96"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/vojir-mikulas/red"
@@ -133,6 +133,38 @@ red-driver = { path = "crates/red-driver" }
 red-service = { path = "crates/red-service" }
 red-ai = { path = "crates/red-ai" }
 red-acp = { path = "crates/red-acp" }
+
+# --- Workspace-wide lint policy (see docs/guidelines/tooling.md) ---
+# Centralised once here; every crate opts in with `[lints] workspace = true`.
+# The panic-hygiene family is `warn` (promoted to error by CI's `-D warnings`),
+# so a stray unwrap/expect/panic in a *shipped* path fails the build. Test code
+# is exempt via `clippy.toml` (allow-*-in-tests); the rare legitimate shipped-path
+# expect carries a per-site `#[allow(..., reason = "...")]`.
+[workspace.lints.rust]
+# `deny`, not `forbid` — the allocator counter, `env::set_var`, and `sysconf`
+# genuinely need `unsafe`; each site opts back in with `#[allow(unsafe_code,
+# reason = "...")]`.
+unsafe_code = "deny"
+# `missing_debug_implementations` is intentionally NOT enabled: many public types
+# here wrap non-`Debug` internals (`dyn Fn` cancel tokens, `dyn Stream` cursors,
+# driver connection clients), so it would force manual `Debug` impls with no
+# diagnostic payoff. The panic-hygiene family below is the load-bearing gate.
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+
+[workspace.lints.rustdoc]
+# Catch broken/dangling intra-doc links. `warn` here + `RUSTDOCFLAGS=-D warnings`
+# in CI's `cargo doc` step promotes them to errors, so a rotted `[`link`]` fails
+# the build. `private_intra_doc_links` guards the "public API documents a private
+# helper by name" case (demote such refs to a plain code span, not a link).
+broken_intra_doc_links = "warn"
+private_intra_doc_links = "warn"
 
 [profile.dev]
 # GPUI's dep tree is large; a touch of opt on deps keeps debug builds usable.

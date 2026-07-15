@@ -22,7 +22,7 @@ use std::path::PathBuf;
 // `Context` name, which `gpui::Context` (used by `render_history`) needs.
 use anyhow::{Context as _, Result};
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Context, KeyDownEvent, SharedString};
+use gpui::{Context, KeyDownEvent, SharedString, div, prelude::*, px};
 use serde::{Deserialize, Serialize};
 
 use crate::app::{ActiveConn, AppState};
@@ -230,7 +230,7 @@ impl AppState {
         &self,
         active: &ActiveConn,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
         let view = cx.entity().downgrade();
 

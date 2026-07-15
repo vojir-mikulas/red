@@ -255,7 +255,12 @@ mod tests {
     #[test]
     fn all_tags_and_keys_with_tag() {
         let mut store = KeyMetaStore::in_memory();
-        store.set_note_tags("c", "user:1", String::new(), vec!["hot".into(), "prod".into()]);
+        store.set_note_tags(
+            "c",
+            "user:1",
+            String::new(),
+            vec!["hot".into(), "prod".into()],
+        );
         store.set_note_tags("c", "user:2", String::new(), vec!["prod".into()]);
         store.set_note_tags("c", "job:1", String::new(), vec!["cold".into()]);
         // A different connection's tags don't leak in.

@@ -10,7 +10,7 @@
 
 use flint::prelude::*;
 use flint::{Button, ButtonSize, ButtonVariant, ToastVariant};
-use gpui::{div, prelude::*, px, AnyElement, ClipboardItem, Context, ScrollHandle, SharedString};
+use gpui::{AnyElement, ClipboardItem, Context, ScrollHandle, SharedString, div, prelude::*, px};
 use red_core::{PlanNode, QueryPlan};
 use red_service::Command;
 
@@ -21,7 +21,7 @@ use crate::app::{ActiveConn, AppState, Phase};
 pub(crate) struct PlanView {
     /// Identifies this explain request; a `PlanReady`/`PlanFailed` for a different
     /// epoch (the tab re-explained or switched) is dropped.
-    pub epoch: u64,
+    pub epoch: red_service::Epoch,
     /// The SQL that was explained; shown truncated in the header.
     pub sql: String,
     /// Whether this was an `EXPLAIN ANALYZE` (actuals + hot-node tint).
@@ -74,16 +74,16 @@ impl AppState {
         }
 
         let epoch = crate::result::new_epoch();
-        if let Phase::Connected(active) = &mut self.phase {
-            if let Some(tab) = active.active_mut() {
-                tab.plan = Some(PlanView {
-                    epoch,
-                    sql: sql.clone(),
-                    analyze,
-                    state: PlanState::Loading,
-                    scroll: ScrollHandle::new(),
-                });
-            }
+        if let Phase::Connected(active) = &mut self.phase
+            && let Some(tab) = active.active_mut()
+        {
+            tab.plan = Some(PlanView {
+                epoch,
+                sql: sql.clone(),
+                analyze,
+                state: PlanState::Loading,
+                scroll: ScrollHandle::new(),
+            });
         }
         self.send_active(Command::Explain {
             sql,
@@ -98,13 +98,13 @@ impl AppState {
     pub(crate) fn on_plan_ready(
         &mut self,
         session: Option<red_service::SessionId>,
-        epoch: u64,
+        epoch: red_service::Epoch,
         plan: QueryPlan,
     ) {
-        if let Some(active) = self.conn_mut(session) {
-            if let Some(view) = active.plan_by_epoch(epoch) {
-                view.state = PlanState::Ready(plan);
-            }
+        if let Some(active) = self.conn_mut(session)
+            && let Some(view) = active.plan_by_epoch(epoch)
+        {
+            view.state = PlanState::Ready(plan);
         }
     }
 
@@ -112,22 +112,22 @@ impl AppState {
     pub(crate) fn on_plan_failed(
         &mut self,
         session: Option<red_service::SessionId>,
-        epoch: u64,
+        epoch: red_service::Epoch,
         message: String,
     ) {
-        if let Some(active) = self.conn_mut(session) {
-            if let Some(view) = active.plan_by_epoch(epoch) {
-                view.state = PlanState::Failed(message);
-            }
+        if let Some(active) = self.conn_mut(session)
+            && let Some(view) = active.plan_by_epoch(epoch)
+        {
+            view.state = PlanState::Failed(message);
         }
     }
 
     /// Close the active tab's plan view, returning to the grid (if any).
     pub(crate) fn close_plan(&mut self, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase {
-            if let Some(tab) = active.active_mut() {
-                tab.plan = None;
-            }
+        if let Phase::Connected(active) = &mut self.phase
+            && let Some(tab) = active.active_mut()
+        {
+            tab.plan = None;
         }
         cx.notify();
     }
@@ -398,10 +398,10 @@ fn render_node(
 fn max_actual_time(nodes: &[PlanNode]) -> Option<f64> {
     let mut max: Option<f64> = None;
     fn walk(node: &PlanNode, max: &mut Option<f64>) {
-        if let Some(t) = node_actual_time(node) {
-            if max.is_none_or(|m| t > m) {
-                *max = Some(t);
-            }
+        if let Some(t) = node_actual_time(node)
+            && max.is_none_or(|m| t > m)
+        {
+            *max = Some(t);
         }
         for c in &node.children {
             walk(c, max);

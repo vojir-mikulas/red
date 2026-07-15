@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use gpui::{px, Pixels};
+use gpui::{Pixels, px};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 

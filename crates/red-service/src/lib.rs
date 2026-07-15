@@ -12,8 +12,8 @@
 //! raced against incoming commands so a `Cancel` (or a `timeout`) can abort an
 //! in-flight query out-of-band rather than dropping a future.
 //!
-//! Layout: [`protocol`] holds the `Command`/`Event`/`RunFetch` wire types,
-//! [`dispatch`] the command pump, and this module the UI-facing handles.
+//! Layout: `protocol` holds the `Command`/`Event`/`RunFetch` wire types,
+//! `dispatch` the command pump, and this module the UI-facing handles.
 
 mod acp;
 mod ai;
@@ -28,14 +28,14 @@ mod update;
 
 pub use protocol::{
     AiAgentKind, AiAgentProfile, AiAuthStatus, AiCommand, AiConfig, AiConfigCategory,
-    AiConfigChoice, AiConfigOption, AiContext, AiDelta, AiUsage, Command, Event, ReportTheme,
-    RunFetch, SessionId, SortKey, UpdateConfig,
+    AiConfigChoice, AiConfigOption, AiContext, AiDelta, AiUsage, Command, ConversationId, Epoch,
+    Event, OpId, ReportTheme, RequestId, RunFetch, SessionId, SortKey, UpdateConfig,
 };
 pub use red_acp::DEFAULT_AGENT_COMMAND;
 pub use red_core::{AiLimits, AiPolicy, AiTier};
 
-use futures::channel::mpsc::{unbounded, UnboundedReceiver};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender as CmdSender};
+use futures::channel::mpsc::{UnboundedReceiver, unbounded};
+use tokio::sync::mpsc::{UnboundedSender as CmdSender, unbounded_channel};
 
 /// One command on its way to the backend, tagged with the session it routes to
 /// (`None` for the session-less `TestConnection`/`Shutdown`). See `protocol`.
@@ -109,9 +109,17 @@ pub fn spawn() -> ServiceHandle {
     // non-blocking call usable from the synchronous dispatch loop.
     let (evt_tx, evt_rx) = unbounded::<(Option<SessionId>, Event)>();
 
+    #[allow(
+        clippy::expect_used,
+        reason = "thread spawn fails only on OS resource exhaustion at startup; nothing to recover to"
+    )]
     std::thread::Builder::new()
         .name("red-service".into())
         .spawn(move || {
+            #[allow(
+                clippy::expect_used,
+                reason = "runtime build fails only on OS resource exhaustion at startup; nothing to recover to"
+            )]
             let rt = tokio::runtime::Builder::new_current_thread()
                 // I/O enabled too: the Postgres driver's network connection needs it.
                 .enable_all()

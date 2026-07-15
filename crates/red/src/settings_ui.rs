@@ -7,9 +7,9 @@
 //! The panel is the convenience surface; the *file* (opened from the footer or the
 //! command palette) is the full, documented config, the Zed-spirit primary path.
 
-use flint::prelude::*;
 use flint::Theme;
-use gpui::{canvas, div, prelude::*, px, AnyElement, Context, FontWeight, SharedString};
+use flint::prelude::*;
+use gpui::{AnyElement, Context, FontWeight, SharedString, canvas, div, prelude::*, px};
 
 use crate::app::{AppState, FontSelect};
 use crate::settings::{Density, ThemeMode};
@@ -68,7 +68,7 @@ impl SettingsTab {
 impl AppState {
     /// The settings panel: a scrim over the app, a fixed left nav, an optional
     /// warning banner, the page for the selected category, and a footer.
-    pub(crate) fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let page = settings_page(self.settings_tab, self, cx);
 
         let theme = cx.theme().clone();
@@ -201,7 +201,7 @@ fn settings_banner(
     state: &AppState,
     theme: &Theme,
     cx: &mut Context<AppState>,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     let message = state
         .settings_warnings
         .iter()
@@ -260,7 +260,7 @@ fn settings_nav_item(
     active: SettingsTab,
     theme: &Theme,
     cx: &mut Context<AppState>,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     let is_active = tab == active;
     let focus_ring = theme.accent;
     div()
@@ -463,7 +463,7 @@ fn reveal_wrap(state: &AppState, target: RevealTarget, control: impl IntoElement
 
 /// The theme manager: an Import button, then every theme as a row (built-ins
 /// tagged by family, imported ones with a trash button to remove them).
-fn theme_manager(state: &AppState, cx: &mut Context<AppState>) -> impl IntoElement {
+fn theme_manager(state: &AppState, cx: &mut Context<AppState>) -> impl IntoElement + use<> {
     let theme = cx.theme().clone();
 
     let mut list = div().flex().flex_col().gap_0p5().child(
@@ -494,7 +494,7 @@ fn theme_manage_row(
     user: bool,
     theme: &Theme,
     cx: &mut Context<AppState>,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     let name_owned = name.to_string();
     div()
         .flex()
@@ -895,7 +895,7 @@ fn keymap_row(
     effective: Option<&str>,
     theme: &Theme,
     cx: &mut Context<AppState>,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     let recording = state.keymap_recording == Some(row);
     let pending = state.keymap_capture.as_ref().filter(|c| c.row == row);
     let is_customized = effective != Some(def.keystroke);
@@ -970,7 +970,7 @@ fn idle_control(
     is_customized: bool,
     theme: &Theme,
     cx: &mut Context<AppState>,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     div()
         .flex()
         .items_center()
@@ -1001,7 +1001,7 @@ fn idle_control(
 
 /// The "now recording" affordance: a pulsing prompt to press a shortcut, with a
 /// Cancel that ends capture (Esc does the same from the keyboard).
-fn recording_affordance(theme: &Theme, cx: &mut Context<AppState>) -> impl IntoElement {
+fn recording_affordance(theme: &Theme, cx: &mut Context<AppState>) -> impl IntoElement + use<> {
     div()
         .flex()
         .items_center()
@@ -1032,7 +1032,7 @@ fn capture_confirm(
     cap: &crate::app::KeymapCapture,
     theme: &Theme,
     cx: &mut Context<AppState>,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     let conflict_label = cap
         .conflict
         .map(|j| crate::keymap::action_defs()[j].label.to_string());
@@ -1080,7 +1080,7 @@ fn capture_confirm(
 
 /// A small monospace chip rendering a keystroke as macOS glyphs (`cmd-shift-f` →
 /// `⌘⇧F`), matching the app's keyboard-shortcut chrome.
-fn shortcut_chip(keystroke: &str, theme: &Theme) -> impl IntoElement {
+fn shortcut_chip(keystroke: &str, theme: &Theme) -> impl IntoElement + use<> {
     div()
         .px_2()
         .py_0p5()
@@ -1125,11 +1125,7 @@ fn keystroke_glyphs(keystroke: &str) -> String {
                 })
                 .collect::<Vec<_>>();
             // Mac glyphs read as a run; spelled-out modifiers need a separator.
-            if mac {
-                parts.concat()
-            } else {
-                parts.join("+")
-            }
+            if mac { parts.concat() } else { parts.join("+") }
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -1909,11 +1905,11 @@ fn about_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
 /// The update-status row: a live status line from the updater state, plus the
 /// "Check for updates" action (when enabled) or a "Download" link (when a build
 /// is available but can't be self-applied).
-fn update_status_row(
-    state: &AppState,
-    theme: &Theme,
+fn update_status_row<'a>(
+    state: &'a AppState,
+    theme: &'a Theme,
     cx: &mut Context<AppState>,
-) -> impl IntoElement {
+) -> impl IntoElement + use<'a> {
     use red_core::UpdateState;
 
     let enabled = state.settings.update.auto_update;
@@ -1983,7 +1979,7 @@ fn settings_page_scaffold(title: &str, body: impl IntoElement, theme: &Theme) ->
 }
 
 /// The settings panel's footer: "Open settings file" beside the Done button.
-fn settings_footer(cx: &mut Context<AppState>) -> impl IntoElement {
+fn settings_footer(cx: &mut Context<AppState>) -> impl IntoElement + use<> {
     let theme = cx.theme();
     div()
         .flex()
@@ -2011,7 +2007,7 @@ fn settings_footer(cx: &mut Context<AppState>) -> impl IntoElement {
 }
 
 /// A small uppercase section header above a group of settings rows.
-fn settings_header(title: &str, theme: &Theme) -> impl IntoElement {
+fn settings_header(title: &str, theme: &Theme) -> impl IntoElement + use<> {
     div()
         .pt_4()
         .pb_1()

@@ -38,3 +38,6 @@ rusqlite.workspace = true
 reqwest.workspace = true
 # A scripted fake AiProvider for the write-approval round-trip test.
 async-trait.workspace = true
+
+[lints]
+workspace = true

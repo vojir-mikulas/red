@@ -5,7 +5,7 @@
 //! (`db`, `schema`, `table`, `view`, `col`, `key`, `link`, `play`, `search`,
 //! `lock`, `plus`, `close`, `edit`, `trash`, `chevron`, `sort-asc`/`sort-desc`).
 
-use gpui::{prelude::*, svg, Hsla, Pixels, Svg};
+use gpui::{Hsla, Pixels, Svg, prelude::*, svg};
 
 /// A `size`×`size` icon tinted `color`, loaded from `assets/icons/<name>.svg`.
 pub fn icon(name: &str, size: Pixels, color: Hsla) -> Svg {

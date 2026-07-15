@@ -191,6 +191,7 @@ impl ChatMessage {
     /// The parsed Markdown for this (settled) bubble, cached across frames.
     pub(super) fn markdown(&self) -> Rc<Vec<crate::markdown::Block>> {
         self.refresh_cache();
+        #[allow(clippy::expect_used, reason = "refresh_cache() above populates blocks")]
         self.cache.borrow().blocks.clone().expect("just refreshed")
     }
 
@@ -205,7 +206,7 @@ impl ChatMessage {
 /// wants to run a tool Red didn't auto-allow. The panel shows Allow/Deny and the
 /// answer routes back as `Command::AiPermission`, keyed by `request_id`.
 pub(crate) struct PendingPermission {
-    pub(crate) request_id: u64,
+    pub(crate) request_id: red_service::RequestId,
     pub(crate) title: SharedString,
     pub(crate) detail: Option<SharedString>,
 }
@@ -220,7 +221,7 @@ pub(crate) struct ChatSession {
     pub(crate) messages: Vec<ChatMessage>,
     /// Stable id tying this chat's turns together so the backend keeps history
     /// separate and routes deltas back to the right thread.
-    pub(crate) conversation_id: u64,
+    pub(crate) conversation_id: red_service::ConversationId,
     /// True while a turn is streaming (drives the Stop button + busy state).
     pub(crate) streaming: bool,
     /// Transient tool-activity line ("Running run_select…"), shown while streaming.
@@ -286,7 +287,7 @@ pub(crate) struct ChatSession {
 
 impl ChatSession {
     /// A fresh, empty chat on `provider` with the given stable id.
-    pub(crate) fn new(conversation_id: u64, provider: String) -> Self {
+    pub(crate) fn new(conversation_id: red_service::ConversationId, provider: String) -> Self {
         ChatSession {
             scroll: ScrollHandle::new(),
             messages: Vec::new(),
@@ -339,6 +340,10 @@ impl ChatSession {
                 String::new(),
             ));
         }
+        #[allow(
+            clippy::expect_used,
+            reason = "block above guarantees a trailing assistant message"
+        )]
         self.messages.last_mut().expect("just ensured")
     }
 }
@@ -348,7 +353,7 @@ impl ChatSession {
 /// target rename/delete without threading indices around.
 #[derive(Clone, PartialEq)]
 pub(crate) enum RowKey {
-    Open(u64),
+    Open(red_service::ConversationId),
     Saved(String),
 }
 
@@ -362,7 +367,7 @@ pub(crate) struct Rename {
 }
 
 /// The lifecycle state a history row reflects through its leading dot, replacing
-/// the provider glyph (which now lives in the subtitle text). See [`render::status_dot`].
+/// the provider glyph (which now lives in the subtitle text). See `render::status_dot`.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum RowStatus {
     /// The single never-sent chat: a hollow circle.
@@ -472,7 +477,10 @@ impl AssistantState {
     }
 
     /// Find a chat by its conversation id (events route here, not just to active).
-    pub(super) fn find_mut(&mut self, conversation_id: u64) -> Option<&mut ChatSession> {
+    pub(super) fn find_mut(
+        &mut self,
+        conversation_id: red_service::ConversationId,
+    ) -> Option<&mut ChatSession> {
         self.chats
             .iter_mut()
             .find(|c| c.conversation_id == conversation_id)

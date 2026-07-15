@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// `config.password` is normally empty: it's materialized from the keychain only
 /// transiently (connect / edit / test) and never held here long-term, so it can't
 /// leak via a serialized [`StoredConnection`]. Serialization is deliberately *not*
-/// derived; saving goes through the password-free [`WriteConnection`].
+/// derived; saving goes through the password-free `WriteConnection`.
 #[derive(Clone, Debug)]
 pub struct StoredConnection {
     /// Stable per-connection identity, also the keychain account holding this
@@ -159,21 +159,22 @@ impl RawConnection {
         };
         // Legacy migration: an old `dsn` with no structured fields populated. For a
         // file engine the DSN *is* the path; otherwise parse it back into fields.
-        if config.host.is_empty() && config.database.is_empty() {
-            if let Some(dsn) = self.dsn {
-                if self.kind.is_file() {
-                    config.database = dsn;
-                } else if let Some(p) = ConnectionConfig::parse_conn_str(&dsn) {
-                    config.kind = p.kind;
-                    config.host = p.host;
-                    config.port = p.port;
-                    config.user = p.user;
-                    config.password = p.password;
-                    config.database = p.database;
-                    config.tls = p.tls;
-                } else {
-                    config.database = dsn;
-                }
+        if config.host.is_empty()
+            && config.database.is_empty()
+            && let Some(dsn) = self.dsn
+        {
+            if self.kind.is_file() {
+                config.database = dsn;
+            } else if let Some(p) = ConnectionConfig::parse_conn_str(&dsn) {
+                config.kind = p.kind;
+                config.host = p.host;
+                config.port = p.port;
+                config.user = p.user;
+                config.password = p.password;
+                config.database = p.database;
+                config.tls = p.tls;
+            } else {
+                config.database = dsn;
             }
         }
         StoredConnection {
@@ -325,7 +326,7 @@ pub fn config_path() -> Option<PathBuf> {
 
 /// Load the saved connections, newest-used first. Missing/unreadable/malformed
 /// config yields an empty list (with a warning), never an error. On load we also
-/// run a one-time [`migrate_secrets`] pass (assign ids to legacy entries and
+/// run a one-time `migrate_secrets` pass (assign ids to legacy entries and
 /// move any plaintext password into the keychain), rewriting the stripped file if
 /// anything changed.
 pub fn load() -> Vec<StoredConnection> {
@@ -348,10 +349,10 @@ pub fn load() -> Vec<StoredConnection> {
         .map(RawConnection::into_stored)
         .collect();
 
-    if migrate_secrets(&mut connections) {
-        if let Err(e) = save(&connections) {
-            tracing::warn!("failed to rewrite config after credential migration: {e}");
-        }
+    if migrate_secrets(&mut connections)
+        && let Err(e) = save(&connections)
+    {
+        tracing::warn!("failed to rewrite config after credential migration: {e}");
     }
 
     connections.sort_by_key(|c| std::cmp::Reverse(c.last_accessed));
@@ -404,7 +405,7 @@ fn migrate_secrets(connections: &mut [StoredConnection]) -> bool {
 
 /// Persist the connection list. Normally password-free (secrets live in the
 /// keychain), but a legacy file whose keychain migration failed can still hold
-/// plaintext passwords ([`migrate_secrets`]), so the file is written owner-only on
+/// plaintext passwords (`migrate_secrets`), so the file is written owner-only on
 /// Unix and atomically (temp + rename), never leaving a world-readable credential
 /// or a half-written file. Creates the config dir if needed.
 pub fn save(connections: &[StoredConnection]) -> Result<()> {

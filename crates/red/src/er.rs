@@ -27,8 +27,8 @@ use std::rc::Rc;
 use flint::prelude::*;
 use flint::{Button, ButtonSize, ButtonVariant};
 use gpui::{
-    canvas, div, prelude::*, px, AnyElement, Context, Hsla, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Point, ScrollDelta, ScrollWheelEvent,
+    AnyElement, Context, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point,
+    ScrollDelta, ScrollWheelEvent, canvas, div, prelude::*, px,
 };
 use red_core::ObjectKind;
 
@@ -141,10 +141,10 @@ impl ErView {
         }
         let resolve = |schema: &Option<String>, table: &str| -> Option<usize> {
             let t = table.to_lowercase();
-            if let Some(s) = schema {
-                if let Some(&i) = by_exact.get(&(s.to_lowercase(), t.clone())) {
-                    return Some(i);
-                }
+            if let Some(s) = schema
+                && let Some(&i) = by_exact.get(&(s.to_lowercase(), t.clone()))
+            {
+                return Some(i);
             }
             match by_name.get(&t) {
                 Some(v) if v.len() == 1 => Some(v[0]),
@@ -655,10 +655,10 @@ impl AppState {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                    if let Some(er) = this.er_mut() {
-                        if er.drag.take().is_some() {
-                            cx.notify();
-                        }
+                    if let Some(er) = this.er_mut()
+                        && er.drag.take().is_some()
+                    {
+                        cx.notify();
                     }
                 }),
             )

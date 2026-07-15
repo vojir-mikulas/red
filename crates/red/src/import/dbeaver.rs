@@ -18,9 +18,9 @@ use std::fs;
 use std::path::Path;
 
 use aes::Aes128;
-use anyhow::{anyhow, bail, Context, Result};
-use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use anyhow::{Context, Result, anyhow, bail};
 use cbc::Decryptor;
+use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use red_core::{ConnectionConfig, DbKind, SshAuth, SshConfig};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -137,10 +137,10 @@ fn read_credentials(dir: &Path) -> Result<CredFile> {
 /// Decrypt the credentials blob to its UTF-8 JSON. Tolerant of the (rare) legacy
 /// case where the file is already plaintext JSON.
 fn decrypt_credentials(bytes: &[u8]) -> Result<String> {
-    if let Ok(s) = std::str::from_utf8(bytes) {
-        if s.trim_start().starts_with('{') {
-            return Ok(s.to_string());
-        }
+    if let Ok(s) = std::str::from_utf8(bytes)
+        && s.trim_start().starts_with('{')
+    {
+        return Ok(s.to_string());
     }
     if bytes.len() <= 16 {
         bail!("credentials file too short to hold an IV + ciphertext");

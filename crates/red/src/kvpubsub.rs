@@ -4,7 +4,7 @@
 //! chatty channel can't grow the log forever.
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Context, Entity, Window};
+use gpui::{Context, Entity, Window, div, prelude::*, px};
 use red_core::kv::KvMessage;
 use red_service::{Command, SessionId};
 
@@ -16,7 +16,7 @@ use crate::app::{ActiveConn, AppState};
 const MAX_MESSAGES: usize = 2_000;
 
 pub(crate) struct KvPubSub {
-    pub(crate) epoch: u64,
+    pub(crate) epoch: red_service::Epoch,
     pub(crate) pattern_input: Entity<TextInput>,
     /// `Some(pattern)` once `KvSubscribe` has been sent for it; cleared on
     /// unsubscribe. Distinct from "has this pattern ever received a message"
@@ -88,7 +88,7 @@ impl AppState {
     pub(crate) fn on_kv_message(
         &mut self,
         session: Option<SessionId>,
-        epoch: u64,
+        epoch: red_service::Epoch,
         channel: String,
         payload: String,
         cx: &mut Context<Self>,
@@ -141,7 +141,7 @@ impl AppState {
         tab_idx: usize,
         _window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
         let session = active.session;
         let view = cx.entity().downgrade();

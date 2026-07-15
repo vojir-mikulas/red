@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 /// How long the file must be quiet before a coalesced burst is forwarded.
@@ -127,13 +127,12 @@ fn spawn_debounce(
                 }
             }
             // Settled: suppress our own atomic save, else forward one reload.
-            if let Ok(contents) = std::fs::read_to_string(&path) {
-                if let Ok(mut slot) = expected.lock() {
-                    if *slot == Some(hash(&contents)) {
-                        *slot = None;
-                        continue;
-                    }
-                }
+            if let Ok(contents) = std::fs::read_to_string(&path)
+                && let Ok(mut slot) = expected.lock()
+                && *slot == Some(hash(&contents))
+            {
+                *slot = None;
+                continue;
             }
             if tx.unbounded_send(()).is_err() {
                 return; // UI gone; stop watching.

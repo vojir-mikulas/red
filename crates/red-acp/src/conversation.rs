@@ -219,10 +219,10 @@ async fn run_connection(
                     signal(&ready_closure, Ok(()));
                     // Ship the session's initial config selectors (model / reasoning),
                     // advertised in the `session/new` response.
-                    if let Some(tx) = &config_initial {
-                        if !options.is_empty() {
-                            let _ = tx.send(options);
-                        }
+                    if let Some(tx) = &config_initial
+                        && !options.is_empty()
+                    {
+                        let _ = tx.send(options);
                     }
                     id
                 }
@@ -460,7 +460,7 @@ fn handle_update(
                 },
             };
             Some(AcpDelta::ActivityStarted {
-                id: call.tool_call_id.0.to_string(),
+                id: call.tool_call_id.0.to_string().into(),
                 parent: None,
                 kind,
                 status: map_tool_status(&call.status),
@@ -473,7 +473,7 @@ fn handle_update(
             let status = update.fields.status.as_ref().map(map_tool_status);
             let detail = acp_progress_detail(&update.fields.content);
             (status.is_some() || detail.is_some()).then(|| AcpDelta::ActivityUpdated {
-                id: update.tool_call_id.0.to_string(),
+                id: update.tool_call_id.0.to_string().into(),
                 status,
                 detail,
             })
@@ -491,10 +491,10 @@ fn handle_update(
         }
         _ => None,
     };
-    if let Some(delta) = delta {
-        if let Some(tx) = lock(active_sink).as_ref() {
-            let _ = tx.send(delta);
-        }
+    if let Some(delta) = delta
+        && let Some(tx) = lock(active_sink).as_ref()
+    {
+        let _ = tx.send(delta);
     }
 }
 
@@ -793,11 +793,12 @@ fn map_stop(stop: StopReason) -> AcpStop {
 /// result (the signal was still pending: startup hadn't completed), `false` if
 /// readiness had already fired (so this is a later teardown).
 fn signal(ready: &ReadyCell, result: Result<(), AcpError>) -> bool {
-    if let Some(tx) = lock(ready).take() {
-        let _ = tx.send(result);
-        true
-    } else {
-        false
+    match lock(ready).take() {
+        Some(tx) => {
+            let _ = tx.send(result);
+            true
+        }
+        _ => false,
     }
 }
 

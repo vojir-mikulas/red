@@ -2,9 +2,9 @@
 //! results) · status bar. The panes are the schema tree, the SQL editor, and the
 //! result grid. The split sizes are caller-owned state on [`ActiveConn`].
 
-use flint::prelude::*;
 use flint::Theme;
-use gpui::{div, prelude::*, px, Axis, Context, MouseButton, SharedString, WeakEntity, Window};
+use flint::prelude::*;
+use gpui::{Axis, Context, MouseButton, SharedString, WeakEntity, Window, div, prelude::*, px};
 
 /// Left inset of the top bar. On macOS it clears the seamless traffic lights
 /// overlapping this strip and leaves a little breathing room between them and
@@ -23,7 +23,7 @@ impl AppState {
         active: &ActiveConn,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         // Owned snapshot so building the pane contents below (which borrow `cx`
         // mutably) doesn't clash with the theme tokens used throughout this fn.
         let theme = cx.theme().clone();
@@ -481,7 +481,7 @@ impl AppState {
         view: &WeakEntity<Self>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let disconnect = div()
             .id("disconnect")
             .flex()
@@ -603,12 +603,11 @@ impl AppState {
                     .on_drag_start(move |anchor, _, cx| {
                         start
                             .update(cx, |this, cx| {
-                                if let Phase::Connected(a) = &mut this.phase {
-                                    if let Some(v) = &mut a.kv_view {
-                                        if let Some(s) = &mut v.split {
-                                            s.drag = Some(anchor);
-                                        }
-                                    }
+                                if let Phase::Connected(a) = &mut this.phase
+                                    && let Some(v) = &mut a.kv_view
+                                    && let Some(s) = &mut v.split
+                                {
+                                    s.drag = Some(anchor);
                                 }
                                 cx.notify();
                             })
@@ -617,12 +616,11 @@ impl AppState {
                     .on_resize(move |size, _, cx| {
                         resize
                             .update(cx, |this, cx| {
-                                if let Phase::Connected(a) = &mut this.phase {
-                                    if let Some(v) = &mut a.kv_view {
-                                        if let Some(s) = &mut v.split {
-                                            s.width = size;
-                                        }
-                                    }
+                                if let Phase::Connected(a) = &mut this.phase
+                                    && let Some(v) = &mut a.kv_view
+                                    && let Some(s) = &mut v.split
+                                {
+                                    s.width = size;
                                 }
                                 cx.notify();
                             })
@@ -630,12 +628,11 @@ impl AppState {
                     })
                     .on_drag_end(move |_, cx| {
                         end.update(cx, |this, cx| {
-                            if let Phase::Connected(a) = &mut this.phase {
-                                if let Some(v) = &mut a.kv_view {
-                                    if let Some(s) = &mut v.split {
-                                        s.drag = None;
-                                    }
-                                }
+                            if let Phase::Connected(a) = &mut this.phase
+                                && let Some(v) = &mut a.kv_view
+                                && let Some(s) = &mut v.split
+                            {
+                                s.drag = None;
                             }
                             cx.notify();
                         })
@@ -979,7 +976,7 @@ impl AppState {
         focused: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         use crate::kvbrowse::KV_NEW_TAB_CHOICES;
         let theme = cx.theme().clone();
         let session = active.session;
@@ -1109,7 +1106,11 @@ impl AppState {
     /// browser-history for the keyspace) over a Commands section (past console
     /// commands). Keys re-open the inspector; commands seed the console. Reuses
     /// the same `query_history` store + `relative_time` helper as the SQL dock.
-    fn render_kv_history(&self, active: &ActiveConn, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_kv_history(
+        &self,
+        active: &ActiveConn,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
         let session = active.session;
         let bg_panel = theme.bg_panel;
@@ -1742,7 +1743,7 @@ impl AppState {
         active: &ActiveConn,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
         let view = cx.entity().downgrade();
         let config = &active.config;
@@ -2079,10 +2080,10 @@ impl AppState {
                     .on_drag_start(move |anchor, _, cx| {
                         start
                             .update(cx, |this, cx| {
-                                if let Phase::Connected(a) = &mut this.phase {
-                                    if let Some(s) = &mut a.split {
-                                        s.drag = Some(anchor);
-                                    }
+                                if let Phase::Connected(a) = &mut this.phase
+                                    && let Some(s) = &mut a.split
+                                {
+                                    s.drag = Some(anchor);
                                 }
                                 cx.notify();
                             })
@@ -2091,10 +2092,10 @@ impl AppState {
                     .on_resize(move |size, _, cx| {
                         resize
                             .update(cx, |this, cx| {
-                                if let Phase::Connected(a) = &mut this.phase {
-                                    if let Some(s) = &mut a.split {
-                                        s.width = size;
-                                    }
+                                if let Phase::Connected(a) = &mut this.phase
+                                    && let Some(s) = &mut a.split
+                                {
+                                    s.width = size;
                                 }
                                 cx.notify();
                             })
@@ -2102,10 +2103,10 @@ impl AppState {
                     })
                     .on_drag_end(move |_, cx| {
                         end.update(cx, |this, cx| {
-                            if let Phase::Connected(a) = &mut this.phase {
-                                if let Some(s) = &mut a.split {
-                                    s.drag = None;
-                                }
+                            if let Phase::Connected(a) = &mut this.phase
+                                && let Some(s) = &mut a.split
+                            {
+                                s.drag = None;
                             }
                             cx.notify();
                         })

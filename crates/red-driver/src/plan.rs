@@ -196,6 +196,10 @@ fn push_node(
     node: PlanNode,
 ) {
     while matches!(stack.last(), Some(&(top, _)) if top >= indent) {
+        #[allow(
+            clippy::unwrap_used,
+            reason = "last() above proved the stack is non-empty"
+        )]
         let (_, finished) = stack.pop().unwrap();
         attach(stack, roots, finished);
     }
@@ -418,10 +422,12 @@ mod tests {
         let plan = from_table(columns, rows);
         assert_eq!(plan.nodes.len(), 2);
         assert_eq!(plan.nodes[0].label, "users");
-        assert!(plan.nodes[0]
-            .metrics
-            .iter()
-            .any(|(k, v)| k == "rows" && v == "42"));
+        assert!(
+            plan.nodes[0]
+                .metrics
+                .iter()
+                .any(|(k, v)| k == "rows" && v == "42")
+        );
         // Empty cells are dropped from metrics.
         assert!(!plan.nodes[1].metrics.iter().any(|(k, _)| k == "rows"));
     }

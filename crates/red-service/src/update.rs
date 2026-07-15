@@ -105,11 +105,10 @@ pub(crate) async fn run(events: Events, mut control: UnboundedReceiver<UpdateCon
                 }
             },
             _ = tick => {
-                if let Some(cfg) = &config {
-                    if cfg.enabled {
+                if let Some(cfg) = &config
+                    && cfg.enabled {
                         check(&events, cfg).await;
                     }
-                }
             }
         }
     }
@@ -131,7 +130,7 @@ async fn check(events: &Events, cfg: &UpdateConfig) {
                 UpdateState::Failed {
                     reason: "update check task failed".into(),
                 },
-            )
+            );
         }
     };
 
@@ -154,7 +153,7 @@ async fn check(events: &Events, cfg: &UpdateConfig) {
                     version: release.version,
                     url: release.html_url,
                 },
-            )
+            );
         }
     };
     let asset_url = match release.asset_url {
@@ -166,7 +165,7 @@ async fn check(events: &Events, cfg: &UpdateConfig) {
                     version: release.version,
                     url: release.html_url,
                 },
-            )
+            );
         }
     };
     let checksum_url = release.checksum_url;
@@ -282,12 +281,12 @@ fn fetch_latest_release(repo: &str) -> Result<Release, String> {
             if !name.ends_with(ASSET_SUFFIX) {
                 continue;
             }
-            if let Some(url) = asset["browser_download_url"].as_str() {
-                if is_allowed_download_url(url) {
-                    asset_url = Some(url.to_string());
-                    asset_name = Some(name.to_string());
-                    break;
-                }
+            if let Some(url) = asset["browser_download_url"].as_str()
+                && is_allowed_download_url(url)
+            {
+                asset_url = Some(url.to_string());
+                asset_name = Some(name.to_string());
+                break;
             }
         }
     }

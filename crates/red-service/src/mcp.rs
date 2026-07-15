@@ -15,8 +15,8 @@
 
 use std::convert::Infallible;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -27,7 +27,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use red_ai::CancelToken;
 use red_core::AiPolicy;
-use serde_json::{json, Value as Json};
+use serde_json::{Value as Json, json};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
@@ -287,6 +287,13 @@ fn rpc_error(id: Json, code: i64, message: &str) -> Json {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
+// These three helpers build a `hyper` response from a fixed status + owned body,
+// the one case `http::response::Builder` cannot fail (no invalid header/status is
+// ever supplied), so the `expect` is unreachable by construction.
+#[allow(
+    clippy::expect_used,
+    reason = "builder is infallible for these static inputs"
+)]
 fn json_body(value: Json) -> Response<Full<Bytes>> {
     let bytes = serde_json::to_vec(&value).unwrap_or_default();
     Response::builder()
@@ -296,6 +303,10 @@ fn json_body(value: Json) -> Response<Full<Bytes>> {
         .expect("static response builds")
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "builder is infallible for these static inputs"
+)]
 fn text(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
@@ -303,6 +314,10 @@ fn text(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
         .expect("static response builds")
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "builder is infallible for these static inputs"
+)]
 fn empty(status: StatusCode) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
@@ -492,10 +507,12 @@ mod tests {
         assert_eq!(first["result"]["isError"], json!(false));
         let second = call(&server, &client, select()).await;
         assert_eq!(second["result"]["isError"], json!(true));
-        assert!(second["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("budget"));
+        assert!(
+            second["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("budget")
+        );
     }
 
     #[tokio::test]
@@ -555,10 +572,12 @@ mod tests {
         )
         .await;
         assert_eq!(reply["result"]["isError"], json!(true));
-        assert!(reply["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("cannot modify data"));
+        assert!(
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("cannot modify data")
+        );
     }
 
     #[tokio::test]
@@ -580,6 +599,10 @@ mod tests {
     struct StubKv;
 
     #[async_trait::async_trait]
+    #[allow(
+        clippy::unimplemented,
+        reason = "test stub implements only the KvDriver methods these tests exercise; the rest are never called"
+    )]
     impl red_driver::KvDriver for StubKv {
         async fn ping(&self) -> red_core::Result<()> {
             Ok(())
@@ -863,9 +886,11 @@ mod tests {
         )
         .await;
         assert_eq!(reply["result"]["isError"], json!(true));
-        assert!(reply["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("cannot modify data"));
+        assert!(
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("cannot modify data")
+        );
     }
 }

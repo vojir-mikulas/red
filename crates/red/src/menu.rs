@@ -28,6 +28,7 @@ use flint::components::text_input::{
     Copy as InputCopy, Cut as InputCut, Paste as InputPaste, SelectAll as InputSelectAll,
 };
 
+use crate::Quit;
 use crate::keymap::{
     About, CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusOtherHalf,
     FocusSchema, FormatSql, NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, ReportBug,
@@ -35,7 +36,6 @@ use crate::keymap::{
     SwitchConnection, ToggleSidebar, ToggleSplit,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
-use crate::Quit;
 
 /// Build the full menu tree. Side-effect-free and cheap, so it can be rebuilt and
 /// re-handed to `cx.set_menus` whenever the menu needs to reflect new state.

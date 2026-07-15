@@ -30,3 +30,6 @@ url.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+
+[lints]
+workspace = true

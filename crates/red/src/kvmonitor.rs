@@ -12,7 +12,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Context, SharedString, Window};
+use gpui::{Context, SharedString, Window, div, prelude::*, px};
 use red_core::kv::{ClientInfo, SlowlogEntry};
 use red_service::{Command, SessionId};
 
@@ -39,7 +39,7 @@ pub(crate) struct KvMonitor {
     /// A dedicated epoch for the MONITOR subscription's lifecycle (its own,
     /// distinct from the browse/console/pubsub epochs), torn down by
     /// `CloseResult { epoch }` exactly like the Pub/Sub subscription.
-    pub(crate) epoch: u64,
+    pub(crate) epoch: red_service::Epoch,
     pub(crate) view: MonitorView,
     pub(crate) slowlog: Vec<SlowlogEntry>,
     /// Set once the first `SLOWLOG GET` reply lands, so re-entering the panel
@@ -145,7 +145,7 @@ impl AppState {
     pub(crate) fn on_kv_client_list_ready(
         &mut self,
         session: Option<SessionId>,
-        epoch: u64,
+        epoch: red_service::Epoch,
         clients: Vec<ClientInfo>,
         cx: &mut Context<Self>,
     ) {
@@ -202,7 +202,7 @@ impl AppState {
     pub(crate) fn on_kv_slowlog_ready(
         &mut self,
         session: Option<SessionId>,
-        epoch: u64,
+        epoch: red_service::Epoch,
         entries: Vec<SlowlogEntry>,
         cx: &mut Context<Self>,
     ) {
@@ -294,7 +294,7 @@ impl AppState {
     pub(crate) fn on_kv_monitor_line(
         &mut self,
         session: Option<SessionId>,
-        epoch: u64,
+        epoch: red_service::Epoch,
         line: String,
         cx: &mut Context<Self>,
     ) {
@@ -322,7 +322,7 @@ impl AppState {
         tab_idx: usize,
         _window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
         let session = active.session;
         let writable = !active.config.read_only;

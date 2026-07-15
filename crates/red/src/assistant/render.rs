@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use flint::prelude::*;
 use gpui::{
-    div, prelude::*, px, Animation, AnimationExt, AnyElement, Context, MouseButton, Pixels, Point,
-    SharedString,
+    Animation, AnimationExt, AnyElement, Context, MouseButton, Pixels, Point, SharedString, div,
+    prelude::*, px,
 };
 
 use crate::app::{AppState, Phase};
@@ -1260,61 +1260,62 @@ impl AppState {
         // SQL affordances for the first fenced SQL block in a *settled* assistant
         // turn (suppressed while still typing): insert it into the active editor, or
         // open it in a fresh query tab (a read-only SELECT runs there automatically).
-        if !live && msg.role == ChatRole::Assistant {
-            if let Some(sql) = msg.sql_block() {
-                let sql = sql.to_string();
-                let key = bubble_key(index);
-                let chip = |id: SharedString, glyph: &'static str, label: &'static str| {
-                    div()
-                        .id(id)
-                        .px_2()
-                        .h(px(22.))
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .rounded(px(5.))
-                        .border_1()
-                        .border_color(theme.border)
-                        .text_size(theme.scale(11.))
-                        .text_color(theme.text_muted)
-                        .cursor_pointer()
-                        .hover(|s| s.border_color(theme.accent).text_color(theme.accent))
-                        .child(crate::icons::icon(
-                            glyph,
-                            theme.scale(11.),
-                            theme.text_muted,
-                        ))
-                        .child(label)
-                };
-                let insert_sql = sql.clone();
-                bubble = bubble.child(
-                    div()
-                        .mt_1()
-                        .flex()
-                        .flex_wrap()
-                        .gap_1p5()
-                        .child(
-                            chip(
-                                SharedString::from(format!("ai-insert-{key}")),
-                                "corner-down-left",
-                                "Insert into editor",
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| this.ai_insert_sql(insert_sql.clone(), cx),
-                            )),
+        if !live
+            && msg.role == ChatRole::Assistant
+            && let Some(sql) = msg.sql_block()
+        {
+            let sql = sql.to_string();
+            let key = bubble_key(index);
+            let chip = |id: SharedString, glyph: &'static str, label: &'static str| {
+                div()
+                    .id(id)
+                    .px_2()
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_size(theme.scale(11.))
+                    .text_color(theme.text_muted)
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(theme.accent).text_color(theme.accent))
+                    .child(crate::icons::icon(
+                        glyph,
+                        theme.scale(11.),
+                        theme.text_muted,
+                    ))
+                    .child(label)
+            };
+            let insert_sql = sql.clone();
+            bubble = bubble.child(
+                div()
+                    .mt_1()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1p5()
+                    .child(
+                        chip(
+                            SharedString::from(format!("ai-insert-{key}")),
+                            "corner-down-left",
+                            "Insert into editor",
                         )
-                        .child(
-                            chip(
-                                SharedString::from(format!("ai-open-{key}")),
-                                "table",
-                                "Open in a query tab",
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| this.open_query_in_tab(sql.clone(), cx),
-                            )),
-                        ),
-                );
-            }
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.ai_insert_sql(insert_sql.clone(), cx)
+                        })),
+                    )
+                    .child(
+                        chip(
+                            SharedString::from(format!("ai-open-{key}")),
+                            "table",
+                            "Open in a query tab",
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_query_in_tab(sql.clone(), cx)
+                        })),
+                    ),
+            );
         }
 
         // Generated reports: a prominent card per report, at the very bottom of the
@@ -1324,7 +1325,7 @@ impl AppState {
             for node in &msg.activity {
                 if let red_core::ActivityKind::Report { path, title } = &node.kind {
                     bubble = bubble.child(div().mt_1().child(render_report_card(
-                        &node.id,
+                        node.id.as_str(),
                         path,
                         title.as_deref(),
                         theme,
@@ -1497,7 +1498,7 @@ fn render_subagent_card(
     cx: &mut Context<AppState>,
 ) -> AnyElement {
     use red_core::ActivityStatus::{Denied, Failed, Ok as StatusOk, Pending, Running};
-    let id = SharedString::from(node.id.clone());
+    let id = SharedString::from(node.id.as_str());
     let done = matches!(node.status, StatusOk | Failed | Denied);
     let running = matches!(node.status, Running | Pending);
     // Default: expanded while working (so its progress shows), collapsed once done;
@@ -1513,7 +1514,7 @@ fn render_subagent_card(
             .items_center()
             .justify_center()
             .size(px(13.))
-            .child(running_dot(&node.id, theme, cx.reduce_motion()))
+            .child(running_dot(node.id.as_str(), theme, cx.reduce_motion()))
             .into_any_element()
     } else {
         let (glyph, glyph_color) = activity_glyph(node.status, theme);

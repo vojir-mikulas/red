@@ -15,8 +15,8 @@
 
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -28,15 +28,15 @@ use red_core::{
 use std::fs::File;
 use std::io::BufWriter;
 use std::sync::Mutex as StdMutex;
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, NoTls, Row, RowStream, Statement};
 
-use crate::format::{strip_trailing, ExportWriter, ProgressThrottle};
+use crate::format::{ExportWriter, ProgressThrottle, strip_trailing};
 use crate::pg_text;
 use crate::{
-    driver_err, AbortSignal, ArmGuard, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor,
+    AbortSignal, ArmGuard, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor, driver_err,
 };
 
 /// Warm fetch connections kept ready for the one-shot read paths. `tokio-postgres`
@@ -49,7 +49,7 @@ const FETCH_POOL_CAP: usize = 4;
 
 /// A live PostgreSQL session. Holds the shared `Client` (cursor, introspection,
 /// `execute`) plus a small lazily-grown pool of warm connections the cancellable
-/// one-shot fetches borrow; see [`FETCH_POOL_CAP`].
+/// one-shot fetches borrow; see `FETCH_POOL_CAP`.
 pub struct PostgresDriver {
     client: Arc<Client>,
     version: String,
@@ -503,16 +503,15 @@ impl DatabaseDriver for PostgresDriver {
         &self,
         sql: &str,
         column: &str,
-        numeric: bool,
-        distinct: bool,
+        flags: red_core::StatsFlags,
         abort: &AbortSignal,
     ) -> Result<red_core::ColumnStats> {
-        let sql = crate::stats_sql(sql, column, numeric, distinct, pg_quote);
+        let sql = crate::stats_sql(sql, column, flags, pg_quote);
         self.with_fetch_conn(abort, |client| async move {
             let row = client.query_one(&sql, &[]).await.map_err(map_pg_err)?;
             // Read the one aggregate row full-fidelity, then map it positionally.
             let cells = pg_row(&row, None);
-            Ok(crate::parse_stats(&cells, numeric, distinct))
+            Ok(crate::parse_stats(&cells, flags))
         })
         .await
     }
@@ -546,7 +545,7 @@ impl DatabaseDriver for PostgresDriver {
         sql: &str,
         key: &KeySpec,
         bound: Option<&[Value]>,
-        descending: bool,
+        scroll: red_core::SortDirection,
         limit: usize,
         abort: &AbortSignal,
     ) -> Result<ResultPage> {
@@ -560,9 +559,13 @@ impl DatabaseDriver for PostgresDriver {
         // `col > $1::text` has no operator (42883). Int/real values pin their own
         // wire type and ignore the column type.
         let key_types = key.column_types();
+        // `seek_clauses` only invokes the closure for `i < bound_len`, and
+        // `bound_len > 0` implies `bound` is `Some`, so the empty-slice fallback is
+        // never indexed — it just keeps the closure panic-free.
+        let bound_vals = bound.unwrap_or(&[]);
         let (where_clause, order_by) =
-            crate::seek_clauses(key, bound_len, descending, false, pg_quote, |i| {
-                format!("${}{}", i + 1, pg_cast(&bound.unwrap()[i], key_types[i]))
+            crate::seek_clauses(key, bound_len, scroll, false, pg_quote, |i| {
+                format!("${}{}", i + 1, pg_cast(&bound_vals[i], key_types[i]))
             });
         let sql = format!(
             "SELECT * FROM ({base}) AS _red {where_clause}ORDER BY {order_by} LIMIT {limit}"
@@ -596,10 +599,17 @@ impl DatabaseDriver for PostgresDriver {
         let base = strip_trailing(sql);
         let bound_len = from.map_or(0, <[Value]>::len);
         let key_types = key.column_types();
-        let (where_clause, order_by) =
-            crate::seek_clauses(key, bound_len, false, true, pg_quote, |i| {
-                format!("${}{}", i + 1, pg_cast(&from.unwrap()[i], key_types[i]))
-            });
+        // See `fetch_seek`: the closure runs only for `i < bound_len`, which
+        // implies `from` is `Some`; the fallback keeps it panic-free.
+        let from_vals = from.unwrap_or(&[]);
+        let (where_clause, order_by) = crate::seek_clauses(
+            key,
+            bound_len,
+            red_core::SortDirection::Asc,
+            true,
+            pg_quote,
+            |i| format!("${}{}", i + 1, pg_cast(&from_vals[i], key_types[i])),
+        );
         let sql = format!(
             "SELECT * FROM ({base}) AS _red {where_clause}\
              ORDER BY {order_by} LIMIT {limit} OFFSET {skip}"
@@ -952,7 +962,7 @@ impl QueryCursor for PgCursor {
                     return Ok(RowWindow {
                         rows,
                         exhausted: true,
-                    })
+                    });
                 }
             }
         }
@@ -1024,7 +1034,7 @@ fn pg_params(bound: Option<&[Value]>) -> Result<Vec<Box<dyn ToSql + Sync + Send>
                 Value::Text(s) => Box::new(s.to_string()),
                 Value::Blob(b) => Box::new(b.clone()),
                 Value::Null | Value::Capped(_) => {
-                    return Err(RedError::Query("null seek bound".into()))
+                    return Err(RedError::Query("null seek bound".into()));
                 }
             })
         })
@@ -1655,10 +1665,10 @@ mod tests {
             column_type: None,
             tiebreak: Some("id".into()),
             tiebreak_type: None,
-            descending: false,
+            direction: red_core::SortDirection::Asc,
         };
         let key_desc = KeySpec {
-            descending: true,
+            direction: red_core::SortDirection::Desc,
             ..key_asc.clone()
         };
         battery::seeks_composite_sorted(

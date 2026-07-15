@@ -10,7 +10,7 @@
 //! button calls.
 
 use flint::{Palette, PaletteEvent, PaletteItem, ToastVariant};
-use gpui::{actions, prelude::*, Context, ElementId, Entity, SharedString};
+use gpui::{Context, ElementId, Entity, SharedString, actions, prelude::*};
 use red_core::{ColumnMap, ColumnMeta, CopyMode, TableRef};
 use red_service::Command;
 
@@ -101,7 +101,7 @@ pub(crate) enum Cmd {
     /// Start a fresh assistant chat, saving the current one (M-S5).
     AssistantNewChat,
     /// Start a fresh assistant chat on a specific agent, by index into
-    /// `usable_agents` (the "New chat with <agent>" entries).
+    /// `usable_agents` (the "New chat with \<agent\>" entries).
     AssistantNewChatWith(usize),
     /// Reveal the conversations directory in the OS file manager (M-S5).
     RevealConversationStorage,
@@ -889,7 +889,7 @@ impl AppState {
             );
             return;
         };
-        let id = self.next_export_id;
+        let id = red_service::OpId::new(self.next_export_id);
         self.next_export_id += 1;
         let target_label = format!(
             "{} · {}.{}",
@@ -915,7 +915,7 @@ impl AppState {
 
     /// A "✦ New table…" namespace was picked: stash the source (the focused result's
     /// epoch + columns) and the target namespace, then open a prompt for the new
-    /// table's name. On submit, [`submit_copy_new_table`] creates the table from the
+    /// table's name. On submit, `submit_copy_new_table` creates the table from the
     /// source's column shape and streams the rows in.
     fn pick_copy_new_table(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(ns) = self.copy_new_namespaces.get(index).cloned() else {
@@ -1018,7 +1018,7 @@ impl AppState {
             schema: Some(pending.schema.clone()),
             name: name.to_string(),
         };
-        let id = self.next_export_id;
+        let id = red_service::OpId::new(self.next_export_id);
         self.next_export_id += 1;
         self.start_copy(
             id,
@@ -1034,7 +1034,7 @@ impl AppState {
 
     /// "schema: migrate to…": take the foreground connection's selected schema (all its
     /// tables) and open a picker over every *other* writable namespace (a target
-    /// database). On pick, [`pick_migrate_target`] fires the whole-schema migration.
+    /// database). On pick, `pick_migrate_target` fires the whole-schema migration.
     /// No-op (with a hint) when nothing is migratable / no target is open.
     pub(crate) fn open_migrate_picker(&mut self, cx: &mut Context<Self>) {
         let Some((session, schema, tables)) = self.migrate_source() else {
@@ -1099,7 +1099,7 @@ impl AppState {
         let Some((_source_session, source_schema, tables)) = self.pending_migrate.take() else {
             return;
         };
-        let id = self.next_export_id;
+        let id = red_service::OpId::new(self.next_export_id);
         self.next_export_id += 1;
         self.start_migrate(id, source_schema, tables, target.session, target.schema, cx);
     }

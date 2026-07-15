@@ -17,3 +17,6 @@ serde = { workspace = true, optional = true }
 # Data-only serde derives for persistence at the app edge. Off by default so the
 # core stays dependency-light; the app turns it on.
 serde = ["dep:serde"]
+
+[lints]
+workspace = true

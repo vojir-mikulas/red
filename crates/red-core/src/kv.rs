@@ -722,6 +722,7 @@ pub fn tokenize_command(line: &str) -> Vec<String> {
             }
             _ => {
                 while matches!(chars.peek(), Some(c) if !c.is_whitespace()) {
+                    #[allow(clippy::unwrap_used, reason = "peek() above proved a next char")]
                     tok.push(chars.next().unwrap());
                 }
             }
@@ -1176,10 +1177,11 @@ mod tests {
         // the no-prefix bucket (10).
         assert_eq!(a.namespaces[0].prefix, "user");
         assert_eq!(a.namespaces[0].bytes, 300);
-        assert!(a
-            .namespaces
-            .iter()
-            .any(|n| n.prefix == NO_PREFIX_LABEL && n.count == 1));
+        assert!(
+            a.namespaces
+                .iter()
+                .any(|n| n.prefix == NO_PREFIX_LABEL && n.count == 1)
+        );
 
         // TTL buckets: one persistent, one <hour, one <day (7200s = 2h), one
         // >week (1e6s ≈ 11.6d).

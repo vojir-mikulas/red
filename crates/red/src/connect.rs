@@ -3,10 +3,10 @@
 //! modal form. Pure assembly over Flint components; all state + actions live on
 //! [`AppState`] (`app.rs`).
 
-use flint::prelude::*;
 use flint::Theme;
+use flint::prelude::*;
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, Pixels, Role, SharedString, Window,
+    AnyElement, Context, FontWeight, Hsla, Pixels, Role, SharedString, Window, div, prelude::*, px,
 };
 use red_core::DbKind;
 
@@ -61,7 +61,7 @@ pub(crate) fn engine_icon(kind: DbKind) -> &'static str {
 /// The small brand glyph that marks an engine in the picker dropdown — drawn in
 /// the trigger for the current engine and on every option row. Shares the
 /// per-engine palette with the connection cards via [`engine_tint`].
-pub(crate) fn engine_glyph(kind: DbKind, size: Pixels, theme: &Theme) -> impl IntoElement {
+pub(crate) fn engine_glyph(kind: DbKind, size: Pixels, theme: &Theme) -> impl IntoElement + use<> {
     crate::icons::icon(engine_icon(kind), size, engine_tint(kind, theme))
 }
 
@@ -95,7 +95,7 @@ impl AppState {
     /// row, and a subtle "Edit file" affordance on the right: the file-first escape
     /// hatch that opens `connections.toml` (mirrors the settings panel's "Open
     /// settings file"). Edits to the file re-read live via the connections watcher.
-    fn connections_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn connections_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let edit_file = div()
             .id("connect-edit-file")
@@ -140,7 +140,7 @@ impl AppState {
         &self,
         window: &Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         // Build the cards first (they reborrow `cx` mutably), then read the theme
         // for the surrounding chrome (it holds an immutable borrow). The form modal
         // is rendered at the root (see `render.rs`) so it works in any phase.
@@ -378,11 +378,7 @@ impl AppState {
                     .to_lowercase()
                     .cmp(&self.connections[b].config.name.to_lowercase()),
             };
-            if asc {
-                ord
-            } else {
-                ord.reverse()
-            }
+            if asc { ord } else { ord.reverse() }
         });
         indices
     }
@@ -397,7 +393,7 @@ impl AppState {
         page_count: usize,
         total: usize,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         // Cloned so the theme doesn't hold an immutable borrow of `cx` across the
         // `cx.listener` calls on the buttons below.
         let theme = cx.theme().clone();
@@ -436,7 +432,7 @@ impl AppState {
 
     /// The toolbar above the saved-connection list: a search box that filters the
     /// list as you type, and the Name / Recent sort toggle.
-    fn connect_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn connect_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         // Build the sort cells first (they reborrow `cx` for their listeners), then
         // read the theme for the search box's chrome.
         let sort_name = self.sort_cell("Name", ConnectSortField::Name, cx);
@@ -476,14 +472,14 @@ impl AppState {
     /// One cell of the Name / Recent sort toggle. The active field takes the accent
     /// treatment and its arrow shows the live direction; an inactive cell shows the
     /// direction a first click would apply. Clicking the active field flips the
-    /// direction (see [`ConnectSort::toggle`]). Both share the cards' subtle hover
+    /// direction (see `ConnectSort::toggle`). Both share the cards' subtle hover
     /// so the welcome screen's interactive surfaces feel consistent.
     fn sort_cell(
         &self,
         label: &'static str,
         field: ConnectSortField,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let on = self.connect_sort.field == field;
         // The arrow reflects the current direction when active, else the direction
@@ -529,7 +525,7 @@ impl AppState {
             }))
     }
 
-    fn new_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn new_button(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         div()
             .id("connect-new")
@@ -582,7 +578,7 @@ impl AppState {
         last_accessed: Option<u64>,
         pinned: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         // The icon square (its glyph, fill, border) and the selection border both
         // track the connection's own label color; the engine is conveyed by the
@@ -804,7 +800,11 @@ impl AppState {
             .on_click(cx.listener(move |this, _, _, cx| this.connect(orig_ix, cx)))
     }
 
-    pub(crate) fn render_form(&self, form: &FormState, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_form(
+        &self,
+        form: &FormState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         // Owned clone so the theme doesn't hold an immutable borrow of `cx` across
         // the `&mut cx` helper calls below.
         let theme = cx.theme().clone();
@@ -1003,7 +1003,7 @@ impl AppState {
         selected: SshAuthMode,
         theme: &Theme,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let cells = SshAuthMode::all().iter().map(|&mode| {
             let on = mode == selected;
             let (bg, border, text) = if on {
@@ -1185,7 +1185,7 @@ impl AppState {
         form: &FormState,
         theme: &Theme,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let focus_ring = theme.text;
         let swatches = (0..6u8).map(|i| {
             let color = label_color(i, theme);
@@ -1297,7 +1297,11 @@ impl AppState {
     /// Connect on the right. The button shows "Testing…" while a probe is in
     /// flight; the result arrives as a toast (see the `TestSucceeded`/`TestFailed`
     /// arms in `on_event`), not inline.
-    fn render_form_footer(&self, form: &FormState, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_form_footer(
+        &self,
+        form: &FormState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let testing = matches!(form.test, TestState::Testing);
 

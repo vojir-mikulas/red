@@ -9,8 +9,8 @@
 //! adaptive thinking, tool use, and prompt-cached system + tools. OpenAI and a
 //! local (Ollama / OpenAI-compatible) provider drop in behind the same trait.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc::UnboundedSender;
@@ -18,7 +18,7 @@ use tokio::sync::mpsc::UnboundedSender;
 mod anthropic;
 mod types;
 
-pub use anthropic::{is_safe_base_url, AnthropicProvider};
+pub use anthropic::{AnthropicProvider, is_safe_base_url};
 pub use types::{
     AiError, ContentBlock, Delta, Message, Result, Role, StopReason, ToolDef, TurnOutcome,
     TurnRequest, Usage,

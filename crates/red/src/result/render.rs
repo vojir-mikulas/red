@@ -4,16 +4,16 @@
 
 use std::rc::Rc;
 
-use flint::prelude::*;
 use flint::TextInput;
+use flint::prelude::*;
 use gpui::{
-    div, prelude::*, px, Axis, Entity, Hsla, MouseButton, Pixels, Point, SharedString, Window,
+    Axis, Entity, Hsla, MouseButton, Pixels, Point, SharedString, Window, div, prelude::*, px,
 };
 use red_core::ExportFormat;
 
 use super::buffer::{CellKind, DisplayCell};
 use super::edit::EditSlot;
-use super::{gutter_width, DATA_COL_WIDTH};
+use super::{DATA_COL_WIDTH, gutter_width};
 use crate::app::{ActiveConn, AppState, Pane, Phase};
 
 /// Group a number's digits in threes (`1234567` → `1,234,567`) so large row
@@ -151,7 +151,7 @@ impl AppState {
         is_focused: bool,
         _window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let (bg, bg_app, border, border_soft) = (
             theme.bg_panel,
@@ -362,10 +362,10 @@ impl AppState {
             let mut col = Column::new(c.name.clone())
                 .width(px(DATA_COL_WIDTH))
                 .sortable();
-            if let Some(t) = &c.decl_type {
-                if !t.is_empty() {
-                    col = col.subtitle(t.to_lowercase());
-                }
+            if let Some(t) = &c.decl_type
+                && !t.is_empty()
+            {
+                col = col.subtitle(t.to_lowercase());
             }
             columns.push(col);
         }
@@ -621,21 +621,22 @@ impl AppState {
                     // The open inline editor takes over its cell. The field is
                     // `bare`, so it fills the cell (the Flint cell wrapper supplies
                     // the height/padding) rather than drawing a smaller box inside.
-                    if let Some((er, ec, input)) = &inline {
-                        if *er == abs && *ec == c {
-                            match &suggest_anchor {
-                                Some(anchor) => out.push(
-                                    div()
-                                        .relative()
-                                        .size_full()
-                                        .child(input.clone())
-                                        .child(super::suggest::anchor_canvas(anchor.clone()))
-                                        .into_any_element(),
-                                ),
-                                None => out.push(input.clone().into_any_element()),
-                            }
-                            continue;
+                    if let Some((er, ec, input)) = &inline
+                        && *er == abs
+                        && *ec == c
+                    {
+                        match &suggest_anchor {
+                            Some(anchor) => out.push(
+                                div()
+                                    .relative()
+                                    .size_full()
+                                    .child(input.clone())
+                                    .child(super::suggest::anchor_canvas(anchor.clone()))
+                                    .into_any_element(),
+                            ),
+                            None => out.push(input.clone().into_any_element()),
                         }
+                        continue;
                     }
                     let is_fk = fk_cols.contains(&c);
                     // A staged value (dirty cell) shadows the resident one.
@@ -1059,31 +1060,32 @@ impl AppState {
                     .into_any_element(),
             );
             for c in 0..ncols {
-                if let Some((di, dc, input)) = &draft_inline {
-                    if *di == index && *dc == c {
-                        cells.push(
-                            div()
-                                .relative()
-                                .w(px(DATA_COL_WIDTH))
-                                .flex_shrink_0()
-                                .h_full()
-                                .px_2p5()
-                                .flex()
-                                .items_center()
-                                .border_r_1()
-                                .border_color(line)
-                                .child(input.clone())
-                                // Anchor the FK picker (Track B8) below this draft cell.
-                                .when_some(
-                                    self.cell_suggest
-                                        .as_ref()
-                                        .map(|_| self.cell_suggest_bounds.clone()),
-                                    |d, anchor| d.child(super::suggest::anchor_canvas(anchor)),
-                                )
-                                .into_any_element(),
-                        );
-                        continue;
-                    }
+                if let Some((di, dc, input)) = &draft_inline
+                    && *di == index
+                    && *dc == c
+                {
+                    cells.push(
+                        div()
+                            .relative()
+                            .w(px(DATA_COL_WIDTH))
+                            .flex_shrink_0()
+                            .h_full()
+                            .px_2p5()
+                            .flex()
+                            .items_center()
+                            .border_r_1()
+                            .border_color(line)
+                            .child(input.clone())
+                            // Anchor the FK picker (Track B8) below this draft cell.
+                            .when_some(
+                                self.cell_suggest
+                                    .as_ref()
+                                    .map(|_| self.cell_suggest_bounds.clone()),
+                                |d, anchor| d.child(super::suggest::anchor_canvas(anchor)),
+                            )
+                            .into_any_element(),
+                    );
+                    continue;
                 }
                 let content = match draft.cells.get(&c) {
                     Some(v) => render_cell(
@@ -1157,7 +1159,7 @@ impl AppState {
         &self,
         pos: Point<Pixels>,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         // Editing entries (Track B6) appear only when the focused cell / row is
         // editable on a writable connection's keyed browse.
         let editable_cell = self.active_edit_target().is_some();
@@ -1229,30 +1231,27 @@ impl AppState {
         {
             menu = menu.separator();
         }
-        if let Some(ref_menu) = ref_menu {
-            if !ref_menu.columns.is_empty() {
-                // The referenced table's columns can run long (every column of a
-                // wide table), so they live in a hover-opened flyout rather than
-                // padding out the main menu. `ContextMenu` opens it on hover and
-                // closes it again when a sibling row is entered.
-                let mut sub = Submenu::new("ref-cols", format!("Show from {}", ref_menu.ref_table));
-                for (i, item) in ref_menu.columns.into_iter().enumerate() {
-                    let mark = if item.shown { "✓ " } else { "    " };
-                    let path = item.path;
-                    sub = sub.item(
-                        ContextMenuItem::new(
-                            format!("ref-col-{i}"),
-                            format!("{mark}{}", item.label),
-                        )
+        if let Some(ref_menu) = ref_menu
+            && !ref_menu.columns.is_empty()
+        {
+            // The referenced table's columns can run long (every column of a
+            // wide table), so they live in a hover-opened flyout rather than
+            // padding out the main menu. `ContextMenu` opens it on hover and
+            // closes it again when a sibling row is entered.
+            let mut sub = Submenu::new("ref-cols", format!("Show from {}", ref_menu.ref_table));
+            for (i, item) in ref_menu.columns.into_iter().enumerate() {
+                let mark = if item.shown { "✓ " } else { "    " };
+                let path = item.path;
+                sub = sub.item(
+                    ContextMenuItem::new(format!("ref-col-{i}"), format!("{mark}{}", item.label))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.cell_menu = None;
                             this.toggle_reference_column(path.clone(), cx);
                             cx.notify();
                         })),
-                    );
-                }
-                menu = menu.submenu(sub);
+                );
             }
+            menu = menu.submenu(sub);
         }
         if let Some(path) = joined_path {
             menu = menu.item(
@@ -1328,7 +1327,7 @@ impl AppState {
         &self,
         pos: Point<Pixels>,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let menu = ContextMenu::new("result-export-menu")
             .item(
                 ContextMenuItem::new("export-csv", "CSV").on_click(cx.listener(
@@ -1386,7 +1385,7 @@ impl AppState {
         &self,
         pos: Point<Pixels>,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         // "Copy to…" needs a ready result as its source; the Stats toggle is
         // always available and carries a leading check while its bar is on.
         let ready = matches!(&self.phase, Phase::Connected(a) if a.active_result().is_some_and(|g| g.ready));

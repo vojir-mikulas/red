@@ -11,11 +11,12 @@ use std::time::{Duration, Instant};
 use red_core::AiTier;
 use red_driver::{AbortSignal, CancelToken, DatabaseDriver, KvDriver, QueryCursor};
 
+use crate::protocol::OpId;
 use crate::tunnel::Tunnel;
 use crate::{Event, SessionId};
 
 use super::paging::ResultMap;
-use super::{emit, lock, Events};
+use super::{Events, emit, lock};
 
 /// A session's driver: either the SQL-shaped `DatabaseDriver` seam or the
 /// parallel `KvDriver` seam (Redis; see `docs/plans/redis.md`). Every SQL
@@ -197,8 +198,8 @@ pub(crate) struct SessionState {
     /// path is legacy/test-only (the UI drives results via `OpenResult`).
     pub(crate) active: Option<ActiveQuery>,
     pub(crate) results: ResultMap,
-    pub(crate) inflight: HashMap<u64, InFlight>,
-    pub(crate) exports: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
+    pub(crate) inflight: HashMap<crate::Epoch, InFlight>,
+    pub(crate) exports: Arc<Mutex<HashMap<OpId, Arc<AtomicBool>>>>,
     /// In-use pin against idle eviction: the number of background jobs currently
     /// reading from or writing to this session. A table copy reads from a session
     /// that is, by definition, *not* the foreground (you copy A→B; at most one side
@@ -283,7 +284,7 @@ impl SessionState {
     /// back under the cap. A no-op in normal use (the UI closes superseded results);
     /// this only bites if a caller leaks epochs, turning unbounded growth into a
     /// bounded, logged drop. Never touches `keep` (the just-opened epoch).
-    pub(crate) fn reap_excess_results(&mut self, keep: u64) {
+    pub(crate) fn reap_excess_results(&mut self, keep: crate::Epoch) {
         let mut results = lock(&self.results);
         while results.len() > MAX_OPEN_RESULTS {
             let Some(victim) = results.keys().copied().filter(|&e| e != keep).min() else {
@@ -294,7 +295,7 @@ impl SessionState {
                 f.abort_all();
             }
             tracing::warn!(
-                epoch = victim,
+                epoch = victim.get(),
                 "reaped leaked open result (exceeded MAX_OPEN_RESULTS)"
             );
         }
@@ -446,7 +447,7 @@ pub(crate) fn evict_idle(
     for id in stale {
         if let Some(mut state) = sessions.remove(&id) {
             state.teardown();
-            tracing::info!(id = id.0, "evicted idle session");
+            tracing::info!(id = id.get(), "evicted idle session");
             emit(events, Some(id), Event::Disconnected);
         }
     }
@@ -454,7 +455,7 @@ pub(crate) fn evict_idle(
 
 /// Abort every in-flight fetch across all open results and clear the registry:
 /// the connection is being dropped or replaced, so all of it is doomed work.
-pub(crate) fn abort_all_inflight(inflight: &mut HashMap<u64, InFlight>) {
+pub(crate) fn abort_all_inflight(inflight: &mut HashMap<crate::Epoch, InFlight>) {
     for (_, f) in inflight.drain() {
         f.abort_all();
     }

@@ -30,11 +30,11 @@ fn materialize() -> Option<PathBuf> {
         return None;
     }
     let path = dir.join("sample.db");
-    if !path.exists() {
-        if let Err(e) = std::fs::write(&path, SAMPLE_DB) {
-            tracing::warn!("could not write the sample database: {e}");
-            return None;
-        }
+    if !path.exists()
+        && let Err(e) = std::fs::write(&path, SAMPLE_DB)
+    {
+        tracing::warn!("could not write the sample database: {e}");
+        return None;
     }
     Some(path)
 }

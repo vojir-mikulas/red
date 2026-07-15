@@ -21,11 +21,11 @@ use std::fs;
 use std::path::Path;
 
 use aes::Aes256;
-use anyhow::{anyhow, bail, Context, Result};
-use base64::engine::general_purpose::STANDARD as BASE64;
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
-use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use base64::engine::general_purpose::STANDARD as BASE64;
 use cbc::Decryptor;
+use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use hmac::{Hmac, Mac};
 use red_core::{ConnectionConfig, DbKind, SshAuth, SshConfig};
 use serde::Deserialize;
@@ -177,6 +177,10 @@ fn simple_decrypt(key: &str, token: &str) -> Result<String> {
     }
     let (hmac_hex, rest) = token.split_at(64);
     let expected = hex::decode(hmac_hex).context("decode hmac hex")?;
+    #[allow(
+        clippy::expect_used,
+        reason = "HMAC-SHA256 accepts a key of any length"
+    )]
     let mut mac =
         HmacSha256::new_from_slice(crypto_key.as_slice()).expect("hmac accepts any key len");
     mac.update(rest.as_bytes());
@@ -411,10 +415,12 @@ mod tests {
     #[test]
     fn skips_unsupported_engine_with_reason() {
         let report = import(&fixture_dir()).expect("import");
-        assert!(report
-            .imported
-            .iter()
-            .all(|c| c.source_name != "SQL Server"));
+        assert!(
+            report
+                .imported
+                .iter()
+                .all(|c| c.source_name != "SQL Server")
+        );
         let (_, reason) = report
             .skipped
             .iter()

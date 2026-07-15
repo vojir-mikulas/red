@@ -19,9 +19,9 @@
 
 use flint::Theme;
 use gpui::{
-    canvas, div, prelude::*, px, AnyElement, Bounds, CursorStyle, Decorations, HitboxBehavior,
-    Hsla, MouseButton, Pixels, Point, ResizeEdge, Size, StatefulInteractiveElement, Tiling,
-    WeakEntity, Window,
+    AnyElement, Bounds, CursorStyle, Decorations, HitboxBehavior, Hsla, MouseButton, Pixels, Point,
+    ResizeEdge, Size, StatefulInteractiveElement, Tiling, WeakEntity, Window, canvas, div,
+    prelude::*, px,
 };
 // Only referenced when we build our own drag region; never on Windows, where the
 // native caption bar owns window-move (see `draggable`).
@@ -185,7 +185,7 @@ where
 /// The minimize / maximize / close cluster, drawn only when the window uses
 /// client-side decorations. Returns `None` on macOS/Windows, where the OS draws
 /// these. Sits at the right end of the titlebar.
-pub(crate) fn window_controls(window: &Window, theme: &Theme) -> Option<impl IntoElement> {
+pub(crate) fn window_controls(window: &Window, theme: &Theme) -> Option<impl IntoElement + use<>> {
     if !matches!(window.window_decorations(), Decorations::Client { .. }) {
         return None;
     }
@@ -224,12 +224,12 @@ pub(crate) fn window_controls(window: &Window, theme: &Theme) -> Option<impl Int
 /// One window-control button. Stops propagation on press so it never arms the
 /// titlebar drag underneath it. The icon masks to `currentColor`, so it rests at
 /// the muted text color and brightens on hover via the button's `group`.
-fn control(
+fn control<F: Fn(&mut Window, &mut gpui::App) + 'static>(
     id: &'static str,
     icon: &'static str,
     theme: &Theme,
-    on_click: impl Fn(&mut Window, &mut gpui::App) + 'static,
-) -> impl IntoElement {
+    on_click: F,
+) -> impl IntoElement + use<F> {
     let is_close = id == "window-close";
     let hover_bg = if is_close { theme.red } else { theme.bg_hover };
     let hover_fg = if is_close {

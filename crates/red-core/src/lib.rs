@@ -432,8 +432,39 @@ impl AiPolicy {
 /// A stable id for a node in an assistant turn's activity timeline. On the
 /// direct-provider path it is the provider's `tool_use` id; on the ACP path it is
 /// the agent's `tool_call_id`. Opaque; only used to correlate a node's start with
-/// its later status updates and to attach children to their parent.
-pub type ActivityId = String;
+/// its later status updates and to attach children to their parent. A newtype (not
+/// a bare `String`) so it can't be transposed with the other string ids that flow
+/// through the delta stream; `serde(transparent)` keeps its persisted form a plain
+/// string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(transparent))]
+pub struct ActivityId(String);
+
+impl ActivityId {
+    /// Borrow the underlying id string (for UI element keys, formatting, matching).
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for ActivityId {
+    fn from(s: String) -> Self {
+        ActivityId(s)
+    }
+}
+
+impl From<&str> for ActivityId {
+    fn from(s: &str) -> Self {
+        ActivityId(s.to_string())
+    }
+}
+
+impl std::fmt::Display for ActivityId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// What one [`ActivityNode`] represents. The agent's work is a tree of these:
 /// tool calls, delegated subagents, and proposed writes. New kinds extend the
@@ -872,12 +903,13 @@ fn decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(byte);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(byte);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -1003,6 +1035,20 @@ pub struct ColumnStats {
     pub sum: Option<Value>,
     /// `avg(col)`, numeric columns only.
     pub avg: Option<Value>,
+}
+
+/// Which aggregates a [`ColumnStats`] request should compute. Bundles the two
+/// independent toggles so the boolean pair can't be transposed at a call site
+/// (`column_stats(sql, col, numeric, distinct)` → `column_stats(sql, col, flags)`).
+/// `numeric` adds the `sum`/`avg` pair (decided UI-side from the column's declared
+/// type); `distinct` adds the potentially expensive `count(distinct col)` (guarded
+/// UI-side behind a row threshold).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatsFlags {
+    /// Compute `sum(col)`/`avg(col)` (numeric columns only).
+    pub numeric: bool,
+    /// Compute `count(distinct col)`.
+    pub distinct: bool,
 }
 
 /// One row of a foreign-key lookup list (the in-cell id picker): a referenced-table
@@ -1398,7 +1444,7 @@ pub struct IndexMeta {
 /// [`KeySpec::sorted`]). Arbitrary editor SQL has no key and pages by `OFFSET`.
 ///
 /// The seek is always a single row-value comparison `(c1, …) </> (…)`, so every
-/// column in the tuple shares one [`descending`](Self::descending) direction. RED
+/// column in the tuple shares one [`direction`](Self::direction). RED
 /// only offers a single-column header sort, so the tiebreaker inherits the lead's
 /// direction and a mixed-direction tuple never arises.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1422,9 +1468,9 @@ pub struct KeySpec {
     /// The tiebreaker column's declared type, paired with [`tiebreak`](Self::tiebreak)
     /// for the same cursor-cast reason as [`column_type`](Self::column_type).
     pub tiebreak_type: Option<String>,
-    /// The sort direction of the lead column (header click). `false` (ascending)
-    /// for a plain browse. The tiebreaker shares this direction.
-    pub descending: bool,
+    /// The sort direction of the lead column (header click); `Asc` for a plain
+    /// browse. The tiebreaker shares this direction.
+    pub direction: SortDirection,
 }
 
 /// Whether the key is numerically interpolable. `Int` keys support key-space
@@ -1434,6 +1480,43 @@ pub struct KeySpec {
 pub enum KeyKind {
     Int,
     Other,
+}
+
+/// A sort direction. Replaces the `descending: bool` that flowed through
+/// [`KeySpec`], the sort spec, and the four drivers' seek builders — where a bare
+/// bool invited transposition and read as noise at the `if descending { "DESC" }`
+/// call sites. Note the two distinct roles it plays: a key's *own* ordering
+/// (`KeySpec::direction`) and the *scroll* direction of a page fetch; the keyset
+/// seek composes them with [`reversed_when`](Self::reversed_when).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortDirection {
+    #[default]
+    Asc,
+    Desc,
+}
+
+impl SortDirection {
+    /// Build from the legacy `descending` flag (a header click / scroll flag).
+    pub fn from_descending(descending: bool) -> Self {
+        if descending { Self::Desc } else { Self::Asc }
+    }
+
+    /// Whether this sorts descending.
+    pub fn is_descending(self) -> bool {
+        matches!(self, Self::Desc)
+    }
+
+    /// The SQL keyword for this direction.
+    pub fn sql(self) -> &'static str {
+        if self.is_descending() { "DESC" } else { "ASC" }
+    }
+
+    /// This direction, reversed when `flip` is set. The keyset seek composes a
+    /// key's own direction with the up/down scroll direction — the old
+    /// `key.descending ^ scroll_descending`.
+    pub fn reversed_when(self, flip: bool) -> Self {
+        Self::from_descending(self.is_descending() ^ flip)
+    }
 }
 
 impl KeySpec {
@@ -1446,7 +1529,7 @@ impl KeySpec {
             column_type: None,
             tiebreak: None,
             tiebreak_type: None,
-            descending: false,
+            direction: SortDirection::Asc,
         }
     }
 
@@ -1498,7 +1581,11 @@ impl KeySpec {
     /// table (an expression/alias), or when it's nullable (NULLs don't order
     /// reliably across engines). Sorting by the PK itself collapses to the plain
     /// single-column key, just carrying the direction.
-    pub fn sorted(detail: &TableDetail, sort_col: &str, descending: bool) -> Option<KeySpec> {
+    pub fn sorted(
+        detail: &TableDetail,
+        sort_col: &str,
+        direction: SortDirection,
+    ) -> Option<KeySpec> {
         let pk = resolve_key_column(detail)?;
         let lead = detail.columns.iter().find(|c| c.name == sort_col)?;
         if lead.name == pk.name {
@@ -1508,7 +1595,7 @@ impl KeySpec {
                 column_type: pk.type_name.clone(),
                 tiebreak: None,
                 tiebreak_type: None,
-                descending,
+                direction,
             });
         }
         // A nullable non-PK lead disqualifies keyset, the same posture `from_detail`
@@ -1520,7 +1607,7 @@ impl KeySpec {
             column_type: lead.type_name.clone(),
             tiebreak: Some(pk.name.clone()),
             tiebreak_type: pk.type_name.clone(),
-            descending,
+            direction,
         })
     }
 }
@@ -1882,7 +1969,7 @@ mod key_tests {
 
         // A header-click sort by a non-PK column leads with that column's type and
         // appends the PK as a typed tiebreaker; both need their cast.
-        let sorted = KeySpec::sorted(&detail, "created_at", true).unwrap();
+        let sorted = KeySpec::sorted(&detail, "created_at", SortDirection::Desc).unwrap();
         assert_eq!(sorted.column_type.as_deref(), Some("timestamptz"));
         assert_eq!(sorted.tiebreak.as_deref(), Some("id"));
         assert_eq!(sorted.tiebreak_type.as_deref(), Some("uuid"));

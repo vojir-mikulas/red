@@ -9,7 +9,7 @@
 //! file is the source of truth, and every edit reads the current slots, applies one
 //! change, and saves, so the tab and a hand-edit stay in sync.
 //!
-//! The recorder captures one chord with [`App::intercept_keystrokes`], which runs
+//! The recorder captures one chord with `App::intercept_keystrokes`, which runs
 //! *before* binding dispatch and whose `stop_propagation` suppresses the action,
 //! so capturing a colliding chord (`cmd-w`, `cmd-k`) is safe; the recorder is the
 //! only consumer for that one keypress. The interceptor subscription is held
@@ -165,10 +165,10 @@ impl AppState {
             return;
         };
 
-        if let Ok(text) = crate::keymap_config::KeymapStore::serialize(&blocks) {
-            if let Some(watcher) = &self.keymap_watcher {
-                watcher.note_self_write(&text);
-            }
+        if let Ok(text) = crate::keymap_config::KeymapStore::serialize(&blocks)
+            && let Some(watcher) = &self.keymap_watcher
+        {
+            watcher.note_self_write(&text);
         }
         if let Err(e) = store.save(&blocks) {
             self.notify(

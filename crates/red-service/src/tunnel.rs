@@ -226,10 +226,9 @@ async fn authenticate_agent(
         if let Ok(result) = handle
             .authenticate_publickey_with(user.to_string(), pubkey, None, &mut agent)
             .await
+            && result.success()
         {
-            if result.success() {
-                return Ok(true);
-            }
+            return Ok(true);
         }
     }
     Ok(false)
@@ -356,12 +355,11 @@ AAAEAsgG66AZ1coZRS0N1OW3YSKfVp76vXarHs06agqv8p5/xZr+JfeotCp0xH9pfM4Ca6
         let ssh_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ssh_port = ssh_listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            if let Ok((stream, _)) = ssh_listener.accept().await {
-                if let Ok(session) =
+            if let Ok((stream, _)) = ssh_listener.accept().await
+                && let Ok(session) =
                     russh::server::run_stream(server_config, stream, TestServer).await
-                {
-                    let _ = session.await;
-                }
+            {
+                let _ = session.await;
             }
         });
 
@@ -377,7 +375,13 @@ AAAEAsgG66AZ1coZRS0N1OW3YSKfVp76vXarHs06agqv8p5/xZr+JfeotCp0xH9pfM4Ca6
         )
         .unwrap();
         // SAFETY: the only test mutating HOME, and it's `#[ignore]` (run alone).
-        unsafe { std::env::set_var("HOME", &home) };
+        #[allow(
+            unsafe_code,
+            reason = "isolated #[ignore] test mutates HOME single-threaded"
+        )]
+        unsafe {
+            std::env::set_var("HOME", &home)
+        };
 
         // 4. Open the tunnel and round-trip bytes through the forward.
         let ssh = SshConfig {

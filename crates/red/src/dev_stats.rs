@@ -8,6 +8,14 @@
 //! the direct measure of the per-frame heap churn RED's render path is tuned to
 //! avoid. The only overhead is a couple of relaxed atomic adds per call, paid
 //! solely in `dev-stats` builds.
+//!
+//! This whole module is FFI + a custom `GlobalAlloc`, so `unsafe` is inherent to
+//! its purpose; every block carries a `// SAFETY` note. Opt back in module-wide
+//! rather than repeating a per-site allow on each allocator hook and syscall.
+#![allow(
+    unsafe_code,
+    reason = "counting allocator + task_info/sysconf FFI; each site documents its SAFETY invariant"
+)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

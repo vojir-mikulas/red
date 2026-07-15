@@ -16,13 +16,13 @@
 
 use flint::prelude::*;
 use gpui::{
-    div, prelude::*, px, AnyElement, ClipboardItem, Context, Entity, FocusHandle, Focusable,
-    ScrollHandle, SharedString,
+    AnyElement, ClipboardItem, Context, Entity, FocusHandle, Focusable, ScrollHandle, SharedString,
+    div, prelude::*, px,
 };
 use red_core::{CappedCell, Value};
 
 use crate::decode;
-use red_service::Command;
+use red_service::{Command, OpId};
 
 use crate::app::{ActiveConn, AppState, EditContext, Phase};
 use crate::result::group_digits;
@@ -88,7 +88,7 @@ pub(crate) struct InspectorState {
     /// When set, the pane is *pinned* to this `(epoch, row, col)`: it keeps showing
     /// (and holding the loaded bytes / open edit of) that cell even as the grid cursor
     /// moves, instead of following the cursor live. Cleared on unpin or a result swap.
-    pinned: Option<(u64, usize, usize)>,
+    pinned: Option<(red_service::Epoch, usize, usize)>,
     /// The lens the body is rendered through (Auto / Raw / JSON / Hex).
     format: ValueFormat,
 }
@@ -108,7 +108,7 @@ struct PreviewView {
 /// moved, or a capped cell's full value just loaded) is recognised and rebuilt.
 #[derive(Clone, PartialEq)]
 struct PreviewKey {
-    epoch: u64,
+    epoch: red_service::Epoch,
     row: usize,
     col: usize,
     /// The body's byte length; distinguishes a capped head from the loaded full
@@ -153,7 +153,7 @@ impl InspectorState {
 /// cursor moved) is recognised and dropped. Holds the *formatted* body, not the
 /// raw [`Value`], so rendering never re-formats or clones the (possibly large) value.
 struct InspectedFull {
-    epoch: u64,
+    epoch: red_service::Epoch,
     row: usize,
     col: usize,
     /// The full value itself, kept so a capped/large cell can be *edited*: its
@@ -169,8 +169,8 @@ struct InspectedFull {
 
 /// A `CopyRows` re-fetch issued for the inspector, awaiting its `CopyRowsLoaded`.
 struct PendingInspect {
-    id: u64,
-    epoch: u64,
+    id: OpId,
+    epoch: red_service::Epoch,
     row: usize,
     col: usize,
 }
@@ -272,7 +272,7 @@ impl AppState {
     /// The `(epoch, row, data-col)` of the cell under the grid cursor, mapping the
     /// selection focus through the gutter and clamping to the data columns. `None`
     /// when nothing is selected or no result is open.
-    fn focused_cell(&self) -> Option<(u64, usize, usize)> {
+    fn focused_cell(&self) -> Option<(red_service::Epoch, usize, usize)> {
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
@@ -285,7 +285,7 @@ impl AppState {
     /// otherwise the one under the grid cursor. Everything the pane resolves (its
     /// value, preview, load, edit gate) goes through this, so a pin holds the view
     /// steady while the cursor roams the grid.
-    fn target_cell(&self) -> Option<(u64, usize, usize)> {
+    fn target_cell(&self) -> Option<(red_service::Epoch, usize, usize)> {
         match self.inspector.as_ref().and_then(|i| i.pinned) {
             Some(pinned) => Some(pinned),
             None => self.focused_cell(),
@@ -309,12 +309,11 @@ impl AppState {
         // A pin to a since-replaced result (a re-run/sort/filter bumped the epoch)
         // can't be honored, so drop it and fall back to following the cursor.
         let live_epoch = self.focused_cell().map(|(e, _, _)| e);
-        if let Some(insp) = &mut self.inspector {
-            if let Some((pe, _, _)) = insp.pinned {
-                if live_epoch != Some(pe) {
-                    insp.pinned = None;
-                }
-            }
+        if let Some(insp) = &mut self.inspector
+            && let Some((pe, _, _)) = insp.pinned
+            && live_epoch != Some(pe)
+        {
+            insp.pinned = None;
         }
         // Resolve against the *target* (pinned cell, else cursor): a pinned pane keeps
         // its loaded bytes / open edit even as the cursor roams.
@@ -331,17 +330,17 @@ impl AppState {
                     full.format = fmt;
                 }
             }
-            if let Some(p) = &insp.pending {
-                if !matches(p.epoch, p.row, p.col) {
-                    insp.pending = None;
-                }
+            if let Some(p) = &insp.pending
+                && !matches(p.epoch, p.row, p.col)
+            {
+                insp.pending = None;
             }
             // An inline edit belongs to one cell; abandon it if the target moved off
             // (or the result was replaced) so a stray edit can't apply to a new cell.
-            if let Some(edit) = &insp.editing {
-                if !matches(edit.ctx.epoch, edit.ctx.row, edit.ctx.data_col) {
-                    insp.editing = None;
-                }
+            if let Some(edit) = &insp.editing
+                && !matches(edit.ctx.epoch, edit.ctx.row, edit.ctx.data_col)
+            {
+                insp.editing = None;
             }
         }
         // Keep the selectable read-only preview in step with the displayed value.
@@ -407,19 +406,21 @@ impl AppState {
         }
         let fmt = self.inspector_format();
         // A loaded full value wins; it was formatted once at load / on a lens change.
-        if let Some(full) = self.inspector.as_ref().and_then(|i| i.full.as_ref()) {
-            if full.epoch == epoch && full.row == row && full.col == col {
-                let body = full.view.body.to_string();
-                let key = PreviewKey {
-                    epoch,
-                    row,
-                    col,
-                    len: body.len(),
-                    wrap: full.view.wrap,
-                    format: fmt,
-                };
-                return Some((key, body, full.view.wrap));
-            }
+        if let Some(full) = self.inspector.as_ref().and_then(|i| i.full.as_ref())
+            && full.epoch == epoch
+            && full.row == row
+            && full.col == col
+        {
+            let body = full.view.body.to_string();
+            let key = PreviewKey {
+                epoch,
+                row,
+                col,
+                len: body.len(),
+                wrap: full.view.wrap,
+                format: fmt,
+            };
+            return Some((key, body, full.view.wrap));
         }
         // Otherwise the resident value, when it's whole. A capped cell only has its
         // head, so it isn't selectable here (load it first).
@@ -451,7 +452,7 @@ impl AppState {
         if self.inspector.is_none() {
             return;
         }
-        let id = self.next_copy_id;
+        let id = red_service::OpId::new(self.next_copy_id);
         self.next_copy_id += 1;
         if let Some(insp) = &mut self.inspector {
             insp.pending = Some(PendingInspect {
@@ -476,7 +477,7 @@ impl AppState {
     /// format the one cell we care about and stash it. A stale reply (the cursor
     /// moved, clearing `pending`) finds no match and is dropped. Returns whether it
     /// claimed the reply, so the copy path only runs when it didn't.
-    pub(crate) fn on_inspect_rows(&mut self, id: u64, rows: &[Vec<Value>]) -> bool {
+    pub(crate) fn on_inspect_rows(&mut self, id: OpId, rows: &[Vec<Value>]) -> bool {
         let fmt = self.inspector_format();
         let Some(insp) = &mut self.inspector else {
             return false;
@@ -514,21 +515,22 @@ impl AppState {
         if let (Some(full), Some((epoch, row, col))) = (
             self.inspector.as_ref().and_then(|i| i.full.as_ref()),
             self.focused_cell(),
-        ) {
-            if full.epoch == epoch && full.row == row && full.col == col {
-                let Phase::Connected(active) = &self.phase else {
-                    return None;
-                };
-                return active
-                    .active_result()?
-                    .edit_target_full(self.gutter(), full.value.clone());
-            }
+        ) && full.epoch == epoch
+            && full.row == row
+            && full.col == col
+        {
+            let Phase::Connected(active) = &self.phase else {
+                return None;
+            };
+            return active
+                .active_result()?
+                .edit_target_full(self.gutter(), full.value.clone());
         }
         self.active_edit_target()
     }
 
     /// Whether the inspected cell can be edited: the cheap predicate behind the
-    /// footer "Edit" button, evaluated every frame. Unlike [`inspector_edit_context`]
+    /// footer "Edit" button, evaluated every frame. Unlike `inspector_edit_context`
     /// it never clones the (possibly large) full value.
     fn inspector_can_edit(&self) -> bool {
         if !self.editing_enabled() {
@@ -541,14 +543,15 @@ impl AppState {
         if let (Some(full), Some((epoch, row, col))) = (
             self.inspector.as_ref().and_then(|i| i.full.as_ref()),
             self.focused_cell(),
-        ) {
-            if full.epoch == epoch && full.row == row && full.col == col {
-                if matches!(full.value, Value::Blob(_)) {
-                    return false; // no text round-trip for binary
-                }
-                return matches!(&self.phase, Phase::Connected(active)
-                    if active.active_result().and_then(|g| g.edit_identity(self.gutter())).is_some());
+        ) && full.epoch == epoch
+            && full.row == row
+            && full.col == col
+        {
+            if matches!(full.value, Value::Blob(_)) {
+                return false; // no text round-trip for binary
             }
+            return matches!(&self.phase, Phase::Connected(active)
+                    if active.active_result().and_then(|g| g.edit_identity(self.gutter())).is_some());
         }
         self.active_edit_target().is_some()
     }
@@ -696,15 +699,17 @@ impl AppState {
         let fmt = self.inspector_format();
 
         // A loaded full value wins (formatted once, re-rendered on a lens change).
-        if let Some(full) = self.inspector.as_ref().and_then(|i| i.full.as_ref()) {
-            if full.epoch == epoch && full.row == row && full.col == col {
-                return Some(InspectorView {
-                    col_name,
-                    decl_type,
-                    row,
-                    state: CellState::Ready(full.view.clone()),
-                });
-            }
+        if let Some(full) = self.inspector.as_ref().and_then(|i| i.full.as_ref())
+            && full.epoch == epoch
+            && full.row == row
+            && full.col == col
+        {
+            return Some(InspectorView {
+                col_name,
+                decl_type,
+                row,
+                state: CellState::Ready(full.view.clone()),
+            });
         }
 
         // Otherwise read the resident window. Whole cells (under-cap, or the key
@@ -1293,6 +1298,7 @@ fn pretty_json(s: &str) -> Option<String> {
                 out.push(c);
                 // Keep an empty container on one line: `{}` / `[]`.
                 if matches!(chars.peek(), Some('}') | Some(']')) {
+                    #[allow(clippy::unwrap_used, reason = "peek() above proved a next char")]
                     out.push(chars.next().unwrap());
                 } else {
                     depth += 1;
@@ -1547,9 +1553,11 @@ mod tests {
             r#"{"a":1}"#
         );
         // Json re-indents.
-        assert!(format_value(&json, ValueFormat::Json)
-            .body
-            .contains("\n  \"a\": 1"));
+        assert!(
+            format_value(&json, ValueFormat::Json)
+                .body
+                .contains("\n  \"a\": 1")
+        );
         // Hex dumps the text's bytes and never wraps.
         let hex = format_value(&Value::Text("AB".into()), ValueFormat::Hex);
         assert!(hex.body.starts_with("00000000  41 42"));

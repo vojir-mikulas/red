@@ -4,7 +4,7 @@
 //! *referenced* tables inline. The base table's columns are listed; an FK column
 //! expands (chevron) into the referenced table's columns, recursively
 //! (`tier → cascade → placement`); checking a column adds it to the grid as an
-//! extra, dotted-aliased column via a `LEFT JOIN` (see [`crate::result::build_joins`]
+//! extra, dotted-aliased column via a `LEFT JOIN` (see `crate::result::build_joins`
 //! and the driver's `fk_join_wrap`). This is dbgate's data-grid column tree, built on
 //! RED's windowed cursor; the join decorates one page, never the whole table.
 //!
@@ -14,7 +14,7 @@
 //! on first expand when a large schema overflowed the prefetch cap.
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, AnyElement, Context, SharedString};
+use gpui::{AnyElement, Context, SharedString, div, prelude::*, px};
 use red_core::FkEdge;
 use red_service::Command;
 
@@ -94,7 +94,7 @@ impl AppState {
         &self,
         active: &ActiveConn,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
         let bg_panel = theme.bg_panel;
         let border = theme.border;
@@ -262,6 +262,7 @@ impl AppState {
 
             // Chevron (FK nodes only); toggles the subtree open.
             let chevron = if is_fk {
+                #[allow(clippy::unwrap_used, reason = "FK nodes always carry a target")]
                 let (s, t) = target.clone().unwrap();
                 let node = col_path.clone();
                 div()

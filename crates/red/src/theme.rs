@@ -13,9 +13,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use flint::Theme;
-use gpui::{px, rgb, Hsla};
+use gpui::{Hsla, px, rgb};
 use serde::Deserialize;
 
 use crate::settings::{AppearanceSettings, ThemeSetting};

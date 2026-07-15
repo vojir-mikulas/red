@@ -3,7 +3,7 @@
 //! close-with-unsaved-work).
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, ClipboardItem, Focusable, KeyDownEvent, Render, Window};
+use gpui::{ClipboardItem, Focusable, KeyDownEvent, Render, Window, div, prelude::*, px};
 use red_core::CopyMode;
 
 use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
@@ -29,7 +29,7 @@ impl AppState {
         conn: &Connecting,
         window: &Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let name = conn.config.name.clone();
 
@@ -191,16 +191,15 @@ impl Render for AppState {
         // The Redis "New key" modal just opened; focus its name field.
         if self.focus_create_key {
             self.focus_create_key = false;
-            if let Phase::Connected(active) = &self.phase {
-                if let Some(name) = active
+            if let Phase::Connected(active) = &self.phase
+                && let Some(name) = active
                     .kv_view
                     .as_ref()
                     .and_then(|v| v.active_browse())
                     .and_then(|b| b.create_key.as_ref())
                     .map(|ck| ck.name.clone())
-                {
-                    window.focus(&name.focus_handle(cx), cx);
-                }
+            {
+                window.focus(&name.focus_handle(cx), cx);
             }
         }
 
@@ -289,22 +288,22 @@ impl Render for AppState {
         // cell then shows as dirty. Registered once when an editor opens, dropped when
         // it closes. Mirrors `modal_focus_trap`.
         if self.grid_edit.is_some() {
-            if self.grid_edit_blur.is_none() {
-                if let Some(handle) = self.grid_edit_focus(cx) {
-                    let weak = cx.entity().downgrade();
-                    let sub = window.on_focus_out(&handle, cx, move |_event, _window, cx| {
-                        if let Some(app) = weak.upgrade() {
-                            // Commit only if an editor is still open (a Submit/Cancel
-                            // already cleared it, so its focus move is a no-op here).
-                            app.update(cx, |this, cx| {
-                                if this.grid_edit.is_some() {
-                                    this.commit_grid_edit(cx);
-                                }
-                            });
-                        }
-                    });
-                    self.grid_edit_blur = Some(sub);
-                }
+            if self.grid_edit_blur.is_none()
+                && let Some(handle) = self.grid_edit_focus(cx)
+            {
+                let weak = cx.entity().downgrade();
+                let sub = window.on_focus_out(&handle, cx, move |_event, _window, cx| {
+                    if let Some(app) = weak.upgrade() {
+                        // Commit only if an editor is still open (a Submit/Cancel
+                        // already cleared it, so its focus move is a no-op here).
+                        app.update(cx, |this, cx| {
+                            if this.grid_edit.is_some() {
+                                this.commit_grid_edit(cx);
+                            }
+                        });
+                    }
+                });
+                self.grid_edit_blur = Some(sub);
             }
         } else {
             self.grid_edit_blur = None;
@@ -749,7 +748,7 @@ impl AppState {
     /// The bottom-right notification stack: oldest first (top), newest last
     /// (nearest the corner). Each toast carries a close `✕` wired to
     /// [`AppState::close_notification`]; the export toast also shows its progress.
-    fn render_notifications(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_notifications(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let total = self.notifications.len();
         let hidden = total.saturating_sub(MAX_VISIBLE_TOASTS);
@@ -956,7 +955,11 @@ impl AppState {
 
     /// Confirmation before closing a tab that holds real work. Mirrors the
     /// destructive-statement modal's shape.
-    fn render_confirm_close(&self, title: String, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_confirm_close(
+        &self,
+        title: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let close_view = cx.entity().downgrade();
         let confirm_view = cx.entity().downgrade();
@@ -1002,7 +1005,11 @@ impl AppState {
     /// Close Right) that would drop at least one tab's unsaved work. Mirrors
     /// [`Self::render_confirm_close`]; `count` is the number of tabs the batch
     /// would close.
-    fn render_confirm_close_batch(&self, count: usize, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_confirm_close_batch(
+        &self,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let close_view = cx.entity().downgrade();
         let confirm_view = cx.entity().downgrade();
@@ -1051,7 +1058,7 @@ impl AppState {
     /// confirmations: unticked whenever either modal is open (it can only open
     /// while the setting is still on), and flips `query.confirm_close_tab` off
     /// immediately on check so it applies to this close too.
-    fn dont_ask_close_tab_checkbox(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn dont_ask_close_tab_checkbox(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         div()
             .flex()
@@ -1074,7 +1081,11 @@ impl AppState {
 
     /// Confirmation before deleting a saved connection. Deletion also drops the
     /// keychain credential, so this is the safety rail against accidental removal.
-    fn render_confirm_delete(&self, name: String, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_confirm_delete(
+        &self,
+        name: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let close_view = cx.entity().downgrade();
         let confirm_view = cx.entity().downgrade();
@@ -1117,7 +1128,11 @@ impl AppState {
     /// right-click menu (see [`AppState::kv_request_delete_key`]). Enter deletes,
     /// Esc / Cancel backs out — the destructive action gets an explicit prompt
     /// rather than the inspector's quieter inline confirm bar.
-    fn render_kv_confirm_delete(&self, key: String, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_kv_confirm_delete(
+        &self,
+        key: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let close_view = cx.entity().downgrade();
         let confirm_view = cx.entity().downgrade();
@@ -1176,7 +1191,7 @@ impl AppState {
 
     /// The keyboard-shortcuts reference overlay (`⌘/`). Built from
     /// [`crate::keymap::shortcuts`] so it never drifts from the real bindings.
-    fn render_shortcuts(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_shortcuts(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let close_view = cx.entity().downgrade();
         let mut body = div().flex().flex_col().gap_4();
@@ -1226,7 +1241,7 @@ impl AppState {
         &self,
         pending: crate::app::PendingWrite,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         use crate::app::PendingWrite;
         let theme = cx.theme();
         let close_view = cx.entity().downgrade();

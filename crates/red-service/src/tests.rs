@@ -1,13 +1,13 @@
 use super::*;
-use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
+use futures::channel::mpsc::UnboundedReceiver;
 use std::time::{Duration, Instant};
 
 use red_core::{ConnectionConfig, DbKind, FkJoin, QueryOptions, Value};
 
 /// The session every single-session test drives. Real multi-session routing is
 /// exercised by [`keeps_two_sessions_warm`].
-const S: SessionId = SessionId(1);
+const S: SessionId = SessionId::new(1);
 
 /// Fire a command at the default test session (the channel now routes by id).
 fn send(handle: &ServiceHandle, command: Command) {
@@ -31,8 +31,8 @@ fn sqlite(dsn: &str, read_only: bool) -> ConnectionConfig {
 
 fn counting_sql(n: i64) -> String {
     format!(
-            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < {n}) SELECT x FROM c"
-        )
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < {n}) SELECT x FROM c"
+    )
 }
 
 /// Connect, run a windowed query, and drain it, proving the start → rows →
@@ -232,14 +232,18 @@ async fn loads_and_describes_schema() {
     match next(&mut events).await {
         Some(Event::TableDescribed { table, detail, .. }) => {
             assert_eq!(table, "t");
-            assert!(detail
-                .columns
-                .iter()
-                .any(|c| c.name == "id" && c.primary_key));
-            assert!(detail
-                .columns
-                .iter()
-                .any(|c| c.name == "name" && c.not_null));
+            assert!(
+                detail
+                    .columns
+                    .iter()
+                    .any(|c| c.name == "id" && c.primary_key)
+            );
+            assert!(
+                detail
+                    .columns
+                    .iter()
+                    .any(|c| c.name == "name" && c.not_null)
+            );
         }
         other => panic!("expected TableDescribed, got {other:?}"),
     }
@@ -266,12 +270,12 @@ async fn explains_a_query() {
         Command::Explain {
             sql: counting_sql(10),
             analyze: false,
-            epoch: 7,
+            epoch: crate::Epoch::new(7),
         },
     );
     match next(&mut events).await {
         Some(Event::PlanReady { epoch, plan }) => {
-            assert_eq!(epoch, 7, "the request epoch is echoed");
+            assert_eq!(epoch.get(), 7, "the request epoch is echoed");
             assert!(!plan.nodes.is_empty(), "a plan node was parsed");
             assert!(!plan.raw.is_empty(), "raw EXPLAIN text is present");
             assert!(!plan.analyzed);
@@ -285,12 +289,12 @@ async fn explains_a_query() {
         Command::Explain {
             sql: "SELECT FROM WHERE".into(),
             analyze: false,
-            epoch: 8,
+            epoch: crate::Epoch::new(8),
         },
     );
     match next(&mut events).await {
         Some(Event::PlanFailed { epoch, message }) => {
-            assert_eq!(epoch, 8);
+            assert_eq!(epoch.get(), 8);
             assert!(!message.is_empty());
         }
         other => panic!("expected PlanFailed, got {other:?}"),
@@ -344,13 +348,13 @@ async fn applies_a_data_edit() {
     send(
         &handle,
         Command::ApplyBatch {
-            epoch: 4,
+            epoch: crate::Epoch::new(4),
             ops: vec![edit(1)],
         },
     );
     match next(&mut events).await {
         Some(Event::BatchApplied { epoch, applied }) => {
-            assert_eq!(epoch, 4, "the result epoch is echoed");
+            assert_eq!(epoch.get(), 4, "the result epoch is echoed");
             assert_eq!(applied, 1);
         }
         other => panic!("expected BatchApplied, got {other:?}"),
@@ -360,13 +364,13 @@ async fn applies_a_data_edit() {
     send(
         &handle,
         Command::ApplyBatch {
-            epoch: 5,
+            epoch: crate::Epoch::new(5),
             ops: vec![edit(9999)],
         },
     );
     match next(&mut events).await {
         Some(Event::BatchFailed { epoch, message, .. }) => {
-            assert_eq!(epoch, 5);
+            assert_eq!(epoch.get(), 5);
             assert!(!message.is_empty());
         }
         other => panic!("expected BatchFailed, got {other:?}"),
@@ -391,7 +395,7 @@ async fn opens_and_pages_result() {
         &handle,
         Command::OpenResult {
             sql: counting_sql(1000),
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             table: None,
             sort: None,
             filter: None,
@@ -407,7 +411,7 @@ async fn opens_and_pages_result() {
         }) => {
             assert_eq!(columns[0].name, "x");
             assert_eq!(total, 1000);
-            assert_eq!(epoch, 1);
+            assert_eq!(epoch.get(), 1);
             assert_eq!(key, None, "editor SQL resolves no seek key");
         }
         other => panic!("expected ResultReady, got {other:?}"),
@@ -418,7 +422,7 @@ async fn opens_and_pages_result() {
         Command::FetchPage {
             offset: 998,
             limit: 100,
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
         },
     );
     match next(&mut events).await {
@@ -430,7 +434,7 @@ async fn opens_and_pages_result() {
             assert_eq!(offset, 998);
             assert_eq!(rows.len(), 2); // only rows 999 and 1000 remain
             assert_eq!(rows[0][0], Value::Integer(999));
-            assert_eq!(epoch, 1);
+            assert_eq!(epoch.get(), 1);
         }
         other => panic!("expected ResultPageLoaded, got {other:?}"),
     }
@@ -454,7 +458,7 @@ async fn computes_column_stats_for_open_result() {
         &handle,
         Command::OpenResult {
             sql: counting_sql(1000),
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             table: None,
             sort: None,
             filter: None,
@@ -463,16 +467,18 @@ async fn computes_column_stats_for_open_result() {
     );
     assert!(matches!(
         next(&mut events).await,
-        Some(Event::ResultReady { epoch: 1, .. })
+        Some(Event::ResultReady { epoch, .. }) if epoch == crate::Epoch::new(1)
     ));
 
     send(
         &handle,
         Command::ColumnStats {
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             column: "x".into(),
-            numeric: true,
-            distinct: true,
+            flags: red_core::StatsFlags {
+                numeric: true,
+                distinct: true,
+            },
         },
     );
     match next(&mut events).await {
@@ -481,7 +487,7 @@ async fn computes_column_stats_for_open_result() {
             column,
             stats,
         }) => {
-            assert_eq!(epoch, 1);
+            assert_eq!(epoch.get(), 1);
             assert_eq!(column, "x");
             assert_eq!(stats.total, 1000);
             assert_eq!(stats.non_null, 1000);
@@ -534,7 +540,7 @@ async fn fk_join_expands_referenced_columns_inline() {
         &handle,
         Command::OpenResult {
             sql: "SELECT * FROM channel".into(),
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             table: Some(("main".into(), "channel".into())),
             sort: None,
             filter: None,
@@ -574,7 +580,7 @@ async fn fk_join_expands_referenced_columns_inline() {
     send(
         &handle,
         Command::FetchRun {
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             fetch: RunFetch::Forward { after: None },
             limit: 10,
             seq: 1,
@@ -640,7 +646,7 @@ async fn where_filters_on_expanded_fk_column() {
         &handle,
         Command::OpenResult {
             sql: "SELECT * FROM channel".into(),
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             table: Some(("main".into(), "channel".into())),
             sort: None,
             filter: Some(ResultFilter::Where("\"tier_id.name\" = 'Tier B'".into())),
@@ -668,7 +674,7 @@ async fn where_filters_on_expanded_fk_column() {
     send(
         &handle,
         Command::FetchRun {
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             fetch: RunFetch::Forward { after: None },
             limit: 10,
             seq: 1,
@@ -720,7 +726,7 @@ async fn resolves_key_and_serves_runs() {
         &handle,
         Command::OpenResult {
             sql: "SELECT * FROM t".into(),
-            epoch: 7,
+            epoch: crate::Epoch::new(7),
             table: Some(("main".into(), "t".into())),
             sort: None,
             filter: None,
@@ -741,7 +747,7 @@ async fn resolves_key_and_serves_runs() {
     send(
         &handle,
         Command::FetchRun {
-            epoch: 7,
+            epoch: crate::Epoch::new(7),
             fetch: RunFetch::Forward { after: None },
             limit: 3,
             seq: 1,
@@ -764,7 +770,7 @@ async fn resolves_key_and_serves_runs() {
     send(
         &handle,
         Command::FetchRun {
-            epoch: 7,
+            epoch: crate::Epoch::new(7),
             fetch: RunFetch::Forward {
                 after: Some(vec![Value::Integer(3)]),
             },
@@ -783,7 +789,7 @@ async fn resolves_key_and_serves_runs() {
     send(
         &handle,
         Command::FetchRun {
-            epoch: 7,
+            epoch: crate::Epoch::new(7),
             fetch: RunFetch::Backward {
                 before: vec![Value::Integer(4)],
             },
@@ -806,7 +812,7 @@ async fn resolves_key_and_serves_runs() {
     send(
         &handle,
         Command::FetchRun {
-            epoch: 7,
+            epoch: crate::Epoch::new(7),
             fetch: RunFetch::Jump {
                 ordinal: 499,
                 exact: false,
@@ -834,7 +840,7 @@ async fn resolves_key_and_serves_runs() {
     send(
         &handle,
         Command::FetchRun {
-            epoch: 7,
+            epoch: crate::Epoch::new(7),
             fetch: RunFetch::Jump {
                 ordinal: 0,
                 exact: false,
@@ -921,7 +927,7 @@ async fn mariadb_keyset_end_to_end() {
         &handle,
         Command::OpenResult {
             sql: format!("SELECT * FROM `{}`.`{table}`", p.database),
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             table: Some((p.database.clone(), table.clone())),
             sort: None,
             filter: None,
@@ -943,7 +949,7 @@ async fn mariadb_keyset_end_to_end() {
     send(
         &handle,
         Command::FetchRun {
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             fetch: RunFetch::Forward {
                 after: Some(vec![Value::Integer(999_000)]),
             },
@@ -968,7 +974,7 @@ async fn mariadb_keyset_end_to_end() {
     send(
         &handle,
         Command::FetchRun {
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             fetch: RunFetch::Jump {
                 ordinal: 500_000,
                 exact: false,
@@ -998,7 +1004,7 @@ async fn mariadb_keyset_end_to_end() {
     send(
         &handle,
         Command::FetchRun {
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             fetch: RunFetch::Jump {
                 ordinal: 500_000,
                 exact: true,
@@ -1021,7 +1027,7 @@ async fn mariadb_keyset_end_to_end() {
     send(
         &handle,
         Command::FetchRun {
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             fetch: RunFetch::Backward {
                 before: vec![Value::Integer(500_000)],
             },
@@ -1081,7 +1087,7 @@ async fn text_key_jump_falls_back_to_offset() {
         &handle,
         Command::OpenResult {
             sql: "SELECT * FROM t".into(),
-            epoch: 9,
+            epoch: crate::Epoch::new(9),
             table: Some(("main".into(), "t".into())),
             sort: None,
             filter: None,
@@ -1098,7 +1104,7 @@ async fn text_key_jump_falls_back_to_offset() {
     send(
         &handle,
         Command::FetchRun {
-            epoch: 9,
+            epoch: crate::Epoch::new(9),
             fetch: RunFetch::Jump {
                 ordinal: 50,
                 exact: false,
@@ -1162,8 +1168,8 @@ async fn connect_and_query_roundtrip() {
 /// command to the dropped session reports "not connected" rather than crashing.
 #[tokio::test]
 async fn keeps_two_sessions_warm() {
-    let a = SessionId(1);
-    let b = SessionId(2);
+    let a = SessionId::new(1);
+    let b = SessionId::new(2);
     let mut handle = spawn();
     let mut events = handle.take_events().expect("event stream");
 
@@ -1183,7 +1189,7 @@ async fn keeps_two_sessions_warm() {
         a,
         Command::OpenResult {
             sql: counting_sql(100),
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             table: None,
             sort: None,
             filter: None,
@@ -1194,7 +1200,7 @@ async fn keeps_two_sessions_warm() {
         b,
         Command::OpenResult {
             sql: counting_sql(200),
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             table: None,
             sort: None,
             filter: None,
@@ -1208,7 +1214,7 @@ async fn keeps_two_sessions_warm() {
     while totals.len() < 2 {
         match events.next().await {
             Some((Some(s), Event::ResultReady { total, epoch, .. })) => {
-                assert_eq!(epoch, 1);
+                assert_eq!(epoch.get(), 1);
                 totals.insert(s, total);
             }
             other => panic!("expected ResultReady, got {other:?}"),
@@ -1228,7 +1234,7 @@ async fn keeps_two_sessions_warm() {
         Command::FetchPage {
             offset: 0,
             limit: 5,
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
         },
     );
     match events.next().await {
@@ -1261,7 +1267,7 @@ async fn drain_copy(
 ) -> Event {
     loop {
         match events.next().await.map(|(_, e)| e) {
-            Some(Event::CopyProgress { id, .. }) => assert_eq!(id, copy_id),
+            Some(Event::CopyProgress { id, .. }) => assert_eq!(id.get(), copy_id),
             Some(
                 e @ (Event::CopyFinished { .. }
                 | Event::CopyFailed { .. }
@@ -1308,7 +1314,7 @@ async fn copies_result_into_table() {
         &handle,
         Command::OpenResult {
             sql: "SELECT id, name FROM src".into(),
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             table: None,
             sort: None,
             filter: None,
@@ -1318,17 +1324,17 @@ async fn copies_result_into_table() {
     assert!(matches!(
         next(&mut events).await,
         Some(Event::ResultReady {
-            epoch: 1,
+            epoch,
             total: 3,
             ..
-        })
+        }) if epoch == crate::Epoch::new(1)
     ));
 
     send(
         &handle,
         Command::CopyToTable {
-            id: 7,
-            source_epoch: 1,
+            id: OpId::new(7),
+            source_epoch: crate::Epoch::new(1),
             target: TableRef {
                 schema: Some("main".into()),
                 name: "dst".into(),
@@ -1352,7 +1358,7 @@ async fn copies_result_into_table() {
     );
     match drain_copy(&mut events, 7).await {
         Event::CopyFinished { id, rows } => {
-            assert_eq!(id, 7);
+            assert_eq!(id.get(), 7);
             assert_eq!(rows, 3, "all three rows copied");
         }
         other => panic!("expected CopyFinished, got {other:?}"),
@@ -1363,7 +1369,7 @@ async fn copies_result_into_table() {
         &handle,
         Command::OpenResult {
             sql: "SELECT id, name FROM dst ORDER BY id".into(),
-            epoch: 2,
+            epoch: crate::Epoch::new(2),
             table: None,
             sort: None,
             filter: None,
@@ -1379,7 +1385,7 @@ async fn copies_result_into_table() {
         Command::FetchPage {
             offset: 0,
             limit: 10,
-            epoch: 2,
+            epoch: crate::Epoch::new(2),
         },
     );
     match next(&mut events).await {
@@ -1417,7 +1423,7 @@ async fn copies_result_into_a_new_table() {
         &handle,
         Command::OpenResult {
             sql: "SELECT id, name FROM src".into(),
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             table: None,
             sort: None,
             filter: None,
@@ -1427,18 +1433,18 @@ async fn copies_result_into_a_new_table() {
     assert!(matches!(
         next(&mut events).await,
         Some(Event::ResultReady {
-            epoch: 1,
+            epoch,
             total: 3,
             ..
-        })
+        }) if epoch == crate::Epoch::new(1)
     ));
 
     // Target `created` does not exist; `create` carries the column shape to build it.
     send(
         &handle,
         Command::CopyToTable {
-            id: 9,
-            source_epoch: 1,
+            id: OpId::new(9),
+            source_epoch: crate::Epoch::new(1),
             target: TableRef {
                 schema: Some("main".into()),
                 name: "created".into(),
@@ -1479,7 +1485,7 @@ async fn copies_result_into_a_new_table() {
     );
     match drain_copy(&mut events, 9).await {
         Event::CopyFinished { id, rows } => {
-            assert_eq!(id, 9);
+            assert_eq!(id.get(), 9);
             assert_eq!(
                 rows, 3,
                 "all three rows copied into the freshly-created table"
@@ -1493,7 +1499,7 @@ async fn copies_result_into_a_new_table() {
         &handle,
         Command::OpenResult {
             sql: "SELECT id, name FROM created ORDER BY id".into(),
-            epoch: 2,
+            epoch: crate::Epoch::new(2),
             table: None,
             sort: None,
             filter: None,
@@ -1509,7 +1515,7 @@ async fn copies_result_into_a_new_table() {
         Command::FetchPage {
             offset: 0,
             limit: 10,
-            epoch: 2,
+            epoch: crate::Epoch::new(2),
         },
     );
     match next(&mut events).await {
@@ -1550,7 +1556,7 @@ async fn copy_truncate_insert_refreshes_target() {
         &handle,
         Command::OpenResult {
             sql: "SELECT id, name FROM src".into(),
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             table: None,
             sort: None,
             filter: None,
@@ -1559,13 +1565,13 @@ async fn copy_truncate_insert_refreshes_target() {
     );
     assert!(matches!(
         next(&mut events).await,
-        Some(Event::ResultReady { epoch: 1, .. })
+        Some(Event::ResultReady { epoch, .. }) if epoch == crate::Epoch::new(1)
     ));
     send(
         &handle,
         Command::CopyToTable {
-            id: 3,
-            source_epoch: 1,
+            id: OpId::new(3),
+            source_epoch: crate::Epoch::new(1),
             target: TableRef {
                 schema: Some("main".into()),
                 name: "dst".into(),
@@ -1597,7 +1603,7 @@ async fn copy_truncate_insert_refreshes_target() {
         &handle,
         Command::OpenResult {
             sql: "SELECT id FROM dst WHERE id = 99".into(),
-            epoch: 2,
+            epoch: crate::Epoch::new(2),
             table: None,
             sort: None,
             filter: None,
@@ -1643,7 +1649,7 @@ async fn copy_is_byte_exact_for_long_values() {
         &handle,
         Command::OpenResult {
             sql: "SELECT id, big FROM src".into(),
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             table: None,
             sort: None,
             filter: None,
@@ -1652,13 +1658,13 @@ async fn copy_is_byte_exact_for_long_values() {
     );
     assert!(matches!(
         next(&mut events).await,
-        Some(Event::ResultReady { epoch: 1, .. })
+        Some(Event::ResultReady { epoch, .. }) if epoch == crate::Epoch::new(1)
     ));
     send(
         &handle,
         Command::CopyToTable {
-            id: 1,
-            source_epoch: 1,
+            id: OpId::new(1),
+            source_epoch: crate::Epoch::new(1),
             target: TableRef {
                 schema: Some("main".into()),
                 name: "dst".into(),
@@ -1691,7 +1697,7 @@ async fn copy_is_byte_exact_for_long_values() {
         &handle,
         Command::OpenResult {
             sql: "SELECT length(big) FROM dst".into(),
-            epoch: 2,
+            epoch: crate::Epoch::new(2),
             table: None,
             sort: None,
             filter: None,
@@ -1707,7 +1713,7 @@ async fn copy_is_byte_exact_for_long_values() {
         Command::FetchPage {
             offset: 0,
             limit: 1,
-            epoch: 2,
+            epoch: crate::Epoch::new(2),
         },
     );
     match next(&mut events).await {
@@ -1730,8 +1736,8 @@ async fn copy_is_byte_exact_for_long_values() {
 #[tokio::test]
 async fn copies_across_connections() {
     use red_core::{ColumnMap, CopyMode, TableRef};
-    let a = SessionId(1);
-    let b = SessionId(2);
+    let a = SessionId::new(1);
+    let b = SessionId::new(2);
     let src_path = std::env::temp_dir().join(format!("red_svc_copy_a_{}.db", std::process::id()));
     let dst_path = std::env::temp_dir().join(format!("red_svc_copy_b_{}.db", std::process::id()));
     {
@@ -1769,7 +1775,7 @@ async fn copies_across_connections() {
         a,
         Command::OpenResult {
             sql: "SELECT id, name FROM src".into(),
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             table: None,
             sort: None,
             filter: None,
@@ -1778,13 +1784,13 @@ async fn copies_across_connections() {
     );
     assert!(matches!(
         events.next().await,
-        Some((Some(s), Event::ResultReady { epoch: 1, .. })) if s == a
+        Some((Some(s), Event::ResultReady { epoch, .. })) if s == a && epoch == crate::Epoch::new(1)
     ));
     handle.send_to(
         a,
         Command::CopyToTable {
-            id: 5,
-            source_epoch: 1,
+            id: OpId::new(5),
+            source_epoch: crate::Epoch::new(1),
             target: TableRef {
                 schema: Some("main".into()),
                 name: "dst".into(),
@@ -1816,7 +1822,7 @@ async fn copies_across_connections() {
         b,
         Command::OpenResult {
             sql: "SELECT id, name FROM dst ORDER BY id".into(),
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             table: None,
             sort: None,
             filter: None,
@@ -1838,8 +1844,8 @@ async fn copies_across_connections() {
 /// `child → parent` orders `parent` first.
 #[tokio::test]
 async fn migrates_all_tables_into_another_connection() {
-    let a = SessionId(1);
-    let b = SessionId(2);
+    let a = SessionId::new(1);
+    let b = SessionId::new(2);
     let src_path =
         std::env::temp_dir().join(format!("red_svc_migrate_a_{}.db", std::process::id()));
     let dst_path =
@@ -1880,7 +1886,7 @@ async fn migrates_all_tables_into_another_connection() {
     handle.send_to(
         a,
         Command::MigrateTables {
-            id: 11,
+            id: OpId::new(11),
             source_schema: Some("main".into()),
             tables: vec!["child".into(), "parent".into()],
             target_session: b,
@@ -1900,7 +1906,7 @@ async fn migrates_all_tables_into_another_connection() {
         b,
         Command::OpenResult {
             sql: "SELECT count(*) FROM parent".into(),
-            epoch: 1,
+            epoch: crate::Epoch::new(1),
             table: None,
             sort: None,
             filter: None,
@@ -1915,7 +1921,7 @@ async fn migrates_all_tables_into_another_connection() {
         b,
         Command::OpenResult {
             sql: "SELECT id, parent_id, tag FROM child ORDER BY id".into(),
-            epoch: 2,
+            epoch: crate::Epoch::new(2),
             table: None,
             sort: None,
             filter: None,
@@ -1931,7 +1937,7 @@ async fn migrates_all_tables_into_another_connection() {
         Command::FetchPage {
             offset: 0,
             limit: 10,
-            epoch: 2,
+            epoch: crate::Epoch::new(2),
         },
     );
     match events.next().await.map(|(_, e)| e) {
@@ -1950,7 +1956,7 @@ async fn migrates_all_tables_into_another_connection() {
             sql: "SELECT count(*) FROM sqlite_master \
                   WHERE type='index' AND name='ix_child_parent'"
                 .into(),
-            epoch: 3,
+            epoch: crate::Epoch::new(3),
             table: None,
             sort: None,
             filter: None,
@@ -1966,7 +1972,7 @@ async fn migrates_all_tables_into_another_connection() {
         Command::FetchPage {
             offset: 0,
             limit: 1,
-            epoch: 3,
+            epoch: crate::Epoch::new(3),
         },
     );
     match events.next().await.map(|(_, e)| e) {
@@ -2046,7 +2052,7 @@ async fn ai_turn_resolves_agent_id_with_clear_errors() {
     send(
         &handle,
         Command::AiTurn {
-            conversation_id: 1,
+            conversation_id: ConversationId::new(1),
             agent: "ghost".into(),
             message: "hi".into(),
             context: AiContext::default(),
@@ -2063,7 +2069,7 @@ async fn ai_turn_resolves_agent_id_with_clear_errors() {
     send(
         &handle,
         Command::AiTurn {
-            conversation_id: 2,
+            conversation_id: ConversationId::new(2),
             agent: "api".into(),
             message: "hi".into(),
             context: AiContext::default(),

@@ -13,7 +13,7 @@ use tokio::sync::mpsc::UnboundedReceiver as CmdReceiver;
 use crate::{Command, Envelope, Event, RunFetch, SessionId};
 
 use super::session::ActiveQuery;
-use super::{emit, lock, Events};
+use super::{Events, emit, lock};
 
 /// Rows between checkpoints in the index (see [`CheckpointIndex`]). Serving an
 /// exact jump seeks to the nearest checkpoint then skips at most this many rows,
@@ -68,7 +68,7 @@ pub(crate) struct OpenSpec {
 
 /// The open-result map, shared with the spawned open/fetch tasks (they fill in
 /// bounds/total after the fact and read specs without round-tripping commands).
-pub(crate) type ResultMap = Arc<Mutex<HashMap<u64, OpenSpec>>>;
+pub(crate) type ResultMap = Arc<Mutex<HashMap<crate::Epoch, OpenSpec>>>;
 
 /// Run one window fetch while staying responsive to `Cancel` / `Shutdown` /
 /// timeout. On a full window the cursor is parked back into `active` for the next
@@ -163,13 +163,27 @@ pub(crate) async fn run_fetch(
     match fetch {
         RunFetch::Forward { after } => {
             let page = driver
-                .fetch_seek(&spec.sql, key, after.as_deref(), false, limit, abort)
+                .fetch_seek(
+                    &spec.sql,
+                    key,
+                    after.as_deref(),
+                    red_core::SortDirection::Asc,
+                    limit,
+                    abort,
+                )
                 .await?;
             Ok((page.rows, false))
         }
         RunFetch::Backward { before } => {
             let page = driver
-                .fetch_seek(&spec.sql, key, Some(before.as_slice()), true, limit, abort)
+                .fetch_seek(
+                    &spec.sql,
+                    key,
+                    Some(before.as_slice()),
+                    red_core::SortDirection::Desc,
+                    limit,
+                    abort,
+                )
                 .await?;
             Ok((page.rows, false))
         }
@@ -182,56 +196,53 @@ pub(crate) async fn run_fetch(
             // Interpolates on the *lead* column only (a one-element prefix bound),
             // so a composite sort key still gets fraction jumps when its lead is
             // an integer.
-            if !exact && key.kind == KeyKind::Int {
-                if let (Some((min, max)), Some(total)) = (spec.bounds, spec.total) {
-                    if total > 1 && max > min {
-                        let fraction = (*ordinal as f64 / (total - 1) as f64).clamp(0.0, 1.0);
-                        let span = max as f64 - min as f64;
-                        // Ordinal 0 is the result's first row in sort order: the
-                        // smallest lead value for an ascending sort, the largest
-                        // for a descending one. Seek forward (in sort order) from
-                        // just past the target's neighbour so the bound row is
-                        // included.
-                        let bound = if key.descending {
-                            let target =
-                                (max as f64 - span * fraction).clamp(min as f64, max as f64);
-                            (target as i64).saturating_add(1) // `< t+1` == `<= t`
-                        } else {
-                            let target =
-                                (min as f64 + span * fraction).clamp(min as f64, max as f64);
-                            (target as i64).saturating_sub(1) // `> t-1` == `>= t`
-                        };
-                        let page = driver
-                            .fetch_seek(
-                                &spec.sql,
-                                key,
-                                Some(&[Value::Integer(bound)]),
-                                false,
-                                limit,
-                                abort,
-                            )
-                            .await?;
-                        // Jumping to ordinal 0 seeks from the true start, so exact.
-                        if !page.rows.is_empty() {
-                            return Ok((page.rows, *ordinal != 0));
-                        }
-                        // An empty interpolated window (data shrank underneath)
-                        // falls through to the exact `OFFSET` page.
-                    }
+            if !exact
+                && key.kind == KeyKind::Int
+                && let (Some((min, max)), Some(total)) = (spec.bounds, spec.total)
+                && total > 1
+                && max > min
+            {
+                let fraction = (*ordinal as f64 / (total - 1) as f64).clamp(0.0, 1.0);
+                let span = max as f64 - min as f64;
+                // Ordinal 0 is the result's first row in sort order: the
+                // smallest lead value for an ascending sort, the largest
+                // for a descending one. Seek forward (in sort order) from
+                // just past the target's neighbour so the bound row is
+                // included.
+                let bound = if key.direction.is_descending() {
+                    let target = (max as f64 - span * fraction).clamp(min as f64, max as f64);
+                    (target as i64).saturating_add(1) // `< t+1` == `<= t`
+                } else {
+                    let target = (min as f64 + span * fraction).clamp(min as f64, max as f64);
+                    (target as i64).saturating_sub(1) // `> t-1` == `>= t`
+                };
+                let page = driver
+                    .fetch_seek(
+                        &spec.sql,
+                        key,
+                        Some(&[Value::Integer(bound)]),
+                        red_core::SortDirection::Asc,
+                        limit,
+                        abort,
+                    )
+                    .await?;
+                // Jumping to ordinal 0 seeks from the true start, so exact.
+                if !page.rows.is_empty() {
+                    return Ok((page.rows, *ordinal != 0));
                 }
+                // An empty interpolated window (data shrank underneath)
+                // falls through to the exact `OFFSET` page.
             }
             // Exact jump: serve from the checkpoint index when it reaches this
             // depth: seek to the nearest checkpoint, then skip `< stride` rows
             // (O(stride), exact). The build is kicked off by the `FetchRun` arm.
-            if *exact {
-                if let Some((cp_ordinal, cp_key)) = nearest_checkpoint(spec, *ordinal) {
-                    let skip = *ordinal - cp_ordinal;
-                    if skip <= CHECKPOINT_STRIDE {
-                        let page = driver
-                            .fetch_seek_skip(&spec.sql, key, Some(&cp_key), skip, limit, abort)
-                            .await?;
-                        return Ok((page.rows, false));
-                    }
+            if *exact && let Some((cp_ordinal, cp_key)) = nearest_checkpoint(spec, *ordinal) {
+                let skip = *ordinal - cp_ordinal;
+                if skip <= CHECKPOINT_STRIDE {
+                    let page = driver
+                        .fetch_seek_skip(&spec.sql, key, Some(&cp_key), skip, limit, abort)
+                        .await?;
+                    return Ok((page.rows, false));
                 }
             }
             // No usable key/bounds/index: one `OFFSET` page (O(ordinal), but a
@@ -286,7 +297,7 @@ pub(crate) async fn build_checkpoints(
     driver: Arc<dyn DatabaseDriver>,
     spec: OpenSpec,
     results: ResultMap,
-    epoch: u64,
+    epoch: crate::Epoch,
     abort: AbortSignal,
 ) {
     let key = spec.key.clone();
@@ -361,11 +372,15 @@ pub(crate) async fn build_checkpoints(
 /// path (a sorted browse with no resolvable PK). Ordering by output *position*
 /// is engine-agnostic (it needs no identifier quoting), and the derived table is
 /// aliased because MySQL and Postgres both reject an unaliased subquery in `FROM`.
-pub(crate) fn wrap_sorted(base: &str, position: usize, descending: bool) -> String {
+pub(crate) fn wrap_sorted(
+    base: &str,
+    position: usize,
+    direction: red_core::SortDirection,
+) -> String {
     let base = base.trim_end().trim_end_matches(';').trim_end();
     format!(
         "SELECT * FROM ({base}) AS _red_sort ORDER BY {position} {}",
-        if descending { "DESC" } else { "ASC" }
+        direction.sql()
     )
 }
 
@@ -432,7 +447,7 @@ pub(crate) async fn with_timeout<T>(
 #[cfg(test)]
 mod checkpoint_tests {
     use super::*;
-    use crate::dispatch::session::{AiOverride, SessionDriver, SessionState, MAX_OPEN_RESULTS};
+    use crate::dispatch::session::{AiOverride, MAX_OPEN_RESULTS, SessionDriver, SessionState};
     use red_core::KeyKind;
     use red_driver::SqliteDriver;
 
@@ -471,9 +486,16 @@ mod checkpoint_tests {
 
         // The build aborts unless the result is still open, so register it.
         let results: ResultMap = Arc::new(Mutex::new(HashMap::new()));
-        lock(&results).insert(1, spec.clone());
+        lock(&results).insert(crate::Epoch::new(1), spec.clone());
 
-        build_checkpoints(driver.clone(), spec.clone(), results, 1, AbortSignal::new()).await;
+        build_checkpoints(
+            driver.clone(),
+            spec.clone(),
+            results,
+            crate::Epoch::new(1),
+            AbortSignal::new(),
+        )
+        .await;
 
         // Checkpoints every 10k rows: ids are 1-based, so ordinal N → id N+1.
         // Scoped so the guard is dropped before the `await` below.
@@ -547,20 +569,26 @@ mod checkpoint_tests {
         let over = MAX_OPEN_RESULTS as u64 + 1;
         for epoch in 1..=over {
             let checkpoints = Arc::new(Mutex::new(CheckpointIndex::default()));
-            lock(&state.results).insert(epoch, spec_for(&checkpoints, 1));
-            state.inflight.entry(epoch).or_default();
+            lock(&state.results).insert(crate::Epoch::new(epoch), spec_for(&checkpoints, 1));
+            state.inflight.entry(crate::Epoch::new(epoch)).or_default();
         }
         assert_eq!(lock(&state.results).len(), MAX_OPEN_RESULTS + 1);
 
         // The just-opened epoch is `over`; reaping keeps it and trims to the cap.
-        state.reap_excess_results(over);
+        state.reap_excess_results(crate::Epoch::new(over));
 
         let results = lock(&state.results);
         assert_eq!(results.len(), MAX_OPEN_RESULTS, "trimmed back to the cap");
-        assert!(results.contains_key(&over), "the kept epoch survives");
-        assert!(!results.contains_key(&1), "the lowest epoch was reaped");
         assert!(
-            !state.inflight.contains_key(&1),
+            results.contains_key(&crate::Epoch::new(over)),
+            "the kept epoch survives"
+        );
+        assert!(
+            !results.contains_key(&crate::Epoch::new(1)),
+            "the lowest epoch was reaped"
+        );
+        assert!(
+            !state.inflight.contains_key(&crate::Epoch::new(1)),
             "the reaped epoch's in-flight handle is dropped too"
         );
         assert_eq!(
@@ -571,7 +599,7 @@ mod checkpoint_tests {
         drop(results);
 
         // Under the cap, reaping is a no-op.
-        state.reap_excess_results(over);
+        state.reap_excess_results(crate::Epoch::new(over));
         assert_eq!(lock(&state.results).len(), MAX_OPEN_RESULTS);
 
         std::fs::remove_file(&path).ok();

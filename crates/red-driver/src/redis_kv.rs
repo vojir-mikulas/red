@@ -15,8 +15,8 @@ use red_core::{RedError, Result, Value};
 use redis::aio::MultiplexedConnection;
 use tokio::time::Instant;
 
-use crate::kv::{KvDriver, KvMonitorStream, KvSubscription, KvTopology};
 use crate::AbortSignal;
+use crate::kv::{KvDriver, KvMonitorStream, KvSubscription, KvTopology};
 
 /// Below this many elements, `read_value` fetches a hash/set/zset/list in
 /// full (one round trip); at/above it, only the length is reported and the
@@ -211,13 +211,12 @@ impl RedisDriver {
                 .query_async(&mut conn)
                 .await
                 .ok();
-            if let Some(bytes) = chunk {
-                if String::from_utf8_lossy(&bytes)
+            if let Some(bytes) = chunk
+                && String::from_utf8_lossy(&bytes)
                     .to_lowercase()
                     .contains(&needle)
-                {
-                    out.push(k);
-                }
+            {
+                out.push(k);
             }
         }
         Ok(out)
@@ -568,12 +567,11 @@ fn key_slot(key: &str) -> u16 {
 /// with a non-empty body, only that body (so `{user1}:a` and `{user1}:b`
 /// co-locate); otherwise the whole key. Matches Redis's hash-tag rule exactly.
 fn hashtag(key: &[u8]) -> &[u8] {
-    if let Some(open) = key.iter().position(|&c| c == b'{') {
-        if let Some(rel) = key[open + 1..].iter().position(|&c| c == b'}') {
-            if rel > 0 {
-                return &key[open + 1..open + 1 + rel];
-            }
-        }
+    if let Some(open) = key.iter().position(|&c| c == b'{')
+        && let Some(rel) = key[open + 1..].iter().position(|&c| c == b'}')
+        && rel > 0
+    {
+        return &key[open + 1..open + 1 + rel];
     }
     key
 }
@@ -1114,19 +1112,19 @@ impl KvDriver for RedisDriver {
         // cluster the user means it cluster-wide, so run it on every master and
         // aggregate rather than silently clearing just the seed shard and still
         // reporting OK.
-        if let Some(cl) = &self.cluster {
-            if is_cluster_fanout_command(argv) {
-                let mut last = RespValue::Simple("OK".into());
-                for master in &cl.masters {
-                    let mut conn = master.clone();
-                    match cmd.query_async::<redis::Value>(&mut conn).await {
-                        Ok(value) => last = to_resp_value(value),
-                        Err(e) if e.code().is_some() => return Ok(RespValue::Error(e.to_string())),
-                        Err(e) => return Err(RedError::Driver(e.to_string())),
-                    }
+        if let Some(cl) = &self.cluster
+            && is_cluster_fanout_command(argv)
+        {
+            let mut last = RespValue::Simple("OK".into());
+            for master in &cl.masters {
+                let mut conn = master.clone();
+                match cmd.query_async::<redis::Value>(&mut conn).await {
+                    Ok(value) => last = to_resp_value(value),
+                    Err(e) if e.code().is_some() => return Ok(RespValue::Error(e.to_string())),
+                    Err(e) => return Err(RedError::Driver(e.to_string())),
                 }
-                return Ok(last);
             }
+            return Ok(last);
         }
         // Under a cluster the seed connection only owns ~1/N of the slots and a
         // plain `MultiplexedConnection` doesn't follow `MOVED`, so a console
@@ -1781,10 +1779,10 @@ async fn fetch_stream_page(
     let mut entries = parse_stream_entries(&reply);
     // Drop the boundary entry (the previous page's oldest ID) if it came back,
     // so paging back in time never re-yields an already-shown entry.
-    if let Some(b) = before {
-        if entries.first().map(|e| e.id.as_str()) == Some(b) {
-            entries.remove(0);
-        }
+    if let Some(b) = before
+        && entries.first().map(|e| e.id.as_str()) == Some(b)
+    {
+        entries.remove(0);
     }
     let exhausted = raw_len < fetch;
     let next_before = if exhausted {
@@ -2817,11 +2815,13 @@ mod tests {
             Value::Text(s) => assert_eq!(s.as_ref(), big_value.as_str()),
             other => panic!("expected the full Text value, got {other:?}"),
         }
-        assert!(driver
-            .read_string_full(&tag("missing"))
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            driver
+                .read_string_full(&tag("missing"))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3141,10 +3141,12 @@ mod tests {
         let url = url_or_skip!();
         let driver = RedisDriver::connect(&url, true).await.unwrap();
         assert!(driver.stream_ack("k", "g", &["1-1".into()]).await.is_err());
-        assert!(driver
-            .stream_claim("k", "g", "c", Duration::ZERO, &["1-1".into()])
-            .await
-            .is_err());
+        assert!(
+            driver
+                .stream_claim("k", "g", "c", Duration::ZERO, &["1-1".into()])
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -3245,10 +3247,9 @@ mod tests {
                     Some(m) => {
                         if let Some(ev) =
                             red_core::kv::parse_keyspace_channel(&m.channel, &m.payload)
+                            && ev.key == key
                         {
-                            if ev.key == key {
-                                break Some(ev);
-                            }
+                            break Some(ev);
                         }
                     }
                     None => break None,
@@ -3420,19 +3421,23 @@ mod tests {
         let url = url_or_skip!();
         let driver = RedisDriver::connect(&url, true).await.unwrap();
         let key = tag("readonly-refused");
-        assert!(driver
-            .set_string(&key, "v".into(), StringTtl::Clear)
-            .await
-            .is_err());
+        assert!(
+            driver
+                .set_string(&key, "v".into(), StringTtl::Clear)
+                .await
+                .is_err()
+        );
         assert!(driver.set_field(&key, "f", "v".into()).await.is_err());
         assert!(driver.set_ttl(&key, None).await.is_err());
         assert!(driver.rename_key(&key, "other").await.is_err());
         assert!(driver.delete_keys(&[key]).await.is_err());
         // A write command through the console is refused the same way.
-        assert!(driver
-            .command(&["SET".into(), tag("ro-console"), "v".into()])
-            .await
-            .is_err());
+        assert!(
+            driver
+                .command(&["SET".into(), tag("ro-console"), "v".into()])
+                .await
+                .is_err()
+        );
         // But a read still works.
         assert!(driver.command(&["PING".into()]).await.is_ok());
     }

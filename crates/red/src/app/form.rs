@@ -278,10 +278,10 @@ impl AppState {
             if ssh.user.is_empty() {
                 errors.push((FormField::SshUser, "SSH user is required"));
             }
-            if let SshAuth::Key { path } = &ssh.auth {
-                if path.is_empty() {
-                    errors.push((FormField::SshKeyPath, "Key file path is required"));
-                }
+            if let SshAuth::Key { path } = &ssh.auth
+                && path.is_empty()
+            {
+                errors.push((FormField::SshKeyPath, "Key file path is required"));
             }
         }
         errors
@@ -379,8 +379,10 @@ impl AppState {
                 );
                 self.connections[index].config.password = password.to_string();
             }
-        } else if let Err(e) = crate::secrets::delete_password(&id) {
-            tracing::warn!("failed to clear keychain credential: {e}");
+        } else {
+            if let Err(e) = crate::secrets::delete_password(&id) {
+                tracing::warn!("failed to clear keychain credential: {e}");
+            }
         }
     }
 

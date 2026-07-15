@@ -27,25 +27,25 @@ use std::time::{Duration, Instant};
 
 use flint::prelude::*;
 use gpui::{
-    point, px, ClipboardItem, Context, PathPromptOptions, Pixels, ScrollHandle,
-    UniformListScrollHandle,
+    ClipboardItem, Context, PathPromptOptions, Pixels, ScrollHandle, UniformListScrollHandle,
+    point, px,
 };
 use red_core::{
-    Column as ResultColumn, ColumnMap, ColumnStats, ColumnValue, ExportFormat, FkEdge, FkJoin,
-    ImportFormat, KeySpec, ResultFilter, TableRef, Value, BASE_ALIAS,
+    BASE_ALIAS, Column as ResultColumn, ColumnMap, ColumnStats, ColumnValue, ExportFormat, FkEdge,
+    FkJoin, ImportFormat, KeySpec, ResultFilter, TableRef, Value,
 };
-use red_service::{Command, CommandSender, RunFetch, SessionId, SortKey};
+use red_service::{Command, CommandSender, OpId, RunFetch, SessionId, SortKey};
 
 use crate::app::{
     AppState, EditContext, ExportProgress, ForeignEdit, Notification, NotificationAction,
-    PendingImportPeek, PendingWrite, Phase, TransferKind, TOAST_AUTO_DISMISS,
+    PendingImportPeek, PendingWrite, Phase, TOAST_AUTO_DISMISS, TransferKind,
 };
 
 /// Re-exported so `crate::kvbrowse` (the Redis keyspace browser) mints epochs
 /// from the same process-global counter as the SQL grid, without needing its
 /// own — see `buffer::next_epoch`'s doc comment.
 pub(crate) use buffer::next_epoch as next_kv_epoch;
-use buffer::{next_epoch, window_decision, BufferMode, GridBuffer, KeyedRun, WindowView, WINDOW};
+use buffer::{BufferMode, GridBuffer, KeyedRun, WINDOW, WindowView, next_epoch, window_decision};
 
 /// The resolved identity of an editable cell, `(row, data_col, pk_value, decl_type,
 /// foreign)`, returned by [`ResultGrid::edit_identity`]. `foreign` is `Some` for an
@@ -56,7 +56,7 @@ pub(crate) use render::group_digits;
 /// Mint a fresh, process-unique epoch for a non-grid consumer (the plan view,
 /// Track B4) so its echoed replies are dropped once superseded; it shares the
 /// grid's monotonic source so the two never collide.
-pub(crate) fn new_epoch() -> u64 {
+pub(crate) fn new_epoch() -> red_service::Epoch {
     next_epoch()
 }
 
@@ -119,12 +119,12 @@ pub(in crate::result) struct ReferenceMenuItem {
 /// resolved joins, and the superseded epoch to close.
 type ReopenSpec = (
     String,
-    u64,
+    red_service::Epoch,
     Option<(String, String)>,
     Option<SortKey>,
     Option<ResultFilter>,
     Vec<FkJoin>,
-    u64,
+    red_service::Epoch,
 );
 
 /// Resolve a browse's [`ExpandedCol`] list into the ordered [`FkJoin`] spec the
@@ -274,7 +274,7 @@ pub(crate) struct ResultGrid {
     page_size: usize,
     /// Identifies the current open SQL; bumped on every (re)open so stale page
     /// fetches and late `ResultReady`/`ResultPageLoaded` replies are ignored.
-    pub(crate) epoch: u64,
+    pub(crate) epoch: red_service::Epoch,
     /// When the current query was issued; drives the live "running…" timer.
     query_started: Instant,
     /// Frozen wall-clock time the query took, set once it lands (ready or error).
@@ -536,7 +536,7 @@ impl ResultGrid {
             self.columns.get(dcol).map(|col| SortKey {
                 position: dcol + 1,
                 column: col.name.clone(),
-                descending: !asc,
+                direction: red_core::SortDirection::from_descending(!asc),
             })
         });
         (
@@ -611,7 +611,7 @@ impl ResultGrid {
         })
     }
 
-    /// Like [`edit_target`], but for a value fetched in full out-of-band (the
+    /// Like `edit_target`, but for a value fetched in full out-of-band (the
     /// inspector's "Load full value"): the *resident* cell may be display-capped, so
     /// the caller supplies `original` rather than reading the clipped buffer. This
     /// is what makes a large `TEXT`/JSON cell editable. Binary is still refused;
@@ -633,8 +633,8 @@ impl ResultGrid {
     }
 
     /// The row identity + target column for an inline edit, independent of the
-    /// cell's current value; shared by [`edit_target`] (resident value) and
-    /// [`edit_target_full`] (a supplied loaded value). `foreign` is `Some` when the
+    /// cell's current value; shared by `edit_target` (resident value) and
+    /// `edit_target_full` (a supplied loaded value). `foreign` is `Some` when the
     /// cell is a single-hop inline-expanded FK column (the edit rewrites the
     /// referenced table). `None` unless this is an editable single-table keyed browse
     /// with a usable (present, uncapped) PK and the cursor sitting off the PK column.
@@ -857,7 +857,7 @@ impl ResultGrid {
         &mut self,
         gutter: usize,
         distinct_max: usize,
-    ) -> Option<(u64, String, bool, bool)> {
+    ) -> Option<(red_service::Epoch, String, bool, bool)> {
         let dcol = self.cursor_cell(gutter).map(|(_, c)| c)?;
         let col = self.columns.get(dcol)?;
         let column = col.name.clone();
@@ -892,9 +892,9 @@ impl ResultGrid {
     }
 
     /// Re-request the visible column's summary with `count(distinct)` forced on:
-    /// the bar's "[compute]" affordance when the guard withheld it. Returns the
+    /// the bar's "\[compute\]" affordance when the guard withheld it. Returns the
     /// `(epoch, column, numeric)` to send, or `None` when no column is shown.
-    fn force_distinct_request(&mut self) -> Option<(u64, String, bool)> {
+    fn force_distinct_request(&mut self) -> Option<(red_service::Epoch, String, bool)> {
         let view = self.stats.as_mut()?;
         let (column, numeric) = (view.column.clone(), view.numeric);
         view.state = StatsState::Loading;
@@ -915,10 +915,10 @@ impl ResultGrid {
         if let Some(dcol) = dcol {
             self.stats_cache.insert(dcol, stats.clone());
         }
-        if let Some(view) = self.stats.as_mut() {
-            if view.column == column {
-                view.state = StatsState::Ready(stats);
-            }
+        if let Some(view) = self.stats.as_mut()
+            && view.column == column
+        {
+            view.state = StatsState::Ready(stats);
         }
     }
 
@@ -926,10 +926,11 @@ impl ResultGrid {
     /// waiting on this column (a stale failure for a since-changed selection is
     /// ignored).
     fn fail_stats(&mut self, column: &str) {
-        if let Some(view) = self.stats.as_mut() {
-            if view.column == column && matches!(view.state, StatsState::Loading) {
-                view.state = StatsState::Failed;
-            }
+        if let Some(view) = self.stats.as_mut()
+            && view.column == column
+            && matches!(view.state, StatsState::Loading)
+        {
+            view.state = StatsState::Failed;
         }
     }
 
@@ -1028,7 +1029,7 @@ impl ResultGrid {
     }
 
     /// Keep the keyboard cursor's *column* on screen after a horizontal move:
-    /// the wide-mode counterpart to [`scroll_cursor_into_view`]. Columns are
+    /// the wide-mode counterpart to `scroll_cursor_into_view`. Columns are
     /// fixed-width (a [`GUTTER_WIDTH`] row-number column when shown, then
     /// [`DATA_COL_WIDTH`] per data column), so the focused cell's x-extent is
     /// pure arithmetic; nudge the horizontal handle by the minimum to bring the
@@ -1131,7 +1132,7 @@ impl ResultGrid {
 ///
 /// [`Event::CopyRowsLoaded`]: red_service::Event::CopyRowsLoaded
 pub(crate) struct PendingCopy {
-    pub(crate) id: u64,
+    pub(crate) id: OpId,
     pub(crate) dcol_lo: usize,
     pub(crate) dcol_hi: usize,
 }
@@ -1140,7 +1141,7 @@ pub(crate) struct PendingCopy {
 /// re-fetch: once the row's typed value(s) arrive, the target browse is opened
 /// filtered to them. See [`AppState::on_fk_rows`].
 pub(crate) struct PendingFkFollow {
-    id: u64,
+    id: OpId,
     plan: FkPlan,
 }
 
@@ -1159,7 +1160,7 @@ pub(crate) struct FkReverse {
 /// pair for a single-column FK; several for a composite.
 struct FkPlan {
     /// The source result's epoch (the `CopyRows` is issued against it).
-    epoch: u64,
+    epoch: red_service::Epoch,
     /// The source row whose key value(s) we fetch in full.
     row: usize,
     /// `(schema, table)` of the browse to open.
@@ -1176,7 +1177,7 @@ pub(crate) enum CopyPlan {
     /// (`CopyRows`) and assemble the clipboard text from the reply. `dcol_lo..=dcol_hi`
     /// are the selected data columns (the re-fetched rows carry every column).
     Refetch {
-        epoch: u64,
+        epoch: red_service::Epoch,
         offset: usize,
         limit: usize,
         dcol_lo: usize,
@@ -1291,6 +1292,10 @@ impl AppState {
                 );
                 // Safe: the guard above ensured a focused tab exists. A fresh run
                 // replaces any open plan (Track B4) with its grid.
+                #[allow(
+                    clippy::unwrap_used,
+                    reason = "guard above ensured a focused tab exists"
+                )]
                 let tab = active.active_mut().unwrap();
                 tab.result = Some(grid);
                 tab.plan = None;
@@ -1334,7 +1339,7 @@ impl AppState {
         session: Option<SessionId>,
         columns: Vec<ResultColumn>,
         total: usize,
-        epoch: u64,
+        epoch: red_service::Epoch,
         key: Option<KeySpec>,
         cx: &mut Context<Self>,
     ) {
@@ -1358,13 +1363,13 @@ impl AppState {
     pub(crate) fn on_result_run_failed(
         &mut self,
         session: Option<SessionId>,
-        epoch: u64,
+        epoch: red_service::Epoch,
         seq: u64,
     ) {
-        if let Some(active) = self.conn_mut(session) {
-            if let Some(grid) = active.result_by_epoch(epoch) {
-                grid.buffer.borrow_mut().run_failed(seq);
-            }
+        if let Some(active) = self.conn_mut(session)
+            && let Some(grid) = active.result_by_epoch(epoch)
+        {
+            grid.buffer.borrow_mut().run_failed(seq);
         }
     }
 
@@ -1373,20 +1378,20 @@ impl AppState {
     pub(crate) fn on_result_run(
         &mut self,
         session: Option<SessionId>,
-        epoch: u64,
+        epoch: red_service::Epoch,
         fetch: RunFetch,
         rows: Vec<Vec<Value>>,
         estimated: bool,
         seq: u64,
         cx: &mut Context<Self>,
     ) {
-        if let Some(active) = self.conn_mut(session) {
-            if let Some(grid) = active.result_by_epoch(epoch) {
-                let total = grid.total;
-                grid.buffer
-                    .borrow_mut()
-                    .apply_run(fetch, rows, estimated, seq, total);
-            }
+        if let Some(active) = self.conn_mut(session)
+            && let Some(grid) = active.result_by_epoch(epoch)
+        {
+            let total = grid.total;
+            grid.buffer
+                .borrow_mut()
+                .apply_run(fetch, rows, estimated, seq, total);
         }
         cx.notify();
     }
@@ -1397,15 +1402,15 @@ impl AppState {
         session: Option<SessionId>,
         offset: usize,
         rows: Vec<Vec<Value>>,
-        epoch: u64,
+        epoch: red_service::Epoch,
         cx: &mut Context<Self>,
     ) {
         // Route by session then epoch so a background tab's page lands in its own
         // grid; a page for a superseded result finds no match and is dropped.
-        if let Some(active) = self.conn_mut(session) {
-            if let Some(grid) = active.result_by_epoch(epoch) {
-                grid.buffer.borrow_mut().insert_page(offset, rows);
-            }
+        if let Some(active) = self.conn_mut(session)
+            && let Some(grid) = active.result_by_epoch(epoch)
+        {
+            grid.buffer.borrow_mut().insert_page(offset, rows);
         }
         cx.notify();
     }
@@ -1413,12 +1418,12 @@ impl AppState {
     /// Record a result error against the session's focused tab grid (also surfaced
     /// as a toast). Errors aren't epoch-tagged, so they attach to the focused tab.
     pub(crate) fn on_result_error(&mut self, session: Option<SessionId>, message: &str) {
-        if let Some(active) = self.conn_mut(session) {
-            if let Some(grid) = active.active_result_mut() {
-                grid.error = Some(message.to_string());
-                grid.ready = true;
-                grid.stop_timer();
-            }
+        if let Some(active) = self.conn_mut(session)
+            && let Some(grid) = active.active_result_mut()
+        {
+            grid.error = Some(message.to_string());
+            grid.ready = true;
+            grid.stop_timer();
         }
     }
 
@@ -1464,7 +1469,7 @@ impl AppState {
                     let sort = SortKey {
                         position: dcol + 1,
                         column: col_name,
-                        descending: !asc,
+                        direction: red_core::SortDirection::from_descending(!asc),
                     };
                     Some((
                         grid.base_sql.clone(),
@@ -1522,7 +1527,7 @@ impl AppState {
                         grid.columns.get(dcol).map(|col| SortKey {
                             position: dcol + 1,
                             column: col.name.clone(),
-                            descending: !asc,
+                            direction: red_core::SortDirection::from_descending(!asc),
                         })
                     });
                     Some((
@@ -1680,8 +1685,8 @@ impl AppState {
 
     /// The foreground connection's open result carrying `epoch`, for epoch-scoped
     /// replies on the visible workspace (e.g. a committed in-place cell edit,
-    /// Track B5). Delegates to [`ActiveConn::result_by_epoch`].
-    pub(crate) fn result_by_epoch(&mut self, epoch: u64) -> Option<&mut ResultGrid> {
+    /// Track B5). Delegates to `ActiveConn::result_by_epoch`.
+    pub(crate) fn result_by_epoch(&mut self, epoch: red_service::Epoch) -> Option<&mut ResultGrid> {
         match &mut self.phase {
             Phase::Connected(active) => active.result_by_epoch(epoch),
             _ => None,
@@ -1699,32 +1704,32 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let gutter = self.gutter();
-        if let Phase::Connected(active) = &mut self.phase {
-            if let Some(grid) = active.active_result_mut() {
-                let ncols = grid.columns.len();
-                grid.selection = if gutter == 1 && table_col == 0 {
-                    // Gutter click: span every data column (table cols
-                    // `gutter..=ncols`); an empty result has no columns to select.
-                    (ncols > 0).then(|| match (extend, grid.selection) {
-                        (true, Some(mut range)) => {
-                            range.focus = (row, ncols);
-                            range
-                        }
-                        _ => CellRange {
-                            anchor: (row, 1),
-                            focus: (row, ncols),
-                        },
-                    })
-                } else {
-                    Some(match (extend, grid.selection) {
-                        (true, Some(mut range)) => {
-                            range.focus = (row, table_col);
-                            range
-                        }
-                        _ => CellRange::single(row, table_col),
-                    })
-                };
-            }
+        if let Phase::Connected(active) = &mut self.phase
+            && let Some(grid) = active.active_result_mut()
+        {
+            let ncols = grid.columns.len();
+            grid.selection = if gutter == 1 && table_col == 0 {
+                // Gutter click: span every data column (table cols
+                // `gutter..=ncols`); an empty result has no columns to select.
+                (ncols > 0).then(|| match (extend, grid.selection) {
+                    (true, Some(mut range)) => {
+                        range.focus = (row, ncols);
+                        range
+                    }
+                    _ => CellRange {
+                        anchor: (row, 1),
+                        focus: (row, ncols),
+                    },
+                })
+            } else {
+                Some(match (extend, grid.selection) {
+                    (true, Some(mut range)) => {
+                        range.focus = (row, table_col);
+                        range
+                    }
+                    _ => CellRange::single(row, table_col),
+                })
+            };
         }
         // A new cell selection; refresh the stats bar to its column.
         self.refresh_column_stats(cx);
@@ -1745,45 +1750,45 @@ impl AppState {
     ) {
         let row_height = f32::from(self.settings.grid.density.row_height());
         let gutter = self.gutter();
-        if let Phase::Connected(active) = &mut self.phase {
-            if let Some(grid) = active.active_result_mut() {
-                if !grid.ready || grid.error.is_some() || grid.columns.is_empty() {
-                    return;
-                }
-                let ncols = grid.columns.len();
-                let last_row = grid.total.saturating_sub(1);
-                let page = grid.viewport_rows(row_height).max(1);
-                // Data columns occupy table indices `gutter..=ncols-1+gutter`.
-                let (first_col, last_col) = (gutter, ncols + gutter - 1);
-                // The cursor is the selection's focus; with nothing selected yet
-                // it starts at the first visible row's first data column.
-                let (row, col) = match grid.selection {
-                    Some(r) => r.focus,
-                    None => (grid.first_visible_row(row_height), first_col),
-                };
-                let col = col.clamp(first_col, last_col);
-                let (new_row, new_col) = match mv {
-                    TableNav::Up => (row.saturating_sub(1), col),
-                    TableNav::Down => ((row + 1).min(last_row), col),
-                    TableNav::Left => (row, (col - 1).max(first_col)),
-                    TableNav::Right => (row, (col + 1).min(last_col)),
-                    TableNav::RowStart => (row, first_col),
-                    TableNav::RowEnd => (row, last_col),
-                    TableNav::PageUp => (row.saturating_sub(page), col),
-                    TableNav::PageDown => ((row + page).min(last_row), col),
-                    TableNav::First => (0, col),
-                    TableNav::Last => (last_row, col),
-                };
-                grid.selection = Some(match (extend, grid.selection) {
-                    (true, Some(mut range)) => {
-                        range.focus = (new_row, new_col);
-                        range
-                    }
-                    _ => CellRange::single(new_row, new_col),
-                });
-                grid.scroll_cursor_into_view(new_row, row_height);
-                grid.scroll_col_into_view(new_col, gutter);
+        if let Phase::Connected(active) = &mut self.phase
+            && let Some(grid) = active.active_result_mut()
+        {
+            if !grid.ready || grid.error.is_some() || grid.columns.is_empty() {
+                return;
             }
+            let ncols = grid.columns.len();
+            let last_row = grid.total.saturating_sub(1);
+            let page = grid.viewport_rows(row_height).max(1);
+            // Data columns occupy table indices `gutter..=ncols-1+gutter`.
+            let (first_col, last_col) = (gutter, ncols + gutter - 1);
+            // The cursor is the selection's focus; with nothing selected yet
+            // it starts at the first visible row's first data column.
+            let (row, col) = match grid.selection {
+                Some(r) => r.focus,
+                None => (grid.first_visible_row(row_height), first_col),
+            };
+            let col = col.clamp(first_col, last_col);
+            let (new_row, new_col) = match mv {
+                TableNav::Up => (row.saturating_sub(1), col),
+                TableNav::Down => ((row + 1).min(last_row), col),
+                TableNav::Left => (row, (col - 1).max(first_col)),
+                TableNav::Right => (row, (col + 1).min(last_col)),
+                TableNav::RowStart => (row, first_col),
+                TableNav::RowEnd => (row, last_col),
+                TableNav::PageUp => (row.saturating_sub(page), col),
+                TableNav::PageDown => ((row + page).min(last_row), col),
+                TableNav::First => (0, col),
+                TableNav::Last => (last_row, col),
+            };
+            grid.selection = Some(match (extend, grid.selection) {
+                (true, Some(mut range)) => {
+                    range.focus = (new_row, new_col);
+                    range
+                }
+                _ => CellRange::single(new_row, new_col),
+            });
+            grid.scroll_cursor_into_view(new_row, row_height);
+            grid.scroll_col_into_view(new_col, gutter);
         }
         // The keyboard cursor moved; update the stats bar to the focused column.
         self.refresh_column_stats(cx);
@@ -1806,23 +1811,23 @@ impl AppState {
         if table_col < gutter {
             return;
         }
-        if let Phase::Connected(active) = &mut self.phase {
-            if let Some(grid) = active.active_result_mut() {
-                let last = grid.total.saturating_sub(1);
-                grid.selection = match (extend, grid.selection) {
-                    // Keep the anchor column, pull the focus to this one, and force
-                    // full height so the block stays a clean column span.
-                    (true, Some(mut range)) => {
-                        range.anchor = (0, range.anchor.1.max(gutter));
-                        range.focus = (last, table_col);
-                        Some(range)
-                    }
-                    _ => Some(CellRange {
-                        anchor: (0, table_col),
-                        focus: (last, table_col),
-                    }),
-                };
-            }
+        if let Phase::Connected(active) = &mut self.phase
+            && let Some(grid) = active.active_result_mut()
+        {
+            let last = grid.total.saturating_sub(1);
+            grid.selection = match (extend, grid.selection) {
+                // Keep the anchor column, pull the focus to this one, and force
+                // full height so the block stays a clean column span.
+                (true, Some(mut range)) => {
+                    range.anchor = (0, range.anchor.1.max(gutter));
+                    range.focus = (last, table_col);
+                    Some(range)
+                }
+                _ => Some(CellRange {
+                    anchor: (0, table_col),
+                    focus: (last, table_col),
+                }),
+            };
         }
         // Header ⌘/Ctrl-click selected this whole column, its natural stats target.
         self.refresh_column_stats(cx);
@@ -1837,18 +1842,18 @@ impl AppState {
     /// ready and has columns.
     pub(crate) fn result_select_all(&mut self, cx: &mut Context<Self>) {
         let gutter = self.gutter();
-        if let Phase::Connected(active) = &mut self.phase {
-            if let Some(grid) = active.active_result_mut() {
-                if !grid.ready || grid.error.is_some() || grid.columns.is_empty() {
-                    return;
-                }
-                let last = grid.total.saturating_sub(1);
-                let last_col = grid.columns.len() + gutter - 1;
-                grid.selection = Some(CellRange {
-                    anchor: (0, gutter),
-                    focus: (last, last_col),
-                });
+        if let Phase::Connected(active) = &mut self.phase
+            && let Some(grid) = active.active_result_mut()
+        {
+            if !grid.ready || grid.error.is_some() || grid.columns.is_empty() {
+                return;
             }
+            let last = grid.total.saturating_sub(1);
+            let last_col = grid.columns.len() + gutter - 1;
+            grid.selection = Some(CellRange {
+                anchor: (0, gutter),
+                focus: (last, last_col),
+            });
         }
         cx.notify();
     }
@@ -1860,10 +1865,10 @@ impl AppState {
         self.stats_bar = !self.stats_bar;
         if self.stats_bar {
             self.refresh_column_stats(cx);
-        } else if let Phase::Connected(active) = &mut self.phase {
-            if let Some(grid) = active.active_result_mut() {
-                grid.stats = None;
-            }
+        } else if let Phase::Connected(active) = &mut self.phase
+            && let Some(grid) = active.active_result_mut()
+        {
+            grid.stats = None;
         }
         cx.notify();
     }
@@ -1890,14 +1895,13 @@ impl AppState {
             self.send_active(Command::ColumnStats {
                 epoch,
                 column,
-                numeric,
-                distinct,
+                flags: red_core::StatsFlags { numeric, distinct },
             });
         }
         cx.notify();
     }
 
-    /// The stats bar's "[compute]" button: re-request the shown column's summary
+    /// The stats bar's "\[compute\]" button: re-request the shown column's summary
     /// with `count(distinct)` forced on (the guard had withheld it on a large
     /// result).
     pub(crate) fn compute_column_distinct(&mut self, cx: &mut Context<Self>) {
@@ -1911,8 +1915,10 @@ impl AppState {
             self.send_active(Command::ColumnStats {
                 epoch,
                 column,
-                numeric,
-                distinct: true,
+                flags: red_core::StatsFlags {
+                    numeric,
+                    distinct: true,
+                },
             });
         }
         cx.notify();
@@ -1922,15 +1928,15 @@ impl AppState {
     pub(crate) fn on_column_stats(
         &mut self,
         session: Option<SessionId>,
-        epoch: u64,
+        epoch: red_service::Epoch,
         column: String,
         stats: ColumnStats,
         cx: &mut Context<Self>,
     ) {
-        if let Some(active) = self.conn_mut(session) {
-            if let Some(grid) = active.result_by_epoch(epoch) {
-                grid.apply_stats(&column, stats);
-            }
+        if let Some(active) = self.conn_mut(session)
+            && let Some(grid) = active.result_by_epoch(epoch)
+        {
+            grid.apply_stats(&column, stats);
         }
         cx.notify();
     }
@@ -1940,14 +1946,14 @@ impl AppState {
     pub(crate) fn on_column_stats_failed(
         &mut self,
         session: Option<SessionId>,
-        epoch: u64,
+        epoch: red_service::Epoch,
         column: String,
         cx: &mut Context<Self>,
     ) {
-        if let Some(active) = self.conn_mut(session) {
-            if let Some(grid) = active.result_by_epoch(epoch) {
-                grid.fail_stats(&column);
-            }
+        if let Some(active) = self.conn_mut(session)
+            && let Some(grid) = active.result_by_epoch(epoch)
+        {
+            grid.fail_stats(&column);
         }
         cx.notify();
     }
@@ -1988,14 +1994,14 @@ impl AppState {
         &mut self,
         format: ExportFormat,
         path: PathBuf,
-        epoch: u64,
+        epoch: red_service::Epoch,
         cx: &mut Context<Self>,
     ) {
         let total = match &self.phase {
             Phase::Connected(a) => a.active_result().map(|g| g.total_rows()).unwrap_or(0),
             _ => 0,
         };
-        let id = self.next_export_id;
+        let id = red_service::OpId::new(self.next_export_id);
         self.next_export_id += 1;
         self.send_active(Command::Export {
             format,
@@ -2030,7 +2036,7 @@ impl AppState {
 
     /// The notification id of the export toast carrying `export_id`, if it's still
     /// on screen.
-    fn export_notification_id(&self, export_id: u64) -> Option<u64> {
+    fn export_notification_id(&self, export_id: OpId) -> Option<u64> {
         self.notifications
             .iter()
             .find(|n| n.export.as_ref().is_some_and(|e| e.id == export_id))
@@ -2038,21 +2044,20 @@ impl AppState {
     }
 
     /// `ExportProgress`: advance the export toast's row count + percentage.
-    pub(crate) fn on_export_progress(&mut self, id: u64, rows: usize, cx: &mut Context<Self>) {
+    pub(crate) fn on_export_progress(&mut self, id: OpId, rows: usize, cx: &mut Context<Self>) {
         if let Some(n) = self
             .notifications
             .iter_mut()
             .find(|n| n.export.as_ref().is_some_and(|e| e.id == id))
+            && let Some(export) = &mut n.export
         {
-            if let Some(export) = &mut n.export {
-                export.rows = rows;
-                let pct = rows
-                    .saturating_mul(100)
-                    .checked_div(export.total)
-                    .unwrap_or(0)
-                    .min(100);
-                n.message = format!("Exporting… {pct}%").into();
-            }
+            export.rows = rows;
+            let pct = rows
+                .saturating_mul(100)
+                .checked_div(export.total)
+                .unwrap_or(0)
+                .min(100);
+            n.message = format!("Exporting… {pct}%").into();
         }
         cx.notify();
     }
@@ -2062,7 +2067,7 @@ impl AppState {
     /// file path is what's useful here, not a copy of the toast text).
     pub(crate) fn on_export_finished(
         &mut self,
-        id: u64,
+        id: OpId,
         path: String,
         rows: usize,
         cx: &mut Context<Self>,
@@ -2089,7 +2094,7 @@ impl AppState {
     }
 
     /// `ExportCancelled`: drop the progress toast, leave an auto-dismissing notice.
-    pub(crate) fn on_export_cancelled(&mut self, id: u64, cx: &mut Context<Self>) {
+    pub(crate) fn on_export_cancelled(&mut self, id: OpId, cx: &mut Context<Self>) {
         if let Some(nid) = self.export_notification_id(id) {
             self.dismiss(nid, cx);
         }
@@ -2100,7 +2105,7 @@ impl AppState {
 
     /// `ImportProgress`: advance the import toast's running committed-row count (an
     /// import streams a file of unknown length, so it shows a count, not a %).
-    pub(crate) fn on_import_progress(&mut self, id: u64, rows: usize, cx: &mut Context<Self>) {
+    pub(crate) fn on_import_progress(&mut self, id: OpId, rows: usize, cx: &mut Context<Self>) {
         if let Some(n) = self
             .notifications
             .iter_mut()
@@ -2115,7 +2120,7 @@ impl AppState {
     }
 
     /// `ImportFinished`: drop the progress toast, leave an auto-dismissing success.
-    pub(crate) fn on_import_finished(&mut self, id: u64, rows: usize, cx: &mut Context<Self>) {
+    pub(crate) fn on_import_finished(&mut self, id: OpId, rows: usize, cx: &mut Context<Self>) {
         if let Some(nid) = self.export_notification_id(id) {
             self.dismiss(nid, cx);
         }
@@ -2126,7 +2131,7 @@ impl AppState {
     /// chunk, so the message says how far it got.
     pub(crate) fn on_import_failed(
         &mut self,
-        id: u64,
+        id: OpId,
         rows: usize,
         message: String,
         cx: &mut Context<Self>,
@@ -2143,7 +2148,7 @@ impl AppState {
     }
 
     /// `ImportCancelled`: drop the progress toast; earlier chunks stay committed.
-    pub(crate) fn on_import_cancelled(&mut self, id: u64, rows: usize, cx: &mut Context<Self>) {
+    pub(crate) fn on_import_cancelled(&mut self, id: OpId, rows: usize, cx: &mut Context<Self>) {
         if let Some(nid) = self.export_notification_id(id) {
             self.dismiss(nid, cx);
         }
@@ -2180,13 +2185,13 @@ impl AppState {
             prompt: Some("Import data file".into()),
         });
         cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = paths.await {
-                if let Some(path) = paths.into_iter().next() {
-                    this.update(cx, |this, _| {
-                        this.begin_import_peek(path, target, target_cols)
-                    })
-                    .ok();
-                }
+            if let Ok(Ok(Some(paths))) = paths.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                this.update(cx, |this, _| {
+                    this.begin_import_peek(path, target, target_cols)
+                })
+                .ok();
             }
         })
         .detach();
@@ -2210,7 +2215,7 @@ impl AppState {
             Some("json") => ImportFormat::JsonArray,
             _ => ImportFormat::Csv,
         };
-        let id = self.next_export_id;
+        let id = red_service::OpId::new(self.next_export_id);
         self.next_export_id += 1;
         self.pending_import = Some(PendingImportPeek {
             id,
@@ -2227,7 +2232,7 @@ impl AppState {
     /// so the user sees the file→table mapping before any write.
     pub(crate) fn on_import_columns(
         &mut self,
-        id: u64,
+        id: OpId,
         source_cols: Vec<String>,
         cx: &mut Context<Self>,
     ) {
@@ -2321,7 +2326,7 @@ impl AppState {
         format: ImportFormat,
         target: TableRef,
         mapping: Vec<ColumnMap>,
-        id: u64,
+        id: OpId,
         cx: &mut Context<Self>,
     ) {
         /// Default rows per insert chunk (the driver re-clamps to its parameter cap).
@@ -2363,10 +2368,10 @@ impl AppState {
     /// clamped to the result's bounds. No-op when no result is open.
     pub(crate) fn go_to_row(&mut self, one_based: usize, cx: &mut Context<Self>) {
         let row_height = f32::from(self.settings.grid.density.row_height());
-        if let Phase::Connected(active) = &self.phase {
-            if let Some(grid) = active.active_result() {
-                grid.go_to_row(one_based.saturating_sub(1), row_height);
-            }
+        if let Phase::Connected(active) = &self.phase
+            && let Some(grid) = active.active_result()
+        {
+            grid.go_to_row(one_based.saturating_sub(1), row_height);
         }
         cx.notify();
     }
@@ -2402,7 +2407,7 @@ impl AppState {
                         cx,
                     );
                 }
-                let id = self.next_copy_id;
+                let id = red_service::OpId::new(self.next_copy_id);
                 self.next_copy_id += 1;
                 self.pending_copy = Some(PendingCopy {
                     id,
@@ -2423,7 +2428,7 @@ impl AppState {
     /// A `CopyRows` reply landed: if it's the copy still pending, assemble the
     /// untruncated selection and put it on the clipboard. A superseded reply (the
     /// user copied again before this returned) finds a stale id and is dropped.
-    pub(crate) fn on_copy_rows(&mut self, id: u64, rows: Vec<Vec<Value>>, cx: &mut Context<Self>) {
+    pub(crate) fn on_copy_rows(&mut self, id: OpId, rows: Vec<Vec<Value>>, cx: &mut Context<Self>) {
         // The detail inspector draws full values from the same `CopyRows` path; if
         // this reply is its in-flight fetch, it claims it (and never reaches the
         // clipboard). Ids come from one counter, so the three never collide.
@@ -2492,7 +2497,7 @@ impl AppState {
     }
 
     /// "Go to referenced row": resolve the forward FK of the focused cell, then fetch
-    /// that cell's full value (the target browse opens in [`on_fk_rows`]). No-op if
+    /// that cell's full value (the target browse opens in `on_fk_rows`). No-op if
     /// the focused column isn't a single-column FK or the graph hasn't loaded.
     pub(crate) fn follow_fk_forward(&mut self, cx: &mut Context<Self>) {
         let Phase::Connected(active) = &self.phase else {
@@ -2565,7 +2570,7 @@ impl AppState {
     /// Issue the single-row `CopyRows` re-fetch that backs an FK follow, recording
     /// the plan so [`on_fk_rows`](Self::on_fk_rows) can complete it on the reply.
     fn begin_fk_follow(&mut self, plan: FkPlan, cx: &mut Context<Self>) {
-        let id = self.next_copy_id;
+        let id = red_service::OpId::new(self.next_copy_id);
         self.next_copy_id += 1;
         let (epoch, row) = (plan.epoch, plan.row);
         self.pending_fk = Some(PendingFkFollow { id, plan });
@@ -2582,7 +2587,7 @@ impl AppState {
     /// value(s) and open the target browse filtered to them. A NULL key isn't
     /// followable (nothing to point at), so it's reported and dropped. Returns
     /// whether it claimed the reply.
-    fn on_fk_rows(&mut self, id: u64, rows: &[Vec<Value>], cx: &mut Context<Self>) -> bool {
+    fn on_fk_rows(&mut self, id: OpId, rows: &[Vec<Value>], cx: &mut Context<Self>) -> bool {
         let Some(p) = self.pending_fk.take_if(|p| p.id == id) else {
             return false;
         };
@@ -2615,7 +2620,7 @@ impl AppState {
 
 #[cfg(test)]
 mod join_tests {
-    use super::{build_joins, ExpandedCol};
+    use super::{ExpandedCol, build_joins};
     use red_core::FkEdge;
 
     fn edge(from: &str, fk: &str, to: &str, refc: &str) -> FkEdge {
@@ -2692,8 +2697,8 @@ mod join_tests {
 mod foreign_edit_tests {
     use super::*;
     use crate::result::edit::{PkKey, StagedCell, UpdatedRow};
-    use red_core::{Column, EditOp, FkJoin, KeyKind, KeySpec, TableRef, Value, BASE_ALIAS};
-    use red_service::{spawn, SessionId};
+    use red_core::{BASE_ALIAS, Column, EditOp, FkJoin, KeyKind, KeySpec, TableRef, Value};
+    use red_service::{SessionId, spawn};
     use std::collections::HashMap;
 
     fn col(name: &str, ty: &str) -> Column {
@@ -2708,7 +2713,7 @@ mod foreign_edit_tests {
     /// (`id=10, tier_id=3, tier_id.name='Gold'`).
     fn expanded_grid() -> ResultGrid {
         let handle = spawn();
-        let sender = handle.command_sender(SessionId(1));
+        let sender = handle.command_sender(SessionId::new(1));
         let mut grid = ResultGrid::new(
             "channel".into(),
             "SELECT * FROM channel".into(),

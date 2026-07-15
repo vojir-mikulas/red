@@ -7,11 +7,11 @@
 //! (keychain-routed secrets, never the config file).
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, Context, Div, ElementId, Stateful};
+use gpui::{Context, Div, ElementId, Stateful, div, prelude::*, px};
 use red_core::ConnectionConfig;
 
 use crate::config::StoredConnection;
-use crate::import::discover::{detect, Found};
+use crate::import::discover::{Found, detect};
 use crate::import::{ImportSource, ImportedConnection};
 
 use super::AppState;
@@ -105,13 +105,12 @@ impl AppState {
 
     /// Source step: toggle whether provider `index` is included in the scan.
     pub(crate) fn set_import_provider(&mut self, index: usize, on: bool, cx: &mut Context<Self>) {
-        if let Some(w) = self.import_wizard.as_mut() {
-            if let Some(p) = w.providers.get_mut(index) {
-                if !p.found.is_empty() {
-                    p.selected = on;
-                    cx.notify();
-                }
-            }
+        if let Some(w) = self.import_wizard.as_mut()
+            && let Some(p) = w.providers.get_mut(index)
+            && !p.found.is_empty()
+        {
+            p.selected = on;
+            cx.notify();
         }
     }
 
@@ -182,13 +181,11 @@ impl AppState {
             step: WizardStep::Select { items, .. },
             ..
         }) = self.import_wizard.as_mut()
+            && let Some(item) = items.get_mut(index)
+            && !item.duplicate
         {
-            if let Some(item) = items.get_mut(index) {
-                if !item.duplicate {
-                    item.include = on;
-                    cx.notify();
-                }
-            }
+            item.include = on;
+            cx.notify();
         }
     }
 
@@ -298,7 +295,7 @@ impl AppState {
         &self,
         wizard: &ImportWizard,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         match &wizard.step {
             WizardStep::Source => self.render_import_source(wizard, cx).into_any_element(),
             WizardStep::Select { items, skipped } => self
@@ -313,7 +310,7 @@ impl AppState {
         &self,
         wizard: &ImportWizard,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let close_view = cx.entity().downgrade();
         let confirm_view = cx.entity().downgrade();
@@ -410,7 +407,7 @@ impl AppState {
         items: &[WizardItem],
         skipped: &[WizardSkip],
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let close_view = cx.entity().downgrade();
         let confirm_view = cx.entity().downgrade();
@@ -707,9 +704,5 @@ fn target_summary(config: &ConnectionConfig) -> String {
 }
 
 fn plural(n: usize) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
-    }
+    if n == 1 { "" } else { "s" }
 }

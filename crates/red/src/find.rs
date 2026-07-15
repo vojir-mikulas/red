@@ -13,7 +13,7 @@
 use std::ops::Range;
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, AnyElement, Context, Entity, Focusable, Window};
+use gpui::{AnyElement, Context, Entity, Focusable, Window, div, prelude::*, px};
 
 use crate::app::{AppState, Phase};
 
@@ -195,12 +195,11 @@ impl AppState {
                 let row_height = f32::from(self.settings.grid.density.row_height());
                 let gutter = self.gutter();
                 let target = bar.grid_matches.get(bar.current).copied();
-                if let Some((ord, dcol)) = target {
-                    if let Phase::Connected(active) = &mut self.phase {
-                        if let Some(grid) = active.active_result_mut() {
-                            grid.reveal_cell(ord, dcol + gutter, row_height);
-                        }
-                    }
+                if let Some((ord, dcol)) = target
+                    && let Phase::Connected(active) = &mut self.phase
+                    && let Some(grid) = active.active_result_mut()
+                {
+                    grid.reveal_cell(ord, dcol + gutter, row_height);
                 }
             }
             FindTarget::Editor => {

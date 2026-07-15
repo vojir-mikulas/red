@@ -61,10 +61,10 @@ pub fn normalize(decl: &str) -> NormType {
 
     // ClickHouse wrappers: `Nullable(T)`, `LowCardinality(T)` → classify the inner T.
     for wrap in ["nullable(", "lowcardinality("] {
-        if let Some(rest) = lower.strip_prefix(wrap) {
-            if let Some(inner) = rest.strip_suffix(')') {
-                return normalize(inner);
-            }
+        if let Some(rest) = lower.strip_prefix(wrap)
+            && let Some(inner) = rest.strip_suffix(')')
+        {
+            return normalize(inner);
         }
     }
 

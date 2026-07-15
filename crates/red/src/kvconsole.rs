@@ -5,8 +5,8 @@
 //! without per-command ids; a burst of rapid-fire submissions could in
 //! principle match a reply to the wrong entry.
 
-use gpui::{div, prelude::*, px, Context, Entity, ScrollHandle, Window};
-use red_core::kv::{classify_command, tokenize_command, CommandClass, RespValue};
+use gpui::{Context, Entity, ScrollHandle, Window, div, prelude::*, px};
+use red_core::kv::{CommandClass, RespValue, classify_command, tokenize_command};
 use red_service::{Command, SessionId};
 
 use flint::prelude::*;
@@ -181,7 +181,7 @@ pub(crate) struct KvConsoleEntry {
 }
 
 pub(crate) struct KvConsole {
-    pub(crate) epoch: u64,
+    pub(crate) epoch: red_service::Epoch,
     pub(crate) input: Entity<TextInput>,
     pub(crate) history: Vec<KvConsoleEntry>,
     /// Monotonic request-id source; each sent command takes the next value, and
@@ -426,7 +426,7 @@ impl AppState {
     pub(crate) fn on_kv_command_result(
         &mut self,
         session: Option<SessionId>,
-        epoch: u64,
+        epoch: red_service::Epoch,
         req: u64,
         result: RespValue,
         cx: &mut Context<Self>,
@@ -478,7 +478,7 @@ impl AppState {
         tab_idx: usize,
         _window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
         let session = active.session;
         let view = cx.entity().downgrade();

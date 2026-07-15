@@ -13,12 +13,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::Stream;
+use red_core::Result;
 use red_core::kv::{
     ClientInfo, CollectionKind, KeyMeta, KvCollectionPage, KvMessage, KvScanPage, KvStreamPage,
     KvValue, PendingEntry, RespValue, ScanBudget, ScanCursor, SlowlogEntry, StreamConsumer,
     StreamGroup, StringTtl,
 };
-use red_core::Result;
 
 use crate::AbortSignal;
 

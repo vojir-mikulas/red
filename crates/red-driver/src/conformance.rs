@@ -18,7 +18,7 @@ use red_core::{
     TableRef, Value,
 };
 
-use crate::{AbortSignal, DatabaseDriver, PageCap, DEFAULT_DISPLAY_CELL_CAP};
+use crate::{AbortSignal, DEFAULT_DISPLAY_CELL_CAP, DatabaseDriver, PageCap};
 
 /// `open_cursor` streams the result in windows that never exceed the requested
 /// size, and the total is exact; memory stays flat regardless of result size.
@@ -117,7 +117,7 @@ pub(crate) async fn abort_after_completion_is_noop(driver: &dyn DatabaseDriver, 
     let abort = AbortSignal::new();
     let first = driver.count(fast_sql, &abort).await.unwrap();
     abort.abort(); // late: the fetch already disarmed it
-                   // A follow-up fetch on the (possibly reused) connection still succeeds.
+    // A follow-up fetch on the (possibly reused) connection still succeeds.
     let again = driver.count(fast_sql, &AbortSignal::new()).await.unwrap();
     assert_eq!(
         first, again,
@@ -259,7 +259,15 @@ pub(crate) async fn column_stats_summary(
 
     // Full-result numeric summary, distinct included.
     let s = driver
-        .column_stats(base_sql, int_col, true, true, &abort)
+        .column_stats(
+            base_sql,
+            int_col,
+            red_core::StatsFlags {
+                numeric: true,
+                distinct: true,
+            },
+            &abort,
+        )
         .await
         .unwrap();
     let total = driver.count(base_sql, &abort).await.unwrap();
@@ -287,7 +295,15 @@ pub(crate) async fn column_stats_summary(
 
     // A non-numeric column with distinct withheld: no distinct, no sum/avg.
     let cheap = driver
-        .column_stats(base_sql, text_col, false, false, &abort)
+        .column_stats(
+            base_sql,
+            text_col,
+            red_core::StatsFlags {
+                numeric: false,
+                distinct: false,
+            },
+            &abort,
+        )
         .await
         .unwrap();
     assert!(cheap.distinct.is_none(), "distinct=false omits the count");
@@ -305,7 +321,15 @@ pub(crate) async fn column_stats_summary(
     // `OpenResult` applies), so it narrows like the visible result does.
     let filtered = format!("SELECT * FROM ({base_sql}) AS _red_f WHERE {filter_pred}");
     let fs = driver
-        .column_stats(&filtered, int_col, true, false, &abort)
+        .column_stats(
+            &filtered,
+            int_col,
+            red_core::StatsFlags {
+                numeric: true,
+                distinct: false,
+            },
+            &abort,
+        )
         .await
         .unwrap();
     let fcount = driver.count(&filtered, &abort).await.unwrap();
@@ -458,7 +482,7 @@ pub(crate) async fn seeks_forward_backward_and_reads_bounds(
 
     // First page: no bound, ascending from the start.
     let first = driver
-        .fetch_seek(sql, key, None, false, 5, &abort)
+        .fetch_seek(sql, key, None, red_core::SortDirection::Asc, 5, &abort)
         .await
         .unwrap();
     assert_eq!(first.rows.len(), 5);
@@ -466,7 +490,14 @@ pub(crate) async fn seeks_forward_backward_and_reads_bounds(
 
     // Forward: strictly after a bound.
     let fwd = driver
-        .fetch_seek(sql, key, Some(&[Value::Integer(997)]), false, 5, &abort)
+        .fetch_seek(
+            sql,
+            key,
+            Some(&[Value::Integer(997)]),
+            red_core::SortDirection::Asc,
+            5,
+            &abort,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -480,7 +511,14 @@ pub(crate) async fn seeks_forward_backward_and_reads_bounds(
 
     // Backward: strictly before a bound, returned descending (the caller flips).
     let back = driver
-        .fetch_seek(sql, key, Some(&[Value::Integer(4)]), true, 5, &abort)
+        .fetch_seek(
+            sql,
+            key,
+            Some(&[Value::Integer(4)]),
+            red_core::SortDirection::Desc,
+            5,
+            &abort,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -549,7 +587,14 @@ pub(crate) async fn seeks_composite_sorted(
         let (mut lead, mut tie) = (0usize, 0usize);
         loop {
             let page = driver
-                .fetch_seek(sql, key, bound.as_deref(), false, page_size, &abort)
+                .fetch_seek(
+                    sql,
+                    key,
+                    bound.as_deref(),
+                    red_core::SortDirection::Asc,
+                    page_size,
+                    &abort,
+                )
                 .await
                 .unwrap();
             let Some(last) = page.rows.last() else { break };
@@ -614,7 +659,7 @@ pub(crate) async fn caps_display_keeps_key_and_export(
     // --- Display seek caps the fat non-key cells, key column verbatim. ---
     let abort = AbortSignal::new();
     let page = driver
-        .fetch_seek(sql, key, None, false, 5, &abort)
+        .fetch_seek(sql, key, None, red_core::SortDirection::Asc, 5, &abort)
         .await
         .unwrap();
     assert_eq!(page.rows.len(), 1, "fixture has exactly one row");

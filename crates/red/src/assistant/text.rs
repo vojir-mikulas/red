@@ -486,7 +486,7 @@ mod tests {
         // The chat stores the agent id verbatim; a turn carries it to the backend,
         // which resolves the kind (the panel no longer maps it). Any id round-trips.
         for id in ["anthropic", "subscription", "codex", "local"] {
-            let chat = ChatSession::new(0, id.to_string());
+            let chat = ChatSession::new(red_service::ConversationId::new(0), id.to_string());
             assert_eq!(chat.provider, id);
         }
     }

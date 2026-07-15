@@ -14,11 +14,11 @@
 use std::collections::{HashMap, HashSet};
 
 use flint::{CellRange, TextInput, TextInputEvent, ToastVariant};
-use gpui::{prelude::*, Context, Entity, Focusable, Subscription};
-use red_core::{coerce_edit_value, ColumnValue, EditOp, TableRef, Value};
+use gpui::{Context, Entity, Focusable, Subscription, prelude::*};
+use red_core::{ColumnValue, EditOp, TableRef, Value, coerce_edit_value};
 
-use super::buffer::DisplayCell;
 use super::ResultGrid;
+use super::buffer::DisplayCell;
 use crate::app::{AppState, ForeignEdit, Pane, PendingWrite, Phase};
 
 /// A hashable identity for a row's primary-key value, so staged edits survive the
@@ -148,11 +148,7 @@ impl PendingChanges {
 }
 
 fn plural(n: usize) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
-    }
+    if n == 1 { "" } else { "s" }
 }
 
 /// The per-frame render overlay built by [`PendingChanges::overlay`]: staged cell
@@ -193,7 +189,7 @@ pub(crate) struct GridEdit {
     pub(crate) input: Entity<TextInput>,
     pub(crate) slot: EditSlot,
     pub(crate) decl_type: Option<String>,
-    pub(crate) epoch: u64,
+    pub(crate) epoch: red_service::Epoch,
     _sub: Subscription,
 }
 
@@ -371,7 +367,7 @@ impl AppState {
         &mut self,
         slot: EditSlot,
         decl_type: Option<String>,
-        epoch: u64,
+        epoch: red_service::Epoch,
         current: &Value,
         cx: &mut Context<Self>,
     ) {
@@ -483,7 +479,7 @@ impl AppState {
     /// Tab / Shift-Tab from the open inline editor: commit the current cell, then
     /// open the editor on the next (`forward`) / previous editable cell so a row can
     /// be filled without the mouse. A coercion failure keeps the field open to fix
-    /// (mirrors [`commit_grid_edit`]). Tab past the last cell of the last draft row
+    /// (mirrors `commit_grid_edit`). Tab past the last cell of the last draft row
     /// starts a fresh draft; Shift-Tab off the first cell just returns to the grid.
     pub(crate) fn advance_grid_edit(&mut self, forward: bool, cx: &mut Context<Self>) {
         let Some(edit) = self.grid_edit.take() else {
@@ -581,12 +577,12 @@ impl AppState {
             if Some(c) == pk_idx {
                 continue; // identity column is never editable; skip without a probe
             }
-            if let Phase::Connected(active) = &mut self.phase {
-                if let Some(grid) = active.active_result_mut() {
-                    grid.selection = Some(CellRange::single(r, c + gutter));
-                    grid.scroll_cursor_into_view(r, row_height);
-                    grid.scroll_col_into_view(c + gutter, gutter);
-                }
+            if let Phase::Connected(active) = &mut self.phase
+                && let Some(grid) = active.active_result_mut()
+            {
+                grid.selection = Some(CellRange::single(r, c + gutter));
+                grid.scroll_cursor_into_view(r, row_height);
+                grid.scroll_col_into_view(c + gutter, gutter);
             }
             // `begin_grid_edit` re-resolves the edit target for the moved cursor and
             // no-ops on a non-editable cell; only open when it will actually take.
@@ -650,7 +646,7 @@ impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn stage_existing_value(
         &mut self,
-        epoch: u64,
+        epoch: red_service::Epoch,
         row: usize,
         data_col: usize,
         pk_value: Value,
@@ -661,31 +657,31 @@ impl AppState {
         let Some(pk) = PkKey::from_value(&pk_value) else {
             return;
         };
-        if let Phase::Connected(active) = &mut self.phase {
-            if let Some(grid) = active.active_result_mut() {
-                if grid.epoch != epoch {
-                    return; // the result was replaced under the in-flight edit
-                }
-                if value == original {
-                    if let Some(u) = grid.pending.updates.get_mut(&pk) {
-                        u.cells.remove(&data_col);
-                        if u.cells.is_empty() {
-                            grid.pending.updates.remove(&pk);
-                        }
+        if let Phase::Connected(active) = &mut self.phase
+            && let Some(grid) = active.active_result_mut()
+        {
+            if grid.epoch != epoch {
+                return; // the result was replaced under the in-flight edit
+            }
+            if value == original {
+                if let Some(u) = grid.pending.updates.get_mut(&pk) {
+                    u.cells.remove(&data_col);
+                    if u.cells.is_empty() {
+                        grid.pending.updates.remove(&pk);
                     }
-                } else {
-                    let entry = grid
-                        .pending
-                        .updates
-                        .entry(pk)
-                        .or_insert_with(|| UpdatedRow {
-                            pk_value,
-                            row,
-                            cells: HashMap::new(),
-                        });
-                    entry.row = row;
-                    entry.cells.insert(data_col, StagedCell { value, foreign });
                 }
+            } else {
+                let entry = grid
+                    .pending
+                    .updates
+                    .entry(pk)
+                    .or_insert_with(|| UpdatedRow {
+                        pk_value,
+                        row,
+                        cells: HashMap::new(),
+                    });
+                entry.row = row;
+                entry.cells.insert(data_col, StagedCell { value, foreign });
             }
         }
     }
@@ -695,20 +691,24 @@ impl AppState {
     /// so the column falls back to the engine default (rendered as a faint "default")
     /// instead of inserting an explicit `NULL` — clearing a draft cell means "leave it
     /// to the default", matching DataGrip's new-row behaviour.
-    fn stage_draft_value(&mut self, epoch: u64, index: usize, data_col: usize, value: Value) {
-        if let Phase::Connected(active) = &mut self.phase {
-            if let Some(grid) = active.active_result_mut() {
-                if grid.epoch == epoch {
-                    if let Some(draft) = grid.pending.inserts.get_mut(index) {
-                        match value {
-                            Value::Null => {
-                                draft.cells.remove(&data_col);
-                            }
-                            v => {
-                                draft.cells.insert(data_col, v);
-                            }
-                        }
-                    }
+    fn stage_draft_value(
+        &mut self,
+        epoch: red_service::Epoch,
+        index: usize,
+        data_col: usize,
+        value: Value,
+    ) {
+        if let Phase::Connected(active) = &mut self.phase
+            && let Some(grid) = active.active_result_mut()
+            && grid.epoch == epoch
+            && let Some(draft) = grid.pending.inserts.get_mut(index)
+        {
+            match value {
+                Value::Null => {
+                    draft.cells.remove(&data_col);
+                }
+                v => {
+                    draft.cells.insert(data_col, v);
                 }
             }
         }
@@ -740,12 +740,12 @@ impl AppState {
         if !self.editing_enabled() {
             return;
         }
-        if let Phase::Connected(active) = &mut self.phase {
-            if let Some(grid) = active.active_result_mut() {
-                // Only a keyed single-table browse can be inserted into.
-                if grid.editable_browse() {
-                    grid.pending.inserts.push(DraftRow::default());
-                }
+        if let Phase::Connected(active) = &mut self.phase
+            && let Some(grid) = active.active_result_mut()
+        {
+            // Only a keyed single-table browse can be inserted into.
+            if grid.editable_browse() {
+                grid.pending.inserts.push(DraftRow::default());
             }
         }
         cx.notify();
@@ -756,12 +756,11 @@ impl AppState {
     pub(crate) fn remove_draft_row(&mut self, index: usize, cx: &mut Context<Self>) {
         self.grid_edit = None;
         self.cell_suggest = None;
-        if let Phase::Connected(active) = &mut self.phase {
-            if let Some(grid) = active.active_result_mut() {
-                if index < grid.pending.inserts.len() {
-                    grid.pending.inserts.remove(index);
-                }
-            }
+        if let Phase::Connected(active) = &mut self.phase
+            && let Some(grid) = active.active_result_mut()
+            && index < grid.pending.inserts.len()
+        {
+            grid.pending.inserts.remove(index);
         }
         cx.notify();
     }
@@ -773,25 +772,25 @@ impl AppState {
         if !self.editing_enabled() {
             return;
         }
-        if let Phase::Connected(active) = &mut self.phase {
-            if let Some(grid) = active.active_result_mut() {
-                let Some(pk_idx) = grid.pk_column_index() else {
-                    return;
+        if let Phase::Connected(active) = &mut self.phase
+            && let Some(grid) = active.active_result_mut()
+        {
+            let Some(pk_idx) = grid.pk_column_index() else {
+                return;
+            };
+            let Some(sel) = grid.selection else { return };
+            let (r0, _, r1, _) = sel.bounds();
+            for row in r0..=r1 {
+                let Some(pk_value) = grid.cell_value(row, pk_idx) else {
+                    continue;
                 };
-                let Some(sel) = grid.selection else { return };
-                let (r0, _, r1, _) = sel.bounds();
-                for row in r0..=r1 {
-                    let Some(pk_value) = grid.cell_value(row, pk_idx) else {
-                        continue;
-                    };
-                    let Some(pk) = PkKey::from_value(&pk_value) else {
-                        continue;
-                    };
-                    if grid.pending.deletes.remove(&pk).is_none() {
-                        grid.pending
-                            .deletes
-                            .insert(pk, DeletedRow { pk_value, row });
-                    }
+                let Some(pk) = PkKey::from_value(&pk_value) else {
+                    continue;
+                };
+                if grid.pending.deletes.remove(&pk).is_none() {
+                    grid.pending
+                        .deletes
+                        .insert(pk, DeletedRow { pk_value, row });
                 }
             }
         }
@@ -838,10 +837,10 @@ impl AppState {
     pub(crate) fn revert_changes(&mut self, cx: &mut Context<Self>) {
         self.grid_edit = None;
         self.cell_suggest = None;
-        if let Phase::Connected(active) = &mut self.phase {
-            if let Some(grid) = active.active_result_mut() {
-                grid.pending = PendingChanges::default();
-            }
+        if let Phase::Connected(active) = &mut self.phase
+            && let Some(grid) = active.active_result_mut()
+        {
+            grid.pending = PendingChanges::default();
         }
         cx.notify();
     }
@@ -850,7 +849,12 @@ impl AppState {
     /// the result. Updates-only batches patch the resident buffer in place (rows
     /// didn't move); a batch that deleted or inserted rows reloads the result so
     /// row positions, totals, and server-assigned values re-resolve.
-    pub(crate) fn on_batch_applied(&mut self, epoch: u64, _applied: u64, cx: &mut Context<Self>) {
+    pub(crate) fn on_batch_applied(
+        &mut self,
+        epoch: red_service::Epoch,
+        _applied: u64,
+        cx: &mut Context<Self>,
+    ) {
         let mut reload = false;
         if let Some(grid) = self.result_by_epoch(epoch) {
             // A foreign (inline-expanded FK) edit rewrites a referenced row that may
@@ -884,7 +888,12 @@ impl AppState {
 
     /// A submitted batch failed and rolled back (`BatchFailed`): keep the staged set
     /// (nothing was applied) and surface the engine/assertion message.
-    pub(crate) fn on_batch_failed(&mut self, _epoch: u64, message: String, cx: &mut Context<Self>) {
+    pub(crate) fn on_batch_failed(
+        &mut self,
+        _epoch: red_service::Epoch,
+        message: String,
+        cx: &mut Context<Self>,
+    ) {
         self.notify(ToastVariant::Error, message, cx);
         cx.notify();
     }

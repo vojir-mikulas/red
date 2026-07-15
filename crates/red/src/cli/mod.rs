@@ -13,8 +13,8 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
-use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
+use futures::channel::mpsc::UnboundedReceiver;
 use red_core::{ConnectionConfig, QueryOptions, SshAuth};
 use red_service::{Command, Event, ServiceHandle, SessionId};
 
@@ -26,9 +26,9 @@ use format::{OutFormat, Writer};
 
 /// The source/only session the CLI opens. Single-connection verbs (query, exec,
 /// test) use just this one.
-const PRIMARY: SessionId = SessionId(0);
+const PRIMARY: SessionId = SessionId::new(0);
 /// The target session for the two-connection verbs (copy, migrate).
-const TARGET: SessionId = SessionId(1);
+const TARGET: SessionId = SessionId::new(1);
 
 // Exit codes; a script can branch on the failure class:
 //   0  success
@@ -201,7 +201,7 @@ pub fn run() -> Option<u8> {
 /// CLI logging: quiet by default (warnings/errors to stderr) so stdout stays
 /// pipe-clean, but honour `RUST_LOG` for debugging.
 fn init_tracing() {
-    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
     let _ = tracing_subscriber::registry()
         .with(filter)
@@ -399,6 +399,10 @@ fn cmd_exec(args: ExecArgs) -> u8 {
 /// Spawn the backend and take its event stream.
 fn start() -> (ServiceHandle, EventRx) {
     let mut svc = red_service::spawn();
+    #[allow(
+        clippy::expect_used,
+        reason = "events taken exactly once, right after spawn"
+    )]
     let events = svc.take_events().expect("service event stream");
     (svc, events)
 }

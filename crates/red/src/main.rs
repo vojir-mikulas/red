@@ -62,7 +62,7 @@ mod secrets {
     pub use red_config::secrets::*;
 }
 
-use gpui::{prelude::*, App, Bounds, TitlebarOptions, WindowBounds, WindowOptions};
+use gpui::{App, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*};
 use gpui_platform::application;
 
 use crate::app::AppState;
@@ -125,9 +125,17 @@ fn main() {
 
         // Spawn the Tokio backend and hand its event stream to the root view.
         let mut service = red_service::spawn();
+        #[allow(
+            clippy::expect_used,
+            reason = "events taken exactly once, right after spawn"
+        )]
         let events = service.take_events().expect("service event stream");
 
         let bounds = Bounds::centered(None, gpui::size(gpui::px(1100.0), gpui::px(720.0)), cx);
+        #[allow(
+            clippy::expect_used,
+            reason = "window open failing at startup is unrecoverable"
+        )]
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -187,7 +195,7 @@ fn titlebar_options() -> TitlebarOptions {
 
 /// Initialise `tracing` to stderr. Level is `RUST_LOG` or `info`.
 fn init_tracing() {
-    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::registry()

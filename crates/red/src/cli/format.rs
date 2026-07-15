@@ -6,7 +6,7 @@
 
 use std::io::Write;
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::ValueEnum;
 use red_core::{Column, Value};
 

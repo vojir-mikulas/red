@@ -27,11 +27,11 @@
 //! 64-bit widths, which JSON can't hold losslessly); composites (`Array`, `Tuple`,
 //! `Map`) and the date/decimal/uuid/enum shapes render as text.
 
-use std::fs::{remove_file, File};
+use std::fs::{File, remove_file};
 use std::io::BufWriter;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use red_core::{
@@ -40,14 +40,14 @@ use red_core::{
     RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use serde_json::Value as Json;
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
-use crate::format::{strip_trailing, ExportWriter, ProgressThrottle};
+use crate::format::{ExportWriter, ProgressThrottle, strip_trailing};
 use crate::{
-    driver_err, window_prealloc, AbortSignal, CancelToken, CellCap, DatabaseDriver, PageCap,
-    QueryCursor,
+    AbortSignal, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor, driver_err,
+    window_prealloc,
 };
 
 /// A collected (bounded) read: the result columns, their raw ClickHouse type
@@ -336,7 +336,7 @@ impl ClickhouseDriver {
                 None => {
                     return Err(RedError::Driver(
                         "ClickHouse returned no result header".to_string(),
-                    ))
+                    ));
                 }
             }
         }
@@ -504,12 +504,11 @@ impl DatabaseDriver for ClickhouseDriver {
         &self,
         sql: &str,
         column: &str,
-        numeric: bool,
-        distinct: bool,
+        flags: red_core::StatsFlags,
         abort: &AbortSignal,
     ) -> Result<red_core::ColumnStats> {
         // OLAP loves aggregates; this is a plain read, like every other ClickHouse path.
-        let base = crate::stats_sql(sql, column, numeric, distinct, ch_quote);
+        let base = crate::stats_sql(sql, column, flags, ch_quote);
         let (_, types, rows) = self.run_collect(base, &[], abort).await?;
         // One aggregate row, decoded by the response's column types then read
         // positionally.
@@ -517,7 +516,7 @@ impl DatabaseDriver for ClickhouseDriver {
             .first()
             .map(|r| ch_row(r, &types, None))
             .unwrap_or_default();
-        Ok(crate::parse_stats(&cells, numeric, distinct))
+        Ok(crate::parse_stats(&cells, flags))
     }
 
     async fn fetch_page(
@@ -548,7 +547,7 @@ impl DatabaseDriver for ClickhouseDriver {
         sql: &str,
         key: &KeySpec,
         bound: Option<&[Value]>,
-        descending: bool,
+        scroll: red_core::SortDirection,
         limit: usize,
         abort: &AbortSignal,
     ) -> Result<ResultPage> {
@@ -560,7 +559,7 @@ impl DatabaseDriver for ClickhouseDriver {
         // Typed placeholders `{p0:Int64}` keep the bound a real parameter (bound via
         // `param_p0` URL params), never string-interpolated into the SQL.
         let (where_clause, order_by) =
-            crate::seek_clauses(key, bound.len(), descending, false, ch_quote, |i| {
+            crate::seek_clauses(key, bound.len(), scroll, false, ch_quote, |i| {
                 format!("{{p{i}:{}}}", types[i])
             });
         let base = format!(
@@ -587,10 +586,14 @@ impl DatabaseDriver for ClickhouseDriver {
         let from = from.unwrap_or(&[]);
         let types = from.iter().map(ch_param_type).collect::<Result<Vec<_>>>()?;
         // Inclusive lower bound (`>=`), then `OFFSET skip` within the post-seek window.
-        let (where_clause, order_by) =
-            crate::seek_clauses(key, from.len(), false, true, ch_quote, |i| {
-                format!("{{p{i}:{}}}", types[i])
-            });
+        let (where_clause, order_by) = crate::seek_clauses(
+            key,
+            from.len(),
+            red_core::SortDirection::Asc,
+            true,
+            ch_quote,
+            |i| format!("{{p{i}:{}}}", types[i]),
+        );
         let base = format!(
             "SELECT * FROM ({}) AS _red {where_clause}ORDER BY {order_by} LIMIT {limit} OFFSET {skip}",
             strip_trailing(sql)
@@ -1166,29 +1169,29 @@ fn ch_value(v: &Json, ch_type: &str, max: Option<usize>) -> Value {
         Json::Null => Value::Null,
         Json::Bool(b) => Value::Integer(*b as i64),
         Json::Number(n) => {
-            if is_ch_int(ch_type) {
-                if let Some(i) = n.as_i64() {
-                    return Value::Integer(i);
-                }
+            if is_ch_int(ch_type)
+                && let Some(i) = n.as_i64()
+            {
+                return Value::Integer(i);
             }
-            if is_ch_float(ch_type) {
-                if let Some(f) = n.as_f64() {
-                    return Value::Real(f);
-                }
+            if is_ch_float(ch_type)
+                && let Some(f) = n.as_f64()
+            {
+                return Value::Real(f);
             }
             // Decimal and out-of-i64-range integers keep their exact JSON text.
             text_value(&n.to_string(), max)
         }
         Json::String(s) => {
-            if is_ch_int(ch_type) {
-                if let Ok(i) = s.parse::<i64>() {
-                    return Value::Integer(i);
-                }
+            if is_ch_int(ch_type)
+                && let Ok(i) = s.parse::<i64>()
+            {
+                return Value::Integer(i);
             }
-            if is_ch_float(ch_type) {
-                if let Ok(f) = s.parse::<f64>() {
-                    return Value::Real(f);
-                }
+            if is_ch_float(ch_type)
+                && let Ok(f) = s.parse::<f64>()
+            {
+                return Value::Real(f);
             }
             text_value(s, max)
         }
@@ -1249,7 +1252,7 @@ fn ch_param_type(v: &Value) -> Result<&'static str> {
         Value::Blob(_) | Value::Null | Value::Capped(_) => {
             return Err(RedError::Query(
                 "unsupported ClickHouse seek bound".to_string(),
-            ))
+            ));
         }
     })
 }
@@ -1607,10 +1610,10 @@ mod tests {
             column_type: None,
             tiebreak: Some("id".into()),
             tiebreak_type: None,
-            descending: false,
+            direction: red_core::SortDirection::Asc,
         };
         let key_desc = KeySpec {
-            descending: true,
+            direction: red_core::SortDirection::Desc,
             ..key_asc.clone()
         };
         battery::seeks_composite_sorted(
@@ -1734,7 +1737,7 @@ mod tests {
                 &format!("SELECT id, t FROM {t}"),
                 &key,
                 None,
-                false,
+                red_core::SortDirection::Asc,
                 5,
                 &abort,
             )

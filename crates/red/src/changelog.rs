@@ -11,7 +11,7 @@
 //! last resort. The panel renders the result through [`crate::markdown`].
 
 use flint::prelude::*;
-use gpui::{prelude::*, px, Context};
+use gpui::{Context, prelude::*, px};
 
 use crate::app::AppState;
 use crate::assets::CHANGELOG;
@@ -66,7 +66,7 @@ impl AppState {
     /// The "What's New" overlay: this build's changelog section rendered as
     /// Markdown inside a scrollable modal. Reached from the post-update toast, the
     /// Help menu, and the `help: what's new` palette command.
-    pub(crate) fn render_whats_new(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_whats_new(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
         let close_view = cx.entity().downgrade();
         Modal::new("whats-new")

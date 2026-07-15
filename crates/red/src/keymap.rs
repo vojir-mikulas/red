@@ -28,11 +28,11 @@
 use std::collections::BTreeMap;
 
 use flint::{CodeEditor, ComboBox, Modal, Palette, SelectableLabel, Switcher, TextInput};
-use gpui::{actions, App, KeyBinding, KeyBindingContextPredicate, Keystroke, NoAction};
+use gpui::{App, KeyBinding, KeyBindingContextPredicate, Keystroke, NoAction, actions};
 
+use crate::Quit;
 use crate::keymap_config::KeymapBlock;
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
-use crate::Quit;
 
 // App-chrome actions reachable by keyboard. Editing actions come from Flint's
 // `TextInput` / `CodeEditor`; the grid/tree navigation actions live with their
@@ -755,7 +755,13 @@ fn default_bindings() -> Vec<KeyBinding> {
     DEFAULTS
         .iter()
         .map(|d| {
-            bind_named(d.keystroke, d.action, d.context).expect("DEFAULTS holds a valid binding")
+            #[allow(
+                clippy::expect_used,
+                reason = "DEFAULTS is a compile-time table of valid bindings"
+            )]
+            let bound = bind_named(d.keystroke, d.action, d.context)
+                .expect("DEFAULTS holds a valid binding");
+            bound
         })
         .collect()
 }
@@ -769,13 +775,13 @@ fn user_bindings(blocks: &[KeymapBlock], warnings: &mut Vec<String>) -> Vec<KeyB
         let context = block.context.as_deref();
         // Validate the block's context once; a bad predicate skips the whole block
         // (every binding in it would fail identically).
-        if let Some(c) = context {
-            if let Err(e) = KeyBindingContextPredicate::parse(c) {
-                warnings.push(format!(
-                    "keymap.toml: bad context “{c}” ({e}); skipping its bindings"
-                ));
-                continue;
-            }
+        if let Some(c) = context
+            && let Err(e) = KeyBindingContextPredicate::parse(c)
+        {
+            warnings.push(format!(
+                "keymap.toml: bad context “{c}” ({e}); skipping its bindings"
+            ));
+            continue;
         }
         for (keystroke, action) in &block.bindings {
             match make_binding(keystroke, action, context) {
@@ -815,7 +821,7 @@ fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<Ke
     let keystroke = platform_chord(keystroke);
     let keystroke = keystroke.as_str();
     macro_rules! kb {
-        ($action:expr) => {
+        ($action:expr_2021) => {
             KeyBinding::new(keystroke, $action, context)
         };
     }
@@ -1134,7 +1140,7 @@ mod tests {
     fn conflict_detects_same_context_duplicate() {
         let slots = effective_slots(&[]);
         let filter = row_of("ToggleFilter", Some("RedRoot")); // cmd-shift-f
-                                                              // cmd-t already binds NewTab in RedRoot.
+        // cmd-t already binds NewTab in RedRoot.
         assert_eq!(
             conflict_for(&slots, filter, "cmd-t"),
             Some(row_of("NewTab", Some("RedRoot")))

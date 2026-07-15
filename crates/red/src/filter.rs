@@ -11,7 +11,7 @@
 //! raw SQL `WHERE` expression for power users (trusted like editor SQL).
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, AnyElement, Context, Entity};
+use gpui::{AnyElement, Context, Entity, div, prelude::*, px};
 use red_core::ResultFilter;
 
 use crate::app::AppState;

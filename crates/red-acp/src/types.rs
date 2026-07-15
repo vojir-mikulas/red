@@ -52,7 +52,7 @@ pub struct AcpCommand {
 /// One session configuration selector the agent advertises (ACP `config_options`),
 /// e.g. a model picker or a reasoning-level picker. Only single-select (`Select`)
 /// options are surfaced; the UI renders each as a dropdown. The `id`/`value` strings
-/// are opaque agent identifiers round-tripped back via [`AcpConversation::set_config`].
+/// are opaque agent identifiers round-tripped back via `AcpConversation::set_config`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcpConfigOption {
     pub id: String,

@@ -611,9 +611,9 @@ pub fn decode_pickle(bytes: &[u8]) -> Option<String> {
             }
             b'h' => {
                 let i = cur.u8()? as u64; // BINGET
-                                          // A reference to an undefined memo slot means the pickle is
-                                          // malformed/truncated: bail (fall back to hex) rather than
-                                          // fabricating a Null.
+                // A reference to an undefined memo slot means the pickle is
+                // malformed/truncated: bail (fall back to hex) rather than
+                // fabricating a Null.
                 let v = memo.get(&i)?;
                 let n = node_count_capped(v, MAX_NODES - total_nodes);
                 if total_nodes + n > MAX_NODES {
@@ -1260,7 +1260,7 @@ mod tests {
         assert_eq!(decode_msgpack(b"\xc3").unwrap(), "true");
         assert_eq!(decode_msgpack(b"\xcc\x80").unwrap(), "128"); // uint8 128
         assert_eq!(decode_msgpack(b"\xff").unwrap(), "-1"); // negative fixint
-                                                            // Trailing byte after a complete value: not a clean single value.
+        // Trailing byte after a complete value: not a clean single value.
         assert!(decode_msgpack(b"\xc3\x00\x99").is_none());
         assert!(decode_msgpack(b"").is_none());
     }
@@ -1393,7 +1393,9 @@ mod tests {
     #[test]
     fn decompress_inflates_a_real_gzip_stream() {
         // `printf 'hello, redis world! hello, redis world!' | gzip -n`
-        let gz = unhex("1f8b0800000000000003cb48cdc9c9d751284a4dc92c5628cf2fca495154c8c014030020f4948827000000");
+        let gz = unhex(
+            "1f8b0800000000000003cb48cdc9c9d751284a4dc92c5628cf2fca495154c8c014030020f4948827000000",
+        );
         let out = decompress(&gz).unwrap();
         assert_eq!(out, b"hello, redis world! hello, redis world!");
     }

@@ -1,0 +1,7 @@
+# Panic-hygiene lints (see [workspace.lints]) legitimately fire in test code,
+# where unwrap/expect/dbg are idiomatic. Exempt tests so the restriction lints
+# only guard shipped paths.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-dbg-in-tests = true
+allow-panic-in-tests = true

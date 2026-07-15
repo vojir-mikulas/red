@@ -11,8 +11,8 @@
 
 use flint::prelude::*;
 use gpui::{
-    canvas, div, point, prelude::*, px, Anchor, AnyElement, Bounds, Context, Entity, Pixels,
-    ScrollHandle, SharedString, Window,
+    Anchor, AnyElement, Bounds, Context, Entity, Pixels, ScrollHandle, SharedString, Window,
+    canvas, div, point, prelude::*, px,
 };
 use red_core::{ColumnMeta, LookupRow, TableRef, Value};
 use red_service::{Command, SessionId};
@@ -35,7 +35,7 @@ const FK_ENUM_CACHE_CAP: usize = 256;
 /// held on [`AppState::cell_suggest`] beside the editor it decorates.
 pub(crate) struct CellSuggest {
     /// The result epoch the editor belongs to (drops a stale `LookupReady`).
-    pub(crate) epoch: u64,
+    pub(crate) epoch: red_service::Epoch,
     /// The referenced `(schema, table)` — the cache key and `LookupReady` match key.
     /// `schema` is kept raw (possibly empty) so it round-trips through the command.
     pub(crate) target: (String, String),
@@ -102,7 +102,7 @@ struct LookupSpec {
 impl AppState {
     /// Resolve the FK lookup target for the editor's `data_col`, or `None` when the
     /// column isn't a single-column foreign key of the browse's base table. Independent
-    /// of the cursor (works for a draft row's cell too), mirroring [`reference_menu`].
+    /// of the cursor (works for a draft row's cell too), mirroring `reference_menu`.
     fn fk_lookup_spec(&self, data_col: usize) -> Option<LookupSpec> {
         let Phase::Connected(active) = &self.phase else {
             return None;
@@ -137,11 +137,11 @@ impl AppState {
     /// foreign-key id list (fetched/cached per target) if the column is an FK, else an
     /// enum value list (from the per-table enum cache) if the column is an enum, else
     /// nothing. For a not-yet-loaded enum table it triggers the one-time load and shows
-    /// the picker when [`on_enums_loaded`] arrives. Called by `open_cell_editor` for
+    /// the picker when `on_enums_loaded` arrives. Called by `open_cell_editor` for
     /// every cell.
     pub(crate) fn open_cell_suggest(
         &mut self,
-        epoch: u64,
+        epoch: red_service::Epoch,
         data_col: usize,
         cx: &mut Context<Self>,
     ) {
@@ -267,32 +267,32 @@ impl AppState {
     ) {
         let key = (table.schema.unwrap_or_default(), table.name);
         if let Some(active) = self.conn_mut(session) {
-            if active.enum_cache.len() >= FK_ENUM_CACHE_CAP && !active.enum_cache.contains_key(&key)
+            if active.enum_cache.len() >= FK_ENUM_CACHE_CAP
+                && !active.enum_cache.contains_key(&key)
+                && let Some(victim) = active.enum_cache.keys().next().cloned()
             {
-                if let Some(victim) = active.enum_cache.keys().next().cloned() {
-                    active.enum_cache.remove(&victim);
-                    // Keep the "already requested" guard in sync, or the evicted
-                    // table's enums could never be re-fetched.
-                    active.enum_requested.remove(&victim);
-                }
+                active.enum_cache.remove(&victim);
+                // Keep the "already requested" guard in sync, or the evicted
+                // table's enums could never be re-fetched.
+                active.enum_requested.remove(&victim);
             }
             active.enum_cache.insert(key, columns);
         }
-        if self.cell_suggest.is_none() {
-            if let Some((epoch, data_col)) = self.grid_edit.as_ref().map(|e| {
+        if self.cell_suggest.is_none()
+            && let Some((epoch, data_col)) = self.grid_edit.as_ref().map(|e| {
                 let col = match &e.slot {
                     EditSlot::Row { data_col, .. } | EditSlot::Draft { data_col, .. } => *data_col,
                 };
                 (e.epoch, col)
-            }) {
-                self.open_cell_suggest(epoch, data_col, cx);
-            }
+            })
+        {
+            self.open_cell_suggest(epoch, data_col, cx);
         }
         cx.notify();
     }
 
     /// Send the `FetchLookup` for `spec` (an FK target not yet cached).
-    fn request_lookup(&self, spec: LookupSpec, epoch: u64) {
+    fn request_lookup(&self, spec: LookupSpec, epoch: red_service::Epoch) {
         let (schema, name) = spec.target;
         self.send_active(Command::FetchLookup {
             epoch,
@@ -312,7 +312,7 @@ impl AppState {
     pub(crate) fn on_lookup_ready(
         &mut self,
         session: Option<SessionId>,
-        epoch: u64,
+        epoch: red_service::Epoch,
         target: TableRef,
         rows: Vec<LookupRow>,
         cx: &mut Context<Self>,
@@ -322,22 +322,23 @@ impl AppState {
         if let Some(active) = self.conn_mut(session) {
             if active.lookup_cache.len() >= FK_ENUM_CACHE_CAP
                 && !active.lookup_cache.contains_key(&key)
+                && let Some(victim) = active.lookup_cache.keys().next().cloned()
             {
-                if let Some(victim) = active.lookup_cache.keys().next().cloned() {
-                    active.lookup_cache.remove(&victim);
-                }
+                active.lookup_cache.remove(&victim);
             }
             active.lookup_cache.insert(key.clone(), rows.clone());
         }
         // The epoch is process-unique, so an epoch+target match is unambiguously this
         // editor's picker regardless of which session replied.
-        if let Some(s) = &mut self.cell_suggest {
-            if s.from_lookup && s.epoch == epoch && s.target == key {
-                s.items = rows;
-                s.loading = false;
-                let q = s.query.clone();
-                s.recompute(&q);
-            }
+        if let Some(s) = &mut self.cell_suggest
+            && s.from_lookup
+            && s.epoch == epoch
+            && s.target == key
+        {
+            s.items = rows;
+            s.loading = false;
+            let q = s.query.clone();
+            s.recompute(&q);
         }
         cx.notify();
     }
@@ -346,15 +347,16 @@ impl AppState {
     /// user types the id). Pane-scoped, no toast.
     pub(crate) fn on_lookup_failed(
         &mut self,
-        epoch: u64,
+        epoch: red_service::Epoch,
         target: TableRef,
         cx: &mut Context<Self>,
     ) {
         let key = (target.schema.unwrap_or_default(), target.name);
-        if let Some(s) = &mut self.cell_suggest {
-            if s.epoch == epoch && s.target == key {
-                s.loading = false;
-            }
+        if let Some(s) = &mut self.cell_suggest
+            && s.epoch == epoch
+            && s.target == key
+        {
+            s.loading = false;
         }
         cx.notify();
     }
@@ -419,7 +421,7 @@ impl AppState {
     }
 
     /// Pick the suggestion at list position `pos` (a click): highlight it, then commit
-    /// the editor, which reads it back through [`suggest_selected_value`]. The list is
+    /// the editor, which reads it back through `suggest_selected_value`. The list is
     /// non-focusable, so the click doesn't blur the field before this runs.
     pub(crate) fn accept_suggest(&mut self, pos: usize, cx: &mut Context<Self>) {
         if let Some(s) = &mut self.cell_suggest {
@@ -647,7 +649,7 @@ mod tests {
     #[test]
     fn recompute_filters_case_insensitively_over_id_and_label() {
         let mut s = CellSuggest {
-            epoch: 1,
+            epoch: red_service::Epoch::new(1),
             target: ("s".into(), "t".into()),
             items: vec![
                 LookupRow {

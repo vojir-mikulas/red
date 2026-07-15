@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use mysql_async::consts::ColumnType;
@@ -33,11 +33,11 @@ use red_core::{
     ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
-use crate::format::{strip_trailing, ExportWriter, ProgressThrottle};
+use crate::format::{ExportWriter, ProgressThrottle, strip_trailing};
 use crate::{
-    driver_err, AbortSignal, ArmGuard, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor,
+    AbortSignal, ArmGuard, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor, driver_err,
 };
 
 /// A live MySQL/MariaDB session. Holds a connection `Pool`: cursors take a
@@ -131,10 +131,10 @@ impl MysqlDriver {
                 if !alive.load(Ordering::SeqCst) {
                     return;
                 }
-                if let Ok(mut c) = pool.get_conn().await {
-                    if alive.load(Ordering::SeqCst) {
-                        let _ = c.query_drop(format!("KILL QUERY {conn_id}")).await;
-                    }
+                if let Ok(mut c) = pool.get_conn().await
+                    && alive.load(Ordering::SeqCst)
+                {
+                    let _ = c.query_drop(format!("KILL QUERY {conn_id}")).await;
                 }
             });
         })
@@ -471,13 +471,10 @@ impl DatabaseDriver for MysqlDriver {
         &self,
         sql: &str,
         column: &str,
-        numeric: bool,
-        distinct: bool,
+        flags: red_core::StatsFlags,
         abort: &AbortSignal,
     ) -> Result<red_core::ColumnStats> {
-        let sql = crate::stats_sql(sql, column, numeric, distinct, |c| {
-            format!("`{}`", escape_ident(c))
-        });
+        let sql = crate::stats_sql(sql, column, flags, |c| format!("`{}`", escape_ident(c)));
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
         let _guard = self.arm_kill(abort, conn.id());
         if abort.is_aborted() {
@@ -487,7 +484,7 @@ impl DatabaseDriver for MysqlDriver {
         let rows: Vec<Row> = conn.exec(&stmt, ()).await.map_err(map_my_err)?;
         // One aggregate row, mapped full-fidelity then read positionally.
         let cells = rows.first().map(|r| my_row(r, None)).unwrap_or_default();
-        Ok(crate::parse_stats(&cells, numeric, distinct))
+        Ok(crate::parse_stats(&cells, flags))
     }
 
     async fn fetch_page(
@@ -522,7 +519,7 @@ impl DatabaseDriver for MysqlDriver {
         sql: &str,
         key: &KeySpec,
         bound: Option<&[Value]>,
-        descending: bool,
+        scroll: red_core::SortDirection,
         limit: usize,
         abort: &AbortSignal,
     ) -> Result<ResultPage> {
@@ -531,7 +528,7 @@ impl DatabaseDriver for MysqlDriver {
         let (where_clause, order_by) = crate::seek_clauses(
             key,
             bound_len,
-            descending,
+            scroll,
             false,
             |c| format!("`{}`", escape_ident(c)),
             |_| "?".into(),
@@ -557,7 +554,7 @@ impl DatabaseDriver for MysqlDriver {
         let (where_clause, order_by) = crate::seek_clauses(
             key,
             bound_len,
-            false,
+            red_core::SortDirection::Asc,
             true,
             |c| format!("`{}`", escape_ident(c)),
             |_| "?".into(),
@@ -908,7 +905,7 @@ impl QueryCursor for MyCursor {
                     return Ok(RowWindow {
                         rows,
                         exhausted: true,
-                    })
+                    });
                 }
             }
         }
@@ -1107,6 +1104,10 @@ fn group_indexes(rows: &[Row]) -> Vec<IndexMeta> {
     order
         .into_iter()
         .map(|name| {
+            #[allow(
+                clippy::expect_used,
+                reason = "every name in `order` was inserted into `by_name` just above"
+            )]
             let (unique, mut cols) = by_name
                 .remove(&name)
                 .expect("invariant: every name in `order` was inserted into `by_name`");
@@ -1132,10 +1133,10 @@ fn escape_ident(s: &str) -> String {
 /// 1044 = access denied to database, 1049 = unknown database; none retry away.
 /// Anything else (refused/unreachable host) stays a retryable `Connect`.
 fn map_connect_err(e: MyError) -> RedError {
-    if let MyError::Server(ref se) = e {
-        if matches!(se.code, 1045 | 1044 | 1049) {
-            return RedError::Auth(se.message.clone());
-        }
+    if let MyError::Server(ref se) = e
+        && matches!(se.code, 1045 | 1044 | 1049)
+    {
+        return RedError::Auth(se.message.clone());
     }
     RedError::Connect(e.to_string())
 }
@@ -1143,10 +1144,10 @@ fn map_connect_err(e: MyError) -> RedError {
 /// Map a killed query (`KILL QUERY` → error 1317, SQLSTATE `70100`) to the
 /// distinct `Interrupted`; everything else is a driver error.
 fn map_my_err(e: MyError) -> RedError {
-    if let MyError::Server(ref se) = e {
-        if se.code == 1317 || se.code == 1927 || se.state == "70100" {
-            return RedError::Interrupted;
-        }
+    if let MyError::Server(ref se) = e
+        && (se.code == 1317 || se.code == 1927 || se.state == "70100")
+    {
+        return RedError::Interrupted;
     }
     driver_err(e)
 }
@@ -1473,10 +1474,10 @@ mod tests {
             column_type: None,
             tiebreak: Some("id".into()),
             tiebreak_type: None,
-            descending: false,
+            direction: red_core::SortDirection::Asc,
         };
         let key_desc = KeySpec {
-            descending: true,
+            direction: red_core::SortDirection::Desc,
             ..key_asc.clone()
         };
         battery::seeks_composite_sorted(
@@ -1567,11 +1568,13 @@ mod tests {
             .await
             .unwrap()
             .with_scope(Some(String::new()));
-        assert!(cleared
-            .list_objects()
-            .await
-            .unwrap()
-            .iter()
-            .any(|s| s.name == schema));
+        assert!(
+            cleared
+                .list_objects()
+                .await
+                .unwrap()
+                .iter()
+                .any(|s| s.name == schema)
+        );
     }
 }

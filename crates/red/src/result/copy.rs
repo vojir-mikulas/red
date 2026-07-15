@@ -13,7 +13,7 @@
 use flint::prelude::*;
 use gpui::Context;
 use red_core::{Column, ColumnMap, ConnectionConfig, CopyMode, ObjectKind, TableRef};
-use red_service::{Command, SessionId};
+use red_service::{Command, OpId, SessionId};
 
 use crate::app::{
     AppState, CopyNamespace, CopyTargetCandidate, ExportProgress, Notification, PendingWrite,
@@ -131,10 +131,10 @@ impl AppState {
                 ns.name == schema && ns.objects.iter().any(|o| o.name.eq_ignore_ascii_case(name))
             })
         };
-        if let Phase::Connected(active) = &self.phase {
-            if active.session == session {
-                return has(&active.schema);
-            }
+        if let Phase::Connected(active) = &self.phase
+            && active.session == session
+        {
+            return has(&active.schema);
         }
         self.parked.get(&session).is_some_and(|c| has(&c.schema))
     }
@@ -145,7 +145,7 @@ impl AppState {
     /// the copy confirm so the user sees exactly what will move before any write.
     pub(crate) fn on_copy_target_columns(
         &mut self,
-        id: u64,
+        id: OpId,
         target_cols: Vec<Column>,
         cx: &mut Context<Self>,
     ) {
@@ -163,10 +163,10 @@ impl AppState {
             {
                 Some(idx) => {
                     let scol = &peek.source_cols[idx];
-                    if let (Some(sd), Some(td)) = (&scol.decl_type, &tcol.decl_type) {
-                        if type_changed(sd, td) {
-                            lossy.push(format!("{} ({sd} → {td})", tcol.name));
-                        }
+                    if let (Some(sd), Some(td)) = (&scol.decl_type, &tcol.decl_type)
+                        && type_changed(sd, td)
+                    {
+                        lossy.push(format!("{} ({sd} → {td})", tcol.name));
                     }
                     mapping.push(ColumnMap {
                         source: idx,
@@ -251,8 +251,8 @@ impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start_copy(
         &mut self,
-        id: u64,
-        source_epoch: u64,
+        id: OpId,
+        source_epoch: red_service::Epoch,
         target: TableRef,
         target_session: SessionId,
         mapping: Vec<ColumnMap>,
@@ -303,7 +303,7 @@ impl AppState {
     }
 
     /// The notification id of the transfer toast carrying copy `id`, if still shown.
-    fn copy_notification_id(&self, copy_id: u64) -> Option<u64> {
+    fn copy_notification_id(&self, copy_id: OpId) -> Option<u64> {
         self.notifications
             .iter()
             .find(|n| n.export.as_ref().is_some_and(|e| e.id == copy_id))
@@ -313,7 +313,7 @@ impl AppState {
     /// The kind (Copy vs Migrate) of the transfer toast carrying `copy_id`; the
     /// shared `Copy*` handlers read it for the right verb; defaults to `Copy` if the
     /// toast is already gone.
-    fn copy_kind(&self, copy_id: u64) -> TransferKind {
+    fn copy_kind(&self, copy_id: OpId) -> TransferKind {
         self.notifications
             .iter()
             .find_map(|n| {
@@ -326,26 +326,25 @@ impl AppState {
     }
 
     /// `CopyProgress`: advance the copy/migrate toast's row count + percentage.
-    pub(crate) fn on_copy_progress(&mut self, id: u64, rows: usize, cx: &mut Context<Self>) {
+    pub(crate) fn on_copy_progress(&mut self, id: OpId, rows: usize, cx: &mut Context<Self>) {
         let (gerund, _, _) = self.copy_kind(id).copy_verbs();
         if let Some(n) = self
             .notifications
             .iter_mut()
             .find(|n| n.export.as_ref().is_some_and(|e| e.id == id))
+            && let Some(export) = &mut n.export
         {
-            if let Some(export) = &mut n.export {
-                export.rows = rows;
-                n.message = match rows.saturating_mul(100).checked_div(export.total) {
-                    Some(pct) => format!("{gerund}… {}%", pct.min(100)).into(),
-                    None => format!("{gerund}… {rows} row(s)").into(),
-                };
-            }
+            export.rows = rows;
+            n.message = match rows.saturating_mul(100).checked_div(export.total) {
+                Some(pct) => format!("{gerund}… {}%", pct.min(100)).into(),
+                None => format!("{gerund}… {rows} row(s)").into(),
+            };
         }
         cx.notify();
     }
 
     /// `CopyFinished`: drop the progress toast, leave an auto-dismissing success.
-    pub(crate) fn on_copy_finished(&mut self, id: u64, rows: usize, cx: &mut Context<Self>) {
+    pub(crate) fn on_copy_finished(&mut self, id: OpId, rows: usize, cx: &mut Context<Self>) {
         let (_, past, _) = self.copy_kind(id).copy_verbs();
         if let Some(nid) = self.copy_notification_id(id) {
             self.dismiss(nid, cx);
@@ -357,7 +356,7 @@ impl AppState {
     /// chunk, so the message says how far it got.
     pub(crate) fn on_copy_failed(
         &mut self,
-        id: u64,
+        id: OpId,
         rows: usize,
         message: String,
         cx: &mut Context<Self>,
@@ -375,7 +374,7 @@ impl AppState {
     }
 
     /// `CopyCancelled`: drop the progress toast; earlier chunks stay committed.
-    pub(crate) fn on_copy_cancelled(&mut self, id: u64, rows: usize, cx: &mut Context<Self>) {
+    pub(crate) fn on_copy_cancelled(&mut self, id: OpId, rows: usize, cx: &mut Context<Self>) {
         let (_, _, noun) = self.copy_kind(id).copy_verbs();
         if let Some(nid) = self.copy_notification_id(id) {
             self.dismiss(nid, cx);
@@ -423,7 +422,7 @@ impl AppState {
     /// user has just picked `target_schema` on `target_session`.
     pub(crate) fn start_migrate(
         &mut self,
-        id: u64,
+        id: OpId,
         source_schema: String,
         tables: Vec<String>,
         target_session: SessionId,

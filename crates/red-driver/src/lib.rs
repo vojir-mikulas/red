@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ColumnMeta, ColumnStats, ColumnValue, DbKind, EditOp, ExportFormat, FkEdge, FkJoin,
-    KeySpec, QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta,
-    TableDetail, TableRef, Value, BASE_ALIAS,
+    BASE_ALIAS, Column, ColumnMeta, ColumnStats, ColumnValue, DbKind, EditOp, ExportFormat, FkEdge,
+    FkJoin, KeySpec, QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta,
+    SortDirection, StatsFlags, TableDetail, TableRef, Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -37,14 +37,14 @@ pub use import::ImportReader;
 pub use kv::{KvDriver, KvMonitorStream, KvSubscription, KvTopology};
 pub use mysql::MysqlDriver;
 pub use postgres::PostgresDriver;
-pub use redis_kv::{sentinel_masters, RedisDriver, SentinelMaster};
+pub use redis_kv::{RedisDriver, SentinelMaster, sentinel_masters};
 pub use sqlite::SqliteDriver;
 
 /// Default bytes of a non-key cell's content a *display* fetch keeps; past it,
 /// text is truncated to a [`Value::Capped`] prefix and a blob to its length only.
 /// The resident-cell budget that keeps the grid's RAM flat over fat `TEXT`/`BLOB`
 /// columns: the driver never materializes the over-cap bytes, so a page of huge
-/// cells can't spike the channel. The live value is [`display_cell_cap`], driven
+/// cells can't spike the channel. The live value is `display_cell_cap`, driven
 /// by `grid.max_cell_chars` via [`set_display_cell_cap`].
 pub const DEFAULT_DISPLAY_CELL_CAP: usize = 4096;
 
@@ -66,7 +66,7 @@ pub(crate) fn display_cell_cap() -> usize {
 }
 
 /// Whether [`DatabaseDriver::fetch_page`] caps oversized cells. The display path
-/// caps non-key cells to [`display_cell_cap`]; the clipboard re-fetch wants the
+/// caps non-key cells to `display_cell_cap`; the clipboard re-fetch wants the
 /// real values, so it asks for `Full`. (The seek paths are always display-capped
 /// and learn their exempt key from their own `KeySpec` argument.)
 #[derive(Clone)]
@@ -146,14 +146,16 @@ pub(crate) fn key_positions(key: &KeySpec, columns: &[Column]) -> [Option<usize>
 pub(crate) fn seek_clauses(
     key: &KeySpec,
     bound_len: usize,
-    scroll_descending: bool,
+    scroll: SortDirection,
     inclusive: bool,
     quote: impl Fn(&str) -> String,
     placeholder: impl Fn(usize) -> String,
 ) -> (String, String) {
     let cols: Vec<String> = key.column_names().iter().map(|c| quote(c)).collect();
-    let descending = key.descending ^ scroll_descending;
-    let (strict, dir) = if descending {
+    // The effective direction composes the key's own sort with the scroll
+    // direction (up vs down), the old `key.descending ^ scroll_descending`.
+    let effective = key.direction.reversed_when(scroll.is_descending());
+    let (strict, dir) = if effective.is_descending() {
         ("<", "DESC")
     } else {
         (">", "ASC")
@@ -337,7 +339,7 @@ pub(crate) fn create_table_sql(
     kind: DbKind,
     quote: impl Fn(&str) -> String,
 ) -> String {
-    use red_core::typemap::{normalize, spell, NormType};
+    use red_core::typemap::{NormType, normalize, spell};
     let qualify = qualify_table(table, &quote);
     let pk_count = columns.iter().filter(|c| c.primary_key).count();
     // SQLite expresses a sole-INTEGER-PK auto-increment column *inline* as
@@ -732,18 +734,17 @@ fn sql_literal(v: &Value, backslash_escapes: bool) -> String {
 pub(crate) fn stats_sql(
     sql: &str,
     column: &str,
-    numeric: bool,
-    distinct: bool,
+    flags: StatsFlags,
     quote: impl Fn(&str) -> String,
 ) -> String {
     let col = quote(column);
     let mut items = vec!["count(*)".to_string(), format!("count({col})")];
-    if distinct {
+    if flags.distinct {
         items.push(format!("count(distinct {col})"));
     }
     items.push(format!("min({col})"));
     items.push(format!("max({col})"));
-    if numeric {
+    if flags.numeric {
         items.push(format!("sum({col})"));
         items.push(format!("avg({col})"));
     }
@@ -760,7 +761,7 @@ pub(crate) fn stats_sql(
 /// `min`/`max`/`sum`/`avg` ride through as typed [`Value`]s so the UI formats them
 /// like grid cells. A NULL `sum`/`avg` (every row null) collapses to `None` so the
 /// bar omits it. `nulls` isn't stored; the UI derives `total - non_null`.
-pub(crate) fn parse_stats(cells: &[Value], numeric: bool, distinct: bool) -> ColumnStats {
+pub(crate) fn parse_stats(cells: &[Value], flags: StatsFlags) -> ColumnStats {
     let int_at = |i: usize| match cells.get(i) {
         Some(Value::Integer(n)) => *n,
         Some(Value::Real(x)) => *x as i64,
@@ -772,7 +773,7 @@ pub(crate) fn parse_stats(cells: &[Value], numeric: bool, distinct: bool) -> Col
     i += 1;
     let non_null = int_at(i);
     i += 1;
-    let distinct = distinct.then(|| {
+    let distinct = flags.distinct.then(|| {
         let d = int_at(i);
         i += 1;
         d
@@ -783,7 +784,7 @@ pub(crate) fn parse_stats(cells: &[Value], numeric: bool, distinct: bool) -> Col
     i += 1;
     // A NULL aggregate (empty/all-null column) → None, so the bar shows no sum/avg.
     let non_null_val = |v: Option<Value>| v.filter(|v| !matches!(v, Value::Null));
-    let (sum, avg) = if numeric {
+    let (sum, avg) = if flags.numeric {
         (
             non_null_val(cells.get(i).cloned()),
             non_null_val(cells.get(i + 1).cloned()),
@@ -993,7 +994,7 @@ pub trait DatabaseDriver: Send + Sync {
     /// column type). Synchronous string building; identifiers are quoted, values are
     /// rendered as literals, never raw UI SQL. NULL values are excluded by the
     /// caller (a null FK isn't followable); `pairs` is non-empty. Each impl delegates
-    /// to [`eq_clause`] with its own identifier quoting.
+    /// to `eq_clause` with its own identifier quoting.
     fn eq_predicate(&self, pairs: &[ColumnValue]) -> String;
 
     /// Wrap `base` so each inline FK expansion (Track B7) `LEFT JOIN`s its referenced
@@ -1002,7 +1003,7 @@ pub trait DatabaseDriver: Send + Sync {
     /// is the base result's columns in order (so the projection can interleave). Returns
     /// `base` unchanged for an empty `joins` or an engine without relational FKs (the
     /// default impl, which ClickHouse keeps); the relational engines override it to
-    /// delegate to [`join_wrap`] with their own identifier quoting. Synchronous string
+    /// delegate to `join_wrap` with their own identifier quoting. Synchronous string
     /// building; identifiers are quoted, never raw UI SQL. The unique-target gate is the
     /// caller's (the UI only offers unique-key FKs), so the join can't change the row
     /// count; `count`, the keyset key, and paging stay correct over the wrapped result.
@@ -1022,7 +1023,7 @@ pub trait DatabaseDriver: Send + Sync {
     /// probed columns). `None` when nothing is searchable (all-blob / empty); the
     /// service then applies no filter. `term` is escaped to match literally, never
     /// interpolated raw. Synchronous: pure string building, no engine round-trip.
-    /// Each impl delegates to [`contains_clause`] with its own quoting/cast/keyword.
+    /// Each impl delegates to `contains_clause` with its own quoting/cast/keyword.
     fn contains_predicate(&self, columns: &[ColumnMeta], term: &str) -> Option<String>;
 
     /// Total row count of `sql`'s result: one pass, no row materialization. Lets
@@ -1033,7 +1034,7 @@ pub trait DatabaseDriver: Send + Sync {
     /// An aggregate summary of `column` over `sql` (the result's already-filtered
     /// SQL), pushed to the engine: builds `SELECT count(*), count(col),
     /// [count(distinct col)], min(col), max(col), [sum(col), avg(col)] FROM (sql)
-    /// AS _red` and reads one row (see [`stats_sql`]/[`parse_stats`]), never
+    /// AS _red` and reads one row (see `stats_sql`/`parse_stats`), never
     /// scanning the materialized window. `numeric` toggles the `sum`/`avg`
     /// aggregates (decided UI-side from the column's declared type), `distinct`
     /// toggles the potentially-expensive `count(distinct col)`. Cancellable via
@@ -1043,14 +1044,13 @@ pub trait DatabaseDriver: Send + Sync {
         &self,
         sql: &str,
         column: &str,
-        numeric: bool,
-        distinct: bool,
+        flags: StatsFlags,
         abort: &AbortSignal,
     ) -> Result<ColumnStats>;
 
     /// A bounded list of a referenced table's existing ids (and an optional label
     /// column) for the in-cell foreign-key picker (Track B8): `SELECT DISTINCT
-    /// <id>[, <label>] FROM <target> ORDER BY <id> LIMIT <limit>` (see [`lookup_sql`]),
+    /// <id>[, <label>] FROM <target> ORDER BY <id> LIMIT <limit>` (see `lookup_sql`),
     /// read back through the tested [`fetch_page`](Self::fetch_page) path so no engine
     /// needs its own body. `target`/`id_column`/`label_column` are quoted with the
     /// engine's [`quote_table`](Self::quote_table)/[`quote_ident`](Self::quote_ident);
@@ -1102,8 +1102,9 @@ pub trait DatabaseDriver: Send + Sync {
     /// so it costs the same at row 200 or 46,000,000, unlike `fetch_page`'s
     /// O(offset).
     ///
-    /// `descending` is the *scroll* direction; it composes (XOR) with the key's
-    /// own [`descending`](KeySpec::descending) sort direction. `bound` carries one
+    /// `scroll` is the *scroll* direction; it composes (via
+    /// [`SortDirection::reversed_when`](red_core::SortDirection::reversed_when))
+    /// with the key's own [`direction`](KeySpec::direction). `bound` carries one
     /// value per leading key column: the full tuple for a contiguous seek, or
     /// just the lead value for a key-space interpolation jump (a prefix
     /// comparison). Each value is bound as a real parameter, never interpolated.
@@ -1112,7 +1113,7 @@ pub trait DatabaseDriver: Send + Sync {
         sql: &str,
         key: &KeySpec,
         bound: Option<&[Value]>,
-        descending: bool,
+        scroll: SortDirection,
         limit: usize,
         abort: &AbortSignal,
     ) -> Result<ResultPage>;
@@ -1163,8 +1164,8 @@ pub trait DatabaseDriver: Send + Sync {
 
     /// Apply a batch of guarded, PK-keyed data edits (Track B6) **atomically** in a
     /// single transaction: render each `op` to dialect SQL with every value **bound**
-    /// (see [`edit_sql`]), run them in order, and assert each touches exactly one row,
-    /// rolling the *whole* batch back and returning [`edit_count_err`] (or the
+    /// (see `edit_sql`), run them in order, and assert each touches exactly one row,
+    /// rolling the *whole* batch back and returning `edit_count_err` (or the
     /// engine error) the moment any op fails or matches ≠1 row, so a multi-edit
     /// submit is all-or-nothing and a stale/non-unique key can't half-apply. A
     /// read-only driver rejects the writes at the engine (defense in depth behind the
@@ -1215,7 +1216,7 @@ pub trait DatabaseDriver: Send + Sync {
     /// foreign type that fails at execute time), `NOT NULL` and a composite
     /// `PRIMARY KEY` are carried, and the `CREATE` runs through the same transaction
     /// wrapper as [`execute`](DatabaseDriver::execute) (shared body:
-    /// [`create_table_sql`]). Defaults, indexes, foreign keys, and auto-increment are
+    /// `create_table_sql`). Defaults, indexes, foreign keys, and auto-increment are
     /// **not** emitted in v1 (see `docs/plans/database-migration.md`). Idempotent
     /// (`IF NOT EXISTS`). A read-only driver (ClickHouse) rejects it at the engine, so
     /// it is never a migration target. Returns the engine's affected-row count (0 for
@@ -1225,7 +1226,7 @@ pub trait DatabaseDriver: Send + Sync {
     /// Qualify + quote `table` for this engine (`"schema"."name"`, `` `schema`.`name` ``)
     /// so the migration job can build a `SELECT * FROM <table>` source query without
     /// interpolating raw identifiers. Pure string, no I/O (shared body:
-    /// [`qualify_table`]). Implemented by every driver, including read-only ClickHouse,
+    /// `qualify_table`). Implemented by every driver, including read-only ClickHouse,
     /// which can be a migration *source*.
     fn quote_table(&self, table: &TableRef) -> String;
 
@@ -1237,7 +1238,7 @@ pub trait DatabaseDriver: Send + Sync {
 
     /// Create a secondary index on `table` over `columns` (optionally `unique`) in this
     /// engine's dialect: the migration's **deferred index pass**, run after the data
-    /// loads (shared body: [`create_index_sql`]). Built from the source table's
+    /// loads (shared body: `create_index_sql`). Built from the source table's
     /// [`IndexMeta`](red_core::IndexMeta); the primary-key-backing index is filtered out
     /// by the caller. A read-only driver (ClickHouse) rejects it. The migrate job treats
     /// a failure as non-fatal (logs + continues; an index is decoration, the data is in).
@@ -1251,7 +1252,7 @@ pub trait DatabaseDriver: Send + Sync {
 
     /// Add a foreign key from `child(columns)` to `parent(ref_columns)` in this engine's
     /// dialect: the migration's **deferred FK pass**, run after all tables exist + are
-    /// filled (so dependency order can't block) (shared body: [`add_fk_sql`]).
+    /// filled (so dependency order can't block) (shared body: `add_fk_sql`).
     /// **SQLite can't `ALTER TABLE ADD CONSTRAINT`**, so its impl returns an error the
     /// migrate job treats as a logged skip; ClickHouse (read-only/OLAP) likewise. The
     /// migrate job is best-effort: a failed FK is logged, not fatal.
@@ -1342,9 +1343,9 @@ impl CancelToken {
 ///
 /// Where [`CancelToken`] is produced *by* the driver (the streaming cursor hands
 /// one back), a one-shot `async fn` can't return a handle before it's awaited, so
-/// this inverts it: the caller owns the handle and the driver [`arm`](Self::arm)s
+/// this inverts it: the caller owns the handle and the driver `arm`s
 /// it with an engine [`CancelToken`] for the fetch's lifetime. The arm is dropped
-/// when the fetch returns ([`ArmGuard`]), so a late `abort` after completion (the
+/// when the fetch returns (`ArmGuard`), so a late `abort` after completion (the
 /// connection already back in a pool and reused) is a harmless no-op.
 ///
 /// A single signal can be armed by several concurrent fetches (the open probe runs
@@ -1611,16 +1612,18 @@ mod tests {
     fn contains_clause_searches_untyped_columns() {
         // A computed/untyped column (`type_name: None`) is searched, not skipped.
         let columns = [col("expr", None)];
-        assert!(contains_clause(
-            &columns,
-            "x",
-            |c| c.into(),
-            |c| c.into(),
-            "LIKE",
-            false,
-            true
-        )
-        .is_some());
+        assert!(
+            contains_clause(
+                &columns,
+                "x",
+                |c| c.into(),
+                |c| c.into(),
+                "LIKE",
+                false,
+                true
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -1813,13 +1816,29 @@ mod tests {
         let q = |c: &str| format!("\"{c}\"");
         // Cheap (non-numeric, distinct withheld): count/count/min/max only.
         assert_eq!(
-            stats_sql("SELECT * FROM t;", "name", false, false, q),
+            stats_sql(
+                "SELECT * FROM t;",
+                "name",
+                StatsFlags {
+                    numeric: false,
+                    distinct: false,
+                },
+                q,
+            ),
             "SELECT count(*), count(\"name\"), min(\"name\"), max(\"name\") \
              FROM (SELECT * FROM t) AS _red"
         );
         // Numeric + distinct: the optional columns slot into the fixed order.
         assert_eq!(
-            stats_sql("SELECT * FROM t", "n", true, true, q),
+            stats_sql(
+                "SELECT * FROM t",
+                "n",
+                StatsFlags {
+                    numeric: true,
+                    distinct: true,
+                },
+                q,
+            ),
             "SELECT count(*), count(\"n\"), count(distinct \"n\"), min(\"n\"), max(\"n\"), \
              sum(\"n\"), avg(\"n\") FROM (SELECT * FROM t) AS _red"
         );
@@ -1837,7 +1856,13 @@ mod tests {
             Value::Integer(4500),
             Value::Real(50.0),
         ];
-        let s = parse_stats(&cells, true, true);
+        let s = parse_stats(
+            &cells,
+            StatsFlags {
+                numeric: true,
+                distinct: true,
+            },
+        );
         assert_eq!(s.total, 100);
         assert_eq!(s.non_null, 90);
         assert_eq!(s.distinct, Some(42));
@@ -1853,7 +1878,13 @@ mod tests {
             Value::Text("a".into()),
             Value::Text("z".into()),
         ];
-        let s = parse_stats(&cells, false, false);
+        let s = parse_stats(
+            &cells,
+            StatsFlags {
+                numeric: false,
+                distinct: false,
+            },
+        );
         assert_eq!(s.distinct, None);
         assert_eq!(s.min, Value::Text("a".into()));
         assert_eq!(s.max, Value::Text("z".into()));
@@ -1870,7 +1901,13 @@ mod tests {
             Value::Null,
             Value::Null,
         ];
-        let s = parse_stats(&cells, true, false);
+        let s = parse_stats(
+            &cells,
+            StatsFlags {
+                numeric: true,
+                distinct: false,
+            },
+        );
         assert_eq!(s.total, 12);
         assert_eq!(s.non_null, 0);
         assert_eq!(s.min, Value::Null);

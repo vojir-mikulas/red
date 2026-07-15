@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use flint::prelude::*;
-use gpui::{div, prelude::*, px, App, Context, Entity, UniformListScrollHandle, Window};
+use gpui::{App, Context, Entity, UniformListScrollHandle, Window, div, prelude::*, px};
 use red_core::{ColumnMeta, DbKind, ObjectKind, ResultFilter, SchemaMeta, TableDetail};
 use red_service::Command;
 
@@ -338,7 +338,7 @@ impl AppState {
         active: &ActiveConn,
         _window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let (bg_panel, faint) = (theme.bg_panel, theme.text_faint);
         let footer_size = theme.scale(10.);
@@ -474,10 +474,10 @@ impl AppState {
         if let Phase::Connected(active) = &mut self.phase {
             let s = &mut active.schema;
             if !s.expanded.remove(&node) {
-                if let NodeId::Object { schema, name } = &node {
-                    if !s.details.contains_key(&(schema.clone(), name.clone())) {
-                        describe = Some((schema.clone(), name.clone()));
-                    }
+                if let NodeId::Object { schema, name } = &node
+                    && !s.details.contains_key(&(schema.clone(), name.clone()))
+                {
+                    describe = Some((schema.clone(), name.clone()));
                 }
                 s.expanded.insert(node);
             }
@@ -564,10 +564,10 @@ impl AppState {
                 let row = &flat[i];
                 if let Some((schema, table)) = row.preview.clone() {
                     self.schema_preview(schema, table, cx);
-                } else if row.item.has_children {
-                    if let Some(node) = row.node.clone() {
-                        self.schema_toggle(node, cx);
-                    }
+                } else if row.item.has_children
+                    && let Some(node) = row.node.clone()
+                {
+                    self.schema_toggle(node, cx);
                 }
             }
         }

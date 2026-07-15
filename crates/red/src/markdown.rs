@@ -6,7 +6,7 @@
 //! prose still wraps naturally. It is intentionally not a full CommonMark engine.
 
 use flint::Theme;
-use gpui::{div, font, prelude::*, px, AnyElement, SharedString, StyledText, TextRun};
+use gpui::{AnyElement, SharedString, StyledText, TextRun, div, font, prelude::*, px};
 
 /// Render Markdown `src` as a column of block elements.
 pub(crate) fn render(src: &str, theme: &Theme) -> AnyElement {
@@ -458,31 +458,33 @@ fn parse_inline(text: &str) -> Vec<(String, Span)> {
     while i < chars.len() {
         let c = chars[i];
         // Inline code: verbatim until the next backtick.
-        if c == '`' {
-            if let Some(end) = find(&chars, i + 1, '`') {
-                push_plain(&mut plain, &mut out);
-                out.push((chars[i + 1..end].iter().collect(), Span::Code));
-                i = end + 1;
-                continue;
-            }
+        if c == '`'
+            && let Some(end) = find(&chars, i + 1, '`')
+        {
+            push_plain(&mut plain, &mut out);
+            out.push((chars[i + 1..end].iter().collect(), Span::Code));
+            i = end + 1;
+            continue;
         }
         // Bold, `**…**` (checked before single-`*` italic).
-        if c == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
-            if let Some(end) = find_seq(&chars, i + 2, '*', '*') {
-                push_plain(&mut plain, &mut out);
-                out.push((chars[i + 2..end].iter().collect(), Span::Bold));
-                i = end + 2;
-                continue;
-            }
+        if c == '*'
+            && i + 1 < chars.len()
+            && chars[i + 1] == '*'
+            && let Some(end) = find_seq(&chars, i + 2, '*', '*')
+        {
+            push_plain(&mut plain, &mut out);
+            out.push((chars[i + 2..end].iter().collect(), Span::Bold));
+            i = end + 2;
+            continue;
         }
         // Italic: `*…*` or `_…_`.
-        if c == '*' || c == '_' {
-            if let Some(end) = find(&chars, i + 1, c) {
-                push_plain(&mut plain, &mut out);
-                out.push((chars[i + 1..end].iter().collect(), Span::Italic));
-                i = end + 1;
-                continue;
-            }
+        if (c == '*' || c == '_')
+            && let Some(end) = find(&chars, i + 1, c)
+        {
+            push_plain(&mut plain, &mut out);
+            out.push((chars[i + 1..end].iter().collect(), Span::Italic));
+            i = end + 1;
+            continue;
         }
         plain.push(c);
         i += 1;
