@@ -271,6 +271,89 @@ async fn mcp_tool_list_and_call_round_trip() {
     send(&handle, Command::Shutdown);
 }
 
+/// Compare two same-connection tables by a shared key: the data-diff backend job
+/// (`DiffTables`). Asserts the merge-walk classifies added / removed / changed /
+/// unchanged and reports the column alignment.
+#[tokio::test]
+async fn diffs_two_tables_by_key() {
+    let path = std::env::temp_dir().join(format!("red_diff_{}.db", std::process::id()));
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE lefty(id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE righty(id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO lefty VALUES (1,'a'),(2,'b'),(3,'c');
+             -- 1 unchanged, 2 changed, 3 removed (left only), 4 added (right only).
+             INSERT INTO righty VALUES (1,'a'),(2,'B'),(4,'d');",
+        )
+        .unwrap();
+    }
+
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), true)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    let tref = |name: &str| red_core::TableRef {
+        schema: None,
+        name: name.into(),
+    };
+    send(
+        &handle,
+        Command::DiffTables {
+            id: OpId::new(1),
+            left: tref("lefty"),
+            right_session: S,
+            right: tref("righty"),
+            key: "id".into(),
+        },
+    );
+
+    // Progress ticks (if any) precede the terminal event; take the DiffFinished.
+    loop {
+        match next(&mut events).await {
+            Some(Event::DiffProgress { .. }) => continue,
+            Some(Event::DiffFinished {
+                id: _,
+                summary,
+                plan,
+                rows,
+                truncated,
+            }) => {
+                assert_eq!(summary.unchanged, 1);
+                assert_eq!(summary.changed, 1);
+                assert_eq!(summary.removed, 1);
+                assert_eq!(summary.added, 1);
+                assert!(!truncated);
+                assert_eq!(plan.key, "id");
+                assert_eq!(plan.columns, vec!["id".to_string(), "name".to_string()]);
+                assert!(plan.left_only.is_empty() && plan.right_only.is_empty());
+                // Stored diff rows are in key order: 2 (changed), 3 (removed), 4 (added).
+                let kinds: Vec<_> = rows.iter().map(|r| (r.kind, r.key.clone())).collect();
+                assert_eq!(
+                    kinds,
+                    vec![
+                        (red_core::diff::DiffKind::Changed, "2".to_string()),
+                        (red_core::diff::DiffKind::Removed, "3".to_string()),
+                        (red_core::diff::DiffKind::Added, "4".to_string()),
+                    ]
+                );
+                break;
+            }
+            other => panic!("expected DiffFinished, got {other:?}"),
+        }
+    }
+
+    let _ = std::fs::remove_file(&path);
+    send(&handle, Command::Shutdown);
+}
+
 /// Connect, load the skeleton, then describe a table: the schema-explorer
 /// round-trip the sidebar drives.
 #[tokio::test]

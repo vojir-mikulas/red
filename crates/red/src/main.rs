@@ -15,6 +15,7 @@ mod conversations;
 mod decode;
 #[cfg(feature = "dev-stats")]
 mod dev_stats;
+mod diff_view;
 mod editor;
 mod env;
 mod er;

@@ -5,6 +5,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+pub mod diff;
 pub mod kv;
 pub mod typemap;
 

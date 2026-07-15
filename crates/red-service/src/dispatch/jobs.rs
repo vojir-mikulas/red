@@ -546,6 +546,212 @@ pub(super) async fn migrate_job(
     (committed, None)
 }
 
+/// Rows scanned (summed across both sides) between `DiffProgress` emissions.
+const DIFF_PROGRESS_STEP: usize = 20_000;
+/// Max diff rows retained in memory (added + removed + changed); further diffs are
+/// counted in the summary but not stored (the UI shows a truncation marker). Only
+/// the *diffs* are held — unchanged rows are counted, never kept — so a mostly-equal
+/// diff of huge tables stays cheap.
+const DIFF_ROW_CAP: usize = 20_000;
+
+/// Compare two tables by a shared key: read both sides key-ordered at full fidelity
+/// and merge-walk them, classifying each row as added / removed / changed (see
+/// docs/plans/todo/data-diff.md). The structural counterpart to [`copy_job`] — same
+/// two-cursor read seam and bounded windows, but instead of writing the source into
+/// the target it aligns the two streams and records their differences.
+///
+/// Columns are aligned by name (case-insensitive): the compared set is those present
+/// on both sides (in the left table's order); columns on only one side are reported
+/// but never compared. `key` must be a compared column. Both cursors open full
+/// fidelity so a long TEXT/blob compares byte-exact (a `Value::Capped` would never
+/// equal the whole cell it was truncated from, reading every long cell as "changed").
+/// One window per side is resident, so memory is bounded by the window + the diff-row
+/// cap, never by table size. `cancel` is checked between windows.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn diff_job(
+    left_driver: Arc<dyn DatabaseDriver>,
+    left: TableRef,
+    right_driver: Arc<dyn DatabaseDriver>,
+    right: TableRef,
+    key: String,
+    cancel: Arc<AtomicBool>,
+    events: Events,
+    id: OpId,
+) -> Result<
+    (
+        red_core::diff::DiffColumnPlan,
+        red_core::diff::DiffAccumulator,
+    ),
+    RedError,
+> {
+    use red_core::diff::{DiffAccumulator, DiffColumnPlan};
+
+    // An empty `key` means "align on the left table's primary key": describe it and
+    // use its single PK column. This lets the UI trigger a diff from two table names
+    // alone, without resolving the key itself. A composite / absent PK is an error
+    // the caller surfaces (the user must name a key column).
+    let key = if key.is_empty() {
+        let detail = left_driver
+            .describe_table(left.schema.as_deref().unwrap_or(""), &left.name)
+            .await?;
+        let pk: Vec<&str> = detail
+            .columns
+            .iter()
+            .filter(|c| c.primary_key)
+            .map(|c| c.name.as_str())
+            .collect();
+        match pk.as_slice() {
+            [only] => (*only).to_string(),
+            [] => {
+                return Err(RedError::Query(format!(
+                    "'{}' has no primary key; pick a key column to compare by",
+                    left.name
+                )));
+            }
+            _ => {
+                return Err(RedError::Query(format!(
+                    "'{}' has a composite primary key; pick a single key column to compare by",
+                    left.name
+                )));
+            }
+        }
+    } else {
+        key
+    };
+
+    // Key-ordered, full-fidelity reads of both whole tables. The key is quoted by
+    // the engine's own helper; the table by `quote_table` — no raw UI text.
+    let opts = QueryOptions {
+        window: COPY_CHUNK_ROWS,
+        timeout: None,
+        full_fidelity: true,
+    };
+    let left_sql = format!(
+        "SELECT * FROM {} ORDER BY {}",
+        left_driver.quote_table(&left),
+        left_driver.quote_ident(&key),
+    );
+    let right_sql = format!(
+        "SELECT * FROM {} ORDER BY {}",
+        right_driver.quote_table(&right),
+        right_driver.quote_ident(&key),
+    );
+    let left_cursor = left_driver.open_cursor(&left_sql, opts.clone()).await?;
+    let right_cursor = right_driver.open_cursor(&right_sql, opts).await?;
+
+    // Column names in each side's own order (from the cursor, no extra describe).
+    let left_cols: Vec<String> = left_cursor
+        .columns()
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    let right_cols: Vec<String> = right_cursor
+        .columns()
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    let find = |cols: &[String], name: &str| cols.iter().position(|c| c.eq_ignore_ascii_case(name));
+
+    // Align columns by name: compared = present on both (left's order); the rest
+    // are one-side-only. Each compared column carries its (left_idx, right_idx) so a
+    // row is projected into the shared compared order regardless of the raw layout.
+    let mut columns: Vec<String> = Vec::new();
+    let mut proj: Vec<(usize, usize)> = Vec::new();
+    let mut left_only: Vec<String> = Vec::new();
+    for (li, name) in left_cols.iter().enumerate() {
+        match find(&right_cols, name) {
+            Some(ri) => {
+                columns.push(name.clone());
+                proj.push((li, ri));
+            }
+            None => left_only.push(name.clone()),
+        }
+    }
+    let right_only: Vec<String> = right_cols
+        .iter()
+        .filter(|name| find(&left_cols, name).is_none())
+        .cloned()
+        .collect();
+
+    let Some(key_index) = columns.iter().position(|c| c.eq_ignore_ascii_case(&key)) else {
+        return Err(RedError::Query(format!(
+            "key column '{key}' is not present on both tables"
+        )));
+    };
+
+    let plan = DiffColumnPlan {
+        key: columns[key_index].clone(),
+        columns,
+        left_only,
+        right_only,
+    };
+
+    // Project a raw row into the shared compared-column order.
+    let project = |row: &[Value], side_left: bool| -> Vec<Value> {
+        proj.iter()
+            .map(|(li, ri)| {
+                let idx = if side_left { *li } else { *ri };
+                row.get(idx).cloned().unwrap_or(Value::Null)
+            })
+            .collect()
+    };
+
+    let mut acc = DiffAccumulator::new(key_index, DIFF_ROW_CAP);
+    let mut left_buf: std::collections::VecDeque<Vec<Value>> = std::collections::VecDeque::new();
+    let mut right_buf: std::collections::VecDeque<Vec<Value>> = std::collections::VecDeque::new();
+    let (mut left_done, mut right_done) = (false, false);
+    let mut scanned = 0usize;
+    let mut since_tick = 0usize;
+
+    // Refill a side's projected-row buffer from the next window when it drains.
+    macro_rules! refill {
+        ($buf:ident, $cursor:ident, $done:ident, $left:expr) => {
+            if $buf.is_empty() && !$done {
+                let window = $cursor.next_window(COPY_CHUNK_ROWS).await?;
+                for row in &window.rows {
+                    $buf.push_back(project(row, $left));
+                }
+                scanned += window.rows.len();
+                since_tick += window.rows.len();
+                if window.exhausted {
+                    $done = true;
+                }
+            }
+        };
+    }
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(RedError::Interrupted);
+        }
+        refill!(left_buf, left_cursor, left_done, true);
+        refill!(right_buf, right_cursor, right_done, false);
+        if since_tick >= DIFF_PROGRESS_STEP {
+            since_tick = 0;
+            emit(&events, None, Event::DiffProgress { id, scanned });
+        }
+        let advance = acc.step(
+            left_buf.front().map(Vec::as_slice),
+            right_buf.front().map(Vec::as_slice),
+        );
+        match advance {
+            red_core::diff::Advance::Done => break,
+            red_core::diff::Advance::Left => {
+                left_buf.pop_front();
+            }
+            red_core::diff::Advance::Right => {
+                right_buf.pop_front();
+            }
+            red_core::diff::Advance::Both => {
+                left_buf.pop_front();
+                right_buf.pop_front();
+            }
+        }
+    }
+
+    Ok((plan, acc))
+}
+
 #[cfg(test)]
 mod order_tests {
     use super::*;

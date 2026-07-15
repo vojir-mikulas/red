@@ -40,7 +40,7 @@ use gpui::{
     ScrollHandle, SharedString, WeakEntity, Window, WindowAppearance, prelude::*, px,
 };
 use red_core::{ConnectionConfig, CopyMode, UpdateState};
-use red_service::{AiAuthStatus, Command, Event, ServiceHandle, SessionId, UpdateConfig};
+use red_service::{AiAuthStatus, Command, Event, OpId, ServiceHandle, SessionId, UpdateConfig};
 
 use crate::config::{self, StoredConnection};
 use crate::palette::{Cmd, PromptKind};
@@ -127,6 +127,21 @@ pub struct AppState {
     /// The source of a pending whole-schema migrate, `(source session, source schema,
     /// table names)`, held while the user picks a target namespace from the picker.
     pub(crate) pending_migrate: Option<(SessionId, String, Vec<String>)>,
+    /// The in-flight data-compare (table diff) op id, if any; the diff events ignore
+    /// a reply that isn't for the current op.
+    pub(crate) diff_op: Option<OpId>,
+    /// The "Comparing…" progress toast id for the in-flight diff, so it can be
+    /// updated on progress and dismissed on the terminal event.
+    pub(crate) diff_notif: Option<u64>,
+    /// The `(left, right)` table names for the in-flight diff, shown in the report
+    /// header once it finishes.
+    pub(crate) diff_labels: Option<(String, String)>,
+    /// A pending "compare tables" pick: the foreground session and its table list
+    /// (`(schema, name)`), held while the user picks the left then right table.
+    pub(crate) compare_tables: Vec<(SessionId, Option<String>, String)>,
+    /// The index into [`compare_tables`](Self::compare_tables) of the chosen left
+    /// table, set after the first pick while the right table is chosen.
+    pub(crate) compare_left: Option<usize>,
     /// An in-flight FK click-through (Track B7), waiting on its single-row
     /// `CopyRows` re-fetch to read the typed key value before opening the target
     /// browse. The latest follow wins; an earlier reply is then stale and dropped.
@@ -1088,6 +1103,11 @@ impl AppState {
             pending_copy_new: None,
             migrate_targets: Vec::new(),
             pending_migrate: None,
+            diff_op: None,
+            diff_notif: None,
+            diff_labels: None,
+            compare_tables: Vec::new(),
+            compare_left: None,
             pending_fk: None,
             inspector: None,
             assistant: None,
@@ -1752,6 +1772,16 @@ impl AppState {
             Event::CopyFinished { id, rows } => self.on_copy_finished(id, rows, cx),
             Event::CopyFailed { id, rows, message } => self.on_copy_failed(id, rows, message, cx),
             Event::CopyCancelled { id, rows } => self.on_copy_cancelled(id, rows, cx),
+            Event::DiffProgress { id, scanned } => self.on_diff_progress(id, scanned, cx),
+            Event::DiffFinished {
+                id,
+                plan,
+                summary,
+                rows,
+                truncated,
+            } => self.on_diff_finished(id, plan, summary, rows, truncated, cx),
+            Event::DiffFailed { id, message } => self.on_diff_failed(id, message, cx),
+            Event::DiffCancelled { id } => self.on_diff_cancelled(id, cx),
 
             // --- query plan (Track B4) ---
             Event::PlanReady { epoch, plan } => self.on_plan_ready(session, epoch, plan),

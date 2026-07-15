@@ -3265,6 +3265,103 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 }
             }
 
+            Command::DiffTables {
+                id,
+                left,
+                right_session,
+                right,
+                key,
+            } => {
+                // Mirror `CopyToTable`'s two-session resolution + pinning, but the
+                // job reads both sides and reports differences instead of writing.
+                macro_rules! diff_fail {
+                    ($msg:expr_2021) => {{
+                        emit(
+                            &events,
+                            None,
+                            Event::DiffFailed {
+                                id,
+                                message: $msg.into(),
+                            },
+                        );
+                        continue;
+                    }};
+                }
+                let Some(left_sid) = session_id else { continue };
+                let Some(left_state) = sessions.get(&left_sid) else {
+                    diff_fail!("left connection isn't open")
+                };
+                let Some(left_driver) = left_state.driver.as_sql().cloned() else {
+                    diff_fail!("left isn't a SQL connection")
+                };
+                let left_busy = left_state.busy.clone();
+                let exports = left_state.exports.clone();
+                let Some(right_state) = sessions.get(&right_session) else {
+                    diff_fail!("right connection isn't open")
+                };
+                let Some(right_driver) = right_state.driver.as_sql().cloned() else {
+                    diff_fail!("right isn't a SQL connection")
+                };
+                let right_busy = right_state.busy.clone();
+
+                let cancel = Arc::new(AtomicBool::new(false));
+                lock(&exports).insert(id, cancel.clone());
+
+                let events = events.clone();
+                let copy_limit = copy_limit.clone();
+                tokio::spawn(async move {
+                    let _permit = copy_limit.acquire_owned().await;
+                    // Pin both ends for the diff's lifetime (RAII), like copy.
+                    let _left_pin = PinGuard::new(left_busy);
+                    let _right_pin = PinGuard::new(right_busy);
+                    let outcome = diff_job(
+                        left_driver,
+                        left,
+                        right_driver,
+                        right,
+                        key,
+                        cancel,
+                        events.clone(),
+                        id,
+                    )
+                    .await;
+                    lock(&exports).remove(&id);
+                    match outcome {
+                        Ok((plan, acc)) => emit(
+                            &events,
+                            None,
+                            Event::DiffFinished {
+                                id,
+                                plan,
+                                summary: acc.summary,
+                                rows: acc.rows,
+                                truncated: acc.truncated,
+                            },
+                        ),
+                        Err(RedError::Interrupted) => {
+                            emit(&events, None, Event::DiffCancelled { id })
+                        }
+                        Err(e) => emit(
+                            &events,
+                            None,
+                            Event::DiffFailed {
+                                id,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
+                });
+            }
+
+            Command::CancelDiff { id } => {
+                let Some(sid) = session_id else { continue };
+                if let Some(state) = sessions.get(&sid)
+                    && let Some(cancel) = lock(&state.exports).get(&id)
+                {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+
             Command::MigrateTables {
                 id,
                 source_schema,

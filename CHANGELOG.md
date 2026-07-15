@@ -7,6 +7,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Compare tables (data diff): a new "table: compare against…" command picks two
+  tables in a connection and reports which rows are added, removed, or changed,
+  aligned by the left table's primary key. The result is a full-screen read-only
+  report with a summary (added / removed / changed / unchanged), a filter, and
+  changed cells shown as old → new. Both tables are read key-ordered and
+  streamed, so the comparison never loads either table whole; it reports
+  differences only and never writes.
 - `red mcp <connection>`: a headless stdio MCP server. Point Claude Code (or any
   MCP client) at `red mcp my-connection` and it gets Red's read-only database
   tools (schema, describe, profile, SELECT, explain) grounded in that connection,

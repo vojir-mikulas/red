@@ -1041,6 +1041,10 @@ pub(crate) struct ActiveConn {
     /// The read-only ER diagram overlay when open (schema-wide, so it hangs off the
     /// connection, not a tab). `None` when closed. See [`crate::er`].
     pub er: Option<crate::er::ErView>,
+    /// The data-compare (table diff) report overlay when open (a full-screen
+    /// read-only report, so it hangs off the connection like the ER diagram).
+    /// `None` when closed. See [`crate::diff_view`].
+    pub diff: Option<crate::diff_view::DiffReport>,
     /// The Redis shell's dynamic tab set (see docs/plans/redis-workflow-parity.md);
     /// `Some` only for a `DbKind::Redis` session, set up in `on_connected`.
     /// `None` for every SQL engine. Constructed here (needs `cx` to make the
@@ -1097,6 +1101,7 @@ impl ActiveConn {
             columns_drag: None,
             last_active_seq: 0,
             er: None,
+            diff: None,
             kv_view,
         }
     }

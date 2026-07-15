@@ -11,8 +11,8 @@
 
 use flint::{Palette, PaletteEvent, PaletteItem, ToastVariant};
 use gpui::{Context, ElementId, Entity, SharedString, actions, prelude::*};
-use red_core::{ColumnMap, ColumnMeta, CopyMode, TableRef};
-use red_service::Command;
+use red_core::{ColumnMap, ColumnMeta, CopyMode, ObjectKind, TableRef};
+use red_service::{Command, SessionId};
 
 use crate::app::{AppState, PendingCopyNewTable, PendingCopyPeek, Phase};
 
@@ -86,6 +86,12 @@ pub(crate) enum Cmd {
     /// Migrate the pending source schema into the target namespace at this index; the
     /// "Migrate to…" picker activation.
     MigrateTarget(usize),
+    /// Open the "Compare table against…" picker: pick the left table (data-diff).
+    CompareTable,
+    /// A left table was picked at this index; open the picker for the right table.
+    CompareLeft(usize),
+    /// A right table was picked at this index; fire the diff (left is remembered).
+    CompareRight(usize),
     /// Open the read-only schema ER diagram overlay.
     ErDiagram,
     /// EXPLAIN the active tab's query and open the plan view (B4).
@@ -307,6 +313,9 @@ impl AppState {
             Cmd::CopyNewTable(index) => self.pick_copy_new_table(index, cx),
             Cmd::MigrateSchema => self.open_migrate_picker(cx),
             Cmd::MigrateTarget(index) => self.pick_migrate_target(index, cx),
+            Cmd::CompareTable => self.open_compare_picker(cx),
+            Cmd::CompareLeft(index) => self.pick_compare_left(index, cx),
+            Cmd::CompareRight(index) => self.pick_compare_right(index, cx),
             Cmd::ErDiagram => self.open_er_diagram(cx),
             Cmd::Explain => self.explain_query(false, cx),
             Cmd::ExplainAnalyze => self.explain_query(true, cx),
@@ -471,6 +480,14 @@ impl AppState {
                     out.push((
                         PaletteItem::new("cmd:migrate-schema", "schema: migrate to…"),
                         Cmd::MigrateSchema,
+                    ));
+                }
+                // Data-compare (table diff), offered when the connection has at least
+                // two tables to compare (the handler picks left then right).
+                if self.compare_candidates().len() >= 2 {
+                    out.push((
+                        PaletteItem::new("cmd:compare-table", "table: compare against…"),
+                        Cmd::CompareTable,
                     ));
                 }
                 // Only meaningful with rows on screen to navigate / copy.
@@ -1123,5 +1140,139 @@ impl AppState {
         let id = red_service::OpId::new(self.next_export_id);
         self.next_export_id += 1;
         self.start_migrate(id, source_schema, tables, target.session, target.schema, cx);
+    }
+
+    /// The foreground connection's tables (`(session, schema, name)`): the pool the
+    /// "Compare table against…" picker draws both sides from. Same-connection only
+    /// for the shipped scope (D0–D2); cross-connection diff is a later phase.
+    pub(crate) fn compare_candidates(&self) -> Vec<(SessionId, Option<String>, String)> {
+        let Phase::Connected(active) = &self.phase else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for ns in &active.schema.schemas {
+            for o in &ns.objects {
+                if matches!(o.kind, ObjectKind::Table) {
+                    let schema = (!ns.name.is_empty()).then(|| ns.name.clone());
+                    out.push((active.session, schema, o.name.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// "table: compare against…": open a picker over the connection's tables to
+    /// choose the **left** side of a data-diff.
+    pub(crate) fn open_compare_picker(&mut self, cx: &mut Context<Self>) {
+        let tables = self.compare_candidates();
+        if tables.len() < 2 {
+            self.notify(
+                ToastVariant::Info,
+                "Need at least two tables in this connection to compare",
+                cx,
+            );
+            return;
+        }
+        let entries: Vec<(PaletteItem, Cmd)> = tables
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let id = ElementId::from(SharedString::from(format!("compare-left:{i}")));
+                (
+                    PaletteItem::new(id, format!("compare {}", compare_label(t))),
+                    Cmd::CompareLeft(i),
+                )
+            })
+            .collect();
+        self.compare_tables = tables;
+        self.compare_left = None;
+        self.open_command_picker("Compare which table?", entries, cx);
+    }
+
+    /// The left table was picked: open a picker over the *other* tables for the right
+    /// side.
+    fn pick_compare_left(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(left) = self.compare_tables.get(index).cloned() else {
+            return;
+        };
+        self.compare_left = Some(index);
+        let placeholder = format!("Compare {} against…", compare_label(&left));
+        let entries: Vec<(PaletteItem, Cmd)> = self
+            .compare_tables
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != index)
+            .map(|(j, t)| {
+                let id = ElementId::from(SharedString::from(format!("compare-right:{j}")));
+                (
+                    PaletteItem::new(id, format!("against {}", compare_label(t))),
+                    Cmd::CompareRight(j),
+                )
+            })
+            .collect();
+        self.open_command_picker(&placeholder, entries, cx);
+    }
+
+    /// The right table was picked: fire the diff (the backend aligns on the left
+    /// table's primary key).
+    fn pick_compare_right(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(left_idx) = self.compare_left.take() else {
+            return;
+        };
+        let (Some(left), Some(right)) = (
+            self.compare_tables.get(left_idx).cloned(),
+            self.compare_tables.get(index).cloned(),
+        ) else {
+            return;
+        };
+        self.compare_tables = Vec::new();
+        let (session, l_schema, l_name) = left;
+        let (_, r_schema, r_name) = right;
+        self.start_diff(
+            session,
+            TableRef {
+                schema: l_schema,
+                name: l_name,
+            },
+            session,
+            TableRef {
+                schema: r_schema,
+                name: r_name,
+            },
+            cx,
+        );
+    }
+
+    /// Build and open a command-picker palette from `entries` (id → `Cmd`), the shape
+    /// the migrate/compare pickers share.
+    fn open_command_picker(
+        &mut self,
+        placeholder: &str,
+        entries: Vec<(PaletteItem, Cmd)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.palette_cmds = entries
+            .iter()
+            .map(|(item, cmd)| (item.id.clone(), *cmd))
+            .collect();
+        let items: Vec<PaletteItem> = entries.into_iter().map(|(item, _)| item).collect();
+        let placeholder = placeholder.to_string();
+        let palette = cx.new(|cx| {
+            let mut p = Palette::new(cx);
+            p.set_placeholder(&placeholder, cx);
+            p.set_items(items, cx);
+            p
+        });
+        let sub = cx.subscribe(&palette, Self::on_palette_event);
+        self.palette = Some((palette, sub));
+        cx.notify();
+    }
+}
+
+/// Display label for a compare candidate (`schema.name`, or bare `name`).
+fn compare_label(t: &(SessionId, Option<String>, String)) -> String {
+    match &t.1 {
+        Some(s) => format!("{s}.{}", t.2),
+        None => t.2.clone(),
     }
 }

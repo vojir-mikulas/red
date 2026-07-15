@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use red_core::diff::{DiffColumnPlan, DiffRow, DiffSummary};
 use red_core::kv::{
     ClientInfo, CollectionKind, KeyMeta, KvCollectionPage, KvEdit, KvScanPage, KvStreamActionReq,
     KvStreamPage, KvType, KvValue, PendingEntry, RecycledKey, RespValue, ScanBudget, ScanCursor,
@@ -645,6 +646,26 @@ pub enum Command {
     CancelCopy {
         id: OpId,
     },
+    /// Compare two tables by a shared key and report which rows are added /
+    /// removed / changed (see docs/plans/todo/data-diff.md). The envelope's
+    /// [`SessionId`] is the **left** connection; `right_session` is where `right`
+    /// lives (equal to the left for a same-connection diff, another open
+    /// connection for a cross-connection one). Both ends are pinned for the diff's
+    /// lifetime. Both tables are read key-ordered at full fidelity and merge-walked;
+    /// `key` must be a column present on both. A read-only report — it never writes.
+    /// Routes `DiffProgress` / `DiffFinished` / `DiffFailed` / `DiffCancelled` and a
+    /// `CancelDiff { id }`.
+    DiffTables {
+        id: OpId,
+        left: TableRef,
+        right_session: SessionId,
+        right: TableRef,
+        key: String,
+    },
+    /// Abort an in-flight diff by `id` (the toast's Cancel).
+    CancelDiff {
+        id: OpId,
+    },
     /// Migrate **many** tables in one job: the whole-database headline. The
     /// envelope's [`SessionId`] is the **source** session; `source_schema` names the
     /// namespace they live in and `tables` the table names to move. Each is created
@@ -1260,6 +1281,33 @@ pub enum Event {
     CopyCancelled {
         id: OpId,
         rows: usize,
+    },
+    /// A diff is running: `scanned` rows read across both sides so far (progress
+    /// only; the diff holds nothing but the bounded result set). Global (`None`
+    /// session) like the copy family, so its toast survives a ⌘P switch.
+    DiffProgress {
+        id: OpId,
+        scanned: usize,
+    },
+    /// A diff finished: `plan` is the column alignment (compared columns + any
+    /// one-side-only ones), `summary` the added/removed/changed/unchanged totals,
+    /// and `rows` the materialized diff rows in key order (capped; `truncated`
+    /// marks that further diffs past the cap were counted but not stored).
+    DiffFinished {
+        id: OpId,
+        plan: DiffColumnPlan,
+        summary: DiffSummary,
+        rows: Vec<DiffRow>,
+        truncated: bool,
+    },
+    /// A diff failed (describe/read error, missing key, incompatible columns).
+    DiffFailed {
+        id: OpId,
+        message: String,
+    },
+    /// An in-flight diff was cancelled (the toast's Cancel).
+    DiffCancelled {
+        id: OpId,
     },
     /// The self-updater's state changed (Phases 3–4). Global (`None` session);
     /// the UI stores it and renders the titlebar pill + About-tab status from it.

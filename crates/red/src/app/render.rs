@@ -431,6 +431,13 @@ impl Render for AppState {
             _ => None,
         };
 
+        // The data-compare (table diff) report is likewise a full-screen overlay hung
+        // off the connection.
+        let diff_report = match &self.phase {
+            Phase::Connected(active) if active.diff.is_some() => Some(self.render_diff(active, cx)),
+            _ => None,
+        };
+
         let theme = cx.theme();
         // Copied out now (Hsla is Copy) so the client-decoration frame at the end
         // of this fn doesn't hold `theme`'s borrow of `cx` across the dev-stats
@@ -637,6 +644,7 @@ impl Render for AppState {
             .children(whats_new)
             .children(import_wizard)
             .children(er_diagram)
+            .children(diff_report)
             // The connection form modal is rendered at the root so it works in any
             // phase (the welcome screen *and* the connected shell, e.g. opened from
             // the switcher's "New connection…").
