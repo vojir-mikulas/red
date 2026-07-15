@@ -60,25 +60,31 @@ impl DocValue {
         matches!(self, DocValue::Array(_) | DocValue::Document(_))
     }
 
+    /// The [`DocType`] tag for this value, for the inferred-schema panel's
+    /// per-field type distribution.
+    pub fn doc_type(&self) -> DocType {
+        match self {
+            DocValue::Null => DocType::Null,
+            DocValue::Bool(_) => DocType::Bool,
+            DocValue::Int32(_) => DocType::Int,
+            DocValue::Int64(_) => DocType::Long,
+            DocValue::Double(_) => DocType::Double,
+            DocValue::Decimal128(_) => DocType::Decimal,
+            DocValue::Str(_) => DocType::Str,
+            DocValue::ObjectId(_) => DocType::ObjectId,
+            DocValue::DateTime(_) => DocType::Date,
+            DocValue::Timestamp(_) => DocType::Timestamp,
+            DocValue::Binary { .. } => DocType::Binary,
+            DocValue::Regex { .. } => DocType::Regex,
+            DocValue::Array(_) => DocType::Array,
+            DocValue::Document(_) => DocType::Object,
+        }
+    }
+
     /// A one-word type label for the inferred-schema panel and type hints
     /// (`"string"`, `"objectId"`, …). Matches Mongo's `$type` aliases.
     pub fn type_name(&self) -> &'static str {
-        match self {
-            DocValue::Null => "null",
-            DocValue::Bool(_) => "bool",
-            DocValue::Int32(_) => "int",
-            DocValue::Int64(_) => "long",
-            DocValue::Double(_) => "double",
-            DocValue::Decimal128(_) => "decimal",
-            DocValue::Str(_) => "string",
-            DocValue::ObjectId(_) => "objectId",
-            DocValue::DateTime(_) => "date",
-            DocValue::Timestamp(_) => "timestamp",
-            DocValue::Binary { .. } => "binData",
-            DocValue::Regex { .. } => "regex",
-            DocValue::Array(_) => "array",
-            DocValue::Document(_) => "object",
-        }
+        self.doc_type().label()
     }
 
     /// Render this value as MongoDB **relaxed** extended JSON v2 (the compact,
@@ -324,6 +330,174 @@ pub enum DocTopology {
     Sharded,
 }
 
+/// A BSON type tag, the eq/hashable key the inferred-schema panel groups a
+/// field's observed values by. Mirrors the [`DocValue`] arms (collapsing the two
+/// container arms to `Array`/`Object`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DocType {
+    Null,
+    Bool,
+    Int,
+    Long,
+    Double,
+    Decimal,
+    Str,
+    ObjectId,
+    Date,
+    Timestamp,
+    Binary,
+    Regex,
+    Array,
+    Object,
+}
+
+impl DocType {
+    /// The `$type`-alias label (`"string"`, `"objectId"`, …).
+    pub fn label(self) -> &'static str {
+        match self {
+            DocType::Null => "null",
+            DocType::Bool => "bool",
+            DocType::Int => "int",
+            DocType::Long => "long",
+            DocType::Double => "double",
+            DocType::Decimal => "decimal",
+            DocType::Str => "string",
+            DocType::ObjectId => "objectId",
+            DocType::Date => "date",
+            DocType::Timestamp => "timestamp",
+            DocType::Binary => "binData",
+            DocType::Regex => "regex",
+            DocType::Array => "array",
+            DocType::Object => "object",
+        }
+    }
+}
+
+/// One field path's inferred shape across a sample: which types were seen (with
+/// their observed frequency) and how often the field was present at all. The
+/// row the schema panel renders, and the "this field is a string 82% / int 18%"
+/// drift signal a schemaless store needs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldStat {
+    /// The dotted field path (`user.addr.city` for a nested field).
+    pub path: String,
+    /// Observed types with their counts, most-frequent first.
+    pub types: Vec<(DocType, u64)>,
+    /// Fraction of sampled documents in which the field was present, `0.0..=1.0`.
+    pub present_ratio: f32,
+}
+
+/// A collection's inferred schema from [`DocDriver::infer_schema`]: one
+/// [`FieldStat`] per discovered field path (sorted), plus how many documents were
+/// sampled to produce it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocSchema {
+    pub fields: Vec<FieldStat>,
+    pub sampled: usize,
+}
+
+impl DocSchema {
+    /// Roll a sample of documents into a schema: for every field path (dotted for
+    /// nested sub-documents, `_id` included), the distribution of BSON types seen
+    /// and the fraction of the sample the field appeared in. Deterministic —
+    /// paths sort, and each path's types sort by descending count then label — so
+    /// the same sample always yields the same schema. Arrays are recorded as the
+    /// `array` type without descending into element shapes (a v1 simplification).
+    /// Both `MongoDriver` and the test double build their schema through this, so
+    /// the rollup lives once, in the pure core.
+    pub fn from_documents(docs: &[Document]) -> DocSchema {
+        use std::collections::BTreeMap;
+
+        // path -> (present count, type -> count)
+        let mut acc: BTreeMap<String, (u64, BTreeMap<DocType, u64>)> = BTreeMap::new();
+        for doc in docs {
+            let mut record = |path: String, value: &DocValue| {
+                let entry = acc.entry(path).or_default();
+                entry.0 += 1;
+                *entry.1.entry(value.doc_type()).or_insert(0) += 1;
+            };
+            collect_fields("_id", &doc.id, &mut record);
+            for (name, value) in &doc.fields {
+                collect_fields(name, value, &mut record);
+            }
+        }
+
+        let sampled = docs.len();
+        let denom = sampled.max(1) as f32;
+        let fields = acc
+            .into_iter()
+            .map(|(path, (present, type_counts))| {
+                let mut types: Vec<(DocType, u64)> = type_counts.into_iter().collect();
+                // Most-frequent first; ties broken by the stable type label.
+                types.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.label().cmp(b.0.label())));
+                FieldStat {
+                    path,
+                    types,
+                    present_ratio: present as f32 / denom,
+                }
+            })
+            .collect();
+        DocSchema { fields, sampled }
+    }
+}
+
+/// Record `value` at `path`, descending into a sub-document to emit its dotted
+/// child paths too. Arrays and scalars record only themselves.
+fn collect_fields(path: &str, value: &DocValue, record: &mut impl FnMut(String, &DocValue)) {
+    record(path.to_string(), value);
+    if let DocValue::Document(fields) = value {
+        for (name, child) in fields {
+            collect_fields(&format!("{path}.{name}"), child, record);
+        }
+    }
+}
+
+/// One index on a collection (`listIndexes`), for the indexes panel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexInfo {
+    pub name: String,
+    /// The index key spec as `(field, order)` pairs; `order` is the spelling
+    /// Mongo returns (`"1"`/`"-1"` for a b-tree direction, or `"text"`/`"2dsphere"`/
+    /// `"hashed"` for a special index), kept as a string so non-numeric index
+    /// types survive.
+    pub keys: Vec<(String, String)>,
+    pub unique: bool,
+    pub sparse: bool,
+    /// The TTL in seconds (`expireAfterSeconds`) for a TTL index, else `None`.
+    pub ttl: Option<i64>,
+    /// Whether the index is partial (`partialFilterExpression` present).
+    pub partial: bool,
+}
+
+/// A query's `explain` rollup from [`DocDriver::explain`]: the winning-plan
+/// stages plus the numbers that answer "is this query using an index, and how
+/// wasteful is it".
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocPlan {
+    /// The winning plan's stages, outermost first (`FETCH` -> `IXSCAN`, …).
+    pub stages: Vec<PlanStage>,
+    /// The index the winning plan used, if any (`None` for a collection scan).
+    pub index_used: Option<String>,
+    /// Documents the plan examined vs. returned, when the executor reported them
+    /// (an `explain("executionStats")`); the `examined / returned` ratio is the
+    /// waste signal.
+    pub docs_examined: Option<u64>,
+    pub n_returned: Option<u64>,
+    /// Whether the winning plan is a full collection scan (`COLLSCAN`) — the
+    /// "you're missing an index" flag.
+    pub collscan: bool,
+}
+
+/// One node in an `explain` winning plan, flattened with its depth so the panel
+/// can indent the stage tree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanStage {
+    pub stage: String,
+    pub depth: usize,
+    /// The index name for an `IXSCAN` stage, or another short detail, if any.
+    pub detail: Option<String>,
+}
+
 // --- hand-rolled extended-JSON helpers (no serde_json) -----------------------
 
 /// Append `s` as a JSON string literal (quotes + minimal escaping), matching
@@ -503,6 +677,44 @@ mod tests {
         // A nested cell is capped extended-JSON text, still a `Value`.
         let nested = DocValue::Array(vec![DocValue::Int32(1)]).to_cell(4096);
         assert_eq!(nested, Value::Text("[1]".into()));
+    }
+
+    #[test]
+    fn schema_rollup_is_deterministic_and_nested() {
+        let docs = vec![
+            Document {
+                id: DocValue::Int32(1),
+                fields: vec![
+                    ("name".into(), DocValue::Str("a".into())),
+                    (
+                        "user".into(),
+                        DocValue::Document(vec![("age".into(), DocValue::Int32(30))]),
+                    ),
+                ],
+            },
+            Document {
+                id: DocValue::Int32(2),
+                // `name` is an int here (type drift); no `user`.
+                fields: vec![("name".into(), DocValue::Int64(7))],
+            },
+        ];
+        let schema = DocSchema::from_documents(&docs);
+        assert_eq!(schema.sampled, 2);
+        // Paths are sorted and include the dotted nested path.
+        let paths: Vec<&str> = schema.fields.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["_id", "name", "user", "user.age"]);
+
+        let name = schema.fields.iter().find(|f| f.path == "name").unwrap();
+        assert_eq!(name.present_ratio, 1.0);
+        // Two distinct types seen, tie broken by label ("long" < "string").
+        assert_eq!(name.types, vec![(DocType::Long, 1), (DocType::Str, 1)]);
+
+        let user = schema.fields.iter().find(|f| f.path == "user").unwrap();
+        assert_eq!(user.present_ratio, 0.5);
+        assert_eq!(user.types, vec![(DocType::Object, 1)]);
+
+        // Same input -> identical schema (determinism).
+        assert_eq!(DocSchema::from_documents(&docs), schema);
     }
 
     #[test]

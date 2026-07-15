@@ -5,15 +5,16 @@
 //! or `GET`/`SET`. Object-safe like the other two seams, held as
 //! `Arc<dyn DocDriver>`, one impl per engine.
 //!
-//! This is the D0 read-only subset (catalog + windowed `find` + one-document
-//! fetch + count). The streaming server cursor (`next_batch`/`close_cursor`),
-//! `infer_schema`/`aggregate`/`indexes`/`explain`, and every write land in the
-//! later phases (D1/D2) the plan lays out, added additively to this trait.
+//! This is the read path (D0 catalog + windowed `find` + count, plus D1's
+//! `infer_schema`/`aggregate`/`indexes`/`explain`/`distinct`, the streaming server
+//! cursor, and extended-JSON parsing). Writes land in D2, added additively to this
+//! trait.
 
 use async_trait::async_trait;
 use red_core::Result;
 use red_core::doc::{
-    CollectionInfo, DbInfo, DocPage, DocTopology, DocValue, Document, Filter, FindQuery,
+    CollectionInfo, DbInfo, DocCursor, DocPage, DocPlan, DocSchema, DocTopology, DocValue,
+    Document, Filter, FindQuery, IndexInfo,
 };
 
 use crate::AbortSignal;
@@ -60,6 +61,69 @@ pub trait DocDriver: Send + Sync {
     /// estimate (`estimatedDocumentCount`) when `filter` is `None` — the cheap,
     /// O(1) total the grid shows when the whole collection is browsed unfiltered.
     async fn count(&self, db: &str, coll: &str, filter: Option<&Filter>) -> Result<u64>;
+
+    // --- D1 power reads ----------------------------------------------------
+
+    /// Infer a collection's schema by sampling up to `sample` documents
+    /// (`$sample`) and rolling their fields into per-path type frequencies and
+    /// present-ratios. What makes a schemaless collection legible: the discovered
+    /// schema the SQL seam gets for free but a document store must derive.
+    /// Cancellable via `abort`.
+    async fn infer_schema(
+        &self,
+        db: &str,
+        coll: &str,
+        sample: usize,
+        abort: &AbortSignal,
+    ) -> Result<DocSchema>;
+
+    /// Run a read-only aggregation `pipeline` (an array of stage documents) and
+    /// return one window of results, capped by `batch` and cancellable via
+    /// `abort`. Mongo's real analytical engine; write stages (`$out`/`$merge`)
+    /// are the caller's to reject before this runs.
+    async fn aggregate(
+        &self,
+        db: &str,
+        coll: &str,
+        pipeline: &[DocValue],
+        batch: usize,
+        abort: &AbortSignal,
+    ) -> Result<DocPage>;
+
+    /// A collection's indexes (`listIndexes`) with keys / unique / sparse / ttl /
+    /// partial, for the indexes panel.
+    async fn indexes(&self, db: &str, coll: &str) -> Result<Vec<IndexInfo>>;
+
+    /// `explain` a find query: the winning plan, the index used (if any), and the
+    /// examined/returned numbers, so the UI can flag a `COLLSCAN` and the "missing
+    /// index" case.
+    async fn explain(&self, q: &FindQuery) -> Result<DocPlan>;
+
+    /// The distinct values of `field` over documents matching `filter`
+    /// (`distinct`), for cheap cardinality without pulling documents.
+    async fn distinct(
+        &self,
+        db: &str,
+        coll: &str,
+        field: &str,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<DocValue>>;
+
+    /// Advance a live server cursor (`getMore`), returning the next window and an
+    /// updated cursor (`None` once the server exhausts it). Paired with a
+    /// `find`/`aggregate` that opened the cursor; `batch` bounds the window.
+    async fn next_batch(&self, cursor: &DocCursor, batch: usize) -> Result<DocPage>;
+
+    /// Close a live server cursor early (`killCursors`) when the UI abandons a
+    /// scan before exhausting it, so the server doesn't hold it open. Best-effort:
+    /// a failed close is not worth surfacing (the cursor times out server-side).
+    async fn close_cursor(&self, cursor: &DocCursor);
+
+    /// Parse an extended-JSON string (a filter document, or an aggregation
+    /// pipeline array) into a [`DocValue`]. Engine-specific because the
+    /// extended-JSON dialect is the engine's, kept off the pure `red-core` types.
+    /// A syntax error surfaces as a [`red_core::RedError::Query`].
+    fn parse_ext_json(&self, text: &str) -> Result<DocValue>;
 }
 
 #[cfg(test)]
@@ -146,6 +210,86 @@ mod tests {
         }
         async fn count(&self, db: &str, coll: &str, _filter: Option<&Filter>) -> Result<u64> {
             Ok(self.docs(db, coll).len() as u64)
+        }
+        async fn infer_schema(
+            &self,
+            db: &str,
+            coll: &str,
+            sample: usize,
+            _abort: &AbortSignal,
+        ) -> Result<DocSchema> {
+            let docs = self.docs(db, coll);
+            let taken = &docs[..docs.len().min(sample)];
+            Ok(DocSchema::from_documents(taken))
+        }
+        async fn aggregate(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _pipeline: &[DocValue],
+            _batch: usize,
+            _abort: &AbortSignal,
+        ) -> Result<DocPage> {
+            // The in-memory double doesn't execute pipelines; it exists for the
+            // catalog/find/schema paths.
+            Ok(DocPage {
+                docs: Vec::new(),
+                cursor: None,
+                exhausted: true,
+            })
+        }
+        async fn indexes(&self, _db: &str, _coll: &str) -> Result<Vec<red_core::doc::IndexInfo>> {
+            Ok(Vec::new())
+        }
+        async fn explain(&self, q: &FindQuery) -> Result<red_core::doc::DocPlan> {
+            let n = self.docs(&q.db, &q.coll).len() as u64;
+            Ok(red_core::doc::DocPlan {
+                stages: vec![red_core::doc::PlanStage {
+                    stage: "COLLSCAN".into(),
+                    depth: 0,
+                    detail: None,
+                }],
+                index_used: None,
+                docs_examined: Some(n),
+                n_returned: Some(n),
+                collscan: true,
+            })
+        }
+        async fn distinct(
+            &self,
+            db: &str,
+            coll: &str,
+            field: &str,
+            _filter: Option<&Filter>,
+        ) -> Result<Vec<DocValue>> {
+            let mut seen: Vec<DocValue> = Vec::new();
+            for doc in self.docs(db, coll) {
+                let value = if field == "_id" {
+                    Some(&doc.id)
+                } else {
+                    doc.fields.iter().find(|(k, _)| k == field).map(|(_, v)| v)
+                };
+                if let Some(v) = value
+                    && !seen.contains(v)
+                {
+                    seen.push(v.clone());
+                }
+            }
+            Ok(seen)
+        }
+        async fn next_batch(&self, _cursor: &DocCursor, _batch: usize) -> Result<DocPage> {
+            // The double never hands out a live cursor, so a `getMore` is empty.
+            Ok(DocPage {
+                docs: Vec::new(),
+                cursor: None,
+                exhausted: true,
+            })
+        }
+        async fn close_cursor(&self, _cursor: &DocCursor) {}
+        fn parse_ext_json(&self, _text: &str) -> Result<DocValue> {
+            Err(red_core::RedError::Query(
+                "extended-JSON parsing is not supported by the in-memory test driver".into(),
+            ))
         }
     }
 
@@ -238,6 +382,20 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn schema_and_distinct() {
+        let d = sample();
+        let abort = AbortSignal::new();
+        let schema = d.infer_schema("app", "people", 100, &abort).await.unwrap();
+        assert_eq!(schema.sampled, 3);
+        // `_id` is present in every sampled document.
+        let id = schema.fields.iter().find(|f| f.path == "_id").unwrap();
+        assert_eq!(id.present_ratio, 1.0);
+
+        let ids = d.distinct("app", "people", "_id", None).await.unwrap();
+        assert_eq!(ids.len(), 3);
     }
 
     // A `DocCursor` is opaque and echoed back to the driver; assert its identity

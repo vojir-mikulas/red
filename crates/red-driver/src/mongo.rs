@@ -16,7 +16,8 @@ use mongodb::options::ClientOptions;
 use mongodb::results::CollectionType;
 use mongodb::{Client, Cursor};
 use red_core::doc::{
-    CollKind, CollectionInfo, DbInfo, DocPage, DocTopology, DocValue, Document, Filter, FindQuery,
+    CollKind, CollectionInfo, DbInfo, DocCursor, DocPage, DocPlan, DocSchema, DocTopology,
+    DocValue, Document, Filter, FindQuery, IndexInfo, PlanStage,
 };
 use red_core::{RedError, Result};
 
@@ -230,6 +231,188 @@ impl DocDriver for MongoDriver {
                 .map_err(query_err),
         }
     }
+
+    async fn infer_schema(
+        &self,
+        db: &str,
+        coll: &str,
+        sample: usize,
+        abort: &AbortSignal,
+    ) -> Result<DocSchema> {
+        // `$sample` pulls a bounded random subset server-side, so this stays cheap
+        // even on a huge collection; the rollup into per-field type stats is the
+        // pure `red-core` helper both drivers share.
+        let pipeline = vec![doc! { "$sample": { "size": (sample.max(1)) as i64 } }];
+        let mut cursor = self
+            .client
+            .database(db)
+            .collection::<BsonDocument>(coll)
+            .aggregate(pipeline)
+            .await
+            .map_err(query_err)?;
+        let docs = Self::collect_page(&mut cursor, sample.max(1), abort).await?;
+        Ok(DocSchema::from_documents(&docs))
+    }
+
+    async fn aggregate(
+        &self,
+        db: &str,
+        coll: &str,
+        pipeline: &[DocValue],
+        batch: usize,
+        abort: &AbortSignal,
+    ) -> Result<DocPage> {
+        let stages: Vec<BsonDocument> = pipeline.iter().map(doc_to_bson_document).collect();
+        if abort.is_aborted() {
+            return Err(RedError::Interrupted);
+        }
+        let mut cursor = self
+            .client
+            .database(db)
+            .collection::<BsonDocument>(coll)
+            .aggregate(stages)
+            .await
+            .map_err(query_err)?;
+        let docs = Self::collect_page(&mut cursor, batch, abort).await?;
+        let exhausted = docs.len() < batch;
+        Ok(DocPage {
+            docs,
+            cursor: None,
+            exhausted,
+        })
+    }
+
+    async fn indexes(&self, db: &str, coll: &str) -> Result<Vec<IndexInfo>> {
+        let mut cursor = self
+            .client
+            .database(db)
+            .collection::<BsonDocument>(coll)
+            .list_indexes()
+            .await
+            .map_err(query_err)?;
+        let mut out = Vec::new();
+        while let Some(model) = cursor.next().await {
+            let model = model.map_err(query_err)?;
+            let keys = model
+                .keys
+                .iter()
+                .map(|(field, order)| (field.clone(), index_order(order)))
+                .collect();
+            let opts = model.options;
+            out.push(IndexInfo {
+                name: opts
+                    .as_ref()
+                    .and_then(|o| o.name.clone())
+                    .unwrap_or_default(),
+                keys,
+                unique: opts.as_ref().and_then(|o| o.unique).unwrap_or(false),
+                sparse: opts.as_ref().and_then(|o| o.sparse).unwrap_or(false),
+                ttl: opts
+                    .as_ref()
+                    .and_then(|o| o.expire_after)
+                    .map(|d| d.as_secs() as i64),
+                partial: opts
+                    .as_ref()
+                    .is_some_and(|o| o.partial_filter_expression.is_some()),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn explain(&self, q: &FindQuery) -> Result<DocPlan> {
+        let filter = q
+            .filter
+            .as_ref()
+            .map(doc_to_bson_document)
+            .unwrap_or_default();
+        // `explain` isn't a first-class typed call, so run it as a command with
+        // execution stats (which fills in the examined/returned numbers).
+        let reply = self
+            .client
+            .database(&q.db)
+            .run_command(doc! {
+                "explain": { "find": &q.coll, "filter": filter },
+                "verbosity": "executionStats",
+            })
+            .await
+            .map_err(query_err)?;
+
+        let planner = reply
+            .get_document("queryPlanner")
+            .map_err(|_| RedError::Query("explain returned no queryPlanner".into()))?;
+        let winning = planner
+            .get_document("winningPlan")
+            .map_err(|_| RedError::Query("explain returned no winningPlan".into()))?;
+        // Mongo 5+ (SBE) nests the classic stage tree under `queryPlan`.
+        let plan_root = winning.get_document("queryPlan").unwrap_or(winning);
+
+        let mut stages = Vec::new();
+        let mut index_used = None;
+        let mut collscan = false;
+        flatten_plan(plan_root, 0, &mut stages, &mut index_used, &mut collscan);
+
+        let exec = reply.get_document("executionStats").ok();
+        Ok(DocPlan {
+            stages,
+            index_used,
+            docs_examined: exec.and_then(|e| get_num(e, "totalDocsExamined")),
+            n_returned: exec.and_then(|e| get_num(e, "nReturned")),
+            collscan,
+        })
+    }
+
+    async fn distinct(
+        &self,
+        db: &str,
+        coll: &str,
+        field: &str,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<DocValue>> {
+        let filter = filter.map(doc_to_bson_document).unwrap_or_default();
+        let values = self
+            .client
+            .database(db)
+            .collection::<BsonDocument>(coll)
+            .distinct(field, filter)
+            .await
+            .map_err(query_err)?;
+        Ok(values.into_iter().map(bson_to_doc).collect())
+    }
+
+    async fn next_batch(&self, cursor: &DocCursor, batch: usize) -> Result<DocPage> {
+        // A live server cursor is advanced with the low-level `getMore` command
+        // (the typed `Cursor` object can't be reconstructed from just its id).
+        let reply = self
+            .client
+            .database(&cursor.db)
+            .run_command(doc! {
+                "getMore": cursor.id,
+                "collection": &cursor.coll,
+                "batchSize": batch as i64,
+            })
+            .await
+            .map_err(query_err)?;
+        parse_cursor_reply(&reply, &cursor.db, &cursor.coll, "nextBatch")
+    }
+
+    async fn close_cursor(&self, cursor: &DocCursor) {
+        // Best-effort: a failed kill just lets the cursor time out server-side.
+        let _ = self
+            .client
+            .database(&cursor.db)
+            .run_command(doc! { "killCursors": &cursor.coll, "cursors": [cursor.id] })
+            .await;
+    }
+
+    fn parse_ext_json(&self, text: &str) -> Result<DocValue> {
+        let json: serde_json::Value = serde_json::from_str(text)
+            .map_err(|e| RedError::Query(format!("invalid JSON: {e}")))?;
+        // `Bson::try_from` interprets extended-JSON `$`-tags (`$oid`, `$date`, …),
+        // so a typed filter keeps its BSON types rather than degrading to strings.
+        let bson = Bson::try_from(json)
+            .map_err(|e| RedError::Query(format!("invalid extended JSON: {e}")))?;
+        Ok(bson_to_doc(bson))
+    }
 }
 
 // --- topology / error mapping ------------------------------------------------
@@ -261,6 +444,102 @@ fn connect_err(e: MongoError) -> RedError {
 /// A query-time error (browse/find/count): a failed operation, not a connect.
 fn query_err(e: MongoError) -> RedError {
     RedError::Query(e.to_string())
+}
+
+/// Render an index key's order value as the string the panel shows: a b-tree
+/// direction (`1`/`-1`) or a special-index tag (`text`/`2dsphere`/`hashed`).
+fn index_order(order: &Bson) -> String {
+    match order {
+        Bson::Int32(n) => n.to_string(),
+        Bson::Int64(n) => n.to_string(),
+        Bson::Double(x) => x.to_string(),
+        Bson::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Read a numeric explain stat as `u64`, tolerating either BSON int width or a
+/// double (explain reports these inconsistently across server versions).
+fn get_num(doc: &BsonDocument, key: &str) -> Option<u64> {
+    match doc.get(key) {
+        Some(Bson::Int64(n)) => Some(*n as u64),
+        Some(Bson::Int32(n)) => Some(*n as u64),
+        Some(Bson::Double(x)) => Some(*x as u64),
+        _ => None,
+    }
+}
+
+/// Flatten an `explain` winning-plan tree (depth-first) into the panel's stage
+/// list, recording the index an `IXSCAN` used and whether any stage is a
+/// `COLLSCAN`. Recurses through both the single `inputStage` and the fan-out
+/// `inputStages` (an `OR`/merge).
+fn flatten_plan(
+    node: &BsonDocument,
+    depth: usize,
+    out: &mut Vec<PlanStage>,
+    index_used: &mut Option<String>,
+    collscan: &mut bool,
+) {
+    let stage = node.get_str("stage").unwrap_or_default().to_string();
+    if stage == "COLLSCAN" {
+        *collscan = true;
+    }
+    let detail = node.get_str("indexName").ok().map(|name| {
+        if index_used.is_none() {
+            *index_used = Some(name.to_string());
+        }
+        name.to_string()
+    });
+    out.push(PlanStage {
+        stage,
+        depth,
+        detail,
+    });
+    if let Ok(input) = node.get_document("inputStage") {
+        flatten_plan(input, depth + 1, out, index_used, collscan);
+    }
+    if let Some(Bson::Array(stages)) = node.get("inputStages") {
+        for child in stages {
+            if let Bson::Document(d) = child {
+                flatten_plan(d, depth + 1, out, index_used, collscan);
+            }
+        }
+    }
+}
+
+/// Turn a `find`/`getMore` command's `cursor` sub-document into a [`DocPage`].
+/// `batch_field` is `"firstBatch"` for a fresh cursor or `"nextBatch"` for a
+/// `getMore`. A returned cursor `id` of `0` means the server exhausted it.
+fn parse_cursor_reply(
+    reply: &BsonDocument,
+    db: &str,
+    coll: &str,
+    batch_field: &str,
+) -> Result<DocPage> {
+    let cursor = reply
+        .get_document("cursor")
+        .map_err(|_| RedError::Query("cursor reply had no cursor document".into()))?;
+    let id = cursor.get_i64("id").unwrap_or(0);
+    let docs = match cursor.get_array(batch_field) {
+        Ok(batch) => batch
+            .iter()
+            .filter_map(|b| match b {
+                Bson::Document(d) => Some(split_document(d.clone())),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    let live = (id != 0).then(|| DocCursor {
+        id,
+        db: db.to_string(),
+        coll: coll.to_string(),
+    });
+    Ok(DocPage {
+        docs,
+        exhausted: live.is_none(),
+        cursor: live,
+    })
 }
 
 // --- BSON <-> DocValue conversion (the firewall) -----------------------------
