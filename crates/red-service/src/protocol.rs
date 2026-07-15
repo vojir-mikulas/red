@@ -720,6 +720,24 @@ pub enum Command {
         message: String,
         context: AiContext,
     },
+    /// List the AI tool catalog for the envelope's session (the headless
+    /// `red mcp` stdio server's `tools/list`). Resolves the session's driver +
+    /// effective `AiPolicy` the same way `AiTurn` does, then filters the catalog
+    /// to the read-only tools that work headless (drops writes and the GUI-only
+    /// tools). Replied with `AiToolCatalog`, echoing `call_id`. All safety
+    /// enforcement stays server-side; the CLI is a dumb stdio↔JSON-RPC pump.
+    AiToolList {
+        call_id: u64,
+    },
+    /// Run one AI tool for the envelope's session (the `red mcp` server's
+    /// `tools/call`). `input` is the tool arguments as a JSON object string.
+    /// Writes and GUI-only tools are refused server-side; a per-process
+    /// tool-call budget bounds a runaway client. Replied with `AiToolResult`.
+    AiToolCall {
+        call_id: u64,
+        name: String,
+        input: String,
+    },
     /// Abort an in-flight assistant turn by `conversation_id` (the panel's Stop).
     AiCancel {
         conversation_id: ConversationId,
@@ -1251,6 +1269,22 @@ pub enum Event {
     AiDelta {
         conversation_id: ConversationId,
         delta: AiDelta,
+    },
+    /// The AI tool catalog for a `red mcp` `tools/list` (reply to `AiToolList`).
+    /// `tools_json` is the JSON array of `{name, description, inputSchema}`
+    /// objects, formatted server-side so the CLI splices it straight into the
+    /// JSON-RPC reply. `call_id` echoes the request.
+    AiToolCatalog {
+        call_id: u64,
+        tools_json: String,
+    },
+    /// One `red mcp` `tools/call` result (reply to `AiToolCall`). `text` is the
+    /// tool's textual output; `is_error` marks a tool-level failure (a recoverable
+    /// error the model sees, not a transport error). `call_id` echoes the request.
+    AiToolResult {
+        call_id: u64,
+        text: String,
+        is_error: bool,
     },
     /// An assistant turn completed normally; `usage` is its token accounting.
     AiTurnFinished {

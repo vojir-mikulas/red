@@ -1773,6 +1773,9 @@ impl AppState {
                 conversation_id,
                 usage,
             } => self.on_ai_finished(conversation_id, usage, cx),
+            // The `AiToolList`/`AiToolCall` request-response pair is exclusive to
+            // the headless `red mcp` CLI transport; the GUI never issues them.
+            Event::AiToolCatalog { .. } | Event::AiToolResult { .. } => {}
             Event::AiError {
                 conversation_id,
                 message,

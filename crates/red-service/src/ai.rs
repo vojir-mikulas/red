@@ -128,8 +128,8 @@ impl ReportSink {
         }
     }
 
-    /// A no-op sink that drops announcements. For tests and any path with no UI.
-    #[cfg(test)]
+    /// A no-op sink that drops announcements. For tests and any path with no UI
+    /// (the headless `red mcp` transport, which withholds `generate_report`).
     pub(crate) fn disabled() -> Self {
         Self {
             events: None,
@@ -2501,6 +2501,20 @@ pub(crate) fn is_write_tool(name: &str) -> bool {
     !READ_ONLY_TOOLS.contains(&name)
 }
 
+/// Tools that don't mutate the database but assume a running GUI: they emit UI
+/// events (`open_query` opens a tab) or write into the app's on-disk libraries
+/// (`save_query`, `generate_report`) for the app to surface. They're meaningless
+/// over the headless `red mcp` stdio transport, so that path drops them from the
+/// advertised catalog and refuses a call to them.
+pub(crate) const UI_ONLY_TOOLS: &[&str] = &["open_query", "save_query", "generate_report"];
+
+/// Whether `name` may run over the headless `red mcp` transport: a read-only tool
+/// that isn't one of the GUI-only [`UI_ONLY_TOOLS`]. Writes are already excluded
+/// by [`is_write_tool`]; this additionally drops the UI-bound reads.
+pub(crate) fn is_headless_tool(name: &str) -> bool {
+    !is_write_tool(name) && !UI_ONLY_TOOLS.contains(&name)
+}
+
 /// The outcome of vetting a `propose_write` call before it runs (Feature B). The
 /// single source of truth, called by `run_turn` (to decide reject vs. prompt) and
 /// by `run_tool` (to re-validate before executing). Keeping it in one place means
@@ -4373,6 +4387,25 @@ mod tests {
                     WriteAssessment::NotWrite
                 ),
                 "{t} must not be gated as a write"
+            );
+        }
+    }
+
+    #[test]
+    fn headless_transport_keeps_reads_drops_writes_and_gui_tools() {
+        // The `red mcp` stdio transport advertises/runs only DB reads that work
+        // without the GUI: writes and the UI-bound reads are withheld.
+        assert!(is_headless_tool("run_select"));
+        assert!(is_headless_tool("list_schema"));
+        assert!(is_headless_tool("kv_get_value"));
+        // Writes stay out (they're not in READ_ONLY_TOOLS).
+        assert!(!is_headless_tool("propose_write"));
+        assert!(!is_headless_tool("kv_delete"));
+        // GUI-only reads are withheld even though they don't mutate the DB.
+        for t in UI_ONLY_TOOLS {
+            assert!(
+                !is_headless_tool(t),
+                "{t} needs the GUI; withhold it headless"
             );
         }
     }

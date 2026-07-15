@@ -186,6 +186,91 @@ async fn disconnect_drops_session() {
     send(&handle, Command::Shutdown);
 }
 
+/// The headless `red mcp` transport (`AiToolList` + `AiToolCall`): list the tool
+/// catalog and run a guarded `run_select`, the same round-trip the CLI stdio pump
+/// wraps. Asserts the catalog withholds writes and GUI-only tools, and that a
+/// select runs against the driver.
+#[tokio::test]
+async fn mcp_tool_list_and_call_round_trip() {
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(&handle, Command::Connect(sqlite(":memory:", true)));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    // tools/list → catalog of headless-safe read tools only.
+    send(&handle, Command::AiToolList { call_id: 1 });
+    let tools_json = match next(&mut events).await {
+        Some(Event::AiToolCatalog {
+            call_id,
+            tools_json,
+        }) => {
+            assert_eq!(call_id, 1);
+            tools_json
+        }
+        other => panic!("expected AiToolCatalog, got {other:?}"),
+    };
+    let tools: serde_json::Value = serde_json::from_str(&tools_json).unwrap();
+    let names: Vec<&str> = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .collect();
+    assert!(names.contains(&"run_select"), "reads exposed: {names:?}");
+    assert!(names.contains(&"list_schema"));
+    // Writes and GUI-only tools are withheld headless.
+    assert!(!names.contains(&"propose_write"));
+    assert!(!names.contains(&"open_query"));
+    assert!(!names.contains(&"save_query"));
+    assert!(!names.contains(&"generate_report"));
+
+    // tools/call run_select → a non-error result carrying the value.
+    send(
+        &handle,
+        Command::AiToolCall {
+            call_id: 2,
+            name: "run_select".into(),
+            input: r#"{"sql":"SELECT 1 AS one"}"#.into(),
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::AiToolResult {
+            call_id,
+            text,
+            is_error,
+        }) => {
+            assert_eq!(call_id, 2);
+            assert!(!is_error, "run_select errored: {text}");
+            assert!(text.contains('1'), "result missing value: {text}");
+        }
+        other => panic!("expected AiToolResult, got {other:?}"),
+    }
+
+    // A withheld write tool is refused in-band (a recoverable tool error), never
+    // reaching the driver.
+    send(
+        &handle,
+        Command::AiToolCall {
+            call_id: 3,
+            name: "propose_write".into(),
+            input: "{}".into(),
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::AiToolResult {
+            call_id, is_error, ..
+        }) => {
+            assert_eq!(call_id, 3);
+            assert!(is_error, "a write tool must be refused headless");
+        }
+        other => panic!("expected AiToolResult, got {other:?}"),
+    }
+    send(&handle, Command::Shutdown);
+}
+
 /// Connect, load the skeleton, then describe a table: the schema-explorer
 /// round-trip the sidebar drives.
 #[tokio::test]

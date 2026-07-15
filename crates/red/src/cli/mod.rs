@@ -20,6 +20,7 @@ use red_service::{Command, Event, ServiceHandle, SessionId};
 
 mod copy;
 mod format;
+mod mcp;
 mod sql_split;
 
 use format::{OutFormat, Writer};
@@ -108,6 +109,9 @@ enum Verb {
     /// Remove all RED data: config + data directories and every keychain secret
     /// (connection passwords, SSH secrets, AI keys). Does not touch the binary.
     Reset(ResetArgs),
+    /// Serve Red's read-only database tools to an MCP client over stdio (for
+    /// Claude Code and other chats; no GUI, no ports).
+    Mcp(mcp::McpArgs),
 }
 
 #[derive(Args)]
@@ -180,6 +184,7 @@ pub fn run() -> Option<u8> {
         "copy",
         "migrate",
         "reset",
+        "mcp",
     ];
     let args: Vec<String> = std::env::args().skip(1).collect();
     let first_positional = args.iter().find(|a| !a.starts_with('-'));
@@ -214,6 +219,7 @@ pub fn run() -> Option<u8> {
         Verb::Copy(a) => copy::cmd_copy(a),
         Verb::Migrate(a) => copy::cmd_migrate(a),
         Verb::Reset(a) => cmd_reset(a),
+        Verb::Mcp(a) => mcp::cmd_mcp(a),
     })
 }
 

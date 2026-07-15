@@ -163,6 +163,10 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
     // overrides over this and enforces the result in the shared tool layer, so it
     // covers both backends and the agent can't bypass it.
     let mut ai_policy = red_core::AiPolicy::default();
+    // Cumulative tool-call tally for the headless `red mcp` transport, bounding a
+    // runaway client over the process's lifetime (the CLI analogue of the API
+    // path's per-conversation budget and the HTTP MCP server's `calls` counter).
+    let mut mcp_tool_calls: usize = 0;
     let ai_state = Arc::new(Mutex::new(crate::ai::AiState::default()));
     // The subscription (ACP) path keeps one live agent conversation per
     // `conversation_id`; the tokio Mutex lets a slow agent start await off-loop.
@@ -458,6 +462,119 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         ));
                     }
                 }
+            }
+
+            Command::AiToolList { call_id } => {
+                // Resolve the session's backend + effective policy the same way
+                // `AiTurn` does, then advertise only the headless-safe read tools
+                // (writes and GUI-only tools dropped). All safety stays here.
+                let Some((backend, policy)) =
+                    resolve_ai_tool_ctx(&sessions, session_id, &ai_policy)
+                else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::AiToolCatalog {
+                            call_id,
+                            tools_json: "[]".into(),
+                        },
+                    );
+                    continue;
+                };
+                let tools: Vec<serde_json::Value> = backend
+                    .catalog(&policy)
+                    .into_iter()
+                    .filter(|t| crate::ai::is_headless_tool(&t.name))
+                    .map(|t| {
+                        serde_json::json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "inputSchema": t.input_schema,
+                        })
+                    })
+                    .collect();
+                let tools_json = serde_json::to_string(&tools).unwrap_or_else(|_| "[]".to_string());
+                emit(
+                    &events,
+                    session_id,
+                    Event::AiToolCatalog {
+                        call_id,
+                        tools_json,
+                    },
+                );
+            }
+
+            Command::AiToolCall {
+                call_id,
+                name,
+                input,
+            } => {
+                let Some((backend, policy)) =
+                    resolve_ai_tool_ctx(&sessions, session_id, &ai_policy)
+                else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::AiToolResult {
+                            call_id,
+                            text: "error: not connected".into(),
+                            is_error: true,
+                        },
+                    );
+                    continue;
+                };
+                // Writes and GUI-only tools never run over the headless transport
+                // (mirrors the HTTP MCP server): refuse in-band so the model can
+                // recover, before charging the budget.
+                if !crate::ai::is_headless_tool(&name) {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::AiToolResult {
+                            call_id,
+                            text: "error: this tool cannot run over the headless MCP transport \
+                                   (it modifies data or requires the Red GUI)."
+                                .into(),
+                            is_error: true,
+                        },
+                    );
+                    continue;
+                }
+                // Charge the cumulative tool-call budget before running anything.
+                let max = policy.limits.max_tool_calls;
+                if max != 0 && mcp_tool_calls >= max {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::AiToolResult {
+                            call_id,
+                            text: "error: tool-call budget exhausted for this session".into(),
+                            is_error: true,
+                        },
+                    );
+                    continue;
+                }
+                mcp_tool_calls += 1;
+                let args: serde_json::Value =
+                    serde_json::from_str(&input).unwrap_or_else(|_| serde_json::json!({}));
+                // A no-op report sink: `generate_report` is withheld headless, and
+                // the CLI has no UI to surface a report card.
+                let report = crate::ai::ReportSink::disabled();
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let (text, ok) = backend
+                        .run_tool(&name, &args, &policy, &red_ai::CancelToken::new(), &report)
+                        .await;
+                    emit(
+                        &events,
+                        session_id,
+                        Event::AiToolResult {
+                            call_id,
+                            text,
+                            is_error: !ok,
+                        },
+                    );
+                });
             }
 
             Command::AiCancel { conversation_id } => {
@@ -3287,6 +3404,27 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
     // reference cycle and orphan the agent subprocesses. Clearing the map drops
     // their command channels, which unwinds the cycle and reaps the processes.
     ai_acp.lock().await.clear();
+}
+
+/// Resolve the AI backend + effective policy for a `red mcp` tool request, the
+/// same resolution `AiTurn` does: the session's driver (SQL or KV seam) becomes
+/// the backend, and the global policy is layered with the connection's overrides
+/// and read-only posture. `None` when the envelope has no live session. All
+/// enforcement (tier filter, write/GUI-tool refusal, budget) is the caller's;
+/// this only assembles the context.
+fn resolve_ai_tool_ctx(
+    sessions: &HashMap<SessionId, SessionState>,
+    session_id: Option<SessionId>,
+    ai_policy: &red_core::AiPolicy,
+) -> Option<(crate::ai::AiBackend, red_core::AiPolicy)> {
+    let state = sessions.get(&session_id?)?;
+    let backend = match &state.driver {
+        SessionDriver::Sql(d) => crate::ai::AiBackend::Sql(d.clone()),
+        SessionDriver::Kv(d) => crate::ai::AiBackend::Kv(d.clone()),
+    };
+    let mut effective = ai_policy.with_overrides(state.ai_override.enabled, state.ai_override.tier);
+    effective.read_only = state.read_only;
+    Some((backend, effective))
 }
 
 /// The UI may have dropped its receiver (window closed); a failed send is the

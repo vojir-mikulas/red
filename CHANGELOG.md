@@ -7,6 +7,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `red mcp <connection>`: a headless stdio MCP server. Point Claude Code (or any
+  MCP client) at `red mcp my-connection` and it gets Red's read-only database
+  tools (schema, describe, profile, SELECT, explain) grounded in that connection,
+  with no GUI and no ports. Writes and GUI-only tools are withheld and a
+  tool-call budget bounds a runaway client, exactly like the in-app MCP path.
 - Redis batch console: the command console has a new Line / Batch toggle. Batch
   mode is a multi-line composer that runs many commands at once with per-command
   output streamed back into the log, a live "running N / M" progress readout, and
