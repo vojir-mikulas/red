@@ -7,6 +7,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- MongoDB support (read-only browse): connect to a `mongodb://` or
+  `mongodb+srv://` deployment and explore it in a dedicated document shell. A
+  `database -> collection` tree on the left lists collections with estimated
+  counts and view / time-series badges; selecting one pages its documents into a
+  sampled-column grid (a column per top-level field, nested values shown as
+  extended JSON) and clicking a row opens the full document as pretty-printed
+  extended JSON that preserves BSON types (ObjectId, dates, decimals, binary).
+  Pages are fetched one window at a time and never load a collection whole.
 - Searchable, grouped History dock: the left History panel (both the SQL and
   Redis shells) now has a search box that narrows the list live and collapsible
   grouped sections. SQL history groups into Today / Yesterday / Earlier time
