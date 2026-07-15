@@ -1,10 +1,11 @@
 //! The MongoDB browser (`MongoView`), the document-store shell parallel to the
-//! Redis `kvbrowse::RedisView`. D0 read-only surface: a `database -> collection`
-//! tree on the left, the selected collection's documents in a sampled-column
-//! grid, and a raw-document inspector on the right. It speaks the `Doc*`
-//! `Command`/`Event` pair (see `red-service`'s protocol) and never touches the
-//! `DocDriver` directly, the same UI/driver separation the SQL and Redis shells
-//! keep. See `docs/plans/todo/doc-driver.md`.
+//! Redis `kvbrowse::RedisView`. A `database -> collection` tree on the left and a
+//! main area that switches (per-collection) between the sampled-column document
+//! grid with an extended-JSON filter bar, the inferred-schema panel, and the
+//! indexes panel; a raw-document inspector docks right when a row is open. It
+//! speaks the `Doc*` `Command`/`Event` pair (see `red-service`'s protocol) and
+//! never touches the `DocDriver` directly, the same UI/driver separation the SQL
+//! and Redis shells keep. See `docs/plans/todo/doc-driver.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
@@ -12,13 +13,33 @@ use std::rc::Rc;
 use flint::Theme;
 use flint::prelude::*;
 use gpui::{
-    Context, FocusHandle, SharedString, UniformListScrollHandle, WeakEntity, Window, div,
+    Context, Entity, FocusHandle, SharedString, UniformListScrollHandle, WeakEntity, Window, div,
     prelude::*, px,
 };
-use red_core::doc::{CollKind, CollectionInfo, DbInfo, DocValue, Document};
+use red_core::doc::{CollKind, CollectionInfo, DbInfo, DocSchema, DocValue, Document, IndexInfo};
 use red_service::{Command, Epoch, SessionId};
 
 use crate::app::{ActiveConn, AppState, Phase};
+
+/// Which view the main area shows for the open collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocPanel {
+    /// The document grid (with the filter bar) — the default.
+    Documents,
+    /// The inferred-schema table (per-field type distribution + present-ratio).
+    Schema,
+    /// The collection's indexes.
+    Indexes,
+}
+
+impl DocPanel {
+    /// The panels in toolbar order, with their segment labels.
+    const ALL: [(DocPanel, &'static str); 3] = [
+        (DocPanel::Documents, "Documents"),
+        (DocPanel::Schema, "Schema"),
+        (DocPanel::Indexes, "Indexes"),
+    ];
+}
 
 /// Documents fetched per page. Matches the service's `DOC_PAGE_ROWS` so a
 /// "next page" advances `skip` by exactly one window.
@@ -75,12 +96,41 @@ struct CollView {
     columns: Vec<String>,
     /// The document row open in the inspector, if any.
     inspector: Option<usize>,
+    /// Which main view is shown (documents / schema / indexes).
+    panel: DocPanel,
+    /// The extended-JSON filter input; its text is applied on Enter or "Run".
+    filter_input: Entity<TextInput>,
+    /// The applied filter (re-sent when paging), or `None` for the whole collection.
+    filter: Option<String>,
+    /// The inferred schema, lazily fetched the first time the Schema panel opens.
+    schema: Option<DocSchema>,
+    /// The collection's indexes, lazily fetched the first time Indexes opens.
+    indexes: Option<Vec<IndexInfo>>,
     scroll: UniformListScrollHandle,
     list_focus: FocusHandle,
 }
 
 impl CollView {
     fn new(db: String, coll: String, cx: &mut Context<AppState>) -> Self {
+        let filter_input = cx.new(|cx| {
+            TextInput::new(cx).with_placeholder("filter, e.g. { \"status\": \"active\" }")
+        });
+        // Apply the filter on Enter, mirroring the SQL/Redis filter bars.
+        cx.subscribe(&filter_input, |this, _input, event: &TextInputEvent, cx| {
+            if !matches!(event, TextInputEvent::Submit) {
+                return;
+            }
+            // Resolve the session out from under the `&this.phase` borrow before
+            // the mutable `doc_apply_filter` call.
+            let session = match &this.phase {
+                Phase::Connected(active) => active.doc_view.as_ref().map(|v| v.session),
+                _ => None,
+            };
+            if let Some(session) = session {
+                this.doc_apply_filter(session, cx);
+            }
+        })
+        .detach();
         Self {
             db,
             coll,
@@ -91,6 +141,11 @@ impl CollView {
             loading: true,
             columns: Vec::new(),
             inspector: None,
+            panel: DocPanel::Documents,
+            filter_input,
+            filter: None,
+            schema: None,
+            indexes: None,
             scroll: UniformListScrollHandle::new(),
             list_focus: cx.focus_handle(),
         }
@@ -291,6 +346,7 @@ impl AppState {
                 db,
                 coll,
                 skip: 0,
+                filter: None,
             },
         );
         cx.notify();
@@ -322,7 +378,11 @@ impl AppState {
         };
         current.loading = true;
         current.inspector = None;
-        let (db, coll) = (current.db.clone(), current.coll.clone());
+        let (db, coll, filter) = (
+            current.db.clone(),
+            current.coll.clone(),
+            current.filter.clone(),
+        );
         self.service.send_to(
             session,
             Command::DocFetchPage {
@@ -330,9 +390,125 @@ impl AppState {
                 db,
                 coll,
                 skip: next_skip,
+                filter,
             },
         );
         cx.notify();
+    }
+
+    /// Apply the filter box's current text: parse-side happens in the service, so
+    /// here just re-fetch from `skip = 0` with the (trimmed) filter, or clear it
+    /// when the box is empty.
+    fn doc_apply_filter(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+        else {
+            return;
+        };
+        let epoch = view.epoch;
+        let Some(current) = view.current.as_mut() else {
+            return;
+        };
+        let text = current.filter_input.read(cx).content().trim().to_string();
+        current.filter = (!text.is_empty()).then_some(text);
+        current.skip = 0;
+        current.loading = true;
+        current.inspector = None;
+        current.panel = DocPanel::Documents;
+        let (db, coll, filter) = (
+            current.db.clone(),
+            current.coll.clone(),
+            current.filter.clone(),
+        );
+        self.service.send_to(
+            session,
+            Command::DocFetchPage {
+                epoch,
+                db,
+                coll,
+                skip: 0,
+                filter,
+            },
+        );
+        cx.notify();
+    }
+
+    /// Switch the open collection's main panel, lazily fetching the schema or
+    /// index list the first time each is shown.
+    fn doc_set_panel(&mut self, session: SessionId, panel: DocPanel, cx: &mut Context<Self>) {
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+        else {
+            return;
+        };
+        let epoch = view.epoch;
+        let Some(current) = view.current.as_mut() else {
+            return;
+        };
+        current.panel = panel;
+        let (db, coll) = (current.db.clone(), current.coll.clone());
+        match panel {
+            DocPanel::Schema if current.schema.is_none() => {
+                self.service
+                    .send_to(session, Command::DocInferSchema { epoch, db, coll });
+            }
+            DocPanel::Indexes if current.indexes.is_none() => {
+                self.service
+                    .send_to(session, Command::DocListIndexes { epoch, db, coll });
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn on_doc_schema(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        schema: DocSchema,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.conn_mut(session).and_then(|a| a.doc_view.as_mut()) else {
+            return;
+        };
+        if view.epoch != epoch {
+            return;
+        }
+        if let Some(current) = view.current.as_mut()
+            && current.db == db
+            && current.coll == coll
+        {
+            current.schema = Some(schema);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn on_doc_indexes(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        indexes: Vec<IndexInfo>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.conn_mut(session).and_then(|a| a.doc_view.as_mut()) else {
+            return;
+        };
+        if view.epoch != epoch {
+            return;
+        }
+        if let Some(current) = view.current.as_mut()
+            && current.db == db
+            && current.coll == coll
+        {
+            current.indexes = Some(indexes);
+            cx.notify();
+        }
     }
 
     /// Open (or, on the same row, close) the inspector on a document row.
@@ -544,8 +720,9 @@ impl AppState {
             .into_any_element()
     }
 
-    /// The main area: a toolbar (collection name + pager) over the sampled-column
-    /// document grid, with the inspector docked right when a row is open.
+    /// The main area: a header (collection name + Documents/Schema/Indexes
+    /// picker, plus the filter bar and pager on the Documents panel) over the
+    /// panel body.
     fn render_doc_main(
         &self,
         v: &MongoView,
@@ -563,10 +740,150 @@ impl AppState {
                 .into_any_element();
         };
 
-        let toolbar = self.render_doc_toolbar(v.session, current, theme, view);
-        let grid = self.render_doc_grid(v.session, current, theme, view);
+        let header = self.render_doc_header(v.session, current, theme, view);
+        let body = match current.panel {
+            DocPanel::Documents => self.render_doc_documents(v.session, current, theme, view),
+            DocPanel::Schema => render_doc_schema_panel(current, theme),
+            DocPanel::Indexes => render_doc_indexes_panel(current, theme),
+        };
 
-        let content = if let Some(sel) = current.inspector.and_then(|i| current.docs.get(i)) {
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(header)
+            .child(body)
+            .into_any_element()
+    }
+
+    fn render_doc_header(
+        &self,
+        session: SessionId,
+        current: &CollView,
+        theme: &Theme,
+        view: &WeakEntity<AppState>,
+    ) -> gpui::AnyElement {
+        let picker_view = view.clone();
+        let selected_ix = DocPanel::ALL
+            .iter()
+            .position(|(p, _)| *p == current.panel)
+            .unwrap_or(0);
+        let picker = DocPanel::ALL
+            .iter()
+            .fold(Segmented::new("doc-panel"), |seg, (_, label)| {
+                seg.segment(*label)
+            })
+            .selected(selected_ix)
+            .on_select(move |ix, _, cx| {
+                let panel = DocPanel::ALL
+                    .get(ix)
+                    .map(|(p, _)| *p)
+                    .unwrap_or(DocPanel::Documents);
+                picker_view
+                    .update(cx, |this, cx| this.doc_set_panel(session, panel, cx))
+                    .ok();
+            });
+
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .flex_shrink_0()
+                    .child(format!("{}.{}", current.db, current.coll)),
+            )
+            .child(picker);
+
+        // The filter bar + pager belong to the Documents panel only.
+        if current.panel == DocPanel::Documents {
+            let start = current.skip + 1;
+            let end = current.skip + current.docs.len() as u64;
+            let range = if current.docs.is_empty() {
+                "0".to_string()
+            } else {
+                format!("{start}\u{2013}{end}")
+            };
+            let total = current
+                .total
+                .map(|t| format!(" of {t}"))
+                .unwrap_or_default();
+            let status = if current.loading {
+                "Loading...".to_string()
+            } else {
+                format!("{range}{total}")
+            };
+
+            let run_view = view.clone();
+            let prev_view = view.clone();
+            let next_view = view.clone();
+            row = row
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(120.))
+                        .child(current.filter_input.clone()),
+                )
+                .child(
+                    Button::new("doc-run-filter", "Run")
+                        .size(ButtonSize::Sm)
+                        .variant(ButtonVariant::Secondary)
+                        .on_click(move |_, _, cx| {
+                            run_view
+                                .update(cx, |this, cx| this.doc_apply_filter(session, cx))
+                                .ok();
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(theme.text_muted)
+                        .child(status),
+                )
+                .child(
+                    Button::new("doc-prev", "Prev")
+                        .size(ButtonSize::Sm)
+                        .variant(ButtonVariant::Secondary)
+                        .disabled(current.skip == 0 || current.loading)
+                        .on_click(move |_, _, cx| {
+                            prev_view
+                                .update(cx, |this, cx| this.doc_page(session, false, cx))
+                                .ok();
+                        }),
+                )
+                .child(
+                    Button::new("doc-next", "Next")
+                        .size(ButtonSize::Sm)
+                        .variant(ButtonVariant::Secondary)
+                        .disabled(current.exhausted || current.loading)
+                        .on_click(move |_, _, cx| {
+                            next_view
+                                .update(cx, |this, cx| this.doc_page(session, true, cx))
+                                .ok();
+                        }),
+                );
+        } else {
+            row = row.child(div().flex_1());
+        }
+        row.into_any_element()
+    }
+
+    /// The Documents panel: the sampled-column grid, with the inspector docked
+    /// right when a row is open.
+    fn render_doc_documents(
+        &self,
+        session: SessionId,
+        current: &CollView,
+        theme: &Theme,
+        view: &WeakEntity<AppState>,
+    ) -> gpui::AnyElement {
+        let grid = self.render_doc_grid(session, current, theme, view);
+        if let Some(sel) = current.inspector.and_then(|i| current.docs.get(i)) {
             div()
                 .flex()
                 .flex_1()
@@ -579,85 +896,12 @@ impl AppState {
                         .flex_shrink_0()
                         .border_l_1()
                         .border_color(theme.border)
-                        .child(self.render_doc_inspector(v.session, sel, theme, view)),
+                        .child(self.render_doc_inspector(session, sel, theme, view)),
                 )
                 .into_any_element()
         } else {
             div().flex_1().min_h(px(0.)).child(grid).into_any_element()
-        };
-
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .child(toolbar)
-            .child(content)
-            .into_any_element()
-    }
-
-    fn render_doc_toolbar(
-        &self,
-        session: SessionId,
-        current: &CollView,
-        theme: &Theme,
-        view: &WeakEntity<AppState>,
-    ) -> gpui::AnyElement {
-        let start = current.skip + 1;
-        let end = current.skip + current.docs.len() as u64;
-        let range = if current.docs.is_empty() {
-            "0".to_string()
-        } else {
-            format!("{start}\u{2013}{end}")
-        };
-        let total = current
-            .total
-            .map(|t| format!(" of {t}"))
-            .unwrap_or_default();
-        let status = if current.loading {
-            "Loading...".to_string()
-        } else {
-            format!("{range}{total}")
-        };
-
-        let prev_view = view.clone();
-        let next_view = view.clone();
-        let prev = Button::new("doc-prev", "Prev")
-            .size(ButtonSize::Sm)
-            .variant(ButtonVariant::Secondary)
-            .disabled(current.skip == 0 || current.loading)
-            .on_click(move |_, _, cx| {
-                prev_view
-                    .update(cx, |this, cx| this.doc_page(session, false, cx))
-                    .ok();
-            });
-        let next = Button::new("doc-next", "Next")
-            .size(ButtonSize::Sm)
-            .variant(ButtonVariant::Secondary)
-            .disabled(current.exhausted || current.loading)
-            .on_click(move |_, _, cx| {
-                next_view
-                    .update(cx, |this, cx| this.doc_page(session, true, cx))
-                    .ok();
-            });
-
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(format!("{}.{}", current.db, current.coll)),
-            )
-            .child(div().flex_1())
-            .child(div().text_color(theme.text_muted).child(status))
-            .child(prev)
-            .child(next)
-            .into_any_element()
+        }
     }
 
     fn render_doc_grid(
@@ -815,6 +1059,149 @@ impl AppState {
             )
             .into_any_element()
     }
+}
+
+// --- panel bodies (free, no `&self` needed) ----------------------------------
+
+/// A centered muted hint filling the panel body (loading / empty states).
+fn doc_centered_hint(text: &str, theme: &Theme) -> gpui::AnyElement {
+    div()
+        .flex()
+        .flex_1()
+        .min_h(px(0.))
+        .items_center()
+        .justify_center()
+        .text_color(theme.text_faint)
+        .child(text.to_string())
+        .into_any_element()
+}
+
+/// One three-column row (Field | middle | trailing), shared by the schema and
+/// index panels. `header` styles it as the muted, bordered column header.
+fn doc_row3(
+    lead: impl Into<SharedString>,
+    middle: impl Into<SharedString>,
+    trail: impl Into<SharedString>,
+    theme: &Theme,
+    header: bool,
+) -> gpui::AnyElement {
+    let color = if header { theme.text_muted } else { theme.text };
+    div()
+        .flex()
+        .items_center()
+        .gap_3()
+        .px_3()
+        .py(px(5.))
+        .when(header, |d| d.border_b_1().border_color(theme.border))
+        .child(
+            div()
+                .w(px(240.))
+                .flex_shrink_0()
+                .truncate()
+                .text_color(color)
+                .child(lead.into()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .text_color(color)
+                .child(middle.into()),
+        )
+        .child(
+            div()
+                .w(px(90.))
+                .flex_shrink_0()
+                .text_color(theme.text_muted)
+                .child(trail.into()),
+        )
+        .into_any_element()
+}
+
+/// The Schema panel: one row per inferred field path with its type distribution
+/// (`string 82% . int 18%`) and present-ratio, or a hint while the sample loads.
+fn render_doc_schema_panel(current: &CollView, theme: &Theme) -> gpui::AnyElement {
+    let Some(schema) = current.schema.as_ref() else {
+        return doc_centered_hint("Sampling schema...", theme);
+    };
+    if schema.fields.is_empty() {
+        return doc_centered_hint("No fields sampled.", theme);
+    }
+    let rows = schema.fields.iter().map(|f| {
+        let total: u64 = f.types.iter().map(|(_, c)| c).sum();
+        let types = f
+            .types
+            .iter()
+            .map(|(t, c)| {
+                let pct = if total > 0 {
+                    (*c as f64 * 100.0 / total as f64).round() as u64
+                } else {
+                    0
+                };
+                format!("{} {pct}%", t.label())
+            })
+            .collect::<Vec<_>>()
+            .join("  \u{b7}  ");
+        let present = format!("{:.0}%", f.present_ratio * 100.0);
+        doc_row3(f.path.clone(), types, present, theme, false)
+    });
+    div()
+        .id("doc-schema")
+        .size_full()
+        .overflow_y_scroll()
+        .text_size(theme.scale(12.))
+        .child(doc_row3("Field", "Types", "Present", theme, true))
+        .children(rows)
+        .child(
+            div()
+                .px_3()
+                .py_2()
+                .text_color(theme.text_faint)
+                .child(format!("sampled {} documents", schema.sampled)),
+        )
+        .into_any_element()
+}
+
+/// The Indexes panel: one row per index with its keys and properties, or a hint
+/// while the list loads.
+fn render_doc_indexes_panel(current: &CollView, theme: &Theme) -> gpui::AnyElement {
+    let Some(indexes) = current.indexes.as_ref() else {
+        return doc_centered_hint("Loading indexes...", theme);
+    };
+    if indexes.is_empty() {
+        return doc_centered_hint("No indexes.", theme);
+    }
+    let rows = indexes.iter().map(|idx| {
+        let keys = idx
+            .keys
+            .iter()
+            .map(|(field, order)| format!("{field}: {order}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut props = Vec::new();
+        if idx.unique {
+            props.push("unique".to_string());
+        }
+        if idx.sparse {
+            props.push("sparse".to_string());
+        }
+        if idx.partial {
+            props.push("partial".to_string());
+        }
+        if let Some(ttl) = idx.ttl {
+            props.push(format!("ttl {ttl}s"));
+        }
+        doc_row3(idx.name.clone(), keys, props.join(", "), theme, false)
+    });
+    div()
+        .id("doc-indexes")
+        .size_full()
+        .overflow_y_scroll()
+        .text_size(theme.scale(12.))
+        .child(doc_row3("Index", "Keys", "Properties", theme, true))
+        .children(rows)
+        .into_any_element()
 }
 
 // --- free helpers ------------------------------------------------------------

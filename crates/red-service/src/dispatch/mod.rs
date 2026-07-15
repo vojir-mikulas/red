@@ -68,6 +68,10 @@ const MAX_CONCURRENT_COPIES: usize = 2;
 /// batch and the event payload, mirroring the SQL grid's page size.
 const DOC_PAGE_ROWS: usize = 100;
 
+/// Documents sampled to infer a collection's schema (`$sample`). Large enough to
+/// surface real type drift, small enough to stay cheap on a big collection.
+const DOC_SCHEMA_SAMPLE: usize = 200;
+
 /// Rows per source window / insert chunk in a table copy (the driver re-clamps the
 /// insert to its bound-parameter cap). Keeps the copy one-chunk-resident regardless
 /// of how many rows move; a `[copy]` knob is a later refinement, like import's.
@@ -2743,6 +2747,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 db,
                 coll,
                 skip,
+                filter,
             } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get_mut(&id) else {
@@ -2757,6 +2762,23 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     );
                     continue;
                 };
+                // Parse the extended-JSON filter up front so a syntax error is a
+                // clean `DocError` rather than a failed find deep in the spawn.
+                let filter = match filter.as_deref().map(|f| driver.parse_ext_json(f)) {
+                    Some(Ok(f)) => Some(f),
+                    Some(Err(e)) => {
+                        emit(
+                            &events,
+                            session_id,
+                            Event::DocError {
+                                epoch,
+                                message: e.to_string(),
+                            },
+                        );
+                        continue;
+                    }
+                    None => None,
+                };
                 // A new page (or a new collection selection) supersedes the
                 // in-flight `find`, like a flung SQL scrollbar.
                 let entry = state.inflight.entry(epoch).or_default();
@@ -2770,7 +2792,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     let query = red_core::doc::FindQuery {
                         db: db.clone(),
                         coll: coll.clone(),
-                        filter: None,
+                        filter: filter.clone(),
                         projection: None,
                         sort: None,
                         skip,
@@ -2797,9 +2819,10 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         return;
                     }
                     // Only the first window pays for the total count; later pages
-                    // reuse it. A count failure just leaves the total unknown.
+                    // reuse it. The count honors the same filter as the find so the
+                    // "of N" matches the filtered result. A failure leaves it unknown.
                     let total = if skip == 0 {
-                        driver.count(&db, &coll, None).await.ok()
+                        driver.count(&db, &coll, filter.as_ref()).await.ok()
                     } else {
                         None
                     };
@@ -2816,6 +2839,88 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             total,
                         },
                     );
+                });
+            }
+
+            Command::DocInferSchema { epoch, db, coll } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_doc().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a MongoDB connection".into()),
+                    );
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let abort = AbortSignal::new();
+                    match driver
+                        .infer_schema(&db, &coll, DOC_SCHEMA_SAMPLE, &abort)
+                        .await
+                    {
+                        Ok(schema) => emit(
+                            &events,
+                            session_id,
+                            Event::DocSchemaReady {
+                                epoch,
+                                db,
+                                coll,
+                                schema,
+                            },
+                        ),
+                        Err(e) => emit(
+                            &events,
+                            session_id,
+                            Event::DocError {
+                                epoch,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
+                });
+            }
+
+            Command::DocListIndexes { epoch, db, coll } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_doc().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a MongoDB connection".into()),
+                    );
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver.indexes(&db, &coll).await {
+                        Ok(indexes) => emit(
+                            &events,
+                            session_id,
+                            Event::DocIndexesReady {
+                                epoch,
+                                db,
+                                coll,
+                                indexes,
+                            },
+                        ),
+                        Err(e) => emit(
+                            &events,
+                            session_id,
+                            Event::DocError {
+                                epoch,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
                 });
             }
 

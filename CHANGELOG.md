@@ -14,7 +14,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sampled-column grid (a column per top-level field, nested values shown as
   extended JSON) and clicking a row opens the full document as pretty-printed
   extended JSON that preserves BSON types (ObjectId, dates, decimals, binary).
-  Pages are fetched one window at a time and never load a collection whole.
+  Pages are fetched one window at a time and never load a collection whole. The
+  document view takes an extended-JSON find filter (applied on Enter), and each
+  collection has a Schema panel that samples documents to show every field's
+  path, its type distribution (e.g. "string 82% / int 18%"), and how often it is
+  present, plus an Indexes panel listing keys and unique / sparse / ttl / partial
+  properties.
 - Searchable, grouped History dock: the left History panel (both the SQL and
   Redis shells) now has a search box that narrows the list live and collapsible
   grouped sections. SQL history groups into Today / Yesterday / Earlier time

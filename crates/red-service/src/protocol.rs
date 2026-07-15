@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use red_core::diff::{DiffColumnPlan, DiffRow, DiffSummary};
-use red_core::doc::{CollectionInfo, DbInfo, Document};
+use red_core::doc::{CollectionInfo, DbInfo, DocSchema, Document, IndexInfo};
 use red_core::kv::{
     ClientInfo, CollectionKind, KeyMeta, KvCollectionPage, KvEdit, KvScanPage, KvStreamActionReq,
     KvStreamPage, KvType, KvValue, PendingEntry, RecycledKey, RespValue, ScanBudget, ScanCursor,
@@ -526,13 +526,29 @@ pub enum Command {
     },
     /// One window of a collection's documents (`find` with `skip`, page-sized),
     /// the browse grid's read. `skip == 0` also asks for the collection's total
-    /// count so the grid can show it. Replied with `DocPageReady`; cancellable
-    /// and epoch-superseded like a SQL page fetch.
+    /// count so the grid can show it. `filter`, when set, is an extended-JSON
+    /// find filter the driver parses (a parse error replies `DocError`). Replied
+    /// with `DocPageReady`; cancellable and epoch-superseded like a SQL page fetch.
     DocFetchPage {
         epoch: Epoch,
         db: String,
         coll: String,
         skip: u64,
+        filter: Option<String>,
+    },
+    /// A collection's inferred schema (sampled per-field type distribution), for
+    /// the schema panel. Replied with `DocSchemaReady`, or `DocError` on failure.
+    DocInferSchema {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+    },
+    /// A collection's indexes (`listIndexes`), for the indexes panel. Replied with
+    /// `DocIndexesReady`, or `DocError` on failure.
+    DocListIndexes {
+        epoch: Epoch,
+        db: String,
+        coll: String,
     },
     /// Compute a column's aggregate summary over the open result's *filtered* SQL
     /// (the column-stats bar): a single `count`/`distinct`/`min`/`max`(/`sum`/`avg`)
@@ -1138,8 +1154,23 @@ pub enum Event {
         exhausted: bool,
         total: Option<u64>,
     },
-    /// A document browse operation failed (list/find), in response to a `Doc*`
-    /// command. Surfaced inline in the browser rather than only as a toast.
+    /// A collection's inferred schema, in response to `DocInferSchema`.
+    DocSchemaReady {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        schema: DocSchema,
+    },
+    /// A collection's indexes, in response to `DocListIndexes`.
+    DocIndexesReady {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        indexes: Vec<IndexInfo>,
+    },
+    /// A document browse operation failed (list/find/schema/indexes), in response
+    /// to a `Doc*` command. Surfaced inline in the browser rather than only as a
+    /// toast.
     DocError {
         epoch: Epoch,
         message: String,

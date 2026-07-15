@@ -1719,6 +1719,22 @@ impl AppState {
             } => {
                 self.on_doc_page(session, epoch, db, coll, skip, docs, exhausted, total, cx);
             }
+            Event::DocSchemaReady {
+                epoch,
+                db,
+                coll,
+                schema,
+            } => {
+                self.on_doc_schema(session, epoch, db, coll, schema, cx);
+            }
+            Event::DocIndexesReady {
+                epoch,
+                db,
+                coll,
+                indexes,
+            } => {
+                self.on_doc_indexes(session, epoch, db, coll, indexes, cx);
+            }
             Event::DocError { epoch, message } => {
                 self.on_doc_error(session, epoch, message, cx);
             }
