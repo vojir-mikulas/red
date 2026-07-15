@@ -4,20 +4,21 @@
 //! (`bson_to_doc`/`doc_to_bson`) is the version firewall the plan calls for, so
 //! the UI, `red-core`, and the eventual plugin API never see either crate.
 //!
-//! D0 read-only subset: connect + identity/topology, the `db → collection`
-//! catalog, windowed `find`, one-document fetch, and count. Writes and the
-//! streaming server cursor land in later phases.
+//! Covers the whole `DocDriver` surface: connect + identity/topology, the
+//! `db → collection` catalog, windowed `find` and the streaming server cursor,
+//! count/distinct, schema inference, aggregation, indexes, explain, and the
+//! read-only-guarded writes.
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use mongodb::bson::{Bson, Document as BsonDocument, doc};
 use mongodb::error::{Error as MongoError, ErrorKind};
-use mongodb::options::ClientOptions;
+use mongodb::options::{ClientOptions, IndexOptions};
 use mongodb::results::CollectionType;
-use mongodb::{Client, Cursor};
+use mongodb::{Client, Cursor, IndexModel};
 use red_core::doc::{
     CollKind, CollectionInfo, DbInfo, DocCursor, DocPage, DocPlan, DocSchema, DocTopology,
-    DocValue, Document, Filter, FindQuery, IndexInfo, PlanStage,
+    DocUpdate, DocValue, Document, Filter, FindQuery, IndexInfo, IndexSpec, PlanStage,
 };
 use red_core::{RedError, Result};
 
@@ -31,13 +32,9 @@ pub struct MongoDriver {
     version: String,
     /// The deployment topology, detected at connect from `hello`.
     topology: DocTopology,
-    /// The connection's read-only posture. Unused in D0 (no write methods exist
-    /// yet); D2's `insert`/`update`/`delete` consult it to refuse writes at the
-    /// driver, exactly like `KvDriver`.
-    #[allow(
-        dead_code,
-        reason = "captured at connect for the D2 write path's read-only refusal"
-    )]
+    /// The connection's read-only posture. The write methods consult it via
+    /// [`MongoDriver::ensure_writable`] to refuse writes at the driver, exactly
+    /// like `KvDriver`.
     read_only: bool,
 }
 
@@ -72,6 +69,17 @@ impl MongoDriver {
             topology,
             read_only,
         })
+    }
+
+    /// Refuse a write on a read-only connection, the driver-level guard the
+    /// human and AI write paths both pass through (defense in depth beside the
+    /// service's own read-only check).
+    fn ensure_writable(&self) -> Result<()> {
+        if self.read_only {
+            Err(RedError::Driver("connection is read-only".into()))
+        } else {
+            Ok(())
+        }
     }
 
     /// Drain up to `cap` documents from a find cursor into a page, cooperatively
@@ -194,8 +202,9 @@ impl DocDriver for MongoDriver {
         }
         let mut cursor = find.await.map_err(query_err)?;
         let docs = Self::collect_page(&mut cursor, cap, abort).await?;
-        // D0 has no live server cursor; a short page means the collection is
-        // exhausted at this offset, and the service pages the rest by `skip`.
+        // This windowed find hands back no live cursor; a short page means the
+        // collection is exhausted at this offset, and the service pages the rest
+        // by `skip`.
         let exhausted = docs.len() < cap;
         Ok(DocPage {
             docs,
@@ -412,6 +421,126 @@ impl DocDriver for MongoDriver {
         let bson = Bson::try_from(json)
             .map_err(|e| RedError::Query(format!("invalid extended JSON: {e}")))?;
         Ok(bson_to_doc(bson))
+    }
+
+    async fn insert(&self, db: &str, coll: &str, docs: &[Document]) -> Result<u64> {
+        self.ensure_writable()?;
+        let bson: Vec<BsonDocument> = docs.iter().map(document_to_bson).collect();
+        let result = self
+            .client
+            .database(db)
+            .collection::<BsonDocument>(coll)
+            .insert_many(bson)
+            .await
+            .map_err(query_err)?;
+        Ok(result.inserted_ids.len() as u64)
+    }
+
+    async fn update(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Filter,
+        change: &DocUpdate,
+        many: bool,
+    ) -> Result<u64> {
+        self.ensure_writable()?;
+        let coll = self.client.database(db).collection::<BsonDocument>(coll);
+        let filter = doc_to_bson_document(filter);
+        let modified = match change {
+            // A `$set` patch merges the given fields; a `Replace` swaps the whole
+            // document (single-match only — `replaceMany` doesn't exist).
+            DocUpdate::Patch(patch) => {
+                let update = doc! { "$set": doc_to_bson_document(patch) };
+                if many {
+                    coll.update_many(filter, update)
+                        .await
+                        .map_err(query_err)?
+                        .modified_count
+                } else {
+                    coll.update_one(filter, update)
+                        .await
+                        .map_err(query_err)?
+                        .modified_count
+                }
+            }
+            DocUpdate::Replace(doc) => {
+                coll.replace_one(filter, document_to_bson(doc))
+                    .await
+                    .map_err(query_err)?
+                    .modified_count
+            }
+        };
+        Ok(modified)
+    }
+
+    async fn replace(&self, db: &str, coll: &str, id: &DocValue, doc: &Document) -> Result<()> {
+        self.ensure_writable()?;
+        self.client
+            .database(db)
+            .collection::<BsonDocument>(coll)
+            .replace_one(doc! { "_id": doc_to_bson(id) }, document_to_bson(doc))
+            .await
+            .map(|_| ())
+            .map_err(query_err)
+    }
+
+    async fn delete(&self, db: &str, coll: &str, filter: &Filter, many: bool) -> Result<u64> {
+        self.ensure_writable()?;
+        let coll = self.client.database(db).collection::<BsonDocument>(coll);
+        let filter = doc_to_bson_document(filter);
+        let deleted = if many {
+            coll.delete_many(filter)
+                .await
+                .map_err(query_err)?
+                .deleted_count
+        } else {
+            coll.delete_one(filter)
+                .await
+                .map_err(query_err)?
+                .deleted_count
+        };
+        Ok(deleted)
+    }
+
+    async fn create_collection(&self, db: &str, coll: &str) -> Result<()> {
+        self.ensure_writable()?;
+        self.client
+            .database(db)
+            .create_collection(coll)
+            .await
+            .map_err(query_err)
+    }
+
+    async fn drop_collection(&self, db: &str, coll: &str) -> Result<()> {
+        self.ensure_writable()?;
+        self.client
+            .database(db)
+            .collection::<BsonDocument>(coll)
+            .drop()
+            .await
+            .map_err(query_err)
+    }
+
+    async fn create_index(&self, db: &str, coll: &str, spec: &IndexSpec) -> Result<()> {
+        self.ensure_writable()?;
+        let keys: BsonDocument = spec
+            .keys
+            .iter()
+            .map(|(field, dir)| (field.clone(), Bson::Int32(*dir)))
+            .collect();
+        let options = IndexOptions::builder()
+            .unique(spec.unique)
+            .name(spec.name.clone())
+            .build();
+        let model = IndexModel::builder().keys(keys).options(options).build();
+        self.client
+            .database(db)
+            .collection::<BsonDocument>(coll)
+            .create_index(model)
+            .await
+            .map(|_| ())
+            .map_err(query_err)
     }
 }
 
@@ -646,6 +775,12 @@ fn doc_to_bson_document(v: &DocValue) -> BsonDocument {
         Bson::Document(d) => d,
         _ => BsonDocument::new(),
     }
+}
+
+/// Convert a whole [`Document`] (with its `_id`) to a wire BSON document, for an
+/// insert/replace. The inverse of [`split_document`].
+fn document_to_bson(doc: &Document) -> BsonDocument {
+    doc_to_bson_document(&doc.to_doc_value())
 }
 
 #[cfg(test)]

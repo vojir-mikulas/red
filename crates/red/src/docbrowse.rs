@@ -17,7 +17,7 @@ use gpui::{
     prelude::*, px,
 };
 use red_core::doc::{
-    CollKind, CollectionInfo, DbInfo, DocPlan, DocSchema, DocValue, Document, IndexInfo,
+    CollKind, CollectionInfo, DbInfo, DocPlan, DocSchema, DocValue, DocWrite, Document, IndexInfo,
 };
 use red_service::{Command, Epoch, SessionId};
 
@@ -66,6 +66,9 @@ const MAX_COLUMNS: usize = 12;
 /// reply so a late one for a superseded request is dropped.
 pub(crate) struct MongoView {
     session: SessionId,
+    /// The connection's read-only posture, captured at connect. Gates every write
+    /// affordance (edit / insert / delete / drop) in the UI.
+    read_only: bool,
     /// The browse epoch, minted once; every `Doc*` reply echoes it.
     epoch: Epoch,
     /// The server's databases (`listDatabases`), the tree's top level.
@@ -78,6 +81,9 @@ pub(crate) struct MongoView {
     current: Option<CollView>,
     /// The last browse error (a failed list/find), shown inline in the tree.
     error: Option<String>,
+    /// A destructive write awaiting confirmation (drop / delete). Rendered as a
+    /// modal over the shell; approving re-sends it as a confirmed `DocApplyWrite`.
+    pending_write: Option<(DocWrite, String)>,
 }
 
 /// The open collection: its current window of documents plus the sampled columns
@@ -101,6 +107,11 @@ struct CollView {
     columns: Vec<String>,
     /// The document row open in the inspector, if any.
     inspector: Option<usize>,
+    /// Whether the inspector is composing a *new* document (insert mode) rather
+    /// than editing the selected row.
+    inspector_insert: bool,
+    /// The inspector's extended-JSON editor (edit-and-save / compose).
+    inspector_editor: Entity<CodeEditor>,
     /// Which main view is shown (documents / schema / indexes).
     panel: DocPanel,
     /// The extended-JSON filter input; its text is applied on Enter or "Run".
@@ -171,6 +182,28 @@ impl CollView {
             },
         )
         .detach();
+        let inspector_editor = cx.new(|cx| {
+            CodeEditor::new(cx)
+                .soft_wrap(false)
+                .a11y_label("MongoDB document editor")
+        });
+        // Cmd+Enter in the inspector saves (edit) or inserts (compose).
+        cx.subscribe(
+            &inspector_editor,
+            |this, _editor, event: &CodeEditorEvent, cx| {
+                if !matches!(event, CodeEditorEvent::Run) {
+                    return;
+                }
+                let session = match &this.phase {
+                    Phase::Connected(active) => active.doc_view.as_ref().map(|v| v.session),
+                    _ => None,
+                };
+                if let Some(session) = session {
+                    this.doc_save_document(session, cx);
+                }
+            },
+        )
+        .detach();
         Self {
             db,
             coll,
@@ -181,6 +214,8 @@ impl CollView {
             loading: true,
             columns: Vec::new(),
             inspector: None,
+            inspector_insert: false,
+            inspector_editor,
             panel: DocPanel::Documents,
             filter_input,
             filter: None,
@@ -202,15 +237,17 @@ impl MongoView {
     /// Build the view for a freshly-connected Mongo session. The first
     /// `DocListDatabases` fires from [`AppState::doc_start_browse`] once the
     /// session is live, not here (this only needs `cx` for future focus state).
-    pub(crate) fn new(session: SessionId, _cx: &mut Context<AppState>) -> Self {
+    pub(crate) fn new(session: SessionId, read_only: bool, _cx: &mut Context<AppState>) -> Self {
         Self {
             session,
+            read_only,
             epoch: crate::result::next_kv_epoch(),
             databases: Vec::new(),
             collections: BTreeMap::new(),
             expanded: BTreeSet::new(),
             current: None,
             error: None,
+            pending_write: None,
         }
     }
 }
@@ -683,21 +720,270 @@ impl AppState {
         }
     }
 
-    /// Open (or, on the same row, close) the inspector on a document row.
+    /// Open (or, on the same row, close) the inspector on a document row, loading
+    /// the row's extended JSON into the editor when it opens.
     fn doc_toggle_inspector(&mut self, session: SessionId, row: usize, cx: &mut Context<Self>) {
-        let Some(current) = self
+        let editor_load = {
+            let Some(current) = self
+                .conn_mut(Some(session))
+                .and_then(|a| a.doc_view.as_mut())
+                .and_then(|v| v.current.as_mut())
+            else {
+                return;
+            };
+            if current.inspector == Some(row) && !current.inspector_insert {
+                current.inspector = None;
+                None
+            } else {
+                current.inspector = Some(row);
+                current.inspector_insert = false;
+                current.docs.get(row).map(|d| {
+                    (
+                        current.inspector_editor.clone(),
+                        pretty_extjson(&d.to_doc_value()),
+                    )
+                })
+            }
+        };
+        if let Some((editor, json)) = editor_load {
+            editor.update(cx, |ed, cx| ed.set_content(json, cx));
+        }
+        cx.notify();
+    }
+
+    /// Open the inspector in compose mode with a blank document template.
+    fn doc_new_document(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let editor = {
+            let Some(current) = self
+                .conn_mut(Some(session))
+                .and_then(|a| a.doc_view.as_mut())
+                .and_then(|v| v.current.as_mut())
+            else {
+                return;
+            };
+            current.inspector = None;
+            current.inspector_insert = true;
+            current.inspector_editor.clone()
+        };
+        editor.update(cx, |ed, cx| ed.set_content("{\n  \n}", cx));
+        cx.notify();
+    }
+
+    /// Save the inspector's editor: insert a new document (compose mode) or
+    /// replace the selected one (edit mode). Parsing happens service-side.
+    fn doc_save_document(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let cmd = {
+            let Some(view) = self
+                .conn_mut(Some(session))
+                .and_then(|a| a.doc_view.as_ref())
+            else {
+                return;
+            };
+            if view.read_only {
+                return;
+            }
+            let Some(current) = view.current.as_ref() else {
+                return;
+            };
+            let doc_json = current.inspector_editor.read(cx).content();
+            let (epoch, db, coll) = (view.epoch, current.db.clone(), current.coll.clone());
+            if current.inspector_insert {
+                Some(Command::DocInsert {
+                    epoch,
+                    db,
+                    coll,
+                    doc_json,
+                })
+            } else {
+                current
+                    .inspector
+                    .and_then(|row| current.docs.get(row))
+                    .map(|d| Command::DocReplace {
+                        epoch,
+                        db,
+                        coll,
+                        id: d.id.clone(),
+                        doc_json,
+                    })
+            }
+        };
+        if let Some(cmd) = cmd {
+            self.service.send_to(session, cmd);
+        }
+    }
+
+    /// Queue a delete of the inspected document behind the confirm modal.
+    fn doc_delete_current(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_mut())
-            .and_then(|v| v.current.as_mut())
         else {
             return;
         };
-        current.inspector = if current.inspector == Some(row) {
-            None
-        } else {
-            Some(row)
+        if view.read_only {
+            return;
+        }
+        let Some(current) = view.current.as_ref() else {
+            return;
         };
+        let Some(doc) = current.inspector.and_then(|row| current.docs.get(row)) else {
+            return;
+        };
+        let write = DocWrite::Delete {
+            db: current.db.clone(),
+            coll: current.coll.clone(),
+            filter: DocValue::Document(vec![("_id".into(), doc.id.clone())]),
+            many: false,
+        };
+        let prompt = format!(
+            "Delete this document from {}.{}? This cannot be undone.",
+            current.db, current.coll
+        );
+        view.pending_write = Some((write, prompt));
         cx.notify();
+    }
+
+    /// Propose dropping the open collection; the service's destructive gate
+    /// replies with a confirm the modal then shows.
+    fn doc_drop_current(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let cmd = {
+            let Some(view) = self
+                .conn_mut(Some(session))
+                .and_then(|a| a.doc_view.as_ref())
+            else {
+                return;
+            };
+            if view.read_only {
+                return;
+            }
+            view.current.as_ref().map(|current| Command::DocApplyWrite {
+                epoch: view.epoch,
+                write: DocWrite::DropCollection {
+                    db: current.db.clone(),
+                    coll: current.coll.clone(),
+                },
+                confirmed: false,
+            })
+        };
+        if let Some(cmd) = cmd {
+            self.service.send_to(session, cmd);
+            cx.notify();
+        }
+    }
+
+    /// Approve the pending destructive write: re-send it confirmed.
+    fn doc_confirm_write(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let sent = {
+            let Some(view) = self
+                .conn_mut(Some(session))
+                .and_then(|a| a.doc_view.as_mut())
+            else {
+                return;
+            };
+            view.pending_write
+                .take()
+                .map(|(write, _)| (view.epoch, write))
+        };
+        if let Some((epoch, write)) = sent {
+            self.service.send_to(
+                session,
+                Command::DocApplyWrite {
+                    epoch,
+                    write,
+                    confirmed: true,
+                },
+            );
+            cx.notify();
+        }
+    }
+
+    /// Dismiss the confirm modal without writing.
+    fn doc_cancel_write(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+        {
+            view.pending_write = None;
+            cx.notify();
+        }
+    }
+
+    /// Close the inspector (edit or compose).
+    fn doc_close_inspector(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(current) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+            .and_then(|v| v.current.as_mut())
+        {
+            current.inspector = None;
+            current.inspector_insert = false;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn on_doc_write_confirm(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: Epoch,
+        write: DocWrite,
+        prompt: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.conn_mut(session).and_then(|a| a.doc_view.as_mut()) else {
+            return;
+        };
+        if view.epoch != epoch {
+            return;
+        }
+        view.pending_write = Some((write, prompt));
+        cx.notify();
+    }
+
+    pub(crate) fn on_doc_write_done(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: Epoch,
+        summary: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sid) = session else { return };
+        // Close the inspector, clear any pending confirm, and gather what the
+        // browse needs to refresh, all before the toast + re-fetch.
+        let refresh = {
+            let Some(view) = self.conn_mut(session).and_then(|a| a.doc_view.as_mut()) else {
+                return;
+            };
+            if view.epoch != epoch {
+                return;
+            }
+            view.pending_write = None;
+            let epoch = view.epoch;
+            view.current.as_mut().map(|c| {
+                c.inspector = None;
+                c.inspector_insert = false;
+                c.loading = true;
+                (
+                    epoch,
+                    c.db.clone(),
+                    c.coll.clone(),
+                    c.skip,
+                    c.filter.clone(),
+                )
+            })
+        };
+        self.notify(ToastVariant::Success, summary, cx);
+        if let Some((epoch, db, coll, skip, filter)) = refresh {
+            self.service.send_to(
+                sid,
+                Command::DocFetchPage {
+                    epoch,
+                    db,
+                    coll,
+                    skip,
+                    filter,
+                },
+            );
+        }
     }
 }
 
@@ -720,7 +1006,19 @@ impl AppState {
             .map(|v| self.render_doc_body(v, &theme, &view))
             .unwrap_or_else(|| div().into_any_element());
 
+        // A destructive write awaiting confirmation overlays everything.
+        let confirm = active
+            .doc_view
+            .as_ref()
+            .and_then(|v| {
+                v.pending_write
+                    .as_ref()
+                    .map(|(_, prompt)| (v.session, prompt.clone()))
+            })
+            .map(|(session, prompt)| self.render_doc_confirm(session, prompt, &theme, &view));
+
         div()
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -728,6 +1026,72 @@ impl AppState {
             .text_color(theme.text)
             .child(topbar)
             .child(div().flex().flex_1().min_h(px(0.)).child(body))
+            .children(confirm)
+    }
+
+    /// The destructive-write confirm modal: a scrim over a centered card with the
+    /// prompt and Cancel / Confirm.
+    fn render_doc_confirm(
+        &self,
+        session: SessionId,
+        prompt: String,
+        theme: &Theme,
+        view: &WeakEntity<AppState>,
+    ) -> gpui::AnyElement {
+        let cancel_view = view.clone();
+        let confirm_view = view.clone();
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::hsla(0., 0., 0., 0.5))
+            .child(
+                div()
+                    .w(px(420.))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .bg(theme.bg_panel)
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded_md()
+                    .child(div().font_weight(gpui::FontWeight::MEDIUM).child("Confirm"))
+                    .child(div().text_color(theme.text_muted).child(prompt))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("doc-confirm-cancel", "Cancel")
+                                    .size(ButtonSize::Sm)
+                                    .variant(ButtonVariant::Secondary)
+                                    .on_click(move |_, _, cx| {
+                                        cancel_view
+                                            .update(cx, |this, cx| {
+                                                this.doc_cancel_write(session, cx)
+                                            })
+                                            .ok();
+                                    }),
+                            )
+                            .child(
+                                Button::new("doc-confirm-ok", "Confirm")
+                                    .size(ButtonSize::Sm)
+                                    .variant(ButtonVariant::Danger)
+                                    .on_click(move |_, _, cx| {
+                                        confirm_view
+                                            .update(cx, |this, cx| {
+                                                this.doc_confirm_write(session, cx)
+                                            })
+                                            .ok();
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_doc_body(
@@ -912,9 +1276,11 @@ impl AppState {
                 .into_any_element();
         };
 
-        let header = self.render_doc_header(v.session, current, theme, view);
+        let header = self.render_doc_header(v.session, current, v.read_only, theme, view);
         let body = match current.panel {
-            DocPanel::Documents => self.render_doc_documents(v.session, current, theme, view),
+            DocPanel::Documents => {
+                self.render_doc_documents(v.session, current, v.read_only, theme, view)
+            }
             DocPanel::Query => self.render_doc_query(v.session, current, theme, view),
             DocPanel::Schema => render_doc_schema_panel(current, theme),
             DocPanel::Indexes => render_doc_indexes_panel(current, theme),
@@ -933,6 +1299,7 @@ impl AppState {
         &self,
         session: SessionId,
         current: &CollView,
+        read_only: bool,
         theme: &Theme,
         view: &WeakEntity<AppState>,
     ) -> gpui::AnyElement {
@@ -1051,6 +1418,32 @@ impl AppState {
                                 .ok();
                         }),
                 );
+            // Write affordances — hidden on a read-only connection.
+            if !read_only {
+                let new_view = view.clone();
+                let drop_view = view.clone();
+                row = row
+                    .child(
+                        Button::new("doc-new", "+ New")
+                            .size(ButtonSize::Sm)
+                            .variant(ButtonVariant::Secondary)
+                            .on_click(move |_, _, cx| {
+                                new_view
+                                    .update(cx, |this, cx| this.doc_new_document(session, cx))
+                                    .ok();
+                            }),
+                    )
+                    .child(
+                        Button::new("doc-drop", "Drop")
+                            .size(ButtonSize::Sm)
+                            .variant(ButtonVariant::Danger)
+                            .on_click(move |_, _, cx| {
+                                drop_view
+                                    .update(cx, |this, cx| this.doc_drop_current(session, cx))
+                                    .ok();
+                            }),
+                    );
+            }
         } else {
             row = row.child(div().flex_1());
         }
@@ -1058,16 +1451,18 @@ impl AppState {
     }
 
     /// The Documents panel: the explain readout (when requested) over the
-    /// sampled-column grid, with the inspector docked right when a row is open.
+    /// sampled-column grid, with the inspector docked right when a row is open or
+    /// a new document is being composed.
     fn render_doc_documents(
         &self,
         session: SessionId,
         current: &CollView,
+        read_only: bool,
         theme: &Theme,
         view: &WeakEntity<AppState>,
     ) -> gpui::AnyElement {
         let grid = self.render_doc_grid(session, current, theme, view);
-        let grid_area = if let Some(sel) = current.inspector.and_then(|i| current.docs.get(i)) {
+        let grid_area = if current.inspector.is_some() || current.inspector_insert {
             div()
                 .flex()
                 .flex_1()
@@ -1080,7 +1475,7 @@ impl AppState {
                         .flex_shrink_0()
                         .border_l_1()
                         .border_color(theme.border)
-                        .child(self.render_doc_inspector(session, sel, theme, view)),
+                        .child(self.render_doc_inspector(session, current, read_only, theme, view)),
                 )
                 .into_any_element()
         } else {
@@ -1245,85 +1640,125 @@ impl AppState {
             .into_any_element()
     }
 
-    /// The raw-document inspector: the selected document as pretty-printed
-    /// extended JSON, preserving BSON types (`$oid`, `$date`, ...).
+    /// The raw-document inspector. On a writable connection it's an editable
+    /// extended-JSON editor with Save / Delete (⌘↵ saves); on a read-only one it
+    /// falls back to the pretty-printed read-only view.
     fn render_doc_inspector(
         &self,
         session: SessionId,
-        doc: &Document,
+        current: &CollView,
+        read_only: bool,
         theme: &Theme,
         view: &WeakEntity<AppState>,
     ) -> gpui::AnyElement {
+        let insert = current.inspector_insert;
+        let title = if insert { "New document" } else { "Document" };
+
         let close_view = view.clone();
-        // Render line-by-line (like the SQL inspector's non-editor fallback) so
-        // the pretty-printed newlines/indentation lay out as real lines; a plain
-        // multi-line `.child(String)` wouldn't break. Bounded so a pathological
-        // document can't lay out unbounded line-divs.
+        let close = Button::new("doc-inspector-close", "Close")
+            .size(ButtonSize::Sm)
+            .variant(ButtonVariant::Ghost)
+            .on_click(move |_, _, cx| {
+                close_view
+                    .update(cx, |this, cx| this.doc_close_inspector(session, cx))
+                    .ok();
+            });
+
+        let mut header = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_1()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child(title),
+            );
+
+        if read_only {
+            return div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .child(header.child(close))
+                .child(self.render_doc_readonly_body(current, theme))
+                .into_any_element();
+        }
+
+        let save_view = view.clone();
+        header = header.child(
+            Button::new("doc-save", if insert { "Insert" } else { "Save" })
+                .size(ButtonSize::Sm)
+                .variant(ButtonVariant::Primary)
+                .on_click(move |_, _, cx| {
+                    save_view
+                        .update(cx, |this, cx| this.doc_save_document(session, cx))
+                        .ok();
+                }),
+        );
+        if !insert {
+            let delete_view = view.clone();
+            header = header.child(
+                Button::new("doc-delete", "Delete")
+                    .size(ButtonSize::Sm)
+                    .variant(ButtonVariant::Danger)
+                    .on_click(move |_, _, cx| {
+                        delete_view
+                            .update(cx, |this, cx| this.doc_delete_current(session, cx))
+                            .ok();
+                    }),
+            );
+        }
+        header = header.child(close);
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(header)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(current.inspector_editor.clone()),
+            )
+            .into_any_element()
+    }
+
+    /// The read-only pretty-printed document view, shown on read-only
+    /// connections in place of the editor.
+    fn render_doc_readonly_body(&self, current: &CollView, theme: &Theme) -> gpui::AnyElement {
+        // Bounded line-by-line render so the pretty JSON's newlines lay out.
         const MAX_LINES: usize = 5_000;
-        let json = pretty_extjson(&doc.to_doc_value());
+        let json = current
+            .inspector
+            .and_then(|row| current.docs.get(row))
+            .map(|d| pretty_extjson(&d.to_doc_value()))
+            .unwrap_or_default();
         let lines: Vec<SharedString> = json
             .lines()
             .take(MAX_LINES)
             .map(|l| SharedString::from(l.to_string()))
             .collect();
         div()
+            .id("doc-inspector-body")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_scroll()
+            .p_3()
             .flex()
             .flex_col()
-            .size_full()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(
-                        div()
-                            .flex_1()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .child("Document"),
-                    )
-                    .child(
-                        Button::new("doc-inspector-close", "Close")
-                            .size(ButtonSize::Sm)
-                            .variant(ButtonVariant::Ghost)
-                            .on_click(move |_, _, cx| {
-                                close_view
-                                    .update(cx, |this, cx| {
-                                        if let Phase::Connected(a) = &mut this.phase
-                                            && let Some(c) = a
-                                                .doc_view
-                                                .as_mut()
-                                                .filter(|v| v.session == session)
-                                                .and_then(|v| v.current.as_mut())
-                                        {
-                                            c.inspector = None;
-                                        }
-                                        cx.notify();
-                                    })
-                                    .ok();
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .id("doc-inspector-body")
-                    .flex_1()
-                    .min_h(px(0.))
-                    .overflow_scroll()
-                    .p_3()
-                    .flex()
-                    .flex_col()
-                    .font_family(theme.mono_family.clone())
-                    .text_size(theme.scale(12.))
-                    .text_color(theme.text)
-                    .children(
-                        lines
-                            .into_iter()
-                            .map(|line| div().flex_shrink_0().child(line)),
-                    ),
+            .font_family(theme.mono_family.clone())
+            .text_size(theme.scale(12.))
+            .text_color(theme.text)
+            .children(
+                lines
+                    .into_iter()
+                    .map(|line| div().flex_shrink_0().child(line)),
             )
             .into_any_element()
     }

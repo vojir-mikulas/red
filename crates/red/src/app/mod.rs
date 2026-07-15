@@ -1751,6 +1751,16 @@ impl AppState {
             } => {
                 self.on_doc_plan(session, epoch, db, coll, plan, cx);
             }
+            Event::DocWriteDone { epoch, summary } => {
+                self.on_doc_write_done(session, epoch, summary, cx);
+            }
+            Event::DocWriteConfirm {
+                epoch,
+                write,
+                prompt,
+            } => {
+                self.on_doc_write_confirm(session, epoch, write, prompt, cx);
+            }
             Event::DocError { epoch, message } => {
                 self.on_doc_error(session, epoch, message, cx);
             }

@@ -7,7 +7,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- MongoDB support (read-only browse): connect to a `mongodb://` or
+- MongoDB support: connect to a `mongodb://` or
   `mongodb+srv://` deployment and explore it in a dedicated document shell. A
   `database -> collection` tree on the left lists collections with estimated
   counts and view / time-series badges; selecting one pages its documents into a
@@ -22,7 +22,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   properties. A Query panel runs an aggregation pipeline (extended JSON, Cmd+Enter)
   into a results grid, and an Explain button on the document view reports the
   winning plan, whether it is a collection scan, the index used, and the
-  documents-examined / returned counts.
+  documents-examined / returned counts. On a writable connection the inspector
+  edits a document as extended JSON (Cmd+Enter saves), and there are affordances
+  to insert a new document, delete one, and drop a collection; a destructive
+  operation (dropping a collection, a delete or update touching many documents,
+  or an unfiltered mutation) is held behind an explicit confirm, and every write
+  is refused outright on a read-only connection.
 - Searchable, grouped History dock: the left History panel (both the SQL and
   Redis shells) now has a search box that narrows the list live and collapsible
   grouped sections. SQL history groups into Today / Yesterday / Earlier time

@@ -244,6 +244,26 @@ impl Document {
         fields.extend(self.fields.iter().cloned());
         DocValue::Document(fields)
     }
+
+    /// Split a parsed [`DocValue::Document`] into a [`Document`], pulling out
+    /// `_id` (defaulting to [`DocValue::Null`] when absent, as Mongo does on
+    /// insert). `None` when `value` isn't a document. The inverse of
+    /// [`to_doc_value`](Self::to_doc_value), for the inspector's edit/insert path.
+    pub fn from_doc_value(value: DocValue) -> Option<Document> {
+        let DocValue::Document(fields) = value else {
+            return None;
+        };
+        let mut id = DocValue::Null;
+        let mut rest = Vec::with_capacity(fields.len());
+        for (k, v) in fields {
+            if k == "_id" {
+                id = v;
+            } else {
+                rest.push((k, v));
+            }
+        }
+        Some(Document { id, fields: rest })
+    }
 }
 
 /// A database in the catalog (`listDatabases`).
@@ -498,6 +518,115 @@ pub struct PlanStage {
     pub detail: Option<String>,
 }
 
+// --- writes ------------------------------------------------------------------
+
+/// How a document changes in an update: a `$set`-style partial patch (merge the
+/// given fields) or a full replacement document.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DocUpdate {
+    /// Merge these top-level fields into the matched documents (`$set`).
+    Patch(DocValue),
+    /// Replace the matched document wholesale.
+    Replace(Document),
+}
+
+/// A new index to create (`createIndex`). v1 covers b-tree keys with an optional
+/// unique constraint and name; ttl/partial creation is a later refinement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexSpec {
+    /// `(field, direction)` pairs; direction is `1` (ascending) or `-1`.
+    pub keys: Vec<(String, i32)>,
+    pub unique: bool,
+    /// An explicit index name, or `None` to let the server derive one.
+    pub name: Option<String>,
+}
+
+/// One document-store write, the unit the classifier ([`classify_doc_op`]) and
+/// the confirm prompt reason about, and what the UI proposes to the service. The
+/// service matches on it to dispatch the right [`crate`]-level driver call, so a
+/// write has exactly one representation from proposal through execution.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DocWrite {
+    Insert {
+        db: String,
+        coll: String,
+        docs: Vec<Document>,
+    },
+    Update {
+        db: String,
+        coll: String,
+        filter: Filter,
+        change: DocUpdate,
+        many: bool,
+    },
+    Replace {
+        db: String,
+        coll: String,
+        id: DocValue,
+        doc: Document,
+    },
+    Delete {
+        db: String,
+        coll: String,
+        filter: Filter,
+        many: bool,
+    },
+    CreateCollection {
+        db: String,
+        coll: String,
+    },
+    DropCollection {
+        db: String,
+        coll: String,
+    },
+    CreateIndex {
+        db: String,
+        coll: String,
+        spec: IndexSpec,
+    },
+}
+
+/// How risky a write is. A `Destructive` op needs an explicit confirm even on a
+/// writable connection, so neither the console nor the AI can slip one through;
+/// mirrors `kv::CommandClass`'s `Destructive` arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocOpClass {
+    Write,
+    Destructive,
+}
+
+/// Whether a filter document matches nothing-specific — i.e. it's empty (`{}`),
+/// so an `update`/`delete` over it touches the whole collection. An absent or
+/// non-document filter is treated as empty (match-all), the conservative reading.
+fn filter_is_empty(filter: &Filter) -> bool {
+    match filter {
+        DocValue::Document(fields) => fields.is_empty(),
+        _ => true,
+    }
+}
+
+/// Classify a proposed write. Destructive covers the document-store footguns the
+/// plan calls out: dropping a collection, a multi-document `delete`/`update`, and
+/// an *un-filtered* `update`/`delete` (which touches the whole collection even
+/// when `many` is false, since Mongo's single-document form still picks an
+/// arbitrary match). Everything else is an ordinary `Write`.
+pub fn classify_doc_op(op: &DocWrite) -> DocOpClass {
+    let destructive = match op {
+        DocWrite::DropCollection { .. } => true,
+        DocWrite::Delete { filter, many, .. } => *many || filter_is_empty(filter),
+        DocWrite::Update { filter, many, .. } => *many || filter_is_empty(filter),
+        DocWrite::Insert { .. }
+        | DocWrite::Replace { .. }
+        | DocWrite::CreateCollection { .. }
+        | DocWrite::CreateIndex { .. } => false,
+    };
+    if destructive {
+        DocOpClass::Destructive
+    } else {
+        DocOpClass::Write
+    }
+}
+
 // --- hand-rolled extended-JSON helpers (no serde_json) -----------------------
 
 /// Append `s` as a JSON string literal (quotes + minimal escaping), matching
@@ -715,6 +844,72 @@ mod tests {
 
         // Same input -> identical schema (determinism).
         assert_eq!(DocSchema::from_documents(&docs), schema);
+    }
+
+    #[test]
+    fn classify_writes() {
+        let doc = || Document {
+            id: DocValue::Int32(1),
+            fields: vec![],
+        };
+        let by_id = || DocValue::Document(vec![("_id".into(), DocValue::Int32(1))]);
+        let empty = || DocValue::Document(vec![]);
+
+        // Ordinary writes.
+        assert_eq!(
+            classify_doc_op(&DocWrite::Insert {
+                db: "d".into(),
+                coll: "c".into(),
+                docs: vec![doc()],
+            }),
+            DocOpClass::Write
+        );
+        assert_eq!(
+            classify_doc_op(&DocWrite::Replace {
+                db: "d".into(),
+                coll: "c".into(),
+                id: DocValue::Int32(1),
+                doc: doc(),
+            }),
+            DocOpClass::Write
+        );
+        // A single, filtered delete is an ordinary write.
+        assert_eq!(
+            classify_doc_op(&DocWrite::Delete {
+                db: "d".into(),
+                coll: "c".into(),
+                filter: by_id(),
+                many: false,
+            }),
+            DocOpClass::Write
+        );
+
+        // Destructive: drop, many, or an un-filtered mutation.
+        assert_eq!(
+            classify_doc_op(&DocWrite::DropCollection {
+                db: "d".into(),
+                coll: "c".into(),
+            }),
+            DocOpClass::Destructive
+        );
+        assert_eq!(
+            classify_doc_op(&DocWrite::Delete {
+                db: "d".into(),
+                coll: "c".into(),
+                filter: by_id(),
+                many: true,
+            }),
+            DocOpClass::Destructive
+        );
+        assert_eq!(
+            classify_doc_op(&DocWrite::Delete {
+                db: "d".into(),
+                coll: "c".into(),
+                filter: empty(),
+                many: false,
+            }),
+            DocOpClass::Destructive
+        );
     }
 
     #[test]

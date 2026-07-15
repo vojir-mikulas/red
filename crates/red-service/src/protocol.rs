@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use red_core::diff::{DiffColumnPlan, DiffRow, DiffSummary};
-use red_core::doc::{CollectionInfo, DbInfo, DocPlan, DocSchema, Document, IndexInfo};
+use red_core::doc::{CollectionInfo, DbInfo, DocPlan, DocSchema, DocWrite, Document, IndexInfo};
 use red_core::kv::{
     ClientInfo, CollectionKind, KeyMeta, KvCollectionPage, KvEdit, KvScanPage, KvStreamActionReq,
     KvStreamPage, KvType, KvValue, PendingEntry, RecycledKey, RespValue, ScanBudget, ScanCursor,
@@ -568,6 +568,36 @@ pub enum Command {
         db: String,
         coll: String,
         filter: Option<String>,
+    },
+    /// Apply one document-store write (insert/update/replace/delete, collection
+    /// or index DDL). Refused on a read-only connection. A *destructive* write
+    /// (drop / delete-or-update many / un-filtered mutation) with `confirmed`
+    /// false is not run: the service replies `DocWriteConfirm` and the UI must
+    /// re-send with `confirmed: true`. On success replies `DocWriteDone`.
+    DocApplyWrite {
+        epoch: Epoch,
+        write: DocWrite,
+        confirmed: bool,
+    },
+    /// Insert one document from the inspector's extended-JSON text (parsed by the
+    /// driver). The text-carrying counterpart to `DocApplyWrite` for the compose
+    /// path; not destructive. Replies `DocWriteDone`, or `DocError` on a parse or
+    /// write failure.
+    DocInsert {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        doc_json: String,
+    },
+    /// Replace the document identified by `id` with the inspector's edited
+    /// extended-JSON text (parsed by the driver). Replies `DocWriteDone`, or
+    /// `DocError` on a parse or write failure.
+    DocReplace {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        id: red_core::doc::DocValue,
+        doc_json: String,
     },
     /// Compute a column's aggregate summary over the open result's *filtered* SQL
     /// (the column-stats bar): a single `count`/`distinct`/`min`/`max`(/`sum`/`avg`)
@@ -1200,6 +1230,20 @@ pub enum Event {
         db: String,
         coll: String,
         plan: DocPlan,
+    },
+    /// A write succeeded (in response to `DocApplyWrite`); `summary` is a short
+    /// human line for a toast, and the UI refreshes the affected browse.
+    DocWriteDone {
+        epoch: Epoch,
+        summary: String,
+    },
+    /// A destructive `DocApplyWrite` needs confirmation before it runs. Carries
+    /// the original `write` back so the UI can re-send it with `confirmed: true`,
+    /// plus a `prompt` describing what will happen.
+    DocWriteConfirm {
+        epoch: Epoch,
+        write: DocWrite,
+        prompt: String,
     },
     /// A document browse operation failed (list/find/schema/indexes), in response
     /// to a `Doc*` command. Surfaced inline in the browser rather than only as a

@@ -5,16 +5,17 @@
 //! or `GET`/`SET`. Object-safe like the other two seams, held as
 //! `Arc<dyn DocDriver>`, one impl per engine.
 //!
-//! This is the read path (D0 catalog + windowed `find` + count, plus D1's
+//! The read path (catalog + windowed `find` + count, plus
 //! `infer_schema`/`aggregate`/`indexes`/`explain`/`distinct`, the streaming server
-//! cursor, and extended-JSON parsing). Writes land in D2, added additively to this
-//! trait.
+//! cursor, and extended-JSON parsing) and the write path
+//! (`insert`/`update`/`replace`/`delete` + collection/index DDL), each write
+//! refused on a read-only connection.
 
 use async_trait::async_trait;
 use red_core::Result;
 use red_core::doc::{
-    CollectionInfo, DbInfo, DocCursor, DocPage, DocPlan, DocSchema, DocTopology, DocValue,
-    Document, Filter, FindQuery, IndexInfo,
+    CollectionInfo, DbInfo, DocCursor, DocPage, DocPlan, DocSchema, DocTopology, DocUpdate,
+    DocValue, Document, Filter, FindQuery, IndexInfo, IndexSpec,
 };
 
 use crate::AbortSignal;
@@ -47,9 +48,10 @@ pub trait DocDriver: Send + Sync {
 
     /// One window of a collection (`find` with `skip`/`limit`), cancellable via
     /// `abort` and capped by `q.batch`. The browse read: never materializes the
-    /// whole collection, the same streaming discipline the SQL cursor holds. In
-    /// D0 the window is `skip`/`limit`-addressed (random access); D1 adds the
-    /// stateful server cursor (`getMore`) for large forward scans.
+    /// whole collection, the same streaming discipline the SQL cursor holds. The
+    /// window is `skip`/`limit`-addressed (random access); the stateful server
+    /// cursor (`getMore`, [`next_batch`](Self::next_batch)) handles large forward
+    /// scans.
     async fn find(&self, q: &FindQuery, abort: &AbortSignal) -> Result<DocPage>;
 
     /// One document by `_id` (`findOne({_id})`), for the inspector's
@@ -62,7 +64,7 @@ pub trait DocDriver: Send + Sync {
     /// O(1) total the grid shows when the whole collection is browsed unfiltered.
     async fn count(&self, db: &str, coll: &str, filter: Option<&Filter>) -> Result<u64>;
 
-    // --- D1 power reads ----------------------------------------------------
+    // --- power reads (schema / aggregate / indexes / explain) --------------
 
     /// Infer a collection's schema by sampling up to `sample` documents
     /// (`$sample`) and rolling their fields into per-path type frequencies and
@@ -124,6 +126,41 @@ pub trait DocDriver: Send + Sync {
     /// extended-JSON dialect is the engine's, kept off the pure `red-core` types.
     /// A syntax error surfaces as a [`red_core::RedError::Query`].
     fn parse_ext_json(&self, text: &str) -> Result<DocValue>;
+
+    // --- writes — every one refused on a read-only connection --------------
+
+    /// Insert documents (`insertMany`), returning how many were inserted.
+    async fn insert(&self, db: &str, coll: &str, docs: &[Document]) -> Result<u64>;
+
+    /// Update documents matching `filter` (`updateOne`/`updateMany`) — a
+    /// `$set` patch or a full replacement per [`DocUpdate`] — returning the
+    /// modified count. `many` chooses one vs. all matches.
+    async fn update(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: &Filter,
+        change: &DocUpdate,
+        many: bool,
+    ) -> Result<u64>;
+
+    /// Replace one document by `_id` (`replaceOne({_id})`) — the inspector's
+    /// edit-and-save. The convenience form of an `update`/`Replace` pinned to a
+    /// single document.
+    async fn replace(&self, db: &str, coll: &str, id: &DocValue, doc: &Document) -> Result<()>;
+
+    /// Delete documents matching `filter` (`deleteOne`/`deleteMany`), returning
+    /// the deleted count. `many` chooses one vs. all matches.
+    async fn delete(&self, db: &str, coll: &str, filter: &Filter, many: bool) -> Result<u64>;
+
+    /// Create an empty collection (`createCollection`).
+    async fn create_collection(&self, db: &str, coll: &str) -> Result<()>;
+
+    /// Drop a collection (`drop`) — destructive; the host gate confirms it first.
+    async fn drop_collection(&self, db: &str, coll: &str) -> Result<()>;
+
+    /// Create an index (`createIndex`).
+    async fn create_index(&self, db: &str, coll: &str, spec: &IndexSpec) -> Result<()>;
 }
 
 #[cfg(test)]
@@ -135,19 +172,31 @@ mod tests {
     /// An in-memory `DocDriver` over a fixed set of collections, for exercising
     /// the seam without a live mongod. The reusable analog of the Redis `StubKv`
     /// test double; promoted out of `#[cfg(test)]` when the UI/AI phases need it.
+    /// `data` is behind a `Mutex` so the write methods (which take `&self`)
+    /// can mutate it.
     struct FakeDocDriver {
         version: String,
+        read_only: bool,
         /// `db → coll → documents`, in insertion order per collection.
-        data: BTreeMap<String, BTreeMap<String, Vec<Document>>>,
+        data: std::sync::Mutex<BTreeMap<String, BTreeMap<String, Vec<Document>>>>,
     }
 
     impl FakeDocDriver {
-        fn docs(&self, db: &str, coll: &str) -> &[Document] {
+        fn docs(&self, db: &str, coll: &str) -> Vec<Document> {
             self.data
+                .lock()
+                .unwrap()
                 .get(db)
                 .and_then(|c| c.get(coll))
-                .map(Vec::as_slice)
-                .unwrap_or(&[])
+                .cloned()
+                .unwrap_or_default()
+        }
+        fn ensure_writable(&self) -> Result<()> {
+            if self.read_only {
+                Err(red_core::RedError::Driver("connection is read-only".into()))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -165,6 +214,8 @@ mod tests {
         async fn list_databases(&self) -> Result<Vec<DbInfo>> {
             Ok(self
                 .data
+                .lock()
+                .unwrap()
                 .keys()
                 .map(|name| DbInfo {
                     name: name.clone(),
@@ -176,6 +227,8 @@ mod tests {
         async fn list_collections(&self, db: &str) -> Result<Vec<CollectionInfo>> {
             Ok(self
                 .data
+                .lock()
+                .unwrap()
                 .get(db)
                 .into_iter()
                 .flat_map(|c| c.iter())
@@ -291,6 +344,93 @@ mod tests {
                 "extended-JSON parsing is not supported by the in-memory test driver".into(),
             ))
         }
+        async fn insert(&self, db: &str, coll: &str, docs: &[Document]) -> Result<u64> {
+            self.ensure_writable()?;
+            self.data
+                .lock()
+                .unwrap()
+                .entry(db.to_string())
+                .or_default()
+                .entry(coll.to_string())
+                .or_default()
+                .extend(docs.iter().cloned());
+            Ok(docs.len() as u64)
+        }
+        async fn update(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _filter: &Filter,
+            _change: &red_core::doc::DocUpdate,
+            _many: bool,
+        ) -> Result<u64> {
+            self.ensure_writable()?;
+            Ok(0)
+        }
+        async fn replace(&self, db: &str, coll: &str, id: &DocValue, doc: &Document) -> Result<()> {
+            self.ensure_writable()?;
+            let mut data = self.data.lock().unwrap();
+            if let Some(docs) = data.get_mut(db).and_then(|c| c.get_mut(coll))
+                && let Some(slot) = docs.iter_mut().find(|d| &d.id == id)
+            {
+                *slot = doc.clone();
+            }
+            Ok(())
+        }
+        async fn delete(&self, db: &str, coll: &str, filter: &Filter, many: bool) -> Result<u64> {
+            self.ensure_writable()?;
+            // The double only understands a `{ _id: ... }` filter (enough for the
+            // single-document delete the UI issues).
+            let id = match filter {
+                DocValue::Document(fields) => fields
+                    .iter()
+                    .find(|(k, _)| k == "_id")
+                    .map(|(_, v)| v.clone()),
+                _ => None,
+            };
+            let mut data = self.data.lock().unwrap();
+            let Some(docs) = data.get_mut(db).and_then(|c| c.get_mut(coll)) else {
+                return Ok(0);
+            };
+            let before = docs.len();
+            match id {
+                Some(id) if !many => {
+                    if let Some(pos) = docs.iter().position(|d| d.id == id) {
+                        docs.remove(pos);
+                    }
+                }
+                Some(id) => docs.retain(|d| d.id != id),
+                None if many => docs.clear(),
+                None => {
+                    if !docs.is_empty() {
+                        docs.remove(0);
+                    }
+                }
+            }
+            Ok((before - docs.len()) as u64)
+        }
+        async fn create_collection(&self, db: &str, coll: &str) -> Result<()> {
+            self.ensure_writable()?;
+            self.data
+                .lock()
+                .unwrap()
+                .entry(db.to_string())
+                .or_default()
+                .entry(coll.to_string())
+                .or_default();
+            Ok(())
+        }
+        async fn drop_collection(&self, db: &str, coll: &str) -> Result<()> {
+            self.ensure_writable()?;
+            if let Some(colls) = self.data.lock().unwrap().get_mut(db) {
+                colls.remove(coll);
+            }
+            Ok(())
+        }
+        async fn create_index(&self, _db: &str, _coll: &str, _spec: &IndexSpec) -> Result<()> {
+            self.ensure_writable()?;
+            Ok(())
+        }
     }
 
     fn sample() -> FakeDocDriver {
@@ -320,7 +460,8 @@ mod tests {
         data.insert("app".to_string(), colls);
         FakeDocDriver {
             version: "7.0.0".into(),
-            data,
+            read_only: false,
+            data: std::sync::Mutex::new(data),
         }
     }
 
@@ -398,8 +539,47 @@ mod tests {
         assert_eq!(ids.len(), 3);
     }
 
+    #[tokio::test]
+    async fn writes_mutate_and_read_only_refuses() {
+        let d = sample();
+        // Insert then delete a document round-trips through the in-memory store.
+        let n = d
+            .insert(
+                "app",
+                "people",
+                &[Document {
+                    id: DocValue::Int32(4),
+                    fields: vec![("name".into(), DocValue::Str("Grace".into()))],
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(d.count("app", "people", None).await.unwrap(), 4);
+        let deleted = d
+            .delete(
+                "app",
+                "people",
+                &DocValue::Document(vec![("_id".into(), DocValue::Int32(4))]),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(d.count("app", "people", None).await.unwrap(), 3);
+
+        // A read-only driver refuses every write at the seam.
+        let ro = FakeDocDriver {
+            version: "7.0.0".into(),
+            read_only: true,
+            data: std::sync::Mutex::new(BTreeMap::new()),
+        };
+        assert!(ro.create_collection("app", "c").await.is_err());
+        assert!(ro.drop_collection("app", "people").await.is_err());
+    }
+
     // A `DocCursor` is opaque and echoed back to the driver; assert its identity
-    // survives a clone the way the D1 `getMore` path will rely on.
+    // survives a clone the way the `getMore` path relies on.
     #[test]
     fn cursor_identity() {
         let c = DocCursor {

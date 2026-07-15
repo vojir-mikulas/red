@@ -1075,8 +1075,8 @@ impl ActiveConn {
         let tab = QueryTab::new("query 1".to_string(), cx);
         let kv_view =
             (config.kind == DbKind::Redis).then(|| crate::kvbrowse::RedisView::new(session, cx));
-        let doc_view =
-            (config.kind == DbKind::Mongo).then(|| crate::docbrowse::MongoView::new(session, cx));
+        let doc_view = (config.kind == DbKind::Mongo)
+            .then(|| crate::docbrowse::MongoView::new(session, config.read_only, cx));
         let history_search = cx.new(|cx| TextInput::new(cx).with_placeholder("Search history…"));
         // Re-render so the search narrows the dock live as the user types.
         cx.subscribe(

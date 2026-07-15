@@ -72,6 +72,146 @@ const DOC_PAGE_ROWS: usize = 100;
 /// surface real type drift, small enough to stay cheap on a big collection.
 const DOC_SCHEMA_SAMPLE: usize = 200;
 
+/// Dispatch a proposed [`DocWrite`](red_core::doc::DocWrite) to the driver and
+/// return a short human summary of what happened (for the UI toast). The gate
+/// (read-only / destructive-confirm) has already passed by the time this runs.
+async fn apply_doc_write(
+    driver: &std::sync::Arc<dyn red_driver::DocDriver>,
+    write: red_core::doc::DocWrite,
+) -> red_core::Result<String> {
+    use red_core::doc::DocWrite;
+    let plural = |n: u64| if n == 1 { "" } else { "s" };
+    match write {
+        DocWrite::Insert { db, coll, docs } => {
+            let n = driver.insert(&db, &coll, &docs).await?;
+            Ok(format!("inserted {n} document{}", plural(n)))
+        }
+        DocWrite::Update {
+            db,
+            coll,
+            filter,
+            change,
+            many,
+        } => {
+            let n = driver.update(&db, &coll, &filter, &change, many).await?;
+            Ok(format!("updated {n} document{}", plural(n)))
+        }
+        DocWrite::Replace { db, coll, id, doc } => {
+            driver.replace(&db, &coll, &id, &doc).await?;
+            Ok("document replaced".into())
+        }
+        DocWrite::Delete {
+            db,
+            coll,
+            filter,
+            many,
+        } => {
+            let n = driver.delete(&db, &coll, &filter, many).await?;
+            Ok(format!("deleted {n} document{}", plural(n)))
+        }
+        DocWrite::CreateCollection { db, coll } => {
+            driver.create_collection(&db, &coll).await?;
+            Ok(format!("created collection {coll}"))
+        }
+        DocWrite::DropCollection { db, coll } => {
+            driver.drop_collection(&db, &coll).await?;
+            Ok(format!("dropped collection {coll}"))
+        }
+        DocWrite::CreateIndex { db, coll, spec } => {
+            driver.create_index(&db, &coll, &spec).await?;
+            Ok("index created".into())
+        }
+    }
+}
+
+/// Resolve the writable document driver for a `Doc*` compose command, emitting
+/// the right error (`DocError`/`Error`) and returning `None` when the session is
+/// absent, read-only, or not a document connection. Shared by `DocInsert`/
+/// `DocReplace`, whose non-destructive writes skip the confirm gate.
+fn doc_write_driver(
+    sessions: &HashMap<SessionId, SessionState>,
+    session_id: Option<SessionId>,
+    events: &Events,
+    epoch: crate::Epoch,
+) -> Option<std::sync::Arc<dyn red_driver::DocDriver>> {
+    let id = session_id?;
+    let Some(state) = sessions.get(&id) else {
+        emit(events, session_id, Event::Error("not connected".into()));
+        return None;
+    };
+    if state.read_only {
+        emit(
+            events,
+            session_id,
+            Event::DocError {
+                epoch,
+                message: "this connection is read-only".into(),
+            },
+        );
+        return None;
+    }
+    match state.driver.as_doc().cloned() {
+        Some(d) => Some(d),
+        None => {
+            emit(
+                events,
+                session_id,
+                Event::Error("not a MongoDB connection".into()),
+            );
+            None
+        }
+    }
+}
+
+/// Turn a parsed extended-JSON value into a single [`Document`], or a `Query`
+/// error when it isn't a JSON object.
+fn parse_one_document(value: red_core::doc::DocValue) -> red_core::Result<red_core::doc::Document> {
+    red_core::doc::Document::from_doc_value(value)
+        .ok_or_else(|| red_core::RedError::Query("document must be a JSON object".into()))
+}
+
+/// Emit the reply for a compose write: `DocWriteDone` on success, `DocError`
+/// otherwise.
+fn emit_doc_write_outcome(
+    events: &Events,
+    session_id: Option<SessionId>,
+    epoch: crate::Epoch,
+    outcome: red_core::Result<String>,
+) {
+    match outcome {
+        Ok(summary) => emit(events, session_id, Event::DocWriteDone { epoch, summary }),
+        Err(e) => emit(
+            events,
+            session_id,
+            Event::DocError {
+                epoch,
+                message: e.to_string(),
+            },
+        ),
+    }
+}
+
+/// The confirm-prompt line for a destructive write (only these reach the prompt).
+fn doc_write_prompt(write: &red_core::doc::DocWrite) -> String {
+    use red_core::doc::DocWrite;
+    match write {
+        DocWrite::DropCollection { db, coll } => format!(
+            "Drop collection {db}.{coll}? This permanently deletes it and cannot be undone."
+        ),
+        DocWrite::Delete { db, coll, many, .. } => {
+            if *many {
+                format!("Delete all matching documents in {db}.{coll}? This cannot be undone.")
+            } else {
+                format!("Delete this document in {db}.{coll}? This cannot be undone.")
+            }
+        }
+        DocWrite::Update { db, coll, .. } => {
+            format!("Update all matching documents in {db}.{coll}?")
+        }
+        _ => "Apply this write?".into(),
+    }
+}
+
 /// Rows per source window / insert chunk in a table copy (the driver re-clamps the
 /// insert to its bound-parameter cap). Keeps the copy one-chunk-resident regardless
 /// of how many rows move; a `[copy]` knob is a later refinement, like import's.
@@ -426,9 +566,10 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         let backend = match &session_driver {
                             session::SessionDriver::Sql(d) => crate::ai::AiBackend::Sql(d.clone()),
                             session::SessionDriver::Kv(d) => crate::ai::AiBackend::Kv(d.clone()),
-                            // The document seam's AI grounding lands in D3 (see
-                            // docs/plans/todo/doc-driver.md); until then, refuse
-                            // cleanly rather than pretend a Mongo session is SQL.
+                            // The document seam's AI grounding isn't wired yet
+                            // (see docs/plans/todo/doc-driver.md); until then,
+                            // refuse cleanly rather than pretend a Mongo session
+                            // is SQL.
                             session::SessionDriver::Doc(_) => {
                                 emit(
                                     &events,
@@ -467,7 +608,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         let backend = match &session_driver {
                             session::SessionDriver::Sql(d) => crate::ai::AiBackend::Sql(d.clone()),
                             session::SessionDriver::Kv(d) => crate::ai::AiBackend::Kv(d.clone()),
-                            // ACP doc grounding lands with D3, like the native arm.
+                            // ACP doc grounding isn't wired yet, like the native arm.
                             session::SessionDriver::Doc(_) => {
                                 emit(
                                     &events,
@@ -3081,6 +3222,123 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 });
             }
 
+            Command::DocApplyWrite {
+                epoch,
+                write,
+                confirmed,
+            } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                if state.read_only {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::DocError {
+                            epoch,
+                            message: "this connection is read-only".into(),
+                        },
+                    );
+                    continue;
+                }
+                let Some(driver) = state.driver.as_doc().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a MongoDB connection".into()),
+                    );
+                    continue;
+                };
+                // Host-side destructive gate: a drop / many / un-filtered write
+                // never runs unconfirmed, so neither the UI nor a future agent can
+                // slip one past the prompt.
+                if !confirmed
+                    && red_core::doc::classify_doc_op(&write)
+                        == red_core::doc::DocOpClass::Destructive
+                {
+                    let prompt = doc_write_prompt(&write);
+                    emit(
+                        &events,
+                        session_id,
+                        Event::DocWriteConfirm {
+                            epoch,
+                            write,
+                            prompt,
+                        },
+                    );
+                    continue;
+                }
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match apply_doc_write(&driver, write).await {
+                        Ok(summary) => {
+                            emit(&events, session_id, Event::DocWriteDone { epoch, summary })
+                        }
+                        Err(e) => emit(
+                            &events,
+                            session_id,
+                            Event::DocError {
+                                epoch,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
+                });
+            }
+
+            Command::DocInsert {
+                epoch,
+                db,
+                coll,
+                doc_json,
+            } => {
+                let Some(driver) = doc_write_driver(&sessions, session_id, &events, epoch) else {
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let outcome = match driver
+                        .parse_ext_json(&doc_json)
+                        .and_then(parse_one_document)
+                    {
+                        Ok(document) => driver
+                            .insert(&db, &coll, &[document])
+                            .await
+                            .map(|n| format!("inserted {n} document")),
+                        Err(e) => Err(e),
+                    };
+                    emit_doc_write_outcome(&events, session_id, epoch, outcome);
+                });
+            }
+
+            Command::DocReplace {
+                epoch,
+                db,
+                coll,
+                id,
+                doc_json,
+            } => {
+                let Some(driver) = doc_write_driver(&sessions, session_id, &events, epoch) else {
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let outcome = match driver
+                        .parse_ext_json(&doc_json)
+                        .and_then(parse_one_document)
+                    {
+                        Ok(document) => driver
+                            .replace(&db, &coll, &id, &document)
+                            .await
+                            .map(|()| "document replaced".to_string()),
+                        Err(e) => Err(e),
+                    };
+                    emit_doc_write_outcome(&events, session_id, epoch, outcome);
+                });
+            }
+
             Command::ColumnStats {
                 epoch,
                 column,
@@ -3968,7 +4226,7 @@ fn resolve_ai_tool_ctx(
     let backend = match &state.driver {
         SessionDriver::Sql(d) => crate::ai::AiBackend::Sql(d.clone()),
         SessionDriver::Kv(d) => crate::ai::AiBackend::Kv(d.clone()),
-        // Document-seam AI grounding lands in D3 (see docs/plans/todo/doc-driver.md);
+        // Document-seam AI grounding isn't wired yet (see docs/plans/todo/doc-driver.md);
         // until then a Mongo session has no AI backend, so tool context is absent.
         SessionDriver::Doc(_) => return None,
     };
