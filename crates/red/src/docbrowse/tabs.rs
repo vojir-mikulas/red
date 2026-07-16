@@ -375,27 +375,13 @@ impl AppState {
         half: SplitHalf,
         cx: &mut Context<Self>,
     ) {
-        let Some(view) = self
+        if let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_mut())
-        else {
-            return;
-        };
-        if from >= view.tabs.len() {
-            return;
+        {
+            view.reorder_tab(from, half);
+            cx.notify();
         }
-        let gap = view.tab_drop_target.take().unwrap_or(from);
-        view.tabs[from].pane = half;
-        let tab = view.tabs.remove(from);
-        let dest = if gap > from { gap - 1 } else { gap };
-        let dest = dest.min(view.tabs.len());
-        view.tabs.insert(dest, tab);
-        view.set_pane_active(half, dest);
-        if let Some(s) = &mut view.split {
-            s.focus = half;
-        }
-        view.normalize_panes();
-        cx.notify();
     }
 
     pub(crate) fn doc_set_tab_drop_target(
@@ -407,9 +393,8 @@ impl AppState {
         if let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_mut())
-            && view.tab_drop_target != Some(gap)
+            && view.set_drop_target(gap)
         {
-            view.tab_drop_target = Some(gap);
             cx.notify();
         }
     }
@@ -418,7 +403,7 @@ impl AppState {
         if let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_mut())
-            && view.tab_drop_target.take().is_some()
+            && view.clear_drop_target()
         {
             cx.notify();
         }
@@ -496,7 +481,7 @@ impl AppState {
             .and_then(|a| a.doc_view.as_mut())
             && let Some(idx) = view.tab_index_by_id(id)
         {
-            view.tabs[idx].pinned = !view.tabs[idx].pinned;
+            view.toggle_pin_at(idx);
             view.tab_menu = None;
             cx.notify();
         }

@@ -416,6 +416,9 @@ impl WorkspaceTab for MongoTab {
     fn pinned(&self) -> bool {
         self.pinned
     }
+    fn set_pinned(&mut self, pinned: bool) {
+        self.pinned = pinned;
+    }
 }
 
 impl TabWorkspace for MongoView {
@@ -437,6 +440,12 @@ impl TabWorkspace for MongoView {
     }
     fn ws_split_mut(&mut self) -> &mut Option<SplitState> {
         &mut self.split
+    }
+    fn ws_drop_target(&self) -> Option<usize> {
+        self.tab_drop_target
+    }
+    fn ws_drop_target_mut(&mut self) -> &mut Option<usize> {
+        &mut self.tab_drop_target
     }
     /// Like Redis, Mongo has no separate pinned strip section, so pinned tabs
     /// sort ahead within their pane's strip.

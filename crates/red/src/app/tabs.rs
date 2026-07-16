@@ -43,9 +43,8 @@ impl AppState {
     /// per-move churn cheap.
     pub(crate) fn set_tab_drop_target(&mut self, gap: usize, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase
-            && active.tab_drop_target != Some(gap)
+            && active.set_drop_target(gap)
         {
-            active.tab_drop_target = Some(gap);
             cx.notify();
         }
     }
@@ -54,7 +53,7 @@ impl AppState {
     /// only when something was showing.
     pub(crate) fn clear_tab_drop_target(&mut self, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase
-            && active.tab_drop_target.take().is_some()
+            && active.clear_drop_target()
         {
             cx.notify();
         }
@@ -65,36 +64,8 @@ impl AppState {
     /// the tab in `half` and focuses it; `normalize_panes` collapses the split if the
     /// drag emptied the source half. Clears the indicator regardless.
     pub(crate) fn drop_tab(&mut self, from: usize, half: SplitHalf, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase
-            && let Some(gap) = active.tab_drop_target.take()
-            && from < active.tabs.len()
-        {
-            // The dragged tab now belongs to the strip it was dropped on.
-            active.tabs[from].pane = half;
-            // `gap` indexes the pre-removal strip; shift left when the
-            // dragged tab sat before the gap.
-            let dest = if from < gap { gap - 1 } else { gap };
-            let dest = dest.min(active.tabs.len() - 1);
-            let tab = active.tabs.remove(from);
-            active.tabs.insert(dest, tab);
-            // Remap the other pane's active index across remove(from)+insert(dest)
-            // so it keeps pointing at its tab; the dropped half is aimed at
-            // the moved tab (its new home, `dest`), and `normalize_panes` then
-            // repairs anything stale (and collapses an emptied half).
-            let remap = |idx: usize| -> usize {
-                if idx == from {
-                    return dest;
-                }
-                let j = if idx > from { idx - 1 } else { idx };
-                if j >= dest { j + 1 } else { j }
-            };
-            active.active_tab = remap(active.active_tab);
-            if let Some(s) = &mut active.split {
-                s.secondary = remap(s.secondary);
-                s.focus = half;
-            }
-            active.set_pane_active(half, dest);
-            active.normalize_panes();
+        if let Phase::Connected(active) = &mut self.phase {
+            active.reorder_tab(from, half);
         }
         cx.notify();
     }
@@ -450,10 +421,8 @@ impl AppState {
     /// tab renders in a fixed section at the start of the strip, always visible
     /// regardless of scroll, and is skipped by the bulk close actions.
     pub(crate) fn toggle_tab_pin(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase
-            && let Some(tab) = active.tabs.get_mut(index)
-        {
-            tab.pinned = !tab.pinned;
+        if let Phase::Connected(active) = &mut self.phase {
+            active.toggle_pin_at(index);
         }
         cx.notify();
     }

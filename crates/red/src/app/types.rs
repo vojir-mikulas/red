@@ -101,6 +101,7 @@ pub(crate) trait WorkspaceTab {
     fn pane(&self) -> SplitHalf;
     fn set_pane(&mut self, half: SplitHalf);
     fn pinned(&self) -> bool;
+    fn set_pinned(&mut self, pinned: bool);
 }
 
 /// A view hosting a set of tabs in an optional side-by-side split. The
@@ -120,10 +121,81 @@ pub(crate) trait TabWorkspace {
     fn ws_set_active(&mut self, i: usize);
     fn ws_split(&self) -> Option<&SplitState>;
     fn ws_split_mut(&mut self) -> &mut Option<SplitState>;
+    /// The gap a dragged tab would land in (the drop indicator), or `None`.
+    fn ws_drop_target(&self) -> Option<usize>;
+    fn ws_drop_target_mut(&mut self) -> &mut Option<usize>;
 
     /// Whether pinned tabs sort ahead of the rest within a pane's strip.
     fn pins_sort_first(&self) -> bool {
         false
+    }
+
+    /// Record the gap a dragged tab would land in. Returns whether it changed, so
+    /// the caller only re-renders when the indicator actually moved (this fires on
+    /// every drag-move, so a no-op notify would spam the frame loop).
+    fn set_drop_target(&mut self, gap: usize) -> bool {
+        if self.ws_drop_target() != Some(gap) {
+            *self.ws_drop_target_mut() = Some(gap);
+            return true;
+        }
+        false
+    }
+
+    /// Drop the drop indicator (cursor left the strip mid-drag). Returns whether
+    /// anything was showing.
+    fn clear_drop_target(&mut self) -> bool {
+        self.ws_drop_target_mut().take().is_some()
+    }
+
+    /// Toggle the pinned flag of the tab at `index`. Returns whether it hit a tab.
+    fn toggle_pin_at(&mut self, index: usize) -> bool {
+        if let Some(t) = self.ws_tabs_mut().get_mut(index) {
+            let pinned = t.pinned();
+            t.set_pinned(!pinned);
+            return true;
+        }
+        false
+    }
+
+    /// Finish a tab-strip drag onto `half`'s strip: assign the dragged tab
+    /// (`from`) to that half and move it into the gap the indicator settled on,
+    /// then remap the *other* pane's active index across the remove+insert so it
+    /// keeps pointing at its own tab (previously only the SQL workspace did this;
+    /// Redis/Mongo relied on `normalize_panes`, which could jump the other pane to
+    /// its first tab). Clears the indicator. Lands the tab in `half` and focuses
+    /// it; `normalize_panes` collapses the split if the drag emptied the source.
+    fn reorder_tab(&mut self, from: usize, half: SplitHalf) {
+        let Some(gap) = self.ws_drop_target_mut().take() else {
+            return;
+        };
+        if from >= self.ws_tabs().len() {
+            return;
+        }
+        // The dragged tab now belongs to the strip it was dropped on.
+        self.ws_tabs_mut()[from].set_pane(half);
+        // `gap` indexes the pre-removal strip; shift left when the dragged tab sat
+        // before the gap.
+        let dest = if from < gap { gap - 1 } else { gap };
+        let dest = dest.min(self.ws_tabs().len() - 1);
+        let tab = self.ws_tabs_mut().remove(from);
+        self.ws_tabs_mut().insert(dest, tab);
+        // Remap an index across remove(from)+insert(dest): the moved tab lands at
+        // `dest`, everything else shifts to keep pointing at its own tab.
+        let remap = |idx: usize| -> usize {
+            if idx == from {
+                return dest;
+            }
+            let j = if idx > from { idx - 1 } else { idx };
+            if j >= dest { j + 1 } else { j }
+        };
+        let active = self.ws_active();
+        self.ws_set_active(remap(active));
+        if let Some(s) = self.ws_split_mut() {
+            s.secondary = remap(s.secondary);
+            s.focus = half;
+        }
+        self.set_pane_active(half, dest);
+        self.normalize_panes();
     }
 
     /// Which half currently receives actions/focus (`Primary` when unsplit).
@@ -373,6 +445,9 @@ mod workspace_tests {
         fn pinned(&self) -> bool {
             self.pinned
         }
+        fn set_pinned(&mut self, pinned: bool) {
+            self.pinned = pinned;
+        }
     }
 
     struct TestWs {
@@ -380,6 +455,7 @@ mod workspace_tests {
         active: usize,
         split: Option<SplitState>,
         sort_pins: bool,
+        drop_target: Option<usize>,
     }
     impl TabWorkspace for TestWs {
         type Tab = TestTab;
@@ -400,6 +476,12 @@ mod workspace_tests {
         }
         fn ws_split_mut(&mut self) -> &mut Option<SplitState> {
             &mut self.split
+        }
+        fn ws_drop_target(&self) -> Option<usize> {
+            self.drop_target
+        }
+        fn ws_drop_target_mut(&mut self) -> &mut Option<usize> {
+            &mut self.drop_target
         }
         fn pins_sort_first(&self) -> bool {
             self.sort_pins
@@ -431,6 +513,7 @@ mod workspace_tests {
             // the first Secondary tab (index 1).
             split: Some(split(0, SplitHalf::Secondary)),
             sort_pins: false,
+            drop_target: None,
         };
         assert_eq!(ws.pane_active(SplitHalf::Primary), Some(0));
         assert_eq!(ws.pane_active(SplitHalf::Secondary), Some(1));
@@ -448,6 +531,7 @@ mod workspace_tests {
             active: 5, // out of range on purpose
             split: Some(split(1, SplitHalf::Secondary)),
             sort_pins: false,
+            drop_target: None,
         };
         ws.normalize_panes();
         assert!(ws.split.is_none(), "an emptied half collapses the split");
@@ -469,6 +553,7 @@ mod workspace_tests {
             active: 0,
             split: None,
             sort_pins: false,
+            drop_target: None,
         };
         assert_eq!(raw.pane_tab_indices(SplitHalf::Primary), vec![0, 1, 2]);
         let pinned_first = TestWs {
@@ -476,12 +561,45 @@ mod workspace_tests {
             active: 0,
             split: None,
             sort_pins: true,
+            drop_target: None,
         };
         // Pinned (index 1) moves ahead; relative order otherwise preserved.
         assert_eq!(
             pinned_first.pane_tab_indices(SplitHalf::Primary),
             vec![1, 0, 2]
         );
+    }
+
+    #[test]
+    fn reorder_lands_the_tab_in_its_new_half_and_keeps_pane_invariants() {
+        let mut ws = TestWs {
+            tabs: vec![
+                tab(SplitHalf::Primary, false),   // 0
+                tab(SplitHalf::Primary, false),   // 1 (focused primary)
+                tab(SplitHalf::Secondary, false), // 2 (focused secondary)
+            ],
+            active: 1,
+            split: Some(split(2, SplitHalf::Primary)),
+            sort_pins: false,
+            drop_target: Some(3), // drag tab 0 to the end of the Secondary strip
+        };
+        ws.reorder_tab(0, SplitHalf::Secondary);
+        // The drop indicator is consumed and the target half is focused.
+        assert_eq!(ws.ws_drop_target(), None);
+        assert_eq!(ws.split.as_ref().unwrap().focus, SplitHalf::Secondary);
+        // The dragged tab now belongs to Secondary.
+        assert!(
+            ws.tabs
+                .iter()
+                .filter(|t| t.pane() == SplitHalf::Secondary)
+                .count()
+                >= 2
+        );
+        // The remap keeps each pane's stored active index pointing at a tab that
+        // pane actually owns (the invariant that previously only held for SQL).
+        let s = ws.split.as_ref().unwrap();
+        assert_eq!(ws.tabs[ws.active].pane(), SplitHalf::Primary);
+        assert_eq!(ws.tabs[s.secondary].pane(), SplitHalf::Secondary);
     }
 }
 
@@ -1029,6 +1147,9 @@ impl WorkspaceTab for QueryTab {
     fn pinned(&self) -> bool {
         self.pinned
     }
+    fn set_pinned(&mut self, pinned: bool) {
+        self.pinned = pinned;
+    }
 }
 
 impl TabWorkspace for ActiveConn {
@@ -1050,6 +1171,12 @@ impl TabWorkspace for ActiveConn {
     }
     fn ws_split_mut(&mut self) -> &mut Option<SplitState> {
         &mut self.split
+    }
+    fn ws_drop_target(&self) -> Option<usize> {
+        self.tab_drop_target
+    }
+    fn ws_drop_target_mut(&mut self) -> &mut Option<usize> {
+        &mut self.tab_drop_target
     }
     // SQL renders pinned tabs in a separate strip section, so `pane_tab_indices`
     // keeps raw order (`pins_sort_first` stays the default `false`).
