@@ -2203,6 +2203,13 @@ impl AppState {
             self.kv_toggle_split(session, cx);
             return;
         }
+        if let Phase::Connected(a) = &self.phase
+            && a.doc_view.is_some()
+        {
+            let session = a.session;
+            self.doc_toggle_split(session, cx);
+            return;
+        }
         let split = matches!(&self.phase, Phase::Connected(a) if a.split.is_some());
         if split {
             self.unsplit(cx);
@@ -2295,6 +2302,13 @@ impl AppState {
         {
             let session = a.session;
             self.kv_focus_other_half(session, cx);
+            return;
+        }
+        if let Phase::Connected(a) = &self.phase
+            && a.doc_view.is_some()
+        {
+            let session = a.session;
+            self.doc_focus_other_half(session, cx);
             return;
         }
         let pane = match &self.phase {

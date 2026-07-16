@@ -1238,6 +1238,11 @@ impl AppState {
                     .text_size(theme.scale(11.))
                     .text_color(theme.text_muted)
                     .child("This can't be undone."),
+            )
+            .child(
+                div()
+                    .pt_1()
+                    .child(self.dont_ask_destructive_checkbox("kv-delete-dont-ask", cx)),
             );
 
         let (confirm_view, cancel_view, close_view) = (view.clone(), view.clone(), view.clone());

@@ -23,8 +23,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   into a results grid, and an Explain button on the document view reports the
   winning plan, whether it is a collection scan, the index used, and the
   documents-examined / returned counts. On a writable connection the inspector
-  edits a document as extended JSON (Cmd+Enter saves), and there are affordances
-  to insert a new document, delete one, and drop a collection; a destructive
+  edits a document two ways, toggled in its header: a field-by-field Form editor
+  and a raw extended-JSON editor (Cmd+Enter saves). The Form editor gives each
+  field an editable name, a searchable type picker (string / int / double /
+  decimal / bool / date / objectId / null / object / array), and a type-aware
+  value control, with
+  add / remove affordances and collapsible nested objects and arrays so deep
+  documents stay navigable; the `_id` is shown read-only and preserved. Switching
+  to Raw serializes the form so the JSON reflects your edits. The inspector docks
+  on the right and is resizable by dragging its divider. There are also
+  affordances to insert a new document, delete one, and drop a collection; a
+  destructive
   operation (dropping a collection, a delete or update touching many documents,
   or an unfiltered mutation) is held behind an explicit confirm, and every write
   is refused outright on a read-only connection. The AI assistant (⌘L) is
@@ -79,6 +88,40 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cached-data directories and every secret it stored in the OS keychain
   (connection passwords, SSH keys, AI keys) in one step. It shows exactly what
   will be removed, is irreversible, and does not touch the RED application binary.
+
+### Changed
+- Delete/destructive confirmations are now unified across the SQL, Redis, and
+  MongoDB shells and governed by a single setting. Deleting a Redis key or a
+  MongoDB document — like running a destructive SQL statement — asks first, and
+  every confirm dialog carries a "Don't ask again" checkbox that turns the guard
+  off for good (it applies to the delete you're confirming too). The Settings →
+  Query → Safety toggle ("Confirm destructive operations", on by default) turns
+  it back on or off at any time. The MongoDB drop-collection confirm stays
+  server-gated and always asks.
+- The MongoDB shell is now a tabbed workspace, matching the SQL and Redis
+  browsers: each collection opens in its own tab, tabs can be reordered by
+  dragging, pinned, and closed, and the work area splits into two side-by-side
+  panes (⌘\, with ⌥⌘\ to switch panes) so you can view two collections at once.
+  ⌘T opens a blank tab, ⌘W closes one, and Ctrl+Tab cycles through them. The
+  same collection can be opened in several independent tabs at once — ⌘-click a
+  collection in the sidebar (or "Duplicate tab" from a tab's context menu) to
+  open another — each with its own filter, paging, inspector, and unsaved edits,
+  so you can browse or edit different documents of one collection side by side.
+  A plain click still fills a focused blank tab or focuses an already-open tab.
+- The document view gains three switchable render modes: the sampled-column
+  Table, a List mode that shows one expandable card per document with a
+  per-field tree (nested objects and arrays indented) and per-document Edit /
+  Clone / Delete actions, and a JSON mode that pretty-prints each document as
+  extended JSON. "Clone" opens a copy of a document in the insert editor with a
+  fresh `_id`.
+- The MongoDB shell gains the same window chrome as the SQL and Redis shells: a
+  footer status bar (connection target and name, read-only badge, the focused
+  collection's document range, and the server version), a collections sidebar
+  that is resizable by dragging its edge and collapsible with ⌘B, and the AI
+  assistant docked as a resizable right panel toggled from the footer (or ⌘L).
+  The per-collection toolbar was reorganised so it no longer overflows: the
+  collection name and panel tabs sit on their own row, the filter bar spans the
+  width below them, and Explain / New / Drop moved into an "Actions" dropdown.
 
 ## [0.17.0] - 2026-07-14
 

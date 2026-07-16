@@ -777,8 +777,10 @@ fn query_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             ))
             .child(settings_header("Safety", &theme))
             .child(setting_row(
-                "Confirm destructive statements",
-                "Ask before running DROP / TRUNCATE / DELETE-without-WHERE and similar.",
+                "Confirm destructive operations",
+                "Ask before a destructive write — DROP / TRUNCATE / DELETE-without-WHERE, \
+                 deleting a Redis key, or deleting a MongoDB document. The confirm \
+                 dialog's \"Don't ask again\" checkbox turns this off.",
                 confirm,
                 &theme,
             )),

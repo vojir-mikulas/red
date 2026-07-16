@@ -1096,6 +1096,37 @@ impl AppState {
             )
     }
 
+    /// The "Don't ask again" checkbox shared by the delete/destructive confirmations
+    /// across the SQL, Redis, and MongoDB shells: ticking it flips
+    /// `query.confirm_destructive` off immediately, so it also applies to the action
+    /// being confirmed right now. `id` distinguishes the modals so several can mount
+    /// in one frame.
+    pub(crate) fn dont_ask_destructive_checkbox(
+        &self,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                Checkbox::new(id, false)
+                    .mark(crate::icons::icon("check", px(12.), theme.on_accent))
+                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                        this.set_confirm_destructive(!*checked, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .text_size(theme.scale(12.))
+                    .text_color(theme.text_muted)
+                    .child("Don't ask again"),
+            )
+            .into_any_element()
+    }
+
     /// Confirmation before deleting a saved connection. Deletion also drops the
     /// keychain credential, so this is the safety rail against accidental removal.
     fn render_confirm_delete(
@@ -1329,7 +1360,8 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         use crate::app::PendingWrite;
-        let theme = cx.theme();
+        // Owned so the body can still reference it after `dont_ask` borrows `cx`.
+        let theme = cx.theme().clone();
         let close_view = cx.entity().downgrade();
         let confirm_view = cx.entity().downgrade();
         // The destructive editor statement and the guarded grid edit share this
@@ -1371,6 +1403,11 @@ impl AppState {
         // The batch preview can be many statements; show more than a single edit's
         // one-liner but still cap it so a huge change-set can't blow up the modal.
         let preview: String = sql.chars().take(1200).collect();
+        // The "Don't ask again" opt-out only belongs on the settings-gated
+        // destructive-statement path; the batch/import/copy confirms aren't governed
+        // by `confirm_destructive`.
+        let dont_ask = matches!(&pending, PendingWrite::EditorSql(_))
+            .then(|| self.dont_ask_destructive_checkbox("destructive-dont-ask", cx));
         let body = div()
             .flex()
             .flex_col()
@@ -1385,7 +1422,8 @@ impl AppState {
                     .text_size(theme.scale(12.))
                     .text_color(theme.text)
                     .child(preview),
-            );
+            )
+            .children(dont_ask);
         let mut footer = div().flex().justify_end().gap_2().child(
             Button::new("confirm-cancel", "Cancel")
                 .variant(ButtonVariant::Secondary)

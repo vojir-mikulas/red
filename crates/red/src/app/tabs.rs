@@ -206,6 +206,14 @@ impl AppState {
             self.kv_step_tab(session, forward, cx);
             return;
         }
+        // A Mongo connection likewise steps its own tabs (no SQL editor focus).
+        if let Phase::Connected(a) = &self.phase
+            && a.doc_view.is_some()
+        {
+            let session = a.session;
+            self.doc_step_tab(session, forward, cx);
+            return;
+        }
         let editor_focused = matches!(
             &self.phase,
             Phase::Connected(active)
@@ -253,6 +261,14 @@ impl AppState {
             self.kv_close_tab(session, idx, cx);
             return;
         }
+        // Mongo: close the focused collection/blank tab of the focused half.
+        if let Phase::Connected(a) = &self.phase
+            && let Some(v) = &a.doc_view
+        {
+            let (session, idx) = (a.session, v.focused_tab_index());
+            self.doc_close_tab(session, idx, cx);
+            return;
+        }
         let index = match &self.phase {
             Phase::Connected(active) if active.active().is_some() => active.active_tab,
             _ => return,
@@ -275,6 +291,13 @@ impl AppState {
             self.kv_refresh_keys(session, cx);
             return;
         }
+        if let Phase::Connected(a) = &self.phase
+            && a.doc_view.is_some()
+        {
+            let session = a.session;
+            self.doc_refresh(session, cx);
+            return;
+        }
         self.refresh_schema();
     }
 
@@ -286,6 +309,14 @@ impl AppState {
         {
             let session = a.session;
             self.kv_new_empty_tab(session, cx);
+            return;
+        }
+        // A Mongo connection likewise has no SQL editor; ⌘T opens a blank tab.
+        if let Phase::Connected(a) = &self.phase
+            && a.doc_view.is_some()
+        {
+            let session = a.session;
+            self.doc_new_empty_tab(session, cx);
             return;
         }
         let tab = match &mut self.phase {
