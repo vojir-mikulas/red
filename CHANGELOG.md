@@ -42,7 +42,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   documents, run aggregations, and explain queries to flag a missing index —
   and, at the write tier, propose a document write, an index, or a collection
   operation for you to approve, with the same per-call gate and destructive
-  confirm the manual path uses.
+  confirm the manual path uses. The whole shell is keyboard navigable: the
+  collection tree and the document grid take arrow and vim (hjkl, g / G, Ctrl-d /
+  Ctrl-u) motions, Enter (or F2) opens the highlighted collection or document,
+  ⌥⌘1 / ⌥⌘3 jump focus between the tree and the grid, F6 cycles between them, and
+  ⌘F searches the collection sidebar (from the tree) or filters documents (from
+  the grid). The sidebar has a search box that narrows the database / collection
+  tree by name as you type.
 - Searchable, grouped History dock: the left History panel (both the SQL and
   Redis shells) now has a search box that narrows the list live and collapsible
   grouped sections. SQL history groups into Today / Yesterday / Earlier time

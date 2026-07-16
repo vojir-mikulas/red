@@ -225,6 +225,16 @@ pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)
             ],
         ),
         (
+            "MongoDB browser",
+            vec![
+                ("↑ / ↓", "Move selection (collection tree, document grid)"),
+                ("← / →", "Collapse / expand a database"),
+                ("↵ / F2", "Open the highlighted collection / document"),
+                ("⌥⌘1 / ⌥⌘3", "Focus collection tree / document grid"),
+                ("⌘F", "Search collections (tree) / filter documents (grid)"),
+            ],
+        ),
+        (
             "Dialogs",
             vec![
                 ("↵", "Confirm / connect"),

@@ -2116,6 +2116,14 @@ impl AppState {
     /// Focusing the schema pane also reveals the sidebar if it was collapsed.
     /// No-op outside the connected shell, or when the editor pane has no open tab.
     pub(crate) fn focus_pane(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
+        // A Mongo connection has no SQL editor/grid; map the pane vocabulary onto
+        // its tree / document grid / filter bar instead.
+        if let Phase::Connected(a) = &self.phase
+            && a.doc_view.is_some()
+        {
+            self.doc_focus_pane(pane, window, cx);
+            return;
+        }
         if pane == Pane::Schema
             && let Phase::Connected(active) = &mut self.phase
         {
@@ -2163,6 +2171,13 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A Mongo connection cycles its own two stops (tree <-> document grid).
+        if let Phase::Connected(a) = &self.phase
+            && a.doc_view.is_some()
+        {
+            self.doc_cycle_focus(window, cx);
+            return;
+        }
         let (current, order) = match &self.phase {
             Phase::Connected(active) => {
                 let mut order = Vec::with_capacity(3);

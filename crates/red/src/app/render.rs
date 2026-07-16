@@ -505,7 +505,13 @@ impl Render for AppState {
                 cx.listener(|this, _: &ToggleColumnsPanel, _, cx| this.toggle_columns_panel(cx)),
             )
             .on_action(cx.listener(|this, _: &RefreshSchema, _, cx| this.refresh_active(cx)))
-            .on_action(cx.listener(|this, _: &SearchSchema, _, cx| {
+            .on_action(cx.listener(|this, _: &SearchSchema, window, cx| {
+                // A Mongo connection's ⌘F (from the tree or root, where the grid's
+                // Table-scoped FindInResult doesn't reach) focuses the sidebar
+                // collection search, mirroring the SQL "search schema" idiom.
+                if this.doc_focus_tree_filter(window, cx) {
+                    return;
+                }
                 this.focus_search = true;
                 cx.notify();
             }))
@@ -539,11 +545,12 @@ impl Render for AppState {
                 this.open_external(crate::app::ISSUES_URL, cx)
             }))
             // --- staged grid editing (Track B6) ---
-            // Enter/F2 in the "Table" context: on a Redis key list it opens the
-            // value inspector on the keyboard cursor; otherwise it begins an
-            // in-place SQL cell edit (the same binding, the right thing per pane).
+            // Enter/F2 in the "Table" context: on a Mongo document grid or a Redis
+            // key list it opens the inspector on the keyboard cursor; otherwise it
+            // begins an in-place SQL cell edit (the same binding, the right thing
+            // per pane).
             .on_action(cx.listener(|this, _: &BeginEdit, window, cx| {
-                if !this.kv_activate_cursor(window, cx) {
+                if !this.doc_activate_cursor(window, cx) && !this.kv_activate_cursor(window, cx) {
                     this.begin_grid_edit(cx);
                 }
             }))

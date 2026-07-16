@@ -10,10 +10,10 @@ use std::rc::Rc;
 use flint::Theme;
 use flint::prelude::*;
 use gpui::{
-    Axis, Context, MouseButton, Pixels, SharedString, UniformListScrollHandle, WeakEntity, Window,
-    div, prelude::*, px,
+    App, Axis, Context, MouseButton, Pixels, SharedString, UniformListScrollHandle, WeakEntity,
+    Window, div, prelude::*, px, uniform_list,
 };
-use red_core::doc::{CollKind, CollectionInfo, DocPlan, DocValue, Document};
+use red_core::doc::{CollKind, DocPlan, DocValue, Document};
 use red_service::SessionId;
 
 use crate::app::{ActiveConn, AppState, Phase, SplitHalf, TabWorkspace};
@@ -147,7 +147,8 @@ impl AppState {
                 .child(div().flex_1().min_w(px(0.)).h_full().child(work))
                 .into_any_element();
         }
-        let tree = self.render_doc_tree(v, &theme, &view);
+        let tree_filter = v.tree_filter.read(cx).content().to_string();
+        let tree = self.render_doc_tree(v, &tree_filter, &theme, &view);
         let tree_pane = div()
             .size_full()
             .border_r_1()
@@ -1028,152 +1029,112 @@ impl AppState {
             .into_any_element()
     }
 
-    /// The `database -> collection` tree (left dock). Databases are click-to-
-    /// expand; a collection row opens it in a tab.
+    /// The `database -> collection` tree (left dock), a Flint `Tree` so it gets
+    /// keyboard + vim navigation for free (see [`AppState::doc_tree_nav`]).
+    /// Databases are click / Enter to expand; a collection row opens it in a tab
+    /// (⌘-click / new-tab handled in `on_select`).
     fn render_doc_tree(
         &self,
         v: &MongoView,
+        filter: &str,
         theme: &Theme,
         view: &WeakEntity<AppState>,
     ) -> gpui::AnyElement {
         let session = v.session;
-        // Highlight every collection that is open in a tab.
-        let open: Vec<(String, String)> = v
-            .tabs
-            .iter()
-            .filter_map(|t| match &t.state {
-                MongoTabState::Collection(c) => Some((c.db.clone(), c.coll.clone())),
-                MongoTabState::Empty => None,
-            })
-            .collect();
-        let icon_size = theme.scale(12.);
-
-        let mut rows = div().flex().flex_col().py_1();
-        for db in &v.databases {
-            let expanded = v.expanded.contains(&db.name);
-            let chevron = if expanded { "chevron-down" } else { "chevron" };
-            let db_name = db.name.clone();
-            let toggle_view = view.clone();
-            rows = rows.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .py_1()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.bg_hover))
-                    .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
-                        let db = db_name.clone();
-                        toggle_view
-                            .update(cx, |this, cx| this.doc_toggle_db(session, db, cx))
-                            .ok();
-                    })
-                    .child(crate::icons::icon(chevron, icon_size, theme.text_muted))
-                    .child(crate::icons::icon("database", icon_size, theme.text_muted))
-                    .child(div().min_w_0().truncate().child(db.name.clone())),
-            );
-            if expanded {
-                match v.collections.get(&db.name) {
-                    Some(colls) if !colls.is_empty() => {
-                        for coll in colls {
-                            rows = rows.child(self.render_doc_coll_row(
-                                session, &db.name, coll, &open, theme, icon_size, view,
-                            ));
-                        }
-                    }
-                    Some(_) => {
-                        rows = rows.child(
-                            div()
-                                .pl(px(40.))
-                                .py_1()
-                                .text_color(theme.text_faint)
-                                .child("(no collections)"),
-                        );
-                    }
-                    None => {
-                        rows = rows.child(
-                            div()
-                                .pl(px(40.))
-                                .py_1()
-                                .text_color(theme.text_faint)
-                                .child("Loading..."),
-                        );
-                    }
-                }
-            }
-        }
+        let flat = v.flatten_doc_tree(filter);
+        let items: Vec<TreeItem> = flat.iter().map(|r| r.item).collect();
+        let selected_ix = v
+            .tree_selected
+            .as_ref()
+            .and_then(|s| flat.iter().position(|r| r.sel.as_ref() == Some(s)));
+        let rows = Rc::new(flat);
 
         let error = v
             .error
             .as_ref()
             .map(|e| div().px_2().py_1().text_color(theme.red).child(e.clone()));
 
-        div()
-            .id("doc-db-tree")
-            .size_full()
-            .overflow_y_scroll()
-            .text_size(theme.scale(13.))
-            .children(error)
-            .child(rows)
-            .into_any_element()
-    }
+        let (nav_view, toggle_view, select_view) = (view.clone(), view.clone(), view.clone());
+        let rows_render = rows.clone();
+        let rows_toggle = rows.clone();
+        let rows_select = rows.clone();
 
-    #[allow(clippy::too_many_arguments)]
-    fn render_doc_coll_row(
-        &self,
-        session: SessionId,
-        db: &str,
-        coll: &CollectionInfo,
-        open: &[(String, String)],
-        theme: &Theme,
-        icon_size: gpui::Pixels,
-        view: &WeakEntity<AppState>,
-    ) -> gpui::AnyElement {
-        let is_open = open.iter().any(|(sd, sc)| sd == db && sc == &coll.name);
-        let (db_owned, coll_owned) = (db.to_string(), coll.name.clone());
-        let select_view = view.clone();
-        let badge = coll_kind_badge(coll.kind);
-        div()
-            .id(SharedString::from(format!("doc-coll-{db}-{}", coll.name)))
+        let tree = Tree::new("doc-db-tree")
+            .rows(items)
+            .row_height(px(24.))
+            .indent(px(14.))
+            .track_scroll(&v.tree_scroll)
+            // The tree owns the sidebar's focus handle; ↑/↓ / ←/→ / Enter (plus
+            // hjkl/g/G) drive selection, expansion, and opening.
+            .focus_handle(v.tree_focus.clone())
+            .vim_nav(self.vim_mode())
+            .on_nav(move |nav, _window, cx| {
+                nav_view
+                    .update(cx, |this, cx| this.doc_tree_nav(session, nav, cx))
+                    .ok();
+            })
+            .selected(selected_ix)
+            .disclosure(|expanded, _window, cx| {
+                let name = if expanded { "chevron-down" } else { "chevron" };
+                crate::icons::icon(name, cx.theme().scale(12.), cx.theme().text_muted)
+                    .into_any_element()
+            })
+            .render_row(move |ix, _window, cx| render_doc_tree_row(&rows_render[ix], cx))
+            .on_toggle(move |ix, _window, cx| {
+                if let Some(DocTreeSel::Db(db)) = rows_toggle[ix].sel.clone() {
+                    toggle_view
+                        .update(cx, |this, cx| this.doc_toggle_db(session, db, cx))
+                        .ok();
+                }
+            })
+            // A body click acts on the row: a database toggles, a collection opens
+            // (⌘/Ctrl-click opens it in a new tab). The click also plants tree
+            // focus so arrows continue from here.
+            .on_select(move |ix, event, window, cx| {
+                let Some(sel) = rows_select[ix].sel.clone() else {
+                    return;
+                };
+                let new_tab = event.modifiers().secondary();
+                select_view
+                    .update(cx, |this, cx| {
+                        if let Some(v) = this
+                            .conn_mut(Some(session))
+                            .and_then(|a| a.doc_view.as_mut())
+                        {
+                            v.tree_selected = Some(sel.clone());
+                            let handle = v.tree_focus.clone();
+                            window.focus(&handle, cx);
+                        }
+                        match sel {
+                            DocTreeSel::Db(db) => this.doc_toggle_db(session, db, cx),
+                            DocTreeSel::Coll { db, coll } => {
+                                this.doc_open_collection(session, db, coll, new_tab, cx)
+                            }
+                        }
+                    })
+                    .ok();
+            });
+
+        // The search box narrows the tree live (see `flatten_doc_tree`); ⌘F from
+        // the tree / root focuses it.
+        let filter_row = div()
+            .flex_shrink_0()
             .flex()
             .items_center()
-            .gap_1()
-            .pl(px(28.))
-            .pr_2()
-            .py_1()
-            .cursor_pointer()
-            .when(is_open, |d| d.bg(theme.bg_selected))
-            .when(!is_open, |d| d.hover(|s| s.bg(theme.bg_hover)))
-            .tooltip(Tooltip::text(crate::keymap::localize_hint(
-                "Open  ·  ⌘-click for a new tab",
-            )))
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                move |ev: &gpui::MouseDownEvent, _, cx| {
-                    let (db, coll) = (db_owned.clone(), coll_owned.clone());
-                    // ⌘/Ctrl-click opens the collection in a new, independent tab.
-                    let new_tab = ev.modifiers.secondary();
-                    select_view
-                        .update(cx, |this, cx| {
-                            this.doc_open_collection(session, db, coll, new_tab, cx)
-                        })
-                        .ok();
-                },
-            )
-            .child(crate::icons::icon("table", icon_size, theme.text_muted))
-            .child(div().min_w_0().flex_1().truncate().child(coll.name.clone()))
-            .children(badge.map(|label| {
-                div()
-                    .text_color(theme.text_faint)
-                    .text_size(theme.scale(10.))
-                    .child(label)
-            }))
-            .child(
-                div()
-                    .text_color(theme.text_faint)
-                    .child(fmt_count(coll.est_count)),
-            )
+            .px_2()
+            .pt_2()
+            .pb_1()
+            .child(div().flex_1().child(v.tree_filter.clone()));
+
+        div()
+            .id("doc-db-tree-dock")
+            .size_full()
+            .flex()
+            .flex_col()
+            .text_size(theme.scale(13.))
+            .child(filter_row)
+            .children(error)
+            .child(div().flex_1().min_h(px(0.)).child(tree))
             .into_any_element()
     }
 
@@ -1582,7 +1543,10 @@ impl AppState {
         let text = theme.text;
         let faint = theme.text_faint;
         let select_view = view.clone();
-        let selected = current.inspector;
+        let nav_view = view.clone();
+        // The keyboard cursor drives the highlight once the grid has been touched;
+        // before that it falls back to the inspected row.
+        let selected = current.cursor.or(current.inspector);
 
         Table::<()>::new("doc-grid", columns)
             .row_count(current.docs.len())
@@ -1590,10 +1554,27 @@ impl AppState {
             .text_size(theme.scale(12.))
             .track_scroll(&current.scroll)
             .focus_handle(current.list_focus.clone())
+            // Vim motions (hjkl/g/G/Ctrl-d/Ctrl-u) ride alongside the arrow keys
+            // when the user has turned vim navigation on.
+            .vim_nav(self.vim_mode())
+            .on_nav(move |nav, _extend, _window, cx| {
+                nav_view
+                    .update(cx, |this, cx| this.doc_grid_nav(session, nav, cx))
+                    .ok();
+            })
             .selected(selected)
-            .on_select(move |ix, _click, _window, cx| {
+            .on_select(move |ix, _click, window, cx| {
                 select_view
-                    .update(cx, |this, cx| this.doc_toggle_inspector(session, ix, cx))
+                    .update(cx, |this, cx| {
+                        // A click plants the keyboard cursor and focuses the grid so
+                        // arrows continue from the clicked row.
+                        if let Some(current) = this.doc_focused_coll_mut(session) {
+                            current.cursor = Some(ix);
+                            let handle = current.list_focus.clone();
+                            window.focus(&handle, cx);
+                        }
+                        this.doc_toggle_inspector(session, ix, cx);
+                    })
                     .ok();
             })
             .render_row(move |ix, _window, _cx| {
@@ -1627,123 +1608,63 @@ impl AppState {
         theme: &Theme,
         view: &WeakEntity<AppState>,
     ) -> gpui::AnyElement {
-        let mut list = div()
-            .id("doc-list")
-            .size_full()
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .text_size(theme.scale(12.));
+        // Flatten the page (and the fields of every expanded document) into
+        // fixed-height rows so `uniform_list` windows the whole thing — the old
+        // container mounted every card and field each frame, hence the jank.
+        let mut rows: Vec<DocListRow> = Vec::new();
         for (i, doc) in current.docs.iter().enumerate() {
             let expanded = current.expanded_rows.contains(&i);
-            let chevron = if expanded { "chevron-down" } else { "chevron" };
-            let group = SharedString::from(format!("doc-card-{i}"));
-            let toggle_view = view.clone();
-            let open_view = view.clone();
-            let id_label = doc.id.to_cell(CELL_CAP).to_string();
-            // Only the chevron + `_id` region toggles expansion, so the action
-            // buttons to its right stay click-safe.
-            let toggle_region = div()
-                .id(("doc-card-toggle", i))
-                .flex()
-                .items_center()
-                .gap_2()
-                .flex_1()
-                .min_w_0()
-                .cursor_pointer()
-                .on_click(move |_, _, cx| {
-                    toggle_view
-                        .update(cx, |this, cx| this.doc_toggle_row(session, i, cx))
-                        .ok();
-                })
-                .child(crate::icons::icon(
-                    chevron,
-                    theme.scale(11.),
-                    theme.text_muted,
-                ))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .font_family(theme.mono_family.clone())
-                        .text_color(theme.text)
-                        .child(format!("_id: {id_label}")),
-                );
-            let mut header = div()
-                .group(group.clone())
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py(px(6.))
-                .hover(|s| s.bg(theme.bg_hover))
-                .child(toggle_region);
-            // Per-document actions, revealed on hover.
-            let edit_view = view.clone();
-            let clone_view = view.clone();
-            let mut actions = div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .invisible()
-                .group_hover(group, |s| s.visible())
-                .child(
-                    Button::new(("doc-card-edit", i), "Edit")
-                        .size(ButtonSize::Sm)
-                        .variant(ButtonVariant::Ghost)
-                        .on_click(move |_, _, cx| {
-                            edit_view
-                                .update(cx, |this, cx| this.doc_toggle_inspector(session, i, cx))
-                                .ok();
-                        }),
-                );
-            if !read_only {
-                actions = actions
-                    .child(
-                        Button::new(("doc-card-clone", i), "Clone")
-                            .size(ButtonSize::Sm)
-                            .variant(ButtonVariant::Ghost)
-                            .on_click(move |_, _, cx| {
-                                clone_view
-                                    .update(cx, |this, cx| this.doc_clone_document(session, i, cx))
-                                    .ok();
-                            }),
-                    )
-                    .child(
-                        Button::new(("doc-card-del", i), "Delete")
-                            .size(ButtonSize::Sm)
-                            .variant(ButtonVariant::Danger)
-                            .on_click(move |_, _, cx| {
-                                open_view
-                                    .update(cx, |this, cx| this.doc_delete_row(session, i, cx))
-                                    .ok();
-                            }),
-                    );
-            }
-            header = header.child(actions);
-
-            let mut card = div()
-                .flex()
-                .flex_col()
-                .border_b_1()
-                .border_color(theme.border)
-                .child(header);
+            rows.push(DocListRow::Header {
+                doc_ix: i,
+                expanded,
+                id_label: SharedString::from(format!("_id: {}", doc.id.to_cell(CELL_CAP))),
+            });
             if expanded {
-                card = card.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .px_3()
-                        .pb_2()
-                        .pl(px(28.))
-                        .font_family(theme.mono_family.clone())
-                        .children(doc_field_rows(doc, theme)),
-                );
+                let mut fields = Vec::new();
+                push_field_data("_id", &doc.id, 0, &mut fields);
+                for (k, v) in &doc.fields {
+                    push_field_data(k, v, 0, &mut fields);
+                }
+                rows.extend(fields.into_iter().map(DocListRow::Field));
             }
-            list = list.child(card);
         }
-        list.into_any_element()
+
+        let rows = Rc::new(rows);
+        let count = rows.len();
+        let row_h = theme.scale(26.);
+        let text_size = theme.scale(12.);
+        let theme = theme.clone();
+        let view = view.clone();
+        let list = uniform_list("doc-list", count, {
+            let rows = rows.clone();
+            move |range, _window, _cx| {
+                let mut out = Vec::with_capacity(range.len());
+                for ix in range {
+                    out.push(match &rows[ix] {
+                        DocListRow::Header {
+                            doc_ix,
+                            expanded,
+                            id_label,
+                        } => doc_list_header(
+                            *doc_ix, *expanded, id_label, session, read_only, row_h, &theme, &view,
+                        ),
+                        DocListRow::Field(f) => doc_list_field(f, row_h, text_size, &theme),
+                    });
+                }
+                out
+            }
+        })
+        .track_scroll(&current.list_scroll)
+        .flex_1();
+
+        div()
+            .id("doc-list")
+            .size_full()
+            .flex()
+            .flex_col()
+            .text_size(text_size)
+            .child(list)
+            .into_any_element()
     }
 
     /// The raw-document inspector. On a writable connection it's an editable
@@ -2114,44 +2035,81 @@ fn render_docs_table(
 
 /// The JSON render mode: a pretty extended-JSON block per document, stacked in a
 /// scroll. Bounded so a huge window can't blow the line budget.
+/// One windowed row of the JSON render mode: a document boundary rule or a single
+/// pretty-printed line. Flattening to fixed-height rows lets `uniform_list`
+/// virtualize the whole window, so scrolling stays smooth on a full page of
+/// documents (the old one-`div`-per-line container laid out every line each
+/// frame).
+enum JsonRow {
+    /// A hairline between two documents.
+    Separator,
+    /// A single extended-JSON line.
+    Line(SharedString),
+}
+
 fn render_doc_json(current: &CollView, theme: &Theme) -> gpui::AnyElement {
     const MAX_LINES: usize = 6_000;
-    let mut container = div()
-        .id("doc-json")
-        .size_full()
-        .overflow_scroll()
-        .p_3()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .font_family(theme.mono_family.clone())
-        .text_size(theme.scale(12.))
-        .text_color(theme.text);
-    let mut budget = MAX_LINES;
+    let mut rows: Vec<JsonRow> = Vec::new();
+    let mut lines_used = 0usize;
     for (i, doc) in current.docs.iter().enumerate() {
-        if budget == 0 {
+        if lines_used >= MAX_LINES {
             break;
         }
+        if i > 0 {
+            rows.push(JsonRow::Separator);
+        }
         let json = pretty_extjson(&doc.to_doc_value());
-        let lines: Vec<SharedString> = json
-            .lines()
-            .take(budget)
-            .map(|l| SharedString::from(l.to_string()))
-            .collect();
-        budget = budget.saturating_sub(lines.len());
-        container = container.child(
-            div()
-                .flex()
-                .flex_col()
-                .when(i > 0, |d| d.border_t_1().border_color(theme.border).pt_2())
-                .children(
-                    lines
-                        .into_iter()
-                        .map(|line| div().flex_shrink_0().child(line)),
-                ),
-        );
+        for line in json.lines() {
+            if lines_used >= MAX_LINES {
+                break;
+            }
+            rows.push(JsonRow::Line(SharedString::from(line.to_string())));
+            lines_used += 1;
+        }
     }
-    container.into_any_element()
+
+    let rows = Rc::new(rows);
+    let count = rows.len();
+    let row_h = theme.scale(18.);
+    let border = theme.border;
+    let list = uniform_list("doc-json", count, {
+        let rows = rows.clone();
+        move |range, _window, _cx| {
+            let mut out = Vec::with_capacity(range.len());
+            for ix in range {
+                let el = match &rows[ix] {
+                    JsonRow::Separator => div()
+                        .h(row_h)
+                        .flex()
+                        .items_center()
+                        .child(div().h(px(1.)).w_full().bg(border)),
+                    // A single fixed-height line; long lines clip (the inspector
+                    // shows the full document).
+                    JsonRow::Line(line) => div()
+                        .h(row_h)
+                        .w_full()
+                        .overflow_hidden()
+                        .child(line.clone()),
+                };
+                out.push(el.into_any_element());
+            }
+            out
+        }
+    })
+    .track_scroll(&current.json_scroll)
+    .flex_1();
+
+    div()
+        .id("doc-json")
+        .size_full()
+        .flex()
+        .flex_col()
+        .p_3()
+        .font_family(theme.mono_family.clone())
+        .text_size(theme.scale(12.))
+        .text_color(theme.text)
+        .child(list)
+        .into_any_element()
 }
 
 /// The explain readout strip: a headline that flags a `COLLSCAN` (red) or names
@@ -2231,6 +2189,70 @@ fn render_explain_box(
 
 // --- free helpers ------------------------------------------------------------
 
+/// Render one collection-tree row's content (icon + label + badges); the Flint
+/// `Tree` draws the chevron, indent, and selection highlight around it. A
+/// collection open in a tab is tinted with the accent.
+fn render_doc_tree_row(row: &DocTreeRow, cx: &App) -> gpui::AnyElement {
+    let theme = cx.theme();
+    let (text, muted, faint, accent) =
+        (theme.text, theme.text_muted, theme.text_faint, theme.accent);
+    let icon_size = theme.scale(12.);
+    match &row.kind {
+        DocTreeKind::Db { name } => div()
+            .flex()
+            .flex_1()
+            .items_center()
+            .gap_1()
+            .child(crate::icons::icon("database", icon_size, muted))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(text)
+                    .child(name.clone()),
+            )
+            .into_any_element(),
+        DocTreeKind::Coll {
+            name,
+            kind,
+            count,
+            open,
+        } => {
+            let name_color = if *open { accent } else { text };
+            let icon_color = if *open { accent } else { muted };
+            div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .gap_1()
+                .child(crate::icons::icon("table", icon_size, icon_color))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_color(name_color)
+                        .child(name.clone()),
+                )
+                .children(coll_kind_badge(*kind).map(|label| {
+                    div()
+                        .text_color(faint)
+                        .text_size(theme.scale(10.))
+                        .child(label)
+                }))
+                .child(div().text_color(faint).child(fmt_count(*count)))
+                .into_any_element()
+        }
+        DocTreeKind::Placeholder(txt) => div()
+            .flex()
+            .flex_1()
+            .items_center()
+            .text_color(faint)
+            .child(*txt)
+            .into_any_element(),
+    }
+}
+
 /// A short badge label for a non-plain collection kind (a view or time-series),
 /// or `None` for an ordinary collection.
 fn coll_kind_badge(kind: CollKind) -> Option<&'static str> {
@@ -2241,73 +2263,190 @@ fn coll_kind_badge(kind: CollKind) -> Option<&'static str> {
     }
 }
 
-/// The rows for an expanded List-mode card: `_id` first, then each field, with
-/// nested Object/Array indented. Bounded so a pathological document can't emit an
-/// unbounded row list.
-fn doc_field_rows(doc: &Document, theme: &Theme) -> Vec<gpui::AnyElement> {
-    let mut out = Vec::new();
-    push_field_row("_id", &doc.id, 0, &mut out, theme);
-    for (key, value) in &doc.fields {
-        push_field_row(key, value, 0, &mut out, theme);
-    }
-    out
-}
-
 /// Max rows a single List-mode card renders (deep/wide documents fall back to
 /// the inspector for the full picture).
 const MAX_FIELD_ROWS: usize = 300;
 
-fn push_field_row(
-    key: &str,
-    value: &DocValue,
+/// One windowed row of the List render mode: a document header (its `_id`, the
+/// expand chevron, hover actions) or one flattened field of an expanded document.
+enum DocListRow {
+    Header {
+        doc_ix: usize,
+        expanded: bool,
+        id_label: SharedString,
+    },
+    Field(FieldRow),
+}
+
+/// A flattened List-mode field: its label, display value, and nesting depth. Held
+/// as data (not a built element) so the enclosing `uniform_list` can build only
+/// the rows in view.
+struct FieldRow {
+    key: String,
+    value: String,
     depth: usize,
-    out: &mut Vec<gpui::AnyElement>,
-    theme: &Theme,
-) {
+}
+
+/// Flatten one field (recursing into objects/arrays) into fixed `FieldRow` data,
+/// capped at [`MAX_FIELD_ROWS`]. The data mirror of [`push_field_row`].
+fn push_field_data(key: &str, value: &DocValue, depth: usize, out: &mut Vec<FieldRow>) {
     if out.len() >= MAX_FIELD_ROWS {
         return;
     }
+    let row = |value: String, depth: usize| FieldRow {
+        key: key.to_string(),
+        value,
+        depth,
+    };
     match value {
         DocValue::Document(fields) if !fields.is_empty() => {
-            out.push(field_row(key, "{ }".to_string(), depth, theme));
+            out.push(row("{ }".to_string(), depth));
             for (k, v) in fields {
-                push_field_row(k, v, depth + 1, out, theme);
+                push_field_data(k, v, depth + 1, out);
             }
         }
         DocValue::Array(items) if !items.is_empty() => {
-            out.push(field_row(key, format!("[ {} ]", items.len()), depth, theme));
+            out.push(row(format!("[ {} ]", items.len()), depth));
             for (i, item) in items.iter().enumerate() {
-                push_field_row(&i.to_string(), item, depth + 1, out, theme);
+                push_field_data(&i.to_string(), item, depth + 1, out);
             }
         }
-        other => out.push(field_row(
-            key,
-            other.to_cell(CELL_CAP).to_string(),
-            depth,
-            theme,
-        )),
+        other => out.push(row(other.to_cell(CELL_CAP).to_string(), depth)),
     }
 }
 
-fn field_row(key: &str, value: String, depth: usize, theme: &Theme) -> gpui::AnyElement {
-    div()
+/// Build one List-mode document header row (fixed height for `uniform_list`):
+/// the expand chevron + `_id`, and the Edit / Clone / Delete actions on hover.
+#[allow(clippy::too_many_arguments)]
+fn doc_list_header(
+    doc_ix: usize,
+    expanded: bool,
+    id_label: &SharedString,
+    session: SessionId,
+    read_only: bool,
+    row_h: Pixels,
+    theme: &Theme,
+    view: &WeakEntity<AppState>,
+) -> gpui::AnyElement {
+    let i = doc_ix;
+    let chevron = if expanded { "chevron-down" } else { "chevron" };
+    let group = SharedString::from(format!("doc-card-{i}"));
+    // Only the chevron + `_id` region toggles expansion, so the action buttons
+    // stay click-safe.
+    let toggle_view = view.clone();
+    let toggle_region = div()
+        .id(("doc-card-toggle", i))
         .flex()
-        .items_start()
+        .items_center()
         .gap_2()
-        .py(px(1.))
-        .pl(px((depth as f32) * 16.))
+        .flex_1()
+        .min_w_0()
+        .cursor_pointer()
+        .on_click(move |_, _, cx| {
+            toggle_view
+                .update(cx, |this, cx| this.doc_toggle_row(session, i, cx))
+                .ok();
+        })
+        .child(crate::icons::icon(
+            chevron,
+            theme.scale(11.),
+            theme.text_muted,
+        ))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_family(theme.mono_family.clone())
+                .text_color(theme.text)
+                .child(id_label.clone()),
+        );
+    let edit_view = view.clone();
+    let mut actions = div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .invisible()
+        .group_hover(group.clone(), |s| s.visible())
+        .child(
+            Button::new(("doc-card-edit", i), "Edit")
+                .size(ButtonSize::Sm)
+                .variant(ButtonVariant::Ghost)
+                .on_click(move |_, _, cx| {
+                    edit_view
+                        .update(cx, |this, cx| this.doc_toggle_inspector(session, i, cx))
+                        .ok();
+                }),
+        );
+    if !read_only {
+        let clone_view = view.clone();
+        let del_view = view.clone();
+        actions = actions
+            .child(
+                Button::new(("doc-card-clone", i), "Clone")
+                    .size(ButtonSize::Sm)
+                    .variant(ButtonVariant::Ghost)
+                    .on_click(move |_, _, cx| {
+                        clone_view
+                            .update(cx, |this, cx| this.doc_clone_document(session, i, cx))
+                            .ok();
+                    }),
+            )
+            .child(
+                Button::new(("doc-card-del", i), "Delete")
+                    .size(ButtonSize::Sm)
+                    .variant(ButtonVariant::Danger)
+                    .on_click(move |_, _, cx| {
+                        del_view
+                            .update(cx, |this, cx| this.doc_delete_row(session, i, cx))
+                            .ok();
+                    }),
+            );
+    }
+    div()
+        .h(row_h)
+        .group(group)
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .border_b_1()
+        .border_color(theme.border)
+        .hover(|s| s.bg(theme.bg_hover))
+        .child(toggle_region)
+        .child(actions)
+        .into_any_element()
+}
+
+/// Build one List-mode field row (fixed height for `uniform_list`): the field key
+/// in accent, its value truncated, indented by nesting depth.
+fn doc_list_field(
+    f: &FieldRow,
+    row_h: Pixels,
+    text_size: Pixels,
+    theme: &Theme,
+) -> gpui::AnyElement {
+    div()
+        .h(row_h)
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .pl(px(28. + f.depth as f32 * 16.))
+        .font_family(theme.mono_family.clone())
+        .text_size(text_size)
         .child(
             div()
                 .flex_shrink_0()
                 .text_color(theme.accent)
-                .child(format!("{key}:")),
+                .child(format!("{}:", f.key)),
         )
         .child(
             div()
                 .min_w_0()
                 .truncate()
                 .text_color(theme.text)
-                .child(value),
+                .child(f.value.clone()),
         )
         .into_any_element()
 }

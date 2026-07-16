@@ -17,13 +17,16 @@ pub(crate) use form::{DocForm, InspectorMode};
 use std::collections::{BTreeMap, BTreeSet};
 
 use flint::prelude::*;
-use gpui::{Context, Entity, FocusHandle, ScrollHandle, UniformListScrollHandle, prelude::*};
+use gpui::{
+    Context, Entity, FocusHandle, Focusable, ScrollHandle, UniformListScrollHandle, Window,
+    prelude::*,
+};
 use red_core::doc::{
     CollectionInfo, DbInfo, DocPlan, DocSchema, DocValue, DocWrite, Document, IndexInfo,
 };
 use red_service::{Command, Epoch, SessionId};
 
-use crate::app::{AppState, Phase, SplitHalf, SplitState, TabWorkspace, WorkspaceTab};
+use crate::app::{AppState, Pane, Phase, SplitHalf, SplitState, TabWorkspace, WorkspaceTab};
 
 /// Which view the main area shows for the open collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +150,55 @@ pub(crate) struct MongoView {
     /// open (Explain / New / Drop live here to keep the toolbar uncrowded).
     /// Mirrors the Redis `actions_menu` positioned-menu pattern.
     actions_menu: Option<gpui::Point<gpui::Pixels>>,
+    /// The `database -> collection` sidebar tree's keyboard focus handle; the
+    /// `FocusSchema` action and a tree click plant focus here.
+    tree_focus: FocusHandle,
+    /// The sidebar search box: narrows the tree to databases / collections whose
+    /// name matches, live as the user types (mirrors the SQL schema filter). ⌘F
+    /// from the tree / root focuses it.
+    tree_filter: Entity<TextInput>,
+    /// The tree's scroll position, so keyboard nav can reveal the selected row.
+    tree_scroll: UniformListScrollHandle,
+    /// The tree's keyboard selection, as a stable identity so it survives a
+    /// re-flatten (databases loading, a branch expanding). Mirrors the schema
+    /// sidebar's `NodeId` selection.
+    tree_selected: Option<DocTreeSel>,
+}
+
+/// A stable identity for a collection-tree row, so the keyboard selection
+/// survives a re-flatten. Mirrors the schema sidebar's `NodeId`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DocTreeSel {
+    /// A database branch (depth 0).
+    Db(String),
+    /// A collection leaf (depth 1) under its database.
+    Coll { db: String, coll: String },
+}
+
+/// What a flattened tree row renders as, alongside its `TreeItem` structure.
+enum DocTreeKind {
+    /// A database branch: its name.
+    Db { name: String },
+    /// A collection leaf: its name, kind badge, estimated count, and whether it's
+    /// open in a tab.
+    Coll {
+        name: String,
+        kind: red_core::doc::CollKind,
+        count: u64,
+        open: bool,
+    },
+    /// A non-navigable hint row ("(no collections)" / "Loading...").
+    Placeholder(&'static str),
+}
+
+/// One visible row of the collection tree in display order: the `TreeItem`
+/// structure Flint needs plus the identity and render data RED acts on. Built by
+/// [`flatten_doc_tree`], mirroring the schema sidebar's `flatten`.
+struct DocTreeRow {
+    item: TreeItem,
+    /// The selectable identity, or `None` for a placeholder row.
+    sel: Option<DocTreeSel>,
+    kind: DocTreeKind,
 }
 
 /// The open collection in a tab: its current window of documents plus the sampled
@@ -212,7 +264,16 @@ struct CollView {
     query_loading: bool,
     query_scroll: UniformListScrollHandle,
     scroll: UniformListScrollHandle,
+    /// Scroll for the List render mode's windowed rows (separate from the Table
+    /// grid's `scroll`, since the two modes flatten to different row counts).
+    list_scroll: UniformListScrollHandle,
+    /// Scroll for the JSON render mode's windowed lines.
+    json_scroll: UniformListScrollHandle,
     list_focus: FocusHandle,
+    /// The keyboard row cursor over `docs` (arrow / vim motions), or `None`
+    /// before the grid has been touched. Drives the grid highlight and the
+    /// Enter-to-inspect target, falling back to the inspected row.
+    cursor: Option<usize>,
 }
 
 impl CollView {
@@ -297,7 +358,10 @@ impl CollView {
             query_loading: false,
             query_scroll: UniformListScrollHandle::new(),
             scroll: UniformListScrollHandle::new(),
+            list_scroll: UniformListScrollHandle::new(),
+            json_scroll: UniformListScrollHandle::new(),
             list_focus: cx.focus_handle(),
+            cursor: None,
         }
     }
 }
@@ -346,7 +410,7 @@ impl MongoView {
     /// `DocListDatabases` fires from [`AppState::doc_start_browse`] once the
     /// session is live. Opens with a single blank tab (the shell always shows
     /// something, and ⌘T / the ＋ button open more).
-    pub(crate) fn new(session: SessionId, read_only: bool, _cx: &mut Context<AppState>) -> Self {
+    pub(crate) fn new(session: SessionId, read_only: bool, cx: &mut Context<AppState>) -> Self {
         Self {
             session,
             read_only,
@@ -370,7 +434,107 @@ impl MongoView {
             split: None,
             tab_menu: None,
             actions_menu: None,
+            tree_focus: cx.focus_handle(),
+            tree_filter: {
+                let filter =
+                    cx.new(|cx| TextInput::new(cx).with_placeholder("Search collections…"));
+                // Re-render so the filter narrows the tree live as the user types.
+                cx.subscribe(&filter, |_this, _input, _evt: &TextInputEvent, cx| {
+                    cx.notify()
+                })
+                .detach();
+                filter
+            },
+            tree_scroll: UniformListScrollHandle::new(),
+            tree_selected: None,
         }
+    }
+
+    /// Flatten the `database -> collection` tree into visible rows in display
+    /// order (the index each Flint `Tree` handler passes back), narrowed to
+    /// `filter` (case-insensitive substring; empty matches all). Mirrors the
+    /// schema sidebar's `flatten`. Filtering can only see already-loaded
+    /// collections, so an unexpanded database stays visible as a browsable anchor
+    /// rather than being hidden on the strength of a name it hasn't fetched yet.
+    fn flatten_doc_tree(&self, filter: &str) -> Vec<DocTreeRow> {
+        let f = filter.trim().to_lowercase();
+        let filtering = !f.is_empty();
+        let hit = |name: &str| name.to_lowercase().contains(&f);
+
+        let open: Vec<(&str, &str)> = self
+            .tabs
+            .iter()
+            .filter_map(|t| match &t.state {
+                MongoTabState::Collection(c) => Some((c.db.as_str(), c.coll.as_str())),
+                MongoTabState::Empty => None,
+            })
+            .collect();
+        let mut rows = Vec::new();
+        for db in &self.databases {
+            let db_match = filtering && hit(&db.name);
+            let colls = self.collections.get(&db.name);
+            let coll_hit = colls.is_some_and(|cs| cs.iter().any(|c| hit(&c.name)));
+
+            // A loaded database with neither a name match nor a matching
+            // collection has definitively nothing to show; drop it. An unloaded
+            // one is kept (we can't prove absence without fetching it).
+            if filtering && !db_match && !coll_hit && colls.is_some() {
+                continue;
+            }
+            // Force the branch open while filtering so matches are visible without
+            // the user expanding each database by hand.
+            let expanded = if filtering {
+                self.expanded.contains(&db.name) || coll_hit || db_match
+            } else {
+                self.expanded.contains(&db.name)
+            };
+            rows.push(DocTreeRow {
+                item: TreeItem::new(0, true, expanded),
+                sel: Some(DocTreeSel::Db(db.name.clone())),
+                kind: DocTreeKind::Db {
+                    name: db.name.clone(),
+                },
+            });
+            if !expanded {
+                continue;
+            }
+            match colls {
+                Some(colls) if !colls.is_empty() => {
+                    // A database whose own name matches shows all its collections;
+                    // otherwise only the matching ones.
+                    for coll in colls
+                        .iter()
+                        .filter(|c| !filtering || db_match || hit(&c.name))
+                    {
+                        let is_open = open.iter().any(|(d, c)| *d == db.name && *c == coll.name);
+                        rows.push(DocTreeRow {
+                            item: TreeItem::leaf(1),
+                            sel: Some(DocTreeSel::Coll {
+                                db: db.name.clone(),
+                                coll: coll.name.clone(),
+                            }),
+                            kind: DocTreeKind::Coll {
+                                name: coll.name.clone(),
+                                kind: coll.kind,
+                                count: coll.est_count,
+                                open: is_open,
+                            },
+                        });
+                    }
+                }
+                Some(_) => rows.push(DocTreeRow {
+                    item: TreeItem::leaf(1),
+                    sel: None,
+                    kind: DocTreeKind::Placeholder("(no collections)"),
+                }),
+                None => rows.push(DocTreeRow {
+                    item: TreeItem::leaf(1),
+                    sel: None,
+                    kind: DocTreeKind::Placeholder("Loading..."),
+                }),
+            }
+        }
+        rows
     }
 
     fn tab_index_by_id(&self, id: u64) -> Option<usize> {
@@ -514,6 +678,10 @@ impl AppState {
         {
             current.inspector = None;
         }
+        // A new window invalidates the keyboard cursor's absolute row.
+        if current.cursor.is_some_and(|c| c >= current.docs.len()) {
+            current.cursor = None;
+        }
         cx.notify();
     }
 
@@ -561,6 +729,103 @@ impl AppState {
                 .send_to(session, Command::DocListCollections { epoch, db });
         }
         cx.notify();
+    }
+
+    /// Move the collection tree's keyboard selection (arrows / Enter, plus the
+    /// vim aliases), driven by Flint's [`TreeNav`]. Left collapses a database or
+    /// steps to the parent; Right expands or descends; Enter opens a collection or
+    /// toggles a database. Mirrors the schema sidebar's `schema_nav`.
+    fn doc_tree_nav(&mut self, session: SessionId, nav: TreeNav, cx: &mut Context<Self>) {
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_ref())
+        else {
+            return;
+        };
+        // Snapshot the rows (owned, so no borrow of `self` is held while the
+        // mutating handlers below run) and the selected row's position. Keyboard
+        // nav walks the same filtered rows the tree shows.
+        let filter = view.tree_filter.read(cx).content().to_string();
+        let rows = view.flatten_doc_tree(&filter);
+        if rows.is_empty() {
+            return;
+        }
+        let sel = view
+            .tree_selected
+            .as_ref()
+            .and_then(|s| rows.iter().position(|r| r.sel.as_ref() == Some(s)));
+
+        match nav {
+            TreeNav::Up => {
+                if let Some(ix) = next_navigable_doc(&rows, sel, false) {
+                    self.doc_tree_select(session, &rows, ix, cx);
+                }
+            }
+            TreeNav::Down => {
+                if let Some(ix) = next_navigable_doc(&rows, sel, true) {
+                    self.doc_tree_select(session, &rows, ix, cx);
+                }
+            }
+            TreeNav::Expand => {
+                let Some(i) = sel else { return };
+                let row = &rows[i];
+                if row.item.has_children && !row.item.expanded {
+                    if let Some(DocTreeSel::Db(db)) = row.sel.clone() {
+                        self.doc_toggle_db(session, db, cx);
+                    }
+                } else if row.item.expanded {
+                    // Already open: descend to the first child (next row down).
+                    if let Some(ix) = next_navigable_doc(&rows, sel, true) {
+                        self.doc_tree_select(session, &rows, ix, cx);
+                    }
+                }
+            }
+            TreeNav::Collapse => {
+                let Some(i) = sel else { return };
+                let row = &rows[i];
+                if row.item.has_children && row.item.expanded {
+                    if let Some(DocTreeSel::Db(db)) = row.sel.clone() {
+                        self.doc_toggle_db(session, db, cx);
+                    }
+                } else if row.item.depth > 0 {
+                    // A collection leaf: jump to its parent database (the nearest
+                    // row above at a shallower depth).
+                    if let Some(p) = (0..i).rev().find(|&j| rows[j].item.depth < row.item.depth) {
+                        self.doc_tree_select(session, &rows, p, cx);
+                    }
+                }
+            }
+            TreeNav::Activate => {
+                let Some(i) = sel else { return };
+                match row_sel_owned(&rows, i) {
+                    Some(DocTreeSel::Coll { db, coll }) => {
+                        self.doc_open_collection(session, db, coll, false, cx);
+                    }
+                    Some(DocTreeSel::Db(db)) => self.doc_toggle_db(session, db, cx),
+                    None => {}
+                }
+            }
+        }
+    }
+
+    /// Set the tree's keyboard selection to `rows[ix]` and reveal it. `ix` indexes
+    /// the flattened rows (the same index Flint hands back).
+    fn doc_tree_select(
+        &mut self,
+        session: SessionId,
+        rows: &[DocTreeRow],
+        ix: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+        {
+            view.tree_selected = rows[ix].sel.clone();
+            view.tree_scroll
+                .scroll_to_item(ix, gpui::ScrollStrategy::Nearest);
+            cx.notify();
+        }
     }
 
     /// Page the open collection by one window. `forward` advances `skip`; the
@@ -857,6 +1122,162 @@ impl AppState {
             current.explain = Some(plan);
             cx.notify();
         }
+    }
+
+    /// Move the document grid's keyboard cursor (arrows / Home / End / Page /
+    /// ⌘arrows, plus the vim aliases), driven by Flint's [`TableNav`]. The grid is
+    /// a single logical column, so Left/Right are inert; the cursor clamps within
+    /// the loaded window (paging is skip-based, not append). Mirrors the Redis
+    /// `kv_browse_nav`.
+    fn doc_grid_nav(&mut self, session: SessionId, nav: TableNav, cx: &mut Context<Self>) {
+        if matches!(nav, TableNav::Left | TableNav::Right) {
+            return;
+        }
+        let Some(current) = self.doc_focused_coll_mut(session) else {
+            return;
+        };
+        if current.docs.is_empty() {
+            return;
+        }
+        let last = current.docs.len() - 1;
+        let cur = current.cursor.unwrap_or(0).min(last);
+
+        // A page jump moves by a screenful; the grid renders roughly this many
+        // rows at the default height, matching the Redis browse list's step.
+        const STEP: usize = 12;
+        let next = match nav {
+            TableNav::Up => cur.saturating_sub(1),
+            TableNav::Down => (cur + 1).min(last),
+            TableNav::PageUp => cur.saturating_sub(STEP),
+            TableNav::PageDown => (cur + STEP).min(last),
+            TableNav::First | TableNav::RowStart => 0,
+            TableNav::Last | TableNav::RowEnd => last,
+            // Left/Right handled above.
+            _ => cur,
+        };
+        current.cursor = Some(next);
+        current
+            .scroll
+            .scroll_to_item(next, gpui::ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    /// Enter / F2 on the document grid: open the inspector on the keyboard cursor's
+    /// row. Returns `true` when it handled the key (the doc grid is the focused
+    /// table), so the shared `BeginEdit` handler falls through otherwise. Mirrors
+    /// the Redis `kv_activate_cursor`.
+    pub(crate) fn doc_activate_cursor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Phase::Connected(active) = &self.phase else {
+            return false;
+        };
+        let session = active.session;
+        let Some(current) = active.doc_view.as_ref().and_then(|v| v.focused_coll()) else {
+            return false;
+        };
+        // Only when the grid actually holds focus, so Enter in the filter box or
+        // the inspector editor isn't hijacked.
+        if !current.list_focus.is_focused(window) {
+            return false;
+        }
+        if current.docs.is_empty() {
+            return true;
+        }
+        let row = current.cursor.unwrap_or(0).min(current.docs.len() - 1);
+        self.doc_toggle_inspector(session, row, cx);
+        true
+    }
+
+    /// ⌘F in a Mongo session: jump focus to the open collection's filter box (the
+    /// extended-JSON find field) instead of the SQL find/search. Returns `true`
+    /// when it handled it (the foreground connection is Mongo with a collection
+    /// open), so the caller falls through to the SQL path otherwise. Mirrors the
+    /// Redis `kv_focus_filter`.
+    pub(crate) fn doc_focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Phase::Connected(active) = &self.phase else {
+            return false;
+        };
+        let Some(current) = active.doc_view.as_ref().and_then(|v| v.focused_coll()) else {
+            return false;
+        };
+        let handle = current.filter_input.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+        true
+    }
+
+    /// ⌘F from the collection tree or the shell root: reveal the sidebar and focus
+    /// its collection-search box (the SQL "search schema" idiom). Returns `true`
+    /// when the foreground connection is Mongo, so the caller falls through to the
+    /// SQL path otherwise.
+    pub(crate) fn doc_focus_tree_filter(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let handle = match &self.phase {
+            Phase::Connected(active) => match active.doc_view.as_ref() {
+                Some(v) => v.tree_filter.read(cx).focus_handle(cx),
+                None => return false,
+            },
+            _ => return false,
+        };
+        if let Phase::Connected(active) = &mut self.phase {
+            active.sidebar_collapsed = false;
+        }
+        window.focus(&handle, cx);
+        cx.notify();
+        true
+    }
+
+    /// Route the SQL pane-focus vocabulary onto the Mongo shell: `Schema` focuses
+    /// the collection tree (revealing the sidebar), `Grid` the document grid, and
+    /// `Editor` the filter bar. No-op when the focused tab holds no collection.
+    pub(crate) fn doc_focus_pane(
+        &mut self,
+        pane: Pane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if pane == Pane::Schema
+            && let Phase::Connected(active) = &mut self.phase
+        {
+            active.sidebar_collapsed = false;
+        }
+        let handle = match &self.phase {
+            Phase::Connected(active) => {
+                let Some(v) = active.doc_view.as_ref() else {
+                    return;
+                };
+                match pane {
+                    Pane::Schema => Some(v.tree_focus.clone()),
+                    Pane::Grid => v.focused_coll().map(|c| c.list_focus.clone()),
+                    Pane::Editor => v
+                        .focused_coll()
+                        .map(|c| c.filter_input.read(cx).focus_handle(cx)),
+                }
+            }
+            _ => return,
+        };
+        let Some(handle) = handle else { return };
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    /// Cycle keyboard focus between the Mongo shell's two stops: the collection
+    /// tree and the document grid. The direction is immaterial with two stops.
+    pub(crate) fn doc_cycle_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let tree_focused = matches!(&self.phase, Phase::Connected(a)
+            if a.doc_view.as_ref().is_some_and(|v| v.tree_focus.is_focused(window)));
+        let pane = if tree_focused {
+            Pane::Grid
+        } else {
+            Pane::Schema
+        };
+        self.doc_focus_pane(pane, window, cx);
     }
 
     /// Open (or, on the same row, close) the inspector on a document row, loading
@@ -1209,6 +1630,26 @@ impl AppState {
 /// The union of top-level field names across a window, `_id` first, capped to
 /// [`MAX_COLUMNS`]. Stable order: `_id`, then first-seen order across the docs,
 /// so the grid columns don't reshuffle between rows.
+/// The next navigable (non-placeholder) tree row from `from` in `forward`, or the
+/// first/last navigable row when nothing is selected yet. Mirrors the schema
+/// sidebar's `next_navigable`.
+fn next_navigable_doc(rows: &[DocTreeRow], from: Option<usize>, forward: bool) -> Option<usize> {
+    let len = rows.len();
+    let has_sel = |i: usize| rows[i].sel.is_some();
+    match (from, forward) {
+        (None, true) => (0..len).find(|&i| has_sel(i)),
+        (None, false) => (0..len).rev().find(|&i| has_sel(i)),
+        (Some(cur), true) => ((cur + 1)..len).find(|&i| has_sel(i)),
+        (Some(cur), false) => (0..cur).rev().find(|&i| has_sel(i)),
+    }
+}
+
+/// The owned selection identity for `rows[ix]`, so the caller can act on it after
+/// dropping the borrow on `rows`.
+fn row_sel_owned(rows: &[DocTreeRow], ix: usize) -> Option<DocTreeSel> {
+    rows.get(ix).and_then(|r| r.sel.clone())
+}
+
 fn sample_columns(docs: &[Document]) -> Vec<String> {
     let mut cols = vec!["_id".to_string()];
     for doc in docs {
