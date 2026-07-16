@@ -1117,8 +1117,11 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 state.reap_excess_results(epoch);
                 // One abort handle for the whole probe bundle: re-sort / close
                 // cancels the (potentially full-table) `count` and column probe.
-                let abort = AbortSignal::new();
-                state.inflight.entry(epoch).or_default().open = Some(abort.clone());
+                let abort = state
+                    .inflight
+                    .entry(epoch)
+                    .or_default()
+                    .supersede(Slot::Open);
                 // Count + column metadata can be slow (a full `COUNT(*)` over a
                 // large table); run them off the dispatch loop so switching to
                 // another table stays instant.
@@ -1329,11 +1332,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // moved); cancel its in-flight fetch so a flung scrollbar doesn't
                 // back a pile of doomed deep-`OFFSET` scans up behind the semaphore.
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.page.take() {
-                    prev.abort();
-                }
-                let abort = AbortSignal::new();
-                entry.page = Some(abort.clone());
+                let abort = entry.supersede(Slot::Page);
                 // Pages fetch concurrently (the driver pools connections) and off
                 // the dispatch loop, so a deep-`OFFSET` page never blocks the next
                 // command or another page, but no more than `page_fetch_limit` at
@@ -1428,8 +1427,11 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 } = &fetch
                     && claim_build(&spec, *ordinal)
                 {
-                    let build_abort = AbortSignal::new();
-                    state.inflight.entry(epoch).or_default().build = Some(build_abort.clone());
+                    let build_abort = state
+                        .inflight
+                        .entry(epoch)
+                        .or_default()
+                        .supersede(Slot::Build);
                     tokio::spawn(build_checkpoints(
                         driver.clone(),
                         spec.clone(),
@@ -1566,11 +1568,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // A retyped filter pattern supersedes the previous scan for
                 // this epoch, like a flung scrollbar supersedes a SQL page.
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.kv_scan.take() {
-                    prev.abort();
-                }
-                let abort = AbortSignal::new();
-                entry.kv_scan = Some(abort.clone());
+                let abort = entry.supersede(Slot::KvScan);
                 let events = events.clone();
                 tokio::spawn(async move {
                     match driver
@@ -1635,11 +1633,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // A new key selection (or a re-selection of the same key)
                 // supersedes whatever the inspector was fetching before.
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.kv_value.take() {
-                    prev.abort();
-                }
-                let abort = AbortSignal::new();
-                entry.kv_value = Some(abort.clone());
+                let abort = entry.supersede(Slot::KvValue);
                 let events = events.clone();
                 tokio::spawn(async move {
                     let result = driver.read_value(&key).await;
@@ -1680,11 +1674,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // Shares the inspector's in-flight slot with `KvReadValue`: a new
                 // key selection mid-load supersedes this fetch.
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.kv_value.take() {
-                    prev.abort();
-                }
-                let abort = AbortSignal::new();
-                entry.kv_value = Some(abort.clone());
+                let abort = entry.supersede(Slot::KvValue);
                 let events = events.clone();
                 tokio::spawn(async move {
                     let result = driver.read_string_full(&key).await;
@@ -1729,11 +1719,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // abort an in-progress page scan and leave the sub-grid stuck
                 // on "Loading…" (an interrupted scan emits no event).
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.kv_collection.take() {
-                    prev.abort();
-                }
-                let abort = AbortSignal::new();
-                entry.kv_collection = Some(abort.clone());
+                let abort = entry.supersede(Slot::KvCollection);
                 let events = events.clone();
                 tokio::spawn(async move {
                     match driver
@@ -1762,16 +1748,16 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 else {
                     continue;
                 };
-                let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.kv_value.take() {
-                    prev.abort();
-                }
                 // `read_list_window` has no cancel token to pass (a single
                 // bounded `LRANGE`, unlike the budgeted `SCAN` loops above);
-                // still record an `AbortSignal` in `entry.kv_value` so a
-                // following `KvReadValue`/`KvReadCollectionPage` is tracked
-                // as superseding this fetch, for consistency with them.
-                entry.kv_value = Some(AbortSignal::new());
+                // still claim the `KvValue` slot so a following
+                // `KvReadValue`/`KvReadCollectionPage` supersedes this fetch,
+                // for consistency with them.
+                state
+                    .inflight
+                    .entry(epoch)
+                    .or_default()
+                    .supersede(Slot::KvValue);
                 let events = events.clone();
                 tokio::spawn(async move {
                     match driver.read_list_window(&key, from_head, count).await {
@@ -1801,14 +1787,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 else {
                     continue;
                 };
-                let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.kv_value.take() {
-                    prev.abort();
-                }
                 // Like `read_list_window`, a single bounded `XREVRANGE` with
-                // no cancel token; the `AbortSignal` only marks it superseded
-                // by a following inspector fetch.
-                entry.kv_value = Some(AbortSignal::new());
+                // no cancel token; claiming the `KvValue` slot only marks it
+                // superseded by a following inspector fetch.
+                state
+                    .inflight
+                    .entry(epoch)
+                    .or_default()
+                    .supersede(Slot::KvValue);
                 let events = events.clone();
                 tokio::spawn(async move {
                     match driver
@@ -1832,10 +1818,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.kv_value.take() {
-                    prev.abort();
-                }
-                entry.kv_value = Some(AbortSignal::new());
+                entry.supersede(Slot::KvValue);
                 let events = events.clone();
                 tokio::spawn(async move {
                     match driver.stream_groups(&key).await {
@@ -1856,10 +1839,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.kv_group_detail.take() {
-                    prev.abort();
-                }
-                entry.kv_group_detail = Some(AbortSignal::new());
+                entry.supersede(Slot::KvGroupDetail);
                 let events = events.clone();
                 tokio::spawn(async move {
                     match driver.stream_consumers(&key, &group).await {
@@ -1895,10 +1875,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // other, so pending gets its own token to supersede only a
                 // later pending fetch.
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.kv_group_pending.take() {
-                    prev.abort();
-                }
-                entry.kv_group_pending = Some(AbortSignal::new());
+                entry.supersede(Slot::KvGroupPending);
                 let events = events.clone();
                 tokio::spawn(async move {
                     match driver.stream_pending(&key, &group, count).await {
@@ -2017,10 +1994,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.kv_value.take() {
-                    prev.abort();
-                }
-                entry.kv_value = Some(AbortSignal::new());
+                entry.supersede(Slot::KvValue);
                 let events = events.clone();
                 tokio::spawn(async move {
                     match driver.command(&argv).await {
@@ -2112,11 +2086,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // per-command `kv_value` slot (import registers none).
                 let read_only = state.read_only;
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.kv_value.take() {
-                    prev.abort();
-                }
-                let abort = AbortSignal::new();
-                entry.kv_value = Some(abort.clone());
+                let abort = entry.supersede(Slot::KvValue);
                 let events = events.clone();
                 tokio::spawn(async move {
                     // Sequential (order matters for dependent commands, like
@@ -2184,7 +2154,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
                 if let Some(entry) = state.inflight.get(&epoch)
-                    && let Some(sig) = &entry.kv_value
+                    && let Some(sig) = entry.slot(Slot::KvValue)
                 {
                     sig.abort();
                 }
@@ -2216,10 +2186,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.kv_value.take() {
-                    prev.abort();
-                }
-                entry.kv_value = Some(AbortSignal::new());
+                entry.supersede(Slot::KvValue);
                 let events = events.clone();
                 tokio::spawn(async move {
                     let result = match &edit {
@@ -2428,11 +2395,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.kv_subscribe.take() {
-                    prev.abort();
-                }
-                let abort = AbortSignal::new();
-                entry.kv_subscribe = Some(abort.clone());
+                let abort = entry.supersede(Slot::KvSubscribe);
                 let events = events.clone();
                 tokio::spawn(async move {
                     let mut sub = match driver.subscribe(&pattern).await {
@@ -2512,10 +2475,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.kv_value.take() {
-                    prev.abort();
-                }
-                entry.kv_value = Some(AbortSignal::new());
+                entry.supersede(Slot::KvValue);
                 let events = events.clone();
                 tokio::spawn(async move {
                     match driver.notify_config().await {
@@ -2576,10 +2536,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.kv_value.take() {
-                    prev.abort();
-                }
-                entry.kv_value = Some(AbortSignal::new());
+                entry.supersede(Slot::KvValue);
                 let events = events.clone();
                 tokio::spawn(async move {
                     match driver.slowlog(count).await {
@@ -2640,11 +2597,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.kv_monitor.take() {
-                    prev.abort();
-                }
-                let abort = AbortSignal::new();
-                entry.kv_monitor = Some(abort.clone());
+                let abort = entry.supersede(Slot::KvMonitor);
                 let events = events.clone();
                 tokio::spawn(async move {
                     let mut mon = match driver.monitor().await {
@@ -2715,10 +2668,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.kv_value.take() {
-                    prev.abort();
-                }
-                entry.kv_value = Some(AbortSignal::new());
+                entry.supersede(Slot::KvValue);
                 let events = events.clone();
                 tokio::spawn(async move {
                     match driver.client_list().await {
@@ -2857,11 +2807,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // A new page (or a new collection selection) supersedes the
                 // in-flight `find`, like a flung SQL scrollbar.
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.doc_page.take() {
-                    prev.abort();
-                }
-                let abort = AbortSignal::new();
-                entry.doc_page = Some(abort.clone());
+                let abort = entry.supersede(Slot::DocPage);
                 let events = events.clone();
                 tokio::spawn(async move {
                     let query = red_core::doc::FindQuery {
@@ -3020,11 +2966,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // Share the browse's abort slot: only one read runs at a time, so a
                 // new aggregate (or a page fetch) supersedes the prior in-flight one.
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.doc_page.take() {
-                    prev.abort();
-                }
-                let abort = AbortSignal::new();
-                entry.doc_page = Some(abort.clone());
+                let abort = entry.supersede(Slot::DocPage);
                 let events = events.clone();
                 tokio::spawn(async move {
                     match driver
@@ -3262,11 +3204,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // another column) supersedes the last one; cancel its in-flight
                 // aggregate at the engine so a heavy `count(distinct)` doesn't linger.
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.stats.take() {
-                    prev.abort();
-                }
-                let abort = AbortSignal::new();
-                entry.stats = Some(abort.clone());
+                let abort = entry.supersede(Slot::Stats);
                 // Off the dispatch loop (a `count(distinct)` over a big result can be
                 // slow) and under the shared page-fetch cap so it can't fan out.
                 let events = events.clone();
@@ -3330,11 +3268,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // A newer lookup for this epoch (editing moved to another FK column)
                 // supersedes the last; cancel its in-flight fetch at the engine.
                 let entry = state.inflight.entry(epoch).or_default();
-                if let Some(prev) = entry.lookup.take() {
-                    prev.abort();
-                }
-                let abort = AbortSignal::new();
-                entry.lookup = Some(abort.clone());
+                let abort = entry.supersede(Slot::Lookup);
                 let events = events.clone();
                 let limit_src = page_fetch_limit.clone();
                 let timeout = statement_timeout;

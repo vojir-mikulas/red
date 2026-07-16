@@ -119,6 +119,55 @@ pub(crate) const MAX_OPEN_RESULTS: usize = 256;
 /// however long the user studies a result without scrolling.
 pub(crate) const IDLE_EVICT: Duration = Duration::from_secs(600);
 
+/// Which detached fetch an [`AbortSignal`] belongs to, so a new request can
+/// supersede the one it replaces by slot identity without a hand-maintained
+/// field per kind. `run` is deliberately *not* here: it carries a monotonic seq
+/// alongside its signal (see [`InFlight::run`]) and is superseded by seq
+/// comparison, not by slot identity.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Slot {
+    /// The `OpenResult` probe bundle (`count` + `fetch_page` + `key_bounds`).
+    Open,
+    /// The latest offset `FetchPage` for this epoch.
+    Page,
+    /// The background checkpoint-index build, if one is running.
+    Build,
+    /// The latest column-stats summary fetch (column-stats bar).
+    Stats,
+    /// The latest FK lookup-list fetch (in-cell FK picker).
+    Lookup,
+    /// The latest `KvFetchScan` (Redis keyspace browse); a fast-retyped filter
+    /// pattern supersedes the in-flight scan the same way a flung scrollbar
+    /// supersedes a SQL page fetch.
+    KvScan,
+    /// The latest value-inspector read (`KvReadValue` / `KvReadListWindow` /
+    /// `KvReadStringFull`): opening a new key supersedes the prior fetch.
+    KvValue,
+    /// The latest `KvReadCollectionPage` (the inspector's big-collection
+    /// sub-grid). Kept apart from [`Slot::KvValue`] so a sibling value read
+    /// (e.g. re-selecting the key) can't abort an in-progress page scan and
+    /// strand the sub-grid on "Loading...".
+    KvCollection,
+    /// The latest `KvStreamConsumers` fetch (the inspector's consumer-group
+    /// view). Apart from [`Slot::KvValue`] so selecting a group doesn't cancel
+    /// the key's value read, and apart from [`Slot::KvGroupPending`] so the
+    /// paired consumers+pending fetches for one group don't cancel each other.
+    KvGroupDetail,
+    /// The latest `KvStreamPending` fetch (the consumer-group pending list).
+    /// See [`Slot::KvGroupDetail`].
+    KvGroupPending,
+    /// A live `KvSubscribe` (Redis Pub/Sub monitor). Long-lived by design (it
+    /// stays armed for as long as the subscription panel is open) rather than
+    /// superseded by a follow-up request; torn down by `CloseResult`.
+    KvSubscribe,
+    /// A live `KvMonitor` firehose (Redis MONITOR profiler). Long-lived like
+    /// [`Slot::KvSubscribe`].
+    KvMonitor,
+    /// The latest `DocFetchPage` (the MongoDB browse grid): selecting a new
+    /// collection, or paging the current one, supersedes the in-flight `find`.
+    DocPage,
+}
+
 /// The cancellable work in flight for one open result. Each detached fetch carries
 /// an [`AbortSignal`]; when a newer one supersedes it (a flung scrollbar, a new
 /// page, a closed tab) the old signal is [`abort`](AbortSignal::abort)ed so the
@@ -126,83 +175,41 @@ pub(crate) const IDLE_EVICT: Duration = Duration::from_secs(600);
 /// the dispatch loop (single-threaded), so no extra lock; the spawned task keeps
 /// its own clone and the driver disarms it on completion, making a late abort a
 /// no-op.
+///
+/// Keyed by [`Slot`] so adding a fetch kind can't drift out of [`abort_all`] the
+/// way a hand-maintained field-per-kind list could.
 #[derive(Default)]
 pub(crate) struct InFlight {
-    /// The `OpenResult` probe bundle (`count` + `fetch_page` + `key_bounds`).
-    pub(crate) open: Option<AbortSignal>,
-    /// The latest offset `FetchPage` for this epoch.
-    pub(crate) page: Option<AbortSignal>,
+    slots: HashMap<Slot, AbortSignal>,
     /// The latest `FetchRun`, tagged with its `seq` so a stale (lower-seq) run
-    /// arriving late doesn't cancel a newer one.
+    /// arriving late doesn't cancel a newer one. Superseded by seq, not by slot
+    /// identity, so it stays a distinct field rather than living in `slots`.
     pub(crate) run: Option<(u64, AbortSignal)>,
-    /// The background checkpoint-index build, if one is running.
-    pub(crate) build: Option<AbortSignal>,
-    /// The latest column-stats summary fetch for this epoch (column-stats bar).
-    pub(crate) stats: Option<AbortSignal>,
-    /// The latest FK lookup-list fetch for this epoch (in-cell FK picker).
-    pub(crate) lookup: Option<AbortSignal>,
-    /// The latest `KvFetchScan` for this epoch (Redis keyspace browse); a
-    /// fast-retyped filter pattern supersedes the in-flight scan the same
-    /// way a flung scrollbar supersedes a SQL page fetch.
-    pub(crate) kv_scan: Option<AbortSignal>,
-    /// The latest `KvReadValue`/`KvReadCollectionPage`/`KvReadListWindow` for
-    /// this epoch (the value inspector): opening a new key, or paging its
-    /// big-collection sub-grid, supersedes whatever the inspector was
-    /// fetching before.
-    pub(crate) kv_value: Option<AbortSignal>,
-    /// The latest `KvReadCollectionPage` for this epoch (the inspector's
-    /// big-collection sub-grid). Separate from `kv_value` so a sibling value
-    /// read (e.g. re-selecting the key) can't abort an in-progress page scan
-    /// and strand the sub-grid on "Loading…" — an interrupted collection scan
-    /// emits no event, and a stale page for another key is already filtered
-    /// out UI-side by its key.
-    pub(crate) kv_collection: Option<AbortSignal>,
-    /// The latest `KvStreamConsumers` fetch for this epoch (the inspector's
-    /// consumer-group view). Separate from `kv_value` so selecting a group
-    /// doesn't cancel the key's value read, and separate from
-    /// `kv_group_pending` so the paired consumers+pending fetches for one
-    /// group don't cancel each other.
-    pub(crate) kv_group_detail: Option<AbortSignal>,
-    /// The latest `KvStreamPending` fetch for this epoch (the inspector's
-    /// consumer-group pending list). See `kv_group_detail`.
-    pub(crate) kv_group_pending: Option<AbortSignal>,
-    /// A live `KvSubscribe` for this epoch (Redis Pub/Sub monitor). Unlike
-    /// every other slot here, this one is long-lived by design (it stays
-    /// armed for as long as the subscription panel is open) rather than
-    /// superseded by a follow-up request; it's torn down by `CloseResult`
-    /// when the panel closes.
-    pub(crate) kv_subscribe: Option<AbortSignal>,
-    /// A live `KvMonitor` firehose for this epoch (Redis MONITOR profiler).
-    /// Long-lived like `kv_subscribe`: it stays armed until `CloseResult`
-    /// stops it, rather than being superseded by a follow-up request.
-    pub(crate) kv_monitor: Option<AbortSignal>,
-    /// The latest `DocFetchPage` for this epoch (the MongoDB browse grid):
-    /// selecting a new collection, or paging the current one, supersedes the
-    /// in-flight `find` the same way a flung scrollbar supersedes a SQL page.
-    pub(crate) doc_page: Option<AbortSignal>,
 }
 
 impl InFlight {
+    /// Install a fresh abort for `slot`, aborting whatever it superseded, and
+    /// return the new signal: the supersede dance every read arm shares. The
+    /// returned handle shares state with the stored clone, so arming it (or
+    /// cloning it into the spawned task) drives the same signal that
+    /// [`abort_all`](Self::abort_all) and the next `supersede` reach.
+    pub(crate) fn supersede(&mut self, slot: Slot) -> AbortSignal {
+        let sig = AbortSignal::new();
+        if let Some(prev) = self.slots.insert(slot, sig.clone()) {
+            prev.abort();
+        }
+        sig
+    }
+
+    /// The signal currently armed for `slot`, if any: used to abort a stale
+    /// in-flight read out of band (e.g. `KvBatchStop`).
+    pub(crate) fn slot(&self, slot: Slot) -> Option<&AbortSignal> {
+        self.slots.get(&slot)
+    }
+
     /// Supersede every in-flight fetch for this result (tab closed / reconnected).
     pub(crate) fn abort_all(&self) {
-        for sig in [
-            self.open.as_ref(),
-            self.page.as_ref(),
-            self.build.as_ref(),
-            self.stats.as_ref(),
-            self.lookup.as_ref(),
-            self.kv_scan.as_ref(),
-            self.kv_value.as_ref(),
-            self.kv_collection.as_ref(),
-            self.kv_group_detail.as_ref(),
-            self.kv_group_pending.as_ref(),
-            self.kv_subscribe.as_ref(),
-            self.kv_monitor.as_ref(),
-            self.doc_page.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        for sig in self.slots.values() {
             sig.abort();
         }
         if let Some((_, sig)) = &self.run {
