@@ -947,85 +947,65 @@ impl AppState {
         theme: &Theme,
         view: &WeakEntity<AppState>,
     ) -> gpui::AnyElement {
-        let cancel_view = view.clone();
-        let confirm_view = view.clone();
         // The "Don't ask again" opt-out only rides on the client-gated single delete;
         // the server-gated drop/many confirms ignore the setting, so offering it there
-        // would be a checkbox that does nothing.
-        let toggle_view = view.clone();
-        let dont_ask = suppressible.then(|| {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    Checkbox::new("doc-delete-dont-ask", false)
-                        .mark(crate::icons::icon("check", px(12.), theme.on_accent))
-                        .on_change(move |checked: &bool, _, cx| {
-                            toggle_view
-                                .update(cx, |this, cx| this.set_confirm_destructive(!*checked, cx))
-                                .ok();
-                        }),
-                )
-                .child(
-                    div()
-                        .text_size(theme.scale(12.))
-                        .text_color(theme.text_muted)
-                        .child("Don't ask again"),
-                )
-        });
-        div()
-            .absolute()
-            .inset_0()
+        // would be a checkbox that does nothing. Shared with the SQL/Redis confirms
+        // via the one checkbox builder rather than a Mongo-local copy.
+        let dont_ask = suppressible
+            .then(|| AppState::dont_ask_checkbox_el("doc-delete-dont-ask", theme, view.clone()));
+        let body = div()
             .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::hsla(0., 0., 0., 0.5))
+            .flex_col()
+            .gap_3()
+            .child(div().text_color(theme.text_muted).child(prompt))
+            .children(dont_ask);
+        // Flint's `Modal`, like the SQL/Redis confirms, so the scrim, focus trap,
+        // and Esc/Enter come for free instead of a hand-rolled card. Each action
+        // rides both a footer button (3-arg `on_click`) and the modal's
+        // keyboard handler (2-arg `on_close`/`on_confirm`), so it takes its own
+        // weak-handle clone.
+        let (cancel_btn, cancel_key) = (view.clone(), view.clone());
+        let (confirm_btn, confirm_key) = (view.clone(), view.clone());
+        let footer = div()
+            .flex()
+            .justify_end()
+            .gap_2()
             .child(
-                div()
-                    .w(px(420.))
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .p_4()
-                    .bg(theme.bg_panel)
-                    .border_1()
-                    .border_color(theme.border)
-                    .rounded_md()
-                    .child(div().font_weight(gpui::FontWeight::MEDIUM).child("Confirm"))
-                    .child(div().text_color(theme.text_muted).child(prompt))
-                    .children(dont_ask)
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                Button::new("doc-confirm-cancel", "Cancel")
-                                    .size(ButtonSize::Sm)
-                                    .variant(ButtonVariant::Secondary)
-                                    .on_click(move |_, _, cx| {
-                                        cancel_view
-                                            .update(cx, |this, cx| {
-                                                this.doc_cancel_write(session, cx)
-                                            })
-                                            .ok();
-                                    }),
-                            )
-                            .child(
-                                Button::new("doc-confirm-ok", "Confirm")
-                                    .size(ButtonSize::Sm)
-                                    .variant(ButtonVariant::Danger)
-                                    .on_click(move |_, _, cx| {
-                                        confirm_view
-                                            .update(cx, |this, cx| {
-                                                this.doc_confirm_write(session, cx)
-                                            })
-                                            .ok();
-                                    }),
-                            ),
-                    ),
+                Button::new("doc-confirm-cancel", "Cancel")
+                    .size(ButtonSize::Sm)
+                    .variant(ButtonVariant::Secondary)
+                    .on_click(move |_, _, cx| {
+                        cancel_btn
+                            .update(cx, |this, cx| this.doc_cancel_write(session, cx))
+                            .ok();
+                    }),
             )
+            .child(
+                Button::new("doc-confirm-ok", "Confirm")
+                    .size(ButtonSize::Sm)
+                    .variant(ButtonVariant::Danger)
+                    .on_click(move |_, _, cx| {
+                        confirm_btn
+                            .update(cx, |this, cx| this.doc_confirm_write(session, cx))
+                            .ok();
+                    }),
+            );
+        Modal::new("doc-confirm")
+            .title("Confirm")
+            .width(px(420.))
+            .focus_handle(self.modal_focus.clone())
+            .footer(footer)
+            .on_close(move |_, cx| {
+                cancel_key
+                    .update(cx, |this, cx| this.doc_cancel_write(session, cx))
+                    .ok();
+            })
+            .on_confirm(move |_, cx| {
+                confirm_key
+                    .update(cx, |this, cx| this.doc_confirm_write(session, cx))
+                    .ok();
+            })
+            .child(body)
             .into_any_element()
     }
 
