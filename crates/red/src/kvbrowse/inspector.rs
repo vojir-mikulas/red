@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use flint::prelude::*;
-use gpui::{Context, Entity, UniformListScrollHandle, prelude::*, px};
+use gpui::{Context, Entity, UniformListScrollHandle, prelude::*};
 use red_core::kv::{
     CollectionKind, KvCollection, KvCollectionPage, KvElement, KvStreamActionReq, KvStreamPage,
     KvType, KvValue, PendingEntry, RecycledKey, StreamAction, StreamConsumer, StreamGroup,
@@ -90,14 +90,8 @@ impl AppState {
         // the value body becoming editable in place, exactly like the SQL cell
         // inspector's inline editor. ⌘↵ (Run) saves; Esc cancels. Enter inserts
         // a newline, so multi-line JSON stays editable.
-        let value_editor = cx.new(|cx| {
-            CodeEditor::new(cx)
-                .gutter(false)
-                .resting_border(false)
-                .corner_radius(px(0.))
-                .soft_wrap(true)
-                .a11y_label("Key value editor")
-        });
+        let value_editor =
+            cx.new(|cx| crate::inspector::value_body_editor_base("Key value editor", true, cx));
         cx.subscribe(
             &value_editor,
             move |this, _, event: &CodeEditorEvent, cx| match event {
@@ -413,17 +407,7 @@ impl AppState {
             return;
         };
         let (body, _summary, wrap) = crate::inspector::format_value_body(&value, fmt);
-        let editor = cx.new(|cx| {
-            let mut e = CodeEditor::new(cx)
-                .gutter(false)
-                .resting_border(false)
-                .corner_radius(px(0.))
-                .soft_wrap(wrap)
-                .a11y_label("Key value")
-                .with_content(body);
-            e.set_read_only(true, cx);
-            e
-        });
+        let editor = crate::inspector::build_readonly_value_editor("Key value", body, wrap, cx);
         // Esc from the focused preview closes the inspector, matching Esc from
         // the keyspace grid (the editor swallows the key otherwise).
         let sub = cx.subscribe(&editor, move |this, _, event: &CodeEditorEvent, cx| {

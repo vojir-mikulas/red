@@ -120,6 +120,41 @@ pub(crate) fn value_format_buttons(
         .collect()
 }
 
+/// The shared chrome for every value-body [`CodeEditor`] the inspectors host
+/// (SQL cell + Redis string; read-only preview and inline editor alike):
+/// gutterless, borderless, square, and soft-wrapped to match the surrounding
+/// pane. Callers add the content, the read-only flag, and their own per-seam
+/// event subscription (Esc-closes for the preview, Run/Esc for the editor).
+pub(crate) fn value_body_editor_base(
+    a11y_label: &'static str,
+    wrap: bool,
+    cx: &mut Context<CodeEditor>,
+) -> CodeEditor {
+    CodeEditor::new(cx)
+        .gutter(false)
+        .resting_border(false)
+        .corner_radius(px(0.))
+        .soft_wrap(wrap)
+        .a11y_label(a11y_label)
+}
+
+/// Build the read-only value-body editor that makes a shown value *selectable*
+/// (drag / double-click a word / partial ⌘C), shared verbatim by the SQL cell
+/// inspector's preview and the Redis string inspector's. The caller owns the Esc
+/// subscription (its close action differs per seam) and where the entity lands.
+pub(crate) fn build_readonly_value_editor(
+    a11y_label: &'static str,
+    body: String,
+    wrap: bool,
+    cx: &mut Context<AppState>,
+) -> Entity<CodeEditor> {
+    cx.new(|cx| {
+        let mut e = value_body_editor_base(a11y_label, wrap, cx).with_content(body);
+        e.set_read_only(true, cx);
+        e
+    })
+}
+
 /// All the inspector's persistent state. Present iff the pane is open.
 pub(crate) struct InspectorState {
     /// Scroll position of the value body, kept across frames (the body is
@@ -424,17 +459,7 @@ impl AppState {
                 if insp.preview.as_ref().map(|p| &p.key) == Some(&key) {
                     return; // unchanged; keep the editor and its selection
                 }
-                let editor = cx.new(|cx| {
-                    let mut e = CodeEditor::new(cx)
-                        .gutter(false)
-                        .resting_border(false)
-                        .corner_radius(px(0.))
-                        .soft_wrap(wrap)
-                        .a11y_label("Cell value")
-                        .with_content(body);
-                    e.set_read_only(true, cx);
-                    e
-                });
+                let editor = build_readonly_value_editor("Cell value", body, wrap, cx);
                 // Esc from the focused preview closes the pane, matching Esc from the
                 // grid (the editor's own Escape action swallows the key otherwise).
                 let sub = cx.subscribe(&editor, |this, _, event: &CodeEditorEvent, cx| {
@@ -652,15 +677,8 @@ impl AppState {
         // how the read-only body lays each out.
         let seed = prefill.clone();
         let wrap = view.wrap;
-        let editor = cx.new(|cx| {
-            CodeEditor::new(cx)
-                .gutter(false)
-                .resting_border(false)
-                .corner_radius(px(0.))
-                .soft_wrap(wrap)
-                .a11y_label("Cell value editor")
-                .with_content(seed)
-        });
+        let editor =
+            cx.new(|cx| value_body_editor_base("Cell value editor", wrap, cx).with_content(seed));
         // ⌘↵ (Run) saves and Esc cancels; Enter inserts a newline, so multi-line JSON
         // is editable. The footer carries the same Save / Cancel as buttons.
         let sub = cx.subscribe(
