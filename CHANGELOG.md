@@ -30,8 +30,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   value control, with
   add / remove affordances and collapsible nested objects and arrays so deep
   documents stay navigable; the `_id` is shown read-only and preserved. Switching
-  to Raw serializes the form so the JSON reflects your edits. The inspector docks
-  on the right and is resizable by dragging its divider. There are also
+  to Raw serializes the form so the JSON reflects your edits. The inspector floats
+  over the grid, docked to the right and resizable by dragging its left edge, so
+  the grid keeps its full width instead of being squeezed. The documents also
+  render as an expandable per-document List or a whole-page JSON view, both of
+  which are selectable so you can highlight text and copy it. There are also
   affordances to insert a new document, delete one, and drop a collection; a
   destructive
   operation (dropping a collection, a delete or update touching many documents,

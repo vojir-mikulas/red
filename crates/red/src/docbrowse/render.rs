@@ -11,9 +11,9 @@ use flint::Theme;
 use flint::prelude::*;
 use gpui::{
     App, Axis, Context, MouseButton, Pixels, SharedString, UniformListScrollHandle, WeakEntity,
-    Window, div, prelude::*, px, uniform_list,
+    Window, div, list, prelude::*, px,
 };
-use red_core::doc::{CollKind, DocPlan, DocValue, Document};
+use red_core::doc::{CollKind, DocPlan, Document};
 use red_service::SessionId;
 
 use crate::app::{ActiveConn, AppState, Phase, SplitHalf, TabWorkspace};
@@ -1366,49 +1366,51 @@ impl AppState {
         };
         let show_inspector = current.inspector.is_some() || current.inspector_insert;
         let content_area = if show_inspector {
-            // The inspector docks on the right and is resizable, reusing the same
-            // per-connection width the SQL/Redis inspectors do (`inspector_w`).
-            let inspector = div()
-                .size_full()
-                .flex()
-                .min_h(px(0.))
-                .border_l_1()
-                .border_color(theme.border)
-                .child(self.render_doc_inspector(session, current, read_only, theme, view));
-            let (start, resize, end) = (view.clone(), view.clone(), view.clone());
-            div()
-                .flex()
+            // The inspector floats *over* the grid (docked to the right), so the
+            // grid keeps its full width instead of being squeezed by a split. Its
+            // left edge is a drag handle that resizes the overlay, reusing the same
+            // per-connection width/anchor the SQL/Redis inspectors do.
+            let panel = self.render_doc_inspector_overlay(
+                session,
+                current,
+                read_only,
+                inspector_w,
+                theme,
+                view,
+            );
+            let mut area = div()
+                .relative()
                 .flex_1()
                 .min_h(px(0.))
-                .child(
-                    SplitPane::new("doc-split-inspector", Axis::Horizontal)
-                        .sized(SplitSide::Trailing)
-                        .size(inspector_w)
-                        .gutter(px(1.))
-                        .drag(inspector_drag)
-                        .min_first(px(280.))
-                        .max_first(px(1400.))
-                        .on_drag_start(move |anchor, _, cx| {
-                            start
-                                .update(cx, |this, cx| {
-                                    if let Phase::Connected(a) = &mut this.phase {
-                                        a.inspector_drag = Some(anchor);
-                                    }
-                                    cx.notify();
-                                })
-                                .ok();
-                        })
-                        .on_resize(move |size, _, cx| {
+                // The grid underneath keeps the full width.
+                .child(div().size_full().flex().min_h(px(0.)).child(content))
+                .child(panel);
+            // While dragging the handle, a full-cover overlay tracks the cursor and
+            // ends the drag on release, mirroring `SplitPane`'s divider drag.
+            if let Some(anchor) = inspector_drag {
+                let (resize, end, end_out) = (view.clone(), view.clone(), view.clone());
+                area = area.child(
+                    div()
+                        .id("doc-inspector-drag")
+                        .occlude()
+                        .absolute()
+                        .inset_0()
+                        .cursor_ew_resize()
+                        .on_mouse_move(move |event: &gpui::MouseMoveEvent, _, cx| {
+                            // Trailing-sized: dragging the handle left grows the panel.
+                            let delta = f32::from(event.position.x - anchor.start_coord);
+                            let raw = f32::from(anchor.start_size) - delta;
+                            let w = px(raw.clamp(280., 1400.));
                             resize
                                 .update(cx, |this, cx| {
                                     if let Phase::Connected(a) = &mut this.phase {
-                                        a.inspector_w = size;
+                                        a.inspector_w = w;
                                     }
                                     cx.notify();
                                 })
                                 .ok();
                         })
-                        .on_drag_end(move |_, cx| {
+                        .on_mouse_up(MouseButton::Left, move |_, _, cx| {
                             end.update(cx, |this, cx| {
                                 if let Phase::Connected(a) = &mut this.phase {
                                     a.inspector_drag = None;
@@ -1417,12 +1419,19 @@ impl AppState {
                             })
                             .ok();
                         })
-                        // A flex wrapper so the grid/list's `flex_1` fills the pane's
-                        // full height (a plain block parent leaves it at auto height).
-                        .first(div().size_full().flex().min_h(px(0.)).child(content))
-                        .second(inspector),
-                )
-                .into_any_element()
+                        .on_mouse_up_out(MouseButton::Left, move |_, _, cx| {
+                            end_out
+                                .update(cx, |this, cx| {
+                                    if let Phase::Connected(a) = &mut this.phase {
+                                        a.inspector_drag = None;
+                                    }
+                                    cx.notify();
+                                })
+                                .ok();
+                        }),
+                );
+            }
+            area.into_any_element()
         } else {
             div()
                 .flex_1()
@@ -1597,9 +1606,12 @@ impl AppState {
             .into_any_element()
     }
 
-    /// The List render mode: one expandable card per document (a per-field tree
-    /// with nested Object/Array drill-down) with per-document Edit / Clone /
-    /// Delete actions on hover.
+    /// The List render mode: one expandable card per document with per-document
+    /// Edit / Clone / Delete actions on hover. An expanded card shows its fields as
+    /// a selectable, copyable [`SelectableLabel`] block (held in
+    /// `current.list_labels`, keyed by row index). Rows are drawn through a
+    /// variable-height virtualized [`gpui::list`], so only on-screen cards are laid
+    /// out (60fps on a full page).
     fn render_doc_list(
         &self,
         session: SessionId,
@@ -1608,62 +1620,139 @@ impl AppState {
         theme: &Theme,
         view: &WeakEntity<AppState>,
     ) -> gpui::AnyElement {
-        // Flatten the page (and the fields of every expanded document) into
-        // fixed-height rows so `uniform_list` windows the whole thing — the old
-        // container mounted every card and field each frame, hence the jank.
-        let mut rows: Vec<DocListRow> = Vec::new();
-        for (i, doc) in current.docs.iter().enumerate() {
-            let expanded = current.expanded_rows.contains(&i);
-            rows.push(DocListRow::Header {
-                doc_ix: i,
-                expanded,
-                id_label: SharedString::from(format!("_id: {}", doc.id.to_cell(CELL_CAP))),
-            });
-            if expanded {
-                let mut fields = Vec::new();
-                push_field_data("_id", &doc.id, 0, &mut fields);
-                for (k, v) in &doc.fields {
-                    push_field_data(k, v, 0, &mut fields);
-                }
-                rows.extend(fields.into_iter().map(DocListRow::Field));
-            }
-        }
-
-        let rows = Rc::new(rows);
-        let count = rows.len();
-        let row_h = theme.scale(26.);
+        // Per-row data the list closure indexes into (built once per render, not
+        // per painted frame).
+        let rows: Rc<Vec<DocCardRow>> = Rc::new(
+            current
+                .docs
+                .iter()
+                .enumerate()
+                .map(|(i, doc)| DocCardRow {
+                    id_label: SharedString::from(format!("_id: {}", doc.id.to_cell(CELL_CAP))),
+                    expanded: current.expanded_rows.contains(&i),
+                    label: current.list_labels.get(&i).cloned(),
+                })
+                .collect(),
+        );
+        let row_h = theme.scale(28.);
         let text_size = theme.scale(12.);
         let theme = theme.clone();
         let view = view.clone();
-        let list = uniform_list("doc-list", count, {
-            let rows = rows.clone();
-            move |range, _window, _cx| {
-                let mut out = Vec::with_capacity(range.len());
-                for ix in range {
-                    out.push(match &rows[ix] {
-                        DocListRow::Header {
-                            doc_ix,
-                            expanded,
-                            id_label,
-                        } => doc_list_header(
-                            *doc_ix, *expanded, id_label, session, read_only, row_h, &theme, &view,
-                        ),
-                        DocListRow::Field(f) => doc_list_field(f, row_h, text_size, &theme),
-                    });
-                }
-                out
+        let list_el = list(current.list_state.clone(), move |ix, _window, _cx| {
+            let Some(row) = rows.get(ix) else {
+                return div().into_any_element();
+            };
+            let header = doc_list_header(
+                ix,
+                row.expanded,
+                &row.id_label,
+                session,
+                read_only,
+                row_h,
+                &theme,
+                &view,
+            );
+            let mut card = div()
+                .flex()
+                .flex_col()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(header);
+            if row.expanded
+                && let Some(label) = &row.label
+            {
+                card = card.child(
+                    div()
+                        .px_3()
+                        .pb_2()
+                        .pl(px(28.))
+                        .font_family(theme.mono_family.clone())
+                        .text_color(theme.text)
+                        .child(label.clone()),
+                );
             }
+            card.into_any_element()
         })
-        .track_scroll(&current.list_scroll)
-        .flex_1();
+        .size_full();
 
         div()
             .id("doc-list")
             .size_full()
             .flex()
             .flex_col()
+            .min_h(px(0.))
             .text_size(text_size)
-            .child(list)
+            .child(div().flex_1().min_h(px(0.)).child(list_el))
+            .into_any_element()
+    }
+
+    /// The inspector as a floating panel docked to the right edge, over the grid
+    /// (so the grid keeps its width). Its left edge is a grab strip that starts a
+    /// resize drag; the tracking overlay lives in [`Self::render_doc_documents`].
+    fn render_doc_inspector_overlay(
+        &self,
+        session: SessionId,
+        current: &CollView,
+        read_only: bool,
+        inspector_w: Pixels,
+        theme: &Theme,
+        view: &WeakEntity<AppState>,
+    ) -> gpui::AnyElement {
+        let start = view.clone();
+        let handle = div()
+            .id("doc-inspector-handle")
+            .group("doc-inspector-handle")
+            .flex_shrink_0()
+            .w(px(6.))
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_ew_resize()
+            .on_mouse_down(
+                MouseButton::Left,
+                move |event: &gpui::MouseDownEvent, _, cx| {
+                    let anchor = DragAnchor {
+                        start_coord: event.position.x,
+                        start_size: inspector_w,
+                    };
+                    start
+                        .update(cx, |this, cx| {
+                            if let Phase::Connected(a) = &mut this.phase {
+                                a.inspector_drag = Some(anchor);
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                },
+            )
+            .child(
+                div()
+                    .w(px(1.))
+                    .h_full()
+                    .bg(theme.border)
+                    .group_hover("doc-inspector-handle", |s| s.bg(theme.accent)),
+            );
+
+        // The grab strip's own 1px line is the left divider, so the panel itself
+        // draws no left border (that would double it up).
+        div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .w(inspector_w)
+            .occlude()
+            .flex()
+            .bg(theme.bg_panel)
+            .child(handle)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(self.render_doc_inspector(session, current, read_only, theme, view)),
+            )
             .into_any_element()
     }
 
@@ -2033,82 +2122,50 @@ fn render_docs_table(
         .into_any_element()
 }
 
-/// The JSON render mode: a pretty extended-JSON block per document, stacked in a
-/// scroll. Bounded so a huge window can't blow the line budget.
-/// One windowed row of the JSON render mode: a document boundary rule or a single
-/// pretty-printed line. Flattening to fixed-height rows lets `uniform_list`
-/// virtualize the whole window, so scrolling stays smooth on a full page of
-/// documents (the old one-`div`-per-line container laid out every line each
-/// frame).
-enum JsonRow {
-    /// A hairline between two documents.
-    Separator,
-    /// A single extended-JSON line.
-    Line(SharedString),
+/// One List-mode card's data, indexed by the virtualized list's item closure.
+struct DocCardRow {
+    id_label: SharedString,
+    expanded: bool,
+    /// The selectable field block, present once the card has been expanded.
+    label: Option<gpui::Entity<flint::SelectableLabel>>,
 }
 
+/// The JSON render mode: one selectable [`SelectableLabel`] per document (its
+/// pretty extended JSON), drawn through a variable-height virtualized
+/// [`gpui::list`] (`current.json_list` / `current.json_labels`). Only on-screen
+/// documents are laid out, so scrolling a full page stays smooth, and the text
+/// stays selectable + copyable.
 fn render_doc_json(current: &CollView, theme: &Theme) -> gpui::AnyElement {
-    const MAX_LINES: usize = 6_000;
-    let mut rows: Vec<JsonRow> = Vec::new();
-    let mut lines_used = 0usize;
-    for (i, doc) in current.docs.iter().enumerate() {
-        if lines_used >= MAX_LINES {
-            break;
-        }
-        if i > 0 {
-            rows.push(JsonRow::Separator);
-        }
-        let json = pretty_extjson(&doc.to_doc_value());
-        for line in json.lines() {
-            if lines_used >= MAX_LINES {
-                break;
-            }
-            rows.push(JsonRow::Line(SharedString::from(line.to_string())));
-            lines_used += 1;
-        }
-    }
-
-    let rows = Rc::new(rows);
-    let count = rows.len();
-    let row_h = theme.scale(18.);
-    let border = theme.border;
-    let list = uniform_list("doc-json", count, {
-        let rows = rows.clone();
-        move |range, _window, _cx| {
-            let mut out = Vec::with_capacity(range.len());
-            for ix in range {
-                let el = match &rows[ix] {
-                    JsonRow::Separator => div()
-                        .h(row_h)
-                        .flex()
-                        .items_center()
-                        .child(div().h(px(1.)).w_full().bg(border)),
-                    // A single fixed-height line; long lines clip (the inspector
-                    // shows the full document).
-                    JsonRow::Line(line) => div()
-                        .h(row_h)
-                        .w_full()
-                        .overflow_hidden()
-                        .child(line.clone()),
-                };
-                out.push(el.into_any_element());
-            }
-            out
-        }
+    let labels = current.json_labels.clone();
+    let (mono, text_size, text, border) = (
+        theme.mono_family.clone(),
+        theme.scale(12.),
+        theme.text,
+        theme.border,
+    );
+    let list_el = list(current.json_list.clone(), move |ix, _window, _cx| {
+        let Some(label) = labels.get(ix) else {
+            return div().into_any_element();
+        };
+        div()
+            .w_full()
+            .px_3()
+            .py_2()
+            .when(ix > 0, |d| d.border_t_1().border_color(border))
+            .font_family(mono.clone())
+            .text_size(text_size)
+            .text_color(text)
+            .child(label.clone())
+            .into_any_element()
     })
-    .track_scroll(&current.json_scroll)
-    .flex_1();
-
+    .size_full();
     div()
         .id("doc-json")
         .size_full()
         .flex()
         .flex_col()
-        .p_3()
-        .font_family(theme.mono_family.clone())
-        .text_size(theme.scale(12.))
-        .text_color(theme.text)
-        .child(list)
+        .min_h(px(0.))
+        .child(div().flex_1().min_h(px(0.)).child(list_el))
         .into_any_element()
 }
 
@@ -2263,60 +2320,8 @@ fn coll_kind_badge(kind: CollKind) -> Option<&'static str> {
     }
 }
 
-/// Max rows a single List-mode card renders (deep/wide documents fall back to
-/// the inspector for the full picture).
-const MAX_FIELD_ROWS: usize = 300;
-
-/// One windowed row of the List render mode: a document header (its `_id`, the
-/// expand chevron, hover actions) or one flattened field of an expanded document.
-enum DocListRow {
-    Header {
-        doc_ix: usize,
-        expanded: bool,
-        id_label: SharedString,
-    },
-    Field(FieldRow),
-}
-
-/// A flattened List-mode field: its label, display value, and nesting depth. Held
-/// as data (not a built element) so the enclosing `uniform_list` can build only
-/// the rows in view.
-struct FieldRow {
-    key: String,
-    value: String,
-    depth: usize,
-}
-
-/// Flatten one field (recursing into objects/arrays) into fixed `FieldRow` data,
-/// capped at [`MAX_FIELD_ROWS`]. The data mirror of [`push_field_row`].
-fn push_field_data(key: &str, value: &DocValue, depth: usize, out: &mut Vec<FieldRow>) {
-    if out.len() >= MAX_FIELD_ROWS {
-        return;
-    }
-    let row = |value: String, depth: usize| FieldRow {
-        key: key.to_string(),
-        value,
-        depth,
-    };
-    match value {
-        DocValue::Document(fields) if !fields.is_empty() => {
-            out.push(row("{ }".to_string(), depth));
-            for (k, v) in fields {
-                push_field_data(k, v, depth + 1, out);
-            }
-        }
-        DocValue::Array(items) if !items.is_empty() => {
-            out.push(row(format!("[ {} ]", items.len()), depth));
-            for (i, item) in items.iter().enumerate() {
-                push_field_data(&i.to_string(), item, depth + 1, out);
-            }
-        }
-        other => out.push(row(other.to_cell(CELL_CAP).to_string(), depth)),
-    }
-}
-
-/// Build one List-mode document header row (fixed height for `uniform_list`):
-/// the expand chevron + `_id`, and the Edit / Clone / Delete actions on hover.
+/// Build one List-mode document header row: the expand chevron + `_id`, and the
+/// Edit / Clone / Delete actions on hover.
 #[allow(clippy::too_many_arguments)]
 fn doc_list_header(
     doc_ix: usize,
@@ -2410,43 +2415,8 @@ fn doc_list_header(
         .items_center()
         .gap_2()
         .px_3()
-        .border_b_1()
-        .border_color(theme.border)
         .hover(|s| s.bg(theme.bg_hover))
         .child(toggle_region)
         .child(actions)
-        .into_any_element()
-}
-
-/// Build one List-mode field row (fixed height for `uniform_list`): the field key
-/// in accent, its value truncated, indented by nesting depth.
-fn doc_list_field(
-    f: &FieldRow,
-    row_h: Pixels,
-    text_size: Pixels,
-    theme: &Theme,
-) -> gpui::AnyElement {
-    div()
-        .h(row_h)
-        .flex()
-        .items_center()
-        .gap_2()
-        .px_3()
-        .pl(px(28. + f.depth as f32 * 16.))
-        .font_family(theme.mono_family.clone())
-        .text_size(text_size)
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_color(theme.accent)
-                .child(format!("{}:", f.key)),
-        )
-        .child(
-            div()
-                .min_w_0()
-                .truncate()
-                .text_color(theme.text)
-                .child(f.value.clone()),
-        )
         .into_any_element()
 }

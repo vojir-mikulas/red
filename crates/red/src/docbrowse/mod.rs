@@ -18,8 +18,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flint::prelude::*;
 use gpui::{
-    Context, Entity, FocusHandle, Focusable, ScrollHandle, UniformListScrollHandle, Window,
-    prelude::*,
+    Context, Entity, FocusHandle, Focusable, ListAlignment, ListState, ScrollHandle,
+    UniformListScrollHandle, Window, prelude::*,
 };
 use red_core::doc::{
     CollectionInfo, DbInfo, DocPlan, DocSchema, DocValue, DocWrite, Document, IndexInfo,
@@ -264,11 +264,23 @@ struct CollView {
     query_loading: bool,
     query_scroll: UniformListScrollHandle,
     scroll: UniformListScrollHandle,
-    /// Scroll for the List render mode's windowed rows (separate from the Table
-    /// grid's `scroll`, since the two modes flatten to different row counts).
-    list_scroll: UniformListScrollHandle,
-    /// Scroll for the JSON render mode's windowed lines.
-    json_scroll: UniformListScrollHandle,
+    /// The JSON render mode's per-document selectable blocks: one
+    /// [`SelectableLabel`] per document holding its pretty extended JSON, rendered
+    /// through a virtualized [`ListState`] so only on-screen documents are laid
+    /// out (60fps on a full page). Rebuilt when the window changes while JSON mode
+    /// shows; coordinated by [`selection_group`](Self::selection_group).
+    json_labels: Vec<Entity<SelectableLabel>>,
+    /// Virtualized list state for the JSON render mode (variable-height rows).
+    json_list: ListState,
+    /// Virtualized list state for the List render mode (variable-height cards).
+    list_state: ListState,
+    /// The List render mode's per-document selectable field blocks, created when a
+    /// document is expanded (keyed by row index) and cleared when the window
+    /// changes. Coordinated by [`selection_group`](Self::selection_group) so only
+    /// one block holds a highlight at a time.
+    list_labels: BTreeMap<usize, Entity<SelectableLabel>>,
+    /// Shared "who owns the live selection" cell for the List/JSON blocks.
+    selection_group: SelectionGroup,
     list_focus: FocusHandle,
     /// The keyboard row cursor over `docs` (arrow / vim motions), or `None`
     /// before the grid has been touched. Drives the grid highlight and the
@@ -358,12 +370,38 @@ impl CollView {
             query_loading: false,
             query_scroll: UniformListScrollHandle::new(),
             scroll: UniformListScrollHandle::new(),
-            list_scroll: UniformListScrollHandle::new(),
-            json_scroll: UniformListScrollHandle::new(),
+            json_labels: Vec::new(),
+            json_list: new_doc_list_state(0),
+            list_state: new_doc_list_state(0),
+            list_labels: BTreeMap::new(),
+            selection_group: SelectionGroup::default(),
             list_focus: cx.focus_handle(),
             cursor: None,
         }
     }
+
+    /// (Re)build the JSON render mode's per-document selectable blocks for the
+    /// current window and resize its virtualized list. Cheap to hold (each label
+    /// only shapes its text when actually painted).
+    fn rebuild_json_labels(&mut self, cx: &mut Context<AppState>) {
+        let group = self.selection_group.clone();
+        self.json_labels = self
+            .docs
+            .iter()
+            .enumerate()
+            .map(|(i, doc)| {
+                let text = pretty_extjson(&doc.to_doc_value());
+                cx.new(|cx| SelectableLabel::new(text, cx).selection_group(group.clone(), i as u64))
+            })
+            .collect();
+        self.json_list.reset(self.json_labels.len());
+    }
+}
+
+/// A fresh top-aligned [`ListState`] for a document window, with enough overdraw
+/// that a flick keeps painted rows ahead of the viewport.
+fn new_doc_list_state(count: usize) -> ListState {
+    ListState::new(count, ListAlignment::Top, gpui::px(600.))
 }
 
 impl WorkspaceTab for MongoTab {
@@ -668,6 +706,13 @@ impl AppState {
         current.exhausted = exhausted;
         current.loading = false;
         current.expanded_rows.clear();
+        // The List/JSON selectable blocks were built for the old window; drop them
+        // and resize the virtualized lists to the new count.
+        current.list_labels.clear();
+        current.json_labels.clear();
+        let n = current.docs.len();
+        current.list_state.reset(n);
+        current.json_list.reset(n);
         // A count only rides the first page; keep the prior total on later pages.
         if let Some(total) = total {
             current.total = Some(total);
@@ -681,6 +726,10 @@ impl AppState {
         // A new window invalidates the keyboard cursor's absolute row.
         if current.cursor.is_some_and(|c| c >= current.docs.len()) {
             current.cursor = None;
+        }
+        // Rebuild the JSON blocks if that's the visible mode.
+        if matches!(current.view_mode, DocViewMode::Json) {
+            current.rebuild_json_labels(cx);
         }
         cx.notify();
     }
@@ -938,30 +987,65 @@ impl AppState {
         cx.notify();
     }
 
-    /// Toggle a document's expansion in List mode.
+    /// Toggle a document's expansion in List mode. Expanding builds the row's
+    /// selectable field block (a `SelectableLabel`); collapsing drops it.
     fn doc_toggle_row(&mut self, session: SessionId, row: usize, cx: &mut Context<Self>) {
+        // Phase A: flip the expansion and, when opening, gather what the label
+        // needs (its text + the selection group) without holding the borrow.
+        let build = {
+            let Some(current) = self
+                .conn_mut(Some(session))
+                .and_then(|a| a.doc_view.as_mut())
+                .and_then(|v| v.focused_coll_mut())
+            else {
+                return;
+            };
+            if current.expanded_rows.remove(&row) {
+                current.list_labels.remove(&row);
+                None
+            } else {
+                current.expanded_rows.insert(row);
+                current
+                    .docs
+                    .get(row)
+                    .map(|doc| (doc_field_text(doc), current.selection_group.clone()))
+            }
+        };
+        // Phase B: build the label entity (needs `cx`), then store it back.
+        let label = build.map(|(text, group)| {
+            cx.new(|cx| SelectableLabel::new(text, cx).selection_group(group, row as u64))
+        });
         if let Some(current) = self
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_mut())
             .and_then(|v| v.focused_coll_mut())
         {
-            if !current.expanded_rows.remove(&row) {
-                current.expanded_rows.insert(row);
+            if let Some(label) = label {
+                current.list_labels.insert(row, label);
             }
-            cx.notify();
+            // The toggled card changed height; re-measure just that row so the
+            // virtualized list lays the rest out correctly.
+            current.list_state.remeasure_items(row..row + 1);
         }
+        cx.notify();
     }
 
     /// Switch how the Documents panel renders each document (table/list/json).
     fn doc_set_view_mode(&mut self, session: SessionId, mode: DocViewMode, cx: &mut Context<Self>) {
-        if let Some(current) = self
+        let Some(current) = self
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_mut())
             .and_then(|v| v.focused_coll_mut())
-        {
-            current.view_mode = mode;
-            cx.notify();
+        else {
+            return;
+        };
+        current.view_mode = mode;
+        // Build the JSON blocks lazily the first time JSON mode is shown for this
+        // window (cleared on every page load).
+        if matches!(mode, DocViewMode::Json) && current.json_labels.len() != current.docs.len() {
+            current.rebuild_json_labels(cx);
         }
+        cx.notify();
     }
 
     pub(crate) fn on_doc_schema(
@@ -1648,6 +1732,68 @@ fn next_navigable_doc(rows: &[DocTreeRow], from: Option<usize>, forward: bool) -
 /// dropping the borrow on `rows`.
 fn row_sel_owned(rows: &[DocTreeRow], ix: usize) -> Option<DocTreeSel> {
     rows.get(ix).and_then(|r| r.sel.clone())
+}
+
+/// Max field rows a List-mode block flattens (deep/wide documents fall back to
+/// the inspector for the full picture).
+const MAX_FIELD_ROWS: usize = 300;
+
+/// A flattened List-mode field: its label, display value, and nesting depth.
+struct FieldRow {
+    key: String,
+    value: String,
+    depth: usize,
+}
+
+/// Flatten one field (recursing into objects/arrays) into `FieldRow` data, capped
+/// at [`MAX_FIELD_ROWS`].
+fn push_field_data(key: &str, value: &DocValue, depth: usize, out: &mut Vec<FieldRow>) {
+    if out.len() >= MAX_FIELD_ROWS {
+        return;
+    }
+    let row = |value: String, depth: usize| FieldRow {
+        key: key.to_string(),
+        value,
+        depth,
+    };
+    match value {
+        DocValue::Document(fields) if !fields.is_empty() => {
+            out.push(row("{ }".to_string(), depth));
+            for (k, v) in fields {
+                push_field_data(k, v, depth + 1, out);
+            }
+        }
+        DocValue::Array(items) if !items.is_empty() => {
+            out.push(row(format!("[ {} ]", items.len()), depth));
+            for (i, item) in items.iter().enumerate() {
+                push_field_data(&i.to_string(), item, depth + 1, out);
+            }
+        }
+        other => out.push(row(other.to_cell(CELL_CAP).to_string(), depth)),
+    }
+}
+
+/// The selectable "key: value" block for one document's List-mode card: `_id`
+/// first, then each field, nested objects/arrays indented two spaces per level.
+fn doc_field_text(doc: &Document) -> String {
+    let mut fields = Vec::new();
+    push_field_data("_id", &doc.id, 0, &mut fields);
+    for (k, v) in &doc.fields {
+        push_field_data(k, v, 0, &mut fields);
+    }
+    let mut out = String::new();
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        for _ in 0..f.depth {
+            out.push_str("  ");
+        }
+        out.push_str(&f.key);
+        out.push_str(": ");
+        out.push_str(&f.value);
+    }
+    out
 }
 
 fn sample_columns(docs: &[Document]) -> Vec<String> {
