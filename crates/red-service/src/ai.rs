@@ -1900,6 +1900,22 @@ pub(crate) async fn kv_run_tool(
     (content, ok)
 }
 
+/// Append the grounding footer every seam's system prompt shares: the live
+/// connection line and, when set, the read-only notice. One place so the footer
+/// can't drift per seam; the seam passes its already-built body and its own
+/// read-only wording (SQL names the blocked ops; KV/doc keep it terse). SQL's
+/// schema overview is appended by its caller afterward, since only SQL has one.
+fn finish_system_prompt(mut body: String, ctx: &AiContext, read_only_note: &str) -> String {
+    if !ctx.connection.is_empty() {
+        body.push_str(&format!("\nConnected to: {}", ctx.connection));
+    }
+    if ctx.read_only {
+        body.push('\n');
+        body.push_str(read_only_note);
+    }
+    body
+}
+
 /// The Redis agent's system prompt (the KV analogue of [`system_prompt`]): the
 /// same shape, but describing the `kv_*` tools and Redis idioms instead of SQL.
 /// Grounding is lazy — the model calls `kv_server_info`/`kv_scan_keys` rather
@@ -1937,21 +1953,18 @@ pub(crate) fn kv_system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
              the user has asked you to change data."
         }
     };
-    let mut s = format!(
-        "You are Red's Redis agent, embedded in a native database explorer. You help the user \
-         explore and understand the Redis server they are connected to.\n\n\
-         {tools_line}\n\n\
-         Redis keys are addressed by glob patterns (e.g. `user:*`), not SQL — there are no tables \
-         or joins. Be concise: lead with the answer, then the supporting detail. When you show a \
-         command, put it in a fenced ```sh block (e.g. `redis-cli GET foo`).\n",
-    );
-    if !ctx.connection.is_empty() {
-        s.push_str(&format!("\nConnected to: {}", ctx.connection));
-    }
-    if ctx.read_only {
-        s.push_str("\nThis connection is READ-ONLY.");
-    }
-    s
+    finish_system_prompt(
+        format!(
+            "You are Red's Redis agent, embedded in a native database explorer. You help the user \
+             explore and understand the Redis server they are connected to.\n\n\
+             {tools_line}\n\n\
+             Redis keys are addressed by glob patterns (e.g. `user:*`), not SQL — there are no \
+             tables or joins. Be concise: lead with the answer, then the supporting detail. When \
+             you show a command, put it in a fenced ```sh block (e.g. `redis-cli GET foo`).\n",
+        ),
+        ctx,
+        "This connection is READ-ONLY.",
+    )
 }
 
 /// Curate the giant INFO reply down to the fields that matter, plus a computed
@@ -3202,19 +3215,17 @@ pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
              to change data; read first to get it right, and verify after."
         }
     };
-    let mut s = format!(
-        "You are Red's database agent, embedded in a native SQL explorer. You help the user \
-         explore and understand the database they are connected to.\n\n\
-         {tools_line}\n\n\
-         When you write SQL for the user, put it in a fenced ```sql block so they can run it. Be \
-         concise: lead with the answer, then the supporting query or detail.\n",
+    let mut s = finish_system_prompt(
+        format!(
+            "You are Red's database agent, embedded in a native SQL explorer. You help the user \
+             explore and understand the database they are connected to.\n\n\
+             {tools_line}\n\n\
+             When you write SQL for the user, put it in a fenced ```sql block so they can run it. \
+             Be concise: lead with the answer, then the supporting query or detail.\n",
+        ),
+        ctx,
+        "This connection is READ-ONLY: do not propose INSERT/UPDATE/DELETE/DDL.",
     );
-    if !ctx.connection.is_empty() {
-        s.push_str(&format!("\nConnected to: {}", ctx.connection));
-    }
-    if ctx.read_only {
-        s.push_str("\nThis connection is READ-ONLY: do not propose INSERT/UPDATE/DELETE/DDL.");
-    }
     if !ctx.schema_summary.is_empty() {
         s.push_str("\n\nSchema overview (use describe_table for full detail):\n");
         s.push_str(&ctx.schema_summary);
@@ -3801,25 +3812,22 @@ pub(crate) fn doc_system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
              collection always confirms."
         }
     };
-    let mut s = format!(
-        "You are Red's MongoDB agent, embedded in a native database explorer. You help the user \
-         explore and understand the MongoDB deployment they are connected to.\n\n\
-         {tools_line}\n\n\
-         MongoDB is SCHEMALESS: a collection has no declared columns, and a field can be several \
-         types across documents. So ORIENT before you act — doc_server_info to see the deployment, \
-         list_collections for the catalog, describe_collection/profile_collection to learn the \
-         discovered schema, sample_documents to see real shape — THEN find/aggregate to read, and \
-         explain_query/index_advice/audit_collection to reason about performance and health. \
-         Queries are filter documents and aggregation pipelines (extended JSON), never SQL. Be \
-         concise: lead with the answer, then the detail.\n",
-    );
-    if !ctx.connection.is_empty() {
-        s.push_str(&format!("\nConnected to: {}", ctx.connection));
-    }
-    if ctx.read_only {
-        s.push_str("\nThis connection is READ-ONLY.");
-    }
-    s
+    finish_system_prompt(
+        format!(
+            "You are Red's MongoDB agent, embedded in a native database explorer. You help the \
+             user explore and understand the MongoDB deployment they are connected to.\n\n\
+             {tools_line}\n\n\
+             MongoDB is SCHEMALESS: a collection has no declared columns, and a field can be \
+             several types across documents. So ORIENT before you act — doc_server_info to see the \
+             deployment, list_collections for the catalog, describe_collection/profile_collection \
+             to learn the discovered schema, sample_documents to see real shape — THEN \
+             find/aggregate to read, and explain_query/index_advice/audit_collection to reason \
+             about performance and health. Queries are filter documents and aggregation pipelines \
+             (extended JSON), never SQL. Be concise: lead with the answer, then the detail.\n",
+        ),
+        ctx,
+        "This connection is READ-ONLY.",
+    )
 }
 
 /// Vet a doc write tool for the approval gate: build the human-readable operation
