@@ -546,23 +546,7 @@ pub enum RespValue {
     Error(String),
 }
 
-/// How a raw console command line is classified, for the read-only gate and
-/// the destructive-command confirm (see docs/plans/redis.md's console
-/// phase). Unknown commands default to `Write` (the safer default under a
-/// read-only connection) but never `Destructive` on their own, so a typo
-/// doesn't trigger a confirm prompt for no reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandClass {
-    Read,
-    Write,
-    /// Wide-blast-radius or irreversible: gated behind a confirm even on a
-    /// writable connection. Covers the key-nuking family (`FLUSHALL`,
-    /// `FLUSHDB`, `DEL`, `UNLINK`, `SWAPDB`), server/topology/persistence
-    /// control (`SHUTDOWN`, `DEBUG`, `REPLICAOF`/`SLAVEOF`, `FAILOVER`), and the
-    /// dangerous *form* of an otherwise-benign command (`CONFIG SET`,
-    /// `CLIENT KILL`, `ACL SETUSER`, `SCRIPT FLUSH`, `CLUSTER RESET`, ...).
-    Destructive,
-}
+pub use crate::OpClass;
 
 /// Every read-only-safe command this build knows about. Anything not listed
 /// here classifies as `Write` (blocked on a read-only connection) even if
@@ -660,9 +644,14 @@ const DESTRUCTIVE_SUBCOMMANDS: &[(&str, &str)] = &[
     ("XGROUP", "DESTROY"),
 ];
 
-pub fn classify_command(argv: &[String]) -> CommandClass {
+/// Classify a raw console command line for the read-only gate and the
+/// destructive-command confirm (see docs/plans/redis.md's console phase).
+/// Unknown commands default to [`OpClass::Write`] (the safer default under a
+/// read-only connection) but never [`OpClass::Destructive`] on their own, so a
+/// typo doesn't trigger a confirm prompt for no reason.
+pub fn classify_command(argv: &[String]) -> OpClass {
     let Some(name) = argv.first() else {
-        return CommandClass::Read;
+        return OpClass::Read;
     };
     let upper = name.to_ascii_uppercase();
     let sub = argv.get(1).map(|s| s.to_ascii_uppercase());
@@ -671,11 +660,11 @@ pub fn classify_command(argv: &[String]) -> CommandClass {
             .as_deref()
             .is_some_and(|s| DESTRUCTIVE_SUBCOMMANDS.contains(&(upper.as_str(), s)));
     if destructive {
-        CommandClass::Destructive
+        OpClass::Destructive
     } else if READ_COMMANDS.contains(&upper.as_str()) {
-        CommandClass::Read
+        OpClass::Read
     } else {
-        CommandClass::Write
+        OpClass::Write
     }
 }
 
@@ -1017,36 +1006,30 @@ mod tests {
     fn classify_command_knows_reads_writes_and_destructive() {
         assert_eq!(
             classify_command(&["GET".into(), "foo".into()]),
-            CommandClass::Read
+            OpClass::Read
         );
         assert_eq!(
             classify_command(&["SET".into(), "foo".into(), "bar".into()]),
-            CommandClass::Write
+            OpClass::Write
         );
         assert_eq!(
             classify_command(&["DEL".into(), "foo".into()]),
-            CommandClass::Destructive
+            OpClass::Destructive
         );
-        assert_eq!(
-            classify_command(&["FLUSHALL".into()]),
-            CommandClass::Destructive
-        );
+        assert_eq!(classify_command(&["FLUSHALL".into()]), OpClass::Destructive);
         // Case-insensitive, and an unknown command defaults to Write (the
         // conservative choice under a read-only connection).
         assert_eq!(
             classify_command(&["get".into(), "foo".into()]),
-            CommandClass::Read
+            OpClass::Read
         );
-        assert_eq!(
-            classify_command(&["SOMENEWCOMMAND".into()]),
-            CommandClass::Write
-        );
-        assert_eq!(classify_command(&[]), CommandClass::Read);
+        assert_eq!(classify_command(&["SOMENEWCOMMAND".into()]), OpClass::Write);
+        assert_eq!(classify_command(&[]), OpClass::Read);
         // Server/topology/persistence control is destructive by name.
         for cmd in ["DEBUG", "REPLICAOF", "SLAVEOF", "SHUTDOWN"] {
             assert_eq!(
                 classify_command(&[cmd.into()]),
-                CommandClass::Destructive,
+                OpClass::Destructive,
                 "{cmd} should be destructive"
             );
         }
@@ -1054,19 +1037,19 @@ mod tests {
         // while its read/introspection form is not.
         assert_eq!(
             classify_command(&["CONFIG".into(), "SET".into(), "dir".into(), "/tmp".into()]),
-            CommandClass::Destructive
+            OpClass::Destructive
         );
         assert_eq!(
             classify_command(&["config".into(), "get".into(), "dir".into()]),
-            CommandClass::Write // not destructive; CONFIG GET isn't in READ_COMMANDS
+            OpClass::Write // not destructive; CONFIG GET isn't in READ_COMMANDS
         );
         assert_eq!(
             classify_command(&["CLIENT".into(), "KILL".into(), "id".into(), "5".into()]),
-            CommandClass::Destructive
+            OpClass::Destructive
         );
         assert_eq!(
             classify_command(&["ACL".into(), "SETUSER".into(), "bob".into()]),
-            CommandClass::Destructive
+            OpClass::Destructive
         );
     }
 

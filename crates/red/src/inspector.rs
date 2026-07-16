@@ -65,6 +65,61 @@ pub(crate) enum ValueFormat {
     Bits,
 }
 
+/// The lens set every value-format toolbar shows, in display order, as
+/// `(id_suffix, label, format)`. One list so the SQL cell inspector and the
+/// Redis string inspector never drift in which lenses they offer or their order.
+const VALUE_FORMAT_LENSES: &[(&str, &str, ValueFormat)] = &[
+    ("auto", "Auto", ValueFormat::Auto),
+    ("raw", "Raw", ValueFormat::Raw),
+    ("json", "JSON", ValueFormat::Json),
+    ("hex", "Hex", ValueFormat::Hex),
+    ("msgpack", "MsgPack", ValueFormat::MsgPack),
+    ("protobuf", "Protobuf", ValueFormat::Protobuf),
+    ("pickle", "Pickle", ValueFormat::Pickle),
+    ("timestamp", "Time", ValueFormat::Timestamp),
+    ("decompress", "Gzip", ValueFormat::Decompress),
+    ("bits", "Bits", ValueFormat::Bits),
+];
+
+/// Build the lens toggle buttons (Auto / Raw / JSON / Hex + the binary decoders)
+/// shared by the SQL cell inspector and the Redis string inspector. The `current`
+/// lens renders filled; picking one invokes `on_pick`. Each caller supplies its
+/// own `id_prefix` (so element ids stay unique across panels) and owns the
+/// surrounding container, since the two panels style and scroll it differently.
+pub(crate) fn value_format_buttons(
+    id_prefix: &'static str,
+    current: ValueFormat,
+    on_pick: impl Fn(ValueFormat, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> Vec<AnyElement> {
+    let on_pick = std::rc::Rc::new(on_pick);
+    VALUE_FORMAT_LENSES
+        .iter()
+        .map(|(suffix, label, fmt)| {
+            let fmt = *fmt;
+            let on_pick = on_pick.clone();
+            // Wrapped in a non-shrinking cell so a narrow inspector overflows (and
+            // scrolls, where the container enables it) instead of compressing the
+            // buttons.
+            div()
+                .flex_shrink_0()
+                .child(
+                    Button::new(
+                        SharedString::from(format!("{id_prefix}-fmt-{suffix}")),
+                        *label,
+                    )
+                    .variant(if current == fmt {
+                        ButtonVariant::Secondary
+                    } else {
+                        ButtonVariant::Ghost
+                    })
+                    .size(ButtonSize::Sm)
+                    .on_click(move |_, window, cx| on_pick(fmt, window, cx)),
+                )
+                .into_any_element()
+        })
+        .collect()
+}
+
 /// All the inspector's persistent state. Present iff the pane is open.
 pub(crate) struct InspectorState {
     /// Scroll position of the value body, kept across frames (the body is
@@ -1021,17 +1076,7 @@ impl AppState {
     fn format_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let border = cx.theme().border;
         let cur = self.inspector_format();
-        let opt =
-            |id: &'static str, label: &'static str, fmt: ValueFormat, cx: &mut Context<Self>| {
-                Button::new(id, label)
-                    .variant(if cur == fmt {
-                        ButtonVariant::Secondary
-                    } else {
-                        ButtonVariant::Ghost
-                    })
-                    .size(ButtonSize::Sm)
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_inspector_format(fmt, cx)))
-            };
+        let view = cx.entity().downgrade();
         div()
             .flex_shrink_0()
             .flex()
@@ -1041,31 +1086,10 @@ impl AppState {
             .py(px(4.))
             .border_b_1()
             .border_color(border)
-            .child(opt("insp-fmt-auto", "Auto", ValueFormat::Auto, cx))
-            .child(opt("insp-fmt-raw", "Raw", ValueFormat::Raw, cx))
-            .child(opt("insp-fmt-json", "JSON", ValueFormat::Json, cx))
-            .child(opt("insp-fmt-hex", "Hex", ValueFormat::Hex, cx))
-            .child(opt("insp-fmt-msgpack", "MsgPack", ValueFormat::MsgPack, cx))
-            .child(opt(
-                "insp-fmt-protobuf",
-                "Protobuf",
-                ValueFormat::Protobuf,
-                cx,
-            ))
-            .child(opt("insp-fmt-pickle", "Pickle", ValueFormat::Pickle, cx))
-            .child(opt(
-                "insp-fmt-timestamp",
-                "Time",
-                ValueFormat::Timestamp,
-                cx,
-            ))
-            .child(opt(
-                "insp-fmt-decompress",
-                "Gzip",
-                ValueFormat::Decompress,
-                cx,
-            ))
-            .child(opt("insp-fmt-bits", "Bits", ValueFormat::Bits, cx))
+            .children(value_format_buttons("insp", cur, move |fmt, _, cx| {
+                view.update(cx, |this, cx| this.set_inspector_format(fmt, cx))
+                    .ok();
+            }))
             .into_any_element()
     }
 

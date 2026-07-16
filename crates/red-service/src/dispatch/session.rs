@@ -89,6 +89,20 @@ impl SessionDriver {
     }
 }
 
+/// Ground an AI turn in whichever seam this session holds. `AiBackend` carries
+/// the same three driver arms as `SessionDriver`, so the mapping is mechanical;
+/// this one impl replaces the match that was otherwise spelled out at each AI
+/// entry point (subscription, ACP, MCP tool context).
+impl From<&SessionDriver> for crate::ai::AiBackend {
+    fn from(driver: &SessionDriver) -> Self {
+        match driver {
+            SessionDriver::Sql(d) => crate::ai::AiBackend::Sql(d.clone()),
+            SessionDriver::Kv(d) => crate::ai::AiBackend::Kv(d.clone()),
+            SessionDriver::Doc(d) => crate::ai::AiBackend::Doc(d.clone()),
+        }
+    }
+}
+
 /// Backstop cap on open results retained per session. The UI evicts a superseded
 /// result (re-sort / filter / tab-close) by sending `CloseResult`, so the live
 /// count tracks the user's open tabs, well under this. The cap is defense in

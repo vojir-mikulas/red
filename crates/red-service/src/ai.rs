@@ -19,8 +19,8 @@ use red_ai::{
     AiProvider, CancelToken, ContentBlock, Message, Role, StopReason, ToolDef, TurnRequest,
 };
 use red_core::doc::{
-    CollKind, DocOpClass, DocPlan, DocSchema, DocUpdate, DocValue, DocWrite, Document, FindQuery,
-    IndexInfo, IndexSpec, classify_doc_op,
+    CollKind, DocPlan, DocSchema, DocUpdate, DocValue, DocWrite, Document, FindQuery, IndexInfo,
+    IndexSpec, OpClass, classify_doc_op,
 };
 use red_core::kv::{
     KeyMeta, KvCollection, KvValue, RespValue, ScanBudget, ScanCursor, analyze_keyspace,
@@ -832,15 +832,33 @@ async fn run_subagent(
     }
 }
 
-/// The tool subset a delegated subagent may use: the parent's catalog minus every
-/// write tool and minus `spawn_subagent` itself, so a subagent can neither mutate
+/// Apply the two membership gates every seam's catalog shares: the tier decides
+/// which tools exist at all, and any write tool is additionally withheld on a
+/// read-only connection so it's never even offered there (Feature B). One helper
+/// so the SQL, KV, and doc catalogs gate identically.
+fn gate_catalog(all: impl IntoIterator<Item = ToolDef>, policy: &AiPolicy) -> Vec<ToolDef> {
+    all.into_iter()
+        .filter(|t| {
+            policy.tier.allows_tool(&t.name) && !(policy.read_only && is_write_tool(&t.name))
+        })
+        .collect()
+}
+
+/// Narrow a parent catalog to what a delegated subagent may use: minus every
+/// write tool and minus `spawn_subagent` itself, so a child can neither mutate
 /// data nor recurse. Narrows (never widens) the parent's tier — even a Write-tier
-/// parent yields a read-only child.
-fn subagent_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
-    tool_catalog(policy)
+/// parent yields a read-only child. The security-critical "read-only,
+/// non-recursive child" rule, in one place for all three seams.
+fn narrow_to_subagent(catalog: Vec<ToolDef>) -> Vec<ToolDef> {
+    catalog
         .into_iter()
         .filter(|t| t.name != "spawn_subagent" && !is_write_tool(&t.name))
         .collect()
+}
+
+/// The tool subset a delegated SQL subagent may use (see [`narrow_to_subagent`]).
+fn subagent_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
+    narrow_to_subagent(tool_catalog(policy))
 }
 
 /// The subagent's system prompt: a focused, read-only worker that reports back.
@@ -854,13 +872,10 @@ fn subagent_system_prompt(task: &str) -> String {
     )
 }
 
-/// The Redis subagent's tool subset: the parent's KV catalog minus writes and
-/// minus `spawn_subagent` (no mutation, no recursion), like [`subagent_catalog`].
+/// The Redis subagent's tool subset: the parent's KV catalog, narrowed like
+/// [`subagent_catalog`].
 fn kv_subagent_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
-    kv_tool_catalog(policy)
-        .into_iter()
-        .filter(|t| t.name != "spawn_subagent" && !is_write_tool(&t.name))
-        .collect()
+    narrow_to_subagent(kv_tool_catalog(policy))
 }
 
 /// The Redis subagent's system prompt (the KV analogue of [`subagent_system_prompt`]).
@@ -1087,13 +1102,7 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             }),
         },
     ];
-    all.into_iter()
-        // The tier gates membership; additionally, the write tool is withheld on a
-        // read-only connection so it's never even offered there (Feature B).
-        .filter(|t| {
-            policy.tier.allows_tool(&t.name) && !(policy.read_only && is_write_tool(&t.name))
-        })
-        .collect()
+    gate_catalog(all, policy)
 }
 
 /// A one-line summary of a tool call's arguments for the activity timeline: the
@@ -1518,13 +1527,7 @@ pub(crate) fn kv_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             }),
         },
     ];
-    all.into_iter()
-        // The tier gates membership; the write tools are additionally withheld on a
-        // read-only connection so they're never even offered there.
-        .filter(|t| {
-            policy.tier.allows_tool(&t.name) && !(policy.read_only && is_write_tool(&t.name))
-        })
-        .collect()
+    gate_catalog(all, policy)
 }
 
 /// Bounded keyspace walk: loop `scan_keys` accumulating metadata until `max_keys`
@@ -3751,20 +3754,13 @@ pub(crate) fn doc_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             }),
         },
     ];
-    all.into_iter()
-        .filter(|t| {
-            policy.tier.allows_tool(&t.name) && !(policy.read_only && is_write_tool(&t.name))
-        })
-        .collect()
+    gate_catalog(all, policy)
 }
 
-/// The doc subagent's tool subset: the parent's doc catalog minus writes and
-/// `spawn_subagent` (no mutation, no recursion), like `kv_subagent_catalog`.
+/// The doc subagent's tool subset: the parent's doc catalog, narrowed like
+/// [`subagent_catalog`].
 fn doc_subagent_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
-    doc_tool_catalog(policy)
-        .into_iter()
-        .filter(|t| t.name != "spawn_subagent" && !is_write_tool(&t.name))
-        .collect()
+    narrow_to_subagent(doc_tool_catalog(policy))
 }
 
 fn doc_subagent_system_prompt(task: &str) -> String {
@@ -4334,7 +4330,7 @@ async fn doc_apply_write(driver: &Arc<dyn DocDriver>, input: &Json) -> (String, 
     };
     // Defense in depth: never run a destructive shape the classifier flags,
     // even though the approval gate already prompted.
-    if classify_doc_op(&write) == DocOpClass::Destructive
+    if classify_doc_op(&write) == OpClass::Destructive
         && let WriteAssessment::Reject(why) = assess_doc_write("propose_doc_write", input)
     {
         return (format!("error: {why}"), false);

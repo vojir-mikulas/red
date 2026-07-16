@@ -6,7 +6,7 @@
 //! principle match a reply to the wrong entry.
 
 use gpui::{Context, Entity, ScrollHandle, Window, div, prelude::*, px};
-use red_core::kv::{CommandClass, RespValue, classify_command, tokenize_command};
+use red_core::kv::{OpClass, RespValue, classify_command, tokenize_command};
 use red_service::{Command, SessionId};
 
 use flint::prelude::*;
@@ -297,7 +297,7 @@ impl AppState {
         else {
             return;
         };
-        if classify_command(&argv) == CommandClass::Destructive {
+        if classify_command(&argv) == OpClass::Destructive {
             console.pending_confirm = Some(argv);
             cx.notify();
             return;
@@ -405,7 +405,7 @@ impl AppState {
         }
         let destructive = commands
             .iter()
-            .filter(|a| classify_command(a) == CommandClass::Destructive)
+            .filter(|a| classify_command(a) == OpClass::Destructive)
             .count();
         if destructive > 0 {
             console.pending_batch = Some(commands);
@@ -993,7 +993,7 @@ impl AppState {
         let batch_confirm = console.pending_batch.as_ref().map(|commands| {
             let destructive = commands
                 .iter()
-                .filter(|a| classify_command(a) == CommandClass::Destructive)
+                .filter(|a| classify_command(a) == OpClass::Destructive)
                 .count();
             let confirm_view = view.clone();
             let cancel_view = view.clone();
@@ -1230,7 +1230,7 @@ mod tests {
         let commands = parse_batch("GET a\nDEL a\nSET b 1\nFLUSHDB\n");
         let destructive = commands
             .iter()
-            .filter(|a| classify_command(a) == CommandClass::Destructive)
+            .filter(|a| classify_command(a) == OpClass::Destructive)
             .count();
         // DEL and FLUSHDB are destructive; GET and SET are not.
         assert_eq!(destructive, 2);

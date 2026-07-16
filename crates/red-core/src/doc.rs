@@ -586,14 +586,7 @@ pub enum DocWrite {
     },
 }
 
-/// How risky a write is. A `Destructive` op needs an explicit confirm even on a
-/// writable connection, so neither the console nor the AI can slip one through;
-/// mirrors `kv::CommandClass`'s `Destructive` arm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DocOpClass {
-    Write,
-    Destructive,
-}
+pub use crate::OpClass;
 
 /// Whether a filter document matches nothing-specific — i.e. it's empty (`{}`),
 /// so an `update`/`delete` over it touches the whole collection. An absent or
@@ -610,7 +603,7 @@ fn filter_is_empty(filter: &Filter) -> bool {
 /// an *un-filtered* `update`/`delete` (which touches the whole collection even
 /// when `many` is false, since Mongo's single-document form still picks an
 /// arbitrary match). Everything else is an ordinary `Write`.
-pub fn classify_doc_op(op: &DocWrite) -> DocOpClass {
+pub fn classify_doc_op(op: &DocWrite) -> OpClass {
     let destructive = match op {
         DocWrite::DropCollection { .. } => true,
         DocWrite::Delete { filter, many, .. } => *many || filter_is_empty(filter),
@@ -621,9 +614,9 @@ pub fn classify_doc_op(op: &DocWrite) -> DocOpClass {
         | DocWrite::CreateIndex { .. } => false,
     };
     if destructive {
-        DocOpClass::Destructive
+        OpClass::Destructive
     } else {
-        DocOpClass::Write
+        OpClass::Write
     }
 }
 
@@ -862,7 +855,7 @@ mod tests {
                 coll: "c".into(),
                 docs: vec![doc()],
             }),
-            DocOpClass::Write
+            OpClass::Write
         );
         assert_eq!(
             classify_doc_op(&DocWrite::Replace {
@@ -871,7 +864,7 @@ mod tests {
                 id: DocValue::Int32(1),
                 doc: doc(),
             }),
-            DocOpClass::Write
+            OpClass::Write
         );
         // A single, filtered delete is an ordinary write.
         assert_eq!(
@@ -881,7 +874,7 @@ mod tests {
                 filter: by_id(),
                 many: false,
             }),
-            DocOpClass::Write
+            OpClass::Write
         );
 
         // Destructive: drop, many, or an un-filtered mutation.
@@ -890,7 +883,7 @@ mod tests {
                 db: "d".into(),
                 coll: "c".into(),
             }),
-            DocOpClass::Destructive
+            OpClass::Destructive
         );
         assert_eq!(
             classify_doc_op(&DocWrite::Delete {
@@ -899,7 +892,7 @@ mod tests {
                 filter: by_id(),
                 many: true,
             }),
-            DocOpClass::Destructive
+            OpClass::Destructive
         );
         assert_eq!(
             classify_doc_op(&DocWrite::Delete {
@@ -908,7 +901,7 @@ mod tests {
                 filter: empty(),
                 many: false,
             }),
-            DocOpClass::Destructive
+            OpClass::Destructive
         );
     }
 

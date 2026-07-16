@@ -163,6 +163,135 @@ fn doc_write_driver(
     }
 }
 
+/// Resolve the live session for a command, emitting `Event::Error("not
+/// connected")` and returning `None` when the envelope carries no session id or
+/// the session has been evicted. The shared front half of every read handler's
+/// guard prologue; arms that instead want to swallow a missing session silently
+/// (a header stat, a best-effort refresh) keep their own inline `get`.
+fn require_session<'a>(
+    sessions: &'a HashMap<SessionId, SessionState>,
+    session_id: Option<SessionId>,
+    events: &Events,
+) -> Option<&'a SessionState> {
+    let id = session_id?;
+    match sessions.get(&id) {
+        Some(state) => Some(state),
+        None => {
+            emit(events, session_id, Event::Error("not connected".into()));
+            None
+        }
+    }
+}
+
+/// Resolve the KV (Redis) driver for a read handler: the session must exist and
+/// be a Redis connection, else the matching `Event::Error` is emitted and `None`
+/// returned. Collapses the two-guard prologue the `Kv*` read arms share (the
+/// write path uses its own read-only-aware resolver). Arms that then supersede
+/// in-flight work re-acquire the session mutably after this returns the owned
+/// driver handle.
+fn require_kv_driver(
+    sessions: &HashMap<SessionId, SessionState>,
+    session_id: Option<SessionId>,
+    events: &Events,
+) -> Option<std::sync::Arc<dyn red_driver::KvDriver>> {
+    match require_session(sessions, session_id, events)?
+        .driver
+        .as_kv()
+        .cloned()
+    {
+        Some(driver) => Some(driver),
+        None => {
+            emit(
+                events,
+                session_id,
+                Event::Error("not a Redis connection".into()),
+            );
+            None
+        }
+    }
+}
+
+/// Resolve the document (MongoDB) driver for a read handler, mirroring
+/// [`require_kv_driver`]. The write path uses [`doc_write_driver`], which also
+/// enforces the read-only posture.
+fn require_doc_driver(
+    sessions: &HashMap<SessionId, SessionState>,
+    session_id: Option<SessionId>,
+    events: &Events,
+) -> Option<std::sync::Arc<dyn red_driver::DocDriver>> {
+    match require_session(sessions, session_id, events)?
+        .driver
+        .as_doc()
+        .cloned()
+    {
+        Some(driver) => Some(driver),
+        None => {
+            emit(
+                events,
+                session_id,
+                Event::Error("not a MongoDB connection".into()),
+            );
+            None
+        }
+    }
+}
+
+/// Like [`require_kv_driver`], but also hands back the live session mutably so
+/// the caller can supersede in-flight work under the same guard. Used by the
+/// `Kv*` read arms that install an [`AbortSignal`] in `state.inflight` after
+/// resolving the driver.
+fn require_kv_driver_mut<'a>(
+    sessions: &'a mut HashMap<SessionId, SessionState>,
+    session_id: Option<SessionId>,
+    events: &Events,
+) -> Option<(
+    &'a mut SessionState,
+    std::sync::Arc<dyn red_driver::KvDriver>,
+)> {
+    let id = session_id?;
+    if !sessions.contains_key(&id) {
+        emit(events, session_id, Event::Error("not connected".into()));
+        return None;
+    }
+    let state = sessions.get_mut(&id)?;
+    let Some(driver) = state.driver.as_kv().cloned() else {
+        emit(
+            events,
+            session_id,
+            Event::Error("not a Redis connection".into()),
+        );
+        return None;
+    };
+    Some((state, driver))
+}
+
+/// Like [`require_doc_driver`], but also hands back the live session mutably, the
+/// document counterpart to [`require_kv_driver_mut`].
+fn require_doc_driver_mut<'a>(
+    sessions: &'a mut HashMap<SessionId, SessionState>,
+    session_id: Option<SessionId>,
+    events: &Events,
+) -> Option<(
+    &'a mut SessionState,
+    std::sync::Arc<dyn red_driver::DocDriver>,
+)> {
+    let id = session_id?;
+    if !sessions.contains_key(&id) {
+        emit(events, session_id, Event::Error("not connected".into()));
+        return None;
+    }
+    let state = sessions.get_mut(&id)?;
+    let Some(driver) = state.driver.as_doc().cloned() else {
+        emit(
+            events,
+            session_id,
+            Event::Error("not a MongoDB connection".into()),
+        );
+        return None;
+    };
+    Some((state, driver))
+}
+
 /// Turn a parsed extended-JSON value into a single [`Document`], or a `Query`
 /// error when it isn't a JSON object.
 fn parse_one_document(value: red_core::doc::DocValue) -> red_core::Result<red_core::doc::Document> {
@@ -563,11 +692,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         };
                         let model = model.clone();
                         // Ground in whichever seam the session holds.
-                        let backend = match &session_driver {
-                            session::SessionDriver::Sql(d) => crate::ai::AiBackend::Sql(d.clone()),
-                            session::SessionDriver::Kv(d) => crate::ai::AiBackend::Kv(d.clone()),
-                            session::SessionDriver::Doc(d) => crate::ai::AiBackend::Doc(d.clone()),
-                        };
+                        let backend = crate::ai::AiBackend::from(&session_driver);
                         let cancel = red_ai::CancelToken::new();
                         lock(&ai_state).register(conversation_id, cancel.clone());
                         tokio::spawn(crate::ai::run_turn(
@@ -590,11 +715,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         // server, which hosts whichever seam this session holds (SQL
                         // schema/query tools, the Redis `kv_*` tools, or the MongoDB
                         // doc tools).
-                        let backend = match &session_driver {
-                            session::SessionDriver::Sql(d) => crate::ai::AiBackend::Sql(d.clone()),
-                            session::SessionDriver::Kv(d) => crate::ai::AiBackend::Kv(d.clone()),
-                            session::SessionDriver::Doc(d) => crate::ai::AiBackend::Doc(d.clone()),
-                        };
+                        let backend = crate::ai::AiBackend::from(&session_driver);
                         let command = command.clone();
                         // The agent loads its own config (and login) from cwd; use
                         // the process working directory.
@@ -1437,17 +1558,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 cursor,
                 budget,
             } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_kv().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a Redis connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_kv_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 // A retyped filter pattern supersedes the previous scan for
@@ -1481,17 +1594,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::KvProbeKey { epoch, key } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_kv().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a Redis connection".into()),
-                    );
+                let Some(driver) = require_kv_driver(&sessions, session_id, &events) else {
                     continue;
                 };
                 let events = events.clone();
@@ -1524,17 +1627,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::KvReadValue { epoch, key } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_kv().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a Redis connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_kv_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 // A new key selection (or a re-selection of the same key)
@@ -1577,17 +1672,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::KvReadStringFull { epoch, key } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_kv().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a Redis connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_kv_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 // Shares the inspector's in-flight slot with `KvReadValue`: a new
@@ -1633,17 +1720,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 cursor,
                 budget,
             } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_kv().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a Redis connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_kv_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 // Its own slot (not `kv_value`): a sibling value read must not
@@ -1678,17 +1757,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 from_head,
                 count,
             } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_kv().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a Redis connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_kv_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 let entry = state.inflight.entry(epoch).or_default();
@@ -1725,17 +1796,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 before,
                 count,
             } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_kv().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a Redis connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_kv_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 let entry = state.inflight.entry(epoch).or_default();
@@ -1763,17 +1826,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::KvStreamGroups { epoch, key } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_kv().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a Redis connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_kv_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 let entry = state.inflight.entry(epoch).or_default();
@@ -1795,17 +1850,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::KvStreamConsumers { epoch, key, group } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_kv().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a Redis connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_kv_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 let entry = state.inflight.entry(epoch).or_default();
@@ -1837,17 +1884,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 group,
                 count,
             } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_kv().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a Redis connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_kv_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 // Shares the `kv_value` slot's sibling `kv_group_detail` with
@@ -1960,7 +1999,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // The driver still runs the read/write split for reads it does
                 // allow.
                 if state.read_only
-                    && red_core::kv::classify_command(&argv) != red_core::kv::CommandClass::Read
+                    && red_core::kv::classify_command(&argv) != red_core::kv::OpClass::Read
                 {
                     emit(
                         &events,
@@ -2063,17 +2102,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 req_base,
                 commands,
             } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_kv().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a Redis connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_kv_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 // Register an abort under the epoch so a `KvBatchStop` can cancel
@@ -2107,8 +2138,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         // line (visible per-command) rather than reaching the
                         // engine, mirroring the console's service-side gate.
                         let result = if read_only
-                            && red_core::kv::classify_command(argv)
-                                != red_core::kv::CommandClass::Read
+                            && red_core::kv::classify_command(argv) != red_core::kv::OpClass::Read
                         {
                             failed += 1;
                             RespValue::Error("this connection is read-only".into())
@@ -2392,17 +2422,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::KvSubscribe { epoch, pattern } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_kv().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a Redis connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_kv_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 let entry = state.inflight.entry(epoch).or_default();
@@ -2484,17 +2506,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::KvNotifyConfig { epoch } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_kv().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a Redis connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_kv_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 let entry = state.inflight.entry(epoch).or_default();
@@ -2556,17 +2570,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::KvSlowlog { epoch, count } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_kv().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a Redis connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_kv_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 let entry = state.inflight.entry(epoch).or_default();
@@ -2628,17 +2634,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::KvMonitor { epoch } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_kv().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a Redis connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_kv_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 let entry = state.inflight.entry(epoch).or_default();
@@ -2711,17 +2709,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::KvClientList { epoch } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_kv().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a Redis connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_kv_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 let entry = state.inflight.entry(epoch).or_default();
@@ -2784,17 +2774,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::DocListDatabases { epoch } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_doc().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a MongoDB connection".into()),
-                    );
+                let Some(driver) = require_doc_driver(&sessions, session_id, &events) else {
                     continue;
                 };
                 let events = events.clone();
@@ -2818,17 +2798,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::DocListCollections { epoch, db } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_doc().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a MongoDB connection".into()),
-                    );
+                let Some(driver) = require_doc_driver(&sessions, session_id, &events) else {
                     continue;
                 };
                 let events = events.clone();
@@ -2862,17 +2832,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 skip,
                 filter,
             } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_doc().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a MongoDB connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_doc_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 // Parse the extended-JSON filter up front so a syntax error is a
@@ -2956,17 +2918,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::DocInferSchema { epoch, db, coll } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_doc().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a MongoDB connection".into()),
-                    );
+                let Some(driver) = require_doc_driver(&sessions, session_id, &events) else {
                     continue;
                 };
                 let events = events.clone();
@@ -2999,17 +2951,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::DocListIndexes { epoch, db, coll } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_doc().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a MongoDB connection".into()),
-                    );
+                let Some(driver) = require_doc_driver(&sessions, session_id, &events) else {
                     continue;
                 };
                 let events = events.clone();
@@ -3043,17 +2985,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 coll,
                 pipeline,
             } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get_mut(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_doc().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a MongoDB connection".into()),
-                    );
+                let Some((state, driver)) =
+                    require_doc_driver_mut(&mut sessions, session_id, &events)
+                else {
                     continue;
                 };
                 // Parse + validate the pipeline shape up front so a bad pipeline is
@@ -3131,17 +3065,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 coll,
                 filter,
             } => {
-                let Some(id) = session_id else { continue };
-                let Some(state) = sessions.get(&id) else {
-                    emit(&events, session_id, Event::Error("not connected".into()));
-                    continue;
-                };
-                let Some(driver) = state.driver.as_doc().cloned() else {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::Error("not a MongoDB connection".into()),
-                    );
+                let Some(driver) = require_doc_driver(&sessions, session_id, &events) else {
                     continue;
                 };
                 let filter = match filter.as_deref().map(|f| driver.parse_ext_json(f)) {
@@ -3227,8 +3151,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // never runs unconfirmed, so neither the UI nor a future agent can
                 // slip one past the prompt.
                 if !confirmed
-                    && red_core::doc::classify_doc_op(&write)
-                        == red_core::doc::DocOpClass::Destructive
+                    && red_core::doc::classify_doc_op(&write) == red_core::doc::OpClass::Destructive
                 {
                     let prompt = doc_write_prompt(&write);
                     emit(
@@ -4195,11 +4118,7 @@ fn resolve_ai_tool_ctx(
     ai_policy: &red_core::AiPolicy,
 ) -> Option<(crate::ai::AiBackend, red_core::AiPolicy)> {
     let state = sessions.get(&session_id?)?;
-    let backend = match &state.driver {
-        SessionDriver::Sql(d) => crate::ai::AiBackend::Sql(d.clone()),
-        SessionDriver::Kv(d) => crate::ai::AiBackend::Kv(d.clone()),
-        SessionDriver::Doc(d) => crate::ai::AiBackend::Doc(d.clone()),
-    };
+    let backend = crate::ai::AiBackend::from(&state.driver);
     let mut effective = ai_policy.with_overrides(state.ai_override.enabled, state.ai_override.tier);
     effective.read_only = state.read_only;
     Some((backend, effective))

@@ -2061,25 +2061,7 @@ impl AppState {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        use crate::inspector::ValueFormat;
-        let opt = |id: &'static str, label: &'static str, fmt: ValueFormat| {
-            let view = cx.entity().downgrade();
-            // Wrapped in a non-shrinking cell so the row overflows (and scrolls)
-            // instead of compressing the buttons when the inspector is narrow.
-            div().flex_shrink_0().child(
-                Button::new(id, label)
-                    .variant(if current == fmt {
-                        ButtonVariant::Secondary
-                    } else {
-                        ButtonVariant::Ghost
-                    })
-                    .size(ButtonSize::Sm)
-                    .on_click(move |_, _, cx| {
-                        view.update(cx, |this, cx| this.kv_set_str_format(session, fmt, cx))
-                            .ok();
-                    }),
-            )
-        };
+        let view = cx.entity().downgrade();
         div()
             // A narrow inspector can't fit all ten lenses; scroll them
             // horizontally rather than clipping the trailing ones off-panel.
@@ -2093,16 +2075,14 @@ impl AppState {
             .border_b_1()
             .border_color(theme.border)
             .overflow_x_scroll()
-            .child(opt("kv-fmt-auto", "Auto", ValueFormat::Auto))
-            .child(opt("kv-fmt-raw", "Raw", ValueFormat::Raw))
-            .child(opt("kv-fmt-json", "JSON", ValueFormat::Json))
-            .child(opt("kv-fmt-hex", "Hex", ValueFormat::Hex))
-            .child(opt("kv-fmt-msgpack", "MsgPack", ValueFormat::MsgPack))
-            .child(opt("kv-fmt-protobuf", "Protobuf", ValueFormat::Protobuf))
-            .child(opt("kv-fmt-pickle", "Pickle", ValueFormat::Pickle))
-            .child(opt("kv-fmt-timestamp", "Time", ValueFormat::Timestamp))
-            .child(opt("kv-fmt-decompress", "Gzip", ValueFormat::Decompress))
-            .child(opt("kv-fmt-bits", "Bits", ValueFormat::Bits))
+            .children(crate::inspector::value_format_buttons(
+                "kv",
+                current,
+                move |fmt, _, cx| {
+                    view.update(cx, |this, cx| this.kv_set_str_format(session, fmt, cx))
+                        .ok();
+                },
+            ))
             .into_any_element()
     }
 

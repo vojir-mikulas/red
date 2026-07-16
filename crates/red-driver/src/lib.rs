@@ -1439,6 +1439,20 @@ pub(crate) fn driver_err(e: impl std::fmt::Display) -> RedError {
     RedError::Driver(e.to_string())
 }
 
+/// The canonical refusal when a write is attempted on a read-only connection.
+/// Every seam that gates its own writes (the KV and Doc drivers; SQL engines
+/// lean on their native read-only mode instead) routes through this so the
+/// refusal is one error variant with one message, rather than each seam picking
+/// its own `Query`/`Driver` shape. Not `Auth`: this is the connection's own
+/// configured policy, not a credentials problem.
+pub(crate) fn refuse_if_read_only(read_only: bool) -> Result<()> {
+    if read_only {
+        Err(RedError::Query("this connection is read-only".into()))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

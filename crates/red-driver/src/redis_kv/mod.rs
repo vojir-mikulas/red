@@ -7,8 +7,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use red_core::kv::{
-    ClientInfo, CollectionKind, CommandClass, KeyMeta, KvCollection, KvCollectionPage, KvElement,
-    KvMessage, KvScanPage, KvStreamPage, KvType, KvValue, PendingEntry, RespValue, ScanBudget,
+    ClientInfo, CollectionKind, KeyMeta, KvCollection, KvCollectionPage, KvElement, KvMessage,
+    KvScanPage, KvStreamPage, KvType, KvValue, OpClass, PendingEntry, RespValue, ScanBudget,
     ScanCursor, SlowlogEntry, StreamConsumer, StreamGroup, StringTtl,
 };
 use red_core::{RedError, Result, Value};
@@ -181,11 +181,7 @@ impl RedisDriver {
     /// explicitly instead. Distinct from `RedError::Auth`: this isn't a
     /// credentials problem, it's the connection's own configured policy.
     fn check_writable(&self) -> Result<()> {
-        if self.read_only {
-            Err(RedError::Query("this connection is read-only".to_string()))
-        } else {
-            Ok(())
-        }
+        crate::refuse_if_read_only(self.read_only)
     }
 
     /// Value search over a scanned page: keep only string keys whose value
@@ -823,7 +819,7 @@ impl KvDriver for RedisDriver {
         let Some(name) = argv.first() else {
             return Err(RedError::Query("empty command".into()));
         };
-        if self.read_only && red_core::kv::classify_command(argv) != CommandClass::Read {
+        if self.read_only && red_core::kv::classify_command(argv) != OpClass::Read {
             self.check_writable()?;
         }
         let mut cmd = redis::cmd(name);

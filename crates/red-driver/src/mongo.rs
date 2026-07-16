@@ -75,11 +75,7 @@ impl MongoDriver {
     /// human and AI write paths both pass through (defense in depth beside the
     /// service's own read-only check).
     fn ensure_writable(&self) -> Result<()> {
-        if self.read_only {
-            Err(RedError::Driver("connection is read-only".into()))
-        } else {
-            Ok(())
-        }
+        crate::refuse_if_read_only(self.read_only)
     }
 
     /// Drain up to `cap` documents from a find cursor into a page, cooperatively

@@ -10,6 +10,30 @@ pub mod doc;
 pub mod kv;
 pub mod typemap;
 
+/// How risky a database operation is, for the read-only gate and the
+/// destructive-operation confirm. Shared across seams: Redis console commands
+/// ([`kv::classify_command`]) and MongoDB writes ([`doc::classify_doc_op`]) both
+/// classify into this, so the confirm-gating logic can match on one type
+/// regardless of engine. A `Destructive` op needs an explicit confirm even on a
+/// writable connection, so neither the console nor the AI can slip one through.
+///
+/// `Read` is only produced by seams that can tell reads from writes (the KV
+/// console); write-only classifiers such as [`doc::classify_doc_op`] never
+/// return it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpClass {
+    /// A read: always allowed, never gated.
+    Read,
+    /// An ordinary write: blocked on a read-only connection, otherwise allowed.
+    Write,
+    /// Wide-blast-radius or irreversible: gated behind a confirm even on a
+    /// writable connection. Covers Redis's key-nuking / server-control family
+    /// (`FLUSHALL`, `DEL`, `SHUTDOWN`, `CONFIG SET`, ...) and the MongoDB
+    /// footguns (dropping a collection, an unfiltered or multi-document
+    /// `update`/`delete`).
+    Destructive,
+}
+
 /// Which database engine a connection targets. Drives driver selection and,
 /// via [`DbKind::all`]/the metadata accessors, how the connection form renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
