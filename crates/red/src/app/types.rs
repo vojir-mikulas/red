@@ -244,6 +244,117 @@ pub(crate) trait TabWorkspace {
     }
 }
 
+/// The split-pane operations (⌘\ open/close, ⌥⌘\ focus, move-tab-across) shared
+/// by the Redis and MongoDB workspaces, whose versions were byte-for-byte copies
+/// modulo the tab type and default width. Implemented by `RedisView`/`MongoView`
+/// only, not SQL: SQL's `split_right` mints its blank tab with `QueryTab::new`
+/// (which needs a `cx` to build the editor entity) and carries editor-focus and
+/// completion side effects, so it keeps its own `AppState`-level methods.
+///
+/// Each method does the field work on the view and returns whether it changed
+/// anything, so the thin `AppState` wrappers `cx.notify()` exactly when the
+/// per-seam originals did (some notified only on a real change).
+pub(crate) trait SplitWorkspace: TabWorkspace {
+    /// Mint a fresh blank tab in `half`, push it, and return its index. The one
+    /// genuinely per-seam step of opening a split (a `RedisTab` vs a `MongoTab`).
+    fn push_blank_tab(&mut self, half: SplitHalf) -> usize;
+    /// The initial width of the secondary pane.
+    fn split_default_width(&self) -> Pixels;
+    /// Dismiss the tab context menu (a move-to-other-half closes it).
+    fn clear_tab_menu(&mut self);
+    /// Index of the tab with stable id `id`, if present.
+    fn tab_idx_of(&self, id: u64) -> Option<usize>;
+
+    /// Open the split: a fresh blank tab in a focused second pane on the right.
+    /// No-op (returns `false`) when already split.
+    fn split_open(&mut self) -> bool {
+        if self.ws_split().is_some() {
+            return false;
+        }
+        let secondary = self.push_blank_tab(SplitHalf::Secondary);
+        let width = self.split_default_width();
+        *self.ws_split_mut() = Some(SplitState {
+            secondary,
+            focus: SplitHalf::Secondary,
+            width,
+            drag: None,
+        });
+        self.normalize_panes();
+        true
+    }
+
+    /// Collapse the split, folding every tab into the single strip and keeping the
+    /// focused half's tab on screen. No-op (returns `false`) when not split.
+    fn split_close(&mut self) -> bool {
+        let Some(s) = self.ws_split_mut().take() else {
+            return false;
+        };
+        let keep = if s.focus == SplitHalf::Secondary {
+            s.secondary
+        } else {
+            self.ws_active()
+        };
+        for t in self.ws_tabs_mut() {
+            t.set_pane(SplitHalf::Primary);
+        }
+        let last = self.ws_tabs().len().saturating_sub(1);
+        self.ws_set_active(keep.min(last));
+        true
+    }
+
+    /// Toggle the split (the ⌘\ action).
+    fn split_toggle(&mut self) {
+        if self.ws_split().is_some() {
+            self.split_close();
+        } else {
+            self.split_open();
+        }
+    }
+
+    /// Point the focused half at `half`. Returns whether it changed.
+    fn split_set_focus(&mut self, half: SplitHalf) -> bool {
+        if let Some(s) = self.ws_split_mut()
+            && s.focus != half
+        {
+            s.focus = half;
+            return true;
+        }
+        false
+    }
+
+    /// Move focus to the other half (the ⌥⌘\ action). Returns whether split.
+    fn split_focus_other(&mut self) -> bool {
+        if let Some(s) = self.ws_split_mut() {
+            s.focus = s.focus.other();
+            return true;
+        }
+        false
+    }
+
+    /// Move the tab with `id` to the other half (tab context menu), opening the
+    /// split first when there isn't one to move to.
+    fn split_move_tab(&mut self, id: u64) {
+        if self.ws_split().is_none() {
+            self.split_open();
+        }
+        let Some(idx) = self.tab_idx_of(id) else {
+            return;
+        };
+        let target = if self.ws_tabs()[idx].pane() == SplitHalf::Primary {
+            SplitHalf::Secondary
+        } else {
+            SplitHalf::Primary
+        };
+        self.ws_tabs_mut()[idx].set_pane(target);
+        self.set_pane_active(target, idx);
+        if let Some(s) = self.ws_split_mut() {
+            s.focus = target;
+        }
+        self.clear_tab_menu();
+        self.normalize_panes();
+    }
+}
+
 #[cfg(test)]
 mod workspace_tests {
     use super::*;

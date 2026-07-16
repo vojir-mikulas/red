@@ -26,7 +26,9 @@ use red_core::doc::{
 };
 use red_service::{Command, Epoch, SessionId};
 
-use crate::app::{AppState, Pane, Phase, SplitHalf, SplitState, TabWorkspace, WorkspaceTab};
+use crate::app::{
+    AppState, Pane, Phase, SplitHalf, SplitState, SplitWorkspace, TabWorkspace, WorkspaceTab,
+};
 
 /// Which view the main area shows for the open collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -440,6 +442,30 @@ impl TabWorkspace for MongoView {
     /// sort ahead within their pane's strip.
     fn pins_sort_first(&self) -> bool {
         true
+    }
+}
+
+impl SplitWorkspace for MongoView {
+    fn push_blank_tab(&mut self, half: SplitHalf) -> usize {
+        let id = self.tab_seq;
+        self.tab_seq += 1;
+        self.tabs.push(MongoTab {
+            id,
+            title: "New tab".to_string(),
+            state: MongoTabState::Empty,
+            pane: half,
+            pinned: false,
+        });
+        self.tabs.len() - 1
+    }
+    fn split_default_width(&self) -> gpui::Pixels {
+        gpui::px(560.)
+    }
+    fn clear_tab_menu(&mut self) {
+        self.tab_menu = None;
+    }
+    fn tab_idx_of(&self, id: u64) -> Option<usize> {
+        self.tab_index_by_id(id)
     }
 }
 

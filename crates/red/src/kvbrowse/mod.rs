@@ -24,7 +24,9 @@ use red_core::kv::{
 };
 use red_service::{Command, SessionId};
 
-use crate::app::{AppState, Phase, SplitHalf, SplitState, TabWorkspace, WorkspaceTab};
+use crate::app::{
+    AppState, Phase, SplitHalf, SplitState, SplitWorkspace, TabWorkspace, WorkspaceTab,
+};
 mod analysis;
 mod inspector;
 mod render;
@@ -1360,6 +1362,30 @@ impl TabWorkspace for RedisView {
     /// within their pane's strip.
     fn pins_sort_first(&self) -> bool {
         true
+    }
+}
+
+impl SplitWorkspace for RedisView {
+    fn push_blank_tab(&mut self, half: SplitHalf) -> usize {
+        let id = self.tab_seq;
+        self.tab_seq += 1;
+        self.tabs.push(RedisTab {
+            id,
+            title: "New tab".to_string(),
+            state: RedisTabState::Empty,
+            pane: half,
+            pinned: false,
+        });
+        self.tabs.len() - 1
+    }
+    fn split_default_width(&self) -> gpui::Pixels {
+        px(520.)
+    }
+    fn clear_tab_menu(&mut self) {
+        self.tab_menu = None;
+    }
+    fn tab_idx_of(&self, id: u64) -> Option<usize> {
+        self.tab_index_by_id(id)
     }
 }
 

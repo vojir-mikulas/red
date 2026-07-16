@@ -6,11 +6,11 @@
 use std::time::Duration;
 
 use flint::prelude::*;
-use gpui::{Context, prelude::*, px};
+use gpui::{Context, prelude::*};
 use red_core::kv::KvType;
 use red_service::{Command, SessionId};
 
-use crate::app::{ActiveConn, AppState, Phase, SplitHalf, SplitState, TabWorkspace};
+use crate::app::{ActiveConn, AppState, Phase, SplitHalf, SplitWorkspace, TabWorkspace};
 
 use super::*;
 
@@ -338,81 +338,22 @@ impl AppState {
 
     // --- split panes ---
 
-    const KV_SPLIT_DEFAULT_WIDTH: f32 = 520.;
-
-    /// Toggle the side-by-side split (the ⌘\ action, routed here for a Redis
-    /// connection): open a second pane, or collapse it when already split.
+    /// Toggle the side-by-side split (⌘\, routed here for a Redis connection):
+    /// open a second focused pane, or collapse it when already split. The split
+    /// mechanics live in [`SplitWorkspace`], shared with the Mongo workspace;
+    /// this wrapper only resolves the view and notifies.
     pub(crate) fn kv_toggle_split(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let split = self
-            .conn_mut(Some(session))
-            .and_then(|a| a.kv_view.as_ref())
-            .is_some_and(|v| v.split.is_some());
-        if split {
-            self.kv_unsplit(session, cx);
-        } else {
-            self.kv_split_right(session, cx);
-        }
-    }
-
-    /// Open the split: a fresh blank tab in a second, focused pane on the right
-    /// (its body shows the type chooser). The left pane keeps its tabs; move a
-    /// tab across with the tab context menu or by dragging.
-    pub(crate) fn kv_split_right(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(view) = self
+        if let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.kv_view.as_mut())
-        else {
-            return;
-        };
-        if view.split.is_some() {
-            return; // already split
+        {
+            view.split_toggle();
+            cx.notify();
         }
-        let id = view.tab_seq;
-        view.tab_seq += 1;
-        view.tabs.push(RedisTab {
-            id,
-            title: "New tab".to_string(),
-            state: RedisTabState::Empty,
-            pane: SplitHalf::Secondary,
-            pinned: false,
-        });
-        let secondary = view.tabs.len() - 1;
-        view.split = Some(SplitState {
-            secondary,
-            focus: SplitHalf::Secondary,
-            width: px(Self::KV_SPLIT_DEFAULT_WIDTH),
-            drag: None,
-        });
-        view.normalize_panes();
-        cx.notify();
     }
 
-    /// Collapse the split: every tab folds into the single strip, keeping the
-    /// focused half's tab on screen.
-    pub(crate) fn kv_unsplit(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(view) = self
-            .conn_mut(Some(session))
-            .and_then(|a| a.kv_view.as_mut())
-        else {
-            return;
-        };
-        let Some(s) = view.split.take() else {
-            return;
-        };
-        let keep = if s.focus == SplitHalf::Secondary {
-            s.secondary
-        } else {
-            view.active_tab
-        };
-        for t in &mut view.tabs {
-            t.pane = SplitHalf::Primary;
-        }
-        view.active_tab = keep.min(view.tabs.len().saturating_sub(1));
-        cx.notify();
-    }
-
-    /// Set the focused half (a per-half mouse-down picks this, so actions target
-    /// the half the user just touched). No-op when not split or unchanged.
+    /// Set the focused half (a per-half mouse-down picks this). No-op when not
+    /// split or unchanged.
     pub(crate) fn kv_set_split_focus(
         &mut self,
         session: SessionId,
@@ -422,10 +363,8 @@ impl AppState {
         if let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.kv_view.as_mut())
-            && let Some(s) = &mut view.split
-            && s.focus != half
+            && view.split_set_focus(half)
         {
-            s.focus = half;
             cx.notify();
         }
     }
@@ -435,13 +374,8 @@ impl AppState {
         if let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.kv_view.as_mut())
-            && let Some(s) = &mut view.split
+            && view.split_focus_other()
         {
-            s.focus = if s.focus == SplitHalf::Primary {
-                SplitHalf::Secondary
-            } else {
-                SplitHalf::Primary
-            };
             cx.notify();
         }
     }
@@ -454,36 +388,13 @@ impl AppState {
         id: u64,
         cx: &mut Context<Self>,
     ) {
-        let is_split = self
-            .conn_mut(Some(session))
-            .and_then(|a| a.kv_view.as_ref())
-            .is_some_and(|v| v.split.is_some());
-        if !is_split {
-            self.kv_split_right(session, cx);
-            // Then move the requested tab into the (now Secondary) pane below.
-        }
-        let Some(view) = self
+        if let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.kv_view.as_mut())
-        else {
-            return;
-        };
-        let Some(idx) = view.tab_index_by_id(id) else {
-            return;
-        };
-        let target = if view.tabs[idx].pane == SplitHalf::Primary {
-            SplitHalf::Secondary
-        } else {
-            SplitHalf::Primary
-        };
-        view.tabs[idx].pane = target;
-        view.set_pane_active(target, idx);
-        if let Some(s) = &mut view.split {
-            s.focus = target;
+        {
+            view.split_move_tab(id);
+            cx.notify();
         }
-        view.tab_menu = None;
-        view.normalize_panes();
-        cx.notify();
     }
 
     /// Pin/unpin the tab with `id` (pinned tabs sort ahead in their strip).
