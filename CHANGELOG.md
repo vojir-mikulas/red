@@ -6,131 +6,82 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-07-20
+
 ### Added
-- MongoDB support: connect to a `mongodb://` or
-  `mongodb+srv://` deployment and explore it in a dedicated document shell. A
-  `database -> collection` tree on the left lists collections with estimated
-  counts and view / time-series badges; selecting one pages its documents into a
-  sampled-column grid (a column per top-level field, nested values shown as
-  extended JSON) and clicking a row opens the full document as pretty-printed
-  extended JSON that preserves BSON types (ObjectId, dates, decimals, binary).
-  Pages are fetched one window at a time and never load a collection whole. The
-  document view takes an extended-JSON find filter (applied on Enter), and each
-  collection has a Schema panel that samples documents to show every field's
-  path, its type distribution (e.g. "string 82% / int 18%"), and how often it is
-  present, plus an Indexes panel listing keys and unique / sparse / ttl / partial
-  properties. A Query panel runs an aggregation pipeline (extended JSON, Cmd+Enter)
-  into a results grid, and an Explain button on the document view reports the
-  winning plan, whether it is a collection scan, the index used, and the
-  documents-examined / returned counts. On a writable connection the inspector
-  edits a document two ways, toggled in its header: a field-by-field Form editor
-  and a raw extended-JSON editor (Cmd+Enter saves). The Form editor gives each
-  field an editable name, a searchable type picker (string / int / double /
-  decimal / bool / date / objectId / null / object / array), and a type-aware
-  value control, with
-  add / remove affordances and collapsible nested objects and arrays so deep
-  documents stay navigable; the `_id` is shown read-only and preserved. Switching
-  to Raw serializes the form so the JSON reflects your edits. The inspector floats
-  over the grid, docked to the right and resizable by dragging its left edge, so
-  the grid keeps its full width instead of being squeezed. The documents also
-  render as an expandable per-document List or a whole-page JSON view, both of
-  which are selectable so you can highlight text and copy it. There are also
-  affordances to insert a new document, delete one, and drop a collection; a
-  destructive
-  operation (dropping a collection, a delete or update touching many documents,
-  or an unfiltered mutation) is held behind an explicit confirm, and every write
-  is refused outright on a read-only connection. The AI assistant (⌘L) is
-  grounded in the MongoDB connection too: it can inspect the deployment, discover
-  a collection's schema and type drift, profile fields, sample and query
-  documents, run aggregations, and explain queries to flag a missing index —
-  and, at the write tier, propose a document write, an index, or a collection
-  operation for you to approve, with the same per-call gate and destructive
-  confirm the manual path uses. The whole shell is keyboard navigable: the
-  collection tree and the document grid take arrow and vim (hjkl, g / G, Ctrl-d /
-  Ctrl-u) motions, Enter (or F2) opens the highlighted collection or document,
-  ⌥⌘1 / ⌥⌘3 jump focus between the tree and the grid, F6 cycles between them, and
-  ⌘F searches the collection sidebar (from the tree) or filters documents (from
-  the grid). The sidebar has a search box that narrows the database / collection
-  tree by name as you type.
-- Searchable, grouped History dock: the left History panel (both the SQL and
-  Redis shells) now has a search box that narrows the list live and collapsible
-  grouped sections. SQL history groups into Today / Yesterday / Earlier time
-  buckets; the Redis dock's "Recently viewed keys" and "Commands" sections each
-  collapse. Each section shows its row count, and a match force-expands its
-  section. The two docks now share one renderer instead of duplicating the chrome.
-- Compare tables (data diff): a new "table: compare against…" command picks two
-  tables in a connection and reports which rows are added, removed, or changed,
-  aligned by the left table's primary key. The result is a full-screen read-only
-  report with a summary (added / removed / changed / unchanged), a filter, and
-  changed cells shown as old → new. Both tables are read key-ordered and
-  streamed, so the comparison never loads either table whole; it reports
-  differences only and never writes.
+- MongoDB support: connect to a `mongodb://` or `mongodb+srv://` deployment and
+  explore it in a dedicated document shell. A database → collection tree lists
+  collections with estimated counts and view / time-series badges; selecting one
+  streams its documents into a continuously scrolling grid (a column per
+  top-level field) that fetches a window at a time and never loads a collection
+  whole. An extended-JSON find filter narrows the view, and the inspector shows a
+  document as pretty-printed extended JSON that preserves BSON types (ObjectId,
+  dates, decimals, binary).
+- MongoDB analysis panels: a Schema panel samples documents to show each field's
+  path, type distribution ("string 82% / int 18%"), and how often it is present;
+  an Indexes panel lists keys and unique / sparse / ttl / partial properties; a
+  Query panel runs an aggregation pipeline into a results grid; and Explain
+  reports the winning plan, the index used, and documents examined / returned.
+- MongoDB editing (writable connections): edit a document with a field-by-field
+  Form editor — editable names, a searchable type picker, collapsible nested
+  objects and arrays, `_id` kept read-only — or a raw extended-JSON editor.
+  Insert, delete, clone, and drop are available; destructive operations sit
+  behind an explicit confirm and every write is refused on a read-only
+  connection.
+- MongoDB workspace: a tabbed workspace like the SQL and Redis browsers.
+  Collections open in reorderable, pinnable tabs (the same collection can open
+  several times, each with its own filter and edits), a split view shows two at
+  once (⌘\), and Table / List / JSON render modes switch how documents display.
+  Standard window chrome — footer status bar, collapsible sidebar (⌘B), docked
+  AI panel — plus full keyboard and vim (hjkl, g/G, Ctrl-d/Ctrl-u) navigation.
+- MongoDB AI assistant (⌘L): grounded in the connection, it inspects the
+  deployment, profiles schemas and type drift, samples and queries documents,
+  runs aggregations, and explains queries to flag missing indexes; at the write
+  tier it proposes document, index, or collection operations to approve behind
+  the same gates as the manual path.
+- Searchable, grouped History dock: the left History panel (SQL and Redis shells)
+  gains a live search box and collapsible grouped sections — SQL by Today /
+  Yesterday / Earlier, Redis by "Recently viewed keys" and "Commands" — each
+  showing its row count and force-expanding on a match.
+- Compare tables (data diff): a new "table: compare against…" command reports
+  which rows are added, removed, or changed between two tables, aligned by the
+  left table's primary key, as a full-screen read-only report (summary, filter,
+  changed cells shown old → new). Both tables are read key-ordered and streamed,
+  so neither loads whole; it never writes.
 - `red mcp <connection>`: a headless stdio MCP server. Point Claude Code (or any
-  MCP client) at `red mcp my-connection` and it gets Red's read-only database
-  tools (schema, describe, profile, SELECT, explain) grounded in that connection,
-  with no GUI and no ports. Writes and GUI-only tools are withheld and a
-  tool-call budget bounds a runaway client, exactly like the in-app MCP path.
-- Redis batch console: the command console has a new Line / Batch toggle. Batch
-  mode is a multi-line composer that runs many commands at once with per-command
-  output streamed back into the log, a live "running N / M" progress readout, and
-  a Stop button that cancels between commands. A destructive command anywhere in
-  the batch is counted and confirmed once up front rather than one prompt per
-  line, and each command still passes the read-only and destructive gates. Load a
-  `.redis`/`.txt` file into the composer or save the buffer back out.
-- Connect through a proxy: the connection form has a new "Connect via proxy"
-  section (network engines) for reaching a database via a SOCKS5 or HTTP CONNECT
-  proxy, with optional proxy-auth username and password. The proxy password is
-  stored in the OS keychain like every other secret. A connection uses either a
-  proxy or an SSH tunnel, not both.
+  MCP client) at `red mcp my-connection` for Red's read-only database tools
+  (schema, describe, profile, SELECT, explain) grounded in that connection, with
+  no GUI and no ports. Writes are withheld and a tool-call budget bounds a
+  runaway client, like the in-app MCP path.
+- Redis batch console: a Line / Batch toggle adds a multi-line composer that runs
+  many commands at once with per-command output, a live "running N / M" readout,
+  and a Stop button. A destructive command is confirmed once up front rather than
+  per line, and each still passes the read-only and destructive gates. Load a
+  `.redis`/`.txt` file or save the buffer back out.
+- Connect through a proxy: a new "Connect via proxy" section (network engines)
+  reaches a database via a SOCKS5 or HTTP CONNECT proxy, with optional auth whose
+  password is stored in the OS keychain. A connection uses either a proxy or an
+  SSH tunnel, not both.
 - Import connections from more tools: alongside DBeaver and DBGate, the import
   wizard now reads JetBrains DataGrip / IntelliJ (`dataSources.xml`),
-  RedisInsight (its saved-databases store), and plain credential files
-  (`~/.pgpass`, `~/.my.cnf`, `~/.pg_service.conf`). Passwords held in a tool's
-  own encrypted store are imported when they're recoverable and otherwise flagged
-  so you can re-enter them, never silently dropped.
-- Vim navigation: an optional keymap setting (Settings -> Keymap, or the
-  "keymap: turn on vim navigation" command) adds `hjkl`, `g`/`G`, `0`/`$`, and
-  `Ctrl-d`/`Ctrl-u` motions to the result grid, the schema tree, and the history
-  dock, alongside the existing arrow keys. Off by default; applies live.
-- Remove all RED data: a "Remove all RED data" action (Settings -> Behavior, the
-  command palette, or `red reset` on the command line) deletes RED's config and
-  cached-data directories and every secret it stored in the OS keychain
-  (connection passwords, SSH keys, AI keys) in one step. It shows exactly what
-  will be removed, is irreversible, and does not touch the RED application binary.
+  RedisInsight, and plain credential files (`~/.pgpass`, `~/.my.cnf`,
+  `~/.pg_service.conf`). Passwords are imported when recoverable and otherwise
+  flagged for re-entry, never silently dropped.
+- Vim navigation: an optional keymap setting adds `hjkl`, `g`/`G`, `0`/`$`, and
+  `Ctrl-d`/`Ctrl-u` motions to the result grid, schema tree, and history dock,
+  alongside the arrow keys. Off by default; applies live.
+- Remove all RED data: a "Remove all RED data" action (Settings → Behavior, the
+  palette, or `red reset`) deletes RED's config and cached-data directories and
+  every keychain secret (connection passwords, SSH keys, AI keys) in one step. It
+  shows what will be removed, is irreversible, and leaves the binary untouched.
 
 ### Changed
-- Delete/destructive confirmations are now unified across the SQL, Redis, and
-  MongoDB shells and governed by a single setting. Deleting a Redis key or a
-  MongoDB document — like running a destructive SQL statement — asks first, and
-  every confirm dialog carries a "Don't ask again" checkbox that turns the guard
-  off for good (it applies to the delete you're confirming too). The Settings →
-  Query → Safety toggle ("Confirm destructive operations", on by default) turns
-  it back on or off at any time. The MongoDB drop-collection confirm stays
-  server-gated and always asks.
-- The MongoDB shell is now a tabbed workspace, matching the SQL and Redis
-  browsers: each collection opens in its own tab, tabs can be reordered by
-  dragging, pinned, and closed, and the work area splits into two side-by-side
-  panes (⌘\, with ⌥⌘\ to switch panes) so you can view two collections at once.
-  ⌘T opens a blank tab, ⌘W closes one, and Ctrl+Tab cycles through them. The
-  same collection can be opened in several independent tabs at once — ⌘-click a
-  collection in the sidebar (or "Duplicate tab" from a tab's context menu) to
-  open another — each with its own filter, paging, inspector, and unsaved edits,
-  so you can browse or edit different documents of one collection side by side.
-  A plain click still fills a focused blank tab or focuses an already-open tab.
-- The document view gains three switchable render modes: the sampled-column
-  Table, a List mode that shows one expandable card per document with a
-  per-field tree (nested objects and arrays indented) and per-document Edit /
-  Clone / Delete actions, and a JSON mode that pretty-prints each document as
-  extended JSON. "Clone" opens a copy of a document in the insert editor with a
-  fresh `_id`.
-- The MongoDB shell gains the same window chrome as the SQL and Redis shells: a
-  footer status bar (connection target and name, read-only badge, the focused
-  collection's document range, and the server version), a collections sidebar
-  that is resizable by dragging its edge and collapsible with ⌘B, and the AI
-  assistant docked as a resizable right panel toggled from the footer (or ⌘L).
-  The per-collection toolbar was reorganised so it no longer overflows: the
-  collection name and panel tabs sit on their own row, the filter bar spans the
-  width below them, and Explain / New / Drop moved into an "Actions" dropdown.
+- Delete/destructive confirmations are unified across the SQL, Redis, and MongoDB
+  shells under one setting. Deleting a Redis key or a MongoDB document now asks
+  first like a destructive SQL statement, and every confirm dialog carries a
+  "Don't ask again" checkbox (Settings → Query → "Confirm destructive
+  operations", on by default, turns it back on). The MongoDB drop-collection
+  confirm stays server-gated and always asks.
 
 ## [0.17.0] - 2026-07-14
 
