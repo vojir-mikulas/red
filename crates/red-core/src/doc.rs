@@ -320,6 +320,25 @@ pub struct FindQuery {
     pub batch: usize,
 }
 
+/// A keyset seek into an `_id`-ordered browse: which boundary to page from and
+/// in which direction. The browse grid's continuous scroll reads windows this
+/// way rather than by `skip`, so a deep window costs O(window) on the always
+/// present `_id` index instead of O(skip). The `_id` sort is implied and total
+/// (BSON orders `_id` across mixed types), so the three arms cover the whole
+/// scroll: seed at the start, extend either way, or land at an exact ordinal.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DocSeek {
+    /// The first window (`after` is `None`), or the window strictly after the
+    /// boundary `_id` (`{_id: {$gt: after}}`). Rows come back ascending.
+    Forward { after: Option<DocValue> },
+    /// The window strictly before the boundary `_id` (`{_id: {$lt: before}}`),
+    /// returned ascending so it prepends onto the resident run in order.
+    Backward { before: DocValue },
+    /// Land exactly at ordinal `skip` (`find().sort(_id).skip(skip)`), the
+    /// scrollbar's far jump. Exact (not interpolated), so ordinals stay precise.
+    Jump { skip: u64 },
+}
+
 /// One window of documents plus the server cursor to continue from. `cursor` is
 /// `None` when the whole result fit in this batch; `exhausted` is the explicit
 /// "no more documents" flag (a `Some(cursor)` with `exhausted` never happens).

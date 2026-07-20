@@ -14,8 +14,8 @@
 use async_trait::async_trait;
 use red_core::Result;
 use red_core::doc::{
-    CollectionInfo, DbInfo, DocCursor, DocPage, DocPlan, DocSchema, DocTopology, DocUpdate,
-    DocValue, Document, Filter, FindQuery, IndexInfo, IndexSpec,
+    CollectionInfo, DbInfo, DocCursor, DocPage, DocPlan, DocSchema, DocSeek, DocTopology,
+    DocUpdate, DocValue, Document, Filter, FindQuery, IndexInfo, IndexSpec,
 };
 
 use crate::AbortSignal;
@@ -53,6 +53,23 @@ pub trait DocDriver: Send + Sync {
     /// cursor (`getMore`, [`next_batch`](Self::next_batch)) handles large forward
     /// scans.
     async fn find(&self, q: &FindQuery, abort: &AbortSignal) -> Result<DocPage>;
+
+    /// One `_id`-keyset window for the browse grid's continuous scroll: the docs
+    /// ordered by `_id` ascending, seeked relative to a boundary `_id` per
+    /// [`DocSeek`], narrowed by the same `filter` a `find` takes. O(window) at any
+    /// depth on the always present `_id` index (unlike the O(skip) `find`), except
+    /// a [`DocSeek::Jump`] which pays one `skip` to land at an exact ordinal.
+    /// Returns at most `limit` documents, always in ascending `_id` order.
+    /// Cancellable via `abort`; never materializes more than the window.
+    async fn find_seek(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: Option<&Filter>,
+        seek: DocSeek,
+        limit: usize,
+        abort: &AbortSignal,
+    ) -> Result<Vec<Document>>;
 
     /// One document by `_id` (`findOne({_id})`), for the inspector's
     /// full-fidelity raw-document view. `Ok(None)` when no document matches, not
@@ -252,6 +269,39 @@ mod tests {
                 cursor: None,
                 exhausted,
             })
+        }
+        async fn find_seek(
+            &self,
+            db: &str,
+            coll: &str,
+            _filter: Option<&Filter>,
+            seek: DocSeek,
+            limit: usize,
+            _abort: &AbortSignal,
+        ) -> Result<Vec<Document>> {
+            // The double treats its insertion order as the `_id` order, enough to
+            // exercise the seek arms without a BSON collator.
+            let all = self.docs(db, coll);
+            let pos = |id: &DocValue| all.iter().position(|d| &d.id == id);
+            let slice: Vec<Document> = match seek {
+                DocSeek::Forward { after: None } => all.iter().take(limit).cloned().collect(),
+                DocSeek::Forward { after: Some(id) } => {
+                    let start = pos(&id).map_or(all.len(), |i| i + 1);
+                    all.iter().skip(start).take(limit).cloned().collect()
+                }
+                DocSeek::Backward { before } => {
+                    let end = pos(&before).unwrap_or(0);
+                    let start = end.saturating_sub(limit);
+                    all[start..end].to_vec()
+                }
+                DocSeek::Jump { skip } => all
+                    .iter()
+                    .skip(skip as usize)
+                    .take(limit)
+                    .cloned()
+                    .collect(),
+            };
+            Ok(slice)
         }
         async fn get_document(
             &self,

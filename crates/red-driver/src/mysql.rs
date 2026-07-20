@@ -395,10 +395,13 @@ impl DatabaseDriver for MysqlDriver {
 
     async fn foreign_keys(&self) -> Result<Vec<FkEdge>> {
         // `key_column_usage` carries the referenced endpoint per FK column with a
-        // reliable `ordinal_position`, so composite keys group correctly. Scope to
-        // the connected database (`DATABASE()`) to match `list_objects`.
+        // reliable `ordinal_position`, so composite keys group correctly. Scope the
+        // same way `list_objects` does — one named database, or every non-system
+        // database the connection can see — so the emitted `from_schema` matches the
+        // schema the tree browses. (`DATABASE()` is the DSN's default database, which
+        // is unrelated to `self.scope` and NULL when the DSN carries no database.)
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
-        let rows: Vec<(
+        type FkQueryRow = (
             String,
             String,
             String,
@@ -406,18 +409,29 @@ impl DatabaseDriver for MysqlDriver {
             String,
             String,
             String,
-        )> = conn
-            .exec(
-                "SELECT table_schema, table_name, column_name, \
+        );
+        const SELECT: &str = "SELECT table_schema, table_name, column_name, \
                         referenced_table_schema, referenced_table_name, referenced_column_name, \
                         constraint_name \
                  FROM information_schema.key_column_usage \
-                 WHERE referenced_table_name IS NOT NULL AND table_schema = DATABASE() \
-                 ORDER BY table_schema, table_name, constraint_name, ordinal_position",
-                (),
+                 WHERE referenced_table_name IS NOT NULL";
+        const ORDER: &str =
+            " ORDER BY table_schema, table_name, constraint_name, ordinal_position";
+        let rows: Vec<FkQueryRow> = if let Some(scope) = &self.scope {
+            conn.exec(
+                format!("{SELECT} AND table_schema = ?{ORDER}"),
+                (scope.clone(),),
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(driver_err)?
+        } else {
+            conn.query(format!(
+                "{SELECT} AND table_schema NOT IN \
+                   ('information_schema', 'performance_schema', 'mysql', 'sys'){ORDER}"
+            ))
+            .await
+            .map_err(driver_err)?
+        };
         let edges = crate::group_fk_edges(rows.into_iter().map(
             |(from_schema, from_table, from_column, to_schema, to_table, to_column, constraint)| {
                 crate::FkRow {

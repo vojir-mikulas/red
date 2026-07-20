@@ -78,9 +78,13 @@ impl AppState {
                 return;
             }
         }
-        // Build the collection's state (its own epoch) before borrowing the view.
+        // Build the collection's state (its own epoch) before borrowing the view,
+        // and seed its first window (this also fetches the count). The grid's
+        // load-on-scroll takes over from there.
         let epoch = crate::result::next_kv_epoch();
-        let coll_view = CollView::new(epoch, db.clone(), coll.clone(), cx);
+        let sender = self.service.command_sender(session);
+        let coll_view = CollView::new(epoch, db.clone(), coll.clone(), sender, cx);
+        coll_view.seed_browse();
         let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_mut())
@@ -113,16 +117,6 @@ impl AppState {
         };
         view.set_pane_active(half, idx);
         view.tab_scroll.scroll_to_item(idx);
-        self.service.send_to(
-            session,
-            Command::DocFetchPage {
-                epoch,
-                db,
-                coll,
-                skip: 0,
-                filter: None,
-            },
-        );
         cx.notify();
     }
 
@@ -153,15 +147,18 @@ impl AppState {
         let Some((db, coll, filter)) = src else {
             return;
         };
-        // Build the copy (its own epoch) and seed its filter before borrowing view.
+        // Build the copy (its own epoch), seed its filter, then seed the browse
+        // (which reads that filter) before borrowing the view.
         let epoch = crate::result::next_kv_epoch();
-        let mut coll_view = CollView::new(epoch, db.clone(), coll.clone(), cx);
+        let sender = self.service.command_sender(session);
+        let mut coll_view = CollView::new(epoch, db.clone(), coll.clone(), sender, cx);
         coll_view.filter = filter.clone();
         if let Some(f) = &filter {
             coll_view
                 .filter_input
                 .update(cx, |input, cx| input.set_content(f.clone(), cx));
         }
+        coll_view.seed_browse();
         let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_mut())
@@ -181,16 +178,6 @@ impl AppState {
         let idx = view.tabs.len() - 1;
         view.set_pane_active(half, idx);
         view.tab_scroll.scroll_to_item(idx);
-        self.service.send_to(
-            session,
-            Command::DocFetchPage {
-                epoch,
-                db,
-                coll,
-                skip: 0,
-                filter,
-            },
-        );
         cx.notify();
     }
 
@@ -540,34 +527,20 @@ impl AppState {
         }
     }
 
-    /// ⌘R: reload the databases list and re-fetch the focused collection's page.
+    /// ⌘R: reload the databases list and re-seed the focused collection's browse
+    /// (back to the first window; the count is re-read too).
     pub(crate) fn doc_refresh(&mut self, session: SessionId, cx: &mut Context<Self>) {
         self.doc_start_browse(session, cx);
-        let params = self
+        if let Some(c) = self
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_mut())
             .and_then(|v| v.focused_coll_mut())
-            .map(|c| {
-                c.loading = true;
-                (
-                    c.epoch,
-                    c.db.clone(),
-                    c.coll.clone(),
-                    c.skip,
-                    c.filter.clone(),
-                )
-            });
-        if let Some((epoch, db, coll, skip, filter)) = params {
-            self.service.send_to(
-                session,
-                Command::DocFetchPage {
-                    epoch,
-                    db,
-                    coll,
-                    skip,
-                    filter,
-                },
-            );
+        {
+            c.loading = true;
+            c.inspector = None;
+            c.inspector_doc = None;
+            c.expanded_rows.clear();
+            c.seed_browse();
         }
         cx.notify();
     }

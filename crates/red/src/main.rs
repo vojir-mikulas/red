@@ -22,6 +22,7 @@ mod env;
 mod er;
 mod filter;
 mod find;
+mod gridwindow;
 mod history;
 mod history_panel;
 mod icons;

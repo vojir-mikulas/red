@@ -16,7 +16,9 @@ use gpui::{
 use red_core::doc::{CollKind, DocPlan, Document};
 use red_service::SessionId;
 
+use super::window::{FetchCtx, place_window};
 use crate::app::{ActiveConn, AppState, Phase, SplitHalf, TabWorkspace};
+use crate::result::group_digits;
 
 use super::*;
 
@@ -265,22 +267,16 @@ impl AppState {
             .child(div().min_w_0().truncate().child(config.name.clone()))
             .children(read_only_badge);
 
-        // Right: the focused collection's document range.
+        // Right: the focused collection's document count (the whole collection,
+        // not one window; the grid scrolls the whole thing).
         let counts = active
             .doc_view
             .as_ref()
             .and_then(|v| v.focused_coll())
-            .map(|c| {
-                if c.loading {
-                    "loading…".to_string()
-                } else if c.docs.is_empty() {
-                    "0 documents".to_string()
-                } else {
-                    let start = c.skip + 1;
-                    let end = c.skip + c.docs.len() as u64;
-                    let total = c.total.map(|t| format!(" of {t}")).unwrap_or_default();
-                    format!("{start}\u{2013}{end}{total}")
-                }
+            .map(|c| match c.window.borrow().total() {
+                Some(0) => "0 documents".to_string(),
+                Some(total) => format!("{} documents", group_digits(total)),
+                None => "loading\u{2026}".to_string(),
             });
         let status_right = div()
             .flex()
@@ -1235,8 +1231,6 @@ impl AppState {
                 });
 
             let run_view = view.clone();
-            let prev_view = view.clone();
-            let next_view = view.clone();
             let actions_view = view.clone();
             let actions_button = div()
                 .id("doc-actions")
@@ -1293,28 +1287,6 @@ impl AppState {
                                 .ok();
                         }),
                 )
-                .child(
-                    Button::new("doc-prev", "Prev")
-                        .size(ButtonSize::Sm)
-                        .variant(ButtonVariant::Secondary)
-                        .disabled(current.skip == 0 || current.loading)
-                        .on_click(move |_, _, cx| {
-                            prev_view
-                                .update(cx, |this, cx| this.doc_page(session, false, cx))
-                                .ok();
-                        }),
-                )
-                .child(
-                    Button::new("doc-next", "Next")
-                        .size(ButtonSize::Sm)
-                        .variant(ButtonVariant::Secondary)
-                        .disabled(current.exhausted || current.loading)
-                        .on_click(move |_, _, cx| {
-                            next_view
-                                .update(cx, |this, cx| this.doc_page(session, true, cx))
-                                .ok();
-                        }),
-                )
                 .child(actions_button);
             header = header.child(toolbar);
         }
@@ -1335,7 +1307,7 @@ impl AppState {
         theme: &Theme,
         view: &WeakEntity<AppState>,
     ) -> gpui::AnyElement {
-        let content = if current.docs.is_empty() && !current.loading {
+        let content = if current.window.borrow().total() == Some(0) {
             doc_centered_hint("No documents.", theme)
         } else {
             match current.view_mode {
@@ -1525,20 +1497,54 @@ impl AppState {
             })
             .collect();
 
-        let docs = Rc::new(current.docs.clone());
+        // Resolve (and possibly re-center) the virtual-scroll window for this
+        // frame; the list lays out only `win.len` rows offset by `base`, so it
+        // scrolls the whole collection without exceeding the `f32` layout ceiling.
+        let row_height = self.settings.grid.density.row_height();
+        let win = current
+            .window
+            .borrow()
+            .prepare_window(&current.scroll, row_height);
+        let base = win.base;
+        let total = current.window.borrow().row_count();
+
+        // Snapshot the resident documents (and their anchor) into the render
+        // closure; `render_row` gets window-local indices, mapped back to absolute
+        // ordinals to read the run.
+        let (anchor, resident) = {
+            let w = current.window.borrow();
+            let (anchor, docs) = w.resident();
+            (anchor, Rc::new(docs.iter().cloned().collect::<Vec<_>>()))
+        };
         let cols = Rc::new(current.columns.clone());
-        let render_docs = docs.clone();
         let render_cols = cols.clone();
         let text = theme.text;
         let faint = theme.text_faint;
         let select_view = view.clone();
         let nav_view = view.clone();
-        // The keyboard cursor drives the highlight once the grid has been touched;
-        // before that it falls back to the inspected row.
-        let selected = current.cursor.or(current.inspector);
 
-        Table::<()>::new("doc-grid", columns)
-            .row_count(current.docs.len())
+        // The keyboard cursor (absolute) drives the highlight; before it is set it
+        // falls back to the inspected row. `Table::selected` is window-local.
+        let selected = current
+            .cursor
+            .or(current.inspector)
+            .and_then(|s| s.checked_sub(base))
+            .filter(|&local| local < win.len);
+
+        // Load-on-scroll: the paint closure advances the run (evict + fetch)
+        // without re-entering the view, exactly like the SQL grid.
+        let window_rc = current.window.clone();
+        let sender = current.sender.clone();
+        let (db, coll, filter, epoch) = (
+            current.db.clone(),
+            current.coll.clone(),
+            current.filter.clone(),
+            current.epoch,
+        );
+
+        let table = Table::<()>::new("doc-grid", columns)
+            .row_count(win.len)
+            .row_height(row_height)
             .grid_lines(true)
             .text_size(theme.scale(12.))
             .track_scroll(&current.scroll)
@@ -1553,21 +1559,41 @@ impl AppState {
             })
             .selected(selected)
             .on_select(move |ix, _click, window, cx| {
+                let ord = base + ix;
                 select_view
                     .update(cx, |this, cx| {
                         // A click plants the keyboard cursor and focuses the grid so
                         // arrows continue from the clicked row.
                         if let Some(current) = this.doc_focused_coll_mut(session) {
-                            current.cursor = Some(ix);
+                            current.cursor = Some(ord);
                             let handle = current.list_focus.clone();
                             window.focus(&handle, cx);
                         }
-                        this.doc_toggle_inspector(session, ix, cx);
+                        this.doc_toggle_inspector(session, ord, cx);
                     })
                     .ok();
             })
+            .on_visible_range(move |range, window, _| {
+                // `range` is window-local; the run is keyed by absolute ordinal.
+                let abs = (base + range.start)..(base + range.end);
+                let ctx = FetchCtx {
+                    epoch,
+                    db: &db,
+                    coll: &coll,
+                    filter: filter.as_deref(),
+                };
+                let settled = window_rc.borrow_mut().ensure(abs, &ctx, &sender);
+                // Mid-fling we skipped fetching; ask for another paint so the
+                // window the scroll settles on still gets loaded.
+                if !settled {
+                    window.refresh();
+                }
+            })
             .render_row(move |ix, _window, _cx| {
-                let Some(doc) = render_docs.get(ix) else {
+                let Some(doc) = (base + ix)
+                    .checked_sub(anchor)
+                    .and_then(|i| resident.get(i))
+                else {
                     return Vec::new();
                 };
                 render_cols
@@ -1582,7 +1608,32 @@ impl AppState {
                         None => div().text_color(faint).child("\u{2014}").into_any_element(),
                     })
                     .collect()
-            })
+            });
+
+        // The fraction-mapped scrollbar spans the whole collection (not the
+        // f32-bounded window the list lays out), so the thumb is honest at
+        // millions of documents; a scrub relocates the window with one exact seek.
+        let scrub_scroll = current.scroll.clone();
+        let scrub_window = current.window.borrow().window_base_handle();
+        let scrub_view = view.clone();
+        let rh = f32::from(row_height);
+        let scrollbar = Scrollbar::new("doc-scrollbar", &current.scrollbar)
+            .fraction(win.fraction)
+            .thumb(win.thumb)
+            .on_scrub(move |fraction, _, cx| {
+                let target = (fraction as f64 * total.saturating_sub(1) as f64).round() as usize;
+                place_window(&scrub_window, &scrub_scroll, total, target, rh);
+                scrub_view.update(cx, |_this, cx| cx.notify()).ok();
+            });
+
+        div()
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .min_h(px(0.))
+            .child(div().flex_1().min_h(px(0.)).child(table))
+            .child(scrollbar)
             .into_any_element()
     }
 
@@ -1601,16 +1652,24 @@ impl AppState {
         view: &WeakEntity<AppState>,
     ) -> gpui::AnyElement {
         // Per-row data the list closure indexes into (built once per render, not
-        // per painted frame).
+        // per painted frame). The List mode lays out the resident window by local
+        // index; expansion and selectable blocks are keyed by absolute ordinal.
+        let (anchor, resident) = {
+            let w = current.window.borrow();
+            let (anchor, docs) = w.resident();
+            (anchor, docs.iter().cloned().collect::<Vec<_>>())
+        };
         let rows: Rc<Vec<DocCardRow>> = Rc::new(
-            current
-                .docs
+            resident
                 .iter()
                 .enumerate()
-                .map(|(i, doc)| DocCardRow {
-                    id_label: SharedString::from(format!("_id: {}", doc.id.to_cell(CELL_CAP))),
-                    expanded: current.expanded_rows.contains(&i),
-                    label: current.list_labels.get(&i).cloned(),
+                .map(|(i, doc)| {
+                    let ord = anchor + i;
+                    DocCardRow {
+                        id_label: SharedString::from(format!("_id: {}", doc.id.to_cell(CELL_CAP))),
+                        expanded: current.expanded_rows.contains(&ord),
+                        label: current.list_labels.get(&ord).cloned(),
+                    }
                 })
                 .collect(),
         );
@@ -1623,7 +1682,7 @@ impl AppState {
                 return div().into_any_element();
             };
             let header = doc_list_header(
-                ix,
+                anchor + ix,
                 row.expanded,
                 &row.id_label,
                 session,
@@ -1862,8 +1921,8 @@ impl AppState {
     fn render_doc_readonly_body(&self, current: &CollView, theme: &Theme) -> gpui::AnyElement {
         const MAX_LINES: usize = 5_000;
         let json = current
-            .inspector
-            .and_then(|row| current.docs.get(row))
+            .inspector_doc
+            .as_ref()
             .map(|d| pretty_extjson(&d.to_doc_value()))
             .unwrap_or_default();
         let lines: Vec<SharedString> = json

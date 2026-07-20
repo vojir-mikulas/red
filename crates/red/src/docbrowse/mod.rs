@@ -11,10 +11,15 @@
 mod form;
 mod render;
 mod tabs;
+mod window;
 
 pub(crate) use form::{DocForm, InspectorMode};
 
+use window::{DocWindow, FetchCtx};
+
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use flint::prelude::*;
 use gpui::{
@@ -22,9 +27,9 @@ use gpui::{
     UniformListScrollHandle, Window, prelude::*,
 };
 use red_core::doc::{
-    CollectionInfo, DbInfo, DocPlan, DocSchema, DocValue, DocWrite, Document, IndexInfo,
+    CollectionInfo, DbInfo, DocPlan, DocSchema, DocSeek, DocValue, DocWrite, Document, IndexInfo,
 };
-use red_service::{Command, Epoch, SessionId};
+use red_service::{Command, CommandSender, Epoch, SessionId};
 
 use crate::app::{
     AppState, Pane, Phase, SplitHalf, SplitState, SplitWorkspace, TabWorkspace, WorkspaceTab,
@@ -72,10 +77,6 @@ impl DocViewMode {
         (DocViewMode::Json, "JSON"),
     ];
 }
-
-/// Documents fetched per page. Matches the service's `DOC_PAGE_ROWS` so a
-/// "next page" advances `skip` by exactly one window.
-const PAGE: u64 = 100;
 
 /// Display byte cap for a grid cell's text (nested values render as capped
 /// extended JSON; the inspector shows the full document). The red crate doesn't
@@ -212,25 +213,31 @@ struct CollView {
     epoch: Epoch,
     db: String,
     coll: String,
-    /// The resident window of documents (one `PAGE`), or empty while loading.
-    docs: Vec<Document>,
-    /// The offset of this window into the collection.
-    skip: u64,
-    /// The collection's total document count, once the first page reported it.
-    total: Option<u64>,
-    /// Whether this is the last window (no further pages).
-    exhausted: bool,
-    /// Whether a `DocFetchPage` is in flight (shows a loading hint).
+    /// This session's command sender, bound at open so the grid's load-on-scroll
+    /// (`DocWindow::ensure`, called from the paint closure) can issue a
+    /// `DocFetchRun` without re-entering the view entity.
+    sender: CommandSender,
+    /// The windowed `_id`-keyset document run behind the grid: the browse's
+    /// continuous scroll over a collection of any size (see [`DocWindow`]). Shared
+    /// via `Rc<RefCell>` so the grid's paint-time `on_visible_range` closure can
+    /// advance it (evict + fetch on scroll) without re-entering the view entity.
+    window: Rc<RefCell<DocWindow>>,
+    /// Whether a fetch is in flight (shows a loading hint) before the run first
+    /// reports its total.
     loading: bool,
-    /// The union of top-level field names across the window (`_id` first),
-    /// capped to [`MAX_COLUMNS`]; the grid's columns.
+    /// The union of top-level field names seen across resident documents (`_id`
+    /// first), capped to [`MAX_COLUMNS`]; the grid's columns. Accumulated so
+    /// columns don't flicker as the window scrolls onto documents of other shapes.
     columns: Vec<String>,
     /// How the Documents panel renders each document (table / list / json).
     view_mode: DocViewMode,
-    /// The documents expanded in List mode, by row index.
+    /// The documents expanded in List mode, by absolute ordinal.
     expanded_rows: BTreeSet<usize>,
-    /// The document row open in the inspector, if any.
+    /// The document open in the inspector, by absolute ordinal, if any.
     inspector: Option<usize>,
+    /// A snapshot of the inspected document, held so the inspector (and its
+    /// save/delete) survives the row scrolling out of the resident window.
+    inspector_doc: Option<Document>,
     /// Whether the inspector is composing a *new* document (insert mode) rather
     /// than editing the selected row.
     inspector_insert: bool,
@@ -266,6 +273,9 @@ struct CollView {
     query_loading: bool,
     query_scroll: UniformListScrollHandle,
     scroll: UniformListScrollHandle,
+    /// The grid's fraction-mapped scrollbar drag state (sized over the whole
+    /// collection, not the resident window).
+    scrollbar: ScrollbarState,
     /// The JSON render mode's per-document selectable blocks: one
     /// [`SelectableLabel`] per document holding its pretty extended JSON, rendered
     /// through a virtualized [`ListState`] so only on-screen documents are laid
@@ -284,14 +294,20 @@ struct CollView {
     /// Shared "who owns the live selection" cell for the List/JSON blocks.
     selection_group: SelectionGroup,
     list_focus: FocusHandle,
-    /// The keyboard row cursor over `docs` (arrow / vim motions), or `None`
-    /// before the grid has been touched. Drives the grid highlight and the
+    /// The keyboard row cursor as an absolute ordinal (arrow / vim motions), or
+    /// `None` before the grid has been touched. Drives the grid highlight and the
     /// Enter-to-inspect target, falling back to the inspected row.
     cursor: Option<usize>,
 }
 
 impl CollView {
-    fn new(epoch: Epoch, db: String, coll: String, cx: &mut Context<AppState>) -> Self {
+    fn new(
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        sender: CommandSender,
+        cx: &mut Context<AppState>,
+    ) -> Self {
         let filter_input = cx.new(|cx| {
             TextInput::new(cx).with_placeholder("filter, e.g. { \"status\": \"active\" }")
         });
@@ -347,15 +363,14 @@ impl CollView {
             epoch,
             db,
             coll,
-            docs: Vec::new(),
-            skip: 0,
-            total: None,
-            exhausted: false,
+            sender,
+            window: Rc::new(RefCell::new(DocWindow::new())),
             loading: true,
             columns: Vec::new(),
             view_mode: DocViewMode::Table,
             expanded_rows: BTreeSet::new(),
             inspector: None,
+            inspector_doc: None,
             inspector_insert: false,
             inspector_mode: InspectorMode::Form,
             form: None,
@@ -372,6 +387,7 @@ impl CollView {
             query_loading: false,
             query_scroll: UniformListScrollHandle::new(),
             scroll: UniformListScrollHandle::new(),
+            scrollbar: ScrollbarState::new(),
             json_labels: Vec::new(),
             json_list: new_doc_list_state(0),
             list_state: new_doc_list_state(0),
@@ -383,20 +399,71 @@ impl CollView {
     }
 
     /// (Re)build the JSON render mode's per-document selectable blocks for the
-    /// current window and resize its virtualized list. Cheap to hold (each label
-    /// only shapes its text when actually painted).
+    /// resident window and resize its virtualized list. Cheap to hold (each label
+    /// only shapes its text when actually painted). The blocks are keyed by
+    /// absolute ordinal so the highlight follows a document as the window slides.
     fn rebuild_json_labels(&mut self, cx: &mut Context<AppState>) {
         let group = self.selection_group.clone();
-        self.json_labels = self
-            .docs
+        let (anchor, docs) = {
+            let w = self.window.borrow();
+            let (anchor, resident) = w.resident();
+            (anchor, resident.iter().cloned().collect::<Vec<_>>())
+        };
+        self.json_labels = docs
             .iter()
             .enumerate()
             .map(|(i, doc)| {
                 let text = pretty_extjson(&doc.to_doc_value());
-                cx.new(|cx| SelectableLabel::new(text, cx).selection_group(group.clone(), i as u64))
+                let ord = (anchor + i) as u64;
+                cx.new(|cx| SelectableLabel::new(text, cx).selection_group(group.clone(), ord))
             })
             .collect();
         self.json_list.reset(self.json_labels.len());
+    }
+
+    /// The addressing a fetch needs, borrowed from this collection tab's state.
+    fn fetch_ctx(&self) -> FetchCtx<'_> {
+        FetchCtx {
+            epoch: self.epoch,
+            db: &self.db,
+            coll: &self.coll,
+            filter: self.filter.as_deref(),
+        }
+    }
+
+    /// Seed (or re-seed) the browse: reset the run and fetch the first window,
+    /// which also asks for the collection count. Used on open, on a filter change,
+    /// and after a write refreshes the collection.
+    fn seed_browse(&self) {
+        let ctx = self.fetch_ctx();
+        self.window.borrow_mut().seed(&ctx, &self.sender);
+    }
+
+    /// The number of resident documents around the current viewport (what the
+    /// List/JSON modes lay out; the grid lays out the full `row_count`).
+    fn resident_len(&self) -> usize {
+        self.window.borrow().resident().1.len()
+    }
+
+    /// Scroll the grid so absolute ordinal `ord` is visible: a local scroll when
+    /// it is within the current virtual window, otherwise relocate the window onto
+    /// it (the far keyboard jump, e.g. `Last`), the way the scrollbar scrub does.
+    fn reveal_ord(&self, ord: usize, row_height: f32) {
+        let (base, len, total) = {
+            let w = self.window.borrow();
+            (
+                w.window_base(),
+                w.total().unwrap_or(0).min(crate::gridwindow::WINDOW),
+                w.total(),
+            )
+        };
+        if ord >= base && ord < base + len {
+            self.scroll
+                .scroll_to_item(ord - base, gpui::ScrollStrategy::Nearest);
+        } else if let Some(total) = total {
+            let handle = self.window.borrow().window_base_handle();
+            window::place_window(&handle, &self.scroll, total, ord, row_height);
+        }
     }
 }
 
@@ -711,17 +778,17 @@ impl AppState {
 
     #[allow(
         clippy::too_many_arguments,
-        reason = "the args mirror the DocPageReady event's fields 1:1, like the on_kv_* handlers"
+        reason = "the args mirror the DocRunReady event's fields 1:1, like the on_kv_* handlers"
     )]
-    pub(crate) fn on_doc_page(
+    pub(crate) fn on_doc_run(
         &mut self,
         session: Option<SessionId>,
         epoch: Epoch,
         db: String,
         coll: String,
-        skip: u64,
+        seek: DocSeek,
         docs: Vec<Document>,
-        exhausted: bool,
+        seq: u64,
         total: Option<u64>,
         cx: &mut Context<Self>,
     ) {
@@ -731,42 +798,69 @@ impl AppState {
         let Some(current) = view.coll_by_epoch_mut(epoch) else {
             return;
         };
-        // Drop a late page for a collection the tab has since been repointed at.
+        // Drop a late window for a collection the tab has since been repointed at.
         if current.db != db || current.coll != coll {
             return;
         }
-        current.columns = sample_columns(&docs);
-        current.docs = docs;
-        current.skip = skip;
-        current.exhausted = exhausted;
-        current.loading = false;
-        current.expanded_rows.clear();
-        // The List/JSON selectable blocks were built for the old window; drop them
-        // and resize the virtualized lists to the new count.
+        // Land the window in the run; a stale/mismatched reply is dropped inside.
+        current
+            .window
+            .borrow_mut()
+            .apply(seek, docs, seq, total.map(|t| t as usize));
+        current.loading = current.window.borrow().total().is_none();
+
+        // Accumulate columns from the resident documents (so they don't flicker as
+        // the window scrolls onto documents of other shapes), and resize the
+        // List/JSON virtualized lists to the resident count.
+        let resident: Vec<Document> = current
+            .window
+            .borrow()
+            .resident()
+            .1
+            .iter()
+            .cloned()
+            .collect();
+        merge_columns(&mut current.columns, &resident);
+        let n = resident.len();
         current.list_labels.clear();
         current.json_labels.clear();
-        let n = current.docs.len();
         current.list_state.reset(n);
         current.json_list.reset(n);
-        // A count only rides the first page; keep the prior total on later pages.
-        if let Some(total) = total {
-            current.total = Some(total);
+
+        // Clear an inspector/cursor left past the (now known) end.
+        if let Some(total) = current.window.borrow().total() {
+            if current.inspector.is_some_and(|s| s >= total) {
+                current.inspector = None;
+                current.inspector_doc = None;
+            }
+            if current.cursor.is_some_and(|c| c >= total) {
+                current.cursor = None;
+            }
         }
-        // A shorter window than before can leave the inspector past the end.
-        if let Some(sel) = current.inspector
-            && sel >= current.docs.len()
-        {
-            current.inspector = None;
-        }
-        // A new window invalidates the keyboard cursor's absolute row.
-        if current.cursor.is_some_and(|c| c >= current.docs.len()) {
-            current.cursor = None;
-        }
-        // Rebuild the JSON blocks if that's the visible mode.
         if matches!(current.view_mode, DocViewMode::Json) {
             current.rebuild_json_labels(cx);
         }
         cx.notify();
+    }
+
+    /// A keyset window fetch failed: free the run's in-flight slot so a later
+    /// scroll can retry. The error message rode a separate `DocError`.
+    pub(crate) fn on_doc_run_failed(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: Epoch,
+        seq: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(current) = self
+            .conn_mut(session)
+            .and_then(|a| a.doc_view.as_mut())
+            .and_then(|v| v.coll_by_epoch_mut(epoch))
+        {
+            current.window.borrow_mut().run_failed(seq);
+            current.loading = false;
+            cx.notify();
+        }
     }
 
     pub(crate) fn on_doc_error(
@@ -912,53 +1006,9 @@ impl AppState {
         }
     }
 
-    /// Page the open collection by one window. `forward` advances `skip`; the
-    /// backward step floors at zero.
-    fn doc_page(&mut self, session: SessionId, forward: bool, cx: &mut Context<Self>) {
-        let Some(view) = self
-            .conn_mut(Some(session))
-            .and_then(|a| a.doc_view.as_mut())
-        else {
-            return;
-        };
-        let Some(current) = view.focused_coll_mut() else {
-            return;
-        };
-        let next_skip = if forward {
-            if current.exhausted {
-                return;
-            }
-            current.skip + PAGE
-        } else {
-            if current.skip == 0 {
-                return;
-            }
-            current.skip.saturating_sub(PAGE)
-        };
-        current.loading = true;
-        current.inspector = None;
-        let (epoch, db, coll, filter) = (
-            current.epoch,
-            current.db.clone(),
-            current.coll.clone(),
-            current.filter.clone(),
-        );
-        self.service.send_to(
-            session,
-            Command::DocFetchPage {
-                epoch,
-                db,
-                coll,
-                skip: next_skip,
-                filter,
-            },
-        );
-        cx.notify();
-    }
-
-    /// Apply the filter box's current text: parsing happens in the service, so
-    /// here just re-fetch from `skip = 0` with the (trimmed) filter, or clear it
-    /// when the box is empty.
+    /// Apply the filter box's current text: set the (trimmed) filter, or clear it
+    /// when the box is empty, and re-seed the browse from the first window. The
+    /// grid's continuous scroll takes over from there.
     fn doc_apply_filter(&mut self, session: SessionId, cx: &mut Context<Self>) {
         let Some(view) = self
             .conn_mut(Some(session))
@@ -971,26 +1021,14 @@ impl AppState {
         };
         let text = current.filter_input.read(cx).content().trim().to_string();
         current.filter = (!text.is_empty()).then_some(text);
-        current.skip = 0;
         current.loading = true;
         current.inspector = None;
+        current.inspector_doc = None;
+        current.cursor = None;
+        current.expanded_rows.clear();
+        current.columns.clear();
         current.panel = DocPanel::Documents;
-        let (epoch, db, coll, filter) = (
-            current.epoch,
-            current.db.clone(),
-            current.coll.clone(),
-            current.filter.clone(),
-        );
-        self.service.send_to(
-            session,
-            Command::DocFetchPage {
-                epoch,
-                db,
-                coll,
-                skip: 0,
-                filter,
-            },
-        );
+        current.seed_browse();
         cx.notify();
     }
 
@@ -1024,7 +1062,10 @@ impl AppState {
 
     /// Toggle a document's expansion in List mode. Expanding builds the row's
     /// selectable field block (a `SelectableLabel`); collapsing drops it.
-    fn doc_toggle_row(&mut self, session: SessionId, row: usize, cx: &mut Context<Self>) {
+    /// Expand/collapse the List-mode card at absolute ordinal `ord`. Its expansion
+    /// and selectable block are keyed by ordinal (so they survive the window
+    /// sliding); the virtualized list re-measures the resident-local row.
+    fn doc_toggle_row(&mut self, session: SessionId, ord: usize, cx: &mut Context<Self>) {
         // Phase A: flip the expansion and, when opening, gather what the label
         // needs (its text + the selection group) without holding the borrow.
         let build = {
@@ -1035,20 +1076,21 @@ impl AppState {
             else {
                 return;
             };
-            if current.expanded_rows.remove(&row) {
-                current.list_labels.remove(&row);
+            if current.expanded_rows.remove(&ord) {
+                current.list_labels.remove(&ord);
                 None
             } else {
-                current.expanded_rows.insert(row);
+                current.expanded_rows.insert(ord);
                 current
-                    .docs
-                    .get(row)
+                    .window
+                    .borrow()
+                    .doc_at(ord)
                     .map(|doc| (doc_field_text(doc), current.selection_group.clone()))
             }
         };
         // Phase B: build the label entity (needs `cx`), then store it back.
         let label = build.map(|(text, group)| {
-            cx.new(|cx| SelectableLabel::new(text, cx).selection_group(group, row as u64))
+            cx.new(|cx| SelectableLabel::new(text, cx).selection_group(group, ord as u64))
         });
         if let Some(current) = self
             .conn_mut(Some(session))
@@ -1056,11 +1098,12 @@ impl AppState {
             .and_then(|v| v.focused_coll_mut())
         {
             if let Some(label) = label {
-                current.list_labels.insert(row, label);
+                current.list_labels.insert(ord, label);
             }
-            // The toggled card changed height; re-measure just that row so the
-            // virtualized list lays the rest out correctly.
-            current.list_state.remeasure_items(row..row + 1);
+            // The toggled card changed height; re-measure just that resident row so
+            // the virtualized list lays the rest out correctly.
+            let local = ord.saturating_sub(current.window.borrow().anchor());
+            current.list_state.remeasure_items(local..local + 1);
         }
         cx.notify();
     }
@@ -1076,8 +1119,9 @@ impl AppState {
         };
         current.view_mode = mode;
         // Build the JSON blocks lazily the first time JSON mode is shown for this
-        // window (cleared on every page load).
-        if matches!(mode, DocViewMode::Json) && current.json_labels.len() != current.docs.len() {
+        // resident window (cleared on every window change).
+        if matches!(mode, DocViewMode::Json) && current.json_labels.len() != current.resident_len()
+        {
             current.rebuild_json_labels(cx);
         }
         cx.notify();
@@ -1252,13 +1296,16 @@ impl AppState {
         if matches!(nav, TableNav::Left | TableNav::Right) {
             return;
         }
+        let row_height = f32::from(self.settings.grid.density.row_height());
         let Some(current) = self.doc_focused_coll_mut(session) else {
             return;
         };
-        if current.docs.is_empty() {
+        // The cursor ranges over all documents (absolute ordinals), not just the
+        // resident window; moving onto an off-window row relocates the window.
+        let Some(total) = current.window.borrow().total().filter(|&t| t > 0) else {
             return;
-        }
-        let last = current.docs.len() - 1;
+        };
+        let last = total - 1;
         let cur = current.cursor.unwrap_or(0).min(last);
 
         // A page jump moves by a screenful; the grid renders roughly this many
@@ -1275,9 +1322,7 @@ impl AppState {
             _ => cur,
         };
         current.cursor = Some(next);
-        current
-            .scroll
-            .scroll_to_item(next, gpui::ScrollStrategy::Nearest);
+        current.reveal_ord(next, row_height);
         cx.notify();
     }
 
@@ -1302,11 +1347,11 @@ impl AppState {
         if !current.list_focus.is_focused(window) {
             return false;
         }
-        if current.docs.is_empty() {
+        let Some(total) = current.window.borrow().total().filter(|&t| t > 0) else {
             return true;
-        }
-        let row = current.cursor.unwrap_or(0).min(current.docs.len() - 1);
-        self.doc_toggle_inspector(session, row, cx);
+        };
+        let ord = current.cursor.unwrap_or(0).min(total - 1);
+        self.doc_toggle_inspector(session, ord, cx);
         true
     }
 
@@ -1399,23 +1444,28 @@ impl AppState {
         self.doc_focus_pane(pane, window, cx);
     }
 
-    /// Open (or, on the same row, close) the inspector on a document row, loading
-    /// the row's extended JSON into the editor when it opens.
-    fn doc_toggle_inspector(&mut self, session: SessionId, row: usize, cx: &mut Context<Self>) {
+    /// Open (or, on the same ordinal, close) the inspector on a document, loading
+    /// its extended JSON into the editor when it opens. `ord` is an absolute
+    /// ordinal; the document is snapshotted so the inspector survives the row
+    /// scrolling out of the resident window.
+    fn doc_toggle_inspector(&mut self, session: SessionId, ord: usize, cx: &mut Context<Self>) {
         // Phase A: flip the selection and, when opening, clone the target document
         // so the form/editor can be built without holding the borrow.
         let doc = {
             let Some(current) = self.doc_focused_coll_mut(session) else {
                 return;
             };
-            if current.inspector == Some(row) && !current.inspector_insert {
+            if current.inspector == Some(ord) && !current.inspector_insert {
                 current.inspector = None;
+                current.inspector_doc = None;
                 current.form = None;
                 None
             } else {
-                current.inspector = Some(row);
+                let doc = current.window.borrow().doc_at(ord).cloned();
+                current.inspector = Some(ord);
                 current.inspector_insert = false;
-                current.docs.get(row).cloned()
+                current.inspector_doc = doc.clone();
+                doc
             }
         };
         if let Some(d) = doc {
@@ -1444,6 +1494,7 @@ impl AppState {
                 return;
             };
             current.inspector = None;
+            current.inspector_doc = None;
             current.inspector_insert = true;
             current.form = Some(form);
             current.inspector_editor.clone()
@@ -1452,12 +1503,13 @@ impl AppState {
         cx.notify();
     }
 
-    /// Clone the selected document into the compose editor (drops `_id` so the
-    /// insert mints a fresh one), the Compass-style "insert a copy" affordance.
-    fn doc_clone_document(&mut self, session: SessionId, row: usize, cx: &mut Context<Self>) {
+    /// Clone the document at absolute ordinal `ord` into the compose editor (drops
+    /// `_id` so the insert mints a fresh one), the Compass-style "insert a copy"
+    /// affordance.
+    fn doc_clone_document(&mut self, session: SessionId, ord: usize, cx: &mut Context<Self>) {
         let doc = self
             .doc_focused_coll_mut(session)
-            .and_then(|current| current.docs.get(row).cloned());
+            .and_then(|current| current.window.borrow().doc_at(ord).cloned());
         let Some(d) = doc else {
             return;
         };
@@ -1468,6 +1520,7 @@ impl AppState {
                 return;
             };
             current.inspector = None;
+            current.inspector_doc = None;
             current.inspector_insert = true;
             current.form = Some(form);
             current.inspector_editor.clone()
@@ -1502,10 +1555,7 @@ impl AppState {
                 },
                 InspectorMode::Raw => Ok(current.inspector_editor.read(cx).content().to_string()),
             };
-            let id = current
-                .inspector
-                .and_then(|row| current.docs.get(row))
-                .map(|d| d.id.clone());
+            let id = current.inspector_doc.as_ref().map(|d| d.id.clone());
             (
                 current.epoch,
                 current.db.clone(),
@@ -1552,8 +1602,9 @@ impl AppState {
             .and_then(|v| v.focused_coll_mut())
     }
 
-    /// Queue a delete of a document behind the confirm modal.
-    fn doc_delete_row(&mut self, session: SessionId, row: usize, cx: &mut Context<Self>) {
+    /// Queue a delete of the document at absolute ordinal `ord` behind the confirm
+    /// modal.
+    fn doc_delete_row(&mut self, session: SessionId, ord: usize, cx: &mut Context<Self>) {
         let pending = {
             let Some(view) = self
                 .conn_mut(Some(session))
@@ -1567,7 +1618,7 @@ impl AppState {
             let Some(current) = view.focused_coll() else {
                 return;
             };
-            let Some(doc) = current.docs.get(row) else {
+            let Some(doc) = current.window.borrow().doc_at(ord).cloned() else {
                 return;
             };
             let write = DocWrite::Delete {
@@ -1680,6 +1731,7 @@ impl AppState {
             .and_then(|v| v.focused_coll_mut())
         {
             current.inspector = None;
+            current.inspector_doc = None;
             current.inspector_insert = false;
             cx.notify();
         }
@@ -1707,48 +1759,31 @@ impl AppState {
         summary: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(sid) = session else { return };
+        let _ = session;
         // Close the inspector on the writing tab, clear any pending confirm, and
-        // gather what the browse needs to refresh, all before the toast + re-fetch.
-        let refresh = {
+        // re-seed the browse (a write shifts ordinals, so the resident window and
+        // its expansions are re-derived from a fresh first window).
+        {
             let Some(view) = self.conn_mut(session).and_then(|a| a.doc_view.as_mut()) else {
                 return;
             };
             view.pending_write = None;
-            view.coll_by_epoch_mut(epoch).map(|c| {
+            if let Some(c) = view.coll_by_epoch_mut(epoch) {
                 c.inspector = None;
+                c.inspector_doc = None;
                 c.inspector_insert = false;
+                c.cursor = None;
+                c.expanded_rows.clear();
                 c.loading = true;
-                (
-                    c.epoch,
-                    c.db.clone(),
-                    c.coll.clone(),
-                    c.skip,
-                    c.filter.clone(),
-                )
-            })
-        };
-        self.notify(ToastVariant::Success, summary, cx);
-        if let Some((epoch, db, coll, skip, filter)) = refresh {
-            self.service.send_to(
-                sid,
-                Command::DocFetchPage {
-                    epoch,
-                    db,
-                    coll,
-                    skip,
-                    filter,
-                },
-            );
+                c.seed_browse();
+            }
         }
+        self.notify(ToastVariant::Success, summary, cx);
     }
 }
 
 // --- free helpers ------------------------------------------------------------
 
-/// The union of top-level field names across a window, `_id` first, capped to
-/// [`MAX_COLUMNS`]. Stable order: `_id`, then first-seen order across the docs,
-/// so the grid columns don't reshuffle between rows.
 /// The next navigable (non-placeholder) tree row from `from` in `forward`, or the
 /// first/last navigable row when nothing is selected yet. Mirrors the schema
 /// sidebar's `next_navigable`.
@@ -1833,17 +1868,29 @@ fn doc_field_text(doc: &Document) -> String {
 
 fn sample_columns(docs: &[Document]) -> Vec<String> {
     let mut cols = vec!["_id".to_string()];
+    merge_columns(&mut cols, docs);
+    cols
+}
+
+/// Fold the top-level field names of `docs` into `cols` (first-seen order, `_id`
+/// always leading), capped at [`MAX_COLUMNS`]. Additive, so the grid's columns
+/// accumulate as the window scrolls onto documents of other shapes rather than
+/// flickering when a field is absent from the current resident set. Seeds `_id`
+/// on an empty `cols`.
+fn merge_columns(cols: &mut Vec<String>, docs: &[Document]) {
+    if cols.is_empty() {
+        cols.push("_id".to_string());
+    }
     for doc in docs {
         for (name, _) in &doc.fields {
             if cols.len() >= MAX_COLUMNS {
-                return cols;
+                return;
             }
             if !cols.iter().any(|c| c == name) {
                 cols.push(name.clone());
             }
         }
     }
-    cols
 }
 
 /// The display string for one grid cell: the document's value for `col`, or

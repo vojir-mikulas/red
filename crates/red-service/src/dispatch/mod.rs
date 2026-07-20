@@ -63,9 +63,10 @@ const MAX_CONCURRENT_IMPORTS: usize = 2;
 /// together without fanning out an unbounded number of pinned connections.
 const MAX_CONCURRENT_COPIES: usize = 2;
 
-/// Documents per `DocFetchPage` window (the MongoDB browse grid). One window is
-/// resident at a time; the browser pages by `skip`, so this bounds the `find`
-/// batch and the event payload, mirroring the SQL grid's page size.
+/// Documents per non-browse document window (aggregation results, explain
+/// sampling): the `find`/`aggregate` batch and event payload bound. The browse
+/// grid sizes its own keyset windows (`DocFetchRun`); this covers the paths that
+/// still read a single fixed window.
 const DOC_PAGE_ROWS: usize = 100;
 
 /// Documents sampled to infer a collection's schema (`$sample`). Large enough to
@@ -2775,12 +2776,15 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 });
             }
 
-            Command::DocFetchPage {
+            Command::DocFetchRun {
                 epoch,
                 db,
                 coll,
-                skip,
                 filter,
+                seek,
+                limit,
+                seq,
+                want_total,
             } => {
                 let Some((state, driver)) =
                     require_doc_driver_mut(&mut sessions, session_id, &events)
@@ -2804,25 +2808,19 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     }
                     None => None,
                 };
-                // A new page (or a new collection selection) supersedes the
-                // in-flight `find`, like a flung SQL scrollbar.
+                // A new window (or a new collection selection) supersedes the
+                // in-flight seek, like a flung SQL scrollbar.
                 let entry = state.inflight.entry(epoch).or_default();
                 let abort = entry.supersede(Slot::DocPage);
                 let events = events.clone();
                 tokio::spawn(async move {
-                    let query = red_core::doc::FindQuery {
-                        db: db.clone(),
-                        coll: coll.clone(),
-                        filter: filter.clone(),
-                        projection: None,
-                        sort: None,
-                        skip,
-                        limit: None,
-                        batch: DOC_PAGE_ROWS,
-                    };
-                    let page = match driver.find(&query, &abort).await {
-                        Ok(page) => page,
-                        // A superseded fetch emits nothing; a real failure surfaces.
+                    let docs = match driver
+                        .find_seek(&db, &coll, filter.as_ref(), seek.clone(), limit, &abort)
+                        .await
+                    {
+                        Ok(docs) => docs,
+                        // A superseded fetch emits nothing; a real failure both
+                        // surfaces (banner) and frees the buffer's in-flight slot.
                         Err(red_core::RedError::Interrupted) => return,
                         Err(e) => {
                             emit(
@@ -2833,16 +2831,26 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                     message: e.to_string(),
                                 },
                             );
+                            emit(
+                                &events,
+                                session_id,
+                                Event::DocRunFailed {
+                                    epoch,
+                                    db,
+                                    coll,
+                                    seq,
+                                },
+                            );
                             return;
                         }
                     };
                     if abort.is_aborted() {
                         return;
                     }
-                    // Only the first window pays for the total count; later pages
-                    // reuse it. The count honors the same filter as the find so the
-                    // "of N" matches the filtered result. A failure leaves it unknown.
-                    let total = if skip == 0 {
+                    // Only the first window of a browse pays for the total count;
+                    // later windows reuse it. The count honors the same filter so
+                    // "of N" matches the filtered result; a failure leaves it unknown.
+                    let total = if want_total {
                         driver.count(&db, &coll, filter.as_ref()).await.ok()
                     } else {
                         None
@@ -2850,13 +2858,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     emit(
                         &events,
                         session_id,
-                        Event::DocPageReady {
+                        Event::DocRunReady {
                             epoch,
                             db,
                             coll,
-                            skip,
-                            docs: page.docs,
-                            exhausted: page.exhausted,
+                            seek,
+                            docs,
+                            seq,
                             total,
                         },
                     );

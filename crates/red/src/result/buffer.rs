@@ -1,7 +1,8 @@
 //! The windowed row buffer behind the grid: the two paging modes (offset and
-//! keyset-run), eviction around the viewport, and the virtual-scroll window
-//! arithmetic. Holds at most ~`2*margin` rows regardless of result size, where the
-//! margin scales with the page (`grid.page_size`).
+//! keyset-run) and eviction around the viewport. Holds at most ~`2*margin` rows
+//! regardless of result size, where the margin scales with the page
+//! (`grid.page_size`). The virtual-scroll window arithmetic it feeds lives in
+//! [`crate::gridwindow`], shared with the document grid.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
@@ -36,21 +37,6 @@ const FLING_PAGES: usize = 3;
 /// abandons run-extension (which would chain seeks across the gap) and jumps: one
 /// key-space interpolated seek that replaces the run.
 const JUMP_PAGES: usize = 2;
-
-/// Physical rows the list (`uniform_list`) is laid out over at once. GPUI places
-/// each row at `index * row_height` in `f32`, which is only exact up to 2^24
-/// (~16.7M) px; past that, positions quantize: rows overlap, double up, and the
-/// wheel sticks. So the list never spans the whole result: it lays out at most
-/// `WINDOW` rows (a `WINDOW * row_height` canvas, well under the ceiling), and
-/// `window_base` slides that window across a result of any size (tens of
-/// millions of rows). The fraction-mapped scrollbar drives long jumps; wheel
-/// scrolling re-centers the window near its edges (see `prepare_window`).
-pub(super) const WINDOW: usize = 100_000;
-
-/// When the viewport scrolls within this many rows of a window edge (and more
-/// result exists beyond that edge), the window re-centers on the viewport,
-/// compensating the list's pixel offset so the visible rows don't move.
-const REANCHOR_MARGIN: usize = 5_000;
 
 /// Monotonic id for each opened result. Tags `OpenResult`/`FetchPage` so the
 /// backend can drop stale page fetches and the grid can ignore late replies for
@@ -800,127 +786,6 @@ impl OffsetPages {
                 epoch,
             });
         }
-    }
-}
-
-/// The virtual-scroll window resolved for one render (see
-/// `ResultGrid::prepare_window`).
-pub(super) struct WindowView {
-    /// Absolute ordinal of list-local index 0.
-    pub(super) base: usize,
-    /// Physical rows fed to `uniform_list` this frame (`total.min(WINDOW)`).
-    pub(super) len: usize,
-    /// Scrollbar thumb position, 0..=1, over the *whole* result.
-    pub(super) fraction: f32,
-    /// Scrollbar thumb size (viewport / total).
-    pub(super) thumb: f32,
-}
-
-/// Pure window arithmetic, factored out of `ResultGrid::prepare_window` for
-/// testing. Given the result `total`, the current window `base`, the viewport's
-/// top row in list-local coordinates, and the viewport height in rows, returns
-/// the base to use this frame and, when it changed, the list-local row the
-/// pixel offset must be re-anchored onto so the visible rows don't move.
-///
-/// The window re-centers on the viewport once it scrolls within
-/// [`REANCHOR_MARGIN`] of an edge that has more result beyond it.
-pub(super) fn window_decision(
-    total: usize,
-    base: usize,
-    local_first: usize,
-    viewport_rows: usize,
-) -> (usize, Option<usize>) {
-    if total <= WINDOW {
-        return (0, None);
-    }
-    let max_base = total - WINDOW;
-    let base = base.min(max_base);
-    let abs_first = base + local_first;
-    let near_top = base > 0 && local_first < REANCHOR_MARGIN;
-    let near_bottom = base < max_base && local_first + viewport_rows + REANCHOR_MARGIN > WINDOW;
-    if near_top || near_bottom {
-        let desired = abs_first.saturating_sub(WINDOW / 2).min(max_base);
-        if desired != base {
-            return (desired, Some(abs_first - desired));
-        }
-    }
-    (base, None)
-}
-
-#[cfg(test)]
-mod window_tests {
-    use super::*;
-
-    /// A small result fits in one window: never windowed, never re-anchored.
-    #[test]
-    fn small_result_is_never_windowed() {
-        assert_eq!(window_decision(WINDOW, 0, 0, 30), (0, None));
-        assert_eq!(window_decision(WINDOW, 0, WINDOW - 1, 30), (0, None));
-        assert_eq!(window_decision(500, 0, 400, 30), (0, None));
-    }
-
-    /// At rest in the middle of a window, with margins on both sides, nothing
-    /// moves.
-    #[test]
-    fn mid_window_holds_still() {
-        let total = 50_000_000;
-        assert_eq!(
-            window_decision(total, 1_000_000, WINDOW / 2, 30),
-            (1_000_000, None)
-        );
-    }
-
-    /// Scrolling near the bottom edge re-centers the window forward and reports
-    /// the local row to pin the offset to (so the visible rows don't jump).
-    #[test]
-    fn near_bottom_recenters_forward() {
-        let total = 50_000_000;
-        let base = 1_000_000;
-        let local_first = WINDOW - 100; // viewport top is 100 rows from the edge
-        let (new_base, reanchor) = window_decision(total, base, local_first, 30);
-        let abs_first = base + local_first;
-        // The window slid forward and the viewport sits near its middle again.
-        assert!(new_base > base);
-        assert_eq!(reanchor, Some(abs_first - new_base));
-        assert_eq!(new_base + reanchor.unwrap(), abs_first); // same absolute row
-        assert_eq!(reanchor.unwrap(), WINDOW / 2);
-    }
-
-    /// Scrolling back near the top edge re-centers the window backward.
-    #[test]
-    fn near_top_recenters_backward() {
-        let total = 50_000_000;
-        let base = 1_000_000;
-        let local_first = 100;
-        let (new_base, reanchor) = window_decision(total, base, local_first, 30);
-        let abs_first = base + local_first;
-        assert!(new_base < base);
-        assert_eq!(new_base + reanchor.unwrap(), abs_first);
-        assert_eq!(reanchor.unwrap(), WINDOW / 2);
-    }
-
-    /// Near the result's true start the window can't slide further: clamps to 0,
-    /// and once the viewport is genuinely at the top it stays put.
-    #[test]
-    fn clamps_at_result_start() {
-        let total = 50_000_000;
-        // base small, viewport near window top: desired base clamps at 0.
-        let (new_base, _) = window_decision(total, 10_000, 100, 30);
-        assert_eq!(new_base, 0);
-        // base 0 with the viewport at the very top: nothing to do.
-        assert_eq!(window_decision(total, 0, 0, 30), (0, None));
-    }
-
-    /// Near the result's true end the base clamps to `total - WINDOW`.
-    #[test]
-    fn clamps_at_result_end() {
-        let total = 50_000_000;
-        let max_base = total - WINDOW;
-        // Already at the last window, viewport near the bottom: no further slide.
-        assert_eq!(
-            window_decision(total, max_base, WINDOW - 50, 30),
-            (max_base, None)
-        );
     }
 }
 

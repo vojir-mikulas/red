@@ -1708,16 +1708,24 @@ impl AppState {
             } => {
                 self.on_doc_collections(session, epoch, db, collections, cx);
             }
-            Event::DocPageReady {
+            Event::DocRunReady {
                 epoch,
                 db,
                 coll,
-                skip,
+                seek,
                 docs,
-                exhausted,
+                seq,
                 total,
             } => {
-                self.on_doc_page(session, epoch, db, coll, skip, docs, exhausted, total, cx);
+                self.on_doc_run(session, epoch, db, coll, seek, docs, seq, total, cx);
+            }
+            Event::DocRunFailed {
+                epoch,
+                db: _,
+                coll: _,
+                seq,
+            } => {
+                self.on_doc_run_failed(session, epoch, seq, cx);
             }
             Event::DocSchemaReady {
                 epoch,

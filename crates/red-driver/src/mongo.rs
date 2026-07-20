@@ -17,7 +17,7 @@ use mongodb::options::{ClientOptions, IndexOptions};
 use mongodb::results::CollectionType;
 use mongodb::{Client, Cursor, IndexModel};
 use red_core::doc::{
-    CollKind, CollectionInfo, DbInfo, DocCursor, DocPage, DocPlan, DocSchema, DocTopology,
+    CollKind, CollectionInfo, DbInfo, DocCursor, DocPage, DocPlan, DocSchema, DocSeek, DocTopology,
     DocUpdate, DocValue, Document, Filter, FindQuery, IndexInfo, IndexSpec, PlanStage,
 };
 use red_core::{RedError, Result};
@@ -207,6 +207,44 @@ impl DocDriver for MongoDriver {
             cursor: None,
             exhausted,
         })
+    }
+
+    async fn find_seek(
+        &self,
+        db: &str,
+        coll: &str,
+        filter: Option<&Filter>,
+        seek: DocSeek,
+        limit: usize,
+        abort: &AbortSignal,
+    ) -> Result<Vec<Document>> {
+        let limit = limit.max(1);
+        let coll_h = self.client.database(db).collection::<BsonDocument>(coll);
+        let base = filter.map(doc_to_bson_document).unwrap_or_default();
+
+        // A Backward window queries `_id` descending so the `limit` takes the rows
+        // nearest the boundary, then reverses to ascending before returning, so it
+        // prepends onto the resident run in order. Forward and Jump read ascending.
+        let (query, ascending) = match &seek {
+            DocSeek::Forward { after: Some(id) } => (and_id_bound(base, "$gt", id), true),
+            DocSeek::Forward { after: None } | DocSeek::Jump { .. } => (base, true),
+            DocSeek::Backward { before } => (and_id_bound(base, "$lt", before), false),
+        };
+
+        let sort = doc! { "_id": if ascending { 1 } else { -1 } };
+        let mut find = coll_h.find(query).sort(sort).limit(limit as i64);
+        if let DocSeek::Jump { skip } = seek {
+            find = find.skip(skip);
+        }
+        if abort.is_aborted() {
+            return Err(RedError::Interrupted);
+        }
+        let mut cursor = find.await.map_err(query_err)?;
+        let mut docs = Self::collect_page(&mut cursor, limit, abort).await?;
+        if !ascending {
+            docs.reverse();
+        }
+        Ok(docs)
     }
 
     async fn get_document(&self, db: &str, coll: &str, id: &DocValue) -> Result<Option<Document>> {
@@ -770,6 +808,21 @@ fn doc_to_bson_document(v: &DocValue) -> BsonDocument {
     match doc_to_bson(v) {
         Bson::Document(d) => d,
         _ => BsonDocument::new(),
+    }
+}
+
+/// AND the user `base` filter with an `_id` range bound (`op` is `"$gt"` /
+/// `"$lt"`). Using `$and` keeps a user filter that itself mentions `_id` correct,
+/// where merging the bound into the same document would clobber it.
+fn and_id_bound(base: BsonDocument, op: &str, id: &DocValue) -> BsonDocument {
+    let mut range = BsonDocument::new();
+    range.insert(op, doc_to_bson(id));
+    let mut bound = BsonDocument::new();
+    bound.insert("_id", range);
+    if base.is_empty() {
+        bound
+    } else {
+        doc! { "$and": [Bson::Document(base), Bson::Document(bound)] }
     }
 }
 

@@ -13,7 +13,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use red_core::diff::{DiffColumnPlan, DiffRow, DiffSummary};
-use red_core::doc::{CollectionInfo, DbInfo, DocPlan, DocSchema, DocWrite, Document, IndexInfo};
+use red_core::doc::{
+    CollectionInfo, DbInfo, DocPlan, DocSchema, DocSeek, DocWrite, Document, IndexInfo,
+};
 use red_core::kv::{
     ClientInfo, CollectionKind, KeyMeta, KvCollectionPage, KvEdit, KvScanPage, KvStreamActionReq,
     KvStreamPage, KvType, KvValue, PendingEntry, RecycledKey, RespValue, ScanBudget, ScanCursor,
@@ -524,17 +526,22 @@ pub enum Command {
         epoch: Epoch,
         db: String,
     },
-    /// One window of a collection's documents (`find` with `skip`, page-sized),
-    /// the browse grid's read. `skip == 0` also asks for the collection's total
-    /// count so the grid can show it. `filter`, when set, is an extended-JSON
-    /// find filter the driver parses (a parse error replies `DocError`). Replied
-    /// with `DocPageReady`; cancellable and epoch-superseded like a SQL page fetch.
-    DocFetchPage {
+    /// One `_id`-keyset window for the browse grid's continuous scroll: the
+    /// documents at `seek` (relative to a boundary `_id`, or an exact ordinal
+    /// jump), narrowed by the optional extended-JSON `filter` the driver parses (a
+    /// parse error replies `DocError`). `want_total` (the first window of a fresh
+    /// browse) also asks for the collection count. `seq` echoes back on
+    /// `DocRunReady`/`DocRunFailed` so a stale window is dropped; cancellable and
+    /// epoch-superseded like a SQL run fetch.
+    DocFetchRun {
         epoch: Epoch,
         db: String,
         coll: String,
-        skip: u64,
         filter: Option<String>,
+        seek: DocSeek,
+        limit: usize,
+        seq: u64,
+        want_total: bool,
     },
     /// A collection's inferred schema (sampled per-field type distribution), for
     /// the schema panel. Replied with `DocSchemaReady`, or `DocError` on failure.
@@ -1190,18 +1197,29 @@ pub enum Event {
         db: String,
         collections: Vec<CollectionInfo>,
     },
-    /// One window of a collection's documents, in response to `DocFetchPage`.
-    /// Echoes `db`/`coll`/`skip` so a late page for a superseded selection is
-    /// discarded; `total` is the collection count, present only for the first
-    /// page (`skip == 0`). `exhausted` marks the last window.
-    DocPageReady {
+    /// One `_id`-keyset window, in response to `DocFetchRun`. Echoes `db`/`coll`
+    /// and the requested `seek`/`seq` so the buffer can match the reply to its
+    /// boundary and drop a superseded one. `docs` is ascending by `_id` and short
+    /// of `limit` at a true end. `total` is the collection count, present only
+    /// when the request set `want_total`.
+    DocRunReady {
         epoch: Epoch,
         db: String,
         coll: String,
-        skip: u64,
+        seek: DocSeek,
         docs: Vec<Document>,
-        exhausted: bool,
+        seq: u64,
         total: Option<u64>,
+    },
+    /// A `DocFetchRun` failed (a real error, not a supersede). Echoes `seq` so the
+    /// buffer frees its in-flight slot and holds off re-issuing until the viewport
+    /// moves, the way the SQL grid handles `ResultRunFailed`. The human-facing
+    /// message rides a separate `DocError`.
+    DocRunFailed {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        seq: u64,
     },
     /// A collection's inferred schema, in response to `DocInferSchema`.
     DocSchemaReady {

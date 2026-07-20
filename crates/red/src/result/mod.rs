@@ -41,11 +41,12 @@ use crate::app::{
     PendingImportPeek, PendingWrite, Phase, TOAST_AUTO_DISMISS, TransferKind,
 };
 
+use crate::gridwindow::{WINDOW, WindowView, scrollbar_metrics, window_decision};
 /// Re-exported so `crate::kvbrowse` (the Redis keyspace browser) mints epochs
 /// from the same process-global counter as the SQL grid, without needing its
 /// own — see `buffer::next_epoch`'s doc comment.
 pub(crate) use buffer::next_epoch as next_kv_epoch;
-use buffer::{BufferMode, GridBuffer, KeyedRun, WINDOW, WindowView, next_epoch, window_decision};
+use buffer::{BufferMode, GridBuffer, KeyedRun, next_epoch};
 
 /// The resolved identity of an editable cell, `(row, data_col, pk_value, decl_type,
 /// foreign)`, returned by [`ResultGrid::edit_identity`]. `foreign` is `Some` for an
@@ -821,13 +822,7 @@ impl ResultGrid {
 
         // Scrollbar position is absolute (fraction of the whole result), not of
         // the window, so the thumb reflects where we are in all 50M rows.
-        let denom = total.saturating_sub(viewport_rows).max(1) as f32;
-        let fraction = (abs_first as f32 / denom).clamp(0.0, 1.0);
-        let thumb = if total > 0 {
-            (viewport_rows as f32 / total as f32).clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
+        let (fraction, thumb) = scrollbar_metrics(total, abs_first, viewport_rows);
 
         WindowView {
             base,
@@ -1217,11 +1212,7 @@ pub(in crate::result) fn place_window(
     target: usize,
     row_height: f32,
 ) {
-    let base = if total > WINDOW {
-        target.saturating_sub(WINDOW / 2).min(total - WINDOW)
-    } else {
-        0
-    };
+    let base = crate::gridwindow::centered_base(total, target);
     window_base.set(base);
     let local = target - base;
     let st = scroll.0.borrow();
