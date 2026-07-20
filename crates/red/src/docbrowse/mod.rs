@@ -196,7 +196,7 @@ enum DocTreeKind {
 
 /// One visible row of the collection tree in display order: the `TreeItem`
 /// structure Flint needs plus the identity and render data RED acts on. Built by
-/// [`flatten_doc_tree`], mirroring the schema sidebar's `flatten`.
+/// `flatten_doc_tree`, mirroring the schema sidebar's `flatten`.
 struct DocTreeRow {
     item: TreeItem,
     /// The selectable identity, or `None` for a placeholder row.

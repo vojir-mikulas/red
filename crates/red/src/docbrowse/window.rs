@@ -67,7 +67,7 @@ pub(super) struct DocWindow {
     /// The previous paint's first visible ordinal, to gauge scroll velocity.
     last_start: Option<usize>,
     /// Absolute ordinal of the virtual window's list-local row 0. `Rc<Cell>` so
-    /// the scrollbar's scrub closure can relocate it (see [`Self::place_window`]).
+    /// the scrollbar's scrub closure can relocate it (see [`place_window`]).
     window_base: Rc<Cell<usize>>,
 }
 

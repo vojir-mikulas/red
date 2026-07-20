@@ -1116,10 +1116,10 @@ impl AppState {
         Self::dont_ask_checkbox_el(id, cx.theme(), cx.entity().downgrade())
     }
 
-    /// The checkbox itself, over a [`WeakEntity`] rather than `&self` + a live
+    /// The checkbox itself, over a [`gpui::WeakEntity`] rather than `&self` + a live
     /// `cx`, so the Mongo confirm (built off a weak handle deep in its render
     /// chain, where no `Context` is in hand) shares this one builder instead of
-    /// forking a copy. The `&self` [`dont_ask_destructive_checkbox`] above is the
+    /// forking a copy. The `&self` [`dont_ask_destructive_checkbox`](Self::dont_ask_destructive_checkbox) above is the
     /// thin wrapper for the SQL/Redis confirms that do have a `cx`.
     pub(crate) fn dont_ask_checkbox_el(
         id: &'static str,

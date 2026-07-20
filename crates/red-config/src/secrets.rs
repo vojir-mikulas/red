@@ -187,7 +187,7 @@ pub fn delete_ai_key(provider: &str) -> Result<()> {
     remove(&ai_key_account(provider))
 }
 
-/// Drop every cached plaintext secret from the in-memory [`CACHE`], zeroizing
+/// Drop every cached plaintext secret from the in-memory `CACHE`, zeroizing
 /// each value on the way out (the `Zeroizing` wrapper wipes it on `Drop`). The
 /// keychain is untouched; this only forgets what this process has read, so no
 /// plaintext lingers in memory for the rest of the run. Used by the "Remove all

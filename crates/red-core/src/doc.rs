@@ -426,7 +426,7 @@ pub struct FieldStat {
     pub present_ratio: f32,
 }
 
-/// A collection's inferred schema from [`DocDriver::infer_schema`]: one
+/// A collection's inferred schema from `DocDriver::infer_schema`: one
 /// [`FieldStat`] per discovered field path (sorted), plus how many documents were
 /// sampled to produce it.
 #[derive(Debug, Clone, PartialEq)]
@@ -508,7 +508,7 @@ pub struct IndexInfo {
     pub partial: bool,
 }
 
-/// A query's `explain` rollup from [`DocDriver::explain`]: the winning-plan
+/// A query's `explain` rollup from `DocDriver::explain`: the winning-plan
 /// stages plus the numbers that answer "is this query using an index, and how
 /// wasteful is it".
 #[derive(Debug, Clone, PartialEq)]

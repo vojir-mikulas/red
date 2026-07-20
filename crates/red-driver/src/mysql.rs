@@ -415,8 +415,7 @@ impl DatabaseDriver for MysqlDriver {
                         constraint_name \
                  FROM information_schema.key_column_usage \
                  WHERE referenced_table_name IS NOT NULL";
-        const ORDER: &str =
-            " ORDER BY table_schema, table_name, constraint_name, ordinal_position";
+        const ORDER: &str = " ORDER BY table_schema, table_name, constraint_name, ordinal_position";
         let rows: Vec<FkQueryRow> = if let Some(scope) = &self.scope {
             conn.exec(
                 format!("{SELECT} AND table_schema = ?{ORDER}"),
