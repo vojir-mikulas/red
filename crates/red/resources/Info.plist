@@ -2,11 +2,11 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key>            <string>Red</string>
-  <key>CFBundleDisplayName</key>     <string>Red</string>
+  <key>CFBundleName</key>            <string>RED</string>
+  <key>CFBundleDisplayName</key>     <string>RED</string>
   <key>CFBundleIdentifier</key>      <string>dev.vojir.red</string>
-  <key>CFBundleExecutable</key>      <string>Red</string>
-  <key>CFBundleIconFile</key>        <string>Red</string>
+  <key>CFBundleExecutable</key>      <string>RED</string>
+  <key>CFBundleIconFile</key>        <string>RED</string>
   <key>CFBundleShortVersionString</key> <string>__VERSION__</string>
   <key>CFBundleVersion</key>         <string>__VERSION__</string>
   <key>CFBundlePackageType</key>     <string>APPL</string>

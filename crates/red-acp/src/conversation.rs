@@ -200,7 +200,7 @@ async fn run_connection(
             },
             agent_client_protocol::on_receive_notification!(),
         )
-        // Permission requests (M-S2): auto-allow Red's read-only DB tools (the
+        // Permission requests (M-S2): auto-allow RED's read-only DB tools (the
         // agent is already capability-restricted to no filesystem/terminal); route
         // anything else to the user for a decision, defaulting to deny.
         .on_receive_request(
@@ -266,7 +266,7 @@ async fn start_session(
         .await?;
 
     // If the agent advertises an auth method, run the first one; for Claude
-    // Code's subscription this triggers its own browser `/login`. Red never sees
+    // Code's subscription this triggers its own browser `/login`. RED never sees
     // the tokens. (When already logged in, no methods are advertised.)
     if let Some(method) = init.auth_methods.first() {
         conn.send_request(AuthenticateRequest::new(method.id().clone()))
@@ -594,7 +594,7 @@ fn map_plan_entry(entry: &PlanEntry) -> PlanStep {
     }
 }
 
-/// Map ACP `config_options` to Red's [`AcpConfigOption`], keeping only single-select
+/// Map ACP `config_options` to RED's [`AcpConfigOption`], keeping only single-select
 /// selectors (the only kind on the stable build) and flattening grouped choices.
 fn map_config_options(options: &[SessionConfigOption]) -> Vec<AcpConfigOption> {
     options.iter().filter_map(map_config_option).collect()
@@ -658,7 +658,7 @@ fn restricted_capabilities() -> ClientCapabilities {
 }
 
 /// Decide one permission request (M-S2): `true` allows the agent's tool call.
-/// Red's read-only DB tools auto-allow; anything else is forwarded to the user
+/// RED's read-only DB tools auto-allow; anything else is forwarded to the user
 /// (via `permissions`) and blocks on their answer, defaulting to deny when no UI
 /// is wired or the sink has gone away.
 async fn decide_permission(
@@ -685,7 +685,7 @@ async fn decide_permission(
     decided.await.unwrap_or(false)
 }
 
-/// Whether a tool call is one of Red's known read-only DB tools and so may run
+/// Whether a tool call is one of RED's known read-only DB tools and so may run
 /// without prompting. A mutating tool kind is never auto-allowed even if its
 /// title matches; the gate for a future write tool stays closed by default.
 fn is_auto_allowed(tool_call: &ToolCallUpdate, allow_tools: &[String]) -> bool {

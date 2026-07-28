@@ -1,8 +1,8 @@
-# Red - Roughly Enough Data
+# RED - Roughly Enough Data
 
 A fast, native database explorer built in Rust.
 
-Red is for inspecting schemas, browsing large tables, running SQL, and exporting data. The name is the goal: show roughly enough data to make a decision quickly, without the weight of a full IDE-style database tool.
+RED is for inspecting schemas, browsing large tables, running SQL, and exporting data. The name is the goal: show roughly enough data to make a decision quickly, without the weight of a full IDE-style database tool.
 
 It's built on GPUI and renders on the GPU, so there's no Electron or embedded browser.
 
@@ -42,11 +42,11 @@ Prebuilt, signed binaries are on the [latest release](https://github.com/vojir-m
 
 Or build from source; see [Development](#development).
 
-On first launch Red seeds a small, read-only **Sample database** so you can explore the schema browser, run queries, and try the result grid immediately, with no database setup required.
+On first launch RED seeds a small, read-only **Sample database** so you can explore the schema browser, run queries, and try the result grid immediately, with no database setup required.
 
 ## Privacy
 
-Red has no telemetry and makes no network calls of its own. Connection credentials are stored in your operating system's keychain, never in plaintext. The AI assistant is opt-in and only talks to the provider you configure.
+RED has no telemetry and makes no network calls of its own. Connection credentials are stored in your operating system's keychain, never in plaintext. The AI assistant is opt-in and only talks to the provider you configure.
 
 ## Architecture
 
@@ -81,4 +81,4 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup and contribution 
 
 GPL-3.0-or-later.
 
-Red links against GPUI, whose dependency tree includes GPL-licensed crates. See [`NOTICE`](NOTICE) for details.
+RED links against GPUI, whose dependency tree includes GPL-licensed crates. See [`NOTICE`](NOTICE) for details.

@@ -1,4 +1,4 @@
--- Sample database for Red — a small, self-contained e-commerce schema used as
+-- Sample database for RED — a small, self-contained e-commerce schema used as
 -- the "Sample database" preview that ships with the app (see crates/red/src/sample.rs).
 --
 -- Regenerate the binary with:

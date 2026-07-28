@@ -240,7 +240,7 @@ impl AppState {
 
         // The brand lockup: the square mark beside the wordmark, centered. The mark
         // is pinned to the brand red (`red.svg` renders as a masked square) so it
-        // reads as "Red" regardless of the active theme's accent.
+        // reads as "RED" regardless of the active theme's accent.
         let header = div()
             .flex()
             .items_center()
@@ -260,7 +260,7 @@ impl AppState {
                     .text_color(theme.text)
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_size(theme.scale(24.))
-                    .child("Red"),
+                    .child("RED"),
             );
 
         let empty_note = |msg: &'static str, theme: &Theme| {

@@ -45,6 +45,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   no settings at all before, and Redis had a single row filed under Behavior.
 
 ### Changed
+- The app is now called RED, in capitals, everywhere it names itself: the
+  welcome screen, the macOS menu bar, the window title, and the About page. The
+  application itself is renamed to match, so the icon in the Dock or the
+  applications menu reads RED. Saved connections, settings, and stored passwords
+  are untouched and carry over as they are.
 - Settings are now organised by what a setting is about rather than by which
   engine came first. Grid settings apply to every grid, and the confirmation
   rules that already governed Redis and MongoDB deletes now live under Safety

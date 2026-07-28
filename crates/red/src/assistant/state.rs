@@ -1501,7 +1501,7 @@ impl AppState {
         }
     }
 
-    /// The agent asked to run a tool Red didn't auto-allow (M-S2): show the prompt
+    /// The agent asked to run a tool RED didn't auto-allow (M-S2): show the prompt
     /// on its originating chat (the switcher flags a background one).
     pub(crate) fn on_ai_permission_request(
         &mut self,
@@ -1690,7 +1690,7 @@ impl AppState {
                 active.config.kind, active.config.database
             ),
             read_only: active.config.read_only,
-            // Paint AI-generated reports in Red's active theme (Ayu, GitHub Dark, …).
+            // Paint AI-generated reports in RED's active theme (Ayu, GitHub Dark, …).
             theme: Some(Box::new(report_theme(cx.theme()))),
             // Where generated reports are written (Settings → AI agent → Report folder).
             // Empty means "use the system temp dir", so don't send a path at all then.

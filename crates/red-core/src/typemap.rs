@@ -2,7 +2,7 @@
 //! the database-migration / "copy into a *new* table" path.
 //!
 //! dbgate carries a column's declared-type string **verbatim** across engines and
-//! lets a foreign type (`jsonb`, `uuid`, an array) fail at execute time. Red instead
+//! lets a foreign type (`jsonb`, `uuid`, an array) fail at execute time. RED instead
 //! parses each engine's declared type into the small [`NormType`] lattice and spells
 //! it back out for the *target* engine, so a Postgres `int4` / `numeric(10,2)` /
 //! `bool` / `timestamptz` becomes a faithful MySQL/SQLite/Postgres column rather than

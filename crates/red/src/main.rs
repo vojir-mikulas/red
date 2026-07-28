@@ -195,7 +195,7 @@ fn titlebar_options() -> TitlebarOptions {
 #[cfg(not(target_os = "macos"))]
 fn titlebar_options() -> TitlebarOptions {
     TitlebarOptions {
-        title: Some("Red".into()),
+        title: Some("RED".into()),
         appears_transparent: false,
         traffic_light_position: None,
     }

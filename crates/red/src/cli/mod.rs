@@ -108,7 +108,7 @@ enum Verb {
     /// Remove all RED data: config + data directories and every keychain secret
     /// (connection passwords, SSH secrets, AI keys). Does not touch the binary.
     Reset(ResetArgs),
-    /// Serve Red's read-only database tools to an MCP client over stdio (for
+    /// Serve RED's read-only database tools to an MCP client over stdio (for
     /// Claude Code and other chats; no GUI, no ports).
     Mcp(mcp::McpArgs),
 }

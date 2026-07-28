@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sign (hardened runtime), notarize, and staple build/Red.app.
+# Sign (hardened runtime), notarize, and staple build/RED.app.
 #
 # Local use — relies on your keychain identity and notary credentials:
 #   SIGN_IDENTITY="Developer ID Application: Mikulas Vojir (ZGT84Z73N9)" \
@@ -9,7 +9,7 @@
 # Set SKIP_NOTARIZE=1 to only sign (useful before the API key exists).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APP="$ROOT/build/Red.app"
+APP="$ROOT/build/RED.app"
 : "${SIGN_IDENTITY:?set SIGN_IDENTITY to your 'Developer ID Application: …' string}"
 
 echo "▸ signing $APP"
@@ -28,8 +28,8 @@ fi
 : "${NOTARY_ISSUER:?set NOTARY_ISSUER}"
 
 echo "▸ notarizing (this can take a few minutes)"
-ditto -c -k --keepParent "$APP" "$ROOT/build/Red.zip"
-xcrun notarytool submit "$ROOT/build/Red.zip" \
+ditto -c -k --keepParent "$APP" "$ROOT/build/RED.zip"
+xcrun notarytool submit "$ROOT/build/RED.zip" \
   --key "$NOTARY_KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" --wait
 
 echo "▸ stapling"

@@ -1,6 +1,6 @@
 //! ACP backend for the assistant: drives the user's Claude **subscription** by
 //! running Claude Code as an external agent over the Agent Client Protocol, the
-//! same way Zed does. The agent owns its OAuth/billing (`/login`); Red never sees
+//! same way Zed does. The agent owns its OAuth/billing (`/login`); RED never sees
 //! the tokens. This is the second provider behind the shipped `red-ai` API-key
 //! path; both feed the same `Command::AiTurn`/`Event::AiDelta` plumbing.
 //!

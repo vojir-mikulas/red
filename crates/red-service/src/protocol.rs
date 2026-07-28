@@ -957,7 +957,7 @@ pub enum Command {
     /// OAuth flow: it opens the browser to an authorize URL (relayed as
     /// `AiLoginPrompt`), the user authorizes there, then submits the code the
     /// browser shows via [`Command::AiSubmitLoginCode`]. Ends with `AiLoginFinished`.
-    /// A no-op for an API agent (those carry a key, not a login). Red never sees the
+    /// A no-op for an API agent (those carry a key, not a login). RED never sees the
     /// OAuth tokens; the CLI owns them.
     AiReauthenticateAgent {
         agent_id: String,
@@ -1684,7 +1684,7 @@ pub enum Event {
         conversation_id: ConversationId,
         message: String,
     },
-    /// The subscription agent wants to run a tool Red didn't auto-allow (M-S2):
+    /// The subscription agent wants to run a tool RED didn't auto-allow (M-S2):
     /// the panel shows a confirm prompt and answers with `Command::AiPermission`.
     /// `title` is what the agent intends to do; `detail` is a compact rendering of
     /// the tool's input, if any. Scoped to its conversation, shown inline.
@@ -1870,7 +1870,7 @@ pub struct AiContext {
     /// Whether this connection forbids writes, folded into the prompt so the
     /// model doesn't propose edits it can't run.
     pub read_only: bool,
-    /// The active Red/Flint theme's colors, so an AI-generated report can match
+    /// The active RED/Flint theme's colors, so an AI-generated report can match
     /// the app's look (Ayu Dark, GitHub Dark, …) instead of a generic light/dark
     /// document. `None` falls back to the report's built-in light/dark (which
     /// follows the OS). The UI fills it from the live `Theme`; only the
@@ -1886,7 +1886,7 @@ pub struct AiContext {
 
 /// A snapshot of the active theme's colors as CSS color strings, handed to the
 /// report generator so the standalone HTML report (page, tables, charts, filter
-/// controls) is painted in Red's current palette. UI-agnostic on this side: the
+/// controls) is painted in RED's current palette. UI-agnostic on this side: the
 /// UI converts its `Hsla` tokens to CSS; the report shell + chart/table renderer
 /// just substitute them.
 #[derive(Debug, Clone)]
@@ -1958,7 +1958,7 @@ pub struct AiCommand {
 
 /// Who (if anyone) is signed in on a subscription (ACP) agent, the
 /// `AiAgentAuthStatus` payload, surfaced in Settings → AI. Resolved by asking the
-/// agent's bundled CLI; Red never sees the OAuth tokens, only this summary.
+/// agent's bundled CLI; RED never sees the OAuth tokens, only this summary.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AiAuthStatus {
     pub logged_in: bool,

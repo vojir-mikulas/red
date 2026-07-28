@@ -1,6 +1,6 @@
 //! The subscription assistant's backend half: drives a turn through `red-acp`
 //! (Claude Code over ACP) instead of the Messages API. The agent runs its own
-//! model → tool → model loop and reaches Red's database through the localhost MCP
+//! model → tool → model loop and reaches RED's database through the localhost MCP
 //! server we host (`crate::mcp`); this module just keeps one live ACP
 //! conversation per `conversation_id`, feeds it grounded prompts, and relays the
 //! streamed deltas as the **same** `Event::AiDelta`/`AiTurnFinished`/`AiError`
@@ -27,7 +27,7 @@ use crate::protocol::{
 };
 use crate::{Event, SessionId};
 
-/// The MCP server name the agent sees for Red's DB tools.
+/// The MCP server name the agent sees for RED's DB tools.
 const MCP_SERVER_NAME: &str = "red-db";
 
 /// How long a conversation may sit untouched before the idle sweep tears its
@@ -457,7 +457,7 @@ pub(crate) async fn run_turn(
 /// pastes. We park a code sink the UI fires via `AiSubmitLoginCode`, relay the
 /// CLI's lifecycle as `AiLoginPrompt`/`AiLoginFinished`, and on success force idle
 /// conversations to re-handshake so they adopt the (possibly switched) account.
-/// Red never sees the OAuth tokens; the CLI owns them.
+/// RED never sees the OAuth tokens; the CLI owns them.
 /// Run one throwaway prompt on an ACP agent and return its text.
 ///
 /// The confirm dialog's advisory review, for agents that own their own process

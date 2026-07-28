@@ -8,14 +8,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-default-run = "Red"
+default-run = "RED"
 
 # Capitalised on purpose: with no `.app` bundle, macOS derives the bold
-# app-menu title from the executable's filename, so naming the binary "Red"
-# makes the top bar read "Red" instead of the lowercase crate name. The package
+# app-menu title from the executable's filename, so naming the binary "RED"
+# makes the top bar read "RED" instead of the lowercase crate name. The package
 # stays `red` — `cargo run -p red` still picks this up via `default-run`.
 [[bin]]
-name = "Red"
+name = "RED"
 path = "src/main.rs"
 
 [features]

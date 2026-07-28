@@ -1,6 +1,6 @@
 //! `red mcp <connection>`: a headless **stdio** MCP server (see
 //! docs/plans/todo/mcp-stdio.md). Gives any MCP client (Claude Code, other chats)
-//! Red's read-only database tools without the GUI open.
+//! RED's read-only database tools without the GUI open.
 //!
 //! This is a dumb stdio↔JSON-RPC pump: it reads one JSON-RPC message per line
 //! from stdin, answers `initialize`/`ping` locally, and translates `tools/list`/

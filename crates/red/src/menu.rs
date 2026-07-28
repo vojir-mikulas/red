@@ -41,19 +41,19 @@ use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 /// re-handed to `cx.set_menus` whenever the menu needs to reflect new state.
 ///
 /// macOS forces the bold app-menu title to the process/bundle name. With no
-/// `.app` bundle that's the executable filename, so the binary is named `Red`
-/// (see `crates/red/Cargo.toml`) to make the top bar read "Red".
+/// `.app` bundle that's the executable filename, so the binary is named `RED`
+/// (see `crates/red/Cargo.toml`) to make the top bar read "RED".
 pub(crate) fn build_menus() -> Vec<Menu> {
     vec![
         // The app menu. macOS overrides the visible name with the bundle name.
-        Menu::new("Red").items([
-            MenuItem::action("About Red", About),
+        Menu::new("RED").items([
+            MenuItem::action("About RED", About),
             MenuItem::separator(),
             MenuItem::action("Settings…", Settings),
             MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
-            MenuItem::action("Quit Red", Quit),
+            MenuItem::action("Quit RED", Quit),
         ]),
         Menu::new("Connection").items([
             // Open the ⌘P switcher (active + recent connections), or start a new

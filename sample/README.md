@@ -1,6 +1,6 @@
 # Sample database
 
-`sample.db` is the small, read-only SQLite database Red seeds on first launch as
+`sample.db` is the small, read-only SQLite database RED seeds on first launch as
 the **Sample database** preview, so a new user can explore the app without
 configuring a connection. It's embedded into the binary at build time
 (`crates/red/src/sample.rs`) and written to the app data directory on first run.

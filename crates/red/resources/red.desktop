@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Red
+Name=RED
 GenericName=Database Explorer
 Comment=Roughly Enough Data — a fast, native database explorer
-Exec=Red
+Exec=RED
 Icon=red
 Terminal=false
 Categories=Development;Database;Utility;

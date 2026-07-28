@@ -166,7 +166,7 @@ pub enum ThemeSetting {
 
 impl Default for ThemeSetting {
     fn default() -> Self {
-        // Follow the OS appearance out of the box, on Red's brand-red Ayu pair.
+        // Follow the OS appearance out of the box, on RED's brand-red Ayu pair.
         ThemeSetting::Modal {
             mode: ThemeMode::System,
             light: default_light(),

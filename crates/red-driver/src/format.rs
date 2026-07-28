@@ -212,7 +212,7 @@ const HTML_STYLE: &str = concat!(
 );
 
 /// The default report heading when the caller (or model) supplies no title.
-const DEFAULT_REPORT_TITLE: &str = "Red — query report";
+const DEFAULT_REPORT_TITLE: &str = "RED — query report";
 
 /// The HTML report's document head up to the opening `<table>`: the doctype, the
 /// inline style, and the `<h1>` heading. `title` sets both the browser `<title>` and

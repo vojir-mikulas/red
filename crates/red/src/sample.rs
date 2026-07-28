@@ -1,6 +1,6 @@
 //! The bundled "Sample database" preview.
 //!
-//! A tiny read-only SQLite database ships with Red so a first-time user can open
+//! A tiny read-only SQLite database ships with RED so a first-time user can open
 //! the app and immediately browse real data (schema, joins, a view, filtering)
 //! without configuring a connection first. The database bytes are embedded at
 //! build time and written out to the app data directory on the very first launch,

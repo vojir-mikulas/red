@@ -2497,7 +2497,7 @@ pub enum UpdateState {
     /// The check or staging failed; `reason` is user-facing.
     Failed { reason: String },
     /// A newer release exists but RED can't self-swap (not running from a
-    /// writable `/Applications/Red.app`: a dev build, Homebrew, a read-only
+    /// writable `/Applications/RED.app`: a dev build, Homebrew, a read-only
     /// volume). `url` links the GitHub release for a manual download.
     Unsupported { version: String, url: String },
 }

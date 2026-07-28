@@ -166,7 +166,7 @@ impl AppState {
             let hint = if is_subscription {
                 "Ask a question about the connected database. Chatting via your Claude \
                  subscription (Claude Code). The first message starts the agent, which reads \
-                 the schema and runs capped, read-only SELECTs through Red's tools."
+                 the schema and runs capped, read-only SELECTs through RED's tools."
             } else {
                 "Ask a question about the connected database. The agent can read the \
                  schema and run capped, read-only SELECTs to answer."

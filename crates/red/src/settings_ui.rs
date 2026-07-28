@@ -1836,7 +1836,7 @@ fn about_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                     .pb_2()
                     .text_size(theme.scale(TEXT_ROW))
                     .text_color(theme.text_muted)
-                    .child("Red: Roughly Enough Data, a fast, native database explorer."),
+                    .child("RED: Roughly Enough Data, a fast, native database explorer."),
             )
             .child(settings_header("Build", &theme))
             .child(setting_row(
@@ -1877,7 +1877,7 @@ fn about_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             .child(settings_header("Feedback", &theme))
             .child(setting_row(
                 "Report a bug",
-                "Red is in early development. Found something wrong? Open an \
+                "RED is in early development. Found something wrong? Open an \
                  issue on GitHub.",
                 Button::new("report-bug", "Report a bug…")
                     .variant(ButtonVariant::Secondary)

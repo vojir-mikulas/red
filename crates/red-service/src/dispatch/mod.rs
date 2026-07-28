@@ -817,7 +817,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         ));
                     }
                     AiProfileRuntime::Acp { command } => {
-                        // The external ACP agent grounds through Red's loopback MCP
+                        // The external ACP agent grounds through RED's loopback MCP
                         // server, which hosts whichever seam this session holds (SQL
                         // schema/query tools, the Redis `kv_*` tools, or the MongoDB
                         // doc tools).
@@ -912,7 +912,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         Event::AiToolResult {
                             call_id,
                             text: "error: this tool cannot run over the headless MCP transport \
-                                   (it modifies data or requires the Red GUI)."
+                                   (it modifies data or requires the RED GUI)."
                                 .into(),
                             is_error: true,
                         },

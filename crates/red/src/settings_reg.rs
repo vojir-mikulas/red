@@ -644,7 +644,7 @@ static DEFS: &[SettingDef] = &[
         tab: SettingsTab::Safety,
         group: "Confirmations",
         label: "Confirm from",
-        help: "How dangerous an action has to be before Red asks first. \"Risky\" covers an \
+        help: "How dangerous an action has to be before RED asks first. \"Risky\" covers an \
                UPDATE or DELETE with no WHERE, a privilege change, a Redis key delete, or a \
                MongoDB document delete; \"Destructive\" is a DROP or TRUNCATE, always \
                confirmed by typing the object's name. A connection marked Prod confirms \

@@ -169,7 +169,7 @@ fn css_color(c: gpui::Hsla) -> String {
 }
 
 /// Snapshot the active Flint theme into a [`red_service::ReportTheme`] so an
-/// AI-generated report is painted in Red's current palette (page, tables, chart
+/// AI-generated report is painted in RED's current palette (page, tables, chart
 /// cards, filter bar) instead of a generic light/dark document. The categorical
 /// chart palette is pulled from the theme's semantic colors, led by the accent.
 pub(super) fn report_theme(t: &flint::Theme) -> red_service::ReportTheme {

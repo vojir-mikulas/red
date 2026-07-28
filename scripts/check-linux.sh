@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build Red for Linux in a Docker container, from a macOS (or any) host.
+# Build RED for Linux in a Docker container, from a macOS (or any) host.
 #
-# Red has no macOS lock-in in its own code, but GPUI's Linux backend (x11 +
+# RED has no macOS lock-in in its own code, but GPUI's Linux backend (x11 +
 # wayland) needs a handful of system -dev packages to compile. This script spins
 # up an official `rust` image, installs those, and builds `-p red` against a
 # throwaway target dir so it never clobbers the host's macOS `target/`.

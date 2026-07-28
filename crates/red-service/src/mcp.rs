@@ -1,7 +1,7 @@
 //! A localhost HTTP MCP server that grounds the **subscription (ACP) assistant**
 //! in the live database. Claude Code (the ACP agent) connects to MCP servers we
 //! name in `session/new`; the live run showed it advertises `mcp_capabilities`
-//! `http` (not `acp`), so Red *hosts* the server and the agent connects in.
+//! `http` (not `acp`), so RED *hosts* the server and the agent connects in.
 //!
 //! It serves the same read-only tools the API-key path uses (via
 //! `crate::ai::AiBackend`), bound to one session's driver — the SQL

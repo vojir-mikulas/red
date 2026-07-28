@@ -248,7 +248,7 @@ impl AppState {
     }
 
     /// Relaunch into the freshly-staged build (Phase 4). The new bundle is already
-    /// swapped over `/Applications/Red.app`, so this just spawns it and exits;
+    /// swapped over `/Applications/RED.app`, so this just spawns it and exits;
     /// macOS replaces the running process with the new version.
     #[cfg(target_os = "macos")]
     pub(crate) fn restart_for_update(&mut self, _cx: &mut Context<Self>) {
@@ -904,7 +904,7 @@ impl AppState {
     /// the browser, then the user pastes the code shown there. We open the inline
     /// prompt and ask the backend to begin; `AiLoginPrompt`/`AiLoginFinished` drive
     /// the rest. Session-less. A no-op for an API agent (those carry a key, not a
-    /// login). Red never sees the OAuth tokens.
+    /// login). RED never sees the OAuth tokens.
     pub(crate) fn reauthenticate_agent(&mut self, id: &str, cx: &mut Context<Self>) {
         self.ai_login_code.update(cx, |i, cx| i.set_content("", cx));
         self.ai_login = Some(crate::app::AiLoginFlow {

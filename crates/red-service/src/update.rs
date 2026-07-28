@@ -5,7 +5,7 @@
 //! are platform-agnostic; only asset selection, the install-root probe, the swap,
 //! and the relaunch differ per OS.
 //!
-//! **macOS** swaps a notarized `.dmg` over `/Applications/Red.app`. **Linux** is
+//! **macOS** swaps a notarized `.dmg` over `/Applications/RED.app`. **Linux** is
 //! AppImage-only: it replaces the running `$APPIMAGE` in place (see the Linux
 //! `download_and_swap`). Other platforms (Windows) report `Unsupported` and fall
 //! back to a manual download. Integrity on macOS rests on notarization; on Linux,
@@ -26,13 +26,13 @@
 //! mounted bundle is run through `codesign --verify --deep --strict` and
 //! `spctl --assess --type execute`, and its Team ID is required to match the
 //! *running* (already-Gatekeeper-validated) bundle's, so a compromised release
-//! serving some *other* notarized app can't be installed over Red. The download
+//! serving some *other* notarized app can't be installed over RED. The download
 //! host is pinned to GitHub's asset hosts, and `curl` carries connect/total
 //! timeouts so a black-hole host can't tie up a blocking thread.
 //!
 //! The swap is staged, not in place: the new bundle is rsynced to a sibling
-//! `Red.app.new`, then swapped in with atomic renames (with rollback); a failure
-//! mid-copy never leaves a half-written, unrunnable `Red.app` behind.
+//! `RED.app.new`, then swapped in with atomic renames (with rollback); a failure
+//! mid-copy never leaves a half-written, unrunnable `RED.app` behind.
 
 use std::path::Path;
 
@@ -385,14 +385,14 @@ fn semver_cmp(l: &Semver, r: &Semver) -> std::cmp::Ordering {
 }
 
 /// The installed `.app` bundle root *if* we're allowed to swap it: the running
-/// executable must live in `…/Red.app/Contents/MacOS/Red` under a writable
+/// executable must live in `…/RED.app/Contents/MacOS/RED` under a writable
 /// `/Applications`. Anything else (a `cargo run` dev build, a Homebrew/read-only
 /// install) returns `None`, which the caller surfaces as `Unsupported` with a
 /// manual-download link, matching the plan's "don't fight the package manager".
 #[cfg(target_os = "macos")]
 fn installed_app_root() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let app = exe.parent()?.parent()?.parent()?; // …/Red.app
+    let app = exe.parent()?.parent()?.parent()?; // …/RED.app
     let is_bundle = app.extension().and_then(|e| e.to_str()) == Some("app");
     let writable = app.starts_with("/Applications")
         && app
@@ -421,7 +421,7 @@ fn installed_app_root() -> Option<std::path::PathBuf> {
     ok.then_some(path)
 }
 
-/// The installed `Red.exe` path *if* we're allowed to replace it. Self-update only
+/// The installed `RED.exe` path *if* we're allowed to replace it. Self-update only
 /// applies to a **portable** install: the distributed zip drops a `.red-portable`
 /// marker next to the exe, so a `cargo run` dev build or any loose exe (no marker)
 /// is never silently overwritten. The exe and its directory must be writable so we
@@ -481,7 +481,7 @@ fn download_and_swap(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700));
     }
-    let dmg = tmp.join("Red.dmg");
+    let dmg = tmp.join("RED.dmg");
     let mount = tmp.join("mnt");
 
     let result = (|| -> Result<(), String> {
@@ -519,7 +519,7 @@ fn download_and_swap(
             ],
         )?;
 
-        let mounted_app = mount.join("Red.app");
+        let mounted_app = mount.join("RED.app");
         // Authenticity gate: the staple proved integrity on mount, but not that
         // the contained app is *ours*. Verify the signature and require its Team
         // ID to match the running bundle's, then stage-and-swap. Detach happens
@@ -537,11 +537,11 @@ fn download_and_swap(
     result
 }
 
-/// Verify the mounted bundle is a genuine, Gatekeeper-acceptable Red build signed
+/// Verify the mounted bundle is a genuine, Gatekeeper-acceptable RED build signed
 /// by the same Team ID as the *running* app. Three independent checks: a strict
 /// signature verification, a Gatekeeper assessment (notarization), and a Team ID
 /// match, so a compromised release serving a different (but notarized) app can't
-/// be installed over Red.
+/// be installed over RED.
 #[cfg(target_os = "macos")]
 fn verify_authentic(mounted_app: &Path, running_app: &Path) -> Result<(), String> {
     let app = mounted_app.to_str().ok_or("non-UTF-8 mounted app path")?;
@@ -586,15 +586,15 @@ fn team_identifier(app: &Path) -> Option<String> {
         .filter(|id| !id.is_empty() && id != "not set")
 }
 
-/// Replace `app_root` with `staged` (a mounted `Red.app`) without ever leaving a
-/// half-written bundle on disk: rsync into a sibling `Red.app.new`, then swap it in
+/// Replace `app_root` with `staged` (a mounted `RED.app`) without ever leaving a
+/// half-written bundle on disk: rsync into a sibling `RED.app.new`, then swap it in
 /// with atomic renames; the running process keeps its already-mapped pages, so a
 /// live swap is safe. On a failed final rename the previous bundle is restored.
 #[cfg(target_os = "macos")]
 fn staged_swap(staged: &Path, app_root: &Path) -> Result<(), String> {
     let parent = app_root.parent().ok_or("app has no parent dir")?;
-    let new_app = parent.join("Red.app.new");
-    let old_app = parent.join(format!("Red.app.old-{}", std::process::id()));
+    let new_app = parent.join("RED.app.new");
+    let old_app = parent.join(format!("RED.app.old-{}", std::process::id()));
 
     // Clean any leftovers from a previous interrupted update.
     let _ = std::fs::remove_dir_all(&new_app);
@@ -815,11 +815,11 @@ fn parse_sha256_hex(s: &str) -> Option<String> {
     (tok.len() == 64 && tok.bytes().all(|b| b.is_ascii_hexdigit())).then(|| tok.to_string())
 }
 
-/// Windows portable self-update: download the new `Red.exe` beside the running one,
+/// Windows portable self-update: download the new `RED.exe` beside the running one,
 /// verify it against the release's `.sha256` sidecar (no Authenticode check yet;
 /// integrity rests on the checksum, fetched over TLS from a pinned GitHub host),
 /// then replace-on-restart. A running `.exe` can't be deleted, but it *can* be
-/// renamed: move the live exe to `Red.exe.old`, move the new one into place
+/// renamed: move the live exe to `RED.exe.old`, move the new one into place
 /// (rolling back on failure), and reap the `.old` on next launch. Without a sidecar
 /// we refuse rather than run unverified bytes.
 #[cfg(target_os = "windows")]
@@ -978,7 +978,7 @@ mod tests {
         let valid = "a".repeat(64);
         // The leading token of a `sha256sum` line, or a bare digest, parses.
         assert_eq!(
-            parse_sha256_hex(&format!("{valid}  Red-1.0.0-x86_64.AppImage")),
+            parse_sha256_hex(&format!("{valid}  RED-1.0.0-x86_64.AppImage")),
             Some(valid.clone())
         );
         assert_eq!(parse_sha256_hex(&valid), Some(valid));
@@ -992,25 +992,25 @@ mod tests {
     fn download_host_is_pinned_to_github() {
         // GitHub's two asset hosts are accepted.
         assert!(is_allowed_download_url(
-            "https://github.com/o/r/releases/download/v1/Red.dmg"
+            "https://github.com/o/r/releases/download/v1/RED.dmg"
         ));
         assert!(is_allowed_download_url(
-            "https://objects.githubusercontent.com/github-production-release-asset/x/Red.dmg"
+            "https://objects.githubusercontent.com/github-production-release-asset/x/RED.dmg"
         ));
         // Everything else is refused before the bytes reach curl.
         assert!(!is_allowed_download_url(
-            "http://github.com/o/r/Red.dmg" // not https
+            "http://github.com/o/r/RED.dmg" // not https
         ));
-        assert!(!is_allowed_download_url("https://evil.example.com/Red.dmg"));
+        assert!(!is_allowed_download_url("https://evil.example.com/RED.dmg"));
         assert!(!is_allowed_download_url(
-            "https://evil.com/github.com/Red.dmg"
+            "https://evil.com/github.com/RED.dmg"
         ));
         // Userinfo / port spoofs that embed `github.com` in the authority.
         assert!(!is_allowed_download_url(
-            "https://github.com@evil.com/Red.dmg"
+            "https://github.com@evil.com/RED.dmg"
         ));
         assert!(!is_allowed_download_url(
-            "https://github.com.evil.com/Red.dmg"
+            "https://github.com.evil.com/RED.dmg"
         ));
     }
 }

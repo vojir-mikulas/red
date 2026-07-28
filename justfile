@@ -49,13 +49,13 @@ check: fmt lint test
 icon:
     mkdir -p build
     rsvg-convert -w 1024 -h 1024 assets/red.svg -o build/icon-1024.png
-    ./scripts/make-icns.sh build/icon-1024.png build/Red.icns
+    ./scripts/make-icns.sh build/icon-1024.png build/RED.icns
 
-# Assemble build/Red.app. Native arch (fast); use `bundle-universal` to ship.
+# Assemble build/RED.app. Native arch (fast); use `bundle-universal` to ship.
 bundle:
     ARCH=native ./scripts/bundle-mac.sh
 
-# Assemble a universal (arm64+x86_64) build/Red.app for distribution.
+# Assemble a universal (arm64+x86_64) build/RED.app for distribution.
 bundle-universal:
     ARCH=universal ./scripts/bundle-mac.sh
 

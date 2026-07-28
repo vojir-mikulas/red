@@ -1,7 +1,7 @@
 //! Subscription **sign-in** and "who is logged in" for the Claude Agent ACP agent.
 //!
 //! The agent (`@agentclientprotocol/claude-agent-acp`) never advertises an auth
-//! method to Red; it only offers terminal-login methods when the *client* asks
+//! method to RED; it only offers terminal-login methods when the *client* asks
 //! for the `auth.terminal` capability, and even then its `authenticate` RPC isn't
 //! implemented for them. So the old "spawn a probe handshake to pop `/login`"
 //! approach was a silent no-op once signed in. Instead the agent ships a CLI: run
@@ -10,12 +10,12 @@
 //! - `auth status` → JSON ([`AuthStatus`]): login state, email, subscription.
 //! - `auth login --claudeai` → a **paste-code** OAuth flow: it opens the browser
 //!   to an authorize URL, then waits on **stdin** for the code the browser shows.
-//!   There is no localhost auto-callback variant, so Red drives it: read the URL
+//!   There is no localhost auto-callback variant, so RED drives it: read the URL
 //!   off stdout ([`run_login`] emits [`LoginEvent::Url`]), let the user authorize,
 //!   then feed the code back over stdin (the `code` receiver).
 //! - `auth logout` → clears the stored credential.
 //!
-//! Red never sees the OAuth tokens: the bundled CLI owns them.
+//! RED never sees the OAuth tokens: the bundled CLI owns them.
 
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -69,7 +69,7 @@ pub struct AuthStatus {
 /// One step of the interactive [`run_login`] flow, relayed to the UI.
 #[derive(Debug)]
 pub enum LoginEvent {
-    /// The authorize URL the CLI opened (and printed). Red surfaces it so the user
+    /// The authorize URL the CLI opened (and printed). RED surfaces it so the user
     /// can open it manually if the auto-open didn't land, then authorizes there.
     Url(String),
     /// The flow finished: `Ok` on a stored credential, `Err(message)` otherwise

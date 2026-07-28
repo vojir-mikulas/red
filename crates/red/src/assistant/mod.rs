@@ -1,6 +1,6 @@
 //! The AI assistant panel: a right-docked, grounded chat sidebar (the AI-assistant
 //! M1 slice). It streams a conversation with a model that knows about the connected
-//! database and can read it through Red's existing safe seams: the panel never
+//! database and can read it through RED's existing safe seams: the panel never
 //! speaks HTTP, it sends `Command::AiTurn` and drains `Event::AiDelta` like every
 //! other backend interaction. The backend runs the model → tool → model loop and
 //! the read-only tool catalog (see `red-service`'s `ai` module); this file is just
@@ -203,7 +203,7 @@ impl ChatMessage {
 }
 
 /// A pending agent tool-permission prompt (M-S2, subscription path): the agent
-/// wants to run a tool Red didn't auto-allow. The panel shows Allow/Deny and the
+/// wants to run a tool RED didn't auto-allow. The panel shows Allow/Deny and the
 /// answer routes back as `Command::AiPermission`, keyed by `request_id`.
 pub(crate) struct PendingPermission {
     pub(crate) request_id: red_service::RequestId,

@@ -42,7 +42,7 @@ jobs:
           brew install librsvg
           mkdir -p build
           rsvg-convert -w 1024 -h 1024 assets/red.svg -o build/icon-1024.png
-          ./scripts/make-icns.sh build/icon-1024.png build/Red.icns
+          ./scripts/make-icns.sh build/icon-1024.png build/RED.icns
           ARCH=universal ./scripts/bundle-mac.sh "$VERSION"
 
       - name: Sign
@@ -58,10 +58,10 @@ jobs:
           ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
         run: |
           echo "$KEY" | base64 --decode > $RUNNER_TEMP/key.p8
-          ditto -c -k --keepParent build/Red.app build/Red.zip
-          xcrun notarytool submit build/Red.zip \
+          ditto -c -k --keepParent build/RED.app build/RED.zip
+          xcrun notarytool submit build/RED.zip \
             --key $RUNNER_TEMP/key.p8 --key-id "$KEY_ID" --issuer "$ISSUER" --wait
-          xcrun stapler staple build/Red.app
+          xcrun stapler staple build/RED.app
 
       - name: Package .dmg
         env:
@@ -71,13 +71,13 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           brew install create-dmg
-          create-dmg --volname "Red $VERSION" --app-drop-link 480 200 \
-            --icon "Red.app" 160 200 --window-size 640 400 \
-            "build/Red-$VERSION.dmg" "build/Red.app"
-          codesign --force --timestamp --sign "$IDENTITY" "build/Red-$VERSION.dmg"
-          xcrun notarytool submit "build/Red-$VERSION.dmg" \
+          create-dmg --volname "RED $VERSION" --app-drop-link 480 200 \
+            --icon "RED.app" 160 200 --window-size 640 400 \
+            "build/RED-$VERSION.dmg" "build/RED.app"
+          codesign --force --timestamp --sign "$IDENTITY" "build/RED-$VERSION.dmg"
+          xcrun notarytool submit "build/RED-$VERSION.dmg" \
             --key $RUNNER_TEMP/key.p8 --key-id "$KEY_ID" --issuer "$ISSUER" --wait
-          xcrun stapler staple "build/Red-$VERSION.dmg"
+          xcrun stapler staple "build/RED-$VERSION.dmg"
 
       # Slice this version's section out of CHANGELOG.md so the Release body
       # matches the curated notes (and the in-app "What's New" panel). Keys off
@@ -100,7 +100,7 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: build/Red-*.dmg
+          files: build/RED-*.dmg
           body_path: build/RELEASE_NOTES.md
           fail_on_unmatched_files: true
 
@@ -138,8 +138,8 @@ jobs:
         with:
           # The .sha256 sidecar backs the Linux self-updater's integrity check.
           files: |
-            build/Red-*.AppImage
-            build/Red-*.AppImage.sha256
+            build/RED-*.AppImage
+            build/RED-*.AppImage.sha256
           fail_on_unmatched_files: true
 
   windows:
@@ -163,7 +163,7 @@ jobs:
           # The bare .exe + .sha256 are the self-update payload; the .zip is the
           # first-time portable install.
           files: |
-            build/Red-*-windows.zip
-            build/Red-*-windows.exe
-            build/Red-*-windows.exe.sha256
+            build/RED-*-windows.zip
+            build/RED-*-windows.exe
+            build/RED-*-windows.exe.sha256
           fail_on_unmatched_files: true

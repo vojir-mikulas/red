@@ -114,7 +114,7 @@ pub(crate) struct ReportSink {
     events: Option<Events>,
     session: Option<SessionId>,
     conversation_id: ConversationId,
-    /// The active app theme, so `generate_report` can paint the report in Red's
+    /// The active app theme, so `generate_report` can paint the report in RED's
     /// colors. Captured when the sink is built (per turn on the API-key path; at
     /// conversation start on the subscription path).
     theme: Option<ReportTheme>,
@@ -353,7 +353,7 @@ pub(crate) async fn run_turn(
     // (Redis) backend offers its own read-only `kv_*` catalog.
     let tools = backend.catalog(&policy);
     // Where `generate_report` delivers its file so the UI opens it (Feature C);
-    // carries the active theme so the report matches Red's colors.
+    // carries the active theme so the report matches RED's colors.
     let report = ReportSink::new(
         events.clone(),
         session,
@@ -1961,7 +1961,7 @@ pub(crate) fn kv_system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
     };
     finish_system_prompt(
         format!(
-            "You are Red's Redis agent, embedded in a native database explorer. You help the user \
+            "You are RED's Redis agent, embedded in a native database explorer. You help the user \
              explore and understand the Redis server they are connected to.\n\n\
              {tools_line}\n\n\
              Redis keys are addressed by glob patterns (e.g. `user:*`), not SQL — there are no \
@@ -2899,8 +2899,8 @@ const REPORT_STYLE: &str = concat!(
     "</style>",
 );
 
-/// The report's base document style. With a `theme` (the active Red palette) the
-/// page, tables and code blocks are painted in Red's colors and pinned to its
+/// The report's base document style. With a `theme` (the active RED palette) the
+/// page, tables and code blocks are painted in RED's colors and pinned to its
 /// light/dark; without one, fall back to [`REPORT_STYLE`] (built-in, OS-driven).
 fn report_style(theme: Option<&ReportTheme>) -> String {
     let Some(th) = theme else {
@@ -3005,10 +3005,10 @@ fn wrap_report_html(
     let title = title
         .map(str::trim)
         .filter(|t| !t.is_empty())
-        .unwrap_or("Red — report");
+        .unwrap_or("RED — report");
     let t = red_driver::html_escape(title);
     let safe_body = strip_scripts(body);
-    // The base document style: Red's active theme if the UI supplied one, else
+    // The base document style: RED's active theme if the UI supplied one, else
     // the built-in light/dark (follows the OS).
     let style = report_style(theme);
 
@@ -3124,7 +3124,7 @@ pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
     };
     let mut s = finish_system_prompt(
         format!(
-            "You are Red's database agent, embedded in a native SQL explorer. You help the user \
+            "You are RED's database agent, embedded in a native SQL explorer. You help the user \
              explore and understand the database they are connected to.\n\n\
              {tools_line}\n\n\
              When you write SQL for the user, put it in a fenced ```sql block so they can run it. \
@@ -3721,7 +3721,7 @@ pub(crate) fn doc_system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
     };
     finish_system_prompt(
         format!(
-            "You are Red's MongoDB agent, embedded in a native database explorer. You help the \
+            "You are RED's MongoDB agent, embedded in a native database explorer. You help the \
              user explore and understand the MongoDB deployment they are connected to.\n\n\
              {tools_line}\n\n\
              MongoDB is SCHEMALESS: a collection has no declared columns, and a field can be \
