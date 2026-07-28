@@ -150,7 +150,56 @@ impl AppState {
             with_columns
         };
 
-        // Outermost column boundary: History | (schema | editor / results).
+        // Mutations | (schema | columns | editor / results): sits between History and
+        // Schema, since it's about the connection rather than the focused result.
+        let with_mutations = if active.mutations_open {
+            let pane = self.render_mutations(active, cx);
+            let start = view.clone();
+            let resize = view.clone();
+            let end = view.clone();
+            SplitPane::new("shell-split-mutations", Axis::Horizontal)
+                .size(active.mutations_w)
+                .gutter(px(1.))
+                .drag(active.mutations_drag)
+                .min_first(px(240.))
+                .max_first(px(560.))
+                .on_drag_start(move |anchor, _, cx| {
+                    start
+                        .update(cx, |this, cx| {
+                            if let Phase::Connected(a) = &mut this.phase {
+                                a.mutations_drag = Some(anchor);
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                })
+                .on_resize(move |size, _, cx| {
+                    resize
+                        .update(cx, |this, cx| {
+                            if let Phase::Connected(a) = &mut this.phase {
+                                a.mutations_w = size;
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                })
+                .on_drag_end(move |_, cx| {
+                    end.update(cx, |this, cx| {
+                        if let Phase::Connected(a) = &mut this.phase {
+                            a.mutations_drag = None;
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .first(pane)
+                .second(with_schema)
+                .into_any_element()
+        } else {
+            with_schema
+        };
+
+        // Outermost column boundary: History | (mutations | schema | editor / results).
         let workspace = if show_history {
             let history_pane = self.render_history(active, cx);
             let start = view.clone();
@@ -192,10 +241,10 @@ impl AppState {
                     .ok();
                 })
                 .first(history_pane)
-                .second(with_schema)
+                .second(with_mutations)
                 .into_any_element()
         } else {
-            with_schema
+            with_mutations
         };
 
         // With the assistant open, dock it to the right of the whole workspace via
@@ -395,6 +444,41 @@ impl AppState {
             ))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_columns_panel(cx)));
 
+        // Mutations panel toggle, offered only on an engine whose row edits are
+        // asynchronous background work. Tinted amber while any is still running, so
+        // an edit that outlived its submit stays visible without the panel open --
+        // the whole point being that a grid which hasn't changed yet reads as
+        // "it didn't work" and invites a retry that doubles the cost.
+        let running = self.running_mutations();
+        let mutations_toggle = self.tracks_mutations().then(|| {
+            div()
+                .id("toggle-mutations")
+                .mr_1()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(20.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .tooltip(Tooltip::text(if running == 0 {
+                    "Toggle mutations".to_string()
+                } else {
+                    format!("Toggle mutations  ({running} running)")
+                }))
+                .hover(|s| s.bg(theme.bg_elevated))
+                .child(crate::icons::icon(
+                    "refresh-cw",
+                    theme.scale(14.),
+                    match (active.mutations_open, running) {
+                        (_, n) if n > 0 => theme.yellow,
+                        (true, _) => theme.accent,
+                        _ => theme.text_muted,
+                    },
+                ))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_mutations(cx)))
+        });
+
         // Assistant toggle, pinned to the far-right of the status bar (mirrors the
         // schema sidebar toggle on the left). Accent-tinted while the panel is open.
         // Hidden entirely when the assistant is disabled for this connection (the
@@ -450,6 +534,7 @@ impl AppState {
                     .child(history_toggle)
                     .child(sidebar_toggle)
                     .child(columns_toggle)
+                    .children(mutations_toggle)
                     .child(status_left),
             )
             .child(

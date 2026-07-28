@@ -16,7 +16,7 @@ mod render;
 mod suggest;
 
 pub(crate) use autoscroll::Autoscroll;
-pub(crate) use edit::GridEdit;
+pub(crate) use edit::{GridEdit, OpSource};
 pub(crate) use suggest::CellSuggest;
 
 use std::cell::{Cell, RefCell};
@@ -32,7 +32,7 @@ use gpui::{
 };
 use red_core::{
     BASE_ALIAS, Column as ResultColumn, ColumnMap, ColumnStats, ColumnValue, ExportFormat, FkEdge,
-    FkJoin, ImportFormat, KeySpec, ResultFilter, TableRef, Value,
+    FkJoin, ImportFormat, KeySpec, ResultFilter, RowEditCaps, TableRef, Value,
 };
 use red_service::{Command, CommandSender, OpId, RunFetch, SessionId, SortKey};
 
@@ -48,10 +48,18 @@ use crate::gridwindow::{WINDOW, WindowView, scrollbar_metrics, window_decision};
 pub(crate) use buffer::next_epoch as next_kv_epoch;
 use buffer::{BufferMode, GridBuffer, KeyedRun, next_epoch};
 
-/// The resolved identity of an editable cell, `(row, data_col, pk_value, decl_type,
-/// foreign)`, returned by [`ResultGrid::edit_identity`]. `foreign` is `Some` for an
-/// inline-expanded FK column that writes back to its referenced table (Track B7).
-type EditIdentity = (usize, usize, Value, Option<String>, Option<ForeignEdit>);
+/// The resolved identity of an editable cell, `(row, data_col, key_values,
+/// decl_type, foreign)`, returned by [`ResultGrid::edit_identity`]. `key_values` are
+/// the row's identity-column values in `RowEditCaps::identity` order; `foreign` is
+/// `Some` for an inline-expanded FK column that writes back to its referenced table
+/// (Track B7).
+type EditIdentity = (
+    usize,
+    usize,
+    Vec<(String, Value)>,
+    Option<String>,
+    Option<ForeignEdit>,
+);
 pub(crate) use render::group_digits;
 
 /// Mint a fresh, process-unique epoch for a non-grid consumer (the plan view,
@@ -264,6 +272,11 @@ pub(crate) struct ResultGrid {
     /// The seek key the backend resolved (`ResultReady`). Track B5 reads its PK to
     /// key a guarded edit; `None` (editor SQL / no usable PK) means not editable.
     key: Option<KeySpec>,
+    /// What this result's existing rows may be changed to, resolved by the backend
+    /// alongside [`key`](Self::key). Default (`EditMode::None`) for editor SQL and
+    /// for a table the engine can't mutate; its `note` is the one-line reason the
+    /// grid shows instead of the affordances.
+    pub(in crate::result) edit: RowEditCaps,
     pub(in crate::result) buffer: Rc<RefCell<GridBuffer>>,
     /// Staged, not-yet-submitted edits for this result (Track B6), keyed by PK so
     /// they survive the windowed buffer's eviction. Cleared on every (re)open.
@@ -343,6 +356,7 @@ impl ResultGrid {
             joined_cols: HashSet::new(),
             tree_expanded: HashSet::new(),
             key: None,
+            edit: RowEditCaps::default(),
             buffer: Rc::new(RefCell::new(GridBuffer::new(page_size))),
             pending: edit::PendingChanges::default(),
             sender,
@@ -580,19 +594,110 @@ impl ResultGrid {
             .and_then(|r| r.values.get(col).cloned())
     }
 
-    /// Whether this result is an editable single-table keyed browse (a base table
-    /// plus a resolved PK): the precondition for any staged edit / insert / delete.
+    /// Whether this result's existing rows can be edited: a single-table browse whose
+    /// table reported an edit contract, with every identity column present in the
+    /// result. The precondition for a staged **update or delete**, which have to
+    /// address one existing row.
+    ///
+    /// Deliberately independent of the *seek* key: paging and editing want different
+    /// things from a key, and conflating them is what used to make a composite-primary
+    /// -key table uneditable on every engine.
     pub(crate) fn editable_browse(&self) -> bool {
-        self.table.is_some() && self.key.is_some()
+        self.table.is_some() && self.edit.editable() && self.identity_column_indices().is_some()
     }
 
-    /// The data-column index of the identity (PK) column (the sorted browse's
-    /// tiebreaker, else the lead key), when this is an editable browse and the PK
-    /// column is present in the result.
-    pub(in crate::result) fn pk_column_index(&self) -> Option<usize> {
-        let key = self.key.as_ref()?;
-        let pk_column = key.tiebreak.clone().unwrap_or_else(|| key.column.clone());
-        self.columns.iter().position(|c| c.name == pk_column)
+    /// Whether rows can be **inserted** into this result: a single-table browse, with
+    /// no key requirement. An insert names no existing row, so it needs no identity;
+    /// this is what lets a ClickHouse `MergeTree` browse (whose composite sorting key
+    /// resolves no single PK, hence no [`editable_browse`](Self::editable_browse))
+    /// still offer the draft-row zone.
+    pub(crate) fn insertable_browse(&self) -> bool {
+        self.table.is_some()
+    }
+
+    /// Whether a draft row may set data column `col`. False for a column the engine
+    /// computes for itself (a ClickHouse `MATERIALIZED` / `ALIAS`), which rejects an
+    /// explicit value on insert: the draft zone shows it as computed rather than
+    /// offering an editor that would only produce an engine error at submit.
+    pub(in crate::result) fn insertable_column(&self, col: usize) -> bool {
+        match self.columns.get(col) {
+            Some(c) => !self.edit.no_insert.iter().any(|n| n == &c.name),
+            None => false,
+        }
+    }
+
+    /// The one-line reason this result's existing rows can't be edited, when the
+    /// connection itself could edit them (so the user sees "why not here", not
+    /// silence). `None` when the rows *are* editable, or when nothing was reported.
+    pub(in crate::result) fn not_editable_note(&self) -> Option<&str> {
+        (!self.edit.editable())
+            .then_some(self.edit.note.as_deref())
+            .flatten()
+    }
+
+    /// The data-column indices of the identity columns, in identity order. `None`
+    /// unless *every* one is present in the result: a partial identity would address
+    /// more rows than the user is looking at.
+    pub(in crate::result) fn identity_column_indices(&self) -> Option<Vec<usize>> {
+        if self.edit.identity.is_empty() {
+            return None;
+        }
+        let idx: Vec<usize> = self
+            .edit
+            .identity
+            .iter()
+            .filter_map(|name| self.columns.iter().position(|c| &c.name == name))
+            .collect();
+        (idx.len() == self.edit.identity.len()).then_some(idx)
+    }
+
+    /// The `(column, value)` pairs that address the resident row at `row`, in
+    /// identity order. `None` when the row isn't resident, or when nothing usable is
+    /// left to address it by.
+    ///
+    /// Members the grid can't compare are dropped rather than refused: a
+    /// display-clipped cell holds only a prefix, a blob has no comparable text form,
+    /// and a float may not have survived the read exactly. What that costs depends on
+    /// the contract, so it decides differently for each. The **guarded** one addresses
+    /// a row by its declared key, so a member it can't use leaves the predicate
+    /// under-specified and the row is not editable. The **best-effort** one addresses
+    /// by value snapshot -- an inherently partial thing on an engine with no unique
+    /// key -- and counts the matches before it writes, so it works with whatever
+    /// members it has and refuses later if they aren't enough.
+    pub(in crate::result) fn identity_values(&self, row: usize) -> Option<Vec<(String, Value)>> {
+        let idx = self.identity_column_indices()?;
+        let mut usable = Vec::with_capacity(idx.len());
+        let mut dropped = false;
+        for (&col, name) in idx.iter().zip(&self.edit.identity) {
+            match self.cell_value(row, col)? {
+                Value::Real(_) | Value::Blob(_) | Value::Capped(_) => dropped = true,
+                value => usable.push((name.clone(), value)),
+            }
+        }
+        if usable.is_empty() || (dropped && self.edit.mode == red_core::EditMode::Guarded) {
+            return None;
+        }
+        Some(usable)
+    }
+
+    /// The contract this result's rows can be edited under, as the backend resolved
+    /// it for the browsed table.
+    pub(crate) fn edit_mode(&self) -> red_core::EditMode {
+        if self.editable_browse() {
+            self.edit.mode
+        } else {
+            red_core::EditMode::None
+        }
+    }
+
+    /// Whether data column `col` can be *updated*. False for a column the engine
+    /// won't let change (a key column: changing identity is out of scope, and
+    /// ClickHouse rejects it outright) or computes for itself.
+    pub(in crate::result) fn updatable_column(&self, col: usize) -> bool {
+        match self.columns.get(col) {
+            Some(c) => !self.edit.no_update.iter().any(|n| n == &c.name),
+            None => false,
+        }
     }
 
     /// Assemble the guarded-edit target (Track B5) for the cell under the cursor:
@@ -603,7 +708,7 @@ impl ResultGrid {
     /// the target cell is binary / display-clipped (no safe inline round-trip).
     /// `gutter` is the data-column table offset (see [`AppState::gutter`]).
     pub(crate) fn edit_target(&self, gutter: usize) -> Option<EditContext> {
-        let (row, col, pk_value, decl_type, foreign) = self.edit_identity(gutter)?;
+        let (row, col, key_values, decl_type, foreign) = self.edit_identity(gutter)?;
         let original = self.cell_value(row, col)?;
         // A resident inline edit needs a safe round-trip: no binary, and no
         // display-clipped cell (we'd only have its head). The inspector's
@@ -616,7 +721,7 @@ impl ResultGrid {
             epoch: self.epoch,
             row,
             data_col: col,
-            pk_value,
+            key_values,
             decl_type,
             original,
             foreign,
@@ -632,12 +737,12 @@ impl ResultGrid {
         if matches!(original, Value::Blob(_)) {
             return None;
         }
-        let (row, col, pk_value, decl_type, foreign) = self.edit_identity(gutter)?;
+        let (row, col, key_values, decl_type, foreign) = self.edit_identity(gutter)?;
         Some(EditContext {
             epoch: self.epoch,
             row,
             data_col: col,
-            pk_value,
+            key_values,
             decl_type,
             original,
             foreign,
@@ -651,15 +756,14 @@ impl ResultGrid {
     /// referenced table). `None` unless this is an editable single-table keyed browse
     /// with a usable (present, uncapped) PK and the cursor sitting off the PK column.
     pub(crate) fn edit_identity(&self, gutter: usize) -> Option<EditIdentity> {
-        self.table.as_ref()?; // must be a single-table browse to be editable
-        let key = self.key.as_ref()?;
-        // The identity column: the tiebreaker (the PK) for a sorted browse, else the
-        // lead key (which is the PK for a plain browse).
-        let pk_column = key.tiebreak.clone().unwrap_or_else(|| key.column.clone());
-        let pk_idx = self.columns.iter().position(|c| c.name == pk_column)?;
+        if !self.editable_browse() {
+            return None;
+        }
         let (row, col) = self.cursor_cell(gutter)?;
         let target = self.columns.get(col)?;
-        if target.name == pk_column {
+        // A key column (changing identity is out of scope, and ClickHouse rejects it)
+        // or an engine-computed one is never the target of an edit.
+        if !self.updatable_column(col) {
             return None;
         }
         // An inline-expanded reference column (Track B7) writes back to the *joined*
@@ -671,11 +775,8 @@ impl ResultGrid {
         } else {
             None
         };
-        let pk_value = self.cell_value(row, pk_idx)?;
-        if matches!(pk_value, Value::Null | Value::Capped(_)) {
-            return None;
-        }
-        Some((row, col, pk_value, target.decl_type.clone(), foreign))
+        let key_values = self.identity_values(row)?;
+        Some((row, col, key_values, target.decl_type.clone(), foreign))
     }
 
     /// Resolve the referenced-table write target for the inline-expanded FK column at
@@ -781,7 +882,13 @@ impl ResultGrid {
     /// Install the open result's metadata and reset the buffer into the right
     /// mode: keyed when the backend resolved a seek key that names a result
     /// column, offset otherwise.
-    fn on_ready(&mut self, columns: Vec<ResultColumn>, total: usize, key: Option<KeySpec>) {
+    fn on_ready(
+        &mut self,
+        columns: Vec<ResultColumn>,
+        total: usize,
+        key: Option<KeySpec>,
+        edit: RowEditCaps,
+    ) {
         // Keyed only when every key column (lead, then tiebreaker) is present in
         // the result; a `SELECT *` table browse always satisfies this.
         let key_cols = key.as_ref().and_then(|k| {
@@ -793,6 +900,7 @@ impl ResultGrid {
             (cols.len() == k.column_names().len()).then_some(cols)
         });
         self.key = key;
+        self.edit = edit;
         self.columns = columns;
         self.total = total;
         // An unfiltered open re-baselines the "of N" the filtered status reads
@@ -1362,7 +1470,13 @@ impl AppState {
         cx.notify();
     }
 
-    /// Backend reported the open result's columns + total (+ resolved seek key).
+    /// Backend reported the open result's columns + total, plus what it resolved
+    /// about the result itself: the seek key and the edit contract.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per `Event::ResultReady` field; bundling them would \
+                  duplicate the protocol type for one call site"
+    )]
     pub(crate) fn on_result_ready(
         &mut self,
         session: Option<SessionId>,
@@ -1370,6 +1484,7 @@ impl AppState {
         total: usize,
         epoch: red_service::Epoch,
         key: Option<KeySpec>,
+        edit: RowEditCaps,
         cx: &mut Context<Self>,
     ) {
         // Route to the event's session (it may be a backgrounded workspace), then
@@ -1379,7 +1494,7 @@ impl AppState {
             // with the shared one; mark FK columns now that the column set is known.
             let graph = active.fk_graph.clone();
             if let Some(grid) = active.result_by_epoch(epoch) {
-                grid.on_ready(columns, total, key);
+                grid.on_ready(columns, total, key, edit);
                 grid.set_fk_cols(&graph);
                 grid.set_joined_cols();
             }
@@ -2753,7 +2868,7 @@ mod join_tests {
 #[cfg(test)]
 mod foreign_edit_tests {
     use super::*;
-    use crate::result::edit::{PkKey, StagedCell, UpdatedRow};
+    use crate::result::edit::{RowKey, StagedCell, UpdatedRow};
     use red_core::{BASE_ALIAS, Column, EditOp, FkJoin, KeyKind, KeySpec, TableRef, Value};
     use red_service::{SessionId, spawn};
     use std::collections::HashMap;
@@ -2784,6 +2899,14 @@ mod foreign_edit_tests {
             col("tier_id.name", "text"),
         ];
         grid.key = Some(KeySpec::single("id", KeyKind::Int));
+        // The backend reports the row identity alongside the key; here it's the PK.
+        grid.edit = red_core::RowEditCaps {
+            mode: red_core::EditMode::Guarded,
+            identity: vec!["id".into()],
+            no_update: vec!["id".into()],
+            no_insert: Vec::new(),
+            note: None,
+        };
         grid.joins = vec![FkJoin {
             alias: "_red_j0".into(),
             parent_alias: BASE_ALIAS.into(),
@@ -2865,44 +2988,211 @@ mod foreign_edit_tests {
                 foreign: Some(f),
             },
         );
+        let key_values = vec![("id".to_string(), Value::Integer(10))];
         grid.pending.updates.insert(
-            PkKey::Int(10),
+            RowKey::from_values(&key_values).expect("an int identity is stageable"),
             UpdatedRow {
-                pk_value: Value::Integer(10),
+                key_values,
                 row: 0,
                 cells,
             },
         );
-        let ops = grid.build_edit_ops();
+        let ops = grid.build_edit_batch().ops;
         assert_eq!(
             ops.len(),
             2,
             "one base UPDATE + one referenced-table UPDATE"
         );
 
-        let (base_key, base_set) = ops
+        let (base_keys, base_set) = ops
             .iter()
             .find_map(|op| match op {
-                EditOp::Update { table, key, set } if table.name == "channel" => Some((key, set)),
+                EditOp::Update { table, keys, set } if table.name == "channel" => Some((keys, set)),
                 _ => None,
             })
             .expect("base UPDATE present");
-        assert_eq!(base_key.column, "id");
-        assert_eq!(base_key.value, Value::Integer(10));
+        assert_eq!(
+            base_keys.len(),
+            1,
+            "a single-column PK is a one-term identity"
+        );
+        assert_eq!(base_keys[0].column, "id");
+        assert_eq!(base_keys[0].value, Value::Integer(10));
         assert_eq!(base_set.len(), 1);
         assert_eq!(base_set[0].column, "tier_id");
 
-        let (fk_key, fk_set) = ops
+        let (fk_keys, fk_set) = ops
             .iter()
             .find_map(|op| match op {
-                EditOp::Update { table, key, set } if table.name == "tier" => Some((key, set)),
+                EditOp::Update { table, keys, set } if table.name == "tier" => Some((keys, set)),
                 _ => None,
             })
             .expect("referenced-table UPDATE present");
-        assert_eq!(fk_key.column, "id");
-        assert_eq!(fk_key.value, Value::Integer(3)); // the FK value identifies the ref row
+        assert_eq!(fk_keys[0].column, "id");
+        assert_eq!(fk_keys[0].value, Value::Integer(3)); // the FK value identifies the ref row
         assert_eq!(fk_set[0].column, "name"); // leaf, not the dotted alias
         assert_eq!(fk_set[0].value, Value::Text("Platinum".into()));
         assert_eq!(fk_set[0].decl_type.as_deref(), Some("text"));
+    }
+}
+
+/// Resolving a row's identity: the composite-key refactor's UI half. The rules that
+/// decide *which* row an edit addresses, and when it refuses to address one at all.
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::result::edit::RowKey;
+    use red_core::{Column, EditMode, EditOp, RowEditCaps, Value};
+    use red_service::{SessionId, spawn};
+
+    /// A `parts(tenant, id, label, note)` browse with one resident row, whose edit
+    /// contract is `mode` over the identity `columns`.
+    fn grid(mode: EditMode, identity: &[&str], row: Vec<Value>) -> ResultGrid {
+        let handle = spawn();
+        let sender = handle.command_sender(SessionId::new(1));
+        let mut grid = ResultGrid::new(
+            "parts".into(),
+            "SELECT * FROM parts".into(),
+            Some(("main".into(), "parts".into())),
+            sender,
+            100,
+        );
+        grid.columns = ["tenant", "id", "label", "note"]
+            .iter()
+            .map(|name| Column {
+                name: (*name).into(),
+                decl_type: Some("text".into()),
+            })
+            .collect();
+        grid.edit = RowEditCaps {
+            mode,
+            identity: identity.iter().map(|s| (*s).to_string()).collect(),
+            no_update: identity.iter().map(|s| (*s).to_string()).collect(),
+            no_insert: Vec::new(),
+            note: None,
+        };
+        grid.buffer.borrow_mut().insert_page(0, vec![row]);
+        grid
+    }
+
+    fn whole_row() -> Vec<Value> {
+        vec![
+            Value::Text("acme".into()),
+            Value::Integer(7),
+            Value::Text("bolt".into()),
+            Value::Null,
+        ]
+    }
+
+    /// A composite key addresses the row by its whole tuple, which is what makes a
+    /// composite-primary-key table editable at all.
+    #[test]
+    fn composite_identity_becomes_a_conjunction() {
+        let mut grid = grid(EditMode::Guarded, &["tenant", "id"], whole_row());
+        assert!(grid.editable_browse());
+        let key_values = grid.identity_values(0).expect("both members are usable");
+        assert_eq!(
+            key_values,
+            vec![
+                ("tenant".to_string(), Value::Text("acme".into())),
+                ("id".to_string(), Value::Integer(7)),
+            ]
+        );
+
+        grid.pending.deletes.insert(
+            RowKey::from_values(&key_values).expect("a text+int identity is stageable"),
+            crate::result::edit::DeletedRow { key_values, row: 0 },
+        );
+        let ops = grid.build_edit_batch().ops;
+        match &ops[..] {
+            [EditOp::Delete { keys, .. }] => {
+                assert_eq!(keys.len(), 2, "both members reach the WHERE");
+                assert_eq!(keys[0].column, "tenant");
+                assert_eq!(keys[1].value, Value::Integer(7));
+                // The declared type rides along so a text-decoded value casts back
+                // into its column on the engines that need it.
+                assert_eq!(keys[0].decl_type.as_deref(), Some("text"));
+            }
+            other => panic!("expected one DELETE, got {other:?}"),
+        }
+    }
+
+    /// A null identity member is kept (the driver renders `IS NULL`); it is a real
+    /// value the row has, not a missing one.
+    #[test]
+    fn a_null_member_still_addresses_the_row() {
+        let grid = grid(EditMode::BestEffort, &["id", "note"], whole_row());
+        let key_values = grid.identity_values(0).expect("null is usable");
+        assert_eq!(key_values[1], ("note".to_string(), Value::Null));
+        assert!(RowKey::from_values(&key_values).is_some());
+    }
+
+    /// A display-clipped cell holds only a prefix. The guarded contract addresses by
+    /// declared key, so losing a member makes the row uneditable; the best-effort one
+    /// addresses by value snapshot and counts before it writes, so it narrows.
+    #[test]
+    fn a_clipped_member_refuses_under_guarded_and_narrows_under_best_effort() {
+        let clipped = vec![
+            Value::Text("acme".into()),
+            Value::Integer(7),
+            Value::capped_text("a very long label indeed", 4),
+            Value::Null,
+        ];
+        let guarded = grid(EditMode::Guarded, &["id", "label"], clipped.clone());
+        assert!(
+            guarded.identity_values(0).is_none(),
+            "an under-specified declared key is refused, not guessed at"
+        );
+
+        let best_effort = grid(EditMode::BestEffort, &["id", "label"], clipped);
+        let key_values = best_effort
+            .identity_values(0)
+            .expect("the usable members still address the row");
+        assert_eq!(
+            key_values,
+            vec![("id".to_string(), Value::Integer(7))],
+            "the clipped member is dropped, the rest stands"
+        );
+    }
+
+    /// With nothing usable left, the row isn't editable at all -- an `UPDATE` with an
+    /// empty `WHERE` would address the whole table.
+    #[test]
+    fn no_usable_member_is_not_editable() {
+        let blobs = vec![
+            Value::Blob(vec![1, 2, 3]),
+            Value::Real(1.5),
+            Value::Text("bolt".into()),
+            Value::Null,
+        ];
+        let grid = grid(EditMode::BestEffort, &["tenant", "id"], blobs);
+        assert!(grid.identity_values(0).is_none());
+        assert!(RowKey::from_values(&[]).is_none());
+    }
+
+    /// A table the engine reported as unmutable, and a result missing an identity
+    /// column, are both simply not editable.
+    #[test]
+    fn refuses_without_a_contract_or_a_resident_identity() {
+        let none = grid(EditMode::None, &[], whole_row());
+        assert!(!none.editable_browse());
+        assert_eq!(none.edit_mode(), EditMode::None);
+
+        let missing = grid(EditMode::BestEffort, &["id", "absent"], whole_row());
+        assert!(
+            missing.identity_column_indices().is_none(),
+            "a partial identity would address more rows than are on screen"
+        );
+        assert!(!missing.editable_browse());
+    }
+
+    /// Editor SQL has no base table to write back to, whatever it reports.
+    #[test]
+    fn editor_sql_is_never_editable() {
+        let handle = spawn();
+        let sender = handle.command_sender(SessionId::new(1));
+        let grid = ResultGrid::new("query".into(), "SELECT 1".into(), None, sender, 100);
+        assert!(!grid.editable_browse());
+        assert!(!grid.insertable_browse());
     }
 }

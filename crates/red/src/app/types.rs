@@ -909,7 +909,16 @@ pub(crate) enum PendingWrite {
     /// reply to its result.
     Batch {
         ops: Vec<EditOp>,
+        /// Where each op came from, so a partially-applied batch can un-stage
+        /// exactly what landed. Same length and order as `ops`.
+        sources: Vec<crate::result::OpSource>,
         epoch: red_service::Epoch,
+        /// Which contract this batch runs under. Also carries the user's
+        /// "apply to all matching rows" acknowledgement, which the dialog toggles.
+        mode: red_core::BatchMode,
+        /// What the backend said each op would do, for the best-effort dialog. Empty
+        /// under the atomic contract, which confirms without a preflight.
+        plan: Vec<red_core::OpPlan>,
     },
     /// A confirmed data import (Track: data import): everything to fire
     /// `Command::Import` on confirm, plus the precomputed `prose`/`preview` the
@@ -1004,23 +1013,28 @@ pub(crate) struct PendingCopyNewTable {
     pub schema: String,
 }
 
-/// The editable grid cell under the cursor (Track B6): its identity (the row's PK
-/// value), position (absolute row, data column), and the focused column's declared
-/// type / current value. Built by [`ResultGrid::edit_target`] and consumed by the
-/// inline editor + the inspector edit, which coerce a typed value against
-/// `decl_type` and stage it under the row's PK.
+/// The editable grid cell under the cursor (Track B6): its row's identity values,
+/// position (absolute row, data column), and the focused column's declared type /
+/// current value. Built by [`ResultGrid::edit_target`] and consumed by the inline
+/// editor + the inspector edit, which coerce a typed value against `decl_type` and
+/// stage it under the row's identity.
 #[derive(Clone)]
 pub(crate) struct EditContext {
     pub epoch: red_service::Epoch,
     /// Absolute row ordinal and data-column index of the edited cell.
     pub row: usize,
     pub data_col: usize,
-    pub pk_value: red_core::Value,
+    /// The `(column, value)` pairs that address the row, in `RowEditCaps::identity`
+    /// order: one for a single-column primary key, several for a composite one or for
+    /// a ClickHouse value snapshot. Carries the column names because the usable set
+    /// can be narrower than the declared identity (see
+    /// [`ResultGrid::identity_values`]).
+    pub key_values: Vec<(String, red_core::Value)>,
     pub decl_type: Option<String>,
     pub original: red_core::Value,
     /// Set when the edited cell is an inline-expanded foreign-key column (Track
     /// B7): the edit updates the *referenced* table's row, not this browse's base
-    /// table. `None` for an ordinary base-table cell (updated via the row's PK).
+    /// table. `None` for an ordinary base-table cell (updated via the row's identity).
     pub foreign: Option<ForeignEdit>,
 }
 
@@ -1436,6 +1450,19 @@ pub(crate) struct ActiveConn {
     /// restores the previous width.
     pub history_w: Pixels,
     pub history_drag: Option<DragAnchor>,
+    /// Whether the Mutations panel is shown in the left dock. Offered only on an
+    /// engine whose row edits are asynchronous background work
+    /// ([`DbKind::tracks_mutations`](red_core::DbKind::tracks_mutations)); on every
+    /// other engine a write is finished when the statement returns and there would be
+    /// nothing to show.
+    pub mutations_open: bool,
+    /// The last `system.mutations` listing, unfinished first. Refreshed on open, on
+    /// every submit, and while anything is still running.
+    pub mutations: Vec<red_core::MutationInfo>,
+    /// A listing is in flight (the panel shows it instead of an empty state).
+    pub mutations_loading: bool,
+    pub mutations_w: Pixels,
+    pub mutations_drag: Option<DragAnchor>,
     /// Whether the Columns panel (inline FK expansion, Track B7) is shown in the left
     /// dock, i.e. the recursive tree that picks referenced columns into the active
     /// browse.
@@ -1524,6 +1551,11 @@ impl ActiveConn {
             history_bucket_collapsed: std::collections::HashSet::new(),
             history_w: px(240.),
             history_drag: None,
+            mutations_open: false,
+            mutations: Vec::new(),
+            mutations_loading: false,
+            mutations_w: px(320.),
+            mutations_drag: None,
             columns_open: false,
             columns_w: px(260.),
             columns_drag: None,

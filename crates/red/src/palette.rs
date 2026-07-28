@@ -46,6 +46,9 @@ pub(crate) enum Cmd {
     ClearHistory,
     ToggleSidebar,
     ToggleColumnsPanel,
+    /// Show/hide the Mutations panel (ClickHouse: the engine's in-flight background
+    /// edits).
+    ToggleMutations,
     RefreshSchema,
     Disconnect,
     /// Move keyboard focus to the schema / editor / grid pane.
@@ -290,6 +293,7 @@ impl AppState {
             Cmd::ClearHistory => self.clear_history(cx),
             Cmd::ToggleSidebar => self.toggle_sidebar(cx),
             Cmd::ToggleColumnsPanel => self.toggle_columns_panel(cx),
+            Cmd::ToggleMutations => self.toggle_mutations(cx),
             Cmd::RefreshSchema => self.refresh_schema(),
             Cmd::Disconnect => self.disconnect(cx),
             // Pane focus needs a `Window`; defer it to the next render (drained
@@ -358,16 +362,44 @@ impl AppState {
         }
     }
 
-    /// Whether guarded in-grid editing is enabled for the active connection (Track
-    /// B5): a writable (non-read-only) connection whose engine supports the
-    /// transactional, exactly-one-row edit contract. Read-only is the safe default,
-    /// and an OLAP engine (ClickHouse) is excluded even when writable: its async,
-    /// non-atomic mutations can't honor the guarded-edit guarantees.
-    pub(crate) fn editing_enabled(&self) -> bool {
+    /// Which contract the **active result's** existing rows can be edited under
+    /// (Track B5). Three gates in one, all of which must agree: the connection is
+    /// writable, the engine has *some* edit contract, and the table this result
+    /// browses reported one (see [`red_core::RowEditCaps`]).
+    ///
+    /// [`EditMode::None`] means no update/delete affordances at all -- read-only is
+    /// the safe default at every level.
+    pub(crate) fn row_edit_mode(&self) -> red_core::EditMode {
+        let Phase::Connected(active) = &self.phase else {
+            return red_core::EditMode::None;
+        };
+        let caps = active.config.kind.write_caps();
+        if active.config.read_only || !(caps.guarded_edit || caps.best_effort_edit) {
+            return red_core::EditMode::None;
+        }
+        active
+            .active_result()
+            .map(|g| g.edit_mode())
+            .unwrap_or(red_core::EditMode::None)
+    }
+
+    /// Whether the active result's existing rows can be edited at all.
+    pub(crate) fn row_edit_enabled(&self) -> bool {
+        !matches!(self.row_edit_mode(), red_core::EditMode::None)
+    }
+
+    /// Whether in-grid **inserting** (the draft-row zone, "+ Row", file import) is
+    /// enabled for the active connection: a writable connection whose engine accepts
+    /// a bulk `INSERT`. Deliberately a separate gate from
+    /// [`row_edit_enabled`](Self::row_edit_enabled): an insert needs none of the
+    /// row-identity or rollback guarantees an update or a delete does, so ClickHouse
+    /// -- which can be an insert target but has no guarded edit -- passes this one
+    /// and fails that one.
+    pub(crate) fn insert_enabled(&self) -> bool {
         matches!(
             &self.phase,
             Phase::Connected(active)
-                if !active.config.read_only && active.config.kind.write_caps().guarded_edit
+                if !active.config.read_only && active.config.kind.write_caps().insert
         )
     }
 
@@ -375,7 +407,7 @@ impl AppState {
     /// is editable (a single-table keyed browse, non-PK, non-clipped). `None`
     /// otherwise; the entry point and palette gate both consult this.
     pub(crate) fn active_edit_target(&self) -> Option<crate::app::EditContext> {
-        if !self.editing_enabled() {
+        if !self.row_edit_enabled() {
             return None;
         }
         let gutter = self.gutter();
@@ -505,28 +537,29 @@ impl AppState {
                         Cmd::CopyToTable,
                     ));
                 }
-                // Staged data editing (B6), offered on a writable, edit-enabled
-                // connection browsing an editable (single-table keyed) result. Add
-                // row is always available there; submit/revert only with changes.
-                if self.editing_enabled()
-                    && active.active_result().is_some_and(|g| g.editable_browse())
+                // Staged data editing (B6), offered on a writable connection browsing
+                // a single-table result. "Add row" rides the *insert* gate, so it is
+                // offered on an engine that accepts inserts without supporting guarded
+                // row editing (ClickHouse); submit/revert follow whatever is staged.
+                if self.insert_enabled()
+                    && active
+                        .active_result()
+                        .is_some_and(|g| g.insertable_browse())
                 {
                     out.push((
                         PaletteItem::new("cmd:add-row", "data: add row").hint("⌥⌘N"),
                         Cmd::AddRow,
                     ));
-                    if self.has_pending_changes() {
-                        out.push((
-                            PaletteItem::new("cmd:submit-changes", "data: submit changes")
-                                .hint("⌘↵"),
-                            Cmd::SubmitChanges,
-                        ));
-                        out.push((
-                            PaletteItem::new("cmd:revert-changes", "data: revert changes")
-                                .hint("⌥⌘Z"),
-                            Cmd::RevertChanges,
-                        ));
-                    }
+                }
+                if self.has_pending_changes() {
+                    out.push((
+                        PaletteItem::new("cmd:submit-changes", "data: submit changes").hint("⌘↵"),
+                        Cmd::SubmitChanges,
+                    ));
+                    out.push((
+                        PaletteItem::new("cmd:revert-changes", "data: revert changes").hint("⌥⌘Z"),
+                        Cmd::RevertChanges,
+                    ));
                 }
                 out.push((
                     PaletteItem::new("cmd:history", "query: toggle history"),
@@ -592,6 +625,14 @@ impl AppState {
                     PaletteItem::new("cmd:columns", "view: toggle columns panel").hint("⇧⌘C"),
                     Cmd::ToggleColumnsPanel,
                 ));
+                // Only where there are background mutations to watch; on every other
+                // engine a write is finished when the statement returns.
+                if self.tracks_mutations() {
+                    out.push((
+                        PaletteItem::new("cmd:mutations", "view: toggle mutations panel"),
+                        Cmd::ToggleMutations,
+                    ));
+                }
                 out.push((
                     PaletteItem::new("cmd:refresh", "schema: refresh").hint("⌘R"),
                     Cmd::RefreshSchema,

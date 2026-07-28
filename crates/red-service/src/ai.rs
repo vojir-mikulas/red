@@ -1080,9 +1080,11 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "propose_changeset".into(),
-            description: "Execute SEVERAL data-modifying statements as ONE atomic transaction: \
-                they all commit together, or if any fails the whole set is rolled back (nothing \
-                changes). Use this for a related multi-step change — e.g. insert a parent row then \
+            description: "Execute SEVERAL data-modifying statements as ONE approved unit, in \
+                order. On an engine with multi-statement transactions they commit together, or if \
+                any fails the whole set is rolled back (nothing changes); ClickHouse has no such \
+                transaction, so there a failure leaves the statements before it applied. Use this \
+                for a related multi-step change — e.g. insert a parent row then \
                 its children, or update several rows in lockstep — where a half-applied result \
                 would be wrong. EVERY call requires explicit approval: the user sees the full list \
                 of statements and must Allow it before anything runs; assume it may be denied. Each \
@@ -1095,7 +1097,7 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
                 "properties": {
                     "statements": {
                         "type": "array",
-                        "description": "The INSERT/UPDATE/DELETE statements to run in order, in one transaction. Each is a single statement (UPDATE/DELETE need a WHERE).",
+                        "description": "The INSERT/UPDATE/DELETE statements to run in order, as one unit. Each is a single statement (UPDATE/DELETE need a WHERE).",
                         "items": { "type": "string" },
                         "minItems": 1,
                     },
@@ -2332,8 +2334,10 @@ pub(crate) async fn run_tool(
             }
         }
         "propose_changeset" => {
-            // Re-vet at execution (defense in depth), then run the whole set in one
-            // transaction: all commit or none do. Approval was already granted above.
+            // Re-vet at execution (defense in depth), then run the whole set through
+            // `execute_batch`: one transaction where the engine has them (all commit
+            // or none do), sequential on ClickHouse, which has none. Approval was
+            // already granted above.
             match assess_write(name, input, policy) {
                 WriteAssessment::NeedsApproval { .. } => {
                     let statements = changeset_statements(input);
@@ -2346,8 +2350,8 @@ pub(crate) async fn run_tool(
                             let total: u64 = affected.iter().sum();
                             (
                                 format!(
-                                    "Executed the changeset in one transaction: {} statement(s), \
-                                     {total} row(s) affected. Verify with a SELECT if it matters.",
+                                    "Executed the changeset: {} statement(s), {total} row(s) \
+                                     affected. Verify with a SELECT if it matters.",
                                     statements.len()
                                 ),
                                 true,
@@ -2355,8 +2359,10 @@ pub(crate) async fn run_tool(
                         }
                         Err(e) => (
                             format!(
-                                "error: the changeset failed and was rolled back (nothing \
-                                     changed): {e}"
+                                "error: the changeset failed: {e}. On an engine with \
+                                 transactions it was rolled back and nothing changed; on \
+                                 ClickHouse the statements before the failure may have applied, \
+                                 so verify with a SELECT."
                             ),
                             false,
                         ),

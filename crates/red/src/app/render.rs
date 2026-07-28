@@ -4,7 +4,7 @@
 
 use flint::prelude::*;
 use gpui::{ClipboardItem, Focusable, KeyDownEvent, Render, Window, div, prelude::*, px};
-use red_core::CopyMode;
+use red_core::{BatchMode, CopyMode};
 
 use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::app::AiReviewState;
@@ -1584,6 +1584,108 @@ impl AppState {
         )
     }
 
+    /// The three caveats a best-effort submit carries, above the statements.
+    ///
+    /// These are not decoration. Under this contract the writes are asynchronous, so
+    /// the grid may not show them the instant Submit returns; there is no
+    /// transaction, so a failure halfway leaves the earlier changes in place; and the
+    /// engine rewrites data *by part*, so a one-cell edit on a large table can be an
+    /// expensive operation. A dialog that said only "are you sure" would be hiding all
+    /// three.
+    fn render_best_effort_card(
+        &self,
+        plan: &[red_core::OpPlan],
+        theme: &flint::Theme,
+    ) -> gpui::AnyElement {
+        // Only a *mutation* carries the cost caveat; an insert is an ordinary write.
+        let mutations = plan
+            .iter()
+            .filter(|p| p.blocked.is_none() && matches!(p.verb, "Update" | "Delete"))
+            .count();
+        let mut lines = vec![
+            "Applied one statement at a time: a failure partway leaves the earlier \
+             changes in place."
+                .to_string(),
+        ];
+        if mutations > 0 {
+            lines.push(
+                "Updates and deletes are asynchronous mutations. ClickHouse rewrites \
+                 data by part, so this can cost far more than the rows it changes."
+                    .to_string(),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .rounded(theme.radius_sm)
+            .bg(theme.bg_input)
+            .border_1()
+            .border_color(theme.border_soft)
+            .text_size(theme.scale(11.5))
+            .text_color(theme.text_muted)
+            .children(lines.into_iter().map(|line| {
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_1p5()
+                    .child(crate::icons::icon(
+                        "alert-triangle",
+                        theme.scale(12.),
+                        theme.text_muted,
+                    ))
+                    .child(div().child(line))
+            }))
+            .into_any_element()
+    }
+
+    /// The explicit "apply to all N rows" acknowledgement, shown only when the
+    /// preflight found an op whose identity matches more than one row.
+    ///
+    /// ClickHouse has no unique row address, so an identity that matches several rows
+    /// is a real possibility rather than a bug, and the difference between "change
+    /// this row" and "change these four" is not something to infer. Ticking this is
+    /// what turns those ops from refused into runnable.
+    fn render_apply_to_all(
+        &self,
+        plan: &[red_core::OpPlan],
+        acknowledged: bool,
+        theme: &flint::Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let extra: u64 = plan
+            .iter()
+            .filter_map(|p| p.matches.filter(|n| *n > 1))
+            .sum();
+        if extra == 0 {
+            return None;
+        }
+        let view = cx.entity().downgrade();
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    Checkbox::new("batch-apply-to-all", acknowledged)
+                        .mark(crate::icons::icon("check", px(12.), theme.on_accent))
+                        .on_change(move |checked: &bool, _, cx| {
+                            let checked = *checked;
+                            view.update(cx, |this, cx| this.set_apply_to_all(checked, cx))
+                                .ok();
+                        }),
+                )
+                .child(
+                    div()
+                        .text_size(theme.scale(12.5))
+                        .text_color(theme.text)
+                        .child(format!("Apply to all {extra} matching rows, not just one")),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The destructive-statement confirmation modal: the write safety rail.
     fn render_confirm(
         &self,
@@ -1612,7 +1714,14 @@ impl AppState {
                 sql.clone(),
                 "Run statement",
             ),
-            PendingWrite::Batch { ops, .. } => {
+            // The atomic contract: one transaction, all or nothing. The generic
+            // `preview_sql` is enough here because the driver binds the same op and
+            // rolls the whole batch back if any of it surprises us.
+            PendingWrite::Batch {
+                ops,
+                mode: BatchMode::Atomic,
+                ..
+            } => {
                 let n = ops.len();
                 let prose = if n == 1 {
                     "This will apply 1 staged change in a single transaction. Submit it?"
@@ -1625,6 +1734,31 @@ impl AppState {
                 let combined = ops
                     .iter()
                     .map(|op| op.preview_sql())
+                    .collect::<Vec<_>>()
+                    .join(";\n");
+                ("Submit changes", prose, combined, "Submit")
+            }
+            // The best-effort contract: the preflight's real statements, so what is
+            // approved is what runs. Blocked ops are listed and will be skipped.
+            PendingWrite::Batch { plan, .. } => {
+                let runnable = plan.iter().filter(|p| p.blocked.is_none()).count();
+                let blocked = plan.len() - runnable;
+                let mut prose = match runnable {
+                    0 => "None of these can run as staged.".to_string(),
+                    1 => "This will apply 1 staged change, one statement at a time.".to_string(),
+                    n => format!("This will apply {n} staged changes, one statement at a time."),
+                };
+                if blocked > 0 {
+                    prose.push_str(&format!(" {blocked} can't run and will be skipped."));
+                }
+                let combined = plan
+                    .iter()
+                    .map(|p| match (&p.blocked, p.matches) {
+                        (Some(reason), _) => format!("-- skipped, {reason}\n{}", p.sql),
+                        (None, Some(1)) => p.sql.clone(),
+                        (None, Some(n)) => format!("-- matches {n} rows\n{}", p.sql),
+                        (None, None) => p.sql.clone(),
+                    })
                     .collect::<Vec<_>>()
                     .join(";\n");
                 ("Submit changes", prose, combined, "Submit")
@@ -1668,6 +1802,20 @@ impl AppState {
             }
             _ => None,
         };
+        // The best-effort caveats and the "apply to all N rows" acknowledgement. Both
+        // are specific to a contract that can't promise what the atomic one does, so
+        // neither appears on the relational path.
+        let (best_effort_card, apply_to_all) = match &pending {
+            PendingWrite::Batch {
+                mode: BatchMode::BestEffort { allow_multi_match },
+                plan,
+                ..
+            } => (
+                Some(self.render_best_effort_card(plan, &theme)),
+                self.render_apply_to_all(plan, *allow_multi_match, &theme, cx),
+            ),
+            _ => (None, None),
+        };
         let body = div()
             .flex()
             .flex_col()
@@ -1679,6 +1827,7 @@ impl AppState {
                     .child(prose),
             )
             .children(risk_card)
+            .children(best_effort_card)
             .children(self.render_ai_review(&theme))
             .child(
                 // The statement itself, framed as a quoted artefact rather than more
@@ -1696,6 +1845,7 @@ impl AppState {
                     .child(preview),
             )
             .children(self.render_type_to_confirm(&theme))
+            .children(apply_to_all)
             .children(dont_ask);
         let mut footer = div().flex().justify_end().gap_2().child(
             Button::new("confirm-cancel", "Cancel")
@@ -1726,7 +1876,7 @@ impl AppState {
                     // Stays disabled until the object's name has been typed, when the
                     // grade called for that. `confirm_destructive` re-checks, so this
                     // is the affordance rather than the guarantee.
-                    .disabled(!self.confirm_target_matches(cx))
+                    .disabled(!self.confirm_target_matches(cx) || !self.confirm_has_work())
                     .on_click(cx.listener(|this, _, _, cx| this.confirm_destructive(cx))),
             );
         }

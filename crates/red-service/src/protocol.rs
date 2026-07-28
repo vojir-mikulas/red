@@ -22,10 +22,10 @@ use red_core::kv::{
     SlowlogEntry, StreamAction, StreamConsumer, StreamGroup,
 };
 use red_core::{
-    ActivityId, ActivityKind, ActivityStatus, AiLimits, AiTier, Column, ColumnMap, ColumnMeta,
-    ColumnStats, ConnectionConfig, CopyMode, EditOp, ExportFormat, FkEdge, FkJoin, ImportFormat,
-    KeySpec, LookupRow, PlanStep, QueryOptions, QueryPlan, ResultFilter, RowWindow, SchemaMeta,
-    SortDirection, StatsFlags, TableDetail, TableRef, UpdateState, Value,
+    ActivityId, ActivityKind, ActivityStatus, AiLimits, AiTier, BatchMode, Column, ColumnMap,
+    ColumnMeta, ColumnStats, ConnectionConfig, CopyMode, EditOp, ExportFormat, FkEdge, FkJoin,
+    ImportFormat, KeySpec, LookupRow, PlanStep, QueryOptions, QueryPlan, ResultFilter, RowWindow,
+    SchemaMeta, SortDirection, StatsFlags, TableDetail, TableRef, UpdateState, Value,
 };
 
 /// Identifies one keep-alive backend session. Minted UI-side at connect start so
@@ -692,14 +692,44 @@ pub enum Command {
     Execute {
         sql: String,
     },
-    /// Apply a batch of guarded, PK-keyed data edits (Track B6) **atomically** on the
-    /// active session. The driver renders each `op` to dialect SQL, binds every
-    /// value, runs them in one transaction, and asserts each touches exactly one
-    /// row (all-or-nothing). `epoch` is the active result's epoch so a reply for a
-    /// superseded result (tab switched / re-run) is dropped. Replied with
-    /// `BatchApplied` (then the UI patches/refetches) or `BatchFailed` (scoped to the
-    /// result pane), never a global error toast.
+    /// Apply a batch of guarded, identity-keyed data edits (Track B6) on the active
+    /// session. The driver renders each `op` to dialect SQL and binds every value;
+    /// `mode` picks which contract it runs under (see [`BatchMode`]), because the two
+    /// are different promises rather than a strictness dial.
+    ///
+    /// [`Atomic`](BatchMode::Atomic) runs them in one transaction, asserting each
+    /// touches exactly one row, and replies `BatchApplied` or `BatchFailed`.
+    /// [`BestEffort`](BatchMode::BestEffort) runs each op on its own, preflight-
+    /// counted, and replies `BatchPartial` with one outcome per op -- on an engine
+    /// with no transaction, "3 of 5 applied" is a real result and has to be sayable.
+    ///
+    /// `epoch` is the active result's epoch so a reply for a superseded result (tab
+    /// switched / re-run) is dropped. Every reply is scoped to the result pane, never
+    /// a global error toast.
     ApplyBatch {
+        epoch: Epoch,
+        ops: Vec<EditOp>,
+        mode: BatchMode,
+    },
+    /// List the background mutations this connection can see, for the Mutations
+    /// panel. Replied with `MutationsLoaded`. Read-only and cheap (one catalog
+    /// query), so the panel polls it while anything is still running.
+    ListMutations,
+    /// Cancel the background mutation `id` on `table` (`KILL MUTATION`). Replied with
+    /// a fresh `MutationsLoaded` so the panel reflects the kill without a second
+    /// round trip; a failure is a global `Error`.
+    KillMutation {
+        table: TableRef,
+        id: String,
+    },
+    /// Ask what an `ApplyBatch` *would* do, without writing anything: the real
+    /// statement per op and how many rows its identity currently matches. Replied
+    /// with `BatchPreflight`.
+    ///
+    /// Only the best-effort path needs this. Under the atomic contract the driver's
+    /// own one-row assertion (and its rollback) is a stronger guarantee than a count
+    /// taken a moment earlier could be, so that path confirms without a round trip.
+    PreflightBatch {
         epoch: Epoch,
         ops: Vec<EditOp>,
     },
@@ -1351,6 +1381,11 @@ pub enum Event {
         total: usize,
         epoch: Epoch,
         key: Option<KeySpec>,
+        /// What the grid may change about this result's existing rows, resolved from
+        /// the same `describe_table` the seek key came from, so a browse learns its
+        /// edit contract with no extra round trip. Default (`EditMode::None`) for
+        /// editor SQL, which has no single base table to write back to.
+        edit: red_core::RowEditCaps,
     },
     /// One page of the open result. Echoes `offset` so the grid drops it into the
     /// right slot of its window buffer regardless of arrival order, and `epoch`
@@ -1463,6 +1498,33 @@ pub enum Event {
     BatchFailed {
         epoch: Epoch,
         failed_index: Option<usize>,
+        message: String,
+    },
+    /// The answer to `ListMutations` / `KillMutation`: the connection's background
+    /// mutations, unfinished first. An engine without them reports an empty list.
+    MutationsLoaded {
+        mutations: Vec<red_core::MutationInfo>,
+    },
+    /// A **best-effort** edit batch finished: one outcome per submitted op, in batch
+    /// order. Some may have applied, some been blocked by the preflight, some failed
+    /// at the engine, and some still be running as asynchronous mutations -- there was
+    /// no transaction, so this is the only honest shape for the reply. The UI reports
+    /// the tally and keeps the unfinished ops staged.
+    BatchPartial {
+        epoch: Epoch,
+        outcomes: Vec<red_core::OpOutcome>,
+    },
+    /// The answer to `PreflightBatch`: what each op would run and how many rows it
+    /// matches right now. Feeds the confirm dialog, so what the user approves is what
+    /// executes.
+    BatchPreflight {
+        epoch: Epoch,
+        plan: Vec<red_core::OpPlan>,
+    },
+    /// A `PreflightBatch` couldn't be answered (the catalog was unreadable, the
+    /// connection dropped). Pane-local like `BatchFailed`; nothing was written.
+    BatchPreflightFailed {
+        epoch: Epoch,
         message: String,
     },
     /// An `Explain` produced a plan. Echoes `epoch` so the UI drops a plan for a

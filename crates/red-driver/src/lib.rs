@@ -15,7 +15,8 @@ use async_trait::async_trait;
 use red_core::{
     BASE_ALIAS, CmpOp, Column, ColumnMeta, ColumnPredicate, ColumnStats, ColumnValue, DbKind,
     EditOp, ExportFormat, FkEdge, FkJoin, KeySpec, QueryOptions, QueryPlan, RedError, Result,
-    ResultPage, RowWindow, SchemaMeta, SortDirection, StatsFlags, TableDetail, TableRef, Value,
+    ResultPage, RowEditCaps, RowWindow, SchemaMeta, SortDirection, StatsFlags, TableDetail,
+    TableRef, Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -217,14 +218,29 @@ pub(crate) fn edit_sql<'a>(
         }
     };
 
+    // The identity conjunction. A null member renders `IS NULL` and binds nothing:
+    // `= NULL` is never true, so a row whose identity column *is* null would be
+    // addressed by a predicate that matches no row at all.
+    let identity = |keys: &'a [ColumnValue], params: &mut Vec<&'a Value>| -> String {
+        keys.iter()
+            .map(|cv| match cv.value {
+                Value::Null => format!("{} IS NULL", quote(&cv.column)),
+                _ => format!("{} = {}", quote(&cv.column), slot(cv, params)),
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
+
     let mut params: Vec<&Value> = Vec::new();
     let sql = match op {
-        EditOp::Update { table, key, set } => {
+        EditOp::Update { table, keys, set } => {
             let mut assigns = Vec::with_capacity(set.len());
             for cv in set {
                 assigns.push(format!("{} = {}", quote(&cv.column), slot(cv, &mut params)));
             }
-            let where_clause = format!("{} = {}", quote(&key.column), slot(key, &mut params));
+            // Assignments bind before the identity, so the placeholder indices match
+            // the order values are pushed in (`$1 … $n` on Postgres).
+            let where_clause = identity(keys, &mut params);
             format!(
                 "UPDATE {} SET {} WHERE {}",
                 qualify(table),
@@ -232,8 +248,8 @@ pub(crate) fn edit_sql<'a>(
                 where_clause
             )
         }
-        EditOp::Delete { table, key } => {
-            let where_clause = format!("{} = {}", quote(&key.column), slot(key, &mut params));
+        EditOp::Delete { table, keys } => {
+            let where_clause = identity(keys, &mut params);
             format!("DELETE FROM {} WHERE {}", qualify(table), where_clause)
         }
         EditOp::Insert { table, values } => {
@@ -1107,6 +1123,26 @@ pub trait DatabaseDriver: Send + Sync {
     /// user expands a table, so the initial tree load stays light.
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableDetail>;
 
+    /// What in-grid row editing this table supports (see [`RowEditCaps`]), resolved
+    /// once per browse next to its seek key. `detail` is the already-loaded
+    /// [`describe_table`](Self::describe_table) result, so the relational default
+    /// costs **no** extra round trip: a primary key is all it needs.
+    ///
+    /// ClickHouse overrides this because none of what it needs -- the table engine,
+    /// which columns are in the sorting / partition / sampling key, which are
+    /// `MATERIALIZED` or `ALIAS` -- is expressible in a [`TableDetail`], and getting
+    /// it wrong means a mutation that rewrites the whole table or is rejected by the
+    /// engine after the user confirmed it.
+    async fn edit_caps(
+        &self,
+        schema: &str,
+        table: &str,
+        detail: &TableDetail,
+    ) -> Result<RowEditCaps> {
+        let _ = (schema, table);
+        Ok(RowEditCaps::guarded(detail))
+    }
+
     /// The enum-typed columns of `table` and their allowed values (Track B8: the
     /// in-cell enum picker), `{ column → [variant, …] }`. Used to offer a value
     /// dropdown when editing an enum cell. The default returns nothing (engines
@@ -1332,6 +1368,94 @@ pub trait DatabaseDriver: Send + Sync {
     /// transactional [`apply_edits`](DatabaseDriver::apply_edits) batch path.
     async fn apply_edit(&self, op: &EditOp) -> Result<u64> {
         self.apply_edits(std::slice::from_ref(op)).await
+    }
+
+    /// What each op of `ops` *would* run, without running any of it: the statement in
+    /// this engine's dialect, how many rows its identity currently matches, and why
+    /// it can't run when it can't. Feeds the confirm dialog, so what the user approves
+    /// is what executes.
+    ///
+    /// The default is pure and does no I/O: a generic
+    /// [`preview_sql`](EditOp::preview_sql) per op and no match count. That is honest
+    /// for the atomic engines, where the driver itself asserts exactly one row and a
+    /// mismatch rolls the batch back -- there is nothing a preflight could add that
+    /// the transaction doesn't already guarantee. ClickHouse overrides it, because
+    /// there the count *is* the guarantee.
+    async fn preflight_edits(&self, ops: &[EditOp]) -> Result<Vec<red_core::OpPlan>> {
+        Ok(ops
+            .iter()
+            .enumerate()
+            .map(|(index, op)| red_core::OpPlan {
+                index,
+                verb: op.verb(),
+                sql: op.preview_sql(),
+                matches: None,
+                blocked: None,
+            })
+            .collect())
+    }
+
+    /// Apply `ops` **best-effort**: run every one, never stop the batch on a failure,
+    /// and report per op what happened (see [`OpOutcome`](red_core::OpOutcome)).
+    ///
+    /// This is a different promise from [`apply_edits`](Self::apply_edits), not a
+    /// relaxed one, and it lives on its own method so that contract's wording stays
+    /// exactly as strong as it is. Here there is no transaction, no rollback, and no
+    /// engine-enforced one-row guarantee: correctness rests on the preflight count,
+    /// and partial application is a legitimate result the caller must report honestly.
+    ///
+    /// `mode` carries the user's "apply to all N matching rows" acknowledgement; an
+    /// [`Atomic`](red_core::BatchMode::Atomic) mode here means the caller wants the
+    /// atomic contract and the default below delegates to it.
+    ///
+    /// The default runs the atomic path and maps its all-or-nothing answer onto the
+    /// per-op shape, so an engine that has real transactions keeps them.
+    async fn apply_edits_best_effort(
+        &self,
+        ops: &[EditOp],
+        mode: red_core::BatchMode,
+    ) -> Result<Vec<red_core::OpOutcome>> {
+        use red_core::{OpOutcome, OpStatus};
+        let _ = mode;
+        let outcome = |status: OpStatus| -> Vec<OpOutcome> {
+            ops.iter()
+                .enumerate()
+                .map(|(index, op)| OpOutcome {
+                    index,
+                    verb: op.verb(),
+                    status: status.clone(),
+                })
+                .collect()
+        };
+        match self.apply_edits(ops).await {
+            // The batch committed as a unit, so every op applied to its one row.
+            Ok(_) => Ok(outcome(OpStatus::Applied { affected: 1 })),
+            // It rolled back as a unit, so no op applied -- reporting the whole batch
+            // failed is not a simplification here, it is what happened.
+            Err(e) => Ok(outcome(OpStatus::Failed(e.to_string()))),
+        }
+    }
+
+    /// The background mutations this connection can see, newest and unfinished
+    /// first (see [`MutationInfo`](red_core::MutationInfo)). Polled by the Mutations
+    /// panel while any edit is still being applied.
+    ///
+    /// The default is empty: on an engine whose writes complete before the statement
+    /// returns there is nothing to track, and `DbKind::tracks_mutations` keeps the
+    /// panel from being offered there at all.
+    async fn mutations(&self) -> Result<Vec<red_core::MutationInfo>> {
+        Ok(Vec::new())
+    }
+
+    /// Cancel the background mutation `id` on `table`. Stops further part rewrites;
+    /// the parts already rewritten stay rewritten, since there is no transaction to
+    /// undo them -- which is exactly why the panel shows progress rather than
+    /// pretending a kill is an undo. A read-only driver refuses it.
+    async fn kill_mutation(&self, table: &TableRef, id: &str) -> Result<()> {
+        let _ = (table, id);
+        Err(RedError::Driver(
+            "this engine has no background mutations to cancel".to_string(),
+        ))
     }
 
     /// Bulk-insert `rows` into `table` for `columns` (each a target column's name +
@@ -1611,6 +1735,61 @@ mod tests {
             default: None,
             auto_increment: false,
         }
+    }
+
+    /// The composite identity renders as an AND-conjunction with every non-null
+    /// value bound in push order, and a null member compares with `IS NULL` while
+    /// consuming no bind slot -- the detail that keeps `$n` numbering aligned on an
+    /// engine with positional placeholders.
+    #[test]
+    fn edit_sql_renders_composite_identity() {
+        let cv = |column: &str, value: Value| ColumnValue {
+            column: column.into(),
+            value,
+            decl_type: None,
+        };
+        let table = TableRef {
+            schema: Some("main".into()),
+            name: "t".into(),
+        };
+        let quote = |id: &str| format!("\"{id}\"");
+        let numbered = |i: usize, _: &ColumnValue| format!("${}", i + 1);
+
+        let update = EditOp::Update {
+            table: table.clone(),
+            keys: vec![
+                cv("tenant", Value::Text("acme".into())),
+                cv("id", Value::Integer(7)),
+                cv("region", Value::Null),
+            ],
+            set: vec![cv("name", Value::Text("new".into()))],
+        };
+        let (sql, params) = edit_sql(&update, quote, numbered);
+        assert_eq!(
+            sql,
+            "UPDATE \"main\".\"t\" SET \"name\" = $1 \
+             WHERE \"tenant\" = $2 AND \"id\" = $3 AND \"region\" IS NULL"
+        );
+        assert_eq!(
+            params,
+            vec![
+                &Value::Text("new".into()),
+                &Value::Text("acme".into()),
+                &Value::Integer(7)
+            ],
+            "the null identity member binds nothing, so numbering stays contiguous"
+        );
+
+        let delete = EditOp::Delete {
+            table,
+            keys: vec![cv("a", Value::Integer(1)), cv("b", Value::Integer(2))],
+        };
+        let (sql, params) = edit_sql(&delete, quote, numbered);
+        assert_eq!(
+            sql,
+            "DELETE FROM \"main\".\"t\" WHERE \"a\" = $1 AND \"b\" = $2"
+        );
+        assert_eq!(params.len(), 2);
     }
 
     #[test]

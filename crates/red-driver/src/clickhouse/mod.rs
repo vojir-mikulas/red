@@ -14,12 +14,15 @@
 //! **target**: [`insert_rows`](ClickhouseDriver::insert_rows) streams an
 //! `INSERT … FORMAT JSONCompactEachRow`, [`create_table`](ClickhouseDriver::create_table)
 //! emits `MergeTree` DDL, and [`clear_table`](ClickhouseDriver::clear_table)
-//! `TRUNCATE`s. In-grid **editing** stays **unsupported**: ClickHouse `UPDATE`/`DELETE`
-//! are asynchronous `ALTER TABLE … UPDATE` mutations with no transaction or rollback
-//! over a non-unique sort key, so the trait's "batch in one transaction, assert exactly
-//! one row, roll back on failure" contract cannot be honored; [`apply_edits`] returns a
-//! typed error (a best-effort mutation mode is a later phase). Secondary indexes and
-//! foreign keys have no OLAP equivalent, so those migration passes are logged skips.
+//! `TRUNCATE`s. The grid's **draft-row insert** rides the same path:
+//! [`apply_edits`](ClickhouseDriver::apply_edits) folds an all-`Insert` batch into
+//! bulk inserts. In-grid **update / delete** stay unsupported *on that seam*:
+//! ClickHouse `UPDATE`/`DELETE` are asynchronous `ALTER TABLE … UPDATE` mutations with
+//! no transaction or rollback over a non-unique sort key, so the trait's "batch in one
+//! transaction, assert exactly one row, roll back on failure" contract cannot be
+//! honored; `apply_edits` returns a typed error (a best-effort mutation mode is a later
+//! phase). Secondary indexes and foreign keys have no OLAP equivalent, so those
+//! migration passes are logged skips.
 //!
 //! Value mapping leans on the engine: the `JSON…` formats render every type to JSON
 //! text for us, so a cell is a "JSON scalar/array → [`Value`]" map; no hand-written
@@ -37,11 +40,11 @@ use async_trait::async_trait;
 use red_core::{
     Column, ColumnMeta, ColumnPredicate, ColumnValue, ConnectionConfig, DbKind, EditOp,
     ExportFormat, FkEdge, KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError,
-    Result, ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
+    Result, ResultPage, RowEditCaps, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use serde_json::Value as Json;
-use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
 
 use crate::format::{ExportWriter, ProgressThrottle, strip_trailing};
@@ -49,6 +52,8 @@ use crate::{
     AbortSignal, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor, driver_err,
     window_prealloc,
 };
+
+mod write;
 
 /// A collected (bounded) read: the result columns, their raw ClickHouse type
 /// strings (for value mapping), and the raw JSON cell rows.
@@ -94,6 +99,11 @@ pub struct ClickhouseDriver {
     /// When set, the schema tree is restricted to this one database (the
     /// connection's chosen `database`); `None` lists every non-system database.
     scope: Option<String>,
+    /// Which mutation spellings this server has, probed lazily on the first write
+    /// (see [`write::features_from`]). Shared across [`scoped`](DatabaseDriver::scoped)
+    /// handles so rebinding the database doesn't re-probe, and never touched at all
+    /// by a read-only session.
+    features: Arc<OnceCell<write::ChFeatures>>,
 }
 
 impl ClickhouseDriver {
@@ -141,6 +151,7 @@ impl ClickhouseDriver {
             read_only,
             version: String::new(),
             scope: None,
+            features: Arc::new(OnceCell::new()),
         };
         driver.version = driver.fetch_version().await?;
         Ok(driver)
@@ -311,6 +322,269 @@ impl ClickhouseDriver {
             .await
     }
 
+    /// The `system.columns` + `system.tables` facts that decide what a table will let
+    /// the grid write (see [`write::ChTableFacts`]). One round trip; shared by
+    /// [`edit_caps`](DatabaseDriver::edit_caps) and the mutation path, which needs the
+    /// same answers plus the engine name.
+    async fn table_facts(&self, schema: &str, table: &str) -> Result<write::ChTableFacts> {
+        let base = "SELECT c.name, c.type, c.default_kind, c.is_in_sorting_key, \
+             c.is_in_primary_key, c.is_in_partition_key, c.is_in_sampling_key, t.engine \
+             FROM system.columns AS c INNER JOIN system.tables AS t \
+             ON t.database = c.database AND t.name = c.table \
+             WHERE c.database = {db:String} AND c.table = {tbl:String} ORDER BY c.position"
+            .to_string();
+        let (_, _, rows) = self.run_simple(base, &table_params(schema, table)).await?;
+        let text = |row: &Vec<Json>, i: usize| {
+            row.get(i)
+                .and_then(Json::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let flag = |row: &Vec<Json>, i: usize| row.get(i).and_then(json_to_i64).unwrap_or(0) == 1;
+        let mut engine = String::new();
+        let columns: Vec<write::ChColumn> = rows
+            .iter()
+            .map(|row| {
+                engine = text(row, 7);
+                write::ChColumn {
+                    name: text(row, 0),
+                    type_name: text(row, 1),
+                    default_kind: text(row, 2),
+                    in_sorting_key: flag(row, 3),
+                    in_primary_key: flag(row, 4),
+                    in_partition_key: flag(row, 5),
+                    in_sampling_key: flag(row, 6),
+                }
+            })
+            .collect();
+        if columns.is_empty() {
+            return Err(RedError::Query(format!(
+                "{schema}.{table} has no readable columns"
+            )));
+        }
+        Ok(write::ChTableFacts { engine, columns })
+    }
+
+    /// What mutation spellings this server has, probed once and cached (see the
+    /// `features` field). Probing rather than assuming is the point: the lightweight
+    /// DML forms and their sync settings arrived across several releases, and sending
+    /// a setting the server doesn't know is an error rather than a no-op.
+    ///
+    /// A failed probe answers "nothing is available", which is the conservative
+    /// reading: the always-present `ALTER …` form with no sync setting attached, and
+    /// therefore an outcome reported as *submitted* rather than applied.
+    async fn write_features(&self) -> write::ChFeatures {
+        *self
+            .features
+            .get_or_init(|| async {
+                let names: Vec<String> = (0..write::PROBE_SETTINGS.len())
+                    .map(|i| format!("{{s{i}:String}}"))
+                    .collect();
+                let sql = format!(
+                    "SELECT name, value FROM system.settings WHERE name IN ({})",
+                    names.join(", ")
+                );
+                let params: Vec<(String, String)> = write::PROBE_SETTINGS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| (format!("param_s{i}"), (*name).to_string()))
+                    .collect();
+                let settings = match self.run_simple(sql, &params).await {
+                    Ok((_, _, rows)) => rows
+                        .iter()
+                        .map(|row| {
+                            let cell = |i: usize| {
+                                row.get(i)
+                                    .and_then(Json::as_str)
+                                    .unwrap_or_default()
+                                    .to_string()
+                            };
+                            (cell(0), cell(1))
+                        })
+                        .collect::<Vec<_>>(),
+                    Err(e) => {
+                        tracing::warn!("clickhouse write-feature probe failed: {e}");
+                        Vec::new()
+                    }
+                };
+                write::features_from(&self.version, &settings)
+            })
+            .await
+    }
+
+    /// POST one mutation and classify the reply. A wait that times out is **not** a
+    /// failure: `mutations_sync` only bounds how long we watch, and the mutation the
+    /// server accepted keeps running, so it is reported as still-running rather than
+    /// as an error the user would be tempted to retry into a second part rewrite.
+    async fn run_mutation(&self, sql: String, params: Vec<(String, String)>) -> MutationReply {
+        let qid = new_query_id();
+        let resp = match self.build_query(sql, &qid, &params).send().await {
+            Ok(resp) => resp,
+            Err(e) => return MutationReply::Failed(e.to_string()),
+        };
+        let status = resp.status();
+        let body = match resp.bytes().await {
+            Ok(body) => body,
+            Err(e) => return MutationReply::Failed(e.to_string()),
+        };
+        if status.is_success() {
+            return MutationReply::Done;
+        }
+        let text = String::from_utf8_lossy(&body).to_string();
+        if write::is_timeout_error(&text) {
+            MutationReply::StillRunning
+        } else {
+            MutationReply::Failed(clean_error(&body))
+        }
+    }
+
+    /// Everything decided about one op before anything is written: the statement it
+    /// renders to, how many rows its identity matches, or why it can't run.
+    /// Read the write-relevant catalog facts for every table `ops` touches, once
+    /// each. A submit is usually many rows of one table; without this, a 50-row batch
+    /// would re-read the same `system.columns` join 50 times. Scoped to the one call,
+    /// so it can never serve a stale answer after a concurrent `ALTER`.
+    async fn facts_for(&self, ops: &[EditOp]) -> FactsCache {
+        let mut cache: FactsCache = std::collections::HashMap::new();
+        for op in ops {
+            let key = (self.schema_of(op.table()), op.table().name.clone());
+            if cache.contains_key(&key) {
+                continue;
+            }
+            let facts = self
+                .table_facts(&key.0, &key.1)
+                .await
+                .map_err(|e| e.to_string());
+            cache.insert(key, facts);
+        }
+        cache
+    }
+
+    /// The database an op's table lives in: its own when qualified, else whatever
+    /// this handle is bound to.
+    fn schema_of(&self, table: &TableRef) -> String {
+        match table.schema.as_deref().filter(|s| !s.is_empty()) {
+            Some(s) => s.to_string(),
+            None => self
+                .namespace
+                .clone()
+                .unwrap_or_else(|| self.database.clone()),
+        }
+    }
+
+    async fn preflight_one(
+        &self,
+        op: &EditOp,
+        allow_multi_match: bool,
+        facts: &FactsCache,
+    ) -> Preflight {
+        let blocked = |reason: String| Preflight {
+            display: op.preview_sql(),
+            blocked: Some(reason),
+            ..Preflight::default()
+        };
+        // An insert addresses no existing row, so none of the identity machinery
+        // applies: it rides the bulk insert path, unpreflighted.
+        if matches!(op, EditOp::Insert { .. }) {
+            return Preflight {
+                display: op.preview_sql(),
+                ..Preflight::default()
+            };
+        }
+        let table = op.table();
+        let schema = self.schema_of(table);
+        let facts = match facts.get(&(schema.clone(), table.name.clone())) {
+            Some(Ok(facts)) => facts,
+            Some(Err(e)) => return blocked(e.clone()),
+            None => return blocked(format!("no catalog entry for {}", table.name)),
+        };
+        let caps = facts.edit_caps();
+        if !caps.editable() {
+            return blocked(
+                caps.note
+                    .unwrap_or_else(|| format!("{} is not editable", table.name)),
+            );
+        }
+        // A key or engine-computed column is refused *here*, so the user is told
+        // before confirming rather than by the engine after.
+        if let EditOp::Update { set, .. } = op
+            && let Some(cv) = set
+                .iter()
+                .find(|cv| caps.no_update.iter().any(|n| n == &cv.column))
+        {
+            return blocked(format!(
+                "{} can't be updated: it's part of the table's key or computed by the engine",
+                cv.column
+            ));
+        }
+        let replicated = facts.engine.starts_with("Replicated");
+        let form = self.write_features().await.form(op.verb());
+        let qualified = crate::qualify_table(
+            &TableRef {
+                schema: Some(schema),
+                name: table.name.clone(),
+            },
+            ch_quote,
+        );
+        let rendered = match write::render_op(&qualified, op, form) {
+            Ok(rendered) => rendered,
+            Err(e) => return blocked(e.to_string()),
+        };
+        // The identity count is the whole guarantee on an engine with no unique row
+        // address, so it runs before every write, not just the first.
+        let identity_params: Vec<(String, String)> = rendered
+            .params
+            .iter()
+            .filter(|(name, _)| name.starts_with("param_i"))
+            .cloned()
+            .collect();
+        let matched = match self
+            .run_collect(
+                rendered.count_sql.clone(),
+                &identity_params,
+                &AbortSignal::new(),
+            )
+            .await
+        {
+            Ok((_, _, rows)) => rows
+                .first()
+                .and_then(|r| r.first())
+                .and_then(json_to_i64)
+                .unwrap_or(0)
+                .max(0) as u64,
+            Err(e) => return blocked(format!("couldn't check which rows this matches: {e}")),
+        };
+        let display = rendered.display.clone();
+        let refusal = match matched {
+            0 => Some(
+                "no longer matches any row: it changed or was removed since this result \
+                 loaded. Refresh and try again."
+                    .to_string(),
+            ),
+            1 => None,
+            n if allow_multi_match => {
+                tracing::info!(
+                    rows = n,
+                    "clickhouse edit applies to several rows by consent"
+                );
+                None
+            }
+            n => Some(format!(
+                "matches {n} rows, not one: ClickHouse has no unique row identity, so \
+                 this would change all of them. Confirm applying it to all {n}, or add \
+                 columns that tell them apart."
+            )),
+        };
+        Preflight {
+            rendered: Some(rendered),
+            display,
+            matches: Some(matched),
+            blocked: refusal,
+            replicated,
+            form,
+        }
+    }
+
     /// Open a streaming SELECT and read its two header lines (names, then types),
     /// returning the live response and whatever bytes were buffered past the header.
     /// Shared by the cursor and `export`. A query that fails *before* streaming
@@ -385,6 +659,7 @@ impl DatabaseDriver for ClickhouseDriver {
             read_only: self.read_only,
             version: self.version.clone(),
             scope: self.scope.clone(),
+            features: self.features.clone(),
         })
     }
 
@@ -458,14 +733,10 @@ impl DatabaseDriver for ClickhouseDriver {
         // `Nullable(…)`; primary-key membership is `is_in_primary_key` (the MergeTree
         // ORDER BY / PRIMARY KEY). ClickHouse is OLAP: there are no foreign keys and
         // no secondary indexes in the relational sense, so both vecs stay empty.
-        let base = "SELECT name, type, is_in_primary_key FROM system.columns \
+        let base = "SELECT name, type, is_in_primary_key, default_expression FROM system.columns \
              WHERE database = {db:String} AND table = {tbl:String} ORDER BY position"
             .to_string();
-        let params = vec![
-            ("param_db".to_string(), schema.to_string()),
-            ("param_tbl".to_string(), table.to_string()),
-        ];
-        let (_, _, rows) = self.run_simple(base, &params).await?;
+        let (_, _, rows) = self.run_simple(base, &table_params(schema, table)).await?;
         let columns = rows
             .iter()
             .map(|row| {
@@ -480,11 +751,18 @@ impl DatabaseDriver for ClickhouseDriver {
                     .unwrap_or_default()
                     .to_string();
                 let in_pk = row.get(2).and_then(json_to_i64).unwrap_or(0) == 1;
+                // `default_expression` is empty for a column without one; keep the
+                // schema tree's "no default" as `None` rather than an empty string.
+                let default = row
+                    .get(3)
+                    .and_then(Json::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
                 ColumnMeta {
                     not_null: !type_name.starts_with("Nullable("),
                     primary_key: in_pk,
                     type_name: Some(type_name),
-                    default: None,
+                    default,
                     name,
                     auto_increment: false,
                 }
@@ -495,6 +773,126 @@ impl DatabaseDriver for ClickhouseDriver {
             foreign_keys: Vec::new(),
             indexes: Vec::new(),
         })
+    }
+
+    /// One catalog round trip joining `system.columns` to `system.tables`, because
+    /// nothing that decides whether a ClickHouse row is editable survives into a
+    /// [`TableDetail`]: the table engine, sorting / partition / sampling key
+    /// membership, and whether a column is `MATERIALIZED`/`ALIAS`. `detail` is
+    /// therefore unused here.
+    ///
+    /// A probe failure is **not** an error: it degrades to "not editable, and here is
+    /// why", so a catalog the user can't read (a restricted `system` grant) hides the
+    /// affordance instead of breaking the browse.
+    async fn edit_caps(
+        &self,
+        schema: &str,
+        table: &str,
+        _detail: &TableDetail,
+    ) -> Result<RowEditCaps> {
+        match self.table_facts(schema, table).await {
+            Ok(facts) => Ok(facts.edit_caps()),
+            Err(e) => {
+                tracing::warn!(%schema, %table, "clickhouse edit_caps probe failed: {e}");
+                Ok(RowEditCaps {
+                    note: Some(format!("couldn't read the catalog for {table}: {e}")),
+                    ..RowEditCaps::default()
+                })
+            }
+        }
+    }
+
+    async fn preflight_edits(&self, ops: &[EditOp]) -> Result<Vec<red_core::OpPlan>> {
+        let facts = self.facts_for(ops).await;
+        let mut out = Vec::with_capacity(ops.len());
+        for (index, op) in ops.iter().enumerate() {
+            // The plan is what the *unacknowledged* submit would do, so a
+            // several-row match shows up as a refusal the dialog can offer to
+            // override -- that offer is the acknowledgement.
+            let pre = self.preflight_one(op, false, &facts).await;
+            out.push(red_core::OpPlan {
+                index,
+                verb: op.verb(),
+                sql: pre.display,
+                matches: pre.matches,
+                blocked: pre.blocked,
+            });
+        }
+        Ok(out)
+    }
+
+    /// ClickHouse's real edit path. Every op preflights its identity count, then
+    /// runs on its own: there is no transaction to roll the batch back with, so
+    /// stopping at the first failure would leave the user with neither the change nor
+    /// a report of what did land. One outcome per op, always.
+    async fn apply_edits_best_effort(
+        &self,
+        ops: &[EditOp],
+        mode: red_core::BatchMode,
+    ) -> Result<Vec<red_core::OpOutcome>> {
+        use red_core::{OpOutcome, OpStatus};
+        crate::refuse_if_read_only(self.read_only)?;
+        let allow_multi_match = matches!(
+            mode,
+            red_core::BatchMode::BestEffort {
+                allow_multi_match: true
+            }
+        );
+        let features = self.write_features().await;
+        let facts = self.facts_for(ops).await;
+        let mut out = Vec::with_capacity(ops.len());
+        for (index, op) in ops.iter().enumerate() {
+            let status = match op {
+                // Inserts need no identity and no mutation: straight to the bulk path.
+                EditOp::Insert { table, values } => {
+                    let columns: Vec<Column> = values
+                        .iter()
+                        .map(|cv| Column {
+                            name: cv.column.clone(),
+                            decl_type: cv.decl_type.clone(),
+                        })
+                        .collect();
+                    let row: Vec<Value> = values.iter().map(|cv| cv.value.clone()).collect();
+                    match self.insert_rows(table, &columns, &[row]).await {
+                        Ok(affected) => OpStatus::Applied { affected },
+                        Err(e) => OpStatus::Failed(e.to_string()),
+                    }
+                }
+                _ => {
+                    let pre = self.preflight_one(op, allow_multi_match, &facts).await;
+                    match (pre.blocked, pre.rendered) {
+                        (Some(reason), _) => OpStatus::Blocked(reason),
+                        (None, None) => OpStatus::Blocked(
+                            "this edit couldn't be rendered as a statement".to_string(),
+                        ),
+                        (None, Some(rendered)) => {
+                            let sync = features.sync_settings(pre.form, pre.replicated);
+                            // Without a sync setting the server returns before the
+                            // mutation is visible, so "applied" would be a claim we
+                            // can't back. Say submitted instead.
+                            let waited = !sync.is_empty();
+                            let mut params = rendered.params;
+                            params.extend(sync);
+                            match self.run_mutation(rendered.sql, params).await {
+                                MutationReply::Done if waited => OpStatus::Applied {
+                                    affected: pre.matches.unwrap_or(0),
+                                },
+                                MutationReply::Done | MutationReply::StillRunning => {
+                                    OpStatus::Submitted
+                                }
+                                MutationReply::Failed(message) => OpStatus::Failed(message),
+                            }
+                        }
+                    }
+                }
+            };
+            out.push(OpOutcome {
+                index,
+                verb: op.verb(),
+                status,
+            });
+        }
+        Ok(out)
     }
 
     async fn foreign_keys(&self) -> Result<Vec<FkEdge>> {
@@ -717,22 +1115,89 @@ impl DatabaseDriver for ClickhouseDriver {
         Ok(affected)
     }
 
+    /// An **insert-only** batch is honored here by folding into the native bulk
+    /// insert; `UPDATE`/`DELETE` are refused (see the module docs). Unlike the
+    /// relational engines this is *not* atomic across the batch: ClickHouse has no
+    /// multi-statement transaction, so each column-signature group is its own
+    /// `INSERT` and an error leaves earlier groups applied. For a pure insert batch
+    /// that is the normal ClickHouse posture -- an insert needs none of the
+    /// guarantees an OLAP engine cannot give -- and it is what makes the grid's
+    /// draft-row zone usable here.
     async fn apply_edits(&self, ops: &[EditOp]) -> Result<u64> {
         // An empty batch is a no-op (matching the trait contract) so a stray submit
-        // doesn't error. Otherwise: ClickHouse is OLAP, so `UPDATE`/`DELETE` are
-        // asynchronous `ALTER TABLE … UPDATE` mutations with no transaction or
-        // rollback, so the atomic, exactly-one-row contract this method promises
-        // cannot be honored. Refuse clearly rather than half-apply something the grid
-        // can't safely offer. A best-effort, non-atomic mutation mode is a later phase.
+        // doesn't error.
         if ops.is_empty() {
             return Ok(0);
         }
-        Err(RedError::Driver(
-            "in-grid editing is not supported on ClickHouse (OLAP): UPDATE/DELETE are \
-             asynchronous ALTER … mutations with no transactional rollback. Use the SQL \
-             editor for ALTER TABLE … UPDATE/DELETE if you need them."
-                .to_string(),
-        ))
+        let mut total = 0u64;
+        for group in insert_groups(ops)? {
+            total += self
+                .insert_rows(&group.table, &group.columns, &group.rows)
+                .await?;
+        }
+        Ok(total)
+    }
+
+    async fn mutations(&self) -> Result<Vec<red_core::MutationInfo>> {
+        // Unfinished first, then newest: what is still running is what the panel
+        // exists for, and a finished mutation is only useful as recent history.
+        // Bounded, because `system.mutations` keeps completed entries around and a
+        // long-lived server accumulates them.
+        let base = "SELECT database, table, mutation_id, command, toString(create_time), \
+             parts_to_do, is_done, latest_fail_reason FROM system.mutations \
+             ORDER BY is_done ASC, create_time DESC LIMIT 200"
+            .to_string();
+        let (_, _, rows) = self.run_simple(base, &[]).await?;
+        let text = |row: &Vec<Json>, i: usize| {
+            row.get(i)
+                .and_then(Json::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        Ok(rows
+            .iter()
+            .map(|row| red_core::MutationInfo {
+                database: text(row, 0),
+                table: text(row, 1),
+                id: text(row, 2),
+                command: text(row, 3),
+                created: text(row, 4),
+                parts_to_do: row.get(5).and_then(json_to_i64).unwrap_or(0),
+                done: row.get(6).and_then(json_to_i64).unwrap_or(0) == 1,
+                fail_reason: Some(text(row, 7)).filter(|s| !s.is_empty()),
+            })
+            .collect())
+    }
+
+    async fn kill_mutation(&self, table: &TableRef, id: &str) -> Result<()> {
+        crate::refuse_if_read_only(self.read_only)?;
+        let schema = match table.schema.as_deref().filter(|s| !s.is_empty()) {
+            Some(s) => s.to_string(),
+            None => self
+                .namespace
+                .clone()
+                .unwrap_or_else(|| self.database.clone()),
+        };
+        // Bound, not interpolated: a mutation id and a table name both come from the
+        // engine's own catalog, but they still reach the statement as parameters.
+        let sql = "KILL MUTATION WHERE database = {db:String} AND table = {tbl:String} \
+             AND mutation_id = {mid:String}"
+            .to_string();
+        let mut params = table_params(&schema, &table.name);
+        params.push(("param_mid".to_string(), id.to_string()));
+        let qid = new_query_id();
+        let resp = self
+            .build_query(sql, &qid, &params)
+            .send()
+            .await
+            .map_err(driver_err)?;
+        let status = resp.status();
+        let body = resp.bytes().await.map_err(driver_err)?;
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(ch_error(&body))
+        }
     }
 
     async fn insert_rows(
@@ -1055,6 +1520,108 @@ fn host_authority(host: &str, port: u16) -> String {
     }
 }
 
+/// The write-relevant catalog facts for the tables one batch touches, keyed by
+/// `(database, table)`. A failed read is kept as its message rather than dropped, so
+/// the ops on that table are blocked with a reason instead of silently skipped.
+type FactsCache =
+    std::collections::HashMap<(String, String), std::result::Result<write::ChTableFacts, String>>;
+
+/// How a POSTed mutation ended. Separate from `Result` because "the wait expired" is
+/// a third answer, neither success nor failure: the server accepted the mutation and
+/// is still applying it.
+enum MutationReply {
+    Done,
+    StillRunning,
+    Failed(String),
+}
+
+/// One op, decided but not yet written: see `ClickhouseDriver::preflight_one`.
+#[derive(Default)]
+struct Preflight {
+    /// The rendered statement + binds. `None` for an insert (which needs none) and
+    /// for a blocked op (which will never run).
+    rendered: Option<write::OpSql>,
+    /// The statement as the confirm dialog shows it, values inline.
+    display: String,
+    /// Rows the identity currently matches; `None` for an insert.
+    matches: Option<u64>,
+    /// Why this op can't run. `Some` means nothing will be attempted.
+    blocked: Option<String>,
+    /// The table is on a `Replicated*` engine, so the sync wait must cover every
+    /// replica rather than this server alone.
+    replicated: bool,
+    form: write::Form,
+}
+
+/// The `param_db` / `param_tbl` binds every `system.*` catalog probe takes, so the
+/// database and table names stay real parameters rather than interpolated text.
+fn table_params(schema: &str, table: &str) -> Vec<(String, String)> {
+    vec![
+        ("param_db".to_string(), schema.to_string()),
+        ("param_tbl".to_string(), table.to_string()),
+    ]
+}
+
+/// One bulk `INSERT`'s worth of an edit batch: the target table, the columns every
+/// row in the group fills, and the rows themselves. Built by [`insert_groups`].
+struct InsertGroup {
+    table: TableRef,
+    columns: Vec<Column>,
+    rows: Vec<Vec<Value>>,
+}
+
+/// Regroup an all-[`EditOp::Insert`] batch into one bulk insert per
+/// `(table, column list)`, preserving batch order. Two draft rows that filled
+/// *different* columns must not share a statement (their values would land in the
+/// wrong columns), so the column signature is part of the grouping key, not just the
+/// table; drafts that filled the same columns fold into a single `INSERT`.
+///
+/// An `Update`/`Delete` op is an error rather than a skip: ClickHouse cannot honor
+/// the atomic, exactly-one-row contract [`apply_edits`](DatabaseDriver::apply_edits)
+/// promises, and silently dropping half a submit would be worse than refusing it.
+fn insert_groups(ops: &[EditOp]) -> Result<Vec<InsertGroup>> {
+    let mut groups: Vec<InsertGroup> = Vec::new();
+    for op in ops {
+        let EditOp::Insert { table, values } = op else {
+            return Err(RedError::Driver(
+                "in-grid UPDATE/DELETE is not supported on ClickHouse (OLAP): they are \
+                 asynchronous ALTER … mutations with no transactional rollback. Use the SQL \
+                 editor for ALTER TABLE … UPDATE/DELETE if you need them."
+                    .to_string(),
+            ));
+        };
+        let columns: Vec<Column> = values
+            .iter()
+            .map(|cv| Column {
+                name: cv.column.clone(),
+                decl_type: cv.decl_type.clone(),
+            })
+            .collect();
+        let row: Vec<Value> = values.iter().map(|cv| cv.value.clone()).collect();
+        // Linear scan: a submit carries a handful of draft rows, never enough to
+        // warrant a map keyed on the signature.
+        match groups
+            .iter_mut()
+            .find(|g| &g.table == table && same_columns(&g.columns, &columns))
+        {
+            Some(g) => g.rows.push(row),
+            None => groups.push(InsertGroup {
+                table: table.clone(),
+                columns,
+                rows: vec![row],
+            }),
+        }
+    }
+    Ok(groups)
+}
+
+/// Whether two column lists name the same columns in the same order (the grouping
+/// signature for [`insert_groups`]). Declared types are ignored: they come from the
+/// same result's column metadata, so equal names imply equal types.
+fn same_columns(a: &[Column], b: &[Column]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name == y.name)
+}
+
 /// Build a ClickHouse `CREATE TABLE IF NOT EXISTS … ENGINE = MergeTree ORDER BY …`.
 /// The shared [`create_table_sql`](crate::create_table_sql) isn't usable here:
 /// ClickHouse expresses nullability as `Nullable(T)` (columns are NOT NULL by
@@ -1127,7 +1694,7 @@ fn ch_json_cell(v: &Value) -> Json {
 /// backslash must be doubled as well as the backtick; otherwise a name ending in
 /// `\` (or a smuggled `` \` ``) escapes the closing backtick and breaks out of the
 /// identifier. Double `\` first so the backticks added next aren't re-escaped.
-fn ch_quote(ident: &str) -> String {
+pub(super) fn ch_quote(ident: &str) -> String {
     format!("`{}`", ident.replace('\\', "\\\\").replace('`', "``"))
 }
 
@@ -1894,6 +2461,61 @@ mod tests {
         );
     }
 
+    // Server-free unit test; always runs (no ClickHouse needed).
+    #[test]
+    fn insert_groups_fold_by_table_and_columns() {
+        let tref = |name: &str| TableRef {
+            schema: Some("db".into()),
+            name: name.into(),
+        };
+        let cv = |column: &str, value: Value| ColumnValue {
+            column: column.into(),
+            value,
+            decl_type: None,
+        };
+        let insert = |table: &str, values: Vec<ColumnValue>| EditOp::Insert {
+            table: tref(table),
+            values,
+        };
+
+        // Same table, same columns → one statement holding both rows, in batch order.
+        let groups = insert_groups(&[
+            insert("t", vec![cv("id", Value::Integer(1))]),
+            insert("t", vec![cv("id", Value::Integer(2))]),
+        ])
+        .unwrap();
+        assert_eq!(groups.len(), 1, "same signature folds into one INSERT");
+        assert_eq!(
+            groups[0].rows,
+            vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+        );
+
+        // A different column set must not share a statement: its values would land
+        // in the wrong columns.
+        let groups = insert_groups(&[
+            insert("t", vec![cv("id", Value::Integer(1))]),
+            insert(
+                "t",
+                vec![cv("id", Value::Integer(2)), cv("n", Value::Integer(9))],
+            ),
+            insert("u", vec![cv("id", Value::Integer(3))]),
+        ])
+        .unwrap();
+        assert_eq!(groups.len(), 3, "column set and table both split groups");
+        assert_eq!(groups[2].table.name, "u");
+
+        // An update in the batch is refused, not silently dropped.
+        let update = EditOp::Update {
+            table: tref("t"),
+            keys: vec![cv("id", Value::Integer(1))],
+            set: vec![cv("n", Value::Integer(2))],
+        };
+        assert!(
+            insert_groups(&[insert("t", vec![cv("id", Value::Integer(1))]), update]).is_err(),
+            "a non-insert op is refused rather than skipped"
+        );
+    }
+
     #[tokio::test]
     async fn writes_create_insert_read_clear() {
         // ClickHouse as a copy/migration *target*: `create_table` emits MergeTree DDL
@@ -2049,27 +2671,358 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn editing_is_unsupported() {
+    async fn draft_row_inserts_apply_but_update_delete_refuse() {
+        // The grid's draft-row zone submits `EditOp::Insert`s through `apply_edits`;
+        // ClickHouse honors those (an insert needs none of the guarantees OLAP can't
+        // give) and refuses update/delete on the same seam.
         let url = url_or_skip!();
         let driver = ClickhouseDriver::connect(&url, false).await.unwrap();
-        // A non-empty edit batch is refused (OLAP has no transactional in-grid edit);
-        // an empty batch is a no-op returning 0.
-        let op = EditOp::Delete {
-            table: red_core::TableRef {
-                schema: Some(database(&url)),
-                name: "whatever".into(),
-            },
-            key: red_core::ColumnValue {
-                column: "id".into(),
-                value: Value::Integer(1),
-                decl_type: None,
-            },
+        let db = database(&url);
+        let t = tag("edits");
+        let tref = TableRef {
+            schema: Some(db.clone()),
+            name: t.clone(),
         };
-        assert!(driver.apply_edit(&op).await.is_err(), "edits are refused");
+        driver
+            .execute(&format!(
+                "CREATE TABLE IF NOT EXISTS `{db}`.`{t}` \
+                 (id Int32, name Nullable(String)) ENGINE = MergeTree ORDER BY (id)"
+            ))
+            .await
+            .unwrap();
+        let cv = |column: &str, value: Value| ColumnValue {
+            column: column.into(),
+            value,
+            decl_type: None,
+        };
+
+        // An empty batch is a no-op returning 0, with no engine round-trip.
         assert_eq!(
             driver.apply_edits(&[]).await.unwrap(),
             0,
             "empty batch is a no-op"
         );
+
+        // Two drafts sharing a column signature fold into one INSERT; a third filling
+        // only `id` is its own statement. All three land.
+        let applied = driver
+            .apply_edits(&[
+                EditOp::Insert {
+                    table: tref.clone(),
+                    values: vec![
+                        cv("id", Value::Integer(1)),
+                        cv("name", Value::Text("one".into())),
+                    ],
+                },
+                EditOp::Insert {
+                    table: tref.clone(),
+                    values: vec![
+                        cv("id", Value::Integer(2)),
+                        cv("name", Value::Text("two".into())),
+                    ],
+                },
+                EditOp::Insert {
+                    table: tref.clone(),
+                    values: vec![cv("id", Value::Integer(3))],
+                },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(applied, 3, "every draft row is reported inserted");
+        let abort = AbortSignal::new();
+        assert_eq!(
+            driver
+                .count(&format!("SELECT id FROM `{db}`.`{t}`"), &abort)
+                .await
+                .unwrap(),
+            3,
+            "the draft rows are in the table"
+        );
+
+        // Update / delete stay refused on this seam: OLAP has no transactional,
+        // exactly-one-row in-grid edit.
+        assert!(
+            driver
+                .apply_edit(&EditOp::Delete {
+                    table: tref.clone(),
+                    keys: vec![cv("id", Value::Integer(1))],
+                })
+                .await
+                .is_err(),
+            "delete is refused"
+        );
+        assert!(
+            driver
+                .apply_edit(&EditOp::Update {
+                    table: tref.clone(),
+                    keys: vec![cv("id", Value::Integer(1))],
+                    set: vec![cv("name", Value::Text("changed".into()))],
+                })
+                .await
+                .is_err(),
+            "update is refused"
+        );
+        driver
+            .execute(&format!("DROP TABLE `{db}`.`{t}`"))
+            .await
+            .unwrap();
+    }
+
+    /// The best-effort edit contract end to end: insert, update and delete each land
+    /// and read back; a duplicated row, a stale row and a key-column edit are each
+    /// refused **by the preflight**, by name and count, rather than by the engine
+    /// after the user confirmed; and a batch mixing good and bad ops reports one
+    /// outcome per op instead of stopping at the first failure.
+    #[tokio::test]
+    async fn applies_edits_best_effort() {
+        use red_core::{BatchMode, OpStatus};
+        let url = url_or_skip!();
+        let driver = ClickhouseDriver::connect(&url, false).await.unwrap();
+        let db = database(&url);
+        let t = tag("besteffort");
+        let tref = TableRef {
+            schema: Some(db.clone()),
+            name: t.clone(),
+        };
+        // `id` is the sorting key (so it leads the identity and can never be
+        // updated); `name` and `note` are ordinary columns.
+        driver
+            .execute(&format!(
+                "CREATE TABLE IF NOT EXISTS `{db}`.`{t}` \
+                 (id Int32, name String, note Nullable(String)) ENGINE = MergeTree ORDER BY (id)"
+            ))
+            .await
+            .unwrap();
+        let cv = |column: &str, value: Value, decl: &str| ColumnValue {
+            column: column.into(),
+            value,
+            decl_type: Some(decl.into()),
+        };
+        let id = |n: i32| cv("id", Value::Integer(n.into()), "Int32");
+        let name = |v: &str| cv("name", Value::Text(v.into()), "String");
+        let solo = BatchMode::BestEffort {
+            allow_multi_match: false,
+        };
+        let abort = AbortSignal::new();
+        let count_where = |predicate: &str| {
+            let sql = format!("SELECT id FROM `{db}`.`{t}` WHERE {predicate}");
+            let abort = &abort;
+            let driver = &driver;
+            async move { driver.count(&sql, abort).await.unwrap() }
+        };
+        let one = |outcomes: Vec<red_core::OpOutcome>| {
+            assert_eq!(outcomes.len(), 1);
+            outcomes.into_iter().next().expect("one outcome")
+        };
+
+        // Insert two rows through the best-effort seam.
+        let outcomes = driver
+            .apply_edits_best_effort(
+                &[
+                    EditOp::Insert {
+                        table: tref.clone(),
+                        values: vec![id(1), name("one")],
+                    },
+                    EditOp::Insert {
+                        table: tref.clone(),
+                        values: vec![id(2), name("two")],
+                    },
+                ],
+                solo,
+            )
+            .await
+            .unwrap();
+        assert!(
+            outcomes.iter().all(|o| !o.status.unfinished()),
+            "both inserts land: {outcomes:?}"
+        );
+
+        // A single-cell update against a sorting-key identity lands and is visible.
+        let updated = one(driver
+            .apply_edits_best_effort(
+                &[EditOp::Update {
+                    table: tref.clone(),
+                    keys: vec![id(1), name("one")],
+                    set: vec![cv("note", Value::Text("edited".into()), "Nullable(String)")],
+                }],
+                solo,
+            )
+            .await
+            .unwrap());
+        assert!(
+            matches!(
+                updated.status,
+                OpStatus::Applied { .. } | OpStatus::Submitted
+            ),
+            "the update ran: {:?}",
+            updated.status
+        );
+        if matches!(updated.status, OpStatus::Applied { .. }) {
+            assert_eq!(
+                count_where("note = 'edited'").await,
+                1,
+                "an applied mutation is visible on the next read"
+            );
+        }
+
+        // A key column is refused in preflight, not by the engine.
+        let key_edit = one(driver
+            .apply_edits_best_effort(
+                &[EditOp::Update {
+                    table: tref.clone(),
+                    keys: vec![id(2), name("two")],
+                    set: vec![id(99)],
+                }],
+                solo,
+            )
+            .await
+            .unwrap());
+        match key_edit.status {
+            OpStatus::Blocked(reason) => assert!(
+                reason.contains("id"),
+                "the refusal names the column: {reason}"
+            ),
+            other => panic!("expected a blocked key-column edit, got {other:?}"),
+        }
+
+        // A row that changed underneath is refused as stale, by count.
+        let stale = one(driver
+            .apply_edits_best_effort(
+                &[EditOp::Delete {
+                    table: tref.clone(),
+                    keys: vec![id(1), name("gone")],
+                }],
+                solo,
+            )
+            .await
+            .unwrap());
+        match stale.status {
+            OpStatus::Blocked(reason) => assert!(
+                reason.contains("no longer matches"),
+                "a stale row says so: {reason}"
+            ),
+            other => panic!("expected a blocked stale delete, got {other:?}"),
+        }
+
+        // Duplicates are normal on ClickHouse, and an ambiguous identity is refused
+        // by count unless the user acknowledged applying to all of them.
+        driver
+            .apply_edits_best_effort(
+                &[EditOp::Insert {
+                    table: tref.clone(),
+                    values: vec![id(2), name("two")],
+                }],
+                solo,
+            )
+            .await
+            .unwrap();
+        let ambiguous = one(driver
+            .apply_edits_best_effort(
+                &[EditOp::Delete {
+                    table: tref.clone(),
+                    keys: vec![id(2), name("two")],
+                }],
+                solo,
+            )
+            .await
+            .unwrap());
+        match ambiguous.status {
+            OpStatus::Blocked(reason) => assert!(
+                reason.contains("matches 2 rows"),
+                "the refusal reports the count: {reason}"
+            ),
+            other => panic!("expected a blocked ambiguous delete, got {other:?}"),
+        }
+        // With the acknowledgement it runs, taking both rows.
+        let acknowledged = one(driver
+            .apply_edits_best_effort(
+                &[EditOp::Delete {
+                    table: tref.clone(),
+                    keys: vec![id(2), name("two")],
+                }],
+                BatchMode::BestEffort {
+                    allow_multi_match: true,
+                },
+            )
+            .await
+            .unwrap());
+        assert!(
+            !acknowledged.status.unfinished(),
+            "the acknowledged delete ran: {:?}",
+            acknowledged.status
+        );
+
+        // A partial batch reports per-op outcomes and never stops at the first
+        // failure: the good op after a blocked one still runs.
+        let outcomes = driver
+            .apply_edits_best_effort(
+                &[
+                    EditOp::Delete {
+                        table: tref.clone(),
+                        keys: vec![id(404), name("missing")],
+                    },
+                    EditOp::Insert {
+                        table: tref.clone(),
+                        values: vec![id(3), name("three")],
+                    },
+                ],
+                solo,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 2, "one outcome per op");
+        assert!(
+            outcomes[0].status.unfinished(),
+            "the stale delete is blocked"
+        );
+        assert!(
+            !outcomes[1].status.unfinished(),
+            "the op after a blocked one still runs: {:?}",
+            outcomes[1].status
+        );
+        assert_eq!(count_where("id = 3").await, 1);
+
+        // The preflight reports the same refusals without writing anything.
+        let plan = driver
+            .preflight_edits(&[EditOp::Delete {
+                table: tref.clone(),
+                keys: vec![id(404), name("missing")],
+            }])
+            .await
+            .unwrap();
+        assert_eq!(plan[0].matches, Some(0));
+        assert!(plan[0].blocked.is_some());
+        assert!(
+            plan[0].sql.contains("DELETE") && plan[0].sql.contains("`id` = 404"),
+            "the plan shows the real statement: {}",
+            plan[0].sql
+        );
+
+        // A non-MergeTree table reports why its rows can't be edited.
+        let memory = tag("memory");
+        driver
+            .execute(&format!(
+                "CREATE TABLE IF NOT EXISTS `{db}`.`{memory}` (id Int32) ENGINE = Memory"
+            ))
+            .await
+            .unwrap();
+        let caps = driver
+            .edit_caps(&db, &memory, &TableDetail::default())
+            .await
+            .unwrap();
+        assert_eq!(caps.mode, red_core::EditMode::None);
+        assert!(
+            caps.note.unwrap_or_default().contains("Memory"),
+            "the reason names the engine"
+        );
+
+        driver
+            .execute(&format!("DROP TABLE `{db}`.`{memory}`"))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!("DROP TABLE `{db}`.`{t}`"))
+            .await
+            .unwrap();
     }
 }

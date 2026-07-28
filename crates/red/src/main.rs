@@ -40,6 +40,7 @@ mod kvpubsub;
 mod local_state;
 mod markdown;
 mod menu;
+mod mutations;
 mod palette;
 mod plan;
 mod queries;

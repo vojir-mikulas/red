@@ -965,7 +965,7 @@ pub(crate) async fn applies_edits(driver: &dyn DatabaseDriver, schema: &str, tab
     let affected = driver
         .apply_edit(&EditOp::Update {
             table: tref(),
-            key: id(1),
+            keys: vec![id(1)],
             set: vec![name(Value::Text(evil.into()))],
         })
         .await
@@ -982,7 +982,7 @@ pub(crate) async fn applies_edits(driver: &dyn DatabaseDriver, schema: &str, tab
     driver
         .apply_edit(&EditOp::Update {
             table: tref(),
-            key: id(1),
+            keys: vec![id(1)],
             set: vec![name(Value::Null)],
         })
         .await
@@ -998,7 +998,7 @@ pub(crate) async fn applies_edits(driver: &dyn DatabaseDriver, schema: &str, tab
         driver
             .apply_edit(&EditOp::Update {
                 table: tref(),
-                key: id(9999),
+                keys: vec![id(9999)],
                 set: vec![name(Value::Text("ghost".into()))],
             })
             .await
@@ -1019,11 +1019,47 @@ pub(crate) async fn applies_edits(driver: &dyn DatabaseDriver, schema: &str, tab
     driver
         .apply_edit(&EditOp::Delete {
             table: tref(),
-            key: id(2),
+            keys: vec![id(2)],
         })
         .await
         .unwrap();
     assert_eq!(count(all.clone()).await, 1, "delete removed one row");
+
+    // A *composite* identity addresses the row by a conjunction, which is what makes
+    // a composite-primary-key table editable. Row 1's `name` is NULL at this point,
+    // so this also proves the null member renders `IS NULL` (an `= NULL` would match
+    // nothing and the edit would report 0 rows).
+    let affected = driver
+        .apply_edit(&EditOp::Update {
+            table: tref(),
+            keys: vec![id(1), name(Value::Null)],
+            set: vec![name(Value::Text("composite".into()))],
+        })
+        .await
+        .unwrap();
+    assert_eq!(affected, 1, "composite identity addresses exactly one row");
+    assert_eq!(
+        read(one_name.clone()).await.rows[0][1],
+        Value::Text("composite".into())
+    );
+    // The conjunction is an AND: a wrong member matches nothing, rather than the
+    // predicate degrading to its first term.
+    assert!(
+        driver
+            .apply_edit(&EditOp::Update {
+                table: tref(),
+                keys: vec![id(1), name(Value::Text("not the value".into()))],
+                set: vec![name(Value::Text("nope".into()))],
+            })
+            .await
+            .is_err(),
+        "every identity member has to match"
+    );
+    assert_eq!(
+        read(one_name.clone()).await.rows[0][1],
+        Value::Text("composite".into()),
+        "the refused edit changed nothing"
+    );
 }
 
 /// A read-only connection rejects a data edit at the engine: defense in depth
@@ -1034,11 +1070,11 @@ pub(crate) async fn read_only_rejects_edit(driver: &dyn DatabaseDriver, schema: 
             schema: Some(schema.into()),
             name: table.into(),
         },
-        key: ColumnValue {
+        keys: vec![ColumnValue {
             column: "id".into(),
             value: Value::Integer(1),
             decl_type: None,
-        },
+        }],
         set: vec![ColumnValue {
             column: "name".into(),
             value: Value::Text("nope".into()),
@@ -1185,7 +1221,7 @@ pub(crate) async fn applies_batch_atomic(driver: &dyn DatabaseDriver, schema: &s
             },
             EditOp::Update {
                 table: tref(),
-                key: id(1),
+                keys: vec![id(1)],
                 set: vec![name("uno")],
             },
             EditOp::Insert {
@@ -1208,11 +1244,11 @@ pub(crate) async fn applies_batch_atomic(driver: &dyn DatabaseDriver, schema: &s
             .apply_edits(&[
                 EditOp::Delete {
                     table: tref(),
-                    key: id(2),
+                    keys: vec![id(2)],
                 },
                 EditOp::Update {
                     table: tref(),
-                    key: id(9999),
+                    keys: vec![id(9999)],
                     set: vec![name("ghost")],
                 },
             ])
@@ -1239,11 +1275,11 @@ pub(crate) async fn read_only_rejects_batch(
             schema: Some(schema.into()),
             name: table.into(),
         },
-        key: ColumnValue {
+        keys: vec![ColumnValue {
             column: "id".into(),
             value: Value::Integer(1),
             decl_type: None,
-        },
+        }],
         set: vec![ColumnValue {
             column: "name".into(),
             value: Value::Text("nope".into()),

@@ -3,42 +3,74 @@
 //! Editing is no longer a per-cell modal round-trip (the old B5 palette prompt).
 //! The user edits cells *in place*, the changes accumulate in a per-result
 //! [`PendingChanges`] set (marked dirty in the grid), and one **Submit** flushes
-//! the whole set to the backend as a single transactional batch (`ApplyBatch`);
-//! **Revert** drops it.
+//! the whole set to the backend as one batch (`ApplyBatch`); **Revert** drops it.
 //!
-//! The load-bearing decision: staged edits key by **primary key**, not row index,
-//! so they survive the windowed buffer's eviction; a dirty cell is recognised by
-//! its row's PK at paint time. The set is bounded by how many edits the user made,
-//! never by result size, so it stays inside the perf budget.
+//! The load-bearing decision: staged edits key by **row identity**, not row index,
+//! so they survive the windowed buffer's eviction; a dirty cell is recognised by its
+//! row's [`RowKey`] at paint time. The set is bounded by how many edits the user
+//! made, never by result size, so it stays inside the perf budget.
+//!
+//! The identity is a *vector* of `(column, value)` pairs rather than one primary-key
+//! value, which is what lets a composite-primary-key table be edited at all, and what
+//! lets ClickHouse -- where nothing is unique and a row is addressed by a snapshot of
+//! its values -- be edited under the best-effort contract (see
+//! [`red_core::BatchMode`]).
 
 use std::collections::{HashMap, HashSet};
 
 use flint::{CellRange, TextInput, TextInputEvent, ToastVariant};
 use gpui::{Context, Entity, Focusable, Subscription, prelude::*};
-use red_core::{ColumnValue, EditOp, TableRef, Value, coerce_edit_value};
+use red_core::{BatchMode, ColumnValue, EditMode, EditOp, TableRef, Value, coerce_edit_value};
+use red_service::Command;
 
 use super::ResultGrid;
 use super::buffer::DisplayCell;
 use crate::app::{AppState, ForeignEdit, Pane, PendingWrite, Phase};
 
-/// A hashable identity for a row's primary-key value, so staged edits survive the
-/// windowed buffer's eviction (they key by PK, not by row index). Only the PK
-/// types a keyed browse actually exposes are representable; a real/blob/NULL PK
-/// yields `None` and the cell simply isn't stageable (the edit gate already
-/// rejects those).
+/// A hashable snapshot of a row's identity values, so staged edits survive the
+/// windowed buffer's eviction (they key by identity, not by row index).
+///
+/// A *vector*, because a row address is not one column: a composite primary key
+/// needs its whole tuple, and on an engine with no unique key at all (ClickHouse)
+/// the address is a snapshot of every comparable column. Only the value shapes that
+/// can be compared in a `WHERE` are representable; a float/blob/clipped member
+/// yields `None` and the cell simply isn't stageable.
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub(crate) enum PkKey {
+pub(crate) struct RowKey(Vec<(String, KeyPart)>);
+
+/// One member of a [`RowKey`]. [`Value`] is `PartialEq` but not `Hash` (it carries a
+/// float), so the hashable members are spelled out rather than derived.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum KeyPart {
+    /// A null member; the driver renders it `IS NULL`, not `= NULL`.
+    Null,
     Int(i64),
     Text(String),
 }
 
-impl PkKey {
-    pub(crate) fn from_value(v: &Value) -> Option<PkKey> {
-        match v {
-            Value::Integer(n) => Some(PkKey::Int(*n)),
-            Value::Text(s) => Some(PkKey::Text(s.to_string())),
-            _ => None,
+impl RowKey {
+    /// The identity for a row's `(column, value)` pairs, or `None` when there are
+    /// none or a member can't be compared. The column names are part of the key: the
+    /// usable set can differ between rows (a clipped cell here, a whole one there),
+    /// and two rows whose *values* happen to line up under different column sets are
+    /// not the same row.
+    pub(crate) fn from_values(values: &[(String, Value)]) -> Option<RowKey> {
+        if values.is_empty() {
+            return None;
         }
+        values
+            .iter()
+            .map(|(column, v)| {
+                let part = match v {
+                    Value::Null => KeyPart::Null,
+                    Value::Integer(n) => KeyPart::Int(*n),
+                    Value::Text(s) => KeyPart::Text(s.to_string()),
+                    Value::Real(_) | Value::Blob(_) | Value::Capped(_) => return None,
+                };
+                Some((column.clone(), part))
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(RowKey)
     }
 }
 
@@ -53,20 +85,23 @@ pub(crate) struct StagedCell {
 }
 
 /// One staged row update: the columns the user changed (data-column index → staged
-/// cell), the PK value (to build the base `UPDATE`), and the absolute row the PK sat
-/// at when staged. The row stays valid for an updates-only batch (no rows move),
-/// so submit can patch the resident buffer in place without a refetch.
+/// cell), the row's identity values (to build the base `UPDATE`'s `WHERE`), and the
+/// absolute row it sat at when staged. The row stays valid for an updates-only batch
+/// (no rows move), so submit can patch the resident buffer in place without a
+/// refetch.
 pub(crate) struct UpdatedRow {
-    pub(crate) pk_value: Value,
+    /// The `(column, value)` pairs that address the row (see
+    /// `ResultGrid::identity_values`).
+    pub(crate) key_values: Vec<(String, Value)>,
     pub(crate) row: usize,
     pub(crate) cells: HashMap<usize, StagedCell>,
 }
 
-/// One row marked for deletion: the PK value (to build the `DELETE`) and the
+/// One row marked for deletion: its identity values (to build the `DELETE`) and the
 /// absolute row it sat at when marked (to paint it struck-through; stays valid
 /// until a structural submit reloads the result).
 pub(crate) struct DeletedRow {
-    pub(crate) pk_value: Value,
+    pub(crate) key_values: Vec<(String, Value)>,
     pub(crate) row: usize,
 }
 
@@ -83,10 +118,10 @@ pub(crate) struct DraftRow {
 /// result is (re)opened, sorted, or filtered.
 #[derive(Default)]
 pub(crate) struct PendingChanges {
-    /// PK → the row's staged column changes.
-    pub(crate) updates: HashMap<PkKey, UpdatedRow>,
-    /// PK → the row marked for deletion.
-    pub(crate) deletes: HashMap<PkKey, DeletedRow>,
+    /// Row identity → the row's staged column changes.
+    pub(crate) updates: HashMap<RowKey, UpdatedRow>,
+    /// Row identity → the row marked for deletion.
+    pub(crate) deletes: HashMap<RowKey, DeletedRow>,
     /// Locally-authored draft rows, rendered in the grid's bottom zone.
     pub(crate) inserts: Vec<DraftRow>,
 }
@@ -96,11 +131,11 @@ impl PendingChanges {
         self.updates.is_empty() && self.deletes.is_empty() && self.inserts.is_empty()
     }
 
-    /// The staged value for a resident row's `(pk, data_col)`, for the render
+    /// The staged value for a resident row's `(identity, data_col)`, for the render
     /// overlay. `None` when that cell isn't dirty.
-    pub(crate) fn cell_override(&self, pk: &PkKey, col: usize) -> Option<&Value> {
+    pub(crate) fn cell_override(&self, key: &RowKey, col: usize) -> Option<&Value> {
         self.updates
-            .get(pk)
+            .get(key)
             .and_then(|u| u.cells.get(&col))
             .map(|c| &c.value)
     }
@@ -169,7 +204,8 @@ pub(crate) enum EditSlot {
     Row {
         row: usize,
         data_col: usize,
-        pk_value: Value,
+        /// The `(column, value)` pairs that address the row.
+        key_values: Vec<(String, Value)>,
         original: Value,
         /// Set when the cell is an inline-expanded FK column: the referenced-table
         /// write target (Track B7). `None` for an ordinary base-table cell.
@@ -193,19 +229,39 @@ pub(crate) struct GridEdit {
     _sub: Subscription,
 }
 
+/// Which staged change an [`EditOp`] came from. Recorded at submit time rather than
+/// reconstructed from the op afterwards, so a *partial* batch can un-stage exactly
+/// what landed: one staged row can produce several ops (its base update plus an
+/// update per inline-expanded FK cell), and only the row whose ops *all* finished has
+/// really been written.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum OpSource {
+    Update(RowKey),
+    Delete(RowKey),
+    /// Index into [`PendingChanges::inserts`] when the batch was built.
+    Insert(usize),
+}
+
+/// A submitted batch: the ops in order, and where each came from.
+pub(crate) struct EditBatch {
+    pub(crate) ops: Vec<EditOp>,
+    /// Same length and order as `ops`.
+    pub(crate) sources: Vec<OpSource>,
+}
+
 impl ResultGrid {
     /// Build the ordered batch of [`EditOp`]s the staged change-set represents:
     /// updates, then deletes, then draft inserts. Empty (no-column) updates/inserts
-    /// are skipped. Returns an empty vec when the result has no usable PK (it can't
-    /// be edited); the caller treats that as nothing to submit.
-    pub(in crate::result) fn build_edit_ops(&self) -> Vec<EditOp> {
+    /// are skipped. Returns an empty batch when the result has no usable row identity
+    /// (it can't be edited); the caller treats that as nothing to submit.
+    pub(in crate::result) fn build_edit_batch(&self) -> EditBatch {
+        let empty = || EditBatch {
+            ops: Vec::new(),
+            sources: Vec::new(),
+        };
         let Some((schema, name)) = self.table.clone() else {
-            return Vec::new();
+            return empty();
         };
-        let Some(key) = self.key.as_ref() else {
-            return Vec::new();
-        };
-        let pk_column = key.tiebreak.clone().unwrap_or_else(|| key.column.clone());
         let tref = || TableRef {
             schema: Some(schema.clone()),
             name: name.clone(),
@@ -217,16 +273,32 @@ impl ResultGrid {
                 .get(c)
                 .map(|col| (col.name.clone(), col.decl_type.clone()))
         };
-        // A key column binds fine without a type (always int/text), so it carries None.
-        let key_cv = |value: Value| ColumnValue {
-            column: pk_column.clone(),
-            value,
-            decl_type: None,
+        let decl_of = |name: &str| {
+            self.columns
+                .iter()
+                .find(|c| c.name == name)
+                .and_then(|c| c.decl_type.clone())
+        };
+        // The identity conjunction: one pair per identity column, in the order the
+        // backend reported (sorting key first on ClickHouse, so the engine can prune
+        // parts). The declared type rides along for the same reason it does on an
+        // assignment: a value the driver decoded to text (a uuid, a timestamp, a
+        // Decimal) has to be cast back before it can be compared to its column.
+        let key_cvs = |values: &[(String, Value)]| -> Vec<ColumnValue> {
+            values
+                .iter()
+                .map(|(column, value)| ColumnValue {
+                    column: column.clone(),
+                    value: value.clone(),
+                    decl_type: decl_of(column),
+                })
+                .collect()
         };
         let mut ops = Vec::new();
+        let mut sources = Vec::new();
 
-        for u in self.pending.updates.values() {
-            // Base-table cells fold into one `UPDATE … WHERE pk = ?`; each inline-
+        for (key, u) in &self.pending.updates {
+            // Base-table cells fold into one `UPDATE … WHERE <identity>`; each inline-
             // expanded FK cell (Track B7) is its own `UPDATE <ref> … WHERE <fk key>`
             // against the referenced table it came from.
             let mut set: Vec<ColumnValue> = Vec::new();
@@ -241,39 +313,54 @@ impl ResultGrid {
                             });
                         }
                     }
-                    Some(f) => ops.push(EditOp::Update {
-                        table: f.table.clone(),
-                        key: ColumnValue {
-                            column: f.key_column.clone(),
-                            value: f.key_value.clone(),
-                            decl_type: f.key_type.clone(),
-                        },
-                        set: vec![ColumnValue {
-                            column: f.set_column.clone(),
-                            value: cell.value.clone(),
-                            // The referenced column's type (the joined result column)
-                            // rides along so a jsonb/uuid/timestamp value casts back.
-                            decl_type: col_meta(*c).and_then(|(_, dt)| dt),
-                        }],
-                    }),
+                    Some(f) => {
+                        sources.push(OpSource::Update(key.clone()));
+                        ops.push(EditOp::Update {
+                            table: f.table.clone(),
+                            // A followed FK always names a single-column unique key (the
+                            // resolver refuses anything else), so this identity is one pair.
+                            keys: vec![ColumnValue {
+                                column: f.key_column.clone(),
+                                value: f.key_value.clone(),
+                                decl_type: f.key_type.clone(),
+                            }],
+                            set: vec![ColumnValue {
+                                column: f.set_column.clone(),
+                                value: cell.value.clone(),
+                                // The referenced column's type (the joined result column)
+                                // rides along so a jsonb/uuid/timestamp value casts back.
+                                decl_type: col_meta(*c).and_then(|(_, dt)| dt),
+                            }],
+                        });
+                    }
                 }
             }
             if set.is_empty() {
                 continue;
             }
+            let keys = key_cvs(&u.key_values);
+            if keys.is_empty() {
+                continue; // no identity: an unqualified UPDATE is never what was meant
+            }
+            sources.push(OpSource::Update(key.clone()));
             ops.push(EditOp::Update {
                 table: tref(),
-                key: key_cv(u.pk_value.clone()),
+                keys,
                 set,
             });
         }
-        for d in self.pending.deletes.values() {
+        for (key, d) in &self.pending.deletes {
+            let keys = key_cvs(&d.key_values);
+            if keys.is_empty() {
+                continue;
+            }
+            sources.push(OpSource::Delete(key.clone()));
             ops.push(EditOp::Delete {
                 table: tref(),
-                key: key_cv(d.pk_value.clone()),
+                keys,
             });
         }
-        for draft in &self.pending.inserts {
+        for (index, draft) in self.pending.inserts.iter().enumerate() {
             let values: Vec<ColumnValue> = draft
                 .cells
                 .iter()
@@ -288,13 +375,90 @@ impl ResultGrid {
             if values.is_empty() {
                 continue;
             }
+            sources.push(OpSource::Insert(index));
             ops.push(EditOp::Insert {
                 table: tref(),
                 values,
             });
         }
-        ops
+        EditBatch { ops, sources }
     }
+
+    /// Drop the staged changes whose ops **all** finished, leaving the rest staged so
+    /// the user can fix and resubmit. `done` holds the batch positions that landed.
+    ///
+    /// The all-or-nothing rule per source is what keeps a resubmit safe: a row whose
+    /// base update landed but whose referenced-table update failed stays staged
+    /// whole, and re-running the base update is idempotent, whereas dropping it would
+    /// silently lose the half that never got written.
+    pub(in crate::result) fn unstage_finished(
+        &mut self,
+        sources: &[OpSource],
+        done: &HashSet<usize>,
+    ) {
+        let mut drafts: Vec<usize> = Vec::new();
+        for source in sources {
+            if !source_finished(sources, done, source) {
+                continue;
+            }
+            match source {
+                OpSource::Update(key) => {
+                    self.pending.updates.remove(key);
+                }
+                OpSource::Delete(key) => {
+                    self.pending.deletes.remove(key);
+                }
+                OpSource::Insert(index) => drafts.push(*index),
+            }
+        }
+        // Highest index first, so each removal leaves the lower ones addressable.
+        drafts.sort_unstable();
+        drafts.dedup();
+        for index in drafts.into_iter().rev() {
+            if index < self.pending.inserts.len() {
+                self.pending.inserts.remove(index);
+            }
+        }
+    }
+
+    /// The `(row, data_col, value)` triples of the staged updates whose ops all
+    /// landed, so an updates-only batch can patch the resident buffer instead of
+    /// refetching. Read *before* [`unstage_finished`](Self::unstage_finished) drops
+    /// them.
+    pub(in crate::result) fn landed_update_cells(
+        &self,
+        sources: &[OpSource],
+        done: &HashSet<usize>,
+    ) -> Vec<(usize, usize, Value)> {
+        let mut out = Vec::new();
+        for source in sources {
+            let OpSource::Update(key) = source else {
+                continue;
+            };
+            if !source_finished(sources, done, source) {
+                continue;
+            }
+            if let Some(u) = self.pending.updates.get(key) {
+                out.extend(
+                    u.cells
+                        .iter()
+                        .map(|(col, cell)| (u.row, *col, cell.value.clone())),
+                );
+            }
+        }
+        out
+    }
+}
+
+/// Whether every op a staged change produced finished. A row that produced a base
+/// update *and* a referenced-table update has landed only when both did; treating it
+/// as done after one would silently drop the half that never got written.
+fn source_finished(sources: &[OpSource], done: &HashSet<usize>, source: &OpSource) -> bool {
+    sources
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| *s == source)
+        .all(|(i, _)| done.contains(&i))
 }
 
 impl AppState {
@@ -309,21 +473,21 @@ impl AppState {
         let Some(ctx) = self.active_edit_target() else {
             return;
         };
-        let Some(pk) = PkKey::from_value(&ctx.pk_value) else {
+        let Some(key) = RowKey::from_values(&ctx.key_values) else {
             return;
         };
         // Effective current value: a staged override wins over the resident original.
         let current = match &self.phase {
             Phase::Connected(active) => active
                 .active_result()
-                .and_then(|g| g.pending.cell_override(&pk, ctx.data_col).cloned())
+                .and_then(|g| g.pending.cell_override(&key, ctx.data_col).cloned())
                 .unwrap_or_else(|| ctx.original.clone()),
             _ => ctx.original.clone(),
         };
         let slot = EditSlot::Row {
             row: ctx.row,
             data_col: ctx.data_col,
-            pk_value: ctx.pk_value.clone(),
+            key_values: ctx.key_values.clone(),
             original: ctx.original.clone(),
             foreign: ctx.foreign.clone(),
         };
@@ -339,7 +503,9 @@ impl AppState {
     ) {
         let (epoch, decl_type, current) = match &self.phase {
             Phase::Connected(active) => match active.active_result() {
-                Some(g) if index < g.pending.inserts.len() => {
+                // An engine-computed column takes no value on insert, so it has no
+                // editor (see `ResultGrid::insertable_column`).
+                Some(g) if index < g.pending.inserts.len() && g.insertable_column(data_col) => {
                     let decl = g.columns.get(data_col).and_then(|c| c.decl_type.clone());
                     let cur = g.pending.inserts[index]
                         .cells
@@ -447,11 +613,11 @@ impl AppState {
             EditSlot::Row {
                 row,
                 data_col,
-                pk_value,
+                key_values,
                 original,
                 foreign,
             } => self.stage_existing_value(
-                edit.epoch, row, data_col, pk_value, original, value, foreign,
+                edit.epoch, row, data_col, key_values, original, value, foreign,
             ),
             EditSlot::Draft { index, data_col } => {
                 self.stage_draft_value(edit.epoch, index, data_col, value)
@@ -507,12 +673,12 @@ impl AppState {
             EditSlot::Row {
                 row,
                 data_col,
-                pk_value,
+                key_values,
                 original,
                 foreign,
             } => {
                 self.stage_existing_value(
-                    edit.epoch, row, data_col, pk_value, original, value, foreign,
+                    edit.epoch, row, data_col, key_values, original, value, foreign,
                 );
                 self.advance_row_edit(row, data_col, forward, cx);
             }
@@ -536,9 +702,15 @@ impl AppState {
     ) {
         let gutter = self.gutter();
         let row_height = f32::from(self.settings.grid.density.row_height());
-        let (ncols, pk_idx, total) = match &self.phase {
+        let (ncols, locked, total) = match &self.phase {
             Phase::Connected(active) => match active.active_result() {
-                Some(g) => (g.columns.len(), g.pk_column_index(), g.total),
+                Some(g) => (
+                    g.columns.len(),
+                    (0..g.columns.len())
+                        .map(|c| !g.updatable_column(c))
+                        .collect::<Vec<_>>(),
+                    g.total,
+                ),
                 None => return self.focus_grid(cx),
             },
             _ => return,
@@ -574,8 +746,8 @@ impl AppState {
             if !stepped {
                 break;
             }
-            if Some(c) == pk_idx {
-                continue; // identity column is never editable; skip without a probe
+            if locked.get(c).copied().unwrap_or(true) {
+                continue; // identity / engine-computed column; skip without a probe
             }
             if let Phase::Connected(active) = &mut self.phase
                 && let Some(grid) = active.active_result_mut()
@@ -604,31 +776,45 @@ impl AppState {
         forward: bool,
         cx: &mut Context<Self>,
     ) {
-        let (ncols, ndrafts) = match &self.phase {
+        let (ncols, ndrafts, writable) = match &self.phase {
             Phase::Connected(active) => match active.active_result() {
-                Some(g) => (g.columns.len(), g.pending.inserts.len()),
+                Some(g) => (
+                    g.columns.len(),
+                    g.pending.inserts.len(),
+                    (0..g.columns.len())
+                        .map(|c| g.insertable_column(c))
+                        .collect::<Vec<_>>(),
+                ),
                 None => return self.focus_grid(cx),
             },
             _ => return,
         };
-        if ncols == 0 {
+        if ncols == 0 || !writable.iter().any(|w| *w) {
             return self.focus_grid(cx);
         }
-        if forward {
-            if data_col + 1 < ncols {
-                self.begin_draft_edit(index, data_col + 1, cx);
-            } else if index + 1 < ndrafts {
-                self.begin_draft_edit(index + 1, 0, cx);
-            } else {
-                self.add_draft_row(cx); // the new draft lands at the old length
-                self.begin_draft_edit(ndrafts, 0, cx);
+        // Tab skips over engine-computed columns, which have no editor to land in.
+        let step = |mut c: usize| -> Option<usize> {
+            loop {
+                c = if forward { c + 1 } else { c.checked_sub(1)? };
+                if c >= ncols {
+                    return None;
+                }
+                if writable[c] {
+                    return Some(c);
+                }
             }
-        } else if data_col > 0 {
-            self.begin_draft_edit(index, data_col - 1, cx);
-        } else if index > 0 {
-            self.begin_draft_edit(index - 1, ncols - 1, cx);
-        } else {
-            self.focus_grid(cx);
+        };
+        let first = writable.iter().position(|w| *w).unwrap_or(0);
+        let last = writable.iter().rposition(|w| *w).unwrap_or(0);
+        match (forward, step(data_col)) {
+            (_, Some(next)) => self.begin_draft_edit(index, next, cx),
+            (true, None) if index + 1 < ndrafts => self.begin_draft_edit(index + 1, first, cx),
+            (true, None) => {
+                self.add_draft_row(cx); // the new draft lands at the old length
+                self.begin_draft_edit(ndrafts, first, cx);
+            }
+            (false, None) if index > 0 => self.begin_draft_edit(index - 1, last, cx),
+            (false, None) => self.focus_grid(cx),
         }
     }
 
@@ -649,12 +835,12 @@ impl AppState {
         epoch: red_service::Epoch,
         row: usize,
         data_col: usize,
-        pk_value: Value,
+        key_values: Vec<(String, Value)>,
         original: Value,
         value: Value,
         foreign: Option<ForeignEdit>,
     ) {
-        let Some(pk) = PkKey::from_value(&pk_value) else {
+        let Some(key) = RowKey::from_values(&key_values) else {
             return;
         };
         if let Phase::Connected(active) = &mut self.phase
@@ -664,19 +850,19 @@ impl AppState {
                 return; // the result was replaced under the in-flight edit
             }
             if value == original {
-                if let Some(u) = grid.pending.updates.get_mut(&pk) {
+                if let Some(u) = grid.pending.updates.get_mut(&key) {
                     u.cells.remove(&data_col);
                     if u.cells.is_empty() {
-                        grid.pending.updates.remove(&pk);
+                        grid.pending.updates.remove(&key);
                     }
                 }
             } else {
                 let entry = grid
                     .pending
                     .updates
-                    .entry(pk)
+                    .entry(key)
                     .or_insert_with(|| UpdatedRow {
-                        pk_value,
+                        key_values,
                         row,
                         cells: HashMap::new(),
                     });
@@ -724,7 +910,7 @@ impl AppState {
             ctx.epoch,
             ctx.row,
             ctx.data_col,
-            ctx.pk_value,
+            ctx.key_values,
             ctx.original,
             Value::Null,
             ctx.foreign,
@@ -735,16 +921,17 @@ impl AppState {
     // --- row add / delete ---
 
     /// Add a fresh empty draft row to the insert zone (⌘⌥N / footer / palette).
-    /// No-op when editing isn't enabled or the result isn't an editable browse.
+    /// No-op when inserting isn't enabled or the result isn't a single-table browse.
     pub(crate) fn add_draft_row(&mut self, cx: &mut Context<Self>) {
-        if !self.editing_enabled() {
+        if !self.insert_enabled() {
             return;
         }
         if let Phase::Connected(active) = &mut self.phase
             && let Some(grid) = active.active_result_mut()
         {
-            // Only a keyed single-table browse can be inserted into.
-            if grid.editable_browse() {
+            // A draft row names no existing row, so it needs a target table but no
+            // resolved key (unlike an update or a delete).
+            if grid.insertable_browse() {
                 grid.pending.inserts.push(DraftRow::default());
             }
         }
@@ -766,31 +953,28 @@ impl AppState {
     }
 
     /// Toggle deletion of the selected rows (⌘⌫ / context menu): each editable row
-    /// in the selection flips between marked-for-deletion and not. No-op when
+    /// in the selection flips between marked-for-deletion and not. No-op when row
     /// editing isn't enabled or no usable PK is resident for a row.
     pub(crate) fn toggle_delete_rows(&mut self, cx: &mut Context<Self>) {
-        if !self.editing_enabled() {
+        if !self.row_edit_enabled() {
             return;
         }
         if let Phase::Connected(active) = &mut self.phase
             && let Some(grid) = active.active_result_mut()
         {
-            let Some(pk_idx) = grid.pk_column_index() else {
-                return;
-            };
             let Some(sel) = grid.selection else { return };
             let (r0, _, r1, _) = sel.bounds();
             for row in r0..=r1 {
-                let Some(pk_value) = grid.cell_value(row, pk_idx) else {
+                let Some(key_values) = grid.identity_values(row) else {
                     continue;
                 };
-                let Some(pk) = PkKey::from_value(&pk_value) else {
+                let Some(key) = RowKey::from_values(&key_values) else {
                     continue;
                 };
-                if grid.pending.deletes.remove(&pk).is_none() {
+                if grid.pending.deletes.remove(&key).is_none() {
                     grid.pending
                         .deletes
-                        .insert(pk, DeletedRow { pk_value, row });
+                        .insert(key, DeletedRow { key_values, row });
                 }
             }
         }
@@ -802,6 +986,18 @@ impl AppState {
     /// Submit the staged change-set: build the batch, then open the count + combined
     /// preview confirm (the destructive-statement guard, kept by design). No-op with
     /// nothing staged; the caller (⌘↵ in the grid) falls back to running the query.
+    ///
+    /// The confirm is **not** skippable, and deliberately does not consult
+    /// `query.confirm_destructive` the way an editor statement does. That setting
+    /// trades a prompt for a statement the user typed and can see; a staged batch is
+    /// neither, and under the best-effort contract one keystroke can start an
+    /// unbounded, unrollbackable rewrite.
+    ///
+    /// Under the best-effort contract the confirm is preceded by a **preflight** round
+    /// trip, so the dialog can show the statement that will really run and how many
+    /// rows each op currently matches. The atomic path needs none: the driver's own
+    /// one-row assertion and rollback are a stronger guarantee than a count taken a
+    /// moment earlier, so it opens the dialog straight away.
     pub(crate) fn submit_changes(&mut self, cx: &mut Context<Self>) {
         // Flush a half-typed cell first so it isn't silently dropped.
         if self.grid_edit.is_some() {
@@ -810,15 +1006,95 @@ impl AppState {
         let staged = match &self.phase {
             Phase::Connected(active) => active
                 .active_result()
-                .map(|g| (g.epoch, g.build_edit_ops())),
+                .map(|g| (g.epoch, g.build_edit_batch())),
             _ => None,
         };
-        let Some((epoch, ops)) = staged else { return };
-        if ops.is_empty() {
+        let Some((epoch, batch)) = staged else { return };
+        if batch.ops.is_empty() {
             return;
         }
-        self.confirm_exec = Some(PendingWrite::Batch { ops, epoch });
-        self.focus_modal = true;
+        match self.batch_mode() {
+            BatchMode::Atomic => {
+                self.confirm_exec = Some(PendingWrite::Batch {
+                    ops: batch.ops,
+                    sources: batch.sources,
+                    epoch,
+                    mode: BatchMode::Atomic,
+                    plan: Vec::new(),
+                });
+                self.focus_modal = true;
+            }
+            mode => {
+                self.send_active(Command::PreflightBatch {
+                    epoch,
+                    ops: batch.ops.clone(),
+                });
+                self.pending_batch = Some(PendingWrite::Batch {
+                    ops: batch.ops,
+                    sources: batch.sources,
+                    epoch,
+                    mode,
+                    plan: Vec::new(),
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Which contract this connection's edits run under. The engine decides: an
+    /// engine with transactions gets the guarded one, ClickHouse the best-effort one.
+    /// The "apply to all matching rows" acknowledgement starts off -- the user grants
+    /// it in the confirm dialog, if at all.
+    pub(crate) fn batch_mode(&self) -> BatchMode {
+        match self.row_edit_mode() {
+            EditMode::BestEffort => BatchMode::BestEffort {
+                allow_multi_match: false,
+            },
+            _ => BatchMode::Atomic,
+        }
+    }
+
+    /// The preflight came back: open the confirm dialog it was gathered for. A reply
+    /// whose epoch no longer matches the waiting batch is dropped (the result was
+    /// re-run or the submit abandoned).
+    pub(crate) fn on_batch_preflight(
+        &mut self,
+        epoch: red_service::Epoch,
+        plan: Vec<red_core::OpPlan>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(PendingWrite::Batch { epoch: waiting, .. }) = &self.pending_batch else {
+            return;
+        };
+        if *waiting != epoch {
+            return;
+        }
+        if let Some(PendingWrite::Batch {
+            plan: slot,
+            mode,
+            ops,
+            sources,
+            epoch,
+        }) = self.pending_batch.take()
+        {
+            let _ = slot;
+            self.confirm_exec = Some(PendingWrite::Batch {
+                ops,
+                sources,
+                epoch,
+                mode,
+                plan,
+            });
+            self.focus_modal = true;
+        }
+        cx.notify();
+    }
+
+    /// The preflight couldn't be answered, so nothing is confirmed and nothing is
+    /// written: drop the waiting batch (the staged changes stay) and say why.
+    pub(crate) fn on_batch_preflight_failed(&mut self, message: String, cx: &mut Context<Self>) {
+        self.pending_batch = None;
+        self.notify(ToastVariant::Error, message, cx);
         cx.notify();
     }
 
@@ -855,6 +1131,7 @@ impl AppState {
         _applied: u64,
         cx: &mut Context<Self>,
     ) {
+        self.submitted_batch = None;
         let mut reload = false;
         if let Some(grid) = self.result_by_epoch(epoch) {
             // A foreign (inline-expanded FK) edit rewrites a referenced row that may
@@ -894,7 +1171,95 @@ impl AppState {
         message: String,
         cx: &mut Context<Self>,
     ) {
+        self.submitted_batch = None;
         self.notify(ToastVariant::Error, message, cx);
+        cx.notify();
+    }
+
+    /// A **best-effort** batch finished (`BatchPartial`): report per op what happened,
+    /// drop the staged changes that landed, and keep the rest.
+    ///
+    /// There was no transaction, so "3 of 5 applied" is a real outcome and the report
+    /// says so. A blanket "Changes submitted" toast here would be the single most
+    /// misleading thing this feature could do.
+    pub(crate) fn on_batch_partial(
+        &mut self,
+        epoch: red_service::Epoch,
+        outcomes: Vec<red_core::OpOutcome>,
+        cx: &mut Context<Self>,
+    ) {
+        use red_core::OpStatus;
+        let sources = match self.submitted_batch.take() {
+            Some((submitted, sources)) if submitted == epoch => sources,
+            // A reply for a batch this pane no longer owns: report it, change nothing.
+            other => {
+                self.submitted_batch = other;
+                Vec::new()
+            }
+        };
+        let done: HashSet<usize> = outcomes
+            .iter()
+            .filter(|o| !o.status.unfinished())
+            .map(|o| o.index)
+            .collect();
+
+        // A landed delete or insert moves every row after it, and a referenced-table
+        // edit is shared by each base row pointing at it, so both need a reload rather
+        // than an in-place patch of the resident buffer.
+        let structural = outcomes
+            .iter()
+            .any(|o| !o.status.unfinished() && matches!(o.verb, "Delete" | "Insert"));
+        let mut reload = false;
+        if let Some(grid) = self.result_by_epoch(epoch) {
+            let foreign = grid
+                .pending
+                .updates
+                .values()
+                .any(|u| u.cells.values().any(|c| c.foreign.is_some()));
+            reload = structural || foreign;
+            if !reload {
+                for (row, col, value) in grid.landed_update_cells(&sources, &done) {
+                    grid.patch_cell(row, col, value);
+                }
+            }
+            grid.unstage_finished(&sources, &done);
+        }
+        if reload {
+            self.reload_active_result(cx);
+        }
+        // The mutations this submit started are the connection's newest, so refresh
+        // the listing whether or not the panel is open: the status-bar indicator
+        // reads off it too.
+        self.refresh_mutations(cx);
+
+        let count = |f: fn(&OpStatus) -> bool| outcomes.iter().filter(|o| f(&o.status)).count();
+        let applied = count(|s| matches!(s, OpStatus::Applied { .. }));
+        let running = count(|s| matches!(s, OpStatus::Submitted));
+        let mut reasons: Vec<String> = outcomes
+            .iter()
+            .filter_map(|o| o.status.reason().map(|r| format!("{}: {r}", o.verb)))
+            .collect();
+        reasons.dedup();
+
+        let mut summary = format!("{applied} of {} changes applied", outcomes.len());
+        if running > 0 {
+            // Not an error, and explicitly not a retry prompt: the mutation was
+            // accepted and is being applied: re-submitting would start a second full
+            // part rewrite. The panel is where its progress lives.
+            summary.push_str(&format!(
+                ", {running} still running (see the Mutations panel)"
+            ));
+        }
+        let variant = if reasons.is_empty() {
+            ToastVariant::Success
+        } else {
+            ToastVariant::Warning
+        };
+        if !reasons.is_empty() {
+            summary.push('\n');
+            summary.push_str(&reasons.join("\n"));
+        }
+        self.notify(variant, summary, cx);
         cx.notify();
     }
 

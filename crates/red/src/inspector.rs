@@ -584,7 +584,7 @@ impl AppState {
     /// target. Clones the full value, so call it only when actually opening an edit;
     /// the per-frame "is it editable?" check uses [`Self::inspector_can_edit`].
     fn inspector_edit_context(&self) -> Option<EditContext> {
-        if !self.editing_enabled() {
+        if !self.row_edit_enabled() {
             return None;
         }
         // Editing resolves through the grid *cursor* (`active_edit_target`), so a pane
@@ -613,7 +613,7 @@ impl AppState {
     /// footer "Edit" button, evaluated every frame. Unlike `inspector_edit_context`
     /// it never clones the (possibly large) full value.
     fn inspector_can_edit(&self) -> bool {
-        if !self.editing_enabled() {
+        if !self.row_edit_enabled() {
             return false;
         }
         // A pane pinned away from the cursor is view-only (see `inspector_edit_context`).
@@ -748,7 +748,7 @@ impl AppState {
             ctx.epoch,
             ctx.row,
             ctx.data_col,
-            ctx.pk_value,
+            ctx.key_values,
             ctx.original,
             value,
             ctx.foreign,

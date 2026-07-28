@@ -45,10 +45,11 @@ pub enum DbKind {
     Sqlite,
     Mysql,
     /// ClickHouse: the OLAP engine, reached over its HTTP interface. A writable
-    /// connection can be an INSERT / copy / migration *target*, but has no in-grid
-    /// editing: `UPDATE`/`DELETE` are async `ALTER … UPDATE` mutations with no
-    /// transaction/rollback over a non-unique sort key, so its driver refuses
-    /// `apply_edits` (see [`DbKind::write_caps`]).
+    /// connection is an INSERT / copy / migration *target* and can edit rows in the
+    /// grid, but under the **best-effort** contract rather than the guarded one:
+    /// `UPDATE`/`DELETE` are async `ALTER … UPDATE` mutations with no transaction or
+    /// rollback over a non-unique sort key, so each op is preflight-counted and
+    /// reported for itself (see [`DbKind::write_caps`] and [`RowEditCaps`]).
     Clickhouse,
     /// Redis/Valkey: a key-value store, not SQL-shaped at all. Reached through
     /// the parallel `KvDriver` seam (`red-driver`'s `redis_kv` module), not
@@ -150,14 +151,17 @@ impl DbKind {
                 guarded_edit: true,
                 best_effort_edit: false,
             },
-            // ClickHouse (OLAP): a writable connection can be an INSERT / copy /
-            // migration *target*, but has no transactional, exactly-one-row in-grid
-            // editing; its `UPDATE`/`DELETE` are asynchronous, non-atomic mutations
-            // over a non-unique sort key (a best-effort edit mode is a later phase).
+            // ClickHouse (OLAP): a full write target, but under a different contract.
+            // Inserts are ordinary; `UPDATE`/`DELETE` are asynchronous, non-atomic
+            // mutations over a non-unique sort key, so they can't honor the guarded
+            // (one transaction, exactly one row, rollback on failure) promise and ride
+            // the best-effort seam instead -- preflight-counted, per-op reported, and
+            // always confirmed. Which *tables* that applies to is a further question
+            // only the catalog answers; see [`RowEditCaps`].
             DbKind::Clickhouse => WriteCaps {
                 insert: true,
                 guarded_edit: false,
-                best_effort_edit: false,
+                best_effort_edit: true,
             },
             // Redis: no write path exists yet (R0/R1 are read-only browsing).
             // R3 (see docs/plans/redis.md) adds SET/HSET/EXPIRE/DEL through the
@@ -179,6 +183,19 @@ impl DbKind {
                 best_effort_edit: false,
             },
         }
+    }
+
+    /// Whether this engine applies row edits as **asynchronous background
+    /// mutations** the user can watch and cancel (see [`MutationInfo`]). Drives the
+    /// Mutations panel, which would be an empty box on an engine whose writes are
+    /// finished by the time the statement returns.
+    ///
+    /// A descriptor rather than a `== DbKind::Clickhouse` check, for the same reason
+    /// [`write_caps`](Self::write_caps) is one: the UI holds a [`DbKind`], never a
+    /// driver, and scattered engine comparisons are what used to disagree with each
+    /// other.
+    pub const fn tracks_mutations(self) -> bool {
+        matches!(self, DbKind::Clickhouse)
     }
 
     /// How this engine resolves the names in an *unqualified* query — the
@@ -297,8 +314,112 @@ pub struct WriteCaps {
     /// relational edit contract) is possible.
     pub guarded_edit: bool,
     /// Best-effort, non-atomic in-grid `UPDATE`/`DELETE` (async mutations, no
-    /// rollback, no one-row guarantee) is possible; reserved for a later phase.
+    /// rollback, no one-row guarantee) is possible.
     pub best_effort_edit: bool,
+}
+
+/// What in-grid row editing *this table* supports, resolved per browse alongside its
+/// seek key. [`WriteCaps`] answers "can this engine edit at all"; this answers "can
+/// this table, and under which contract" -- questions only the catalog can settle. A
+/// `MergeTree` ClickHouse table is editable where a `Memory` one, a view, or a
+/// `Distributed` table is not, and none of that is derivable from [`DbKind`].
+///
+/// Deliberately about **rows that already exist**. Inserting is governed by
+/// [`WriteCaps::insert`] plus [`no_insert`](Self::no_insert): a draft row names no
+/// existing row, so it needs neither an identity nor a rollback, and stays available
+/// on a table whose [`mode`](Self::mode) is [`EditMode::None`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RowEditCaps {
+    pub mode: EditMode,
+    /// The columns whose values, taken together, address a row for an `UPDATE`/
+    /// `DELETE`. A relational primary key (composite included); on ClickHouse the
+    /// sorting-key columns **first** (so the engine can prune parts, see
+    /// `docs/plans/todo/clickhouse-writes.md` D3), then the remaining comparable
+    /// ones. Empty exactly when [`mode`](Self::mode) is [`EditMode::None`].
+    pub identity: Vec<String>,
+    /// Columns that can never be *updated*: the identity columns themselves, plus
+    /// anything the engine computes (a ClickHouse `MATERIALIZED`/`ALIAS` column).
+    pub no_update: Vec<String>,
+    /// Columns that can never be *written on insert*. Distinct from
+    /// [`no_update`](Self::no_update) on purpose: a sorting-key column must be set on
+    /// a draft row but can never be updated afterwards, so it belongs to one list and
+    /// not the other.
+    pub no_insert: Vec<String>,
+    /// One line the UI can show: why editing is unavailable when
+    /// [`mode`](Self::mode) is [`EditMode::None`], or the caveat that applies when it
+    /// is [`EditMode::BestEffort`]. `None` when there is nothing to say.
+    pub note: Option<String>,
+}
+
+/// Which edit contract a table's rows can be changed under (see [`RowEditCaps`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EditMode {
+    /// Not editable: no usable row identity, or an engine/table that cannot mutate
+    /// at all. [`RowEditCaps::note`] says which.
+    #[default]
+    None,
+    /// The relational contract: one transaction, exactly one row per op, rolled back
+    /// on any failure (see `DatabaseDriver::apply_edits`).
+    Guarded,
+    /// Best-effort: asynchronous, non-atomic, per-op outcomes, and a preflight count
+    /// rather than an engine-enforced one-row guarantee (see
+    /// `DatabaseDriver::apply_edits_best_effort`). ClickHouse.
+    BestEffort,
+}
+
+impl RowEditCaps {
+    /// The pure, catalog-free derivation for a relational engine: the primary key is
+    /// the identity, and it is the one thing that can't be updated. Composite keys
+    /// included -- addressing a row by its full key tuple is exactly as sound as by a
+    /// single column. Falls back to a single-column `UNIQUE NOT NULL` index when the
+    /// table declares no primary key (the same fallback the seek key uses), and
+    /// reports [`EditMode::None`] with a reason when neither exists.
+    pub fn guarded(detail: &TableDetail) -> RowEditCaps {
+        let pk: Vec<String> = detail
+            .columns
+            .iter()
+            .filter(|c| c.primary_key)
+            .map(|c| c.name.clone())
+            .collect();
+        let identity = if pk.is_empty() {
+            detail
+                .indexes
+                .iter()
+                .filter(|i| i.unique && i.columns.len() == 1)
+                .find_map(|i| {
+                    detail
+                        .columns
+                        .iter()
+                        .find(|c| c.name == i.columns[0] && c.not_null)
+                        .map(|c| vec![c.name.clone()])
+                })
+                .unwrap_or_default()
+        } else {
+            pk
+        };
+        if identity.is_empty() {
+            return RowEditCaps {
+                note: Some(
+                    "no primary key or unique NOT NULL column: rows can't be addressed \
+                     individually"
+                        .to_string(),
+                ),
+                ..RowEditCaps::default()
+            };
+        }
+        RowEditCaps {
+            mode: EditMode::Guarded,
+            no_update: identity.clone(),
+            identity,
+            no_insert: Vec::new(),
+            note: None,
+        }
+    }
+
+    /// Whether an existing row can be updated or deleted at all.
+    pub fn editable(&self) -> bool {
+        !matches!(self.mode, EditMode::None)
+    }
 }
 
 impl fmt::Display for DbKind {
@@ -1497,23 +1618,33 @@ pub struct ColumnPredicate {
     pub value: Option<Value>,
 }
 
-/// A single guarded data edit (Track B5), keyed on a result's primary key. Built by
-/// the UI from the result's [`KeySpec`] + base table; a *semantic* edit carrying no
-/// SQL, so the UI stays engine-independent. The driver renders it to dialect SQL,
-/// **binds** every value (never interpolates), and asserts it touches exactly one
-/// row (rolling back otherwise). NULL values are emitted as the literal `NULL`
-/// keyword by the renderer, so the per-engine value binders only ever see non-null
-/// values.
+/// A single guarded data edit (Track B5), keyed on a result's row identity. Built by
+/// the UI from the result's [`RowEditCaps::identity`] + base table; a *semantic* edit
+/// carrying no SQL, so the UI stays engine-independent. The driver renders it to
+/// dialect SQL, **binds** every value (never interpolates), and asserts it touches
+/// exactly one row (rolling back otherwise). NULL values are emitted as the literal
+/// `NULL` keyword by the renderer, so the per-engine value binders only ever see
+/// non-null values.
+///
+/// The identity is a **vector**, not one column: a composite primary key is exactly
+/// as sound a row address as a single one (it just needs a conjunction), and on
+/// ClickHouse -- where nothing is unique -- the address is a snapshot of several
+/// columns' values, checked by a preflight count before anything runs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EditOp {
-    /// Set one or more columns of the PK-identified row.
+    /// Set one or more columns of the identified row.
     Update {
         table: TableRef,
-        key: ColumnValue,
+        /// The identifying `column = value` pairs, AND-joined by the renderer. Never
+        /// empty: an op with no identity would address the whole table.
+        keys: Vec<ColumnValue>,
         set: Vec<ColumnValue>,
     },
-    /// Delete the PK-identified row.
-    Delete { table: TableRef, key: ColumnValue },
+    /// Delete the identified row.
+    Delete {
+        table: TableRef,
+        keys: Vec<ColumnValue>,
+    },
     /// Insert a row with the given column values; omitted columns take their DB
     /// default. After a successful insert the caller refetches to surface
     /// server-assigned values (autoincrement PK, defaults).
@@ -1546,6 +1677,15 @@ pub struct ColumnValue {
 }
 
 impl EditOp {
+    /// The table this op writes to, whichever kind it is.
+    pub fn table(&self) -> &TableRef {
+        match self {
+            EditOp::Update { table, .. }
+            | EditOp::Delete { table, .. }
+            | EditOp::Insert { table, .. } => table,
+        }
+    }
+
     /// The human verb for the confirm modal ("Update" / "Delete" / "Insert").
     pub fn verb(&self) -> &'static str {
         match self {
@@ -1565,26 +1705,35 @@ impl EditOp {
             Some(s) if !s.is_empty() => format!("{}.{}", q(s), q(&t.name)),
             _ => q(&t.name),
         };
+        // The identity conjunction, `IS NULL` for a null value (a `= NULL` would
+        // match nothing, which is the opposite of what the row's value means).
+        let where_clause = |keys: &[ColumnValue]| {
+            keys.iter()
+                .map(|cv| match &cv.value {
+                    Value::Null => format!("{} IS NULL", q(&cv.column)),
+                    v => format!("{} = {}", q(&cv.column), literal(v)),
+                })
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
         match self {
-            EditOp::Update { table, key, set } => {
+            EditOp::Update { table, keys, set } => {
                 let assigns = set
                     .iter()
                     .map(|cv| format!("{} = {}", q(&cv.column), literal(&cv.value)))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!(
-                    "UPDATE {} SET {} WHERE {} = {}",
+                    "UPDATE {} SET {} WHERE {}",
                     qualify(table),
                     assigns,
-                    q(&key.column),
-                    literal(&key.value)
+                    where_clause(keys)
                 )
             }
-            EditOp::Delete { table, key } => format!(
-                "DELETE FROM {} WHERE {} = {}",
+            EditOp::Delete { table, keys } => format!(
+                "DELETE FROM {} WHERE {}",
                 qualify(table),
-                q(&key.column),
-                literal(&key.value)
+                where_clause(keys)
             ),
             EditOp::Insert { table, values } => {
                 let cols = values
@@ -1604,6 +1753,114 @@ impl EditOp {
                     vals
                 )
             }
+        }
+    }
+}
+
+/// One background mutation the engine is applying, or has finished applying (see
+/// `DatabaseDriver::mutations`). ClickHouse's `system.mutations`, generalised.
+///
+/// This exists because a best-effort edit doesn't end when the submit returns. An
+/// `ALTER TABLE … UPDATE` rewrites every part its predicate can touch, which on a
+/// production-sized table can run for minutes after the UI said "submitted"; without
+/// somewhere to watch it, the only feedback is a grid that hasn't changed yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationInfo {
+    pub database: String,
+    pub table: String,
+    /// The engine's handle for this mutation, and what a kill addresses it by.
+    pub id: String,
+    /// The statement it is applying, verbatim.
+    pub command: String,
+    /// When the engine accepted it, as the engine renders it.
+    pub created: String,
+    /// Parts still to rewrite. The honest progress signal: it counts *parts*, not
+    /// rows, which is also why a one-cell edit can have a large number here.
+    pub parts_to_do: i64,
+    pub done: bool,
+    /// Why it is stuck, when it is. `None` while healthy.
+    pub fail_reason: Option<String>,
+}
+
+/// How a batch of [`EditOp`]s should be applied. The two contracts are genuinely
+/// different promises, not a strictness dial, so the caller names which one it wants
+/// and the driver answers with the matching shape (one total, or one outcome per op).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchMode {
+    /// One transaction, exactly one row per op, rolled back whole on any failure:
+    /// `DatabaseDriver::apply_edits`. What the relational engines do.
+    Atomic,
+    /// Per-op, non-atomic, preflight-guarded: `apply_edits_best_effort`. ClickHouse.
+    BestEffort {
+        /// The user saw "this matches N rows" in the confirm dialog and said to apply
+        /// it to all of them. Without this a preflight count other than 1 is refused,
+        /// which is the whole guard against writing the wrong row on an engine that
+        /// has no unique row address.
+        allow_multi_match: bool,
+    },
+}
+
+/// What one op of a batch *would* do, for the confirm dialog: the real statement the
+/// driver will run and how many rows its identity currently matches. Produced by
+/// `DatabaseDriver::preflight_edits` before anything is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpPlan {
+    /// Position in the submitted batch, so the UI can point at the staged change.
+    pub index: usize,
+    /// `"Update"` / `"Delete"` / `"Insert"` (see [`EditOp::verb`]).
+    pub verb: &'static str,
+    /// The statement as it will actually run, in the engine's own dialect, values
+    /// shown inline. Display only -- the executed statement binds them.
+    pub sql: String,
+    /// Rows the identity predicate matches right now. `None` when the op addresses no
+    /// existing row (an insert) or the driver didn't count.
+    pub matches: Option<u64>,
+    /// Why this op can't run at all, when it can't: a key-column edit, a row whose
+    /// identity isn't comparable, a table the engine won't mutate. Blocked ops are
+    /// shown and skipped, never submitted and failed.
+    pub blocked: Option<String>,
+}
+
+/// What actually happened to one op of a best-effort batch. Unlike the atomic path's
+/// single total, every op reports for itself, because on an engine with no
+/// transaction "3 of 5 applied" is the truth and a blanket success would not be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpOutcome {
+    pub index: usize,
+    pub verb: &'static str,
+    pub status: OpStatus,
+}
+
+/// The result of one op in a best-effort batch (see [`OpOutcome`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpStatus {
+    /// Ran, and the engine confirmed it: `affected` rows changed.
+    Applied { affected: u64 },
+    /// Accepted by the engine and still running: an asynchronous mutation that
+    /// outlived the statement timeout. **Not** an error -- the work is queued and
+    /// will land -- so the UI must not re-arm the submit, since a retry is a second
+    /// full part rewrite.
+    Submitted,
+    /// Refused before running, by the preflight rather than the engine: the row moved
+    /// or vanished, the identity matched more than one row, or the op was never
+    /// runnable. Nothing was written.
+    Blocked(String),
+    /// The engine rejected it. Nothing was written *for this op*; earlier ops in the
+    /// batch may already have landed (there is no transaction to undo them).
+    Failed(String),
+}
+
+impl OpStatus {
+    /// Whether the op left the batch's work undone, so the UI keeps it staged.
+    pub fn unfinished(&self) -> bool {
+        matches!(self, OpStatus::Blocked(_) | OpStatus::Failed(_))
+    }
+
+    /// The reason an op didn't land, for the report. `None` when it did.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            OpStatus::Blocked(r) | OpStatus::Failed(r) => Some(r),
+            _ => None,
         }
     }
 }
@@ -2736,7 +2993,7 @@ mod edit_tests {
         };
         let update = EditOp::Update {
             table: table.clone(),
-            key: cv("id", Value::Integer(7)),
+            keys: vec![cv("id", Value::Integer(7))],
             set: vec![cv("name", Value::Text("O'Brien".into()))],
         };
         // Identifiers double-quoted, the value single-quoted with the quote doubled.
@@ -2748,11 +3005,27 @@ mod edit_tests {
 
         let del = EditOp::Delete {
             table: table.clone(),
-            key: cv("id", Value::Integer(7)),
+            keys: vec![cv("id", Value::Integer(7))],
         };
         assert_eq!(
             del.preview_sql(),
             "DELETE FROM \"main\".\"users\" WHERE \"id\" = 7"
+        );
+
+        // A composite identity is a conjunction; a null member compares with
+        // `IS NULL`, since `= NULL` would match nothing.
+        let composite = EditOp::Delete {
+            table: table.clone(),
+            keys: vec![
+                cv("tenant", Value::Text("acme".into())),
+                cv("id", Value::Integer(7)),
+                cv("region", Value::Null),
+            ],
+        };
+        assert_eq!(
+            composite.preview_sql(),
+            "DELETE FROM \"main\".\"users\" \
+             WHERE \"tenant\" = 'acme' AND \"id\" = 7 AND \"region\" IS NULL"
         );
 
         let ins = EditOp::Insert {

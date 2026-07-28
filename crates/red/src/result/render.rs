@@ -374,7 +374,7 @@ impl AppState {
                     .gap_1()
                     // "+ Row" appends a draft (insert) row, shown only on an
                     // editable keyed browse of a writable connection (Track B6).
-                    .when(self.editing_enabled() && grid.editable_browse(), |d| {
+                    .when(self.insert_enabled() && grid.insertable_browse(), |d| {
                         d.child(
                             Button::new("result-add-row", "+ Row")
                                 .variant(ButtonVariant::Ghost)
@@ -426,7 +426,7 @@ impl AppState {
                                 .into_any_element(),
                         },
                     )
-                    .when(self.editing_enabled() && grid.editable_browse(), |t| {
+                    .when(self.insert_enabled() && grid.insertable_browse(), |t| {
                         // Import a CSV/JSONL file into this table. Shown only on an
                         // editable keyed browse of a writable connection, like "+ Row"
                         // (import is a bulk insert). The grid's columns are the target.
@@ -848,6 +848,22 @@ impl AppState {
                             .on_click(cx.listener(|this, _, _, cx| this.revert_changes(cx))),
                     )
             })
+            // Why this table's rows can't be edited, on a connection whose engine
+            // otherwise could. Silence here would read as "editing is broken"; the
+            // engine's own reason ("the Memory engine has no UPDATE/DELETE") is the
+            // difference between a dead end and an explanation.
+            .when_some(
+                self.row_edit_enabled()
+                    .then(|| grid.not_editable_note())
+                    .flatten(),
+                |f, note| {
+                    f.child(div().text_color(border_soft).child("·")).child(
+                        div()
+                            .text_color(dim)
+                            .child(format!("read-only rows: {note}")),
+                    )
+                },
+            )
             .child(div().ml_auto().text_color(dim).child(grid.label.clone()));
 
         // The draggable, fraction-mapped scrollbar: the thumb mirrors the list's
@@ -1223,6 +1239,28 @@ impl AppState {
                     );
                     continue;
                 }
+                // A column the engine computes takes no value on insert, so it gets no
+                // editor: an offered one could only ever produce an engine error at
+                // submit time.
+                if !grid.insertable_column(c) {
+                    cells.push(
+                        div()
+                            .w(px(DATA_COL_WIDTH))
+                            .flex_shrink_0()
+                            .h_full()
+                            .px_2p5()
+                            .flex()
+                            .items_center()
+                            .overflow_hidden()
+                            .border_r_1()
+                            .border_color(line)
+                            .text_color(faint)
+                            .italic()
+                            .child("computed")
+                            .into_any_element(),
+                    );
+                    continue;
+                }
                 let content = match draft.cells.get(&c) {
                     Some(v) => render_cell(
                         &DisplayCell::from_value(v),
@@ -1299,8 +1337,9 @@ impl AppState {
         // Editing entries (Track B6) appear only when the focused cell / row is
         // editable on a writable connection's keyed browse.
         let editable_cell = self.active_edit_target().is_some();
-        let editable_browse = self.editing_enabled()
-            && matches!(&self.phase, Phase::Connected(a) if a.active_result().is_some_and(|g| g.editable_browse()));
+        // `row_edit_enabled` already resolves against the active result's reported
+        // edit contract, which is what "can this browse's rows change" means.
+        let editable_browse = self.row_edit_enabled();
         let mut menu = ContextMenu::new("result-cell-menu")
             .item(
                 ContextMenuItem::new("cell-inspect", "Inspect")

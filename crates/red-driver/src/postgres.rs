@@ -1815,11 +1815,11 @@ mod tests {
         let affected = driver
             .apply_edit(&EditOp::Update {
                 table: tref,
-                key: red_core::ColumnValue {
+                keys: vec![red_core::ColumnValue {
                     column: "id".into(),
                     value: Value::Integer(1),
                     decl_type: None,
-                },
+                }],
                 set: vec![
                     set("doc", "{\"b\": [2, 3]}", "jsonb"),
                     set("at", "2021-06-15 12:30:00+00", "timestamptz"),

@@ -476,6 +476,11 @@ async fn explains_a_query() {
 /// Apply a guarded edit batch (Track B6): `ApplyBatch` on a writable session replies
 /// `BatchApplied` echoing the result epoch, and a batch whose op matches no row comes
 /// back as a pane-local `BatchFailed`, not a global `Error`.
+///
+/// Then the same batch under the *best-effort* contract, which an engine with real
+/// transactions answers through the driver's default: the guarantee is unchanged, and
+/// only the reply's shape (one outcome per op) differs. `PreflightBatch` reports what
+/// each op would run without writing anything.
 #[tokio::test]
 async fn applies_a_data_edit() {
     use red_core::{ColumnValue, EditOp, TableRef};
@@ -505,11 +510,11 @@ async fn applies_a_data_edit() {
             schema: Some("main".into()),
             name: "t".into(),
         },
-        key: ColumnValue {
+        keys: vec![ColumnValue {
             column: "id".into(),
             value: Value::Integer(id),
             decl_type: None,
-        },
+        }],
         set: vec![ColumnValue {
             column: "name".into(),
             value: Value::Text("two".into()),
@@ -522,6 +527,7 @@ async fn applies_a_data_edit() {
         Command::ApplyBatch {
             epoch: crate::Epoch::new(4),
             ops: vec![edit(1)],
+            mode: red_core::BatchMode::Atomic,
         },
     );
     match next(&mut events).await {
@@ -538,6 +544,7 @@ async fn applies_a_data_edit() {
         Command::ApplyBatch {
             epoch: crate::Epoch::new(5),
             ops: vec![edit(9999)],
+            mode: red_core::BatchMode::Atomic,
         },
     );
     match next(&mut events).await {
@@ -546,6 +553,72 @@ async fn applies_a_data_edit() {
             assert!(!message.is_empty());
         }
         other => panic!("expected BatchFailed, got {other:?}"),
+    }
+
+    // The best-effort contract on an engine that *has* transactions: the driver's
+    // default maps the atomic answer onto the per-op shape, so the reply is a
+    // `BatchPartial` with one outcome per op, and the guarantee is unchanged.
+    send(
+        &handle,
+        Command::ApplyBatch {
+            epoch: crate::Epoch::new(6),
+            ops: vec![edit(1)],
+            mode: red_core::BatchMode::BestEffort {
+                allow_multi_match: false,
+            },
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::BatchPartial { epoch, outcomes }) => {
+            assert_eq!(epoch.get(), 6);
+            assert_eq!(outcomes.len(), 1, "one outcome per submitted op");
+            assert_eq!(outcomes[0].index, 0);
+            assert_eq!(outcomes[0].verb, "Update");
+            assert!(matches!(
+                outcomes[0].status,
+                red_core::OpStatus::Applied { affected: 1 }
+            ));
+        }
+        other => panic!("expected BatchPartial, got {other:?}"),
+    }
+    // A rolled-back atomic batch reports every op as failed, because that is what
+    // happened: none of them landed.
+    send(
+        &handle,
+        Command::ApplyBatch {
+            epoch: crate::Epoch::new(7),
+            ops: vec![edit(9999)],
+            mode: red_core::BatchMode::BestEffort {
+                allow_multi_match: false,
+            },
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::BatchPartial { outcomes, .. }) => {
+            assert!(outcomes[0].status.unfinished(), "nothing was applied");
+        }
+        other => panic!("expected BatchPartial, got {other:?}"),
+    }
+
+    // The preflight is read-only and reports one plan per op. The relational default
+    // renders the statement but takes no count: under the atomic contract the
+    // driver's own one-row assertion is the stronger guarantee.
+    send(
+        &handle,
+        Command::PreflightBatch {
+            epoch: crate::Epoch::new(8),
+            ops: vec![edit(1), edit(2)],
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::BatchPreflight { epoch, plan }) => {
+            assert_eq!(epoch.get(), 8);
+            assert_eq!(plan.len(), 2);
+            assert_eq!(plan[1].index, 1);
+            assert!(plan[0].sql.contains("UPDATE"), "{}", plan[0].sql);
+            assert!(plan[0].matches.is_none() && plan[0].blocked.is_none());
+        }
+        other => panic!("expected BatchPreflight, got {other:?}"),
     }
 
     send(&handle, Command::Shutdown);
@@ -581,6 +654,7 @@ async fn opens_and_pages_result() {
             total,
             epoch,
             key,
+            ..
         }) => {
             assert_eq!(columns[0].name, "x");
             assert_eq!(total, 1000);

@@ -6,6 +6,45 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- In-grid editing on ClickHouse. New rows can be added and submitted like on any
+  other engine, and existing rows can be updated and deleted under a contract
+  that matches what an OLAP engine can actually promise: each change is checked
+  against the rows it currently matches before it runs, is applied on its own
+  rather than inside a transaction, and reports its own outcome, so a submit says
+  "3 of 5 changes applied" and names what stopped the rest instead of claiming a
+  success it can't back. Changes that can't run safely, such as editing a
+  sorting-key column or a row that has since changed, are refused before the
+  confirmation rather than by the engine afterwards.
+- The confirmation for a ClickHouse submit shows the statements that will really
+  run, how many rows each currently matches, and the three things worth knowing
+  before agreeing: the writes are asynchronous, they are not one transaction, and
+  the engine rewrites data by part, so a one-cell edit can cost far more than the
+  row it changes. Where a change matches several rows -- normal on an engine with
+  no unique row identity -- it is refused until you explicitly say to apply it to
+  all of them.
+- Mutations panel for ClickHouse connections, listing the background work the
+  engine is still applying after a submit returns, with the parts remaining, any
+  failure reason, and a per-row cancel. The status bar tints while anything is
+  running, so an edit that outlived its submit stays visible without the panel
+  open.
+- Tables with a composite primary key are now editable on PostgreSQL, MySQL and
+  SQLite. Rows are addressed by the whole key rather than a single column, so
+  join tables and other multi-column keys no longer browse as read-only.
+- Bulk import into a ClickHouse table from the result toolbar, alongside the new
+  draft-row insert.
+
+### Changed
+- Editing affordances now follow the table, not just the connection: a table the
+  engine cannot modify, such as a ClickHouse `Memory` table or a view, shows a
+  one-line reason under the grid instead of edit controls that would fail on use.
+  Columns the engine computes for itself are shown as computed in a new row and
+  never offered for editing.
+- The AI assistant no longer describes a multi-statement changeset as always
+  committing together or not at all, which was untrue on ClickHouse. It now says
+  which engines roll back and warns that on ClickHouse the statements before a
+  failure may have applied.
+
 ## [0.19.0] - 2026-07-28
 
 ### Added

@@ -14,7 +14,7 @@ use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
 use red_core::kv::{KvEdit, RecycledKey, RespValue};
 use red_core::{
-    Column, ColumnMeta, KeyKind, KeySpec, QueryOptions, RedError, ResultFilter, Value,
+    BatchMode, Column, ColumnMeta, KeyKind, KeySpec, QueryOptions, RedError, ResultFilter, Value,
     coerce_edit_value,
 };
 use red_driver::{AbortSignal, ImportReader, PageCap};
@@ -1261,6 +1261,20 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         },
                         None => None,
                     };
+                    // What this browse may edit, from the same detail: a relational
+                    // engine derives it purely (no round trip), ClickHouse spends one
+                    // catalog query on the facts a `TableDetail` can't carry. A probe
+                    // failure degrades to "not editable", never to a failed open.
+                    let edit = match (&detail, &table) {
+                        (Some(detail), Some((schema, table))) => driver
+                            .edit_caps(schema, table, detail)
+                            .await
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(%schema, %table, "edit caps probe failed: {e}");
+                                red_core::RowEditCaps::default()
+                            }),
+                        _ => red_core::RowEditCaps::default(),
+                    };
                     let key = match &detail {
                         Some(detail) => {
                             let key = match &sort {
@@ -1419,6 +1433,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                     total,
                                     epoch,
                                     key,
+                                    edit,
                                 },
                             );
                         }
@@ -3722,7 +3737,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 }
             }
 
-            Command::ApplyBatch { epoch, ops } => {
+            Command::ApplyBatch { epoch, ops, mode } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get(&id) else {
                     emit(&events, session_id, Event::Error("not connected".into()));
@@ -3737,26 +3752,122 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
                 let results = state.results.clone();
-                // An atomic batch of bounded writes, each asserted to touch exactly
-                // one row by the driver (all-or-nothing). Like `Execute`, a success
-                // may shift rows under any open result, so drop the checkpoint
-                // indexes; the failure is pane-local (`BatchFailed`), not a global
-                // error toast.
-                match driver.apply_edits(&ops).await {
-                    Ok(applied) => {
-                        for spec in lock(&results).values() {
-                            let mut idx = lock(&spec.checkpoints);
-                            idx.points.clear();
-                            idx.status = BuildStatus::Idle;
-                        }
-                        emit(&events, session_id, Event::BatchApplied { epoch, applied });
+                // Any write may have shifted rows under any open result, so the
+                // checkpoint indexes are dropped and rebuilt lazily on the next deep
+                // jump rather than served from stale keys. Done for a *partial* batch
+                // too: some ops landed, so the indexes are just as stale.
+                let drop_checkpoints = || {
+                    for spec in lock(&results).values() {
+                        let mut idx = lock(&spec.checkpoints);
+                        idx.points.clear();
+                        idx.status = BuildStatus::Idle;
                     }
+                };
+                match mode {
+                    // The relational contract: one transaction, each op asserted to
+                    // touch exactly one row, all-or-nothing. The failure is pane-local
+                    // (`BatchFailed`), not a global error toast.
+                    BatchMode::Atomic => match driver.apply_edits(&ops).await {
+                        Ok(applied) => {
+                            drop_checkpoints();
+                            emit(&events, session_id, Event::BatchApplied { epoch, applied });
+                        }
+                        Err(e) => emit(
+                            &events,
+                            session_id,
+                            Event::BatchFailed {
+                                epoch,
+                                failed_index: None,
+                                message: e.to_string(),
+                            },
+                        ),
+                    },
+                    // Best-effort: every op runs and reports for itself. Only a
+                    // failure to run the batch *at all* is a `BatchFailed`; a batch
+                    // where some ops didn't land is a successful `BatchPartial`
+                    // carrying that news, because that is what happened.
+                    BatchMode::BestEffort { .. } => {
+                        match driver.apply_edits_best_effort(&ops, mode).await {
+                            Ok(outcomes) => {
+                                drop_checkpoints();
+                                emit(&events, session_id, Event::BatchPartial { epoch, outcomes });
+                            }
+                            Err(e) => emit(
+                                &events,
+                                session_id,
+                                Event::BatchFailed {
+                                    epoch,
+                                    failed_index: None,
+                                    message: e.to_string(),
+                                },
+                            ),
+                        }
+                    }
+                }
+            }
+
+            cmd @ (Command::ListMutations | Command::KillMutation { .. }) => {
+                // One arm for both: a kill is always followed by the listing that
+                // shows its effect, so the only difference is whether there is a kill.
+                let kill = match cmd {
+                    Command::KillMutation { table, id } => Some((table, id)),
+                    _ => None,
+                };
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a SQL connection".into()),
+                    );
+                    continue;
+                };
+                // A kill is followed by the same listing, so the panel reflects it
+                // without a second round trip. Killing stops further part rewrites; it
+                // does not undo the parts already rewritten, which is why the panel
+                // shows progress rather than offering an "undo".
+                if let Some((table, id)) = &kill
+                    && let Err(e) = driver.kill_mutation(table, id.as_str()).await
+                {
+                    emit(&events, session_id, Event::Error(e.to_string()));
+                    continue;
+                }
+                match driver.mutations().await {
+                    Ok(mutations) => {
+                        emit(&events, session_id, Event::MutationsLoaded { mutations })
+                    }
+                    Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                }
+            }
+
+            Command::PreflightBatch { epoch, ops } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a SQL connection".into()),
+                    );
+                    continue;
+                };
+                // Reads only: this is what makes the confirm dialog able to show the
+                // statement that will actually run, and the row counts it will hit,
+                // before anything is written.
+                match driver.preflight_edits(&ops).await {
+                    Ok(plan) => emit(&events, session_id, Event::BatchPreflight { epoch, plan }),
                     Err(e) => emit(
                         &events,
                         session_id,
-                        Event::BatchFailed {
+                        Event::BatchPreflightFailed {
                             epoch,
-                            failed_index: None,
                             message: e.to_string(),
                         },
                     ),

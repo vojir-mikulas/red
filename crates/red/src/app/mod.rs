@@ -235,6 +235,13 @@ pub struct AppState {
     /// destructive statement, or a staged grid edit batch (Track B6). See
     /// [`PendingWrite`].
     pub(crate) confirm_exec: Option<PendingWrite>,
+    /// A submit waiting on its backend preflight, held between `PreflightBatch` and
+    /// the `BatchPreflight` that opens its confirm dialog. Only the best-effort
+    /// contract uses it; the atomic one confirms without a round trip.
+    pub(crate) pending_batch: Option<PendingWrite>,
+    /// The epoch and per-op provenance of the batch currently in flight, so a
+    /// `BatchPartial` reply can un-stage exactly the changes that landed.
+    pub(crate) submitted_batch: Option<(red_service::Epoch, Vec<crate::result::OpSource>)>,
     /// The type-to-confirm box for the pending write, when its grade earns one. Kept
     /// beside [`Self::confirm_exec`] rather than inside it because `PendingWrite` is
     /// `Clone` (the modal renders from a clone) and a live entity plus its
@@ -1163,6 +1170,8 @@ impl AppState {
             export_menu: None,
             more_menu: None,
             confirm_exec: None,
+            pending_batch: None,
+            submitted_batch: None,
             confirm_input: None,
             confirm_count: None,
             confirm_review: None,
@@ -1820,7 +1829,8 @@ impl AppState {
                 total,
                 epoch,
                 key,
-            } => self.on_result_ready(session, columns, total, epoch, key, cx),
+                edit,
+            } => self.on_result_ready(session, columns, total, epoch, key, edit, cx),
             Event::ResultPageLoaded {
                 offset,
                 rows,
@@ -1938,6 +1948,14 @@ impl AppState {
             // --- staged grid edits (Track B6) ---
             Event::BatchApplied { epoch, applied } => self.on_batch_applied(epoch, applied, cx),
             Event::BatchFailed { epoch, message, .. } => self.on_batch_failed(epoch, message, cx),
+            Event::BatchPartial { epoch, outcomes } => self.on_batch_partial(epoch, outcomes, cx),
+            Event::MutationsLoaded { mutations } => {
+                self.on_mutations_loaded(session, mutations, cx)
+            }
+            Event::BatchPreflight { epoch, plan } => self.on_batch_preflight(epoch, plan, cx),
+            Event::BatchPreflightFailed { message, .. } => {
+                self.on_batch_preflight_failed(message, cx)
+            }
 
             // --- self-update (Phases 3–4) ---
             Event::UpdateState(state) => self.on_update_state(state, cx),
@@ -2042,13 +2060,40 @@ impl AppState {
         })
     }
 
+    /// Whether the pending write has anything left to do. A best-effort batch whose
+    /// every op the preflight refused would run nothing, so the modal's Submit stays
+    /// disabled rather than firing a no-op the user reads as success.
+    pub(crate) fn confirm_has_work(&self) -> bool {
+        match &self.confirm_exec {
+            Some(PendingWrite::Batch { plan, .. }) if !plan.is_empty() => {
+                plan.iter().any(|p| p.blocked.is_none())
+            }
+            _ => true,
+        }
+    }
+
+    /// Grant or withdraw the "apply to all matching rows" acknowledgement on the
+    /// pending best-effort batch (the confirm dialog's checkbox). Without it an
+    /// identity matching more than one row is refused, which is the only thing
+    /// standing between a click and changing rows the user wasn't looking at.
+    pub(crate) fn set_apply_to_all(&mut self, granted: bool, cx: &mut Context<Self>) {
+        if let Some(PendingWrite::Batch {
+            mode: red_core::BatchMode::BestEffort { allow_multi_match },
+            ..
+        }) = &mut self.confirm_exec
+        {
+            *allow_multi_match = granted;
+        }
+        cx.notify();
+    }
+
     /// Run the pending write the user confirmed: a graded editor statement
     /// or a guarded grid edit (Track B5).
     pub(crate) fn confirm_destructive(&mut self, cx: &mut Context<Self>) {
         // A typed confirmation that hasn't been satisfied is not a confirmation. The
         // modal disables its run button too; this is the backstop for the paths that
         // reach here another way (the modal's own Enter handler).
-        if !self.confirm_target_matches(cx) {
+        if !self.confirm_target_matches(cx) || !self.confirm_has_work() {
             return;
         }
         self.confirm_input = None;
@@ -2056,8 +2101,18 @@ impl AppState {
         self.confirm_review = None;
         match self.confirm_exec.take() {
             Some(PendingWrite::EditorSql { sql, .. }) => self.execute_sql(sql, cx),
-            Some(PendingWrite::Batch { ops, epoch }) => {
-                self.send_active(Command::ApplyBatch { epoch, ops });
+            Some(PendingWrite::Batch {
+                ops,
+                sources,
+                epoch,
+                mode,
+                ..
+            }) => {
+                // Remembered before the send: the reply carries only op *indices*, so
+                // without this a partial batch couldn't tell which staged change each
+                // outcome belongs to.
+                self.submitted_batch = Some((epoch, sources));
+                self.send_active(Command::ApplyBatch { epoch, ops, mode });
             }
             Some(PendingWrite::Import {
                 path,
@@ -2124,8 +2179,11 @@ impl AppState {
 
     pub(crate) fn cancel_destructive(&mut self, cx: &mut Context<Self>) {
         // Cancelling the submit preview keeps the staged change-set intact (it lives
-        // on the result); only the confirm is dropped.
+        // on the result); only the confirm is dropped. A batch still waiting on its
+        // preflight goes with it, so a late reply can't reopen a dialog the user
+        // already dismissed.
         self.confirm_exec = None;
+        self.pending_batch = None;
         self.confirm_input = None;
         self.confirm_count = None;
         self.confirm_review = None;
