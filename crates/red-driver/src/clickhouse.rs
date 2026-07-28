@@ -35,9 +35,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ColumnMeta, ColumnValue, ConnectionConfig, DbKind, EditOp, ExportFormat, FkEdge,
-    KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result, ResultPage,
-    RowWindow, SchemaMeta, TableDetail, TableRef, Value,
+    Column, ColumnMeta, ColumnPredicate, ColumnValue, ConnectionConfig, DbKind, EditOp,
+    ExportFormat, FkEdge, KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError,
+    Result, ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use serde_json::Value as Json;
 use tokio::sync::Mutex;
@@ -488,6 +488,19 @@ impl DatabaseDriver for ClickhouseDriver {
 
     fn eq_predicate(&self, pairs: &[ColumnValue]) -> String {
         crate::eq_clause(pairs, ch_quote, true)
+    }
+
+    fn cmp_predicate(&self, preds: &[ColumnPredicate]) -> String {
+        // Knobs match `contains_predicate` above; ClickHouse has no `ESCAPE`
+        // clause, so it omits one here too.
+        crate::cmp_clause(
+            preds,
+            ch_quote,
+            |c| format!("CAST({c} AS String)"),
+            "ILIKE",
+            true,
+            false,
+        )
     }
 
     async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64> {
@@ -1676,6 +1689,8 @@ mod tests {
             "author_id = 1",
         )
         .await;
+        // The built-not-typed filter wants the same fixture shape.
+        battery::filters_cmp(&driver, &format!("SELECT * FROM {t}"), "author_id", "title").await;
         driver.execute(&format!("DROP TABLE {t}")).await.unwrap();
     }
 

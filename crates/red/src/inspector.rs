@@ -686,8 +686,12 @@ impl AppState {
             |this, _, event: &CodeEditorEvent, cx| match event {
                 CodeEditorEvent::Run => this.save_inspector_edit(cx),
                 CodeEditorEvent::Escape => this.cancel_inspector_edit(cx),
-                // No gutter markers on the cell editor, so this never fires.
-                CodeEditorEvent::Submit | CodeEditorEvent::RunLine(_) => {}
+                // No gutter markers on the cell editor and no `emit_nav`, so none
+                // of these fire.
+                CodeEditorEvent::Submit
+                | CodeEditorEvent::RunLine(_)
+                | CodeEditorEvent::Up
+                | CodeEditorEvent::Down => {}
             },
         );
         if let Some(insp) = &mut self.inspector {

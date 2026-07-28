@@ -226,6 +226,96 @@ fn build_index(
     }
 }
 
+/// The synthetic statement a bare filter expression is completed (and diagnosed)
+/// inside, so the clause-aware passes see a real `WHERE`. `_red` stands in when
+/// the result isn't a table browse: an unknown table contributes no columns, and
+/// the schema-wide candidates still come through.
+fn filter_wrapper(table: Option<&str>) -> String {
+    format!("SELECT * FROM {} WHERE ", table.unwrap_or("_red"))
+}
+
+/// Completions for the result filter bar's `WHERE` box. The *result's own*
+/// columns lead (they are what the predicate can actually name, including
+/// inline-expanded reference columns like `"tier_id.name"`), then the editor's
+/// own schema-aware candidates, reached by wrapping the expression in
+/// [`filter_wrapper`] and shifting the cursor past the prefix.
+fn filter_completion_provider(
+    index: Rc<CompletionIndex>,
+    table: Option<String>,
+    columns: Vec<String>,
+) -> impl Fn(&str, usize) -> Vec<CompletionItem> + 'static {
+    let prefix = filter_wrapper(table.as_deref());
+    let shift = prefix.len();
+    let inner = completion_provider(index);
+    move |content, cursor| {
+        let word = crate::sql::word_prefix(content, cursor).to_lowercase();
+        let mut out: Vec<CompletionItem> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        if !word.is_empty() {
+            for name in &columns {
+                let quoted = quote_column(name);
+                if name.to_lowercase().starts_with(&word)
+                    || quoted.to_lowercase().starts_with(&word)
+                {
+                    seen.insert(name.to_lowercase());
+                    out.push(
+                        CompletionItem::new(quoted, CompletionKind::Field)
+                            .documentation("result column"),
+                    );
+                }
+            }
+        }
+        let cursor = cursor.min(content.len());
+        for item in inner(&format!("{prefix}{content}"), cursor + shift) {
+            if seen.insert(item.label.to_lowercase()) {
+                out.push(item);
+            }
+        }
+        out.truncate(MAX_CANDIDATES);
+        out
+    }
+}
+
+/// The diagnostics provider for the filter box: the same schema-aware pass the
+/// editor runs, over the wrapped statement, with the findings mapped back onto
+/// the box's own offsets (anything landing in the synthetic prefix is dropped).
+fn filter_decoration_provider(
+    index: Rc<CompletionIndex>,
+    table: Option<String>,
+) -> impl Fn(&str) -> Vec<flint::Decoration> + 'static {
+    let prefix = filter_wrapper(table.as_deref());
+    let shift = prefix.len();
+    move |content| {
+        crate::sql::diagnostics(&format!("{prefix}{content}"), index.as_ref())
+            .into_iter()
+            .filter_map(|d| {
+                let start = d.range.start.checked_sub(shift)?;
+                let end = d.range.end.checked_sub(shift)?;
+                Some(flint::Decoration {
+                    range: start..end.min(content.len()),
+                    style: flint::DecorationStyle::Error,
+                })
+            })
+            .collect()
+    }
+}
+
+/// A result column as it must be written in a predicate: bare when it's a plain
+/// identifier, double-quoted otherwise (an inline-expanded reference column is
+/// aliased `tier_id.name`, so it only resolves quoted).
+fn quote_column(name: &str) -> SharedString {
+    let plain = !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+    if plain {
+        SharedString::from(name.to_string())
+    } else {
+        SharedString::from(format!("\"{}\"", name.replace('"', "\"\"")))
+    }
+}
+
 /// The diagnostics provider handed to the editor's decoration seam: it runs the
 /// schema-aware [`crate::sql::diagnostics`] pass against the live buffer each paint
 /// and maps each finding to an error-styled wavy underline.
@@ -1393,6 +1483,38 @@ impl AppState {
                 editor.set_decorations(decoration_provider(index), cx);
             });
         }
+        self.refresh_filter_completions(cx);
+    }
+
+    /// (Re)install completion + diagnostics on the filter bar's `WHERE` box, from
+    /// the active connection's schema and the *active result's* columns. Called
+    /// when the bar opens, when the active result changes, and as the schema grows.
+    /// A no-op with the bar closed or before a connection is up.
+    pub(crate) fn refresh_filter_completions(&mut self, cx: &mut Context<Self>) {
+        let Phase::Connected(active) = &self.phase else {
+            return;
+        };
+        let Some(bar) = &self.filter_bar else {
+            return;
+        };
+        let index = Rc::new(build_index(
+            &active.schema.schemas,
+            &active.schema.details,
+            &active.fk_graph,
+            active.config.kind,
+        ));
+        let (table, columns) = match active.active_result() {
+            Some(grid) => (grid.browsed_table(), grid.column_names()),
+            None => (None, Vec::new()),
+        };
+        let expr = bar.expr.clone();
+        expr.update(cx, |editor, cx| {
+            editor.set_rich_completions(
+                filter_completion_provider(index.clone(), table.clone(), columns),
+                cx,
+            );
+            editor.set_decorations(filter_decoration_provider(index, table), cx);
+        });
     }
 
     /// The tab strip's right-click menu: Pin/Unpin, then Close / Close Others /

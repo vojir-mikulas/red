@@ -21,6 +21,7 @@ mod editor;
 mod env;
 mod er;
 mod filter;
+mod filters;
 mod find;
 mod gridwindow;
 mod history;

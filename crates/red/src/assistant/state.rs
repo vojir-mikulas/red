@@ -145,8 +145,9 @@ impl AppState {
                 // (a no-op when nothing is streaming).
                 CodeEditorEvent::Submit | CodeEditorEvent::Run => this.submit_assistant(cx),
                 CodeEditorEvent::Escape => this.cancel_assistant(cx),
-                // The composer has no gutter markers, so this never fires.
-                CodeEditorEvent::RunLine(_) => {}
+                // The composer has no gutter markers and doesn't opt into
+                // `emit_nav`, so neither of these fires.
+                CodeEditorEvent::RunLine(_) | CodeEditorEvent::Up | CodeEditorEvent::Down => {}
             });
             let key_input = cx.new(|cx| TextInput::new(cx).obscured().with_placeholder("sk-ant-…"));
             let key_sub = cx.subscribe(&key_input, |this, _, e: &TextInputEvent, cx| {

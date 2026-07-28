@@ -21,9 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use red_core::{
-    Column, ColumnMeta, ColumnValue, DbKind, EditOp, ExportFormat, FkEdge, FkJoin, ForeignKeyMeta,
-    IndexMeta, KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result,
-    ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
+    Column, ColumnMeta, ColumnPredicate, ColumnValue, DbKind, EditOp, ExportFormat, FkEdge, FkJoin,
+    ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError,
+    Result, ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use std::fs::File;
 use std::io::BufWriter;
@@ -484,6 +484,19 @@ impl DatabaseDriver for PostgresDriver {
 
     fn eq_predicate(&self, pairs: &[ColumnValue]) -> String {
         crate::eq_clause(pairs, pg_quote, false)
+    }
+
+    fn cmp_predicate(&self, preds: &[ColumnPredicate]) -> String {
+        // The cast / `ILIKE` / `ESCAPE` knobs match `contains_predicate` above:
+        // a column-scoped `Contains` must mean the same thing there and here.
+        crate::cmp_clause(
+            preds,
+            pg_quote,
+            |c| format!("({c})::text"),
+            "ILIKE",
+            false,
+            true,
+        )
     }
 
     fn fk_join_wrap(&self, base: &str, base_cols: &[String], joins: &[FkJoin]) -> String {
@@ -1559,6 +1572,14 @@ mod tests {
             "author_id",
             "title",
             "author_id = 1",
+        )
+        .await;
+        // The built-not-typed filter wants the same fixture shape.
+        battery::filters_cmp(
+            &driver,
+            &format!("SELECT * FROM {books}"),
+            "author_id",
+            "title",
         )
         .await;
 

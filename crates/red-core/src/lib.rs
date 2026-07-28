@@ -1243,6 +1243,94 @@ pub enum ResultFilter {
     /// [`FkEdge`] + the followed row's values, never from raw SQL; NULL values are
     /// excluded by the caller (a null FK isn't followable).
     Eq(Vec<ColumnValue>),
+    /// A conjunction of column comparisons the user *built* rather than typed: the
+    /// "filter by this value" cell menu and the bar's Column mode. AND-joined and
+    /// rendered per engine to an escaped literal predicate
+    /// (`DatabaseDriver::cmp_predicate`), the same no-cast, index-usable shape as
+    /// [`Eq`](Self::Eq) but across the full operator set. Structured, so the UI can
+    /// show it as chips and add a term to it without re-parsing SQL — and so no
+    /// user text ever reaches the query as SQL.
+    Cmp(Vec<ColumnPredicate>),
+}
+
+/// How a [`ColumnPredicate`] compares its column to its value. Deliberately the
+/// small, portable set every engine RED speaks renders identically; anything
+/// richer is what [`ResultFilter::Where`] is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    /// Pattern match. Unlike [`Contains`](Self::Contains), the value's `%`/`_` are
+    /// **not** escaped: a `LIKE` term is a pattern the user wrote on purpose.
+    Like,
+    /// Substring match on one column: [`ResultFilter::Contains`]'s semantics
+    /// (case-insensitive, the value's `%`/`_`/`\` escaped so it matches
+    /// literally, the column cast to text) narrowed from "any column" to this
+    /// one. The common data-grid ask — "rows where this column contains that" —
+    /// without having to know that `%` is a wildcard.
+    ///
+    /// The cast is what makes it work on a non-text column ("id contains 42"),
+    /// and is why this is the one operator here that gives up index usability. A
+    /// substring search is a scan regardless.
+    Contains,
+    IsNull,
+    IsNotNull,
+}
+
+impl CmpOp {
+    /// The operators in picker order.
+    pub const ALL: [CmpOp; 10] = [
+        CmpOp::Eq,
+        CmpOp::Ne,
+        CmpOp::Lt,
+        CmpOp::Le,
+        CmpOp::Gt,
+        CmpOp::Ge,
+        CmpOp::Contains,
+        CmpOp::Like,
+        CmpOp::IsNull,
+        CmpOp::IsNotNull,
+    ];
+
+    /// Whether the operator compares against a value at all. `IS NULL` /
+    /// `IS NOT NULL` are unary, so their [`ColumnPredicate::value`] is `None`.
+    pub fn takes_value(self) -> bool {
+        !matches!(self, CmpOp::IsNull | CmpOp::IsNotNull)
+    }
+
+    /// Whether the operator only makes sense on a text-representable column.
+    /// Drives the Column-mode picker, which narrows the operator list by the
+    /// column's declared type (a bare `LIKE` against an integer column errors on
+    /// Postgres, and the comparison operators carry no cast by design).
+    /// [`Contains`](Self::Contains) is *not* text-only: it casts, so it works on
+    /// any column.
+    pub fn text_only(self) -> bool {
+        matches!(self, CmpOp::Like)
+    }
+
+    /// Whether the operator orders its operands, so it's only offered on columns
+    /// that have a meaningful order (numbers, dates, text).
+    pub fn is_ordering(self) -> bool {
+        matches!(self, CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge)
+    }
+}
+
+/// One `column <op> value` term of a [`ResultFilter::Cmp`]. A *semantic*
+/// comparison carrying no SQL: the driver renders it, quoting the identifier and
+/// escaping the value as a literal, so a value taken from a result cell (which on
+/// a shared database is attacker-controlled) can never break out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnPredicate {
+    /// The result column's name, as it appears in the result (so an inline-expanded
+    /// reference column's dotted name works too).
+    pub column: String,
+    pub op: CmpOp,
+    /// The compared value. `None` exactly when [`CmpOp::takes_value`] is false.
+    pub value: Option<Value>,
 }
 
 /// A single guarded data edit (Track B5), keyed on a result's primary key. Built by

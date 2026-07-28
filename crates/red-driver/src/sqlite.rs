@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ColumnMeta, ColumnValue, DbKind, EditOp, ExportFormat, FkEdge, FkJoin, ForeignKeyMeta,
-    IndexMeta, KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result,
-    ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
+    Column, ColumnMeta, ColumnPredicate, ColumnValue, DbKind, EditOp, ExportFormat, FkEdge, FkJoin,
+    ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError,
+    Result, ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, ErrorCode, OpenFlags};
@@ -156,6 +156,18 @@ impl DatabaseDriver for SqliteDriver {
 
     fn eq_predicate(&self, pairs: &[ColumnValue]) -> String {
         crate::eq_clause(pairs, quote_ident, false)
+    }
+
+    fn cmp_predicate(&self, preds: &[ColumnPredicate]) -> String {
+        // Knobs match `contains_predicate` above (see the Postgres impl).
+        crate::cmp_clause(
+            preds,
+            quote_ident,
+            |c| format!("CAST({c} AS TEXT)"),
+            "LIKE",
+            false,
+            true,
+        )
     }
 
     fn fk_join_wrap(&self, base: &str, base_cols: &[String], joins: &[FkJoin]) -> String {
@@ -1233,6 +1245,10 @@ mod tests {
             2,
         )
         .await;
+
+        // The built-not-typed filter over the same rows: `author_id` is 1,1,2,NULL
+        // and `title` is text, the shape `filters_cmp` (and the stats case) want.
+        battery::filters_cmp(&driver, "SELECT * FROM books", "author_id", "title").await;
 
         // Column stats (pushdown summary): `author_id` is 1,1,2,NULL (total 4,
         // non_null 3, distinct 2), and an `author_id = 1` filter narrows it to 2.

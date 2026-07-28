@@ -1113,8 +1113,9 @@ impl QueryTab {
                     cx.notify();
                 }
                 // The query editor never sends (it's not a `submit_on_enter`
-                // composer); Enter inserts a line here.
-                CodeEditorEvent::Submit => {}
+                // composer); Enter inserts a line here. Nor does it opt into
+                // `emit_nav`, so the arrows stay ordinary cursor motion.
+                CodeEditorEvent::Submit | CodeEditorEvent::Up | CodeEditorEvent::Down => {}
             },
         )
         .detach();

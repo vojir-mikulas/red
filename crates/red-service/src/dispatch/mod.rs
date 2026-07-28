@@ -1194,6 +1194,15 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             Some(driver.eq_predicate(pairs))
                         }
                         Some(ResultFilter::Eq(_)) => None,
+                        // A filter the UI *built* (cell "Filter by", Column mode):
+                        // the driver renders each `column <op> value` with the
+                        // identifier quoted and the value escaped as a literal, so
+                        // no UI text reaches the query as SQL. Empty degrades to no
+                        // filter, exactly as `Eq` does.
+                        Some(ResultFilter::Cmp(preds)) if !preds.is_empty() => {
+                            Some(driver.cmp_predicate(preds))
+                        }
+                        Some(ResultFilter::Cmp(_)) => None,
                         Some(ResultFilter::Contains(term)) => {
                             let cols = match &detail {
                                 Some(d) => d.columns.clone(),

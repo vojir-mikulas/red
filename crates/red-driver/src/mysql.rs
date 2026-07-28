@@ -28,9 +28,9 @@ use mysql_async::{
     Column as MyColumn, Error as MyError, Opts, OptsBuilder, Pool, Row, Value as MyValue,
 };
 use red_core::{
-    Column, ColumnMeta, ColumnValue, DbKind, EditOp, ExportFormat, FkEdge, FkJoin, ForeignKeyMeta,
-    IndexMeta, KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError, Result,
-    ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
+    Column, ColumnMeta, ColumnPredicate, ColumnValue, DbKind, EditOp, ExportFormat, FkEdge, FkJoin,
+    ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError,
+    Result, ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex, mpsc};
@@ -463,6 +463,18 @@ impl DatabaseDriver for MysqlDriver {
 
     fn eq_predicate(&self, pairs: &[ColumnValue]) -> String {
         crate::eq_clause(pairs, |c| format!("`{}`", escape_ident(c)), true)
+    }
+
+    fn cmp_predicate(&self, preds: &[ColumnPredicate]) -> String {
+        // Knobs match `contains_predicate` above (see the Postgres impl).
+        crate::cmp_clause(
+            preds,
+            |c| format!("`{}`", escape_ident(c)),
+            |c| format!("CAST({c} AS CHAR)"),
+            "LIKE",
+            true,
+            true,
+        )
     }
 
     fn fk_join_wrap(&self, base: &str, base_cols: &[String], joins: &[FkJoin]) -> String {
@@ -1314,6 +1326,14 @@ mod tests {
             "author_id",
             "title",
             "author_id = 1",
+        )
+        .await;
+        // The built-not-typed filter wants the same fixture shape.
+        battery::filters_cmp(
+            &driver,
+            &format!("SELECT * FROM `{books}`"),
+            "author_id",
+            "title",
         )
         .await;
 

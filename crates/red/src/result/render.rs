@@ -9,7 +9,7 @@ use flint::prelude::*;
 use gpui::{
     Axis, Entity, Hsla, MouseButton, Pixels, Point, SharedString, Window, div, prelude::*, px,
 };
-use red_core::ExportFormat;
+use red_core::{CmpOp, ExportFormat, Value};
 
 use super::buffer::{CellKind, DisplayCell};
 use super::edit::EditSlot;
@@ -149,9 +149,24 @@ impl AppState {
         tab_idx: usize,
         half: crate::app::SplitHalf,
         is_focused: bool,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        // Built up front so *every* return path below can keep them on screen.
+        // Applying a filter re-opens the result, and a re-open passes through
+        // "not ready" (and possibly "failed") — dropping the bars there would
+        // yank the control the user is typing in out from under them each time
+        // they press Apply, and would hide the engine's message plus the bar's
+        // own "Revert filter" exactly when they're needed.
+        //
+        // They also need `cx` mutably, which the `cx.theme()` borrow below rules
+        // out for the rest of this function.
+        let filter_bar = is_focused
+            .then(|| self.render_filter_bar(window, cx))
+            .flatten();
+        let find_bar = is_focused
+            .then(|| self.render_find_bar(crate::find::FindTarget::Grid, cx))
+            .flatten();
         let theme = cx.theme();
         let (bg, bg_app, border, border_soft) = (
             theme.bg_panel,
@@ -209,7 +224,10 @@ impl AppState {
         // A failed query gets a full-pane panel rather than the cramped toolbar
         // status slot: syntax errors are multi-line and would otherwise clip.
         if let Some(err) = &grid.error {
-            return container.child(
+            // The filter bar stays above the error panel: a rejected predicate is
+            // the likeliest cause, and the bar is where the message and the
+            // one-click way back to the last good filter live.
+            return container.children(filter_bar).child(
                 div()
                     .id("result-error")
                     .flex_1()
@@ -238,9 +256,18 @@ impl AppState {
         let status = if !grid.ready {
             div().text_color(faint).child(format!("running… {elapsed}"))
         } else {
-            div()
-                .text_color(faint)
-                .child(format!("{} rows · {elapsed}", grid.total))
+            // Filtered: read as "matched of total" so the narrowing is quantified
+            // (the unfiltered total is the one captured on the last unfiltered
+            // open; a browse that was born filtered, e.g. an FK follow, has none).
+            let rows = match grid.filtered_of() {
+                Some(whole) => format!(
+                    "{} of {} rows",
+                    group_digits(grid.total),
+                    group_digits(whole)
+                ),
+                None => format!("{} rows", group_digits(grid.total)),
+            };
+            div().text_color(faint).child(format!("{rows} · {elapsed}"))
         };
         let view = cx.entity().downgrade();
         let toolbar = div()
@@ -279,16 +306,48 @@ impl AppState {
                         )
                     })
                     .child(
-                        // ⌘⇧F: toggle the filter bar. Reads as "filled" while a
-                        // filter is applied (Track B2).
-                        Button::new("result-filter", "Filter")
-                            .variant(if grid.filter.is_some() {
-                                ButtonVariant::Secondary
-                            } else {
-                                ButtonVariant::Ghost
-                            })
-                            .size(ButtonSize::Sm)
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_filter_bar(cx))),
+                        // ⌘⇧F: open / focus the filter bar. With a filter applied
+                        // the button becomes a chip naming it (`WHERE amount > 100`)
+                        // with its own ✕, so a narrowed grid can't be mistaken for a
+                        // whole one and an FK-follow filter is visible too (Track B2).
+                        match &grid.filter {
+                            None => Button::new("result-filter", "Filter")
+                                .variant(ButtonVariant::Ghost)
+                                .size(ButtonSize::Sm)
+                                .tooltip("Filter rows (⌘⇧F)")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_filter_bar(window, cx)
+                                }))
+                                .into_any_element(),
+                            Some(filter) => div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    Button::new(
+                                        "result-filter",
+                                        crate::filter::filter_summary(filter),
+                                    )
+                                    .variant(ButtonVariant::Secondary)
+                                    .size(ButtonSize::Sm)
+                                    .tooltip(crate::filter::filter_tooltip(filter))
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| this.toggle_filter_bar(window, cx),
+                                    )),
+                                )
+                                .child(
+                                    IconButton::new(
+                                        "result-filter-clear",
+                                        crate::icons::icon("close", size_11, muted),
+                                    )
+                                    .size(IconButtonSize::Sm)
+                                    .tooltip("Clear filter")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.clear_result_filter(cx)),
+                                    ),
+                                )
+                                .into_any_element(),
+                        },
                     )
                     .when(self.editing_enabled() && grid.editable_browse(), |t| {
                         // Import a CSV/JSONL file into this table. Shown only on an
@@ -340,7 +399,12 @@ impl AppState {
             );
 
         if !grid.ready {
-            return container.child(toolbar);
+            // Still running: keep the bars mounted so a re-open (which every
+            // Apply performs) doesn't make the filter form flicker out and back.
+            return container
+                .child(toolbar)
+                .children(filter_bar)
+                .children(find_bar);
         }
 
         // An optional leading row-number gutter, then one fixed-width, sortable
@@ -737,19 +801,11 @@ impl AppState {
             .child(toolbar)
             // The filter bar (Track B2) sits between the toolbar and the grid when
             // open; narrowing re-opens the result so the grid below just repaints.
-            // Single-instance overlays render in the focused half only.
-            .when_some(
-                is_focused.then(|| self.render_filter_bar(cx)).flatten(),
-                |c, bar| c.child(bar),
-            )
-            // The find bar (Track B2, Tier 1) sits alongside the filter bar; it
-            // only highlights loaded rows, so the grid below just repaints.
-            .when_some(
-                is_focused
-                    .then(|| self.render_find_bar(crate::find::FindTarget::Grid, cx))
-                    .flatten(),
-                |c, bar| c.child(bar),
-            )
+            // The find bar (Tier 1) sits alongside it and only highlights loaded
+            // rows. Both are built at the top of this function (single-instance
+            // overlays, so they render in the focused half only).
+            .children(filter_bar)
+            .children(find_bar)
             .child(
                 div()
                     .flex_1()
@@ -1187,6 +1243,77 @@ impl AppState {
                         cx.notify();
                     })),
             );
+        // "Filter by" (Track B2): narrow the result to the focused cell's value
+        // without writing SQL. Each item builds a `ResultFilter::Cmp` term, which
+        // the driver renders and escapes, so the cell's value never reaches the
+        // query as text. Hidden when no cell is focused (or its row was evicted).
+        if let Some((column, value)) = self.cell_filter_target() {
+            let name = column.name.clone();
+            let shown = crate::filter::value_label(&value);
+            let null = matches!(value, Value::Null);
+            let mut sub = Submenu::new("cell-filter", format!("Filter by {name}"));
+            // A NULL cell can only meaningfully be compared for nullness, so the
+            // `= value` pair would just be two spellings of the same two items.
+            if !null {
+                sub = sub
+                    .item(
+                        ContextMenuItem::new("cell-filter-eq", format!("= {shown}")).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.cell_menu = None;
+                                this.filter_by_cell(CmpOp::Eq, false, cx);
+                            }),
+                        ),
+                    )
+                    .item(
+                        ContextMenuItem::new("cell-filter-ne", format!("<> {shown}")).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.cell_menu = None;
+                                this.filter_by_cell(CmpOp::Ne, false, cx);
+                            }),
+                        ),
+                    )
+                    // Substring rather than equality: the common follow-up when
+                    // the exact cell value is too narrow.
+                    .item(
+                        ContextMenuItem::new("cell-filter-contains", format!("contains {shown}"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cell_menu = None;
+                                this.filter_by_cell(CmpOp::Contains, false, cx);
+                            })),
+                    );
+            }
+            sub = sub
+                .item(
+                    ContextMenuItem::new("cell-filter-null", "IS NULL").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.cell_menu = None;
+                            this.filter_by_cell(CmpOp::IsNull, false, cx);
+                        },
+                    )),
+                )
+                .item(
+                    ContextMenuItem::new("cell-filter-not-null", "IS NOT NULL").on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.cell_menu = None;
+                            this.filter_by_cell(CmpOp::IsNotNull, false, cx);
+                        }),
+                    ),
+                );
+            // Narrow *further* rather than replacing, the multi-term flow the bar's
+            // Column mode also builds. Only offered when there's a built filter to
+            // add to; against a Contains/WHERE filter there is no structure to join.
+            if self.can_add_cell_filter_term() && !null {
+                sub = sub.item(
+                    ContextMenuItem::new("cell-filter-and", format!("Add: = {shown}")).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.cell_menu = None;
+                            this.filter_by_cell(CmpOp::Eq, true, cx);
+                        }),
+                    ),
+                );
+            }
+            menu = menu.separator().submenu(sub);
+        }
         // FK navigation (Track B7): jump to the referenced row or list the tables that
         // reference this one. Both need the FK graph to have edges for the focused
         // column/table.

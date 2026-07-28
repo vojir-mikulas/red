@@ -222,6 +222,15 @@ pub(crate) struct ResultGrid {
     /// The active result filter (Track B2), pushed into the query on (re)open.
     /// `None` is unfiltered. Survives a re-sort (both ride the same `OpenResult`).
     pub(in crate::result) filter: Option<ResultFilter>,
+    /// The row count this result last reported *unfiltered*, so a filtered grid
+    /// can say "1,234 of 45,678 rows". `None` until an unfiltered open reports one
+    /// (a browse born filtered, e.g. an FK follow, never has a whole-set count and
+    /// won't get one at the cost of an extra query).
+    pub(in crate::result) unfiltered_total: Option<usize>,
+    /// The last filter this result actually *opened* with (the one in force when
+    /// rows last arrived). A rejected predicate (bad SQL, unknown column) leaves
+    /// `filter` holding the broken one, so the filter bar's "Revert" restores this.
+    pub(in crate::result) last_good_filter: Option<ResultFilter>,
     pub(in crate::result) selection: Option<CellRange>,
     /// The `(schema, table)` this result browses, when it's a plain table
     /// preview, sent with `OpenResult` so the backend can resolve a seek key.
@@ -324,6 +333,8 @@ impl ResultGrid {
             error: None,
             sort: None,
             filter: None,
+            unfiltered_total: None,
+            last_good_filter: None,
             selection: None,
             table,
             fk_cols: HashSet::new(),
@@ -748,6 +759,25 @@ impl ResultGrid {
             .filter(|_| self.error.is_none())
     }
 
+    /// The table this result browses, for the filter box's completion context.
+    /// `None` for editor SQL (the result's own columns are then all we know).
+    pub(crate) fn browsed_table(&self) -> Option<String> {
+        self.table.as_ref().map(|(_, t)| t.clone())
+    }
+
+    /// The result's column names, in order: what a filter predicate can name.
+    pub(crate) fn column_names(&self) -> Vec<String> {
+        self.columns.iter().map(|c| c.name.clone()).collect()
+    }
+
+    /// The whole-set row count to report a filtered result against ("1,234 **of
+    /// 45,678** rows"), or `None` when unfiltered, when no unfiltered count was
+    /// ever seen, or when the filter matched everything (where "of N" is noise).
+    pub(in crate::result) fn filtered_of(&self) -> Option<usize> {
+        let whole = self.unfiltered_total?;
+        (self.filter.is_some() && whole != self.total).then_some(whole)
+    }
+
     /// Install the open result's metadata and reset the buffer into the right
     /// mode: keyed when the backend resolved a seek key that names a result
     /// column, offset otherwise.
@@ -765,6 +795,13 @@ impl ResultGrid {
         self.key = key;
         self.columns = columns;
         self.total = total;
+        // An unfiltered open re-baselines the "of N" the filtered status reads
+        // against; a filtered one leaves the last baseline alone.
+        if self.filter.is_none() {
+            self.unfiltered_total = Some(total);
+        }
+        // Rows arrived, so whatever filter produced them is one we can fall back to.
+        self.last_good_filter = self.filter.clone();
         self.ready = true;
         self.error = None;
         // A fresh result set starts with a clean change-set + empty stats cache (the
@@ -1664,6 +1701,31 @@ impl AppState {
             self.start_query_ticker(cx);
         }
         cx.notify();
+    }
+
+    /// The active result's error *while a filter is applied*: a rejected predicate
+    /// is by far the likeliest cause, so the filter bar shows the engine's message
+    /// inline and offers a revert instead of leaving the user with a dead grid.
+    pub(crate) fn filter_error(&self) -> Option<String> {
+        let Phase::Connected(active) = &self.phase else {
+            return None;
+        };
+        let grid = active.active_result()?;
+        grid.filter.as_ref()?;
+        grid.error.clone()
+    }
+
+    /// Re-apply the last filter that actually returned rows (the bar's "Revert"),
+    /// clearing the filter when the result was unfiltered before it broke.
+    pub(crate) fn revert_filter(&mut self, cx: &mut Context<Self>) {
+        let last = match &self.phase {
+            Phase::Connected(active) => active
+                .active_result()
+                .and_then(|g| g.last_good_filter.clone()),
+            _ => None,
+        };
+        self.apply_result_filter(last, cx);
+        self.seed_filter_bar(cx);
     }
 
     /// The active result's current filter, for the toolbar chip / filter-bar seed.

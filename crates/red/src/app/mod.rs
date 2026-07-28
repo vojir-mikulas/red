@@ -199,6 +199,14 @@ pub struct AppState {
     /// The result filter bar, when open (Track B2). The transient editing UI; the
     /// *applied* filter lives on the grid (`ResultGrid::filter`).
     pub(crate) filter_bar: Option<crate::filter::FilterBarState>,
+    /// The mode the filter bar last opened / switched to, so a `WHERE` user isn't
+    /// thrown back to `Contains` on every new result. Session-scoped, like the
+    /// bar's visibility.
+    pub(crate) filter_mode: crate::filter::FilterMode,
+    /// Recent result filters per `(connection, browsed table)` (see `filters.rs`),
+    /// loaded once at startup: what the filter bar's recall dropdown lists and
+    /// what ↑/↓ in its box walk.
+    pub(crate) filter_history: crate::filters::FilterHistory,
     /// The find-in-result bar, when open (Track B2, Tier 1). Transient UI; it
     /// scans loaded rows and holds the matches + focused index in its own state.
     pub(crate) find_bar: Option<crate::find::FindBarState>,
@@ -1127,6 +1135,8 @@ impl AppState {
             next_conversation_id: 0,
             stats_bar: false,
             filter_bar: None,
+            filter_mode: crate::filter::FilterMode::default(),
+            filter_history: crate::filters::FilterHistory::load(),
             find_bar: None,
             autoscroll: None,
             autoscroll_epoch: 0,

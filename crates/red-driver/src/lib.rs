@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use red_core::{
-    BASE_ALIAS, Column, ColumnMeta, ColumnStats, ColumnValue, DbKind, EditOp, ExportFormat, FkEdge,
-    FkJoin, KeySpec, QueryOptions, QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta,
-    SortDirection, StatsFlags, TableDetail, TableRef, Value,
+    BASE_ALIAS, CmpOp, Column, ColumnMeta, ColumnPredicate, ColumnStats, ColumnValue, DbKind,
+    EditOp, ExportFormat, FkEdge, FkJoin, KeySpec, QueryOptions, QueryPlan, RedError, Result,
+    ResultPage, RowWindow, SchemaMeta, SortDirection, StatsFlags, TableDetail, TableRef, Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -606,6 +606,117 @@ pub(crate) fn eq_clause(
         .join(" AND ")
 }
 
+/// Render the AND-chain of `column <op> value` comparisons behind every driver's
+/// [`cmp_predicate`](DatabaseDriver::cmp_predicate) (the built-not-typed filter):
+/// [`eq_clause`]'s sibling across the full [`CmpOp`] set, with the same
+/// per-engine `quote` / `backslash_escapes` contract and the same no-cast,
+/// index-usable shape.
+///
+/// Two normalizations keep a built predicate meaning what the user picked:
+/// - `= NULL` / `<> NULL` become `IS NULL` / `IS NOT NULL`. SQL's three-valued
+///   logic makes the literal forms match *nothing*, which would silently read as
+///   "no such rows" rather than "no null rows".
+/// - A value-taking operator handed no value (a UI bug, not reachable through the
+///   cell menu or Column mode) renders against the `NULL` literal, so it matches
+///   nothing rather than producing invalid SQL.
+///
+/// The two pattern operators differ on purpose:
+/// - [`CmpOp::Like`] passes its value through **unescaped** — the `%`/`_` are
+///   what the user typed — and compares the column directly, so an index stays
+///   usable.
+/// - [`CmpOp::Contains`] is [`contains_clause`]'s semantics scoped to one column:
+///   the value's metacharacters are escaped so it matches literally, the column is
+///   cast with `as_text`, and `like_op`/`escape_clause` carry the same per-engine
+///   case-insensitivity and `ESCAPE` rules. Those three parameters exist solely
+///   for this operator; every other one ignores them (and stays uncast).
+///
+/// Either way the string literal itself is escaped, so the injection guard is
+/// unchanged.
+///
+/// An empty `preds` returns an empty string; the caller (the service) treats that
+/// as "no filter" rather than emitting an invalid `WHERE ()`.
+pub(crate) fn cmp_clause(
+    preds: &[ColumnPredicate],
+    quote: impl Fn(&str) -> String,
+    as_text: impl Fn(&str) -> String,
+    like_op: &str,
+    backslash_escapes: bool,
+    escape_clause: bool,
+) -> String {
+    // The escape char inside the literal is one backslash; on a backslash-escaping
+    // engine it must itself be doubled to reach `LIKE` (as in `contains_clause`).
+    let escape = if !escape_clause {
+        String::new()
+    } else if backslash_escapes {
+        r" ESCAPE '\\'".to_string()
+    } else {
+        r" ESCAPE '\'".to_string()
+    };
+    preds
+        .iter()
+        .map(|p| {
+            let col = quote(&p.column);
+            let is_null_value = !p.op.takes_value() || matches!(p.value, None | Some(Value::Null));
+            match (p.op, is_null_value) {
+                (CmpOp::IsNull, _) | (CmpOp::Eq, true) => format!("{col} IS NULL"),
+                (CmpOp::IsNotNull, _) | (CmpOp::Ne, true) => format!("{col} IS NOT NULL"),
+                // What's searched is the column's *text*, so the term is taken as
+                // text too — `like_pattern` owns the escaping and the quoting.
+                (CmpOp::Contains, _) => format!(
+                    "{} {like_op} {}{escape}",
+                    as_text(&col),
+                    like_pattern(
+                        &p.value.as_ref().map(value_text).unwrap_or_default(),
+                        backslash_escapes
+                    )
+                ),
+                (op, _) => {
+                    let value = p.value.as_ref().unwrap_or(&Value::Null);
+                    format!(
+                        "{col} {} {}",
+                        cmp_op_sql(op),
+                        sql_literal(value, backslash_escapes)
+                    )
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// A [`Value`] as the bare text a substring search looks for. No quoting: the
+/// caller's [`like_pattern`] owns that. A NULL, a blob, or a display-capped cell
+/// has no faithful text form, so it searches for the empty string (which `%%`
+/// matches anywhere) rather than for the word `NULL`.
+fn value_text(v: &Value) -> String {
+    match v {
+        Value::Text(s) => s.to_string(),
+        Value::Integer(n) => n.to_string(),
+        Value::Real(x) => x.to_string(),
+        Value::Null | Value::Blob(_) | Value::Capped(_) => String::new(),
+    }
+}
+
+/// The SQL spelling of a [`CmpOp`]. The unary ops never reach this (they're
+/// special-cased in [`cmp_clause`], which composes the whole term); they map to
+/// their keyword so the function stays total.
+fn cmp_op_sql(op: CmpOp) -> &'static str {
+    match op {
+        CmpOp::Eq => "=",
+        CmpOp::Ne => "<>",
+        CmpOp::Lt => "<",
+        CmpOp::Le => "<=",
+        CmpOp::Gt => ">",
+        CmpOp::Ge => ">=",
+        CmpOp::Like => "LIKE",
+        // Composed in full by `cmp_clause` (cast + engine `LIKE`/`ILIKE`), so this
+        // is only a fallback spelling; kept so the match stays total.
+        CmpOp::Contains => "LIKE",
+        CmpOp::IsNull => "IS NULL",
+        CmpOp::IsNotNull => "IS NOT NULL",
+    }
+}
+
 /// Wrap `base` so each [`FkJoin`]'s selected columns ride **inline, next to the
 /// foreign-key column they expand from**: the shared half of every relational
 /// driver's [`fk_join_wrap`](DatabaseDriver::fk_join_wrap) (inline FK expansion,
@@ -1006,6 +1117,18 @@ pub trait DatabaseDriver: Send + Sync {
     /// caller (a null FK isn't followable); `pairs` is non-empty. Each impl delegates
     /// to `eq_clause` with its own identifier quoting.
     fn eq_predicate(&self, pairs: &[ColumnValue]) -> String;
+
+    /// Render a conjunction of `column <op> value` comparisons as an escaped
+    /// *literal* predicate for [`red_core::ResultFilter::Cmp`], the filter the UI
+    /// **builds** (cell "Filter by", Column mode) rather than takes as typed SQL.
+    /// [`eq_predicate`](Self::eq_predicate)'s sibling across the full
+    /// [`CmpOp`] set, with the same no-cast, index-usable shape; see
+    /// [`cmp_clause`], which every impl delegates to with its own identifier
+    /// quoting. Values are rendered as escaped literals, **never** interpolated
+    /// raw — this is the only path a UI-built comparison reaches the engine by.
+    /// Synchronous string building. An empty `preds` returns an empty string,
+    /// which the caller reads as "no filter".
+    fn cmp_predicate(&self, preds: &[ColumnPredicate]) -> String;
 
     /// Wrap `base` so each inline FK expansion (Track B7) `LEFT JOIN`s its referenced
     /// table and selects the chosen columns *inline, next to the FK column they expand
@@ -1669,6 +1792,235 @@ mod tests {
         ];
         let pred = eq_clause(&pairs, |c| format!("\"{c}\""), false);
         assert_eq!(pred, r#""a" = 7 AND "name" = 'O''Brien'"#);
+    }
+
+    /// A `ColumnPredicate` shorthand for the `cmp_clause` tests.
+    fn cp(column: &str, op: CmpOp, value: Option<Value>) -> ColumnPredicate {
+        ColumnPredicate {
+            column: column.into(),
+            op,
+            value,
+        }
+    }
+
+    /// A stand-in text cast for the `cmp_clause` tests. Only `CmpOp::Contains`
+    /// uses it; every other operator must leave the column bare.
+    fn cast(c: &str) -> String {
+        format!("txt({c})")
+    }
+
+    #[test]
+    fn cmp_clause_spells_every_operator_and_joins_with_and() {
+        let preds: Vec<ColumnPredicate> = [
+            (CmpOp::Eq, "="),
+            (CmpOp::Ne, "<>"),
+            (CmpOp::Lt, "<"),
+            (CmpOp::Le, "<="),
+            (CmpOp::Gt, ">"),
+            (CmpOp::Ge, ">="),
+        ]
+        .iter()
+        .map(|(op, _)| cp("a", *op, Some(Value::Integer(1))))
+        .collect();
+        assert_eq!(
+            cmp_clause(&preds, |c| format!("\"{c}\""), cast, "ILIKE", false, true),
+            r#""a" = 1 AND "a" <> 1 AND "a" < 1 AND "a" <= 1 AND "a" > 1 AND "a" >= 1"#
+        );
+    }
+
+    #[test]
+    fn cmp_clause_renders_the_unary_operators_without_a_value() {
+        let preds = vec![
+            cp("a", CmpOp::IsNull, None),
+            cp("b", CmpOp::IsNotNull, None),
+        ];
+        assert_eq!(
+            cmp_clause(&preds, |c| format!("\"{c}\""), cast, "ILIKE", false, true),
+            r#""a" IS NULL AND "b" IS NOT NULL"#
+        );
+    }
+
+    #[test]
+    fn cmp_clause_normalizes_comparisons_against_null() {
+        // `= NULL` / `<> NULL` match nothing under three-valued logic, which would
+        // read as "no such rows" rather than "no null rows"; both normalize.
+        for value in [None, Some(Value::Null)] {
+            assert_eq!(
+                cmp_clause(
+                    &[cp("a", CmpOp::Eq, value.clone())],
+                    |c| c.into(),
+                    cast,
+                    "ILIKE",
+                    false,
+                    true
+                ),
+                "a IS NULL"
+            );
+            assert_eq!(
+                cmp_clause(
+                    &[cp("a", CmpOp::Ne, value)],
+                    |c| c.into(),
+                    cast,
+                    "ILIKE",
+                    false,
+                    true
+                ),
+                "a IS NOT NULL"
+            );
+        }
+        // A *binary* operator with no value can't be normalized into an `IS` form,
+        // so it compares against the NULL literal: matches nothing, never invalid SQL.
+        assert_eq!(
+            cmp_clause(
+                &[cp("a", CmpOp::Gt, None)],
+                |c| c.into(),
+                cast,
+                "ILIKE",
+                false,
+                true
+            ),
+            "a > NULL"
+        );
+    }
+
+    #[test]
+    fn cmp_clause_keeps_like_wildcards_live_but_escapes_the_literal() {
+        // Unlike `contains_clause`, a LIKE pattern is what the user typed, so `%`
+        // stays a wildcard — while the string literal itself is still escaped.
+        assert_eq!(
+            cmp_clause(
+                &[cp("n", CmpOp::Like, Some(Value::Text("a%_'x".into())))],
+                |c| c.into(),
+                cast,
+                "ILIKE",
+                false,
+                true
+            ),
+            "n LIKE 'a%_''x'"
+        );
+    }
+
+    #[test]
+    fn cmp_clause_escaping_is_per_engine_like_eq() {
+        // The same backslash-escape contract as `eq_clause`: an unescaped trailing
+        // `\` on MySQL/ClickHouse would let a value break out of the literal.
+        let v = Value::Text(r"\' OR 1=1 -- ".into());
+        assert_eq!(
+            cmp_clause(
+                &[cp("c", CmpOp::Eq, Some(v.clone()))],
+                |c| format!("`{c}`"),
+                cast,
+                "LIKE",
+                true,
+                true
+            ),
+            r"`c` = '\\'' OR 1=1 -- '"
+        );
+        assert_eq!(
+            cmp_clause(
+                &[cp("c", CmpOp::Eq, Some(v.clone()))],
+                |c| format!("\"{c}\""),
+                cast,
+                "ILIKE",
+                false,
+                true
+            ),
+            r#""c" = '\'' OR 1=1 -- '"#
+        );
+        // The same guard on the `Contains` path, which escapes through
+        // `like_pattern` rather than `sql_literal`.
+        assert_eq!(
+            cmp_clause(
+                &[cp("c", CmpOp::Contains, Some(v))],
+                |c| format!("`{c}`"),
+                cast,
+                "LIKE",
+                true,
+                true
+            ),
+            r"txt(`c`) LIKE '%\\\\'' OR 1=1 -- %' ESCAPE '\\'"
+        );
+    }
+
+    #[test]
+    fn cmp_clause_contains_casts_escapes_and_wraps() {
+        // The column is cast (so a non-text column is searchable), the engine's
+        // case-insensitive keyword is used, the term's metacharacters are escaped
+        // so they match literally, and the whole thing is wrapped in `%…%`.
+        assert_eq!(
+            cmp_clause(
+                &[cp("n", CmpOp::Contains, Some(Value::Text("50%".into())))],
+                |c| c.into(),
+                cast,
+                "ILIKE",
+                false,
+                true
+            ),
+            r"txt(n) ILIKE '%50\%%' ESCAPE '\'"
+        );
+        // A numeric value is searched as its text.
+        assert_eq!(
+            cmp_clause(
+                &[cp("id", CmpOp::Contains, Some(Value::Integer(42)))],
+                |c| c.into(),
+                cast,
+                "LIKE",
+                false,
+                true
+            ),
+            r"txt(id) LIKE '%42%' ESCAPE '\'"
+        );
+        // ClickHouse takes no `ESCAPE` clause.
+        assert_eq!(
+            cmp_clause(
+                &[cp("n", CmpOp::Contains, Some(Value::Text("x".into())))],
+                |c| c.into(),
+                cast,
+                "ILIKE",
+                true,
+                false
+            ),
+            "txt(n) ILIKE '%x%'"
+        );
+        // A NULL / blob value has no faithful text, so it searches for nothing
+        // rather than for the word "NULL".
+        assert_eq!(
+            cmp_clause(
+                &[cp("n", CmpOp::Contains, None)],
+                |c| c.into(),
+                cast,
+                "LIKE",
+                false,
+                false
+            ),
+            "txt(n) LIKE '%%'"
+        );
+    }
+
+    #[test]
+    fn cmp_clause_casts_only_for_contains() {
+        // Every other operator compares the bare column, so an index stays usable.
+        for op in CmpOp::ALL.iter().filter(|o| **o != CmpOp::Contains) {
+            let sql = cmp_clause(
+                &[cp("n", *op, Some(Value::Integer(1)))],
+                |c| c.into(),
+                cast,
+                "ILIKE",
+                false,
+                true,
+            );
+            assert!(!sql.contains("txt("), "{op:?} must not cast: {sql}");
+            assert!(!sql.contains("ESCAPE"), "{op:?} needs no ESCAPE: {sql}");
+        }
+    }
+
+    #[test]
+    fn cmp_clause_empty_is_empty() {
+        // The caller reads "" as "no filter" rather than emitting `WHERE ()`.
+        assert_eq!(
+            cmp_clause(&[], |c| c.into(), cast, "ILIKE", false, true),
+            ""
+        );
     }
 
     #[test]

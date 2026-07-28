@@ -14,8 +14,8 @@
 use std::time::Duration;
 
 use red_core::{
-    Column, ColumnValue, EditOp, ExportFormat, KeySpec, ObjectKind, QueryOptions, RedError,
-    TableRef, Value,
+    CmpOp, Column, ColumnPredicate, ColumnValue, EditOp, ExportFormat, KeySpec, ObjectKind,
+    QueryOptions, RedError, TableRef, Value,
 };
 
 use crate::{AbortSignal, DEFAULT_DISPLAY_CELL_CAP, DatabaseDriver, PageCap};
@@ -238,6 +238,173 @@ pub(crate) async fn filters_eq(
         driver.count(&sql, &abort).await.unwrap(),
         expected,
         "FK equality narrows to the matching rows"
+    );
+}
+
+/// `cmp_predicate` renders the built-not-typed filter ([`red_core::ResultFilter::Cmp`])
+/// with the semantics the UI promises. Every assertion cross-checks the driver's
+/// rendering against an equivalent *hand-written* predicate over the same base, so
+/// there are no magic numbers and every engine is checked identically.
+///
+/// The caller seeds a table its `base_sql` selects, where `int_col` is an integer
+/// column carrying NULLs and duplicate values and `text_col` is a text column —
+/// the same fixture shape [`column_stats_summary`] wants.
+pub(crate) async fn filters_cmp(
+    driver: &dyn DatabaseDriver,
+    base_sql: &str,
+    int_col: &str,
+    text_col: &str,
+) {
+    let abort = AbortSignal::new();
+    let count = |pred: String| {
+        let abort = &abort;
+        async move {
+            let sql = format!("SELECT * FROM ({base_sql}) AS _red_c WHERE ({pred})");
+            driver.count(&sql, abort).await.unwrap()
+        }
+    };
+    let pred = |column: &str, op: CmpOp, value: Option<Value>| ColumnPredicate {
+        column: column.to_string(),
+        op,
+        value,
+    };
+    // The driver's rendering of `preds` must count the same as `raw`.
+    let same = async |preds: Vec<ColumnPredicate>, raw: String, what: &str| {
+        assert_eq!(
+            count(driver.cmp_predicate(&preds)).await,
+            count(raw.clone()).await,
+            "{what}: cmp_predicate disagrees with `{raw}`"
+        );
+    };
+
+    // The ordering and (in)equality operators mean what they spell.
+    for (op, sql) in [
+        (CmpOp::Eq, "="),
+        (CmpOp::Ne, "<>"),
+        (CmpOp::Lt, "<"),
+        (CmpOp::Le, "<="),
+        (CmpOp::Gt, ">"),
+        (CmpOp::Ge, ">="),
+    ] {
+        same(
+            vec![pred(int_col, op, Some(Value::Integer(1)))],
+            format!("{int_col} {sql} 1"),
+            sql,
+        )
+        .await;
+    }
+
+    // The unary operators, and the pair that partitions the whole result.
+    same(
+        vec![pred(int_col, CmpOp::IsNull, None)],
+        format!("{int_col} IS NULL"),
+        "IS NULL",
+    )
+    .await;
+    same(
+        vec![pred(int_col, CmpOp::IsNotNull, None)],
+        format!("{int_col} IS NOT NULL"),
+        "IS NOT NULL",
+    )
+    .await;
+    let nulls = count(driver.cmp_predicate(&[pred(int_col, CmpOp::IsNull, None)])).await;
+    let non_nulls = count(driver.cmp_predicate(&[pred(int_col, CmpOp::IsNotNull, None)])).await;
+    assert_eq!(
+        nulls + non_nulls,
+        driver.count(base_sql, &abort).await.unwrap(),
+        "IS NULL and IS NOT NULL partition the result"
+    );
+    assert!(nulls > 0, "the fixture must carry NULLs to be meaningful");
+
+    // `= NULL` / `<> NULL` normalize to the `IS` forms. Rendered literally they
+    // would match *nothing* under three-valued logic, silently reading as "no such
+    // rows" instead of "no null rows" — the regression this guards.
+    same(
+        vec![pred(int_col, CmpOp::Eq, Some(Value::Null))],
+        format!("{int_col} IS NULL"),
+        "= NULL normalizes",
+    )
+    .await;
+    same(
+        vec![pred(int_col, CmpOp::Ne, None)],
+        format!("{int_col} IS NOT NULL"),
+        "<> with no value normalizes",
+    )
+    .await;
+
+    // `LIKE` passes its pattern through unescaped: `%` is a wildcard here (unlike
+    // `Contains`, where the term is a literal substring).
+    same(
+        vec![pred(text_col, CmpOp::Like, Some(Value::Text("%".into())))],
+        format!("{text_col} LIKE '%'"),
+        "LIKE wildcards are live",
+    )
+    .await;
+
+    // `Contains` is the opposite: a literal substring. An empty term matches every
+    // non-null row, and it casts, so it works on a *numeric* column too — the
+    // reason it isn't gated to text columns.
+    let non_null_text = count(format!("{text_col} IS NOT NULL")).await;
+    assert_eq!(
+        count(driver.cmp_predicate(&[pred(
+            text_col,
+            CmpOp::Contains,
+            Some(Value::Text("".into()))
+        )]))
+        .await,
+        non_null_text,
+        "an empty Contains term matches every non-null row"
+    );
+    assert_eq!(
+        count(driver.cmp_predicate(&[pred(
+            int_col,
+            CmpOp::Contains,
+            Some(Value::Text("1".into()))
+        )]))
+        .await,
+        count(format!("{int_col} IS NOT NULL AND {int_col} = 1")).await,
+        "Contains casts, so it searches a numeric column's text"
+    );
+    // A `%` in a `Contains` term is data, not a wildcard: no row's text contains a
+    // literal percent sign, so this matches nothing. Unescaped it would be `%%%`
+    // and match everything — the regression this guards.
+    assert_eq!(
+        count(driver.cmp_predicate(&[pred(
+            text_col,
+            CmpOp::Contains,
+            Some(Value::Text("%".into()))
+        )]))
+        .await,
+        0,
+        "Contains escapes LIKE metacharacters"
+    );
+
+    // A quote in the value can't break out of the literal (no injection, no error).
+    same(
+        vec![pred(
+            text_col,
+            CmpOp::Eq,
+            Some(Value::Text("O'Brien".into())),
+        )],
+        format!("{text_col} = 'O''Brien'"),
+        "embedded quote is escaped",
+    )
+    .await;
+
+    // Several terms AND-join, and the conjunction is narrower than either alone.
+    let conj = vec![
+        pred(int_col, CmpOp::IsNotNull, None),
+        pred(text_col, CmpOp::Like, Some(Value::Text("%".into()))),
+    ];
+    same(
+        conj.clone(),
+        format!("{int_col} IS NOT NULL AND {text_col} LIKE '%'"),
+        "AND-joined terms",
+    )
+    .await;
+    assert!(
+        count(driver.cmp_predicate(&conj)).await <= non_nulls,
+        "adding a term never widens the result"
     );
 }
 

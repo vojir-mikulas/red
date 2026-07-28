@@ -222,11 +222,12 @@ impl Render for AppState {
             }
         }
 
-        // ⌘⇧F: the result filter bar just opened; focus its input to type at once.
+        // ⌘⇧F: the result filter bar just opened (or switched mode); focus the box
+        // the current mode shows, so typing lands in it at once.
         if self.focus_filter {
             self.focus_filter = false;
             if let Some(bar) = &self.filter_bar {
-                window.focus(&bar.input.focus_handle(cx), cx);
+                window.focus(&bar.focus_handle(cx), cx);
             }
         }
 
@@ -482,7 +483,11 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &ToggleAssistant, window, cx| {
                 this.toggle_assistant(window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ToggleFilter, _, cx| this.toggle_filter_bar(cx)))
+            .on_action(
+                cx.listener(|this, _: &ToggleFilter, window, cx| {
+                    this.toggle_filter_bar(window, cx)
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &FindInResult, window, cx| this.toggle_find_bar(window, cx)),
             )
