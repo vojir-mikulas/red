@@ -228,6 +228,19 @@ impl DatabaseDriver for PostgresDriver {
         self.version.clone()
     }
 
+    /// Unchanged for now. Postgres binds its *database* at connect and cannot
+    /// switch it on a live connection; the rebindable namespace is the schema, via
+    /// `search_path`. Unlike MySQL's re-acquire-per-operation pool, a
+    /// `SET search_path` here is **sticky**: it persists on the long-lived
+    /// `client` and on free-list clients (which are never reset on release), so it
+    /// would leak into later operations and across tabs. Doing it safely needs
+    /// per-client tracking or `SET LOCAL` inside each operation's transaction —
+    /// see docs/plans/todo/database-context.md. Until then `namespace_caps()`
+    /// reports `settable: false` and the UI does not offer a picker.
+    fn scoped(self: Arc<Self>, _namespace: Option<&str>) -> Arc<dyn DatabaseDriver> {
+        self
+    }
+
     async fn open_cursor(&self, sql: &str, opts: QueryOptions) -> Result<Box<dyn QueryCursor>> {
         let (stmt, columns) = prepare_columns(&self.client, sql).await?;
         let stream = self

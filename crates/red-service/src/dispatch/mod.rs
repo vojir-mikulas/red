@@ -1004,7 +1004,11 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 emit(&events, session_id, Event::Disconnected);
             }
 
-            Command::Query { sql, opts } => {
+            Command::Query {
+                sql,
+                opts,
+                namespace,
+            } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get_mut(&id) else {
                     emit(&events, session_id, Event::Error("not connected".into()));
@@ -1019,6 +1023,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     );
                     continue;
                 };
+                // The cursor holds this scoped handle for its whole life, so every
+                // `FetchMore` window stays on the same namespace.
+                let driver = driver.scoped(namespace.as_deref());
                 match driver.open_cursor(&sql, opts.clone()).await {
                     Ok(cursor) => {
                         let aq = ActiveQuery {
@@ -1081,6 +1088,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 sort,
                 filter,
                 joins,
+                namespace,
             } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get_mut(&id) else {
@@ -1095,6 +1103,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     );
                     continue;
                 };
+                let driver = driver.scoped(namespace.as_deref());
                 // A re-open on the same epoch supersedes any prior probe.
                 if let Some(f) = state.inflight.remove(&epoch) {
                     f.abort_all();
@@ -1105,6 +1114,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     epoch,
                     OpenSpec {
                         sql: sql.clone(),
+                        namespace: namespace.clone(),
                         key: None,
                         key_cols: Vec::new(),
                         bounds: None,
@@ -1335,9 +1345,17 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // The tab closed or re-sorted (its epoch is gone); skip the stale
                 // request rather than running an expensive query whose result
                 // would be discarded.
-                let Some(sql) = lock(&state.results).get(&epoch).map(|s| s.sql.clone()) else {
+                let Some((sql, namespace)) = lock(&state.results)
+                    .get(&epoch)
+                    .map(|s| (s.sql.clone(), s.namespace.clone()))
+                else {
                     continue;
                 };
+                // Re-bind the namespace this result was opened against: `driver`
+                // above is the session's handle, which carries only the dialled
+                // default, so without this a later window would change databases
+                // mid-result.
+                let driver = driver.scoped(namespace.as_deref());
                 // A newer page for this epoch supersedes the last one (the viewport
                 // moved); cancel its in-flight fetch so a flung scrollbar doesn't
                 // back a pile of doomed deep-`OFFSET` scans up behind the semaphore.
@@ -1410,6 +1428,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 let Some(spec) = lock(&state.results).get(&epoch).cloned() else {
                     continue;
                 };
+                // Keyset seek runs are the deepest paging path, so this is the one
+                // that would most visibly change databases mid-result.
+                let driver = driver.scoped(spec.namespace.as_deref());
                 let Some(key) = spec.key.clone() else {
                     continue; // a keyless result never gets `FetchRun`s
                 };
@@ -1509,9 +1530,17 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
                 // Stale epoch (tab closed / re-sorted); drop, like `FetchPage`.
-                let Some(sql) = lock(&state.results).get(&epoch).map(|s| s.sql.clone()) else {
+                let Some((sql, namespace)) = lock(&state.results)
+                    .get(&epoch)
+                    .map(|s| (s.sql.clone(), s.namespace.clone()))
+                else {
                     continue;
                 };
+                // Re-bind the namespace this result was opened against: `driver`
+                // above is the session's handle, which carries only the dialled
+                // default, so without this a later window would change databases
+                // mid-result.
+                let driver = driver.scoped(namespace.as_deref());
                 // Same windowed read as a page fetch, but `Full` so the rows carry the
                 // real values (the grid's display cap is bypassed) for the clipboard.
                 // Bounded by `MAX_COPY_ROWS` so a select-all can't pull an unbounded
@@ -3214,9 +3243,17 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // Reuse the result's stored (already-wrapped, filtered) SQL so the
                 // summary matches the visible rows. A stale epoch (tab closed /
                 // re-sorted) drops the request, like `FetchPage`.
-                let Some(sql) = lock(&state.results).get(&epoch).map(|s| s.sql.clone()) else {
+                let Some((sql, namespace)) = lock(&state.results)
+                    .get(&epoch)
+                    .map(|s| (s.sql.clone(), s.namespace.clone()))
+                else {
                     continue;
                 };
+                // Re-bind the namespace this result was opened against: `driver`
+                // above is the session's handle, which carries only the dialled
+                // default, so without this a later window would change databases
+                // mid-result.
+                let driver = driver.scoped(namespace.as_deref());
                 // A newer stats request for this epoch (the selection moved to
                 // another column) supersedes the last one; cancel its in-flight
                 // aggregate at the engine so a heavy `count(distinct)` doesn't linger.
@@ -3453,7 +3490,10 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     );
                     continue;
                 };
-                let Some(sql) = lock(&state.results).get(&epoch).map(|s| s.sql.clone()) else {
+                let Some((sql, namespace)) = lock(&state.results)
+                    .get(&epoch)
+                    .map(|s| (s.sql.clone(), s.namespace.clone()))
+                else {
                     emit(
                         &events,
                         session_id,
@@ -3461,6 +3501,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     );
                     continue;
                 };
+                // An export re-reads the whole result, so it needs the same
+                // namespace the result was opened against (see `FetchPage`).
+                let driver = driver.scoped(namespace.as_deref());
                 // Register the cancel flag before the task starts, so a fast
                 // `CancelExport` can't race ahead of it.
                 let cancel = Arc::new(AtomicBool::new(false));

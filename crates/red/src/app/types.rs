@@ -1064,6 +1064,11 @@ pub(crate) struct QueryTab {
     /// The query plan (Track B4, EXPLAIN), when one is open. Occupies the result
     /// pane in place of the grid; running a query clears it. `None` is the grid.
     pub plan: Option<crate::plan::PlanView>,
+    /// The read-only ER diagram (see [`crate::er`]) when this tab is a diagram
+    /// rather than a query. Unlike `plan`, which shares the result slot with the
+    /// grid, a diagram replaces the **whole half**: there's no query behind it, so
+    /// an editor above it would be dead space. `None` for an ordinary query tab.
+    pub er: Option<crate::er::ErView>,
     /// Which split half owns this tab (Zed-style): each pane's tab strip shows only
     /// its own tabs, so the two halves never duplicate. Always `Primary` while the
     /// work area is unsplit; a drag across the divider (or `split_right`) reassigns it.
@@ -1072,6 +1077,15 @@ pub(crate) struct QueryTab {
     /// visible regardless of scroll, and are skipped by the bulk close actions
     /// (Close Others / Close All / Close Left / Close Right).
     pub pinned: bool,
+    /// Per-tab override of the namespace this tab's SQL resolves unqualified names
+    /// against. `None` (the default) inherits [`ActiveConn::namespace`], so a user
+    /// who never touches the picker sees exactly the old behaviour.
+    ///
+    /// Per-tab rather than per-connection so a split view can compare two
+    /// databases on one connection — the driver binds the namespace per operation,
+    /// so this costs nothing extra. Set when a tab is born from a tree node
+    /// ("New query here") or from the tab's own namespace picker.
+    pub namespace: Option<String>,
 }
 
 impl QueryTab {
@@ -1125,16 +1139,36 @@ impl QueryTab {
             editor,
             result: None,
             plan: None,
+            er: None,
             // New tabs join the focused pane; `push_tab` reassigns this when split.
             pane: SplitHalf::Primary,
             pinned: false,
+            namespace: None,
         }
     }
 
     /// A blank tab the user hasn't touched: no result and the default text still
     /// in the editor. Closing one of these doesn't warrant a confirmation.
+    ///
+    /// An ER tab is never pristine. Its editor is untouched by construction (it has
+    /// none on screen), so without this it would read as blank and be swept up by
+    /// the "replace the empty tab" paths, taking the user's laid-out diagram with it.
     pub(crate) fn is_pristine(&self, cx: &Context<AppState>) -> bool {
-        self.result.is_none() && self.editor.read(cx).content() == EMPTY_QUERY
+        self.er.is_none() && self.result.is_none() && self.editor.read(cx).content() == EMPTY_QUERY
+    }
+
+    /// Whether this tab shows an ER diagram instead of the editor/result pair. The
+    /// query-shaped actions (run, explain, export, filter) are meaningless on one.
+    pub(crate) fn is_er(&self) -> bool {
+        self.er.is_some()
+    }
+
+    /// Whether closing this tab should stop and ask. A diagram never does: it holds
+    /// no query and no unsaved edit, only a pan/zoom and any boxes the user dragged,
+    /// and reopening it from the tree is one right-click. Asking would be the same
+    /// "you may lose work" prompt the *query* tabs use, which would not be true here.
+    pub(crate) fn needs_close_confirm(&self, cx: &Context<AppState>) -> bool {
+        !self.is_er() && !self.is_pristine(cx)
     }
 }
 
@@ -1227,6 +1261,17 @@ pub(crate) struct ActiveConn {
         std::collections::HashMap<(String, String), std::collections::HashMap<String, Vec<String>>>,
     /// Tables whose `LoadEnums` is in flight, so the load fires at most once per table.
     pub enum_requested: std::collections::HashSet<(String, String)>,
+    /// The connection-level namespace new tabs inherit and the toolbar chip shows
+    /// (see [`QueryTab::namespace`] for why the override is per tab). Seeded from
+    /// `config.database` at connect, so nothing changes for a connection that
+    /// named one; `None` on a MySQL connection dialled without a database, which
+    /// is exactly the case the picker exists for.
+    ///
+    /// Only meaningful when `config.kind.namespace_caps().settable`.
+    pub namespace: Option<String>,
+    /// Whether the run bar's namespace picker is showing its option list. Flint's
+    /// `Select` is caller-controlled, so the open state lives here.
+    pub namespace_menu_open: bool,
     /// Open query tabs (never empty), and the index of the focused one.
     pub tabs: Vec<QueryTab>,
     pub active_tab: usize,
@@ -1284,12 +1329,9 @@ pub(crate) struct ActiveConn {
     /// eviction when [`MAX_PARKED_SESSIONS`] is exceeded: the lowest stamp is the
     /// least-recently-foregrounded parked session.
     pub last_active_seq: u64,
-    /// The read-only ER diagram overlay when open (schema-wide, so it hangs off the
-    /// connection, not a tab). `None` when closed. See [`crate::er`].
-    pub er: Option<crate::er::ErView>,
     /// The data-compare (table diff) report overlay when open (a full-screen
-    /// read-only report, so it hangs off the connection like the ER diagram).
-    /// `None` when closed. See [`crate::diff_view`].
+    /// read-only report, so it hangs off the connection). `None` when closed.
+    /// See [`crate::diff_view`].
     pub diff: Option<crate::diff_view::DiffReport>,
     /// The Redis shell's dynamic tab set (see docs/plans/redis-workflow-parity.md);
     /// `Some` only for a `DbKind::Redis` session, set up in `on_connected`.
@@ -1324,6 +1366,12 @@ impl ActiveConn {
         )
         .detach();
         Self {
+            // Seeded from what the connection dialled, so a config that named a
+            // database keeps resolving exactly as before; `None` only on an engine
+            // whose database segment is optional and was left blank (MySQL).
+            namespace: (!config.database.is_empty() && config.kind.namespace_caps().settable)
+                .then(|| config.database.clone()),
+            namespace_menu_open: false,
             session,
             conn_id,
             config,
@@ -1361,7 +1409,6 @@ impl ActiveConn {
             columns_w: px(260.),
             columns_drag: None,
             last_active_seq: 0,
-            er: None,
             diff: None,
             kv_view,
             doc_view,
@@ -1393,6 +1440,21 @@ impl ActiveConn {
     pub(crate) fn active_mut(&mut self) -> Option<&mut QueryTab> {
         let i = self.focused_tab_index();
         self.tabs.get_mut(i)
+    }
+
+    /// The namespace the focused tab's queries resolve unqualified names against:
+    /// the tab's own override, else this connection's. The single place the
+    /// two-layer inheritance is resolved, so every command send agrees.
+    ///
+    /// Always `None` on an engine whose namespace is fixed at connect, so those
+    /// engines send exactly what they sent before.
+    pub(crate) fn namespace_for_send(&self) -> Option<String> {
+        if !self.config.kind.namespace_caps().settable {
+            return None;
+        }
+        self.active()
+            .and_then(|t| t.namespace.clone())
+            .or_else(|| self.namespace.clone())
     }
 
     /// The focused tab's open result, if any. Folds together "no tab" and "tab

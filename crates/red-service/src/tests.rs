@@ -57,6 +57,7 @@ async fn streams_query_in_bounded_windows() {
                 timeout: None,
                 full_fidelity: false,
             },
+            namespace: None,
         },
     );
 
@@ -106,6 +107,7 @@ async fn cancels_query_mid_flight() {
                 timeout: None,
                 full_fidelity: false,
             },
+            namespace: None,
         },
     );
     assert!(matches!(
@@ -144,6 +146,7 @@ async fn query_times_out() {
                 timeout: Some(Duration::from_millis(50)),
                 full_fidelity: false,
             },
+            namespace: None,
         },
     );
     assert!(matches!(
@@ -177,6 +180,7 @@ async fn disconnect_drops_session() {
         Command::Query {
             sql: "SELECT 1".into(),
             opts: QueryOptions::default(),
+            namespace: None,
         },
     );
     match next(&mut events).await {
@@ -568,6 +572,7 @@ async fn opens_and_pages_result() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     match next(&mut events).await {
@@ -631,6 +636,7 @@ async fn computes_column_stats_for_open_result() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     assert!(matches!(
@@ -720,6 +726,7 @@ async fn fk_join_expands_referenced_columns_inline() {
                 to_table: "tier".into(),
                 select: vec![("name".into(), "tier_id.name".into())],
             }],
+            namespace: None,
         },
     );
     match next(&mut events).await {
@@ -826,6 +833,7 @@ async fn where_filters_on_expanded_fk_column() {
                 to_table: "tier".into(),
                 select: vec![("name".into(), "tier_id.name".into())],
             }],
+            namespace: None,
         },
     );
     match next(&mut events).await {
@@ -899,6 +907,7 @@ async fn resolves_key_and_serves_runs() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     match next(&mut events).await {
@@ -1100,6 +1109,7 @@ async fn mariadb_keyset_end_to_end() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     match next(&mut events).await {
@@ -1260,6 +1270,7 @@ async fn text_key_jump_falls_back_to_offset() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     match next(&mut events).await {
@@ -1311,6 +1322,7 @@ async fn connect_and_query_roundtrip() {
         Command::Query {
             sql: "SELECT 42 AS answer".into(),
             opts: QueryOptions::default(),
+            namespace: None,
         },
     );
     assert!(matches!(
@@ -1362,6 +1374,7 @@ async fn keeps_two_sessions_warm() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     handle.send_to(
@@ -1373,6 +1386,7 @@ async fn keeps_two_sessions_warm() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
 
@@ -1487,6 +1501,7 @@ async fn copies_result_into_table() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     assert!(matches!(
@@ -1542,6 +1557,7 @@ async fn copies_result_into_table() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     assert!(matches!(
@@ -1596,6 +1612,7 @@ async fn copies_result_into_a_new_table() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     assert!(matches!(
@@ -1672,6 +1689,7 @@ async fn copies_result_into_a_new_table() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     assert!(matches!(
@@ -1729,6 +1747,7 @@ async fn copy_truncate_insert_refreshes_target() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     assert!(matches!(
@@ -1776,6 +1795,7 @@ async fn copy_truncate_insert_refreshes_target() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     match next(&mut events).await {
@@ -1822,6 +1842,7 @@ async fn copy_is_byte_exact_for_long_values() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     assert!(matches!(
@@ -1870,6 +1891,7 @@ async fn copy_is_byte_exact_for_long_values() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     assert!(matches!(
@@ -1948,6 +1970,7 @@ async fn copies_across_connections() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     assert!(matches!(
@@ -1995,6 +2018,7 @@ async fn copies_across_connections() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     assert!(matches!(
@@ -2079,6 +2103,7 @@ async fn migrates_all_tables_into_another_connection() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     assert!(matches!(
@@ -2094,6 +2119,7 @@ async fn migrates_all_tables_into_another_connection() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     assert!(matches!(
@@ -2129,6 +2155,7 @@ async fn migrates_all_tables_into_another_connection() {
             sort: None,
             filter: None,
             joins: Vec::new(),
+            namespace: None,
         },
     );
     assert!(matches!(

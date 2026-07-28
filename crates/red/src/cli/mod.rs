@@ -342,7 +342,15 @@ fn cmd_query(args: QueryArgs) -> u8 {
         timeout: None,
         full_fidelity: true,
     };
-    svc.send_to(PRIMARY, Command::Query { sql, opts });
+    // No tab context in the CLI: the saved connection's own database applies.
+    svc.send_to(
+        PRIMARY,
+        Command::Query {
+            sql,
+            opts,
+            namespace: None,
+        },
+    );
 
     let mut writer = Writer::new(args.format, std::io::stdout().lock());
     let code = loop {

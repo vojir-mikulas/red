@@ -316,7 +316,7 @@ impl AppState {
             Cmd::CompareTable => self.open_compare_picker(cx),
             Cmd::CompareLeft(index) => self.pick_compare_left(index, cx),
             Cmd::CompareRight(index) => self.pick_compare_right(index, cx),
-            Cmd::ErDiagram => self.open_er_diagram(cx),
+            Cmd::ErDiagram => self.open_er_diagram(self.er_target_namespace(), cx),
             Cmd::Explain => self.explain_query(false, cx),
             Cmd::ExplainAnalyze => self.explain_query(true, cx),
             Cmd::FormatSql => self.format_active_sql(cx),

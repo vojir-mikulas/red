@@ -138,6 +138,74 @@ fn render_cell(
 }
 
 impl AppState {
+    /// The in-panel recovery offered under a failed query when the connection has
+    /// no namespace bound and the engine requires one: name the databases on the
+    /// server and let one click bind the tab and re-run.
+    ///
+    /// This is the point of the whole feature. MySQL's database segment is
+    /// optional (so the tree can browse the whole server), so an unqualified query
+    /// on such a connection returns error 1046 with nothing to act on. Turning
+    /// that into a picker is what makes the dead end a two-click fix.
+    fn render_namespace_fix(
+        &self,
+        active: &ActiveConn,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
+        let names: Vec<String> = active
+            .schema
+            .schemas
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        if names.is_empty() {
+            return None; // the tree hasn't loaded yet; nothing honest to offer
+        }
+        let theme = cx.theme();
+        let (muted, size_11) = (theme.text_muted, theme.scale(11.));
+        let label = active.config.kind.namespace_caps().label.to_lowercase();
+        let view = cx.entity().downgrade();
+
+        let buttons = names.into_iter().take(12).map(move |name| {
+            let view = view.clone();
+            Button::new(SharedString::from(format!("ns-fix-{name}")), name.clone())
+                .variant(ButtonVariant::Ghost)
+                .size(ButtonSize::Sm)
+                .on_click(move |_, _, cx| {
+                    let name = name.clone();
+                    view.update(cx, |this, cx| {
+                        // Bind the connection (not just this tab): an unbound
+                        // connection means *no* tab has a target, so binding
+                        // once fixes them all.
+                        this.set_active_namespace(Some(name), cx);
+                        this.run_editor_query(cx);
+                    })
+                    .ok();
+                })
+        });
+
+        Some(
+            div()
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .pt_2()
+                .text_size(size_11)
+                .text_color(muted)
+                .child(format!(
+                    "Unqualified table names have no target {label}. \
+                     Pick one to set it and re-run, or write them as db.table."
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .children(buttons.collect::<Vec<_>>()),
+                ),
+        )
+    }
+
     /// The results pane: an empty state, an error, or the live windowed grid.
     /// Render the result pane for the tab at `tab_idx`, shown in split half `half`.
     /// `is_focused` is whether this half currently has focus: only the focused half
@@ -167,6 +235,14 @@ impl AppState {
         let find_bar = is_focused
             .then(|| self.render_find_bar(crate::find::FindTarget::Grid, cx))
             .flatten();
+        // A query that failed with no namespace bound, on an engine that *needs*
+        // one, is the "No database selected" dead end. Offer the picker right in
+        // the error panel rather than making the user hunt for the run bar.
+        // Detected from state, not by matching the engine's message text.
+        let namespace_fix = (active.config.kind.namespace_caps().required
+            && active.namespace_for_send().is_none())
+        .then(|| self.render_namespace_fix(active, cx))
+        .flatten();
         let theme = cx.theme();
         let (bg, bg_app, border, border_soft) = (
             theme.bg_panel,
@@ -249,7 +325,8 @@ impl AppState {
                             .child("Query failed")
                             .child(div().text_color(faint).child(format!("· {elapsed}"))),
                     )
-                    .child(div().text_size(size_12).text_color(text).child(err.clone())),
+                    .child(div().text_size(size_12).text_color(text).child(err.clone()))
+                    .children(namespace_fix),
             );
         }
 

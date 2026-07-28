@@ -165,6 +165,9 @@ pub enum Command {
     Query {
         sql: String,
         opts: QueryOptions,
+        /// The namespace unqualified names in `sql` resolve against; see
+        /// [`Command::OpenResult`]. `None` keeps the connection's dialled default.
+        namespace: Option<String>,
     },
     /// Pull the next window from the active cursor.
     FetchMore {
@@ -220,6 +223,11 @@ pub enum Command {
         sort: Option<SortKey>,
         filter: Option<ResultFilter>,
         joins: Vec<FkJoin>,
+        /// The namespace unqualified names in `sql` resolve against — the tab's
+        /// database on MySQL/ClickHouse (see `DbKind::namespace_caps`). `None`
+        /// means "whatever the connection dialled". Stored on the open result, so
+        /// every later page/seek/stat fetch for this epoch binds the same one.
+        namespace: Option<String>,
     },
     /// Fetch one random-access page of an open result (grid load-on-scroll).
     /// `epoch` selects which open result; an unknown epoch is ignored (the tab

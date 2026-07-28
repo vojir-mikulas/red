@@ -79,6 +79,13 @@ impl DatabaseDriver for SqliteDriver {
         rusqlite::version().to_string()
     }
 
+    /// Unchanged: SQLite's `main` is fixed for the life of the connection and
+    /// unqualified names always resolve against it, so there is no namespace to
+    /// rebind (`namespace_caps().settable` is false, so the UI never asks).
+    fn scoped(self: Arc<Self>, _namespace: Option<&str>) -> Arc<dyn DatabaseDriver> {
+        self
+    }
+
     async fn open_cursor(&self, sql: &str, opts: QueryOptions) -> Result<Box<dyn QueryCursor>> {
         let path = self.path.clone();
         let read_only = self.read_only;

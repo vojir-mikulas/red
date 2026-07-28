@@ -47,6 +47,15 @@ pub(crate) struct SchemaState {
     pub tree_scroll: UniformListScrollHandle,
     /// True while the skeleton load is in flight.
     pub loading: bool,
+    /// The open right-click menu (which node, and where to draw it), or `None`.
+    pub menu: Option<SchemaMenu>,
+}
+
+/// An open schema-tree context menu: the node it acts on and the screen position
+/// to anchor it at. Mirrors the Redis key menu's shape (`kvbrowse`'s `KeyMenu`).
+pub(crate) struct SchemaMenu {
+    pub node: NodeId,
+    pub pos: gpui::Point<gpui::Pixels>,
 }
 
 impl SchemaState {
@@ -65,6 +74,7 @@ impl SchemaState {
             filter,
             tree_scroll: UniformListScrollHandle::new(),
             loading: true,
+            menu: None,
         }
     }
 
@@ -358,7 +368,10 @@ impl AppState {
         let schema_count = s.schemas.len();
         let object_count: usize = s.schemas.iter().map(|sc| sc.objects.len()).sum();
 
-        let er_icon = crate::icons::icon("link", cx.theme().scale(16.), cx.theme().text_muted);
+        // Just the filter. The ER diagram used to have an icon button here, from
+        // before the tree had a right-click menu; the menu's per-database item is
+        // both more discoverable and correctly scoped, so the button was a second
+        // way to do a worse version of the same thing.
         let filter_row = div()
             .flex_shrink_0()
             .flex()
@@ -367,15 +380,7 @@ impl AppState {
             .px_2()
             .pt_2()
             .pb_1()
-            .child(div().flex_1().child(s.filter.clone()))
-            // Open the read-only schema ER diagram.
-            .child(
-                IconButton::new("schema-er-diagram", er_icon)
-                    .size(IconButtonSize::Sm)
-                    .tooltip("ER diagram")
-                    .a11y_label("ER diagram")
-                    .on_click(cx.listener(|this, _, _, cx| this.open_er_diagram(cx))),
-            );
+            .child(div().flex_1().child(s.filter.clone()));
 
         // Capture the flattened rows per handler so each can map its click index
         // back to the node it represents.
@@ -383,7 +388,9 @@ impl AppState {
         let rows_toggle = rows.clone();
         let rows_select = rows.clone();
         let rows_activate = rows.clone();
+        let rows_secondary = rows.clone();
         let (tv, sv, av, nv) = (view.clone(), view.clone(), view.clone(), view.clone());
+        let cv = view.clone();
 
         let tree = Tree::new("schema-tree")
             .rows(items)
@@ -436,6 +443,16 @@ impl AppState {
                     av.update(cx, |this, cx| this.schema_preview(schema, table, cx))
                         .ok();
                 }
+            })
+            // Right-click opens the node's action menu. A column row has no
+            // actions of its own, so it falls through and opens nothing.
+            .on_secondary(move |ix, pos, _window, cx| {
+                if let Some(node) = rows_secondary[ix].node.clone()
+                    && !matches!(node, NodeId::Column { .. })
+                {
+                    cv.update(cx, |this, cx| this.schema_open_menu(node, pos, cx))
+                        .ok();
+                }
             });
 
         let footer_text = if s.loading {
@@ -464,6 +481,143 @@ impl AppState {
             .child(filter_row)
             .child(div().flex_1().min_h(px(0.)).child(tree))
             .child(footer)
+        // The right-click menu is deliberately NOT a child here: it renders at
+        // the shell root (see `render_schema_menu`), because this pane is the
+        // narrow sidebar and would both clip the menu and offset its position.
+    }
+
+    /// The right-click menu for one tree node. A namespace row offers the
+    /// namespace actions (the reason this menu exists: pointing a query at a
+    /// database without hand-qualifying every name); an object row offers the
+    /// browse/copy actions that were previously reachable only by clicking.
+    ///
+    /// Rendered from the **shell root**, not from the schema pane. `SchemaMenu.pos`
+    /// is a window coordinate (Flint's `Tree::on_secondary` hands over
+    /// `event.position`), so anchoring it inside the sidebar offset it by the
+    /// pane's origin *and* let the narrow pane clip it. `floating` resolves both:
+    /// it defers the surface (escaping the pane's clip) and fits it to the window.
+    pub(crate) fn render_schema_menu(
+        &self,
+        active: &ActiveConn,
+        menu: &SchemaMenu,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let pos = menu.pos;
+        let caps = active.config.kind.namespace_caps();
+        let mut items = ContextMenu::new("schema-context-menu");
+
+        match &menu.node {
+            NodeId::Schema(name) => {
+                let ns = name.clone();
+                items = items.item(
+                    ContextMenuItem::new("schema-new-query", "New query here").on_click(
+                        cx.listener({
+                            let ns = ns.clone();
+                            move |this, _, window, cx| {
+                                this.schema_close_menu(cx);
+                                this.schema_new_query_in(ns.clone(), window, cx);
+                            }
+                        }),
+                    ),
+                );
+                // Only offered where RED can actually rebind the namespace; on
+                // SQLite/Postgres the item would be a lie (see `namespace_caps`).
+                if caps.settable {
+                    let is_active = active.namespace.as_deref() == Some(ns.as_str());
+                    let label = if is_active {
+                        format!("✓ Active {}", caps.label.to_lowercase())
+                    } else {
+                        format!("Set as active {}", caps.label.to_lowercase())
+                    };
+                    items = items.item(
+                        ContextMenuItem::new("schema-set-namespace", label).on_click(cx.listener(
+                            {
+                                let ns = ns.clone();
+                                move |this, _, _, cx| {
+                                    this.schema_close_menu(cx);
+                                    this.set_active_namespace(Some(ns.clone()), cx);
+                                }
+                            },
+                        )),
+                    );
+                }
+                // Scoped to *this* database: the diagram maps what was right-clicked,
+                // not every database on the connection.
+                items = items.separator().item(
+                    ContextMenuItem::new("schema-er-diagram", "ER diagram").on_click(cx.listener(
+                        {
+                            let ns = ns.clone();
+                            move |this, _, _, cx| {
+                                this.schema_close_menu(cx);
+                                this.open_er_diagram(Some(ns.clone()), cx);
+                            }
+                        },
+                    )),
+                );
+                items = items.item(
+                    ContextMenuItem::new("schema-copy-name", "Copy name").on_click(cx.listener({
+                        let ns = ns.clone();
+                        move |this, _, _, cx| {
+                            this.schema_close_menu(cx);
+                            this.copy_to_clipboard(ns.clone(), "Name copied", cx);
+                        }
+                    })),
+                );
+            }
+            NodeId::Object { schema, name } => {
+                let (sc, nm) = (schema.clone(), name.clone());
+                items = items
+                    .item(
+                        ContextMenuItem::new("schema-browse", "Browse").on_click(cx.listener({
+                            let (sc, nm) = (sc.clone(), nm.clone());
+                            move |this, _, _, cx| {
+                                this.schema_close_menu(cx);
+                                this.schema_preview(sc.clone(), nm.clone(), cx);
+                            }
+                        })),
+                    )
+                    .item(
+                        ContextMenuItem::new("schema-obj-new-query", "New query here").on_click(
+                            cx.listener({
+                                let sc = sc.clone();
+                                move |this, _, window, cx| {
+                                    this.schema_close_menu(cx);
+                                    this.schema_new_query_in(sc.clone(), window, cx);
+                                }
+                            }),
+                        ),
+                    )
+                    .separator()
+                    .item(
+                        ContextMenuItem::new("schema-copy-qualified", "Copy qualified name")
+                            .on_click(cx.listener({
+                                let (sc, nm) = (sc.clone(), nm.clone());
+                                move |this, _, _, cx| {
+                                    this.schema_close_menu(cx);
+                                    let qualified = format!("{sc}.{nm}");
+                                    this.copy_to_clipboard(qualified, "Name copied", cx);
+                                }
+                            })),
+                    );
+            }
+            // Filtered out before the menu opens.
+            NodeId::Column { .. } => {}
+        }
+
+        // Full-bleed catcher dismisses on any outside click; `occlude()` keeps a
+        // press on the menu itself from reaching it (see the Redis key menu).
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.schema_close_menu(cx)),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(|this, _, _, cx| this.schema_close_menu(cx)),
+            )
+            .child(floating(div().occlude().child(items)).at(pos))
     }
 
     // --- tree interactions ---
@@ -494,6 +648,112 @@ impl AppState {
             active.schema.selected = Some(node);
         }
         cx.notify();
+    }
+
+    /// Open the right-click menu on `node`, anchored at the click position. Also
+    /// selects the row, so the menu visibly belongs to what was clicked.
+    pub(crate) fn schema_open_menu(
+        &mut self,
+        node: NodeId,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Phase::Connected(active) = &mut self.phase {
+            active.schema.selected = Some(node.clone());
+            active.schema.menu = Some(SchemaMenu { node, pos });
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn schema_close_menu(&mut self, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase
+            && active.schema.menu.take().is_some()
+        {
+            cx.notify();
+        }
+    }
+
+    /// Set the connection-level namespace every new tab (and any tab without its
+    /// own override) resolves unqualified names against.
+    ///
+    /// Re-runs nothing: an already-open result keeps the namespace it was opened
+    /// with, which is what the backend stores per result. The change takes effect
+    /// on the next query, so switching can't silently repoint rows on screen.
+    pub(crate) fn set_active_namespace(
+        &mut self,
+        namespace: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Phase::Connected(active) = &mut self.phase else {
+            return;
+        };
+        if active.namespace == namespace {
+            return;
+        }
+        active.namespace = namespace.clone();
+        // A tab-level override would mask the change and make the chip look
+        // ignored, so adopting a connection namespace clears the overrides.
+        for tab in &mut active.tabs {
+            tab.namespace = None;
+        }
+        let label = active.config.kind.namespace_caps().label.to_lowercase();
+        if let Some(ns) = namespace {
+            self.notify(ToastVariant::Success, format!("Active {label}: {ns}"), cx);
+        }
+        cx.notify();
+    }
+
+    /// Open/close the breadcrumb's database dropdown.
+    pub(crate) fn toggle_namespace_menu(&mut self, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase {
+            active.namespace_menu_open = !active.namespace_menu_open;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn close_namespace_menu(&mut self, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase
+            && std::mem::take(&mut active.namespace_menu_open)
+        {
+            cx.notify();
+        }
+    }
+
+    /// Point the *focused tab* at `namespace` (the breadcrumb picker). Scoped to the
+    /// tab rather than the connection so a split view can hold two databases; the
+    /// tree's "Set as active" is the connection-wide counterpart.
+    pub(crate) fn set_tab_namespace(&mut self, namespace: Option<String>, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase
+            && active.config.kind.namespace_caps().settable
+            && let Some(tab) = active.active_mut()
+        {
+            tab.namespace = namespace;
+        }
+        cx.notify();
+    }
+
+    /// Open a blank query tab bound to `namespace` — the tree's "New query here".
+    /// The tab carries its own override, so two tabs can sit on two databases.
+    pub(crate) fn schema_new_query_in(
+        &mut self,
+        namespace: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_query(cx);
+        if let Phase::Connected(active) = &mut self.phase
+            && active.config.kind.namespace_caps().settable
+            && let Some(tab) = active.active_mut()
+        {
+            tab.namespace = Some(namespace);
+        }
+        cx.notify();
+    }
+
+    /// Copy `text` and confirm with a toast; the tree's copy-name actions.
+    fn copy_to_clipboard(&mut self, text: String, message: &'static str, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.notify(ToastVariant::Success, message, cx);
     }
 
     /// Drive the schema tree from the keyboard (the focused sidebar's arrows +
@@ -615,7 +875,7 @@ impl AppState {
         filter: Option<ResultFilter>,
         cx: &mut Context<Self>,
     ) {
-        let (sql, label, table_ref) = match &self.phase {
+        let (sql, label, table_ref, browsed_schema) = match &self.phase {
             Phase::Connected(active) => {
                 let kind = active.config.kind;
                 let sql = format!(
@@ -626,7 +886,7 @@ impl AppState {
                 let label = format!("{schema}.{table}");
                 // The browsed table rides along so the backend can resolve a
                 // keyset seek key for it.
-                (sql, label, (schema, table))
+                (sql, label, (schema.clone(), table), schema)
             }
             _ => return,
         };
@@ -651,6 +911,17 @@ impl AppState {
             // No pristine tab to reuse (incl. the empty-strip case), so open one.
             let tab = crate::app::QueryTab::new(label.clone(), cx);
             self.push_tab(tab, cx);
+        }
+        // Browsing a table moves the tab into that table's database, so the
+        // breadcrumb (`connection / database / table`) is true by construction and
+        // a follow-up unqualified query lands where the user is visibly looking.
+        // The generated SQL above is fully qualified either way; this is about the
+        // *next* query the user types into this tab.
+        if let Phase::Connected(active) = &mut self.phase
+            && active.config.kind.namespace_caps().settable
+            && let Some(tab) = active.active_mut()
+        {
+            tab.namespace = Some(browsed_schema);
         }
         let editor = match &self.phase {
             Phase::Connected(active) => match active.active() {

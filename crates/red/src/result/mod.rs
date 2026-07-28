@@ -1356,6 +1356,7 @@ impl AppState {
             sort: None,
             filter,
             joins: Vec::new(),
+            namespace: self.send_namespace(),
         });
         self.start_query_ticker(cx);
         cx.notify();
@@ -1523,6 +1524,7 @@ impl AppState {
                 sort: Some(sort),
                 filter,
                 joins,
+                namespace: self.send_namespace(),
             });
             self.start_query_ticker(cx);
         }
@@ -1581,6 +1583,7 @@ impl AppState {
                 sort,
                 filter,
                 joins,
+                namespace: self.send_namespace(),
             });
             self.start_query_ticker(cx);
         }
@@ -1697,6 +1700,7 @@ impl AppState {
                 sort,
                 filter,
                 joins,
+                namespace: self.send_namespace(),
             });
             self.start_query_ticker(cx);
         }

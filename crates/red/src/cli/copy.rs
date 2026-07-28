@@ -389,6 +389,9 @@ fn open_source(
             sort: None,
             filter: None,
             joins: Vec::new(),
+            // The CLI has no tab context: unqualified names resolve against
+            // whatever the saved connection dialled, exactly as before.
+            namespace: None,
         },
     );
     loop {

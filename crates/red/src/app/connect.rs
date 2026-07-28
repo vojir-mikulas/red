@@ -47,6 +47,17 @@ impl AppState {
         }
     }
 
+    /// The namespace to stamp on a query command for the foreground connection's
+    /// focused tab (see `ActiveConn::namespace_for_send`). `None` when nothing is
+    /// connected, or on an engine whose namespace is fixed at connect — which is
+    /// every engine but MySQL/ClickHouse today, so those paths are unchanged.
+    pub(crate) fn send_namespace(&self) -> Option<String> {
+        match &self.phase {
+            Phase::Connected(active) => active.namespace_for_send(),
+            _ => None,
+        }
+    }
+
     /// Move the foreground live connection (if any) into the warm-session map so
     /// switching back to it is instant. Leaves `phase` `Disconnected`; the caller
     /// installs the next phase. A connecting/disconnected foreground parks nothing.

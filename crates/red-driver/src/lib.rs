@@ -1071,6 +1071,28 @@ pub trait DatabaseDriver: Send + Sync {
     /// synchronous; drivers report a compiled-in or already-known value.
     fn server_version(&self) -> String;
 
+    /// A handle to this same session whose unqualified names resolve against
+    /// `namespace` (a database on MySQL/ClickHouse, see
+    /// [`DbKind::namespace_caps`](red_core::DbKind::namespace_caps)). `None`
+    /// restores the connection's dialled default.
+    ///
+    /// The returned handle **shares the underlying connection/pool** — this is a
+    /// cheap field-level clone, not a new dial, so it is fine to call per
+    /// operation. Every method on the returned handle binds the namespace itself,
+    /// which is what makes a windowed result keep its namespace across seeks: the
+    /// cursor holds the scoped handle, so `fetch_seek`/`count`/`column_stats` for
+    /// that result cannot silently revert to the connection default.
+    ///
+    /// Binding is per operation rather than per session on purpose. MySQL
+    /// re-acquires a pooled connection for *every* method (and a pooled
+    /// connection is reset on reclaim, so session state does not survive anyway),
+    /// so there is no session to bind; and per-operation binding is what lets two
+    /// tabs in a split view target two different databases on one connection.
+    ///
+    /// Engines whose namespace is fixed at connect (SQLite, and Postgres until
+    /// `search_path` gets per-client tracking) return themselves unchanged.
+    fn scoped(self: Arc<Self>, namespace: Option<&str>) -> Arc<dyn DatabaseDriver>;
+
     /// Prepare `sql`, read column metadata, and return a live cursor. Cheap by
     /// design: this does NOT step rows; the first (potentially expensive) step
     /// happens on the first `next_window`, which is the cancellable path.

@@ -55,6 +55,19 @@ pub struct MysqlDriver {
     /// connection's chosen `database`. `None` lists every non-system database on
     /// the server (a MySQL connection can see them all). See [`Self::with_scope`].
     scope: Option<String>,
+    /// The database unqualified names in this handle's queries resolve against,
+    /// when it differs from [`Self::default_db`]. Set by
+    /// [`scoped`](DatabaseDriver::scoped) and applied by [`Self::conn`]; `None`
+    /// means "whatever the DSN dialled", so the pre-existing path is unchanged.
+    ///
+    /// Distinct from `scope`, which only filters the schema *tree* and never
+    /// touches query execution.
+    namespace: Option<String>,
+    /// The database the DSN itself named (`None` when its path segment is empty,
+    /// which is legal for MySQL). Every pooled connection already starts here, so
+    /// a `namespace` equal to this needs no `USE` — that's what keeps the default
+    /// path at its old cost.
+    default_db: Option<String>,
 }
 
 impl MysqlDriver {
@@ -62,6 +75,9 @@ impl MysqlDriver {
     /// verify connectivity, and read the server version.
     pub async fn connect(dsn: &str, read_only: bool) -> Result<Self> {
         let opts = Opts::from_url(dsn).map_err(|e| RedError::Connect(e.to_string()))?;
+        // Remember what the DSN dialled so `scoped` can skip the `USE` round-trip
+        // for the (overwhelmingly common) namespace that matches it.
+        let default_db = opts.db_name().map(str::to_owned).filter(|d| !d.is_empty());
         // `CLIENT_FOUND_ROWS`: report *matched* rows from `affected_rows`, like
         // Postgres and SQLite. Without it a no-op `UPDATE` (PK matched, value
         // unchanged) reports 0 and `apply_edit`'s `affected != 1` check would roll
@@ -86,7 +102,31 @@ impl MysqlDriver {
             version: version.unwrap_or_default(),
             read_only,
             scope: None,
+            namespace: None,
+            default_db,
         })
+    }
+
+    /// A pooled connection with this handle's namespace already bound.
+    ///
+    /// Every method takes its connection from here rather than from the pool
+    /// directly. MySQL hands out an arbitrary pooled connection per operation and
+    /// resets it on reclaim (see the `read_only` field's note), so a default
+    /// database cannot be established once for the session — it has to be
+    /// re-bound per operation. That is also precisely what lets two tabs in a
+    /// split view target two different databases over one connection.
+    ///
+    /// The `USE` is the first statement on this connection, so it lands *before*
+    /// the `START TRANSACTION READ ONLY` that [`Self::begin_stmt`] opens for a
+    /// write batch, never inside it.
+    async fn conn(&self) -> Result<mysql_async::Conn> {
+        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        if let Some(ns) = &self.namespace {
+            conn.query_drop(format!("USE `{}`", escape_ident(ns)))
+                .await
+                .map_err(map_my_err)?;
+        }
+        Ok(conn)
     }
 
     /// The statement that opens a write transaction. On a read-only connection it
@@ -161,7 +201,7 @@ impl MysqlDriver {
         key: &KeySpec,
         abort: &AbortSignal,
     ) -> Result<ResultPage> {
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let mut conn = self.conn().await?;
         let _guard = self.arm_kill(abort, conn.id());
         if abort.is_aborted() {
             return Err(RedError::Interrupted);
@@ -184,7 +224,7 @@ impl MysqlDriver {
 #[async_trait]
 impl DatabaseDriver for MysqlDriver {
     async fn ping(&self) -> Result<()> {
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let mut conn = self.conn().await?;
         conn.query_drop("SELECT 1").await.map_err(driver_err)
     }
 
@@ -192,8 +232,27 @@ impl DatabaseDriver for MysqlDriver {
         self.version.clone()
     }
 
+    /// Rebind the default database. Shares the `Pool` (an `Arc` internally), so
+    /// this is a field copy, not a new dial. A namespace matching what the DSN
+    /// already dialled is stored as `None`, so [`Self::conn`] skips the `USE`
+    /// entirely and the common path costs exactly what it did before.
+    fn scoped(self: Arc<Self>, namespace: Option<&str>) -> Arc<dyn DatabaseDriver> {
+        let requested = namespace.filter(|n| !n.is_empty()).map(str::to_owned);
+        if requested == self.namespace {
+            return self;
+        }
+        Arc::new(Self {
+            pool: self.pool.clone(),
+            version: self.version.clone(),
+            read_only: self.read_only,
+            scope: self.scope.clone(),
+            namespace: requested.filter(|n| Some(n) != self.default_db.as_ref()),
+            default_db: self.default_db.clone(),
+        })
+    }
+
     async fn open_cursor(&self, sql: &str, opts: QueryOptions) -> Result<Box<dyn QueryCursor>> {
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let mut conn = self.conn().await?;
         let conn_id = conn.id();
         // Prepare to read columns up front without stepping rows: cheap, as the
         // contract requires; the (possibly expensive) execute happens in the task.
@@ -254,7 +313,7 @@ impl DatabaseDriver for MysqlDriver {
     }
 
     async fn list_objects(&self) -> Result<Vec<SchemaMeta>> {
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let mut conn = self.conn().await?;
         // Scoped to one database → just that name (empty tree if it doesn't exist);
         // otherwise every non-system database the connection can see.
         let schema_names: Vec<String> = if let Some(scope) = &self.scope {
@@ -306,7 +365,7 @@ impl DatabaseDriver for MysqlDriver {
     }
 
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableDetail> {
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let mut conn = self.conn().await?;
 
         // Columns (`column_key = 'PRI'` ⇒ primary-key member).
         let column_rows: Vec<(String, String, String, Option<String>, String, String)> = conn
@@ -376,7 +435,7 @@ impl DatabaseDriver for MysqlDriver {
         // `enum`); parse the variant list per column. A NULL/absent schema falls back
         // to the connection's default database.
         let schema = table.schema.clone();
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let mut conn = self.conn().await?;
         let rows: Vec<(String, String)> = conn
             .exec(
                 "SELECT column_name, column_type \
@@ -400,7 +459,7 @@ impl DatabaseDriver for MysqlDriver {
         // database the connection can see — so the emitted `from_schema` matches the
         // schema the tree browses. (`DATABASE()` is the DSN's default database, which
         // is unrelated to `self.scope` and NULL when the DSN carries no database.)
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let mut conn = self.conn().await?;
         type FkQueryRow = (
             String,
             String,
@@ -483,7 +542,7 @@ impl DatabaseDriver for MysqlDriver {
 
     async fn count(&self, sql: &str, abort: &AbortSignal) -> Result<i64> {
         let sql = format!("SELECT count(*) FROM ({}) AS _red", strip_trailing(sql));
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let mut conn = self.conn().await?;
         let _guard = self.arm_kill(abort, conn.id());
         if abort.is_aborted() {
             return Err(RedError::Interrupted);
@@ -500,7 +559,7 @@ impl DatabaseDriver for MysqlDriver {
         abort: &AbortSignal,
     ) -> Result<red_core::ColumnStats> {
         let sql = crate::stats_sql(sql, column, flags, |c| format!("`{}`", escape_ident(c)));
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let mut conn = self.conn().await?;
         let _guard = self.arm_kill(abort, conn.id());
         if abort.is_aborted() {
             return Err(RedError::Interrupted);
@@ -524,7 +583,7 @@ impl DatabaseDriver for MysqlDriver {
             "SELECT * FROM ({}) AS _red LIMIT {limit} OFFSET {offset}",
             strip_trailing(sql)
         );
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let mut conn = self.conn().await?;
         let _guard = self.arm_kill(abort, conn.id());
         if abort.is_aborted() {
             return Err(RedError::Interrupted);
@@ -603,7 +662,7 @@ impl DatabaseDriver for MysqlDriver {
             "SELECT min({col}), max({col}) FROM ({}) AS _red",
             strip_trailing(sql)
         );
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let mut conn = self.conn().await?;
         let _guard = self.arm_kill(abort, conn.id());
         if abort.is_aborted() {
             return Err(RedError::Interrupted);
@@ -619,7 +678,7 @@ impl DatabaseDriver for MysqlDriver {
     }
 
     async fn execute(&self, sql: &str) -> Result<u64> {
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let mut conn = self.conn().await?;
         conn.query_drop(self.begin_stmt())
             .await
             .map_err(map_my_err)?;
@@ -640,7 +699,7 @@ impl DatabaseDriver for MysqlDriver {
         if statements.is_empty() {
             return Ok(Vec::new());
         }
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let mut conn = self.conn().await?;
         conn.query_drop(self.begin_stmt())
             .await
             .map_err(map_my_err)?;
@@ -662,7 +721,7 @@ impl DatabaseDriver for MysqlDriver {
         if ops.is_empty() {
             return Ok(0);
         }
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let mut conn = self.conn().await?;
         conn.query_drop(self.begin_stmt())
             .await
             .map_err(map_my_err)?;
@@ -713,7 +772,7 @@ impl DatabaseDriver for MysqlDriver {
         if rows.is_empty() {
             return Ok(0);
         }
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let mut conn = self.conn().await?;
         conn.query_drop(self.begin_stmt())
             .await
             .map_err(map_my_err)?;
@@ -753,7 +812,7 @@ impl DatabaseDriver for MysqlDriver {
             Some(s) if !s.is_empty() => format!("{}.{}", quote(s), quote(&table.name)),
             _ => quote(&table.name),
         };
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let mut conn = self.conn().await?;
         conn.query_drop(self.begin_stmt())
             .await
             .map_err(map_my_err)?;
@@ -813,7 +872,7 @@ impl DatabaseDriver for MysqlDriver {
 
     async fn explain(&self, sql: &str, analyze: bool) -> Result<QueryPlan> {
         let base = strip_trailing(sql);
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let mut conn = self.conn().await?;
         if analyze {
             // `EXPLAIN ANALYZE` (MySQL 8.0.18+) yields the tree format and runs
             // the statement. MariaDB's syntax differs; that surfaces as a normal
@@ -852,7 +911,7 @@ impl DatabaseDriver for MysqlDriver {
         progress: UnboundedSender<u64>,
     ) -> Result<u64> {
         let sql = format!("SELECT * FROM ({}) AS _red", strip_trailing(sql));
-        let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
+        let mut conn = self.conn().await?;
         let stmt = conn.prep(&sql).await.map_err(map_my_err)?;
         let names: Vec<String> = stmt
             .columns()
@@ -1167,12 +1226,24 @@ fn map_connect_err(e: MyError) -> RedError {
 }
 
 /// Map a killed query (`KILL QUERY` → error 1317, SQLSTATE `70100`) to the
-/// distinct `Interrupted`; everything else is a driver error.
+/// distinct `Interrupted`, and "no database selected" (1046, `ER_NO_DB_ERROR`) to
+/// the actionable `NamespaceRequired`; everything else is a driver error.
+///
+/// 1046 is what an unqualified query hits when the connection dialled no database
+/// — legal for MySQL, whose database segment is optional so the tree can browse
+/// the whole server. Left as a generic driver error it surfaces as the engine's
+/// bare "No database selected" toast with nothing to act on; typed, the UI can
+/// answer with a database picker instead.
 fn map_my_err(e: MyError) -> RedError {
-    if let MyError::Server(ref se) = e
-        && (se.code == 1317 || se.code == 1927 || se.state == "70100")
-    {
-        return RedError::Interrupted;
+    if let MyError::Server(ref se) = e {
+        if se.code == 1317 || se.code == 1927 || se.state == "70100" {
+            return RedError::Interrupted;
+        }
+        if se.code == 1046 {
+            return RedError::NamespaceRequired {
+                label: DbKind::Mysql.namespace_caps().label,
+            };
+        }
     }
     driver_err(e)
 }
@@ -1555,6 +1626,62 @@ mod tests {
         )
         .await;
         driver.execute(&format!("DROP TABLE `{t}`")).await.unwrap();
+    }
+
+    /// A `scoped` handle rebinds the default database for real, and — the part
+    /// that actually broke things — *keeps* it across the one-shot fetches a
+    /// windowed result drives, not just the opening statement.
+    #[tokio::test]
+    async fn scoped_rebinds_the_default_database_for_every_fetch() {
+        let url = url_or_skip!();
+        let driver = Arc::new(MysqlDriver::connect(&url, false).await.unwrap());
+        let home = current_schema(&driver).await;
+
+        // A second database with a table the *connection's* database lacks, so an
+        // unqualified reference can only resolve when the namespace is bound.
+        let other = format!("red_ns_{}", std::process::id());
+        driver
+            .execute(&format!("CREATE DATABASE IF NOT EXISTS `{other}`"))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!(
+                "CREATE TABLE `{other}`.`ns_probe` (id INT PRIMARY KEY)"
+            ))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!(
+                "INSERT INTO `{other}`.`ns_probe` VALUES (1), (2), (3)"
+            ))
+            .await
+            .unwrap();
+
+        let abort = AbortSignal::new();
+        let scoped = driver.clone().scoped(Some(&other));
+        // Unqualified: resolves only because the handle bound the namespace.
+        let sql = "SELECT id FROM ns_probe ORDER BY id";
+        assert_eq!(scoped.count(sql, &abort).await.unwrap(), 3);
+        // The paging path re-acquires a pooled connection per call, so this is
+        // what would silently revert to the connection's own database.
+        let page = scoped
+            .fetch_page(sql, 1, 2, PageCap::Full, &abort)
+            .await
+            .unwrap();
+        assert_eq!(page.rows.len(), 2, "second window must stay in `{other}`");
+
+        // The original handle is untouched: scoping is per handle, which is what
+        // lets two tabs sit on two databases over one pool.
+        assert_eq!(current_schema(&driver).await, home);
+        assert!(
+            driver.count(sql, &abort).await.is_err(),
+            "unscoped handle must not see `{other}`.ns_probe"
+        );
+
+        driver
+            .execute(&format!("DROP DATABASE `{other}`"))
+            .await
+            .unwrap();
     }
 
     /// The connection's current database: fixtures live here, so introspection

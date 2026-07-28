@@ -49,6 +49,9 @@ impl AppState {
     pub(crate) fn explain_query(&mut self, analyze: bool, cx: &mut Context<Self>) {
         let sql = match &self.phase {
             Phase::Connected(active) => match active.active() {
+                // An ER tab has no query to explain; its editor is a hidden
+                // placeholder (see `QueryTab::is_er`).
+                Some(tab) if tab.is_er() => return,
                 Some(tab) => {
                     let editor = tab.editor.read(cx);
                     editor.selected_text().unwrap_or_else(|| editor.content())

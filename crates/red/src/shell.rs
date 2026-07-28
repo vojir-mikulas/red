@@ -462,6 +462,15 @@ impl AppState {
                     .children(assistant_enabled.then_some(assistant_toggle)),
             );
 
+        // The schema tree's right-click menu renders here, at the root, so its
+        // full-window dismiss catcher covers the whole shell and its
+        // window-coordinate anchor isn't offset by the sidebar's origin.
+        let schema_menu = active
+            .schema
+            .menu
+            .as_ref()
+            .map(|m| self.render_schema_menu(active, m, cx));
+
         div()
             .size_full()
             .flex()
@@ -471,6 +480,7 @@ impl AppState {
             .child(topbar)
             .child(body)
             .child(statusbar)
+            .children(schema_menu)
     }
 
     /// The top bar (connection switcher · self-update pill · disconnect ·
@@ -1978,6 +1988,33 @@ impl AppState {
     ) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let is_split = active.split.is_some();
+
+        // An ER diagram takes the half whole *below the tab strip*. Unlike a query
+        // plan, which shares the result slot with the grid and keeps the editor above
+        // it, there is no SQL behind a diagram, so the editor would only be shrinking
+        // the canvas — but the strip stays, or the diagram would be a tab you can see
+        // no way out of.
+        if active.tabs.get(tab_idx).is_some_and(|t| t.is_er()) {
+            let canvas = self.render_er(active, tab_idx, cx);
+            let body = div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(theme.bg_app)
+                .child(self.render_tab_strip(active, half, cx))
+                .child(div().flex_1().min_h(px(0.)).child(canvas))
+                .into_any_element();
+            // The visible-table describe wants `&mut self`, so it can't run inside the
+            // frame it belongs to. Deferring also means it reads the viewport rect the
+            // `canvas` in this very frame captured, rather than the previous one's.
+            let view = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                view.update(cx, |this, cx| this.er_fetch_visible_details(tab_idx, cx))
+                    .ok();
+            });
+            return self.wrap_half(body, half, is_focused, is_split, &theme, cx);
+        }
+
         let editor_pane = self.render_editor(active, tab_idx, half, is_focused, cx);
         let results_pane = self.render_results_slot(active, tab_idx, half, is_focused, window, cx);
 
@@ -2022,11 +2059,32 @@ impl AppState {
             .first(editor_pane)
             .second(results_pane);
 
-        // The unique wrapper id scopes the two halves' child element ids apart; the
-        // mouse-down aims run/export/filter at whichever half was clicked.
+        self.wrap_half(
+            vsplit.into_any_element(),
+            half,
+            is_focused,
+            is_split,
+            &theme,
+            cx,
+        )
+    }
+
+    /// Wrap a half's body in the chrome every half shares: the id that scopes the two
+    /// halves' child element ids apart, the focus outline and cross-divider tab drop
+    /// target shown while split, and the mouse-down that aims run/export/filter at
+    /// whichever half was clicked.
+    fn wrap_half(
+        &self,
+        body: gpui::AnyElement,
+        half: SplitHalf,
+        is_focused: bool,
+        is_split: bool,
+        theme: &flint::Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let accent = theme.accent;
         let border = theme.border;
-        let drop_view = view.clone();
+        let drop_view = cx.entity().downgrade();
         div()
             .id(("split-half", half.index()))
             .size_full()
@@ -2053,7 +2111,7 @@ impl AppState {
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| this.set_split_focus(half, cx)),
             )
-            .child(vsplit)
+            .child(body)
             .into_any_element()
     }
 

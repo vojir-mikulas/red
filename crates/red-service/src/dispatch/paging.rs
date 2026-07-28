@@ -56,6 +56,12 @@ pub(crate) enum BuildStatus {
 #[derive(Debug, Clone)]
 pub(crate) struct OpenSpec {
     pub(crate) sql: String,
+    /// The namespace this result's `sql` was opened against (see
+    /// `DatabaseDriver::scoped`). Stored per result, not per session, because
+    /// every later fetch for this epoch — page, seek run, count, stats, export —
+    /// re-derives the driver from the session and would otherwise silently revert
+    /// to the connection's dialled default partway down a windowed result.
+    pub(crate) namespace: Option<String>,
     pub(crate) key: Option<KeySpec>,
     /// Positions of the key columns within a result row (lead, then tiebreaker);
     /// the checkpoint build reads each checkpoint's key tuple out of the row at
@@ -468,6 +474,7 @@ mod checkpoint_tests {
     fn spec_for(checkpoints: &Arc<Mutex<CheckpointIndex>>, total: usize) -> OpenSpec {
         OpenSpec {
             sql: "SELECT * FROM t".into(),
+            namespace: None,
             key: Some(KeySpec::single("x", KeyKind::Int)),
             key_cols: vec![0],
             bounds: None,

@@ -6,6 +6,27 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Database context for MySQL and ClickHouse connections, which can browse a whole
+  server rather than a single database. The editor breadcrumb now reads
+  `connection / database / table`, where the database is a picker showing which
+  one an unqualified `FROM users` will resolve against; browsing a table from the
+  tree moves the tab into that table's database. The schema tree gained a
+  right-click menu with "New query here" and "Set as active database". The target
+  is per tab, so a split view can compare two databases over one connection.
+- Right-click menu in the schema tree: browse a table, open a query bound to a
+  namespace, and copy a plain or qualified name.
+
+### Fixed
+- Running an unqualified query on a MySQL connection that named no database
+  reported the server's bare "No database selected" with no way to act on it. The
+  results pane now explains what happened and lists the databases on the server,
+  so picking one sets the target and re-runs the query.
+- ClickHouse connections that named no database silently resolved unqualified
+  queries against `default`, even while browsing another database — which could
+  return a same-named table's rows rather than an error. The database is now
+  explicit and selectable.
+
 ## [0.18.0] - 2026-07-20
 
 ### Added

@@ -179,6 +179,85 @@ impl DbKind {
             },
         }
     }
+
+    /// How this engine resolves the names in an *unqualified* query — the
+    /// namespace a bare `FROM users` binds against — and whether RED can rebind
+    /// it per query. The counterpart to [`DbKind::write_caps`]: the UI holds only
+    /// a [`DbKind`], never a driver, so it reads this to decide whether to offer a
+    /// namespace picker at all and what to call it.
+    ///
+    /// The tree's top level *is* this namespace for every engine (see
+    /// [`SchemaMeta`]), so a picker is just the tree's own list.
+    pub const fn namespace_caps(self) -> NamespaceCaps {
+        match self {
+            // A MySQL connection can browse every database on the server, and its
+            // database segment is optional (see the connection form), so an
+            // unqualified query has no target at all until one is bound: the
+            // engine answers error 1046 (`ER_NO_DB_ERROR`). Rebound per query with
+            // `USE`, which is why this is `settable`.
+            DbKind::Mysql => NamespaceCaps {
+                settable: true,
+                required: true,
+                label: "Database",
+            },
+            // Like MySQL, a ClickHouse connection sees every database — but an
+            // unbound query silently resolves against `default` instead of
+            // erroring, so `required` is false while the picker still matters:
+            // querying the wrong database is a worse failure than being told.
+            DbKind::Clickhouse => NamespaceCaps {
+                settable: true,
+                required: false,
+                label: "Database",
+            },
+            // Postgres binds its database at connect (it cannot be switched on a
+            // live connection); the rebindable namespace is the *schema*, via
+            // `search_path`. Not settable yet: a `SET search_path` persists on a
+            // pooled/streaming client and would leak across tabs, so it needs the
+            // per-client tracking that MySQL's re-acquire-per-operation pooling
+            // makes unnecessary. Tracked in docs/plans/todo/database-context.md.
+            DbKind::Postgres => NamespaceCaps {
+                settable: false,
+                required: false,
+                label: "Schema",
+            },
+            // SQLite's namespaces are `main`/`temp` plus whatever is attached;
+            // `main` is fixed for the lifetime of the connection and unqualified
+            // names resolve against it, so there is nothing to pick.
+            DbKind::Sqlite => NamespaceCaps {
+                settable: false,
+                required: false,
+                label: "Database",
+            },
+            // Neither engine is SQL-shaped, so "the namespace an unqualified query
+            // binds against" has no meaning: Redis addresses a logical DB index on
+            // the connection, MongoDB names its database per request over
+            // `DocDriver`. Both stay unsettable so any UI gated on this descriptor
+            // (rather than on the connection kind) stays hidden.
+            DbKind::Redis | DbKind::Mongo => NamespaceCaps {
+                settable: false,
+                required: false,
+                label: "Database",
+            },
+        }
+    }
+}
+
+/// How an engine resolves unqualified names, and whether RED can rebind that per
+/// query (see [`DbKind::namespace_caps`]). A cheap `Copy` descriptor the UI reads
+/// to gate the namespace picker without knowing anything about a driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NamespaceCaps {
+    /// RED can bind a namespace per query on this engine, so the UI may offer a
+    /// picker. When false the namespace is fixed at connect and the picker is
+    /// hidden entirely.
+    pub settable: bool,
+    /// Running with no namespace bound is an error the *engine* raises rather
+    /// than a silent default. Drives the "you must pick one" affordance.
+    pub required: bool,
+    /// What to call this level in the UI: engines whose tree top level is a
+    /// database say "Database", Postgres (whose top level is a schema) says
+    /// "Schema".
+    pub label: &'static str,
 }
 
 /// Whether a DSN string requests TLS — by scheme (`rediss`/`clickhouses`) or a
@@ -2032,6 +2111,14 @@ pub enum RedError {
     },
     #[error("query failed: {0}")]
     Query(String),
+    /// The query names no database and the session has none bound, so the engine
+    /// refused it (MySQL error 1046, `ER_NO_DB_ERROR`). Distinct from
+    /// [`RedError::Query`] because it is not a defect in the SQL: the user need
+    /// only pick a namespace, so the UI answers with a picker instead of a dead
+    /// end. `label` is the engine's word for the level ("Database"/"Schema", from
+    /// [`NamespaceCaps::label`]) so the message reads right per engine.
+    #[error("no {label} selected for this query")]
+    NamespaceRequired { label: &'static str },
     #[error("driver error: {0}")]
     Driver(String),
     /// A fetch was aborted out-of-band (user cancel). Distinct from a failure so
@@ -2071,6 +2158,40 @@ pub enum UpdateState {
     /// writable `/Applications/Red.app`: a dev build, Homebrew, a read-only
     /// volume). `url` links the GitHub release for a manual download.
     Unsupported { version: String, url: String },
+}
+
+#[cfg(test)]
+mod namespace_caps_tests {
+    use super::*;
+
+    /// An engine that *errors* without a bound namespace must also let RED bind
+    /// one. The pair `required && !settable` would be a dead end by construction:
+    /// the query fails, and the UI has nothing to offer — exactly the bug this
+    /// descriptor exists to prevent (MySQL's "No database selected").
+    #[test]
+    fn required_namespaces_are_always_settable() {
+        for kind in DbKind::all() {
+            let caps = kind.namespace_caps();
+            assert!(
+                !caps.required || caps.settable,
+                "{kind} requires a namespace but cannot bind one, which is a dead end"
+            );
+        }
+    }
+
+    /// The label is a UI noun ("Database"/"Schema"), so it must be non-empty and
+    /// capitalized — it is interpolated raw into the picker and its messages.
+    #[test]
+    fn namespace_labels_are_presentable_nouns() {
+        for kind in DbKind::all() {
+            let label = kind.namespace_caps().label;
+            assert!(!label.is_empty(), "{kind} has a blank namespace label");
+            assert!(
+                label.starts_with(|c: char| c.is_ascii_uppercase()),
+                "{kind} label {label:?} should be capitalized"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

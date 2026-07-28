@@ -649,21 +649,17 @@ pub(crate) fn history_label(sql: &str) -> String {
 }
 
 impl AppState {
-    /// The editor pane for the tab at `tab_idx`, shown in split half `half`: the tab
-    /// strip + breadcrumb + the `CodeEditor` surface + run bar. `is_focused` is
-    /// whether this half holds focus; the (single-instance) find bar renders only in
-    /// the focused half.
-    pub(crate) fn render_editor(
+    /// This half's tab strip: one tab per open query in the pane, plus the "＋".
+    ///
+    /// Split out of [`AppState::render_editor`] because an ER tab replaces the
+    /// editor entirely (see `render_half`) yet still needs its strip — a diagram
+    /// you cannot tab away from, and whose own tab you cannot see, is a trap.
+    pub(crate) fn render_tab_strip(
         &self,
         active: &ActiveConn,
-        tab_idx: usize,
         half: crate::app::SplitHalf,
-        is_focused: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        // Owned (not borrowed from `cx`) so the agent-tab branch below can call a
-        // `&mut cx` render method without clashing with the theme tokens this fn
-        // snapshots throughout.
+    ) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let (bg_app, bg_panel, bg_elevated, bg_hover) = (
             theme.bg_app,
@@ -671,24 +667,12 @@ impl AppState {
             theme.bg_elevated,
             theme.bg_hover,
         );
-        let (border, border_soft) = (theme.border, theme.border_soft);
-        let (text, muted, faint, dim) = (
-            theme.text,
-            theme.text_muted,
-            theme.text_faint,
-            theme.text_dim,
-        );
-        let (yellow, on_accent) = (theme.yellow, theme.on_accent);
+        let border = theme.border;
+        let (text, muted, faint) = (theme.text, theme.text_muted, theme.text_faint);
         let accent = theme.accent;
-        // UI-chrome icon size scaled with the general UI font (not the editor
-        // mono font). Snapshotted here (Pixels is Copy) so it survives into the
-        // lazy per-tab `.map` closure without re-borrowing `theme`.
         let icon_close = theme.scale(9.);
-        // UI font + chrome sizes snapshotted (SharedString clones / Copy `Pixels`)
-        // so the tab + breadcrumb chrome tracks the UI font even inside the lazy
-        // per-tab `.map` closure. The editor *surface* keeps its own mono font.
         let ui_family = theme.font_family.clone();
-        let (size_11, size_12) = (theme.scale(11.), theme.scale(12.));
+        let size_12 = theme.scale(12.);
         let view = cx.entity().downgrade();
 
         // --- tab strip: one tab per open query + a "new query" affordance ---
@@ -979,6 +963,43 @@ impl AppState {
                     .child(crate::icons::icon("plus", theme.scale(13.), faint)),
             );
 
+        tabstrip.into_any_element()
+    }
+
+    /// The editor pane for the tab at `tab_idx`, shown in split half `half`: the tab
+    /// strip + breadcrumb + the `CodeEditor` surface + run bar. `is_focused` is
+    /// whether this half holds focus; the (single-instance) find bar renders only in
+    /// the focused half.
+    pub(crate) fn render_editor(
+        &self,
+        active: &ActiveConn,
+        tab_idx: usize,
+        half: crate::app::SplitHalf,
+        is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        // Owned (not borrowed from `cx`) so the agent-tab branch below can call a
+        // `&mut cx` render method without clashing with the theme tokens this fn
+        // snapshots throughout.
+        let theme = cx.theme().clone();
+        let (bg_app, bg_panel) = (theme.bg_app, theme.bg_panel);
+        let (border, border_soft) = (theme.border, theme.border_soft);
+        let (text, muted, faint, dim) = (
+            theme.text,
+            theme.text_muted,
+            theme.text_faint,
+            theme.text_dim,
+        );
+        let (yellow, on_accent) = (theme.yellow, theme.on_accent);
+        // UI font + chrome sizes snapshotted (SharedString clones / Copy `Pixels`)
+        // so the breadcrumb chrome tracks the UI font. The editor *surface* keeps
+        // its own mono font.
+        let ui_family = theme.font_family.clone();
+        let (size_11, size_12) = (theme.scale(11.), theme.scale(12.));
+
+        // The strip is shared with the ER-diagram path, which has no editor.
+        let tabstrip = self.render_tab_strip(active, half, cx);
+
         // No open tab (user closed the last one): keep the strip (its ＋ opens
         // a new query) over an empty pane, and skip the editor/run/breadcrumb.
         let Some(tab) = active.tabs.get(tab_idx) else {
@@ -1001,7 +1022,24 @@ impl AppState {
                 .child(empty);
         };
 
-        // --- breadcrumb: connection › query ---
+        // --- breadcrumb: connection / database / query ---
+        // The database crumb is the *interactive* namespace picker: this bar is
+        // where the eye goes to answer "where am I", so the answer and the control
+        // that changes it are the same widget. (It used to be a separate chip down
+        // in the run bar, which put the answer among the action buttons and let it
+        // disagree with the crumb next to it.)
+        let ns_segment = self.render_namespace_picker(active, cx);
+        // A browse tab is titled "db.table"; with the database as its own crumb the
+        // prefix is redundant, so drop it when the two agree. When they don't, the
+        // qualified title is the honest thing to show and it stays.
+        let crumb_title = match active.namespace_for_send() {
+            Some(ns) => tab
+                .title
+                .strip_prefix(&format!("{ns}."))
+                .unwrap_or(&tab.title)
+                .to_string(),
+            None => tab.title.clone(),
+        };
         let breadcrumb = div()
             .flex_shrink_0()
             .h(px(26.))
@@ -1016,8 +1054,11 @@ impl AppState {
             .text_size(size_11)
             .text_color(muted)
             .child(active.config.name.clone())
+            .when_some(ns_segment, |d, seg| {
+                d.child(div().text_color(dim).child("/")).child(seg)
+            })
             .child(div().text_color(dim).child("/"))
-            .child(div().text_color(text).child(tab.title.clone()));
+            .child(div().text_color(text).child(crumb_title));
 
         // The editor's own typography, applied here: the `CodeEditor` shapes its
         // text with `window.text_style()` / `window.line_height()`, both inherited
@@ -1116,6 +1157,133 @@ impl AppState {
             .child(run_bar)
     }
 
+    /// The breadcrumb's database crumb: which database (MySQL/ClickHouse) an
+    /// unqualified `FROM users` in this tab resolves against, *and* the control
+    /// that changes it.
+    ///
+    /// This is the affordance the feature exists for — before it, nothing on
+    /// screen said what a bare table name would bind to, so a MySQL connection
+    /// dialled without a database failed with the engine's bare "No database
+    /// selected" and no way to act on it.
+    ///
+    /// It lives in the breadcrumb rather than the run bar because the breadcrumb
+    /// is already the "where am I" line: `connection / database / table`. Split
+    /// across two places the two could visibly disagree — the crumb reading one
+    /// database while the picker read another — which is exactly the confusion a
+    /// context indicator is supposed to remove.
+    ///
+    /// Hidden on engines whose namespace is fixed at connect (SQLite, Postgres),
+    /// where a picker would be a lie, and the breadcrumb falls back to its plain
+    /// `connection / title` form. Shows the tab's override when it has one, else
+    /// the connection's; picking writes the *tab* override, so two tabs in a split
+    /// can sit on two databases.
+    fn render_namespace_picker(
+        &self,
+        active: &ActiveConn,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
+        let caps = active.config.kind.namespace_caps();
+        if !caps.settable {
+            return None;
+        }
+        let theme = cx.theme();
+        let (muted, text, yellow) = (theme.text_muted, theme.text, theme.yellow);
+        let hover_bg = theme.bg_panel_2;
+        let (radius, size_11, icon_sz) = (theme.radius_sm, theme.scale(11.), theme.scale(10.));
+        let current = active.namespace_for_send();
+        let names: Vec<String> = active
+            .schema
+            .schemas
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        // Unset on an engine that *errors* without one (MySQL) is the state worth
+        // shouting about, so the crumb goes warning-tinted rather than muted.
+        let unset_is_a_problem = current.is_none() && caps.required;
+        let tint = if unset_is_a_problem { yellow } else { text };
+        let label = current
+            .clone()
+            .unwrap_or_else(|| format!("no {}", caps.label.to_lowercase()));
+
+        // Deliberately hand-built rather than a Flint `Select`, even a `seamless`
+        // one: that trigger hardcodes the base font size, medium weight, `px_2`
+        // and a 24px height, and paints its focus/hover states in the *accent*
+        // colour. In a 26px breadcrumb of 11px muted text that reads as a red
+        // control dropped into a trail of labels. A crumb has to inherit the
+        // trail's typography, so the affordance here is only a hover tint plus a
+        // chevron. (If this shape recurs, it's the spike for a Flint breadcrumb
+        // component — see CONTRIBUTING's "spike in RED first".)
+        let menu = active.namespace_menu_open.then(|| {
+            let mut menu = ContextMenu::new("sql-namespace-menu");
+            for name in &names {
+                let is_current = current.as_deref() == Some(name.as_str());
+                let mut item = ContextMenuItem::new(
+                    SharedString::from(format!("ns-opt-{name}")),
+                    name.clone(),
+                )
+                .on_click(cx.listener({
+                    let name = name.clone();
+                    move |this, _, _, cx| {
+                        this.close_namespace_menu(cx);
+                        this.set_tab_namespace(Some(name.clone()), cx);
+                    }
+                }));
+                // The trailing slot right-aligns the mark, so the names stay flush
+                // left instead of being indented by a checkmark column.
+                if is_current {
+                    item = item.shortcut("✓");
+                }
+                menu = menu.item(item);
+            }
+            // Dismissal rides the surface's own outside-click (what Flint's
+            // `Select`/`ComboBox` do) rather than a full-bleed catcher, which in
+            // this bar would only have covered the breadcrumb strip.
+            floating(
+                div()
+                    .occlude()
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_namespace_menu(cx)))
+                    .child(menu),
+            )
+            .offset(gpui::point(px(0.), px(20.)))
+        });
+
+        Some(
+            div()
+                .relative()
+                .child(
+                    div()
+                        .id("sql-namespace-crumb")
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        // Tight, text-scale padding: enough for the hover tint to
+                        // read as a target without the crumb growing a control-sized
+                        // box inside a 26px bar.
+                        .px_1()
+                        .py(px(1.))
+                        .rounded(radius)
+                        .text_size(size_11)
+                        .text_color(tint)
+                        .cursor_pointer()
+                        // Neutral, not accent: this is a label you can click, not a
+                        // primary action.
+                        .hover(|s| s.bg(hover_bg))
+                        .child(crate::icons::icon("database", icon_sz, muted))
+                        .child(label)
+                        .child(crate::icons::icon("chevron-down", icon_sz, muted))
+                        .when(unset_is_a_problem, |d| {
+                            d.tooltip(Tooltip::text(format!(
+                                "Unqualified table names have no target {}. \
+                                 Pick one, or write them as db.table.",
+                                caps.label.to_lowercase()
+                            )))
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_namespace_menu(cx))),
+                )
+                .children(menu),
+        )
+    }
+
     /// The base `(schema, table)` a hand-typed `SELECT * FROM <table>` browses, when
     /// one can be resolved against the connection catalog, so that the editor result
     /// gets the schema-tree browse's FK affordances and keyset paging. `None` for any
@@ -1167,8 +1335,13 @@ impl AppState {
     fn run_editor_query_impl(&mut self, force_offset: Option<usize>, cx: &mut Context<Self>) {
         // A Redis session has no SQL editor — its `query 1` tab is a phantom that
         // is never rendered (the Redis shell replaces the editor). ⌘↵ / gutter-run
-        // must not construct and send a SQL statement against it.
+        // must not construct and send a SQL statement against it. Same for an ER
+        // diagram tab: its editor exists but is never shown, so running it would
+        // fire the untouched placeholder SQL at the server.
         if matches!(&self.phase, Phase::Connected(a) if a.kv_view.is_some()) {
+            return;
+        }
+        if matches!(&self.phase, Phase::Connected(a) if a.active().is_some_and(|t| t.is_er())) {
             return;
         }
         let sql = match &self.phase {
@@ -1292,7 +1465,9 @@ impl AppState {
         let Phase::Connected(active) = &self.phase else {
             return;
         };
-        let Some(tab) = active.active() else {
+        // `is_er`: the diagram's editor is a never-rendered placeholder, so
+        // formatting it would rewrite a buffer the user can't see.
+        let Some(tab) = active.active().filter(|t| !t.is_er()) else {
             return;
         };
         let editor = tab.editor.clone();

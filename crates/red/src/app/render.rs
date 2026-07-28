@@ -431,14 +431,7 @@ impl Render for AppState {
             .as_ref()
             .map(|w| self.render_import_wizard(w, cx));
 
-        // The read-only ER diagram is a full-screen overlay hung off the connection
-        // (schema-wide), so it renders whenever the active connection has one open.
-        let er_diagram = match &self.phase {
-            Phase::Connected(active) if active.er.is_some() => Some(self.render_er(active, cx)),
-            _ => None,
-        };
-
-        // The data-compare (table diff) report is likewise a full-screen overlay hung
+        // The data-compare (table diff) report is a full-screen overlay hung
         // off the connection.
         let diff_report = match &self.phase {
             Phase::Connected(active) if active.diff.is_some() => Some(self.render_diff(active, cx)),
@@ -541,7 +534,10 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &FocusOtherHalf, _, cx| this.focus_other_half(cx)))
             .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| this.toggle_shortcuts(cx)))
             .on_action(cx.listener(|this, _: &ShowChangelog, _, cx| this.toggle_whats_new(cx)))
-            .on_action(cx.listener(|this, _: &ShowErDiagram, _, cx| this.open_er_diagram(cx)))
+            .on_action(cx.listener(|this, _: &ShowErDiagram, _, cx| {
+                let ns = this.er_target_namespace();
+                this.open_er_diagram(ns, cx)
+            }))
             // Settings panel: ⌘, and the RED → Settings… / About RED menu items.
             .on_action(cx.listener(|this, _: &Settings, _, cx| this.open_settings(cx)))
             .on_action(cx.listener(|this, _: &About, _, cx| this.open_about(cx)))
@@ -661,7 +657,6 @@ impl Render for AppState {
             .children(shortcuts)
             .children(whats_new)
             .children(import_wizard)
-            .children(er_diagram)
             .children(diff_report)
             // The connection form modal is rendered at the root so it works in any
             // phase (the welcome screen *and* the connected shell, e.g. opened from

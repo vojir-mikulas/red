@@ -82,6 +82,13 @@ pub struct ClickhouseDriver {
     user: String,
     password: String,
     database: String,
+    /// Overrides [`Self::database`] for this handle's requests when set (see
+    /// [`scoped`](DatabaseDriver::scoped)). ClickHouse names the database per
+    /// request rather than per session, so rebinding costs nothing at all here —
+    /// no extra round-trip, just a different header value.
+    ///
+    /// Distinct from `scope`, which only filters the schema *tree*.
+    namespace: Option<String>,
     read_only: bool,
     version: String,
     /// When set, the schema tree is restricted to this one database (the
@@ -130,6 +137,7 @@ impl ClickhouseDriver {
             user,
             password: parsed.password,
             database,
+            namespace: None,
             read_only,
             version: String::new(),
             scope: None,
@@ -201,7 +209,10 @@ impl ClickhouseDriver {
             .post(&self.base_url)
             .header("X-ClickHouse-User", self.user.as_str())
             .header("X-ClickHouse-Key", self.password.as_str())
-            .header("X-ClickHouse-Database", self.database.as_str())
+            .header(
+                "X-ClickHouse-Database",
+                self.namespace.as_deref().unwrap_or(&self.database),
+            )
             .query(&q)
             .body(sql)
     }
@@ -353,6 +364,28 @@ impl DatabaseDriver for ClickhouseDriver {
 
     fn server_version(&self) -> String {
         self.version.clone()
+    }
+
+    /// Rebind the database this handle's requests name. ClickHouse carries the
+    /// database as a per-request header, so this is free: no round-trip, no
+    /// session state, nothing to reset. Shares the `reqwest::Client` (internally
+    /// refcounted), so the handle is a field copy.
+    fn scoped(self: Arc<Self>, namespace: Option<&str>) -> Arc<dyn DatabaseDriver> {
+        let requested = namespace.filter(|n| !n.is_empty()).map(str::to_owned);
+        if requested == self.namespace {
+            return self;
+        }
+        Arc::new(Self {
+            client: self.client.clone(),
+            base_url: self.base_url.clone(),
+            user: self.user.clone(),
+            password: self.password.clone(),
+            database: self.database.clone(),
+            namespace: requested,
+            read_only: self.read_only,
+            version: self.version.clone(),
+            scope: self.scope.clone(),
+        })
     }
 
     async fn open_cursor(&self, sql: &str, opts: QueryOptions) -> Result<Box<dyn QueryCursor>> {

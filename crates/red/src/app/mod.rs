@@ -1561,10 +1561,18 @@ impl AppState {
                 table,
                 detail,
             } => {
+                let ncols = detail.columns.len();
                 if let Some(active) = self.conn_mut(session) {
-                    active.schema.details.insert((schema, table), detail);
+                    active
+                        .schema
+                        .details
+                        .insert((schema.clone(), table.clone()), detail);
                 }
                 if session == self.foreground_session {
+                    // Any open diagram sized this table's box from what was resident
+                    // at build time; now that its columns are here, resize and
+                    // re-stack so the box fits them.
+                    self.er_table_described(&schema, &table, ncols);
                     self.refresh_completions(cx);
                     // Repaint views that read the catalog (the schema tree and the
                     // Columns panel's lazily-expanded FK nodes) so a freshly-arrived

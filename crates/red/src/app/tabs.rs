@@ -304,18 +304,18 @@ impl AppState {
         cx.notify();
     }
 
-    /// The tab-strip "×" (and middle-click): close immediately if pristine or the
-    /// user opted out of the confirmation, else ask first.
+    /// The tab-strip "×" (and middle-click): close immediately if the tab holds
+    /// nothing to lose (pristine, or a diagram) or the user opted out of the
+    /// confirmation, else ask first.
     pub(crate) fn request_close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        let pristine = match &self.phase {
+        let confirm = match &self.phase {
             Phase::Connected(active) => active
                 .tabs
                 .get(index)
-                .map(|t| t.is_pristine(cx))
-                .unwrap_or(true),
+                .is_some_and(|t| t.needs_close_confirm(cx)),
             _ => return,
         };
-        if pristine || !self.settings.query.confirm_close_tab {
+        if !confirm || !self.settings.query.confirm_close_tab {
             self.close_many(vec![index], cx);
         } else {
             self.confirm_close_tab = Some(index);
@@ -349,9 +349,12 @@ impl AppState {
             return;
         }
         let any_dirty = match &self.phase {
-            Phase::Connected(active) => indices
-                .iter()
-                .any(|&i| active.tabs.get(i).is_some_and(|t| !t.is_pristine(cx))),
+            Phase::Connected(active) => indices.iter().any(|&i| {
+                active
+                    .tabs
+                    .get(i)
+                    .is_some_and(|t| t.needs_close_confirm(cx))
+            }),
             _ => return,
         };
         if any_dirty && self.settings.query.confirm_close_tab {
