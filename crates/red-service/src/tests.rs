@@ -677,6 +677,159 @@ async fn computes_column_stats_for_open_result() {
     send(&handle, Command::Shutdown);
 }
 
+/// The confirm dialog's row-count preflight end to end: `count_preflight` rewrites a
+/// destructive statement, `CountMatching` runs it, and the number that comes back is
+/// the number of rows the *original* statement would have touched.
+///
+/// The point of the round trip is that the two halves agree. A rewrite that counts
+/// the wrong rows would be worse than no count at all, since it puts a reassuring
+/// number in front of someone about to destroy something.
+#[tokio::test]
+async fn preflight_counts_the_rows_a_statement_would_affect() {
+    // A temp file, not `:memory:`: the driver opens a fresh connection per call, so
+    // an in-memory database would be empty by the time the count runs.
+    let path = std::env::temp_dir().join(format!("red_svc_preflight_{}.db", std::process::id()));
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT);
+             INSERT INTO orders (id, status) VALUES
+             (1,'active'),(2,'active'),(3,'cancelled'),(4,'cancelled'),(5,'shipped');",
+        )
+        .unwrap();
+    }
+
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), true)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    // Each case is (the statement the user typed, the rows it would touch).
+    for (token, statement, expected) in [
+        (1u64, "DELETE FROM orders", 5i64),
+        (2, "DELETE FROM orders WHERE status = 'cancelled'", 2),
+        (3, "UPDATE orders SET status = 'x' WHERE id > 3", 2),
+        // The predicate is carried through verbatim, so a `;` inside a literal is
+        // data and not a statement boundary.
+        (4, "DELETE FROM orders WHERE status = 'no;such'", 0),
+        // A drop reports what is in the table, so the dialog can say what goes.
+        (5, "DROP TABLE orders", 5),
+        (6, "TRUNCATE TABLE orders", 5),
+    ] {
+        let sql = red_core::sql::count_preflight(statement)
+            .unwrap_or_else(|| panic!("count_preflight declined {statement}"));
+        send(
+            &handle,
+            Command::CountMatching {
+                sql,
+                namespace: None,
+                token,
+            },
+        );
+        match next(&mut events).await {
+            Some(Event::MatchCount { token: got, rows }) => {
+                assert_eq!(got, token, "{statement}");
+                assert_eq!(rows, Some(expected), "{statement}");
+            }
+            other => panic!("expected MatchCount for {statement}, got {other:?}"),
+        }
+    }
+
+    // A count over a table that isn't there fails softly: the dialog shows "row count
+    // unavailable" and stays usable, rather than raising an error over a number the
+    // user never asked for.
+    send(
+        &handle,
+        Command::CountMatching {
+            sql: "SELECT 1 FROM no_such_table".into(),
+            namespace: None,
+            token: 99,
+        },
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::MatchCount {
+            token: 99,
+            rows: None
+        })
+    ));
+
+    send(&handle, Command::Shutdown);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The advisory AI review declines cleanly when there is no agent to ask.
+///
+/// This is the property the whole design leans on: the review is an enrichment on a
+/// dialog that is already open and already actionable, so every way it can fail —
+/// no API key, assistant disabled, an ACP profile, a timeout — has to come back as
+/// one quiet "no note" rather than an error, a hang, or a missing reply. A dialog
+/// waiting forever on a `SqlAssessment` that never arrives would be worse than
+/// having no review at all.
+#[tokio::test]
+async fn sql_review_declines_when_no_agent_is_configured() {
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(&handle, Command::Connect(sqlite(":memory:", true)));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    // No `ConfigureAi` has been sent, so no agent exists.
+    send(
+        &handle,
+        Command::AssessSql {
+            sql: "DELETE FROM orders".into(),
+            agent: String::new(),
+            schema_summary: "orders(id int)".into(),
+            token: 7,
+        },
+    );
+    // Declines with a *reason*, not silence: a review that never runs has to be
+    // distinguishable from one that ran and had nothing to say.
+    match next(&mut events).await {
+        Some(Event::SqlAssessment { token, review }) => {
+            assert_eq!(token, 7);
+            assert!(
+                matches!(&review, crate::SqlReview::Unavailable(why) if !why.is_empty()),
+                "{review:?}"
+            );
+        }
+        other => panic!("expected SqlAssessment, got {other:?}"),
+    }
+
+    // Naming an agent that isn't configured declines the same way rather than
+    // raising an error into a dialog the user is mid-decision on.
+    send(
+        &handle,
+        Command::AssessSql {
+            sql: "DROP TABLE orders".into(),
+            agent: "no-such-agent".into(),
+            schema_summary: String::new(),
+            token: 8,
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::SqlAssessment { token, review }) => {
+            assert_eq!(token, 8);
+            assert!(
+                matches!(&review, crate::SqlReview::Unavailable(why) if !why.is_empty()),
+                "{review:?}"
+            );
+        }
+        other => panic!("expected SqlAssessment, got {other:?}"),
+    }
+
+    send(&handle, Command::Shutdown);
+}
+
 /// Inline FK expansion (Track B7): an `OpenResult` carrying a `LEFT JOIN` spec
 /// decorates a table browse with the referenced table's columns, reported *inline,
 /// right after the FK column they expand from*, without changing the row count (the
@@ -1096,7 +1249,7 @@ async fn mariadb_keyset_end_to_end() {
         },
     );
     match next(&mut events).await {
-        Some(Event::Executed { affected }) => assert_eq!(affected, 1_000_000),
+        Some(Event::Executed { affected, .. }) => assert_eq!(affected, 1_000_000),
         other => panic!("seeding failed: {other:?}"),
     }
 
@@ -1301,6 +1454,106 @@ async fn text_key_jump_falls_back_to_offset() {
         }
         other => panic!("expected ResultRunLoaded, got {other:?}"),
     }
+
+    send(&handle, Command::Shutdown);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A `;`-separated script (the shape of every hand-written "create a table"
+/// snippet: the table, its index, its seed rows) runs as one `Execute`. Before the
+/// split, the whole script reached a driver's single-statement `execute` and came
+/// back as an engine syntax error.
+#[tokio::test]
+async fn executes_multi_statement_script() {
+    let path = std::env::temp_dir().join(format!("red_svc_script_{}.db", std::process::id()));
+    std::fs::remove_file(&path).ok();
+
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), false)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    send(
+        &handle,
+        Command::Execute {
+            sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, note TEXT);\n\
+                  CREATE INDEX t_note ON t(note);\n\
+                  INSERT INTO t VALUES (1, 'hi'), (2, 'yo');"
+                .into(),
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::Executed {
+            statements,
+            affected,
+        }) => {
+            assert_eq!(statements, 3);
+            assert_eq!(affected, 2, "only the INSERT touches rows");
+        }
+        other => panic!("expected Executed, got {other:?}"),
+    }
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 2);
+    let indexes: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='t_note'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexes, 1, "every statement of the script committed");
+
+    send(&handle, Command::Shutdown);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A script is all-or-nothing: a statement that fails takes the earlier ones down
+/// with it, so a half-created schema never survives a typo mid-script.
+#[tokio::test]
+async fn failed_script_rolls_back_earlier_statements() {
+    let path = std::env::temp_dir().join(format!("red_svc_script_fail_{}.db", std::process::id()));
+    std::fs::remove_file(&path).ok();
+
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), false)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    send(
+        &handle,
+        Command::Execute {
+            sql: "CREATE TABLE keep(id INTEGER);\n\
+                  INSERT INTO no_such_table VALUES (1);"
+                .into(),
+        },
+    );
+    assert!(matches!(next(&mut events).await, Some(Event::Error(_))));
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let tables: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='keep'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 0, "the whole script rolled back");
 
     send(&handle, Command::Shutdown);
     std::fs::remove_file(&path).ok();

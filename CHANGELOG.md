@@ -17,7 +17,55 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Right-click menu in the schema tree: browse a table, open a query bound to a
   namespace, and copy a plain or qualified name.
 
+- Connections can be marked Local, Dev, Staging, or Prod, and the write guards
+  follow the marker. A Local connection stops asking about anything short of
+  destroying an object, so a scratch database gets out of your way; a Prod one
+  confirms from the first risky statement, makes every one of those
+  confirmations typed rather than clicked, and offers no "Don't ask again" at
+  all. Unmarked connections behave exactly as before. The marker shows as a
+  coloured badge on the connection card and beside the connection name while
+  you work, and the connection form offers a guess from the host and name that
+  you can accept or ignore.
+- Optional second opinion from your AI agent on a statement the confirmation has
+  stopped, for the mistakes a keyword check cannot see: a filter that looks
+  inverted, a value that reads wrong against the schema, a join that fans out.
+  Off by default, since enabling it sends the statement and a summary of your
+  schema to the configured provider. It is advice and nothing more: it runs
+  nothing, reads no rows, and can never unlock a confirmation or shorten one, so
+  a slow, unavailable, or mistaken model costs you a line of text rather than a
+  table. Turn it on under Settings → Query → Safety.
+- The confirmation for a destructive statement now asks the database how much it
+  will touch, and says so: "This affects 8,412 rows", or "orders holds 8,412
+  rows" before a `DROP TABLE`. The count runs over the same table and `WHERE`
+  clause the statement itself uses, so a predicate that matches far more than you
+  expected shows up before you run it rather than after. It never holds up the
+  dialog: the count fills in a moment later, gives up after two seconds, and says
+  plainly when it couldn't find out.
+
+### Changed
+- Statements are now graded before they run, and the confirmation matches how
+  dangerous they actually are. A filtered `UPDATE … WHERE id = 42` or an
+  `ALTER TABLE … ADD COLUMN` runs without interruption; an `UPDATE` or `DELETE`
+  with no `WHERE`, a privilege change, or a `MERGE` stops and says what it
+  noticed ("No WHERE clause: this removes every row in orders"); and a
+  `DROP TABLE` or `TRUNCATE` asks you to type the object's name before the run
+  button enables. RED also now catches several statements it used to run without
+  asking at all, including `GRANT`/`REVOKE`, `CREATE USER`, stored-procedure
+  calls, `ALTER TABLE … DROP COLUMN`, and a `WITH` query whose CTE writes.
+- "Don't ask again" on a confirmation now only silences the kind of statement in
+  front of you, so hiding the routine prompts no longer hides the one before a
+  `DROP DATABASE`. The old `query.confirm_destructive` setting is replaced by
+  `query.confirm_from`, which takes `write`, `risky`, `critical`, or `never` and
+  is migrated from the old value on first launch; `confirm_destructive = false`
+  becomes `critical` rather than `never`, since it used to be the only way to
+  stop being asked about ordinary writes.
+
 ### Fixed
+- Running a multi-statement script from the editor (a `CREATE TABLE` followed by
+  its indexes and seed rows, say) executed only its first statement and reported
+  success on SQLite, and failed with a bare engine error elsewhere. The whole
+  script now runs as one transaction, and the toast reports how many statements
+  committed.
 - Running an unqualified query on a MySQL connection that named no database
   reported the server's bare "No database selected" with no way to act on it. The
   results pane now explains what happened and lists the databases on the server,

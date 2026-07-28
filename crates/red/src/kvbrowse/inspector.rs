@@ -653,7 +653,7 @@ impl AppState {
 
     pub(crate) fn kv_request_delete(&mut self, session: SessionId, cx: &mut Context<Self>) {
         // Opt-out: when delete confirmations are disabled, delete straight away.
-        if !self.settings.query.confirm_destructive {
+        if !self.confirm_policy().confirms_delete() {
             self.kv_confirm_delete(session, cx);
             return;
         }

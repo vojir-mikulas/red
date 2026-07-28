@@ -86,6 +86,7 @@ fn parse(xml: &str) -> ImportReport {
                 database: parsed.database,
                 color: 0,
                 read_only: false,
+                env: Default::default(),
                 tls: false,
                 ai_enabled: None,
                 ai_tier: None,

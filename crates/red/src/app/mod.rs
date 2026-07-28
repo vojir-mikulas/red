@@ -44,9 +44,11 @@ use red_service::{AiAuthStatus, Command, Event, OpId, ServiceHandle, SessionId, 
 
 use crate::config::{self, StoredConnection};
 use crate::palette::{Cmd, PromptKind};
+use crate::settings::ConfirmPolicy;
 use crate::settings::{Density, FileSettingsStore, Settings, ThemeMode, ThemeSetting};
 use crate::settings_ui::{RevealTarget, SettingsTab};
 use crate::theme::ThemeRegistry;
+use red_core::ConnEnv;
 
 /// Shared slot for the focused settings control's window-space bounds, tagged with
 /// which control it belongs to. Written by a canvas overlay during paint, read on
@@ -233,6 +235,23 @@ pub struct AppState {
     /// destructive statement, or a staged grid edit batch (Track B6). See
     /// [`PendingWrite`].
     pub(crate) confirm_exec: Option<PendingWrite>,
+    /// The type-to-confirm box for the pending write, when its grade earns one. Kept
+    /// beside [`Self::confirm_exec`] rather than inside it because `PendingWrite` is
+    /// `Clone` (the modal renders from a clone) and a live entity plus its
+    /// subscription must not be.
+    pub(crate) confirm_input: Option<ConfirmInput>,
+    /// How many rows the pending statement will touch: `None` when no preflight was
+    /// sent (the statement wasn't a rewritable shape), otherwise the answer or the
+    /// wait for it. Never gates the run button; see [`PreflightCount`].
+    pub(crate) confirm_count: Option<PreflightCount>,
+    /// Bumped for every confirmation opened, so a `MatchCount` for a dialog the user
+    /// already dismissed is recognised as stale and dropped rather than landing in
+    /// the next one. Shared with the advisory AI review, which is scoped to the same
+    /// dialog.
+    pub(crate) confirm_count_token: u64,
+    /// The advisory AI note for the open confirmation, when one was requested.
+    /// Display-only; see [`AiReview`].
+    pub(crate) confirm_review: Option<AiReview>,
     /// A data-import header peek in flight (file chosen, awaiting the source columns
     /// from the backend so the import confirm can be built). At most one at a time.
     pub(crate) pending_import: Option<PendingImportPeek>,
@@ -1144,6 +1163,10 @@ impl AppState {
             export_menu: None,
             more_menu: None,
             confirm_exec: None,
+            confirm_input: None,
+            confirm_count: None,
+            confirm_review: None,
+            confirm_count_token: 0,
             pending_import: None,
             grid_edit: None,
             cell_suggest: None,
@@ -1833,12 +1856,43 @@ impl AppState {
             }
 
             // --- export & writes ---
-            Event::Executed { affected } => {
-                self.notify(
-                    ToastVariant::Success,
-                    format!("{affected} row(s) affected"),
-                    cx,
-                );
+            Event::SqlAssessment { token, review } => {
+                // Advisory only. This sets a line of text and nothing else: it never
+                // touches the threshold, the typed confirmation, or the run button.
+                if token == self.confirm_count_token
+                    && self.confirm_exec.is_some()
+                    && let Some(pending) = self.confirm_review.as_mut()
+                {
+                    pending.state = match review {
+                        red_service::SqlReview::Concern(note) => AiReviewState::Concern(note),
+                        red_service::SqlReview::NoConcern => AiReviewState::NoConcern,
+                        red_service::SqlReview::Unavailable(why) => AiReviewState::Unavailable(why),
+                    };
+                    cx.notify();
+                }
+            }
+            Event::MatchCount { token, rows } => {
+                // A reply for a dialog that has since been dismissed (or replaced by
+                // a newer one) is stale; the token is what tells them apart.
+                if token == self.confirm_count_token && self.confirm_exec.is_some() {
+                    self.confirm_count =
+                        Some(rows.map_or(PreflightCount::Unavailable, PreflightCount::Rows));
+                    cx.notify();
+                }
+            }
+            Event::Executed {
+                statements,
+                affected,
+            } => {
+                // A script committed as one transaction: say how many statements ran,
+                // since "0 row(s) affected" alone reads like nothing happened after a
+                // batch of DDL.
+                let message = if statements > 1 {
+                    format!("{statements} statement(s) run, {affected} row(s) affected")
+                } else {
+                    format!("{affected} row(s) affected")
+                };
+                self.notify(ToastVariant::Success, message, cx);
                 // A write may have changed the schema (CREATE/DROP); refresh the
                 // tree of the session that ran it.
                 if let Some(id) = session {
@@ -1961,11 +2015,47 @@ impl AppState {
         }
     }
 
-    /// Run the pending write the user confirmed: a destructive editor statement
+    /// How confirmations behave right now: the configured threshold clamped by the
+    /// active connection's environment. The single place any guard asks, so a `Prod`
+    /// connection cannot be softened by a caller that forgot to check.
+    ///
+    /// With no connection there is nothing to protect, so the bare setting applies.
+    pub(crate) fn confirm_policy(&self) -> ConfirmPolicy {
+        let env = match &self.phase {
+            Phase::Connected(active) => active.config.env,
+            _ => ConnEnv::Unset,
+        };
+        ConfirmPolicy::resolve(self.settings.query.confirm_from, env)
+    }
+
+    /// Whether the type-to-confirm box (when one is armed) currently holds the
+    /// object's name. `true` when no box is armed, so callers that gate on it work
+    /// unchanged for the ordinary confirmations.
+    pub(crate) fn confirm_target_matches(&self, cx: &gpui::App) -> bool {
+        self.confirm_input.as_ref().is_none_or(|typed| {
+            typed
+                .input
+                .read(cx)
+                .content()
+                .trim()
+                .eq_ignore_ascii_case(&typed.expect)
+        })
+    }
+
+    /// Run the pending write the user confirmed: a graded editor statement
     /// or a guarded grid edit (Track B5).
     pub(crate) fn confirm_destructive(&mut self, cx: &mut Context<Self>) {
+        // A typed confirmation that hasn't been satisfied is not a confirmation. The
+        // modal disables its run button too; this is the backstop for the paths that
+        // reach here another way (the modal's own Enter handler).
+        if !self.confirm_target_matches(cx) {
+            return;
+        }
+        self.confirm_input = None;
+        self.confirm_count = None;
+        self.confirm_review = None;
         match self.confirm_exec.take() {
-            Some(PendingWrite::EditorSql(sql)) => self.execute_sql(sql, cx),
+            Some(PendingWrite::EditorSql { sql, .. }) => self.execute_sql(sql, cx),
             Some(PendingWrite::Batch { ops, epoch }) => {
                 self.send_active(Command::ApplyBatch { epoch, ops });
             }
@@ -2036,6 +2126,9 @@ impl AppState {
         // Cancelling the submit preview keeps the staged change-set intact (it lives
         // on the result); only the confirm is dropped.
         self.confirm_exec = None;
+        self.confirm_input = None;
+        self.confirm_count = None;
+        self.confirm_review = None;
         self.refocus_root = true;
         cx.notify();
     }

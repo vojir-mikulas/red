@@ -11,6 +11,7 @@ use gpui::{
 use red_core::{DbKind, ProxyKind};
 
 use crate::app::{AppState, ConnectSortField, FormField, FormState, SshAuthMode, TestState};
+use red_core::ConnEnv;
 
 /// How many saved-connection cards the welcome screen shows per page. Kept small
 /// so a long roster paginates into single screens instead of one tall scroll.
@@ -28,6 +29,19 @@ pub(crate) fn label_color(index: u8, theme: &Theme) -> Hsla {
         theme.text_muted,
     ];
     palette[(index as usize).min(palette.len() - 1)]
+}
+
+/// The badge styling for a deployment marker. Colour carries the same warning the
+/// guards do, so a production connection is recognisable before anything is typed
+/// into it, and a local one is visibly the safe place to experiment.
+pub(crate) fn env_badge(env: ConnEnv) -> BadgeVariant {
+    match env {
+        ConnEnv::Unset => BadgeVariant::Neutral,
+        ConnEnv::Local => BadgeVariant::Success,
+        ConnEnv::Dev => BadgeVariant::Info,
+        ConnEnv::Staging => BadgeVariant::Warning,
+        ConnEnv::Prod => BadgeVariant::Danger,
+    }
 }
 
 /// The accent tint for an engine, used on the engine picker's glyphs and cards.
@@ -668,6 +682,14 @@ impl AppState {
                                     .child(config.name.clone()),
                             )
                             .child(Badge::new(badge_label).variant(badge_variant))
+                            // The deployment marker, so which database you are about
+                            // to open is legible before you open it. `Unset` renders
+                            // nothing rather than a badge saying "unknown".
+                            .when(config.env != ConnEnv::Unset, |row| {
+                                row.child(
+                                    Badge::new(config.env.label()).variant(env_badge(config.env)),
+                                )
+                            })
                             // A persistent pin marker on a pinned card (the hover
                             // actions carry the unpin button).
                             .when(pinned, |row| {
@@ -1312,7 +1334,8 @@ impl AppState {
         )
     }
 
-    /// The label-color swatches + the read-only access toggle, sharing one row.
+    /// The label-color swatches, the environment picker, and the access toggles:
+    /// two rows, since all three on one line overflows the modal.
     fn render_label_access_row(
         &self,
         form: &FormState,
@@ -1341,22 +1364,82 @@ impl AppState {
                 .on_click(cx.listener(move |this, _, _, cx| this.set_form_color(i, cx)))
         });
 
+        // The deployment marker. Least to most dangerous left-to-right, matching the
+        // settings threshold control, so "further right means treat this more
+        // carefully" reads the same in both places.
+        const ENVS: [ConnEnv; 5] = [
+            ConnEnv::Unset,
+            ConnEnv::Local,
+            ConnEnv::Dev,
+            ConnEnv::Staging,
+            ConnEnv::Prod,
+        ];
+        let env_sel = ENVS.iter().position(|&e| e == form.env).unwrap_or(0);
+        let env_view = cx.entity().downgrade();
+        let env_picker = Segmented::new("form-env")
+            .segment("Unset")
+            .segment("Local")
+            .segment("Dev")
+            .segment("Staging")
+            .segment("Prod")
+            .selected(env_sel)
+            .on_select(move |ix, _, cx| {
+                let env = ENVS[ix.min(ENVS.len() - 1)];
+                env_view
+                    .update(cx, |this, cx| this.set_form_env(env, cx))
+                    .ok();
+            });
+        // A suggestion, not an assignment: one click accepts it, ignoring it costs
+        // nothing. See `ConnEnv::suggest`.
+        let suggestion = self.form_env_suggestion(cx).map(|env| {
+            let view = cx.entity().downgrade();
+            div()
+                .id("form-env-suggest")
+                .cursor_pointer()
+                .text_size(theme.scale(11.5))
+                .text_color(theme.accent)
+                .child(format!("Looks like {}. Use it?", env.label()))
+                .on_click(move |_, _, cx| {
+                    view.update(cx, |this, cx| this.set_form_env(env, cx)).ok();
+                })
+        });
+
+        // Two rows: the swatches and the environment picker share the first, the
+        // access toggles get the second. These sat on one row until the environment
+        // picker landed, which widened it enough to push the right-aligned toggles
+        // past the edge of the modal.
         div()
             .flex()
-            .items_start()
+            .flex_col()
             .gap_3()
             .child(
-                labeled_field("Label", theme).child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(7.))
-                        .h(px(32.))
-                        .children(swatches),
-                ),
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_3()
+                    .child(
+                        labeled_field("Label", theme).child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(7.))
+                                .h(px(32.))
+                                .children(swatches),
+                        ),
+                    )
+                    .child(
+                        labeled_field("Environment", theme).child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(div().flex().items_center().h(px(32.)).child(env_picker))
+                                .children(suggestion),
+                        ),
+                    ),
             )
             .child(
-                labeled_field("Access", theme).ml_auto().flex_none().child(
+                labeled_field("Access", theme).flex_none().child(
                     div()
                         .flex()
                         .items_center()

@@ -1239,11 +1239,13 @@ impl AppState {
                     .text_color(theme.text_muted)
                     .child("This can't be undone."),
             )
-            .child(
-                div()
-                    .pt_1()
-                    .child(self.dont_ask_destructive_checkbox("kv-delete-dont-ask", cx)),
-            );
+            .children(self.confirm_policy().allow_quiet.then(|| {
+                div().pt_1().child(self.dont_ask_destructive_checkbox(
+                    "kv-delete-dont-ask",
+                    red_core::sql::RiskLevel::Risky,
+                    cx,
+                ))
+            }));
 
         let (confirm_view, cancel_view, close_view) = (view.clone(), view.clone(), view.clone());
         let footer = div()

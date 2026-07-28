@@ -12,8 +12,14 @@ use gpui::{Context, Hsla, MouseButton, Pixels, Point, SharedString, Window, div,
 use red_core::{DbKind, FkEdge, ObjectKind, SchemaMeta, TableDetail};
 use red_service::Command;
 
+use crate::app::PreflightCount;
 use crate::app::{ActiveConn, AppState, Phase, TabCloseScope, TabWorkspace};
+use crate::app::{AiReview, AiReviewState};
 use crate::sql::CompletionContext;
+use red_core::ConnEnv;
+use red_core::sql::RiskLevel;
+
+use crate::app::ConfirmInput;
 
 /// How many candidates the popup ever shows; the editor renders at most 8, but
 /// we hand it a few more so prefix-narrowing has headroom.
@@ -1054,6 +1060,15 @@ impl AppState {
             .text_size(size_11)
             .text_color(muted)
             .child(active.config.name.clone())
+            // The deployment marker rides next to the connection name, where the eye
+            // already goes to answer "where am I". Knowing you are on production
+            // before typing is worth more than any dialog after.
+            .when(active.config.env != ConnEnv::Unset, |bar| {
+                bar.child(
+                    Badge::new(active.config.env.label())
+                        .variant(crate::connect::env_badge(active.config.env)),
+                )
+            })
             .when_some(ns_segment, |d, seg| {
                 d.child(div().text_color(dim).child("/")).child(seg)
             })
@@ -1397,15 +1412,16 @@ impl AppState {
             self.query_history.record(&conn_id, &sql);
         }
 
-        // Row-returning statements stream into the grid; writes execute in a
-        // transaction; destructive writes ask for confirmation first.
-        let kind = crate::sql::classify(&sql);
+        // Grade the statement: `Safe` streams into the grid, everything else executes
+        // in a transaction, and the configured threshold decides which of those first
+        // stop to ask.
+        let assessment = red_core::sql::assess(&sql);
 
         // On a read-only connection, refuse writes up front instead of letting
         // them round-trip to the engine and bounce back as a cryptic error. The
         // engine still rejects writes as a backstop; this is the friendly gate.
         let read_only = matches!(&self.phase, Phase::Connected(active) if active.config.read_only);
-        if read_only && !matches!(kind, crate::sql::StatementKind::Query) {
+        if read_only && assessment.level > RiskLevel::Safe {
             self.notify(
                 ToastVariant::Error,
                 "Connection is read-only; write statements are disabled.",
@@ -1414,47 +1430,99 @@ impl AppState {
             return;
         }
 
-        match kind {
-            crate::sql::StatementKind::Query => {
-                // A row-returning batch can't open as one result: the paging path
-                // wraps the SQL in a single `SELECT * FROM (<sql>) AS _red`, which a
-                // `;`-separated batch makes a syntax error. Only an explicit
-                // multi-statement selection reaches here (a no-selection run already
-                // narrowed to the caret's statement); say so plainly.
-                if crate::sql::statement_count(&sql) > 1 {
-                    self.notify(
-                        ToastVariant::Error,
-                        "Select a single statement to run; \
-                         a multi-statement query can't open as a result.",
-                        cx,
-                    );
-                    return;
-                }
-                // When the query is a plain `SELECT * FROM <table>`, tag the result
-                // with that base table so it gets the same FK affordances (accent,
-                // click-through, reference-column tree) and keyset paging as a browse
-                // opened from the schema tree. Resolve before the auto-limit shadows
-                // `sql` (the sniffer accepts a trailing LIMIT either way).
-                let table = self.resolve_browse_table(&sql);
-                // Guard a bare `SELECT *` against flooding the grid: append the
-                // configured `LIMIT` unless the user wrote their own.
-                let sql =
-                    crate::sql::auto_limit(&sql, self.settings.query.auto_limit).unwrap_or(sql);
-                self.open_result("query", sql, table, cx)
+        if assessment.level == RiskLevel::Safe {
+            // A row-returning batch can't open as one result: the paging path
+            // wraps the SQL in a single `SELECT * FROM (<sql>) AS _red`, which a
+            // `;`-separated batch makes a syntax error. Only an explicit
+            // multi-statement selection reaches here (a no-selection run already
+            // narrowed to the caret's statement); say so plainly.
+            if crate::sql::statement_count(&sql) > 1 {
+                self.notify(
+                    ToastVariant::Error,
+                    "Select a single statement to run; \
+                     a multi-statement query can't open as a result.",
+                    cx,
+                );
+                return;
             }
-            crate::sql::StatementKind::Write => self.execute_sql(sql, cx),
-            crate::sql::StatementKind::Destructive => {
-                // The safety rail is opt-out in settings; when off, run immediately.
-                if self.settings.query.confirm_destructive {
-                    self.confirm_exec = Some(crate::app::PendingWrite::EditorSql(sql));
-                    // Focus the modal so its own Enter/Esc handling is heard.
-                    self.focus_modal = true;
-                    cx.notify();
-                } else {
-                    self.execute_sql(sql, cx);
-                }
-            }
+            // When the query is a plain `SELECT * FROM <table>`, tag the result
+            // with that base table so it gets the same FK affordances (accent,
+            // click-through, reference-column tree) and keyset paging as a browse
+            // opened from the schema tree. Resolve before the auto-limit shadows
+            // `sql` (the sniffer accepts a trailing LIMIT either way).
+            let table = self.resolve_browse_table(&sql);
+            // Guard a bare `SELECT *` against flooding the grid: append the
+            // configured `LIMIT` unless the user wrote their own.
+            let sql = crate::sql::auto_limit(&sql, self.settings.query.auto_limit).unwrap_or(sql);
+            self.open_result("query", sql, table, cx);
+            return;
         }
+
+        if self.confirm_policy().requires(assessment.level) {
+            self.open_confirm(sql, assessment, cx);
+        } else {
+            self.execute_sql(sql, cx);
+        }
+    }
+
+    /// Raise the confirmation modal for a graded statement, arming the type-to-confirm
+    /// box when the grade is [`RiskLevel::Critical`] and the doomed object could be
+    /// named. Everything below `Critical`, and anything critical whose target could
+    /// not be extracted, gets the ordinary Cancel/Run modal.
+    fn open_confirm(
+        &mut self,
+        sql: String,
+        assessment: red_core::sql::Assessment,
+        cx: &mut Context<Self>,
+    ) {
+        self.confirm_input = self
+            .confirm_policy()
+            .requires_typing(assessment.level)
+            .then(|| assessment.confirm_target())
+            .flatten()
+            .map(|target| ConfirmInput::new(target.to_string(), cx));
+        // Ask the engine how much this touches. Fired here rather than awaited, so
+        // the dialog opens on the grading immediately and the number fills in.
+        self.confirm_count_token = self.confirm_count_token.wrapping_add(1);
+        let namespace = match &self.phase {
+            Phase::Connected(active) => active.namespace_for_send(),
+            _ => None,
+        };
+        self.confirm_count = red_core::sql::count_preflight(&sql).map(|count_sql| {
+            self.send_active(Command::CountMatching {
+                sql: count_sql,
+                namespace,
+                token: self.confirm_count_token,
+            });
+            PreflightCount::Pending
+        });
+        // The advisory review, when the user opted in. Gated on the grading rather
+        // than fired on every run: a round-trip per statement would contradict the
+        // point of the app, and the deterministic guards are what actually decide
+        // whether to stop. This only ever adds a line to a dialog already open.
+        self.confirm_review =
+            (self.settings.query.ai_review && assessment.level >= RiskLevel::Risky).then(|| {
+                // Which agent runs this isn't a separate setting: it follows the
+                // assistant panel. Carry its display name so the line can say who
+                // answered rather than leaving the user to guess.
+                let agent = self.assistant_agent_id();
+                let name = self.agent_name(&agent);
+                self.send_active(Command::AssessSql {
+                    sql: sql.clone(),
+                    agent,
+                    schema_summary: self.review_schema_context(assessment.table.as_deref()),
+                    token: self.confirm_count_token,
+                });
+                AiReview {
+                    agent: name,
+                    state: AiReviewState::Pending,
+                }
+            });
+        self.confirm_exec = Some(crate::app::PendingWrite::EditorSql { sql, assessment });
+        // Focus the modal (or, when there is one, its type-to-confirm box) so its
+        // Enter/Esc handling is heard.
+        self.focus_modal = true;
+        cx.notify();
     }
 
     /// Beautify the active editor's SQL in place (⌥⌘F / palette / Query menu):

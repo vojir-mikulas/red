@@ -947,8 +947,14 @@ impl AppState {
         // the server-gated drop/many confirms ignore the setting, so offering it there
         // would be a checkbox that does nothing. Shared with the SQL/Redis confirms
         // via the one checkbox builder rather than a Mongo-local copy.
-        let dont_ask = suppressible
-            .then(|| AppState::dont_ask_checkbox_el("doc-delete-dont-ask", theme, view.clone()));
+        let dont_ask = (suppressible && self.confirm_policy().allow_quiet).then(|| {
+            AppState::dont_ask_checkbox_el(
+                "doc-delete-dont-ask",
+                red_core::sql::RiskLevel::Risky,
+                theme,
+                view.clone(),
+            )
+        });
         let body = div()
             .flex()
             .flex_col()

@@ -25,6 +25,10 @@ use red_core::doc::{
 use red_core::kv::{
     KeyMeta, KvCollection, KvValue, RespValue, ScanBudget, ScanCursor, analyze_keyspace,
 };
+// The read gate below and the write gate in `write_shape` share their stripping,
+// their whole-word test, and their token lists with the UI's own gates, so a fix to
+// one can't leave the others behind.
+use red_core::sql::{DANGEROUS_FNS, WRITE_TOKENS, has_word, strip_noise};
 use red_core::{
     ActivityKind, ActivityStatus, AiLimits, AiPolicy, AiTier, RedError, TableRef, Value,
 };
@@ -2431,13 +2435,14 @@ fn cap_result_bytes(mut content: String, max: usize) -> String {
 /// `INTO OUTFILE` and sequence-advancing functions also write while leading with
 /// SELECT. So, like [`write_shape`], we reason about a **noise-stripped** copy
 /// (literals/quoted-identifiers/comments blanked) and reject any surviving write
-/// keyword, sharing `strip_sql_noise`/`has_word` so the read and write gates can't
-/// drift. False positives (a rejected legitimate read) are acceptable: the user can
+/// keyword. The stripping, the whole-word test, and both token lists live in
+/// `red_core::sql`, so this gate, the UI's `is_read_only`, and [`write_shape`] cannot
+/// drift apart. False positives (a rejected legitimate read) are acceptable: the user can
 /// always run such a query by hand in a query tab. (Defense in depth: opening the
 /// AI's reads on an engine-level read-only connection would make this belt-and-
 /// suspenders: a worthwhile follow-up, but it needs a per-call driver seam.)
 fn is_read_only_select(sql: &str) -> bool {
-    let stripped = strip_sql_noise(sql);
+    let stripped = strip_noise(sql);
     let trimmed = stripped.trim().trim_end_matches(';').trim();
     if trimmed.is_empty() {
         return false;
@@ -2458,41 +2463,6 @@ fn is_read_only_select(sql: &str) -> bool {
     // column legitimately named one of them would be quoted, and quoting blanks it
     // out before this check. (`FOR UPDATE` locking reads trip `update` and are
     // rejected too; fine, the assistant browses, it doesn't lock.)
-    const WRITE_TOKENS: &[&str] = &[
-        "insert", "update", "delete", "merge", "into", "nextval", "setval",
-    ];
-    // Server-side functions callable from inside a SELECT that write/read files,
-    // manipulate large objects, execute remote SQL, or emit WAL, all beyond a read
-    // tier's intent (e.g. `SELECT lo_import('/etc/passwd')`, `SELECT load_file(…)`,
-    // `SELECT dblink_exec('…','DELETE …')`). This is a denylist of the well-known
-    // dangerous ones; the *complete* guarantee is engine-level read-only (see the
-    // doc comment). The names are underscore-qualified identifiers, not plausible
-    // bare column names, so blocking them won't trip a real browse query.
-    const DANGEROUS_FNS: &[&str] = &[
-        // Postgres: file read/write, large objects, remote exec, WAL, admin file ops.
-        "lo_import",
-        "lo_export",
-        "pg_read_file",
-        "pg_read_binary_file",
-        "pg_ls_dir",
-        "pg_stat_file",
-        "pg_logical_emit_message",
-        // `dblink`/`dblink_send_query` run arbitrary SQL on a remote (often the
-        // same loopback) server from inside a SELECT: a write channel that reads
-        // as read-only here. `dblink_exec` is the obvious one; the bare and async
-        // forms are the same hole under a different name.
-        "dblink",
-        "dblink_exec",
-        "dblink_open",
-        "dblink_send_query",
-        "pg_file_write",
-        "pg_file_unlink",
-        "pg_file_rename",
-        // MySQL: file read and UDF command execution.
-        "load_file",
-        "sys_exec",
-        "sys_eval",
-    ];
     !WRITE_TOKENS
         .iter()
         .chain(DANGEROUS_FNS)
@@ -2863,7 +2833,7 @@ enum WriteShape {
 /// fool the gate; e.g. `UPDATE t SET note = 'see where'` (no real WHERE) is still
 /// blocked, and a `;` inside a string isn't read as statement chaining.
 fn write_shape(sql: &str) -> WriteShape {
-    let stripped = strip_sql_noise(sql);
+    let stripped = strip_noise(sql);
     let trimmed = stripped.trim().trim_end_matches(';').trim();
     if trimmed.is_empty() {
         return WriteShape::Blocked("the statement is empty");
@@ -2897,75 +2867,6 @@ fn write_shape(sql: &str) -> WriteShape {
              manually in a query tab",
         ),
     }
-}
-
-/// Blank out the parts of `sql` that aren't structure: single-quoted strings
-/// (with `''` escapes), double-quoted / backtick-quoted identifiers, and `--` line
-/// and `/* */` block comments. Each run is replaced with spaces so positions and the
-/// surrounding keywords are preserved. Used so the write classifier reasons about
-/// real SQL keywords, never text that merely *looks* like one inside a literal.
-fn strip_sql_noise(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            // String literal / quoted identifier: consume to the matching close,
-            // honoring the doubled-quote escape (`''`, `""`).
-            '\'' | '"' | '`' => {
-                out.push(' ');
-                while let Some(&n) = chars.peek() {
-                    chars.next();
-                    if n == c {
-                        // A doubled quote is an escape, not a close.
-                        if chars.peek() == Some(&c) {
-                            chars.next();
-                            out.push(' ');
-                            out.push(' ');
-                            continue;
-                        }
-                        break;
-                    }
-                    out.push(' ');
-                }
-                out.push(' ');
-            }
-            // Line comment `-- …` to end of line.
-            '-' if chars.peek() == Some(&'-') => {
-                out.push(' ');
-                while let Some(&n) = chars.peek() {
-                    if n == '\n' {
-                        break;
-                    }
-                    chars.next();
-                    out.push(' ');
-                }
-            }
-            // Block comment `/* … */`.
-            '/' if chars.peek() == Some(&'*') => {
-                out.push(' ');
-                chars.next();
-                out.push(' ');
-                while let Some(n) = chars.next() {
-                    out.push(' ');
-                    if n == '*' && chars.peek() == Some(&'/') {
-                        chars.next();
-                        out.push(' ');
-                        break;
-                    }
-                }
-            }
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-/// Whether `word` appears in `haystack` as a whole word (delimited by non-word
-/// chars), not merely as a substring. `haystack` is assumed already lowercased.
-fn has_word(haystack: &str, word: &str) -> bool {
-    haystack
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .any(|tok| tok == word)
 }
 
 /// The report shell's inline stylesheet: a neutral, light/dark base the model's

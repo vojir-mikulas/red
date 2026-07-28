@@ -1635,7 +1635,7 @@ impl AppState {
         };
         // Opt-out: when delete confirmations are disabled, apply the delete straight
         // away (still gated as a single, filtered write server-side).
-        if !self.settings.query.confirm_destructive {
+        if !self.confirm_policy().confirms_delete() {
             let (epoch, write, _) = pending;
             self.service.send_to(
                 session,

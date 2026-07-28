@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub mod diff;
 pub mod doc;
 pub mod kv;
+pub mod sql;
 pub mod typemap;
 
 /// How risky a database operation is, for the read-only gate and the
@@ -774,6 +775,84 @@ pub struct PlanStep {
 }
 
 /// A saved connection target. Stored as structured fields rather than one opaque
+/// Which deployment a connection points at.
+///
+/// A safety guard is only ever a compromise between catching mistakes and getting
+/// in the way, and the right compromise is not the same on a scratch database as on
+/// the one customers are using. Without this, the strictness that makes sense for
+/// production has to be endured everywhere, which is how people end up switching the
+/// guards off entirely, on every connection at once.
+///
+/// [`Unset`](Self::Unset) is the default and behaves exactly as no marker at all, so
+/// this can be added to `ConnectionConfig` without changing what any saved
+/// connection does. The app never infers a value silently; the connection form
+/// *offers* one (a `localhost` host suggests [`Local`](Self::Local), a name
+/// containing "prod" suggests [`Prod`](Self::Prod)) and the user accepts or ignores
+/// it. Guessing "production" wrongly would be as annoying as guessing "local" would
+/// be dangerous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "lowercase")
+)]
+pub enum ConnEnv {
+    /// No marker: the guards behave exactly as configured globally.
+    #[default]
+    Unset,
+    /// A scratch or throwaway database, where a mistake costs nothing.
+    Local,
+    /// A shared development database.
+    Dev,
+    /// Pre-production. Treated as `Dev` for confirmations; the distinction is for
+    /// the user's own labelling.
+    Staging,
+    /// Production. Confirmations get stricter and cannot be switched off from a
+    /// dialog.
+    Prod,
+}
+
+impl ConnEnv {
+    /// A short label for the connection list and the run bar. Empty for
+    /// [`Unset`](Self::Unset), which should render no badge at all.
+    pub fn label(self) -> &'static str {
+        match self {
+            ConnEnv::Unset => "",
+            ConnEnv::Local => "Local",
+            ConnEnv::Dev => "Dev",
+            ConnEnv::Staging => "Staging",
+            ConnEnv::Prod => "Prod",
+        }
+    }
+
+    /// The value the connection form should *offer* for a connection with this host
+    /// and name, or `None` when nothing about it is suggestive.
+    ///
+    /// Only ever a suggestion. A loopback host is strong evidence of a scratch
+    /// database; "prod" in the name is weaker but worth raising, and erring toward
+    /// the stricter reading is the safe direction for a guess the user can decline.
+    pub fn suggest(host: &str, name: &str) -> Option<Self> {
+        let name = name.to_ascii_lowercase();
+        if name.contains("prod") && !name.contains("non-prod") && !name.contains("nonprod") {
+            return Some(ConnEnv::Prod);
+        }
+        if name.contains("staging") || name.contains("stage") {
+            return Some(ConnEnv::Staging);
+        }
+        let host = host.trim().to_ascii_lowercase();
+        if matches!(
+            host.as_str(),
+            "" | "localhost" | "127.0.0.1" | "::1" | "0.0.0.0"
+        ) {
+            return Some(ConnEnv::Local);
+        }
+        if name.contains("dev") {
+            return Some(ConnEnv::Dev);
+        }
+        None
+    }
+}
+
 /// DSN so the form can offer both entry modes and so engines stay swappable; the
 /// driver-facing connection string is composed on demand by [`Self::dsn`]. For a
 /// file engine the path lives in `database`; `host`/`port`/`user`/`password` are
@@ -811,6 +890,12 @@ pub struct ConnectionConfig {
     /// `security-review-2026-07.md`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub tls: bool,
+    /// Which deployment this connection points at. Drives how strict the write
+    /// guards are: see `ConfirmPolicy` in the app. Defaults to
+    /// [`ConnEnv::Unset`], which changes nothing, so an existing
+    /// `connections.toml` keeps its exact behaviour.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub env: ConnEnv,
     /// Per-connection AI master-switch override. `None` inherits the global
     /// `[ai] enabled`; `Some(false)` is a true kill switch for *this* connection
     /// (no panel, no tools, no agent), e.g. a production database.
@@ -2343,6 +2428,39 @@ mod key_tests {
 #[cfg(test)]
 mod conn_tests {
     use super::*;
+
+    #[test]
+    fn env_suggestion_reads_host_and_name() {
+        // A loopback host is strong evidence of a scratch database. A blank host is
+        // the same thing: a file engine, or a form not filled in yet.
+        assert_eq!(ConnEnv::suggest("localhost", "app"), Some(ConnEnv::Local));
+        assert_eq!(ConnEnv::suggest("127.0.0.1", "app"), Some(ConnEnv::Local));
+        assert_eq!(ConnEnv::suggest("", "scratch.db"), Some(ConnEnv::Local));
+        // The name wins over the host: a tunnelled production database is still
+        // production, and that is the reading that errs safely.
+        assert_eq!(
+            ConnEnv::suggest("localhost", "prod replica"),
+            Some(ConnEnv::Prod)
+        );
+        assert_eq!(
+            ConnEnv::suggest("db.internal", "API prod"),
+            Some(ConnEnv::Prod)
+        );
+        // "non-prod" is not production, and would be an especially annoying thing to
+        // guess wrong.
+        assert_eq!(ConnEnv::suggest("db.internal", "non-prod"), None);
+        assert_eq!(ConnEnv::suggest("db.internal", "nonprod api"), None);
+        assert_eq!(
+            ConnEnv::suggest("db.internal", "staging"),
+            Some(ConnEnv::Staging)
+        );
+        assert_eq!(
+            ConnEnv::suggest("db.internal", "dev box"),
+            Some(ConnEnv::Dev)
+        );
+        // Nothing suggestive: say nothing rather than guess.
+        assert_eq!(ConnEnv::suggest("db.internal", "analytics"), None);
+    }
 
     #[test]
     fn dsn_composes_network_url() {

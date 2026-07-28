@@ -21,7 +21,6 @@ use red_service::{Command, Event, ServiceHandle, SessionId};
 mod copy;
 mod format;
 mod mcp;
-mod sql_split;
 
 use format::{OutFormat, Writer};
 
@@ -389,7 +388,10 @@ fn cmd_exec(args: ExecArgs) -> u8 {
             return EXIT_USAGE;
         }
     };
-    let statements = sql_split::split_statements(&sql);
+    // The service would split a script itself, but it runs one whole `Execute` in a
+    // single transaction; a seed script is run statement by statement here so a
+    // failure names the offending statement and the ones before it stay committed.
+    let statements = red_core::sql::split_statements(&sql);
     if statements.is_empty() {
         eprintln!("no statements to execute");
         return EXIT_OK;
@@ -409,7 +411,12 @@ fn cmd_exec(args: ExecArgs) -> u8 {
 
     let mut total: u64 = 0;
     for (idx, stmt) in statements.iter().enumerate() {
-        svc.send_to(PRIMARY, Command::Execute { sql: stmt.clone() });
+        svc.send_to(
+            PRIMARY,
+            Command::Execute {
+                sql: (*stmt).to_string(),
+            },
+        );
         match wait_execute(&mut events) {
             Ok(affected) => total += affected,
             Err(msg) => {
@@ -545,7 +552,7 @@ fn connect_session(
 fn wait_execute(events: &mut EventRx) -> Result<u64, String> {
     loop {
         match recv(events) {
-            Some(Event::Executed { affected }) => return Ok(affected as u64),
+            Some(Event::Executed { affected, .. }) => return Ok(affected as u64),
             Some(Event::Error(e)) => return Err(e),
             Some(_) => continue,
             None => return Err("backend closed unexpectedly".into()),

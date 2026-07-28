@@ -10,6 +10,7 @@ use red_service::Command;
 use crate::config::StoredConnection;
 
 use super::{AppState, FormField, FormState, SshAuthMode, TestState};
+use red_core::ConnEnv;
 
 impl AppState {
     /// Set every form text input in one go.
@@ -105,6 +106,8 @@ impl AppState {
             color: 3,
             // Read-only by default, RED's safe-by-default posture.
             read_only: true,
+            // Unmarked until the user picks, or accepts the form's suggestion.
+            env: ConnEnv::Unset,
             tls: false,
             editing: None,
             submitted: false,
@@ -190,6 +193,7 @@ impl AppState {
             kind: config.kind,
             color: config.color,
             read_only: config.read_only,
+            env: config.env,
             tls: config.tls,
             editing: Some(index),
             submitted: false,
@@ -291,6 +295,7 @@ impl AppState {
             database: read(&self.database_input),
             color: form.color,
             read_only: form.read_only,
+            env: form.env,
             tls: form.tls && !form.kind.is_file(),
             ai_enabled,
             ai_tier,
@@ -641,6 +646,31 @@ impl AppState {
             form.color = color;
         }
         cx.notify();
+    }
+
+    /// Set the deployment marker from the connection form's picker.
+    pub(crate) fn set_form_env(&mut self, env: ConnEnv, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.form {
+            form.env = env;
+        }
+        cx.notify();
+    }
+
+    /// What the form should *offer* as this connection's environment, or `None` when
+    /// the user has already chosen one or nothing about the fields is suggestive.
+    ///
+    /// Never applied on its own. A wrong guess of "production" is an irritation the
+    /// user has to undo, and a wrong guess of "local" is a guard silently relaxed on
+    /// a database that needed it, so the choice stays theirs either way.
+    pub(crate) fn form_env_suggestion(&self, cx: &gpui::App) -> Option<ConnEnv> {
+        let form = self.form.as_ref()?;
+        if form.env != ConnEnv::Unset {
+            return None;
+        }
+        ConnEnv::suggest(
+            &self.host_input.read(cx).content(),
+            &self.name_input.read(cx).content(),
+        )
     }
 
     pub(crate) fn set_form_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {

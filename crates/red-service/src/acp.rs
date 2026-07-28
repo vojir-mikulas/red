@@ -458,6 +458,67 @@ pub(crate) async fn run_turn(
 /// CLI's lifecycle as `AiLoginPrompt`/`AiLoginFinished`, and on success force idle
 /// conversations to re-handshake so they adopt the (possibly switched) account.
 /// Red never sees the OAuth tokens; the CLI owns them.
+/// Run one throwaway prompt on an ACP agent and return its text.
+///
+/// The confirm dialog's advisory review, for agents that own their own process
+/// instead of an API key. Deliberately **not** the user's open chat: reusing that
+/// conversation would inject a review prompt into their visible history and carry
+/// their chat's context into a judgement about one statement. So this spawns a
+/// private session, asks once, and drops it.
+///
+/// The session is stripped of everything the panel gives an agent: no MCP
+/// grounding server, so no database tools and no way to read a row; no
+/// auto-allowed tools; and `permissions: None`, which is deny-by-default for
+/// anything the agent asks for anyway. It gets a text prompt and returns text.
+///
+/// **The cost is a process spawn per review** — launching the agent, handshaking,
+/// and opening a session, which on a cold start is seconds rather than
+/// milliseconds. That is why the caller gives this path a longer budget than the
+/// API one, and why the review stays opt-in.
+///
+/// ACP has no system-prompt slot, so the instructions ride in the prompt text
+/// alongside the statement. The `<statement>` framing still applies; the guarantee
+/// that a fooled model cannot approve anything is unchanged, because the verdict
+/// is display-only either way.
+pub(crate) async fn one_shot(
+    command: String,
+    cwd: PathBuf,
+    prompt: String,
+) -> Result<String, String> {
+    let config = AcpConfig {
+        command,
+        cwd,
+        // No grounding server: this review reads the schema summary it was handed
+        // and nothing else.
+        mcp: None,
+        allow_tools: Vec::new(),
+        // Deny-by-default. Nothing is wired to answer a permission request, which
+        // is the correct posture for a prompt that should not be using tools.
+        permissions: None,
+        commands: None,
+        config: None,
+    };
+    let agent = AcpConversation::start(config)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (tx, mut rx) = mpsc::unbounded_channel::<AcpDelta>();
+    let done = agent.prompt(prompt, tx);
+    // Text arrives as deltas; the turn result carries only usage and stop reason,
+    // so accumulate as we go. Thinking chunks are dropped: the dialog wants the
+    // answer, not the reasoning.
+    let mut text = String::new();
+    while let Some(delta) = rx.recv().await {
+        if let AcpDelta::Text(chunk) = delta {
+            text.push_str(&chunk);
+        }
+    }
+    match done.await {
+        Ok(Ok(_)) => Ok(text),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("the agent stopped before answering".into()),
+    }
+}
+
 pub(crate) async fn start_login(
     manager: Arc<tokio::sync::Mutex<AcpManager>>,
     command: String,

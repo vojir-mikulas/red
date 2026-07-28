@@ -109,6 +109,7 @@ pub fn import(dir: &Path) -> Result<ImportReport> {
                 database,
                 color: 0,
                 read_only: conn.read_only,
+                env: Default::default(),
                 // TLS isn't extracted from the external store yet; a `rediss://`
                 // etc. pasted later still sets it.
                 tls: false,

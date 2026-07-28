@@ -12,6 +12,7 @@ use flint::prelude::*;
 use gpui::{AnyElement, Context, FontWeight, SharedString, canvas, div, prelude::*, px};
 
 use crate::app::{AppState, FontSelect};
+use crate::settings::ConfirmThreshold;
 use crate::settings::{Density, ThemeMode};
 
 /// The Appearance-tab controls that can sit below the fold and so are scrolled
@@ -736,8 +737,32 @@ fn query_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             limit_view.update(cx, |this, cx| this.set_auto_limit(n, cx));
         });
 
-    let confirm = Toggle::new("set-confirm", state.settings.query.confirm_destructive)
-        .on_change(cx.listener(|this, on: &bool, _, cx| this.set_confirm_destructive(*on, cx)));
+    // The confirmation threshold, least to most permissive left-to-right, so moving
+    // right is always "ask me less".
+    const CONFIRM_LEVELS: [ConfirmThreshold; 4] = [
+        ConfirmThreshold::Write,
+        ConfirmThreshold::Risky,
+        ConfirmThreshold::Critical,
+        ConfirmThreshold::Never,
+    ];
+    let confirm_sel = CONFIRM_LEVELS
+        .iter()
+        .position(|&l| l == state.settings.query.confirm_from)
+        .unwrap_or(1);
+    let confirm_view = view.clone();
+    let confirm = Segmented::new("set-confirm")
+        .segment("Any write")
+        .segment("Risky")
+        .segment("Destructive")
+        .segment("Never")
+        .selected(confirm_sel)
+        .on_select(move |ix, _, cx| {
+            let level = CONFIRM_LEVELS[ix.min(CONFIRM_LEVELS.len() - 1)];
+            confirm_view.update(cx, |this, cx| this.set_confirm_from(level, cx));
+        });
+
+    let ai_review = Toggle::new("set-ai-review", state.settings.query.ai_review)
+        .on_change(cx.listener(|this, on: &bool, _, cx| this.set_ai_review(*on, cx)));
 
     // Statement-timeout presets, in seconds (0 = off); a custom value shows none.
     const TIMEOUT_PRESETS: [u32; 4] = [0, 10, 30, 60];
@@ -777,11 +802,23 @@ fn query_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             ))
             .child(settings_header("Safety", &theme))
             .child(setting_row(
-                "Confirm destructive operations",
-                "Ask before a destructive write — DROP / TRUNCATE / DELETE-without-WHERE, \
-                 deleting a Redis key, or deleting a MongoDB document. The confirm \
-                 dialog's \"Don't ask again\" checkbox turns this off.",
+                "Confirm from",
+                "How dangerous a statement has to be before Red asks first. \"Risky\" \
+                 covers an UPDATE or DELETE with no WHERE, a privilege change, or a \
+                 MERGE; \"Destructive\" is a DROP or TRUNCATE, which is always confirmed \
+                 by typing the object's name. A connection marked Prod confirms from \
+                 Risky whatever this says.",
                 confirm,
+                &theme,
+            ))
+            .child(setting_row(
+                "Ask the assistant to review",
+                "Add a second opinion from your AI agent to the confirmation, for the \
+                 mistakes a keyword check can't see (a filter that looks inverted, say). \
+                 This sends the statement and a summary of your schema to the configured \
+                 provider. It is advice only: it never runs anything, and never unlocks \
+                 the confirmation.",
+                ai_review,
                 &theme,
             )),
         &theme,
@@ -1492,10 +1529,15 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
     let agents = state.settings.ai.resolved_agents();
     let usable: std::collections::HashSet<&str> =
         state.usable_agents.iter().map(|a| a.id.as_str()).collect();
+    // The *resolved* default, not the raw setting: an empty or stale `default_agent`
+    // still resolves to a real agent, and that is the one a new chat would open on,
+    // so it is the one to mark.
+    let default_agent = state.settings.ai.resolved_default_agent();
 
     let mut list = div().flex().flex_col().gap_1();
     for a in &agents {
         let is_acp = a.kind.eq_ignore_ascii_case("acp");
+        let is_default = a.id == default_agent;
         // The subscription agent's last-known sign-in, once checked (the AI tab asks
         // on open). API agents have no sign-in; they carry a key.
         let acp_auth = is_acp.then(|| state.ai_auth.get(a.id.as_str())).flatten();
@@ -1521,6 +1563,30 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
             .text_size(theme.scale(10.))
             .text_color(theme.text_muted)
             .child(if is_acp { "ACP" } else { "API" });
+        // Which agent is the default was previously settable only by hand-editing
+        // `[ai] default_agent`, which made it invisible: nothing on screen said
+        // which agent a new chat (or a confirm-dialog review) would use.
+        let default_control: AnyElement = if is_default {
+            div()
+                .flex_none()
+                .px_1p5()
+                .rounded(px(4.))
+                .bg(theme.accent_ghost)
+                .text_size(theme.scale(10.))
+                .text_color(theme.accent)
+                .child("DEFAULT")
+                .into_any_element()
+        } else {
+            let id = a.id.clone();
+            Button::new(
+                SharedString::from(format!("ai-default-{}", a.id)),
+                "Make default",
+            )
+            .variant(ButtonVariant::Ghost)
+            .size(ButtonSize::Sm)
+            .on_click(cx.listener(move |this, _, _, cx| this.set_default_agent(&id, cx)))
+            .into_any_element()
+        };
         // Re-auth / switch account (M-S4) lives here, not in the chat panel: an ACP
         // agent owns its own `/login`, so this asks the backend to spawn it for a
         // fresh handshake (it pops its own browser when signed out). API agents
@@ -1656,6 +1722,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                         ),
                 )
                 .child(kind_badge)
+                .child(default_control)
                 .when_some(key_btn, |row, b| row.child(b))
                 .when_some(signout, |row, b| row.child(b))
                 .when_some(signin, |row, b| row.child(b)),
@@ -1717,9 +1784,11 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                      key; use “Add key” (stored in the OS keyring, never in the file). A \
                      subscription (ACP) agent signs in through your browser; use the key \
                      button to sign in or switch account, and “Sign out” to disconnect; the \
-                     row shows who's signed in. Choose which agent runs a chat from the \
-                     chat's agent dropdown. Add or remove agents and edit their command / \
-                     endpoint / model in the settings file.",
+                     row shows who's signed in. The DEFAULT agent is the one a new chat \
+                     opens on, and the one that reviews a statement in the confirmation \
+                     dialog; a chat can still be switched to another from its own agent \
+                     dropdown. Add or remove agents and edit their command / endpoint / \
+                     model in the settings file.",
                 ),
         )
         .child(list)

@@ -22,6 +22,7 @@ use crate::result::ResultGrid;
 use crate::schema::SchemaState;
 
 use super::AppState;
+use red_core::ConnEnv;
 
 /// Which font-family picker (UI sans / UI mono / editor) a settings action refers
 /// to; routes a choice to the matching setter and the matching combo box.
@@ -713,6 +714,10 @@ pub(crate) struct FormState {
     /// Label-palette index (see `connect::label_color`).
     pub color: u8,
     pub read_only: bool,
+    /// Which deployment this connection points at, driving how strict its write
+    /// confirmations are. The form offers a suggestion from the host and name but
+    /// never applies one on its own; see [`ConnEnv::suggest`].
+    pub env: ConnEnv,
     /// Encrypt the connection with TLS (see `docs/plans/redis.md`'s TLS toggle
     /// item). Off by default; only offered for network engines.
     pub tls: bool,
@@ -778,13 +783,127 @@ pub(crate) enum FormField {
     ProxyHost,
 }
 
+/// The advisory AI review for the open confirmation: which agent was asked, and
+/// what came back.
+///
+/// **This is display-only, structurally.** Nothing in the confirmation path reads
+/// it: not the threshold, not the typed-confirmation match, not the run button.
+/// That is the whole design. A model that is unavailable, slow, wrong, or talked
+/// into approving something by text inside the statement it is reviewing can then
+/// only ever cost the user a line of text, never a table.
+///
+/// `agent` is carried so the line can name who answered. Which agent runs a review
+/// is not a separate setting: it follows the assistant panel (the open chat's
+/// agent, else the same default a new chat would pick), and showing the name is
+/// what makes that legible rather than mysterious.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AiReview {
+    pub(crate) agent: SharedString,
+    pub(crate) state: AiReviewState,
+}
+
+/// What the advisory review came back with.
+///
+/// [`NoConcern`](Self::NoConcern) and [`Unavailable`](Self::Unavailable) are
+/// separate on purpose. Both are "no note", and collapsing them into one silent
+/// outcome made a working review indistinguishable from a broken one: the dialog
+/// said "asking the assistant…" and then just stopped.
+///
+/// There is still no "looks fine" verdict. `NoConcern` is phrased as a statement
+/// about the assistant, never about the statement, because "this is safe to run"
+/// is a promise the model is not entitled to make.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AiReviewState {
+    /// The request is in flight.
+    Pending,
+    /// The model raised a specific concern.
+    Concern(String),
+    /// The model answered and had nothing to add.
+    NoConcern,
+    /// The review could not run, with a short reason.
+    Unavailable(String),
+}
+
+/// The row-count preflight's state for the open confirmation.
+///
+/// Modelled with an explicit `Unavailable` rather than falling back to `Pending`
+/// forever, because "we asked and could not find out" and "we are still asking" read
+/// very differently to someone deciding whether to run a `DELETE`. Neither ever
+/// blocks the run button: the dialog is fully actionable from the grading alone, and
+/// a count that arrives late is an enrichment, not a gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreflightCount {
+    /// The count is in flight.
+    Pending,
+    /// The statement will touch this many rows.
+    Rows(i64),
+    /// The count timed out or errored. Said out loud rather than hidden, so the
+    /// absence of a number is never mistaken for a small one.
+    Unavailable,
+}
+
+/// The type-to-confirm box shown for a [`RiskLevel::Critical`] statement: the user
+/// has to type the doomed object's name before the run button enables.
+///
+/// This exists because a modal that can be dismissed by pressing Enter is, after the
+/// hundredth time, not a decision but a reflex, and the whole grading effort is
+/// wasted if the worst case can still be waved through the same way as the routine
+/// one. Typing a name cannot be done absent-mindedly.
+///
+/// [`RiskLevel::Critical`]: red_core::sql::RiskLevel::Critical
+pub(crate) struct ConfirmInput {
+    pub(crate) input: Entity<flint::TextInput>,
+    /// The bare object name the typed text has to match, compared case-insensitively
+    /// after trimming. Case-insensitive because engines differ on identifier folding
+    /// and the point is deliberateness, not transcription accuracy.
+    pub(crate) expect: String,
+    /// Held, not detached: dropping this with the modal unsubscribes.
+    _sub: gpui::Subscription,
+}
+
+impl ConfirmInput {
+    pub(crate) fn new(expect: String, cx: &mut Context<AppState>) -> Self {
+        let input = cx.new(|cx| {
+            flint::TextInput::new(cx).with_placeholder(SharedString::from(expect.clone()))
+        });
+        let sub = cx.subscribe(&input, |this, _input, evt: &flint::TextInputEvent, cx| {
+            match evt {
+                // Enter runs it, but only once the name matches; otherwise the key is
+                // swallowed rather than closing the modal on a half-typed name.
+                flint::TextInputEvent::Submit => {
+                    if this.confirm_target_matches(cx) {
+                        this.confirm_destructive(cx);
+                    }
+                }
+                flint::TextInputEvent::Cancel => this.cancel_destructive(cx),
+                // Re-render so the run button tracks what has been typed so far.
+                flint::TextInputEvent::Change => cx.notify(),
+                flint::TextInputEvent::Tab
+                | flint::TextInputEvent::BackTab
+                | flint::TextInputEvent::Up
+                | flint::TextInputEvent::Down => {}
+            }
+        });
+        Self {
+            input,
+            expect,
+            _sub: sub,
+        }
+    }
+}
+
 /// A write awaiting the confirm modal (Track B5 generalized the destructive-confirm
 /// path to carry either). Confirming runs it; cancelling drops it.
 #[derive(Clone)]
 pub(crate) enum PendingWrite {
-    /// A destructive editor statement (`UPDATE`/`DELETE`/… typed in the SQL editor),
-    /// run verbatim via `execute_sql` on confirm.
-    EditorSql(String),
+    /// A graded editor statement, run verbatim via `execute_sql` on confirm. The
+    /// [`Assessment`] rides along so the modal can show *why* it stopped and, at
+    /// [`RiskLevel::Critical`](red_core::sql::RiskLevel::Critical), which object the
+    /// user has to type out.
+    EditorSql {
+        sql: String,
+        assessment: red_core::sql::Assessment,
+    },
     /// A staged grid edit batch (Track B6): the previewed, parameterized
     /// [`EditOp`]s sent as one `Command::ApplyBatch` on confirm. `epoch` scopes the
     /// reply to its result.

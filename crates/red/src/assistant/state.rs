@@ -209,6 +209,107 @@ impl AppState {
     /// then the resolved default agent, then the first usable agent. Each candidate
     /// is skipped unless it's currently usable (e.g. an API agent with no key while
     /// an ACP agent is ready).
+    /// The agent an out-of-panel request should run on: the open chat's agent when
+    /// there is one, otherwise the same default a new chat would pick. Lets the
+    /// confirm dialog's advisory review use "the user's agent" without needing a
+    /// chat to be open.
+    pub(crate) fn assistant_agent_id(&self) -> String {
+        self.assistant
+            .as_ref()
+            .map(|state| state.active().provider.clone())
+            .unwrap_or_else(|| self.default_ai_provider())
+    }
+
+    /// The schema context for the confirm dialog's advisory review, focused on the
+    /// one table the statement targets.
+    ///
+    /// Deliberately *not* [`Self::ai_schema_summary`], which is only a list of
+    /// object names. A reviewer given nothing but names cannot do the job it exists
+    /// for: it can't tell an inverted predicate from a correct one without the
+    /// columns, and it can't say what a `DROP` would strand without the foreign
+    /// keys. Asked to judge from names alone it correctly answers "nothing to add"
+    /// every time, which is exactly how this looked in practice.
+    ///
+    /// So this sends the two things the user cannot easily see and the model can
+    /// actually reason from: the target's columns (when the tree has loaded them)
+    /// and every foreign key touching it, in both directions. The connection-wide
+    /// FK graph is loaded once at connect, so the inbound references are always
+    /// available even for a table that was never expanded.
+    pub(crate) fn review_schema_context(&self, table: Option<&str>) -> String {
+        let Phase::Connected(active) = &self.phase else {
+            return String::new();
+        };
+        // The bare table name, since the FK graph and the detail map are keyed by it
+        // rather than by the qualified reference as written in the SQL.
+        let Some(bare) = table.map(|t| {
+            t.rsplit('.')
+                .next()
+                .unwrap_or(t)
+                .trim_matches(['"', '`', '[', ']'].as_slice())
+        }) else {
+            return summarize_schema(&active.schema.schemas);
+        };
+
+        let mut out = String::new();
+        if let Some((_, detail)) = active
+            .schema
+            .details
+            .iter()
+            .find(|((_, name), _)| name.eq_ignore_ascii_case(bare))
+        {
+            out.push_str(&format!("Columns of {bare}:\n"));
+            for c in &detail.columns {
+                let ty = c.type_name.as_deref().unwrap_or("?");
+                let pk = if c.primary_key { " PRIMARY KEY" } else { "" };
+                let nn = if c.not_null { " NOT NULL" } else { "" };
+                out.push_str(&format!("  {} {ty}{pk}{nn}\n", c.name));
+            }
+        }
+
+        // Both directions matter and they mean different things: outbound keys say
+        // what this table depends on, inbound keys say what breaks if it goes.
+        let mut inbound = Vec::new();
+        let mut outbound = Vec::new();
+        for e in &active.fk_graph {
+            let cols = |pairs: &[(String, String)]| {
+                pairs
+                    .iter()
+                    .map(|(a, b)| format!("{a} -> {b}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            if e.to_table.eq_ignore_ascii_case(bare) {
+                inbound.push(format!(
+                    "  {} references it ({})",
+                    e.from_table,
+                    cols(&e.columns)
+                ));
+            } else if e.from_table.eq_ignore_ascii_case(bare) {
+                outbound.push(format!(
+                    "  it references {} ({})",
+                    e.to_table,
+                    cols(&e.columns)
+                ));
+            }
+        }
+        if !inbound.is_empty() {
+            out.push_str(&format!("\nForeign keys pointing at {bare}:\n"));
+            out.push_str(&inbound.join("\n"));
+            out.push('\n');
+        }
+        if !outbound.is_empty() {
+            out.push_str(&format!("\nForeign keys from {bare}:\n"));
+            out.push_str(&outbound.join("\n"));
+            out.push('\n');
+        }
+        // Nothing focused to say (an unexpanded table on a connection whose FK graph
+        // failed to load): fall back to the catalog so the model has *something*.
+        if out.is_empty() {
+            return summarize_schema(&active.schema.schemas);
+        }
+        out
+    }
+
     fn default_ai_provider(&self) -> String {
         let usable = |id: &str| self.usable_agents.iter().any(|a| a.id == id);
         if let Some(last) = self.local_state.last_agent()

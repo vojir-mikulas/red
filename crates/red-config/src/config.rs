@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use red_core::{AiTier, ConnectionConfig, DbKind, ProxyConfig, ProxyKind, SshAuth, SshConfig};
+use red_core::{
+    AiTier, ConnEnv, ConnectionConfig, DbKind, ProxyConfig, ProxyKind, SshAuth, SshConfig,
+};
 use serde::{Deserialize, Serialize};
 
 /// A saved connection plus a recency stamp for "recent" ordering. The in-memory
@@ -69,6 +71,10 @@ struct RawConnection {
     color: u8,
     #[serde(default)]
     read_only: bool,
+    /// Which deployment this points at, driving how strict the write guards are.
+    /// Absent in configs written before the marker, where `Unset` changes nothing.
+    #[serde(default)]
+    env: ConnEnv,
     /// Encrypt with TLS (`rediss`/HTTPS/`require_ssl`). Absent in pre-TLS
     /// configs, where it defaults to off.
     #[serde(default)]
@@ -190,6 +196,7 @@ impl RawConnection {
             database: self.database,
             color: self.color,
             read_only: self.read_only,
+            env: self.env,
             tls: self.tls,
             ai_enabled: self.ai_enabled,
             ai_tier: self.ai_tier,
@@ -246,6 +253,10 @@ struct WriteConnection {
     database: String,
     color: u8,
     read_only: bool,
+    /// Deployment marker; omitted when unset so pre-marker files round-trip
+    /// byte-for-byte, like the TLS and AI keys below.
+    #[serde(skip_serializing_if = "is_unset_env")]
+    env: ConnEnv,
     /// TLS toggle; omitted when off so pre-TLS files round-trip byte-for-byte.
     #[serde(skip_serializing_if = "is_false")]
     tls: bool,
@@ -342,6 +353,7 @@ impl From<&StoredConnection> for WriteConnection {
             database: c.database.clone(),
             color: c.color,
             read_only: c.read_only,
+            env: c.env,
             tls: c.tls,
             ai_enabled: c.ai_enabled,
             ai_tier: c.ai_tier,
@@ -358,6 +370,12 @@ impl From<&StoredConnection> for WriteConnection {
 /// `fn(&bool) -> bool`, which `std::ops::Not::not` (taking `bool` by value) isn't.
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// An unmarked connection writes no `env` key, so a file saved before the marker
+/// existed round-trips unchanged.
+fn is_unset_env(env: &ConnEnv) -> bool {
+    *env == ConnEnv::Unset
 }
 
 #[derive(Default, Serialize)]
@@ -566,6 +584,7 @@ mod tests {
                     // A Sentinel master must round-trip; conn-a leaves it empty to
                     // confirm it's omitted from the file and reads back blank.
                     sentinel_master: "mymaster".into(),
+                    env: ConnEnv::Prod,
                 },
                 last_accessed: None,
                 pinned: false,
@@ -578,6 +597,13 @@ mod tests {
         let text = toml::to_string_pretty(&cfg).expect("serialize");
         // The password must not appear anywhere in the serialized file.
         assert!(!text.contains("secret"), "password leaked into config file");
+        // An unmarked connection writes no `env` key at all, so a file saved before
+        // the marker existed round-trips byte-for-byte.
+        assert_eq!(
+            text.matches("env = ").count(),
+            1,
+            "unset env was written:\n{text}"
+        );
 
         let back: RawConfigFile = toml::from_str(&text).expect("deserialize");
         let back: Vec<StoredConnection> = back
@@ -599,6 +625,9 @@ mod tests {
         // Password is not persisted; it comes back empty.
         assert_eq!(back[1].config.password, "");
         assert_eq!(back[1].last_accessed, None);
+        // The deployment marker round-trips; an unmarked one reads back unset.
+        assert_eq!(back[0].config.env, ConnEnv::Unset);
+        assert_eq!(back[1].config.env, ConnEnv::Prod);
         // Per-connection AI overrides round-trip; an unset one stays inherited.
         assert_eq!(back[0].config.ai_enabled, None);
         assert_eq!(back[0].config.ai_tier, None);

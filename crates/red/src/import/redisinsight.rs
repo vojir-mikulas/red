@@ -118,6 +118,7 @@ fn read_report(conn: &Connection) -> Result<ImportReport> {
                 database,
                 color: 0,
                 read_only: false,
+                env: Default::default(),
                 tls,
                 ai_enabled: None,
                 ai_tier: None,

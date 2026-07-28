@@ -4,6 +4,8 @@
 //! the updater controls. Split out of `mod.rs`.
 
 use super::*;
+use crate::settings::ConfirmThreshold;
+use red_core::sql::RiskLevel;
 
 impl AppState {
     // --- settings: live observers ---
@@ -708,8 +710,53 @@ impl AppState {
         cx.notify();
     }
 
-    pub(crate) fn set_confirm_destructive(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.settings.query.confirm_destructive = on;
+    /// Make `id` the default agent: the one a new chat opens on, and the one the
+    /// confirmation dialog asks for a review. Persists to `[ai] default_agent`.
+    pub(crate) fn set_default_agent(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.settings.ai.default_agent = id.to_string();
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Opt in or out of the confirmation dialog's advisory AI review. Opt-in
+    /// because enabling it sends the statement and a schema summary to the
+    /// configured provider.
+    pub(crate) fn set_ai_review(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.query.ai_review = on;
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Set the confirmation threshold from the settings page.
+    pub(crate) fn set_confirm_from(&mut self, level: ConfirmThreshold, cx: &mut Context<Self>) {
+        self.settings.query.confirm_from = level;
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// The "Don't ask again" checkbox on a confirmation modal: start or stop asking
+    /// about actions graded `level`, by moving the threshold to `level` or just past
+    /// it.
+    ///
+    /// Takes the level being confirmed rather than flipping one switch, so silencing
+    /// what is in front of you cannot silence something worse. The SQL modal only
+    /// offers the checkbox below `Critical` and so can never reach `Never`; the Redis
+    /// and MongoDB delete confirms pass `Critical` (destroying data outright is what
+    /// they do) and so still can, which preserves what their checkbox has always
+    /// meant.
+    ///
+    /// Re-ticking is approximate: it restores asking at `level`, not whatever
+    /// stricter threshold was set before. That only loses a setting the user is
+    /// actively overriding in the same breath, and the direction is toward asking.
+    pub(crate) fn set_confirms_at(&mut self, level: RiskLevel, ask: bool, cx: &mut Context<Self>) {
+        self.settings.query.confirm_from = match (level, ask) {
+            (RiskLevel::Safe | RiskLevel::Write, true) => ConfirmThreshold::Write,
+            (RiskLevel::Risky, true) => ConfirmThreshold::Risky,
+            (RiskLevel::Critical, true) => ConfirmThreshold::Critical,
+            (RiskLevel::Safe | RiskLevel::Write, false) => ConfirmThreshold::Risky,
+            (RiskLevel::Risky, false) => ConfirmThreshold::Critical,
+            (RiskLevel::Critical, false) => ConfirmThreshold::Never,
+        };
         self.save_settings();
         cx.notify();
     }

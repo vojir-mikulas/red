@@ -8,6 +8,12 @@ use std::ops::Range;
 
 use flint::TokenStyle;
 use red_core::DbKind;
+// The service splits a script the same way before running it, so what the confirm
+// gate classifies as one statement is exactly what the engine is handed, and both
+// read-only gates reason over the same stripped copy with the same token lists.
+use red_core::sql::{
+    DANGEROUS_FNS, WRITE_TOKENS, first_keyword, has_word, split_statements, strip_noise,
+};
 
 /// SQL keywords, lowercase. Drives both highlighting and (upper-cased) completion.
 pub const KEYWORDS: &[&str] = &[
@@ -400,7 +406,7 @@ pub fn tokenize(src: &str) -> Vec<(Range<usize>, TokenStyle)> {
         // close-then-reopen rather than an escaped inner quote. Deliberately: it
         // keeps the lexer trivial, and since the content between the doubled quotes
         // stays "inside a string", a `;` there is still not a statement boundary, so
-        // `classify`/`split_statements` (the destructive-query guard) stay correct.
+        // `split_statements` and the risk grading over it stay correct.
         // The only cost is cosmetic: highlighting can split mid-literal on `''`.
         if c == b'\'' || c == b'"' {
             let quote = c;
@@ -489,49 +495,24 @@ pub fn tokenize(src: &str) -> Vec<(Range<usize>, TokenStyle)> {
     out
 }
 
-/// What kind of statement the editor is about to run; drives whether it streams
-/// into the result grid, executes in a transaction, or first asks for confirmation.
-///
-/// Variant order is the severity order (`Query` < `Write` < `Destructive`) so a
-/// batch's kind is the `max` of its statements' kinds; see [`classify`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum StatementKind {
-    /// Row-returning; opens in the result grid.
-    Query,
-    /// A write/DDL that's safe to run after a plain transaction (INSERT, CREATE…).
-    Write,
-    /// A write that destroys or rewrites existing data: confirm before running.
-    Destructive,
-}
-
-/// Classify a statement *batch* by its most-destructive statement. A paste like
-/// `SELECT 1; DROP TABLE users` must confirm, so each `;`-delimited statement is
-/// classified and the highest severity wins (`Destructive` > `Write` > `Query`);
-/// classifying only the leading keyword would let a destructive tail slip past the
-/// confirm modal. A trailing empty statement (after the last `;`) is ignored.
-pub fn classify(sql: &str) -> StatementKind {
-    split_statements(sql)
-        .into_iter()
-        .filter(|s| !first_keyword(s).is_empty())
-        .map(classify_one)
-        .max()
-        .unwrap_or(StatementKind::Query)
-}
-
 /// A conservative read-only gate for **AI-suggested** SQL that would auto-execute
 /// (the agent's `open_query` tool / the "Open in a query tab" chip): the statement
 /// must be a single SELECT/WITH/EXPLAIN/VALUES with no statement separator and no
 /// embedded write keyword or dangerous server-side function. Anything else is loaded
 /// into the tab but *not* run, so a model can never silently execute a write on a
-/// writable connection, closing the [`classify`]-only gate's hole where a
-/// data-modifying CTE (`WITH x AS (DELETE … RETURNING …) SELECT …`) or a
-/// side-effecting function (`SELECT lo_export(…)`) leads with a read keyword.
+/// writable connection. It stays stricter than the risk grading even though that now
+/// catches the data-modifying CTE too: a side-effecting function
+/// (`SELECT lo_export(…)`) is an ordinary read as far as grading is concerned, and
+/// auto-running someone else's SQL deserves a narrower gate than running your own.
 ///
 /// This is the UI twin of `red-service`'s `is_read_only_select`, and reasons the
-/// same way: over a noise-stripped copy (literals/quoted-identifiers/comments
-/// blanked) so a write word inside a string can't fool it and a quoted column named
-/// like one can't trip it. Keep the two token lists in sync. False positives are
-/// fine: a rejected read just doesn't auto-run; the user can still press Run.
+/// same way: over a `strip_noise` copy so a write word inside a string can't fool it
+/// and a quoted column named like one can't trip it, against the same shared
+/// `WRITE_TOKENS` / `DANGEROUS_FNS`. It stays a separate function because it is
+/// deliberately looser about the *leading* keyword: the editor may auto-run an
+/// `EXPLAIN` or a bare `VALUES`, where the assistant's `run_select` may not. False
+/// positives are fine: a rejected read just doesn't auto-run; the user can still
+/// press Run.
 pub fn is_read_only(sql: &str) -> bool {
     let stripped = strip_noise(sql);
     let trimmed = stripped.trim().trim_end_matches(';').trim();
@@ -549,73 +530,10 @@ pub fn is_read_only(sql: &str) -> bool {
     if !read_prefix {
         return false;
     }
-    // Whole-word write verbs (the data-modifying CTE verbs, `INTO` for
-    // `SELECT … INTO`/`OUTFILE`, sequence advancers) and the well-known file/exec/
-    // remote-SQL functions: reserved or underscore-qualified names that can't be a
-    // bare column in a real read (a column so named would be quoted, hence blanked).
-    const WRITE_TOKENS: &[&str] = &[
-        "insert", "update", "delete", "merge", "into", "nextval", "setval",
-    ];
-    const DANGEROUS_FNS: &[&str] = &[
-        "lo_import",
-        "lo_export",
-        "pg_read_file",
-        "pg_read_binary_file",
-        "pg_ls_dir",
-        "pg_stat_file",
-        "pg_logical_emit_message",
-        // `dblink`/`dblink_send_query` run arbitrary SQL on a remote (often the
-        // same loopback) server from inside a SELECT, a write channel that reads
-        // as read-only. Block the bare and async forms, not just `dblink_exec`.
-        "dblink",
-        "dblink_exec",
-        "dblink_open",
-        "dblink_send_query",
-        "pg_file_write",
-        "pg_file_unlink",
-        "pg_file_rename",
-        "load_file",
-        "sys_exec",
-        "sys_eval",
-    ];
     !WRITE_TOKENS
         .iter()
         .chain(DANGEROUS_FNS)
         .any(|w| has_word(&lower, w))
-}
-
-/// A copy of `sql` with string literals, quoted identifiers, and comments blanked to
-/// spaces (reusing [`tokenize`], which marks both `'…'` and `"…"` as `String`), so a
-/// keyword scan sees only live SQL. Length- and boundary-preserving: every blanked
-/// span is a whole token, so replacing its bytes with ASCII spaces keeps valid UTF-8.
-fn strip_noise(sql: &str) -> String {
-    let mut bytes = sql.as_bytes().to_vec();
-    for (range, style) in tokenize(sql) {
-        if matches!(style, TokenStyle::String | TokenStyle::Comment) {
-            for b in &mut bytes[range] {
-                *b = b' ';
-            }
-        }
-    }
-    String::from_utf8(bytes).unwrap_or_default()
-}
-
-/// Whether `word` occurs in `haystack` as a whole ASCII word, not as a fragment of
-/// a longer identifier (so `updated_at` doesn't match `update`). Both are lower-case.
-fn has_word(haystack: &str, word: &str) -> bool {
-    let bytes = haystack.as_bytes();
-    let mut from = 0;
-    while let Some(rel) = haystack[from..].find(word) {
-        let start = from + rel;
-        let end = start + word.len();
-        let left_ok = start == 0 || !is_ident_continue(bytes[start - 1]);
-        let right_ok = end == bytes.len() || !is_ident_continue(bytes[end]);
-        if left_ok && right_ok {
-            return true;
-        }
-        from = start + 1;
-    }
-    false
 }
 
 /// The single `;`-delimited statement to run for a caret at `cursor`: the
@@ -659,68 +577,6 @@ pub fn statement_count(sql: &str) -> usize {
         .into_iter()
         .filter(|s| !first_keyword(s).is_empty())
         .count()
-}
-
-/// Classify a single statement by its leading keyword (comments + whitespace
-/// skipped). See [`classify`] for the batch entry point.
-fn classify_one(sql: &str) -> StatementKind {
-    match first_keyword(sql).to_ascii_uppercase().as_str() {
-        "SELECT" | "WITH" | "PRAGMA" | "EXPLAIN" | "VALUES" => StatementKind::Query,
-        "DROP" | "DELETE" | "UPDATE" | "ALTER" | "TRUNCATE" | "REPLACE" => {
-            StatementKind::Destructive
-        }
-        _ => StatementKind::Write,
-    }
-}
-
-/// Split `sql` into its top-level `;`-delimited statements, with `;` inside string
-/// literals and comments ignored (the same boundary rules [`statement_bounds`]
-/// uses). Borrows; no allocation per statement.
-fn split_statements(sql: &str) -> Vec<&str> {
-    let b = sql.as_bytes();
-    let n = b.len();
-    let mut out = Vec::new();
-    let mut start = 0;
-    let mut i = 0;
-    while i < n {
-        let c = b[i];
-        // Line comment: -- to end of line.
-        if c == b'-' && i + 1 < n && b[i + 1] == b'-' {
-            i += 2;
-            while i < n && b[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        // Block comment: /* ... */
-        if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
-                i += 1;
-            }
-            i = (i + 2).min(n);
-            continue;
-        }
-        // String / quoted literal.
-        if c == b'\'' || c == b'"' {
-            let quote = c;
-            i += 1;
-            while i < n && b[i] != quote {
-                i += 1;
-            }
-            if i < n {
-                i += 1;
-            }
-            continue;
-        }
-        if c == b';' {
-            out.push(&sql[start..i]);
-            start = i + 1;
-        }
-        i += 1;
-    }
-    out.push(&sql[start..]);
-    out
 }
 
 /// Append `LIMIT n` to a bare row-returning `SELECT` that doesn't already limit
@@ -1043,27 +899,6 @@ pub fn normalize_spaces(sql: &str) -> Option<String> {
 fn has_limit_clause(sql: &str) -> bool {
     sql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .any(|word| word.eq_ignore_ascii_case("limit"))
-}
-
-/// The leading keyword of `sql`, skipping leading line/block comments + whitespace.
-pub fn first_keyword(sql: &str) -> String {
-    let mut s = sql.trim_start();
-    loop {
-        if let Some(rest) = s.strip_prefix("--") {
-            s = rest
-                .split_once('\n')
-                .map_or("", |(_, after)| after)
-                .trim_start();
-        } else if let Some(rest) = s.strip_prefix("/*") {
-            match rest.split_once("*/") {
-                Some((_, after)) => s = after.trim_start(),
-                None => return String::new(),
-            }
-        } else {
-            break;
-        }
-    }
-    s.chars().take_while(|c| c.is_ascii_alphabetic()).collect()
 }
 
 /// The identifier immediately before `cursor` (byte offset): the token a
@@ -1849,36 +1684,6 @@ mod tests {
     }
 
     #[test]
-    fn classify_batch_uses_most_destructive_statement() {
-        // A single statement classifies by its leading keyword.
-        assert_eq!(classify("SELECT * FROM t"), StatementKind::Query);
-        assert_eq!(classify("INSERT INTO t VALUES (1)"), StatementKind::Write);
-        assert_eq!(classify("DROP TABLE t"), StatementKind::Destructive);
-        // A multi-statement paste confirms on the destructive tail; the bug this
-        // guards: a leading SELECT must not mask a trailing DROP.
-        assert_eq!(
-            classify("SELECT 1; DROP TABLE users"),
-            StatementKind::Destructive
-        );
-        assert_eq!(
-            classify("INSERT INTO t VALUES (1); SELECT 1"),
-            StatementKind::Write
-        );
-        assert_eq!(classify("SELECT 1; SELECT 2"), StatementKind::Query);
-        // A `;` inside a string or comment doesn't start a new statement.
-        assert_eq!(
-            classify("SELECT 'a; DROP TABLE t' AS x"),
-            StatementKind::Query
-        );
-        assert_eq!(
-            classify("SELECT 1 -- DROP TABLE t\n; SELECT 2"),
-            StatementKind::Query
-        );
-        // Trailing terminator / empty statements are ignored.
-        assert_eq!(classify("DELETE FROM t;"), StatementKind::Destructive);
-    }
-
-    #[test]
     fn is_read_only_allows_plain_reads() {
         assert!(is_read_only("SELECT * FROM users"));
         assert!(is_read_only("  select id from t where name = 'a'  "));
@@ -1890,6 +1695,11 @@ mod tests {
         // is blanked before the scan, so a legitimate read isn't rejected.
         assert!(is_read_only("SELECT 'delete me' AS note FROM t"));
         assert!(is_read_only("SELECT \"delete\" FROM t"));
+        // MySQL's backtick quoting counts too. The previous `tokenize`-based copy of
+        // `strip_noise` classified a backtick span as an identifier rather than a
+        // literal and so left its contents visible, refusing this legitimate read;
+        // sharing red-core's stripper fixes that.
+        assert!(is_read_only("SELECT `delete` FROM t"));
         // `updated_at` must not match the `update` write token (whole-word only).
         assert!(is_read_only("SELECT updated_at FROM t"));
     }

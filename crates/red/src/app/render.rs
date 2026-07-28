@@ -7,6 +7,8 @@ use gpui::{ClipboardItem, Focusable, KeyDownEvent, Render, Window, div, prelude:
 use red_core::CopyMode;
 
 use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
+use crate::app::AiReviewState;
+use crate::app::PreflightCount;
 use crate::keymap::{
     About, AddRow, BeginEdit, CloseInspector, CloseTab, CycleFocusNext, CycleFocusPrev, DeleteRow,
     Explain, FindInResult, FocusEditor, FocusGrid, FocusOtherHalf, FocusSchema, FormatSql,
@@ -17,6 +19,7 @@ use crate::keymap::{
     ToggleInspector, ToggleSidebar, ToggleSplit,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
+use red_core::sql::RiskLevel;
 
 impl AppState {
     /// The connecting splash: an indeterminate progress bar while an attempt is
@@ -321,7 +324,16 @@ impl Render for AppState {
         // opened. Focus it so Flint's `Modal` hears its Esc/Enter.
         if self.focus_modal {
             self.focus_modal = false;
-            window.focus(&self.modal_focus.clone(), cx);
+            // A type-to-confirm box is the whole point of the modal it sits in, so
+            // put the caret there rather than making the user Tab to it. Everything
+            // else focuses the modal root, where Flint's Enter/Esc handling lives.
+            match self.confirm_input.as_ref() {
+                Some(typed) => {
+                    let handle = typed.input.focus_handle(cx);
+                    window.focus(&handle, cx);
+                }
+                None => window.focus(&self.modal_focus.clone(), cx),
+            }
         }
 
         // Focus trap: while a modal is open, a focus-out listener on `modal_focus`
@@ -1104,16 +1116,17 @@ impl AppState {
     }
 
     /// The "Don't ask again" checkbox shared by the delete/destructive confirmations
-    /// across the SQL, Redis, and MongoDB shells: ticking it flips
-    /// `query.confirm_destructive` off immediately, so it also applies to the action
-    /// being confirmed right now. `id` distinguishes the modals so several can mount
-    /// in one frame.
+    /// across the SQL, Redis, and MongoDB shells: ticking it raises
+    /// `query.confirm_from` past `level`, so it also applies to the action being
+    /// confirmed right now but leaves anything more dangerous still gated. `id`
+    /// distinguishes the modals so several can mount in one frame.
     pub(crate) fn dont_ask_destructive_checkbox(
         &self,
         id: &'static str,
+        level: RiskLevel,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        Self::dont_ask_checkbox_el(id, cx.theme(), cx.entity().downgrade())
+        Self::dont_ask_checkbox_el(id, level, cx.theme(), cx.entity().downgrade())
     }
 
     /// The checkbox itself, over a [`gpui::WeakEntity`] rather than `&self` + a live
@@ -1123,6 +1136,7 @@ impl AppState {
     /// thin wrapper for the SQL/Redis confirms that do have a `cx`.
     pub(crate) fn dont_ask_checkbox_el(
         id: &'static str,
+        level: RiskLevel,
         theme: &flint::Theme,
         view: gpui::WeakEntity<AppState>,
     ) -> gpui::AnyElement {
@@ -1133,8 +1147,9 @@ impl AppState {
             .child(
                 Checkbox::new(id, false)
                     .mark(crate::icons::icon("check", px(12.), theme.on_accent))
+                    // "Don't ask again" ticked means *stop* asking, hence the negation.
                     .on_change(move |checked: &bool, _, cx| {
-                        view.update(cx, |this, cx| this.set_confirm_destructive(!*checked, cx))
+                        view.update(cx, |this, cx| this.set_confirms_at(level, !*checked, cx))
                             .ok();
                     }),
             )
@@ -1373,6 +1388,202 @@ impl AppState {
             .child(body)
     }
 
+    /// The danger card: an alert-marked panel carrying what the grading noticed and
+    /// how many rows are at stake.
+    ///
+    /// One card rather than loose lines because the reasons and the row count are
+    /// the same claim at two resolutions ("this removes every row in orders" /
+    /// "1,142 rows"), and reading them as one block is what makes the magnitude
+    /// land. Everything in here is a fact RED established itself, which is why it
+    /// gets the red accent and the assistant's bubble below does not.
+    fn render_risk_card(
+        &self,
+        assessment: &red_core::sql::Assessment,
+        theme: &flint::Theme,
+    ) -> Option<gpui::AnyElement> {
+        let reasons: Vec<String> = assessment.risks.iter().map(describe_risk).collect();
+        let count = self.preflight_line(assessment);
+        if reasons.is_empty() && count.is_none() {
+            return None;
+        }
+        let mut lines = div().flex().flex_col().gap_1().flex_1().min_w(px(0.));
+        for reason in reasons {
+            lines = lines.child(
+                div()
+                    .text_size(theme.scale(12.5))
+                    .text_color(theme.text)
+                    .child(reason),
+            );
+        }
+        if let Some((text, emphatic)) = count {
+            lines = lines.child(
+                div()
+                    .text_size(theme.scale(12.5))
+                    .text_color(if emphatic {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    })
+                    .child(text),
+            );
+        }
+        Some(
+            div()
+                .flex()
+                .items_start()
+                .gap_2()
+                .p(px(10.))
+                .rounded(theme.radius)
+                .bg(theme.red.opacity(0.08))
+                .border_l_2()
+                .border_color(theme.red)
+                .child(div().flex_none().pt(px(1.)).child(crate::icons::icon(
+                    "alert-triangle",
+                    theme.scale(14.),
+                    theme.red,
+                )))
+                .child(lines)
+                .into_any_element(),
+        )
+    }
+
+    /// The row-count preflight as text, plus whether it deserves full-strength
+    /// colour. `None` when no preflight was sent.
+    ///
+    /// A real figure is emphatic; "counting…", "unavailable", and a zero count are
+    /// muted. Zero especially: it is the strongest evidence the statement is *not*
+    /// the one the user is worried about, so it should not shout.
+    fn preflight_line(&self, assessment: &red_core::sql::Assessment) -> Option<(String, bool)> {
+        use red_core::sql::Risk;
+        // A `DROP` does not "affect" rows so much as take them with it; say what is
+        // in the table rather than implying a row-level operation.
+        let drops = assessment
+            .risks
+            .iter()
+            .any(|r| matches!(r, Risk::Drops { .. }));
+        let table = assessment.table.as_deref().unwrap_or("this table");
+        Some(match self.confirm_count? {
+            PreflightCount::Pending => ("Counting affected rows…".to_string(), false),
+            PreflightCount::Unavailable => ("Row count unavailable.".to_string(), false),
+            PreflightCount::Rows(0) if drops => (format!("{table} is empty."), false),
+            PreflightCount::Rows(0) => ("This affects no rows.".to_string(), false),
+            PreflightCount::Rows(n) if drops => (
+                format!(
+                    "{table} holds {} rows.",
+                    crate::result::group_digits(n.max(0) as usize)
+                ),
+                true,
+            ),
+            PreflightCount::Rows(n) => (
+                format!(
+                    "This affects {} rows.",
+                    crate::result::group_digits(n.max(0) as usize)
+                ),
+                true,
+            ),
+        })
+    }
+
+    /// The assistant's advisory note, as an attributed message bubble.
+    ///
+    /// Styled as a distinct surface with the agent's name in its header rather than
+    /// as another line of dialog text, because it is the one thing here RED did not
+    /// establish itself. A reader should be able to tell at a glance which claims
+    /// are the app's and which are a model's, and a bubble says "someone said this"
+    /// in a way a sentence cannot.
+    ///
+    /// Every outcome renders. An earlier version showed nothing for "no concern"
+    /// and nothing for "couldn't ask", which made a working review look identical
+    /// to a broken one: "asking the assistant…" simply vanished. Note what is still
+    /// *not* rendered: any claim that the statement is safe. `NoConcern` speaks
+    /// about the assistant, never about the SQL.
+    fn render_ai_review(&self, theme: &flint::Theme) -> Option<gpui::AnyElement> {
+        let review = self.confirm_review.as_ref()?;
+        let (text, muted) = match &review.state {
+            AiReviewState::Pending => ("Reviewing…".to_string(), true),
+            AiReviewState::Concern(note) => (note.clone(), false),
+            AiReviewState::NoConcern => ("Nothing to add.".to_string(), true),
+            AiReviewState::Unavailable(why) => (format!("Couldn't review this: {why}."), true),
+        };
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p(px(10.))
+                .rounded(theme.radius)
+                // The one square corner points at the speaker, the way a chat
+                // bubble's tail does.
+                .rounded_tl(px(2.))
+                .bg(theme.bg_elevated)
+                .border_1()
+                .border_color(theme.border_soft)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(crate::icons::icon(
+                            "sparkles",
+                            theme.scale(12.),
+                            theme.accent,
+                        ))
+                        .child(
+                            div()
+                                .text_size(theme.scale(11.))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme.accent)
+                                .child(review.agent.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(theme.scale(12.5))
+                        .text_color(if muted { theme.text_muted } else { theme.text })
+                        .child(text),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The type-to-confirm box, when the pending write armed one. `None` otherwise,
+    /// which is every confirmation below `Critical`.
+    fn render_type_to_confirm(&self, theme: &flint::Theme) -> Option<gpui::AnyElement> {
+        let typed = self.confirm_input.as_ref()?;
+        // Set apart from the rest of the body: everything above is something to
+        // read, this is the one thing to *do*. A caret sitting in an unlabelled box
+        // under a wall of warnings is easy to miss, and missing it reads as a broken
+        // dialog with a dead button.
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .pt_1()
+                .border_t_1()
+                .border_color(theme.border_soft)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(crate::icons::icon(
+                            "lock",
+                            theme.scale(12.),
+                            theme.text_muted,
+                        ))
+                        .child(
+                            div()
+                                .text_size(theme.scale(12.5))
+                                .text_color(theme.text_muted)
+                                .child(format!("Type “{}” to confirm", typed.expect)),
+                        ),
+                )
+                .child(typed.input.clone())
+                .into_any_element(),
+        )
+    }
+
     /// The destructive-statement confirmation modal: the write safety rail.
     fn render_confirm(
         &self,
@@ -1387,9 +1598,17 @@ impl AppState {
         // The destructive editor statement and the guarded grid edit share this
         // modal; only the title, prose, preview text, and button label differ.
         let (title, prose, sql, run_label): (&str, String, String, &str) = match &pending {
-            PendingWrite::EditorSql(sql) => (
-                "Confirm destructive statement",
-                "This statement modifies data and can't be undone. Run it?".to_string(),
+            PendingWrite::EditorSql { sql, assessment } => (
+                match assessment.level {
+                    RiskLevel::Critical => "This destroys data",
+                    _ => "Confirm this statement",
+                },
+                // The reasons below say what was noticed; the prose only has to say
+                // what is being asked, so it does not restate them.
+                match assessment.level {
+                    RiskLevel::Critical => "This can't be undone.".to_string(),
+                    _ => "This statement changes more than it names. Run it?".to_string(),
+                },
                 sql.clone(),
                 "Run statement",
             ),
@@ -1423,26 +1642,60 @@ impl AppState {
         // The batch preview can be many statements; show more than a single edit's
         // one-liner but still cap it so a huge change-set can't blow up the modal.
         let preview: String = sql.chars().take(1200).collect();
-        // The "Don't ask again" opt-out only belongs on the settings-gated
-        // destructive-statement path; the batch/import/copy confirms aren't governed
-        // by `confirm_destructive`.
-        let dont_ask = matches!(&pending, PendingWrite::EditorSql(_))
-            .then(|| self.dont_ask_destructive_checkbox("destructive-dont-ask", cx));
+        // What the grading actually noticed, above the SQL. A modal that only says
+        // "are you sure" teaches nothing and gets dismissed; one that says "no WHERE
+        // clause: this rewrites every row in orders" is a different question.
+        let risk_card = match &pending {
+            PendingWrite::EditorSql { assessment, .. } => self.render_risk_card(assessment, &theme),
+            _ => None,
+        };
+        // The "Don't ask again" opt-out belongs only on the settings-gated editor
+        // path, and there only below `Critical`: silencing the routine case must not
+        // silence `DROP TABLE`, which is exactly what the old single switch did. To
+        // stop being asked about a drop you have to say so in settings. A production
+        // connection withholds it entirely (`allow_quiet`), so the moment of hurry is
+        // never when the guard comes off.
+        let policy = self.confirm_policy();
+        let dont_ask = match &pending {
+            PendingWrite::EditorSql { assessment, .. }
+                if policy.allow_quiet && assessment.level < RiskLevel::Critical =>
+            {
+                Some(self.dont_ask_destructive_checkbox(
+                    "destructive-dont-ask",
+                    assessment.level,
+                    cx,
+                ))
+            }
+            _ => None,
+        };
         let body = div()
             .flex()
             .flex_col()
             .gap_2()
-            .child(div().text_color(theme.text_muted).child(prose))
             .child(
+                div()
+                    .text_size(theme.scale(12.5))
+                    .text_color(theme.text_muted)
+                    .child(prose),
+            )
+            .children(risk_card)
+            .children(self.render_ai_review(&theme))
+            .child(
+                // The statement itself, framed as a quoted artefact rather than more
+                // dialog prose: the border and the mono face say "this is the thing,
+                // verbatim", which matters when the point is to re-read it.
                 div()
                     .p_2()
                     .rounded(theme.radius_sm)
                     .bg(theme.bg_input)
+                    .border_1()
+                    .border_color(theme.border_soft)
                     .font_family(theme.mono_family.clone())
                     .text_size(theme.scale(12.))
                     .text_color(theme.text)
                     .child(preview),
             )
+            .children(self.render_type_to_confirm(&theme))
             .children(dont_ask);
         let mut footer = div().flex().justify_end().gap_2().child(
             Button::new("confirm-cancel", "Cancel")
@@ -1470,6 +1723,10 @@ impl AppState {
             footer = footer.child(
                 Button::new("confirm-run", run_label)
                     .variant(ButtonVariant::Danger)
+                    // Stays disabled until the object's name has been typed, when the
+                    // grade called for that. `confirm_destructive` re-checks, so this
+                    // is the affordance rather than the guarantee.
+                    .disabled(!self.confirm_target_matches(cx))
                     .on_click(cx.listener(|this, _, _, cx| this.confirm_destructive(cx))),
             );
         }
@@ -1489,6 +1746,71 @@ impl AppState {
                     .ok();
             })
             .child(body)
+    }
+}
+
+/// One [`Risk`] as a phrase for the confirm modal.
+///
+/// The wording lives here rather than on the type because `red-core` has no business
+/// holding user-facing copy: the grading is data, and this is the one place that
+/// decides how to say it.
+///
+/// [`Risk`]: red_core::sql::Risk
+fn describe_risk(risk: &red_core::sql::Risk) -> String {
+    use red_core::sql::{DropKind, MutateVerb, Risk};
+
+    // "in orders" when the table could be named, "in the table" when it could not.
+    let in_table = |table: &Option<String>| match table {
+        Some(name) => format!("in {name}"),
+        None => "in the table".to_string(),
+    };
+    let mutates = |verb: &MutateVerb| match verb {
+        MutateVerb::Update => "rewrites",
+        MutateVerb::Delete => "removes",
+    };
+    match risk {
+        Risk::WholeTable { verb, table } => format!(
+            "No WHERE clause: this {} every row {}.",
+            mutates(verb),
+            in_table(table)
+        ),
+        Risk::AlwaysTrue { verb, table } => format!(
+            "The WHERE clause is always true, so this {} every row {}.",
+            mutates(verb),
+            in_table(table)
+        ),
+        Risk::Drops { object, name } => {
+            let what = match object {
+                DropKind::Table => "table",
+                DropKind::Database => "database",
+                DropKind::Schema => "schema",
+                DropKind::View => "view",
+                DropKind::Index => "index",
+                DropKind::Other => "object",
+            };
+            match name {
+                Some(name) => format!("Drops the {what} {name} and everything in it."),
+                None => format!("Drops a whole {what}."),
+            }
+        }
+        Risk::Truncates { table } => format!("Empties every row {}.", in_table(table)),
+        Risk::DropsColumn { table } => format!(
+            "Drops a column or constraint {}, discarding what it held.",
+            in_table(table)
+        ),
+        Risk::PrivilegeChange => "Changes who can access this database.".to_string(),
+        Risk::OpaqueExecution => {
+            "Runs stored code, so what it changes can't be checked here.".to_string()
+        }
+        Risk::Merge { table } => format!("A MERGE can delete rows {}.", in_table(table)),
+        Risk::DataModifyingCte => {
+            "A CTE in this query writes, so it isn't the read it looks like.".to_string()
+        }
+        // 1-based for display: the user is counting statements, not indexing them.
+        Risk::HiddenInBatch { index, total } => format!(
+            "This is statement {} of {total}, so it's easy to miss.",
+            index + 1
+        ),
     }
 }
 

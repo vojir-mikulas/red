@@ -628,6 +628,41 @@ pub enum Command {
         column: String,
         flags: StatsFlags,
     },
+    /// Count the rows a pending destructive statement would affect, for the
+    /// confirmation dialog. `sql` is the row-selecting rewrite from
+    /// `red_core::sql::count_preflight`, which the driver's `count` wraps; `namespace`
+    /// is the database the statement itself will run against, so the count is taken
+    /// over the same table it will.
+    ///
+    /// Not epoch-scoped: a confirmation is not a result. `token` echoes back in
+    /// [`Event::MatchCount`] so a reply for a dialog the user already dismissed is
+    /// dropped. Capped hard by its own short timeout, because this is an enrichment
+    /// the dialog is fully usable without, never something it waits on.
+    CountMatching {
+        sql: String,
+        namespace: Option<String>,
+        token: u64,
+    },
+    /// Ask the configured agent for a second opinion on a statement the confirm
+    /// dialog has already stopped. **Advisory only**, and deliberately weak by
+    /// construction: one completion, no tool catalog, no database access, and a
+    /// verdict the dialog can only *display*.
+    ///
+    /// It exists for the failure the grading cannot see. `DELETE FROM orders WHERE
+    /// status = 'active'` is perfectly filtered and perfectly catastrophic if the
+    /// author meant `'cancelled'`; a model holding the schema can say so, and no
+    /// amount of lexical analysis can.
+    ///
+    /// `schema_summary` is the compact catalog the assistant panel already builds,
+    /// so the model needs no tools to read the database and reads no rows. `agent`
+    /// selects the same configured agent an `AiTurn` would use; `token` echoes back
+    /// so a reply for a dismissed dialog is dropped.
+    AssessSql {
+        sql: String,
+        agent: String,
+        schema_summary: String,
+        token: u64,
+    },
     /// Fetch a bounded list of a referenced table's existing ids (+ an optional label
     /// column) for the in-cell foreign-key picker (Track B8). `epoch` scopes the reply
     /// to the still-open result; `target`/`id_column`/`label_column` name the referenced
@@ -649,7 +684,11 @@ pub enum Command {
     LoadEnums {
         table: TableRef,
     },
-    /// Run a non-row-returning statement (write/DDL) in a transaction.
+    /// Run non-row-returning SQL (write/DDL) in a transaction. `sql` may be a
+    /// `;`-separated script: the service splits it and runs the statements as one
+    /// batch, so a `CREATE TABLE` + `CREATE INDEX` + seed `INSERT` pasted into the
+    /// editor commits together on every engine whose transactions cover DDL. Replied
+    /// with `Executed`.
     Execute {
         sql: String,
     },
@@ -930,6 +969,30 @@ pub enum Command {
 }
 
 /// service → UI. Streamed into the UI's async loop, tagged by the channel
+/// The outcome of an [`Command::AssessSql`] advisory review.
+///
+/// Three states, not two, and the distinction is the whole point. "The model
+/// answered and had nothing to add" and "the review could not run" are the same
+/// *absence of a note*, so an earlier version collapsed them into one silent
+/// outcome. That made a working review indistinguishable from a broken one: the
+/// dialog said "asking the assistant…" and then simply stopped, with no way to
+/// tell whether it had been asked at all.
+///
+/// [`NoConcern`](Self::NoConcern) is deliberately phrased by the UI as a statement
+/// about the *assistant* rather than about the statement. It must not read as
+/// "this is safe to run": that is a promise the model is not entitled to make, and
+/// the reason there is no "looks fine" verdict here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlReview {
+    /// The model raised a specific concern.
+    Concern(String),
+    /// The model answered and had nothing to add.
+    NoConcern,
+    /// The review could not run. Carries a short reason for the user, because a
+    /// review that silently never happens is worse than one that says why.
+    Unavailable(String),
+}
+
 /// envelope with the [`SessionId`] it belongs to (`None` for the session-less
 /// `TestSucceeded`/`TestFailed` probe replies) so the UI routes it to the right
 /// workspace, including a backgrounded one whose query is still populating.
@@ -1336,6 +1399,28 @@ pub enum Event {
         epoch: Epoch,
         column: String,
     },
+    /// The answer to a [`Command::CountMatching`], echoing its `token`.
+    ///
+    /// `rows` is `None` when the count timed out, errored, or the session went away.
+    /// One event for both outcomes rather than a Ready/Failed pair, because the
+    /// dialog treats them identically: it shows the number when there is one and says
+    /// so when there isn't. A failure here is never a toast; the user is mid-decision
+    /// and does not need a second dialog about a count they did not ask for.
+    MatchCount {
+        token: u64,
+        rows: Option<i64>,
+    },
+    /// The agent's advisory verdict on a pending statement, echoing its `AssessSql`
+    /// token.
+    ///
+    /// The dialog may only *show* this. It cannot enable the run button, satisfy a
+    /// typed confirmation, or lower the threshold: a model that is unavailable,
+    /// slow, wrong, or talked into approving something can then only ever cost the
+    /// user a line of text.
+    SqlAssessment {
+        token: u64,
+        review: SqlReview,
+    },
     /// A foreign-key lookup list, in response to `FetchLookup`. Echoes `epoch` and the
     /// `target` table so the grid caches it per FK target (dropping a reply for a
     /// superseded epoch). `rows` is the bounded, distinct id/label list.
@@ -1357,8 +1442,10 @@ pub enum Event {
         table: TableRef,
         columns: std::collections::HashMap<String, Vec<String>>,
     },
-    /// A write/DDL statement committed; `affected` rows changed.
+    /// An `Execute` committed: `statements` statements ran (1 for a plain write,
+    /// more for a script) and `affected` rows changed in total.
     Executed {
+        statements: usize,
         affected: usize,
     },
     /// A guarded edit batch (Track B6) committed on its result's session. Echoes

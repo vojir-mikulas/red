@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use gpui::{Pixels, px};
+use red_core::ConnEnv;
+use red_core::sql::RiskLevel;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -257,6 +259,118 @@ impl Density {
 
 // --- query -------------------------------------------------------------------
 
+/// The lowest [`RiskLevel`] that has to be confirmed before it runs.
+///
+/// A threshold rather than a boolean because a prompt that fires on ordinary work
+/// is the thing that gets safety rails switched off: with one switch, silencing the
+/// routine `UPDATE … WHERE id = 42` also silenced `DROP DATABASE`. Each level here
+/// silences strictly less than the one below it.
+/// Variants are ordered least to most permissive, so `min` is "the stricter of the
+/// two" and `max` is "the more relaxed of the two". [`ConfirmPolicy::resolve`]
+/// leans on that to clamp the user's setting per environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfirmThreshold {
+    /// Confirm anything that writes at all, including a filtered `UPDATE`/`DELETE`
+    /// and plain DDL. The most cautious setting, and noisy by design.
+    Write,
+    /// Confirm anything that reaches further than it names: an unfiltered
+    /// `UPDATE`/`DELETE`, a privilege change, a `DROP`. The default.
+    #[default]
+    Risky,
+    /// Confirm only what destroys a whole object (`DROP TABLE`, `TRUNCATE`).
+    Critical,
+    /// Never confirm. Only reachable from settings, never from a modal's
+    /// "Don't ask again", so it cannot be arrived at by reflex.
+    Never,
+}
+
+impl ConfirmThreshold {
+    /// Whether a statement graded `level` must be confirmed before it runs.
+    pub fn requires(self, level: RiskLevel) -> bool {
+        match self {
+            Self::Write => level >= RiskLevel::Write,
+            Self::Risky => level >= RiskLevel::Risky,
+            Self::Critical => level >= RiskLevel::Critical,
+            Self::Never => false,
+        }
+    }
+}
+
+/// How confirmations behave for one connection: the global setting, clamped by
+/// where that connection points.
+///
+/// Resolved once at the point a statement is about to run, so no caller has to
+/// remember the environment rules, and so a `Prod` connection cannot be made lenient
+/// by a setting or a checkbox somewhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfirmPolicy {
+    /// The threshold actually in force here.
+    pub threshold: ConfirmThreshold,
+    /// The lowest grade whose confirmation must be typed out rather than clicked.
+    pub type_from: RiskLevel,
+    /// Whether a confirmation may offer "Don't ask again".
+    pub allow_quiet: bool,
+}
+
+impl ConfirmPolicy {
+    /// Combine the configured threshold with a connection's environment.
+    ///
+    /// The clamps are one-directional on purpose. `Local` may only *relax* the
+    /// setting and `Prod` may only *tighten* it, so neither can be surprised by a
+    /// global preference: someone who set `write` because they want to be asked
+    /// about everything still gets that on production, and someone who set `never`
+    /// still gets asked before dropping a production table.
+    pub fn resolve(threshold: ConfirmThreshold, env: ConnEnv) -> Self {
+        match env {
+            // No marker, or an environment where a mistake is recoverable: exactly
+            // what the user configured.
+            ConnEnv::Unset | ConnEnv::Dev | ConnEnv::Staging => Self {
+                threshold,
+                type_from: RiskLevel::Critical,
+                allow_quiet: true,
+            },
+            // Scratch: never ask about anything short of destroying an object. This
+            // is the release valve that makes strictness elsewhere tolerable.
+            ConnEnv::Local => Self {
+                threshold: threshold.max(ConfirmThreshold::Critical),
+                type_from: RiskLevel::Critical,
+                allow_quiet: true,
+            },
+            // Production: ask from `Risky` up whatever the setting says, make every
+            // one of those confirmations typed rather than clicked, and offer no way
+            // to switch them off from the dialog. Changing this is a deliberate act
+            // in the connection's settings, not a checkbox at the moment of hurry.
+            ConnEnv::Prod => Self {
+                threshold: threshold.min(ConfirmThreshold::Risky),
+                type_from: RiskLevel::Risky,
+                allow_quiet: false,
+            },
+        }
+    }
+
+    /// Whether a statement graded `level` must be confirmed before it runs.
+    pub fn requires(&self, level: RiskLevel) -> bool {
+        self.threshold.requires(level)
+    }
+
+    /// Whether confirming `level` means typing the object's name out.
+    pub fn requires_typing(&self, level: RiskLevel) -> bool {
+        level >= self.type_from
+    }
+
+    /// Whether a delete outside the SQL editor (a Redis key, a MongoDB document)
+    /// should confirm first.
+    ///
+    /// Asked at [`RiskLevel::Risky`], because that is what those actions are: they
+    /// destroy specific, named data rather than a whole object. That grading is what
+    /// keeps their "Don't ask again" from reaching past them, since silencing `Risky`
+    /// leaves `Critical` (and so `DROP TABLE`) still gated.
+    pub fn confirms_delete(&self) -> bool {
+        self.requires(RiskLevel::Risky)
+    }
+}
+
 /// Query-execution safety rails: RED's on-brand big-result defaults.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -264,23 +378,34 @@ pub struct QuerySettings {
     /// Append `LIMIT n` to a bare `SELECT *` so a fat table can't flood the grid.
     /// `0` disables the auto-limit.
     pub auto_limit: u32,
-    /// Confirm destructive statements (DROP/TRUNCATE/…) before they run.
-    pub confirm_destructive: bool,
+    /// How dangerous a statement has to be before RED asks first. Replaces the old
+    /// `confirm_destructive` boolean, which [`apply_legacy`] migrates.
+    pub confirm_from: ConfirmThreshold,
     /// Abort a query (and each of its page/run fetches) that runs longer than this
     /// many seconds, so a runaway can't wedge the grid. `0` disables the cap.
     pub statement_timeout: u32,
     /// Confirm before closing a tab that holds a query or result. The tab-close
     /// modal's "Don't ask again" checkbox flips this off.
     pub confirm_close_tab: bool,
+    /// Ask the configured AI agent for a second opinion on a statement the confirm
+    /// dialog already stopped, shown as one advisory line.
+    ///
+    /// Off by default, and off is the honest default: enabling it sends the
+    /// statement and a summary of the schema to the configured provider. It is
+    /// also never a gate. The verdict is displayed and nothing more, so an
+    /// unavailable, slow, or mistaken model can only ever cost a line of text.
+    pub ai_review: bool,
 }
 
 impl Default for QuerySettings {
     fn default() -> Self {
         Self {
             auto_limit: 1000,
-            confirm_destructive: true,
+            confirm_from: ConfirmThreshold::default(),
             statement_timeout: 0,
             confirm_close_tab: true,
+            // Opt-in: it sends SQL off the machine.
+            ai_review: false,
         }
     }
 }
@@ -805,11 +930,21 @@ fn ai_section(value: &toml::Value, warnings: &mut Vec<String>) -> AiSettings {
     }
 }
 
-/// Lift the legacy flat keys (`theme` / `density` / `confirm_destructive`) into
-/// the new sections once, so an old file upgrades cleanly. Returns `true` when
-/// anything was migrated (the caller re-saves in the new shape). These keys only
-/// existed at the top level in the old format; the new nested keys live under
-/// their sections, so reading them here is unambiguous.
+/// Lift keys from older file shapes into the current sections once, so an old file
+/// upgrades cleanly. Returns `true` when anything was migrated (the caller re-saves
+/// in the new shape).
+///
+/// Two generations are handled. The flat `theme` / `density` / `confirm_destructive`
+/// keys only ever existed at the *top* level, so reading them there is unambiguous
+/// against today's nested keys. The `confirm_destructive` boolean also had a second
+/// life under `[query]`, which is where all but the oldest files carry it.
+///
+/// Both spellings of the boolean map onto [`ConfirmThreshold`] the same way, and
+/// `false` deliberately becomes [`ConfirmThreshold::Critical`] rather than
+/// [`ConfirmThreshold::Never`]: the old switch was all-or-nothing, so almost
+/// everyone who turned it off did so to stop being asked about routine writes, not
+/// to consent to an unprompted `DROP DATABASE`. Anyone who did mean the latter can
+/// still say so explicitly.
 fn apply_legacy(settings: &mut Settings, value: &toml::Value) -> bool {
     let mut migrated = false;
     if let Some(theme) = value.get("theme").and_then(|v| v.as_str()) {
@@ -820,8 +955,16 @@ fn apply_legacy(settings: &mut Settings, value: &toml::Value) -> bool {
         settings.grid.density = Density::from_index(density.max(0) as usize);
         migrated = true;
     }
-    if let Some(confirm) = value.get("confirm_destructive").and_then(|v| v.as_bool()) {
-        settings.query.confirm_destructive = confirm;
+    let legacy_confirm = value
+        .get("confirm_destructive")
+        .or_else(|| value.get("query")?.get("confirm_destructive"))
+        .and_then(|v| v.as_bool());
+    if let Some(confirm) = legacy_confirm {
+        settings.query.confirm_from = if confirm {
+            ConfirmThreshold::Risky
+        } else {
+            ConfirmThreshold::Critical
+        };
         migrated = true;
     }
     migrated
@@ -969,7 +1112,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.appearance.theme = ThemeSetting::Named("GitHub Dark".into());
         settings.grid.density = Density::Compact;
-        settings.query.confirm_destructive = false;
+        settings.query.confirm_from = ConfirmThreshold::Never;
         settings.grid.null_display = "∅".into();
         t.store.save(&settings).unwrap();
         assert_eq!(t.store.load_report().settings, settings);
@@ -1094,6 +1237,103 @@ mod tests {
     }
 
     #[test]
+    fn each_threshold_silences_strictly_less_than_the_one_below() {
+        use ConfirmThreshold as T;
+        let levels = [
+            RiskLevel::Safe,
+            RiskLevel::Write,
+            RiskLevel::Risky,
+            RiskLevel::Critical,
+        ];
+        // A read is never confirmed, whatever the threshold.
+        for t in [T::Write, T::Risky, T::Critical, T::Never] {
+            assert!(!t.requires(RiskLevel::Safe), "{t:?} confirmed a read");
+        }
+        // Each threshold asks about a suffix of the levels, and each step right asks
+        // about strictly fewer. This is the property the whole design rests on: no
+        // setting can silence a worse statement while still asking about a milder one.
+        let asks = |t: T| levels.iter().filter(|&&l| t.requires(l)).count();
+        assert!(asks(T::Write) > asks(T::Risky));
+        assert!(asks(T::Risky) > asks(T::Critical));
+        assert!(asks(T::Critical) > asks(T::Never));
+        assert_eq!(asks(T::Never), 0);
+        // The default asks about the two grades that reach past what they name.
+        assert!(T::default().requires(RiskLevel::Risky));
+        assert!(T::default().requires(RiskLevel::Critical));
+        // ...and not about a filtered write, which is what made the old gate noisy.
+        assert!(!T::default().requires(RiskLevel::Write));
+        // `Critical` still confirms a drop: that is the floor a modal checkbox can
+        // lower the setting to, and the reason it can never reach `Never`.
+        assert!(T::Critical.requires(RiskLevel::Critical));
+        assert!(!T::Critical.requires(RiskLevel::Risky));
+    }
+
+    #[test]
+    fn non_sql_deletes_follow_the_risky_grade() {
+        // Deleting a Redis key or a Mongo document destroys named data: `Risky`, not
+        // `Critical`. That grading is what lets their "Don't ask again" silence
+        // themselves without reaching past to `DROP TABLE`.
+        for (threshold, expected) in [
+            (ConfirmThreshold::Write, true),
+            (ConfirmThreshold::Risky, true),
+            (ConfirmThreshold::Critical, false),
+            (ConfirmThreshold::Never, false),
+        ] {
+            let policy = ConfirmPolicy::resolve(threshold, ConnEnv::Unset);
+            assert_eq!(policy.confirms_delete(), expected, "{threshold:?}");
+        }
+    }
+
+    #[test]
+    fn local_only_relaxes_and_prod_only_tightens() {
+        use ConfirmThreshold as T;
+        for setting in [T::Write, T::Risky, T::Critical, T::Never] {
+            // An unmarked connection is exactly the setting, so adding the marker to
+            // `ConnectionConfig` changes nothing for a saved connection.
+            let unset = ConfirmPolicy::resolve(setting, ConnEnv::Unset);
+            assert_eq!(unset.threshold, setting, "{setting:?}");
+            assert_eq!(unset, ConfirmPolicy::resolve(setting, ConnEnv::Dev));
+            assert_eq!(unset, ConfirmPolicy::resolve(setting, ConnEnv::Staging));
+
+            // Local never asks about more than the setting would.
+            let local = ConfirmPolicy::resolve(setting, ConnEnv::Local);
+            assert!(local.threshold >= setting, "local tightened {setting:?}");
+            // Prod never asks about less.
+            let prod = ConfirmPolicy::resolve(setting, ConnEnv::Prod);
+            assert!(prod.threshold <= setting, "prod relaxed {setting:?}");
+        }
+    }
+
+    #[test]
+    fn prod_asks_from_risky_and_wont_be_switched_off_from_a_dialog() {
+        let prod = ConfirmPolicy::resolve(ConfirmThreshold::Never, ConnEnv::Prod);
+        // Even with confirmations globally off, production still stops.
+        assert!(prod.requires(RiskLevel::Risky));
+        assert!(prod.requires(RiskLevel::Critical));
+        assert!(!prod.requires(RiskLevel::Safe));
+        // And every one of those is typed out, not clicked through.
+        assert!(prod.requires_typing(RiskLevel::Risky));
+        assert!(prod.requires_typing(RiskLevel::Critical));
+        // No dialog offers a way out; that decision belongs in the connection.
+        assert!(!prod.allow_quiet);
+    }
+
+    #[test]
+    fn local_stops_asking_about_everything_short_of_destroying_an_object() {
+        let local = ConfirmPolicy::resolve(ConfirmThreshold::Write, ConnEnv::Local);
+        assert!(!local.requires(RiskLevel::Write));
+        assert!(!local.requires(RiskLevel::Risky));
+        // A drop is still a drop, even on a scratch database.
+        assert!(local.requires(RiskLevel::Critical));
+        assert!(local.requires_typing(RiskLevel::Critical));
+        assert!(!local.requires_typing(RiskLevel::Risky));
+        assert!(local.allow_quiet);
+        // Someone who turned confirmations off entirely keeps that here.
+        let off = ConfirmPolicy::resolve(ConfirmThreshold::Never, ConnEnv::Local);
+        assert!(!off.requires(RiskLevel::Critical));
+    }
+
+    #[test]
     fn migrates_legacy_flat_file() {
         // The old shape: bare top-level theme/density/confirm_destructive.
         let t = temp_store();
@@ -1108,6 +1348,36 @@ mod tests {
             ThemeSetting::Named("GitHub Dark".into())
         );
         assert_eq!(report.settings.grid.density, Density::Compact);
-        assert!(!report.settings.query.confirm_destructive);
+        // The old boolean was all-or-nothing, so `false` becomes "confirm only what
+        // destroys an object", not "never confirm": see `apply_legacy`.
+        assert_eq!(
+            report.settings.query.confirm_from,
+            ConfirmThreshold::Critical
+        );
+    }
+
+    #[test]
+    fn migrates_the_query_section_confirm_boolean() {
+        // The shape almost every existing file is in: the boolean had moved under
+        // `[query]` before it became a threshold.
+        let t = temp_store();
+        write(
+            &t.store,
+            "[query]\nconfirm_destructive = true\nauto_limit = 500\n",
+        );
+        let report = t.store.load_report();
+        assert!(report.migrated);
+        assert_eq!(report.settings.query.confirm_from, ConfirmThreshold::Risky);
+        // Migrating one key must not disturb its neighbours.
+        assert_eq!(report.settings.query.auto_limit, 500);
+    }
+
+    #[test]
+    fn a_current_file_is_not_treated_as_legacy() {
+        let t = temp_store();
+        write(&t.store, "[query]\nconfirm_from = \"never\"\n");
+        let report = t.store.load_report();
+        assert!(!report.migrated);
+        assert_eq!(report.settings.query.confirm_from, ConfirmThreshold::Never);
     }
 }
