@@ -1615,13 +1615,14 @@ impl AppState {
                 key,
                 kind,
                 cursor,
-                budget: scan_budget(),
+                budget: scan_budget(self.settings.data.page_size),
             },
         );
         cx.notify();
     }
 
     fn kv_load_list_preview(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let preview_count = self.settings.kv.preview_count;
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
@@ -1640,7 +1641,7 @@ impl AppState {
                 epoch,
                 key,
                 from_head: true,
-                count: LIST_PREVIEW_COUNT,
+                count: preview_count,
             },
         );
         cx.notify();
@@ -1732,6 +1733,7 @@ impl AppState {
     /// but continues by entry ID (`stream_before`) rather than a `*SCAN`
     /// cursor.
     pub(crate) fn kv_load_stream_page(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let preview_count = self.settings.kv.preview_count;
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
@@ -1754,7 +1756,7 @@ impl AppState {
                 epoch,
                 key,
                 before,
-                count: STREAM_PAGE_COUNT,
+                count: preview_count,
             },
         );
         cx.notify();

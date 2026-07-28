@@ -45,8 +45,9 @@ use red_service::{AiAuthStatus, Command, Event, OpId, ServiceHandle, SessionId, 
 use crate::config::{self, StoredConnection};
 use crate::palette::{Cmd, PromptKind};
 use crate::settings::ConfirmPolicy;
-use crate::settings::{Density, FileSettingsStore, Settings, ThemeMode, ThemeSetting};
-use crate::settings_ui::{RevealTarget, SettingsTab};
+use crate::settings::{FileSettingsStore, Settings, ThemeMode, ThemeSetting};
+use crate::settings_reg::SettingsTab;
+use crate::settings_ui::RevealTarget;
 use crate::theme::ThemeRegistry;
 use red_core::ConnEnv;
 
@@ -340,6 +341,11 @@ pub struct AppState {
     /// The Keymap tab's search box, filtering the bindable-action list by label or
     /// keystroke.
     pub(crate) keymap_search: Entity<TextInput>,
+    /// The settings panel's search box, filtering every registered setting across
+    /// every page (see [`crate::settings_reg`]). Non-empty replaces the selected
+    /// page with the matching rows, so a setting is findable by name rather than
+    /// by remembering its category.
+    pub(crate) settings_search: Entity<TextInput>,
     /// The row currently capturing a chord (index into [`crate::keymap::action_defs`]),
     /// while the recorder's keystroke interceptor is live. `None` when not recording.
     pub(crate) keymap_recording: Option<usize>,
@@ -693,8 +699,8 @@ impl AppState {
         // Push the backend-side tuning knobs (statement timeout + the driver's
         // fat-cell display cap) so they're in effect before the first connect; the
         // setters and `reload_settings` re-push them when they change.
-        service.send_global(Command::SetStatementTimeout(settings.query.timeout()));
-        service.send_global(Command::SetDisplayCellCap(settings.grid.max_cell_chars));
+        service.send_global(Command::SetStatementTimeout(settings.sql.timeout()));
+        service.send_global(Command::SetDisplayCellCap(settings.data.max_cell_chars));
         // Configure the AI assistant provider (key from the keyring / env). An
         // empty key leaves it off until one is set.
         service.send_global(Command::ConfigureAi(ai_config(&settings)));
@@ -912,6 +918,33 @@ impl AppState {
                 TextInputEvent::Change => cx.notify(),
                 TextInputEvent::Cancel => {
                     this.keymap_search.update(cx, |i, cx| i.set_content("", cx));
+                    cx.notify();
+                }
+                TextInputEvent::Submit
+                | TextInputEvent::Tab
+                | TextInputEvent::BackTab
+                | TextInputEvent::Up
+                | TextInputEvent::Down => {}
+            },
+        )
+        .detach();
+
+        // The settings panel's cross-page search box, in the nav above the
+        // categories. Same shape as the keymap one: bare, out of the Tab ring,
+        // Change re-filters, Esc clears.
+        let settings_search = cx.new(|cx| {
+            TextInput::new(cx)
+                .bare()
+                .tab_stop(false)
+                .with_placeholder("Search settings…")
+        });
+        cx.subscribe(
+            &settings_search,
+            |this, _, event: &TextInputEvent, cx| match event {
+                TextInputEvent::Change => cx.notify(),
+                TextInputEvent::Cancel => {
+                    this.settings_search
+                        .update(cx, |i, cx| i.set_content("", cx));
                     cx.notify();
                 }
                 TextInputEvent::Submit
@@ -1204,6 +1237,7 @@ impl AppState {
             connections_watcher: None,
             keymap_warnings,
             keymap_search,
+            settings_search,
             keymap_recording: None,
             keymap_intercept: None,
             keymap_capture: None,
@@ -2043,7 +2077,7 @@ impl AppState {
             Phase::Connected(active) => active.config.env,
             _ => ConnEnv::Unset,
         };
-        ConfirmPolicy::resolve(self.settings.query.confirm_from, env)
+        ConfirmPolicy::resolve(self.settings.safety.confirm_from, env)
     }
 
     /// Whether the type-to-confirm box (when one is armed) currently holds the

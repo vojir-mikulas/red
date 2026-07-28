@@ -12,8 +12,30 @@ use flint::prelude::*;
 use gpui::{AnyElement, Context, FontWeight, SharedString, canvas, div, prelude::*, px};
 
 use crate::app::{AppState, FontSelect};
-use crate::settings::ConfirmThreshold;
-use crate::settings::{Density, ThemeMode};
+use crate::settings::ThemeMode;
+use crate::settings_reg::{self, Control, SettingDef, SettingsTab, Value};
+
+// --- type scale ---------------------------------------------------------------
+//
+// Six steps, and nothing between them. The panel had drifted to nine sizes
+// (10 / 10.5 / 11 / 11.5 / 12 / 12.5 / 13 / 14 / 18) with half-steps used
+// interchangeably for the same role — a status line at 10.5 beside one at 11 —
+// which reads as sloppy rather than as hierarchy. Every size below is one of
+// these, and `theme.scale` still applies the user's UI font size on top.
+
+/// Page titles.
+const TEXT_TITLE: f32 = 18.;
+/// A settings row's label, a nav category, a read-only value: the panel's
+/// primary text.
+const TEXT_ROW: f32 = 14.;
+/// Inputs and small controls, matching the app's text-field scale.
+const TEXT_CONTROL: f32 = 13.;
+/// Descriptions, section and band headers, and any explanatory prose.
+const TEXT_BODY: f32 = 12.;
+/// Tertiary detail: file keys, paths, status lines, inline notes.
+const TEXT_MINOR: f32 = 11.;
+/// Uppercase chips (CUSTOM, the seam badges).
+const TEXT_BADGE: f32 = 10.;
 
 /// The Appearance-tab controls that can sit below the fold and so are scrolled
 /// into view when Tab focuses them: the five dropdowns and the two font-size
@@ -30,57 +52,56 @@ pub(crate) enum RevealTarget {
     EditorSize,
 }
 
-/// The settings categories, in nav order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SettingsTab {
-    Appearance,
-    Grid,
-    Query,
-    Keymap,
-    Behavior,
-    Ai,
-    About,
-}
-
-impl SettingsTab {
-    pub(crate) const ALL: [SettingsTab; 7] = [
-        SettingsTab::Appearance,
-        SettingsTab::Grid,
-        SettingsTab::Query,
-        SettingsTab::Keymap,
-        SettingsTab::Behavior,
-        SettingsTab::Ai,
-        SettingsTab::About,
-    ];
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            SettingsTab::Appearance => "Appearance",
-            SettingsTab::Grid => "Result grid",
-            SettingsTab::Query => "Query",
-            SettingsTab::Keymap => "Keymap",
-            SettingsTab::Behavior => "Behavior",
-            SettingsTab::Ai => "AI agent",
-            SettingsTab::About => "About",
-        }
-    }
-}
-
 impl AppState {
     /// The settings panel: a scrim over the app, a fixed left nav, an optional
     /// warning banner, the page for the selected category, and a footer.
     pub(crate) fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let page = settings_page(self.settings_tab, self, cx);
-
         let theme = cx.theme().clone();
 
-        let mut nav = div()
+        // A live search over every registered setting wins over the selected
+        // page: with eleven pages, "where is that option" is answered by typing,
+        // not by remembering which category it was filed under.
+        let query = self
+            .settings_search
+            .read(cx)
+            .content()
+            .trim()
+            .to_lowercase();
+        let page = if query.is_empty() {
+            settings_page(self.settings_tab, self, cx)
+        } else {
+            search_results(&query, self, cx)
+        };
+
+        // The category list scrolls independently of the search box above it: at
+        // eleven pages it already outgrows a short window, and a clipped last
+        // category (About) is unreachable rather than merely cut off.
+        let mut list = div()
+            .id("settings-nav")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_0p5();
+        // Bands ("App", "Data", "Policy", "System") are emitted as each one's
+        // first page comes up, so the order lives in `SettingsTab::ALL` alone.
+        let mut band = "";
+        for tab in SettingsTab::ALL {
+            if tab.band() != band {
+                band = tab.band();
+                list = list.child(nav_band_header(band, &theme));
+            }
+            list = list.child(settings_nav_item(tab, self.settings_tab, &theme, cx));
+        }
+
+        let nav = div()
             .flex()
             .flex_col()
             .flex_shrink_0()
             .w(px(184.))
             .p_2()
-            .gap_0p5()
+            .gap_1()
             .bg(theme.bg_panel)
             // The nav's own fill spans the card's rounded left edge; round its
             // left corners to match, or its square corners paint through them
@@ -89,19 +110,8 @@ impl AppState {
             .rounded_bl(px(10.))
             .border_r_1()
             .border_color(theme.border_soft)
-            .child(
-                div()
-                    .px_2()
-                    .pt_1()
-                    .pb_2()
-                    .text_size(theme.scale(12.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.text_faint)
-                    .child("SETTINGS"),
-            );
-        for tab in SettingsTab::ALL {
-            nav = nav.child(settings_nav_item(tab, self.settings_tab, &theme, cx));
-        }
+            .child(settings_search_box(self, &theme))
+            .child(list);
 
         let banner = (!self.settings_warnings.is_empty() || !self.keymap_warnings.is_empty())
             .then(|| settings_banner(self, &theme, cx));
@@ -157,6 +167,13 @@ impl AppState {
                 // the capture, not close the panel.
                 if this.keymap_intercept.is_some() {
                     cx.stop_propagation();
+                    return;
+                }
+                // Likewise while a confirmation is layered over the panel (the
+                // Behavior page's "Remove all RED data"): Esc there means back out
+                // of the confirmation, not close the panel underneath it, and the
+                // panel has to still be there to go back to.
+                if this.confirm_reset {
                     return;
                 }
                 match event.keystroke.key.as_str() {
@@ -223,12 +240,16 @@ fn settings_banner(
         .rounded_tr(px(10.))
         .border_b_1()
         .border_color(theme.border_soft)
-        .child(crate::icons::icon("lock", theme.scale(13.), theme.yellow))
+        .child(crate::icons::icon(
+            "lock",
+            theme.scale(TEXT_CONTROL),
+            theme.yellow,
+        ))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
-                .text_size(theme.scale(12.))
+                .text_size(theme.scale(TEXT_BODY))
                 .text_color(theme.text_muted)
                 .child(SharedString::from(message)),
         )
@@ -239,7 +260,7 @@ fn settings_banner(
                 .px_1()
                 .rounded(theme.radius_sm)
                 .cursor_pointer()
-                .text_size(theme.scale(12.))
+                .text_size(theme.scale(TEXT_BODY))
                 .text_color(theme.text_faint)
                 .hover(|s| s.text_color(theme.text))
                 // Focusable so Tab reaches it; Enter/Space fires the dismiss click.
@@ -253,6 +274,48 @@ fn settings_banner(
                 .on_click(cx.listener(|this, _, _, cx| this.dismiss_settings_warnings(cx)))
                 .child("Dismiss"),
         )
+}
+
+/// The nav's search field. Filters every registered setting across every page,
+/// so a user who remembers the *name* of a setting never has to guess which
+/// category it lives under.
+fn settings_search_box(state: &AppState, theme: &Theme) -> impl IntoElement + use<> {
+    div()
+        .flex()
+        .items_center()
+        .flex_shrink_0()
+        .gap_1p5()
+        .h(px(30.))
+        .px_2()
+        .rounded(theme.radius_sm)
+        .bg(theme.bg_input)
+        .border_1()
+        .border_color(theme.border)
+        .text_size(theme.scale(TEXT_CONTROL))
+        .text_color(theme.text)
+        .child(crate::icons::icon(
+            "search",
+            theme.scale(TEXT_CONTROL),
+            theme.text_faint,
+        ))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(state.settings_search.clone()),
+        )
+}
+
+/// A band label above a run of nav rows.
+fn nav_band_header(band: &'static str, theme: &Theme) -> impl IntoElement + use<> {
+    div()
+        .px_2()
+        .pt_2()
+        .pb_1()
+        .text_size(theme.scale(TEXT_MINOR))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme.text_faint)
+        .child(band.to_uppercase())
 }
 
 /// One left-nav row in the settings panel.
@@ -274,7 +337,7 @@ fn settings_nav_item(
         .px_3()
         .py_1p5()
         .rounded(theme.radius_sm)
-        .text_size(theme.scale(14.))
+        .text_size(theme.scale(TEXT_ROW))
         .cursor_pointer()
         // A transparent border reserved in every state, so the focus ring colours
         // it in without nudging the row's size.
@@ -297,13 +360,290 @@ fn settings_nav_item(
 fn settings_page(tab: SettingsTab, state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     match tab {
         SettingsTab::Appearance => appearance_page(state, cx),
-        SettingsTab::Grid => grid_page(state, cx),
-        SettingsTab::Query => query_page(state, cx),
+        SettingsTab::Editor => editor_page(state, cx),
         SettingsTab::Keymap => keymap_page(state, cx),
         SettingsTab::Behavior => behavior_page(state, cx),
         SettingsTab::Ai => ai_page(state, cx),
         SettingsTab::About => about_page(state, cx),
+        // The seam + data + safety pages are pure registry: every row on them is
+        // a value edit, so there's nothing to hand-assemble.
+        tab => registry_page(tab, state, cx),
     }
+}
+
+// --- registry-driven rows ----------------------------------------------------
+
+/// A whole page rendered from the registry: its groups in registry order, each
+/// under its header.
+fn registry_page(tab: SettingsTab, state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
+    let theme = cx.theme().clone();
+    let mut body = div().flex().flex_col();
+    let mut group = "";
+    let mut first = true;
+    for def in settings_reg::for_tab(tab) {
+        if def.group != group {
+            group = def.group;
+            // The first group's header is redundant under the page title unless
+            // the page has more than one.
+            if !(first
+                && settings_reg::for_tab(tab)
+                    .filter(|d| d.group != group)
+                    .count()
+                    == 0)
+            {
+                body = body.child(settings_header(group, &theme));
+            }
+        }
+        first = false;
+        body = body.child(registry_row(def, tab, state, &theme, cx));
+    }
+    page_scaffold(tab, body, &theme).into_any_element()
+}
+
+/// The registry rows of one group, for a page that also has hand-written parts.
+fn registry_group(
+    tab: SettingsTab,
+    group: &'static str,
+    state: &AppState,
+    theme: &Theme,
+    cx: &mut Context<AppState>,
+) -> impl IntoElement + use<> {
+    let mut body = div().flex().flex_col();
+    for def in settings_reg::for_group(tab, group) {
+        body = body.child(registry_row(def, tab, state, theme, cx));
+    }
+    body
+}
+
+/// One registry row: label + help on the left, the generated control on the
+/// right, with the seam badge, the risk warning, and a Reset when it differs
+/// from the shipped default.
+fn registry_row(
+    def: &'static SettingDef,
+    tab: SettingsTab,
+    state: &AppState,
+    theme: &Theme,
+    cx: &mut Context<AppState>,
+) -> impl IntoElement + use<> {
+    let modified = def.is_modified(&state.settings);
+    let warn = def
+        .warn
+        .and_then(|f| f(&state.settings))
+        .map(SharedString::from);
+    let control = risky_control(def.key, warn, registry_control(def, state, cx), theme);
+
+    // The badge is only informative where a page mixes scopes: on a seam page
+    // every row is that seam, and repeating it would be noise. In search results
+    // the page name is shown instead, which locates the row better.
+    let badge = (tab == SettingsTab::Data)
+        .then(|| def.applies.badge())
+        .flatten();
+
+    let label = labelled(def, badge, modified, theme);
+    let reset = modified.then(|| reset_button(def, theme, cx));
+    let row = div()
+        .flex()
+        .py_3()
+        .border_b_1()
+        .border_color(theme.border_soft);
+
+    // A toggle is narrow enough to sit opposite its label; a row of segments is
+    // not. Four segments ("Any write / Risky / Destructive / Never") eat most of
+    // the content width, and a `justify_between` row answers that by crushing the
+    // description into a column a few words wide. So: switches on the right,
+    // choices on their own line under a full-width description. It's one rule
+    // rather than a width threshold, which means it also holds at a larger UI
+    // font size, where a threshold tuned at 13px would quietly stop working.
+    match def.control {
+        Control::Toggle => row
+            .items_center()
+            .justify_between()
+            .gap_6()
+            .child(label)
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .children(reset)
+                    .child(control),
+            ),
+        Control::Segments(_) => row.flex_col().gap_2p5().child(label).child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(control)
+                .children(reset),
+        ),
+    }
+}
+
+/// The left-hand column of a registry row: the label (with its optional scope
+/// badge and Modified dot), the description, and the file key it maps to.
+fn labelled(
+    def: &'static SettingDef,
+    badge: Option<&'static str>,
+    modified: bool,
+    theme: &Theme,
+) -> impl IntoElement + use<> {
+    div()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .min_w_0()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(theme.scale(TEXT_ROW))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child(def.label),
+                )
+                .children(badge.map(|b| {
+                    div()
+                        .px_1p5()
+                        .rounded(theme.radius_sm)
+                        .bg(theme.bg_active)
+                        .text_size(theme.scale(TEXT_BADGE))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.text_faint)
+                        .child(b)
+                }))
+                // A quiet dot, not a word: "this one isn't the default" is useful
+                // at a glance and shouldn't compete with the label.
+                .when(modified, |d| {
+                    d.child(
+                        div()
+                            .id(SharedString::from(format!("modified-{}", def.key)))
+                            .size(px(5.))
+                            .rounded_full()
+                            .bg(theme.accent)
+                            .tooltip(flint::Tooltip::text("Changed from the default")),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .text_size(theme.scale(TEXT_BODY))
+                .text_color(theme.text_muted)
+                .child(def.help),
+        )
+        .child(
+            div()
+                .text_size(theme.scale(TEXT_MINOR))
+                .text_color(theme.text_faint)
+                .child(def.key),
+        )
+}
+
+/// The per-row Reset: put this setting back to what RED ships with.
+fn reset_button(
+    def: &'static SettingDef,
+    _theme: &Theme,
+    cx: &mut Context<AppState>,
+) -> impl IntoElement + use<> {
+    Button::new(SharedString::from(format!("reset-{}", def.key)), "Reset")
+        .variant(ButtonVariant::Ghost)
+        .size(ButtonSize::Sm)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            let value = def.default_value();
+            this.edit_settings(cx, |s| (def.set)(s, &value));
+        }))
+}
+
+/// Build the control a [`SettingDef`] asks for, wired to
+/// [`AppState::edit_settings`] so every generated row goes through the one
+/// mutation path (and so inherits its clamping, persistence, and effects).
+fn registry_control(
+    def: &'static SettingDef,
+    state: &AppState,
+    cx: &mut Context<AppState>,
+) -> AnyElement {
+    let current = (def.get)(&state.settings);
+    match &def.control {
+        Control::Toggle => Toggle::new(SharedString::from(def.key), current.as_bool())
+            .on_change(cx.listener(move |this, on: &bool, _, cx| {
+                let value = Value::Bool(*on);
+                this.edit_settings(cx, |s| (def.set)(s, &value));
+            }))
+            .into_any_element(),
+        Control::Segments(segments) => {
+            // A value matching no preset (only reachable by hand-editing the file)
+            // selects nothing rather than snapping to a neighbour.
+            let selected = segments
+                .iter()
+                .position(|s| s.value == current)
+                .unwrap_or(usize::MAX);
+            let view = cx.entity();
+            let mut control = Segmented::new(SharedString::from(def.key));
+            for segment in *segments {
+                control = control.segment(segment.label);
+            }
+            control
+                .selected(selected)
+                .on_select(move |ix, _, cx| {
+                    let Some(segment) = segments.get(ix) else {
+                        return;
+                    };
+                    let value = segment.value.clone();
+                    view.update(cx, |this, cx| {
+                        this.edit_settings(cx, |s| (def.set)(s, &value));
+                    });
+                })
+                .into_any_element()
+        }
+    }
+}
+
+/// The search view: every registered setting matching the query, grouped by the
+/// page it lives on so a hit is also a direction ("it's under Key-value").
+fn search_results(query: &str, state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
+    let theme = cx.theme().clone();
+    let hits: Vec<&'static SettingDef> = settings_reg::defs()
+        .iter()
+        .filter(|d| d.matches(query))
+        .collect();
+
+    let mut body = div().flex().flex_col();
+    if hits.is_empty() {
+        body = body.child(
+            div()
+                .py_4()
+                .text_size(theme.scale(TEXT_BODY))
+                .text_color(theme.text_faint)
+                .child("No settings match your search."),
+        );
+    }
+    let mut tab = None;
+    for def in hits {
+        if tab != Some(def.tab) {
+            tab = Some(def.tab);
+            body = body.child(settings_header(def.tab.label(), &theme));
+        }
+        // Always badge in search results: a row lifted out of its page needs to
+        // say which seam it affects.
+        body = body.child(registry_row(def, SettingsTab::Data, state, &theme, cx));
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .pb_2()
+                .text_size(theme.scale(TEXT_TITLE))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text)
+                .child("Search results"),
+        )
+        .child(body)
+        .into_any_element()
 }
 
 fn appearance_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
@@ -379,16 +719,45 @@ fn appearance_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 ),
                 &theme,
             ))
+            .child(settings_header("Motion", &theme))
+            .child(registry_group(
+                SettingsTab::Appearance,
+                "Motion",
+                state,
+                &theme,
+                cx,
+            ))
+            .child(setting_block(
+                "Manage themes",
+                "Import theme files (.toml), or remove ones you've added.",
+                theme_manager(state, cx),
+                &theme,
+            )),
+        &theme,
+    )
+    .into_any_element()
+}
+
+/// The Editor tab: the code-editor's own typography (its font is independent of
+/// the interface font, which is why it was confusing under Appearance) plus the
+/// registry's layout rows.
+fn editor_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
+    let theme = cx.theme().clone();
+    settings_page_scaffold(
+        "Editor",
+        div()
+            .flex()
+            .flex_col()
             .child(setting_row(
                 "Editor font",
-                "The SQL editor font, independent of the interface. A monospace face is \
-                 recommended.",
+                "The font for the SQL editor, the JSON editor, and the Redis console, \
+                 independent of the interface. A monospace face is recommended.",
                 font_picker(state, FontSelect::Editor),
                 &theme,
             ))
             .child(setting_row(
                 "Editor font size",
-                "SQL editor text size, in pixels. Independent of the interface size.",
+                "Editor text size, in pixels. Independent of the interface size.",
                 reveal_wrap(
                     state,
                     RevealTarget::EditorSize,
@@ -396,11 +765,13 @@ fn appearance_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 ),
                 &theme,
             ))
-            .child(setting_block(
-                "Manage themes",
-                "Import theme files (.toml), or remove ones you've added.",
-                theme_manager(state, cx),
+            .child(settings_header("Layout", &theme))
+            .child(registry_group(
+                SettingsTab::Editor,
+                "Layout",
+                state,
                 &theme,
+                cx,
             )),
         &theme,
     )
@@ -507,13 +878,13 @@ fn theme_manage_row(
         .child(
             div()
                 .flex_1()
-                .text_size(theme.scale(14.))
+                .text_size(theme.scale(TEXT_ROW))
                 .text_color(theme.text)
                 .child(name_owned.clone()),
         )
         .child(
             div()
-                .text_size(theme.scale(12.))
+                .text_size(theme.scale(TEXT_BODY))
                 .text_color(theme.text_faint)
                 .child(if is_light { "light" } else { "dark" }),
         )
@@ -537,293 +908,13 @@ fn theme_manage_row(
                 .on_click(cx.listener(move |this, _, _, cx| this.remove_theme(&name_owned, cx)))
                 .child(crate::icons::icon(
                     "trash",
-                    theme.scale(13.),
+                    theme.scale(TEXT_CONTROL),
                     theme.text_faint,
                 ))
                 .into_any_element()
         } else {
             div().w(px(20.)).into_any_element()
         })
-}
-
-fn grid_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
-    let theme = cx.theme().clone();
-    let view = cx.entity();
-
-    let density_view = view.clone();
-    let density = Segmented::new("set-density")
-        .segment("Compact")
-        .segment("Comfortable")
-        .segment("Spacious")
-        .selected(state.settings.grid.density.index())
-        .on_select(move |ix, _, cx| {
-            density_view.update(cx, |this, cx| this.set_density(Density::from_index(ix), cx));
-        });
-
-    // NULL / ∅ / blank presets. A custom value (set in the file) shows as NULL
-    // here; the file is the place for an arbitrary string.
-    let null_sel = match state.settings.grid.null_display.as_str() {
-        "∅" => 1,
-        "" => 2,
-        _ => 0,
-    };
-    let null_view = view.clone();
-    let null_display = Segmented::new("set-null")
-        .segment("NULL")
-        .segment("∅")
-        .segment("blank")
-        .selected(null_sel)
-        .on_select(move |ix, _, cx| {
-            let value = match ix {
-                1 => "∅",
-                2 => "",
-                _ => "NULL",
-            };
-            null_view.update(cx, |this, cx| this.set_null_display(value, cx));
-        });
-
-    let row_numbers = Toggle::new("set-row-numbers", state.settings.grid.row_numbers)
-        .on_change(cx.listener(|this, on: &bool, _, cx| this.set_row_numbers(*on, cx)));
-
-    // Page-size presets; a custom value (set in the file) shows none selected.
-    const PAGE_PRESETS: [usize; 4] = [100, 200, 500, 1000];
-    let page_sel = PAGE_PRESETS
-        .iter()
-        .position(|&n| n == state.settings.grid.page_size)
-        .unwrap_or(usize::MAX);
-    let page_view = view.clone();
-    let page_size = Segmented::new("set-page-size")
-        .segment("100")
-        .segment("200")
-        .segment("500")
-        .segment("1000")
-        .selected(page_sel)
-        .on_select(move |ix, _, cx| {
-            let n = PAGE_PRESETS[ix.min(PAGE_PRESETS.len() - 1)];
-            page_view.update(cx, |this, cx| this.set_page_size(n, cx));
-        });
-
-    // Fat-cell cap presets, in bytes; a custom value shows none selected.
-    const CELL_PRESETS: [usize; 4] = [1024, 4096, 16384, 65536];
-    let cell_sel = CELL_PRESETS
-        .iter()
-        .position(|&n| n == state.settings.grid.max_cell_chars)
-        .unwrap_or(usize::MAX);
-    let cell_view = view.clone();
-    let max_cell = Segmented::new("set-max-cell")
-        .segment("1K")
-        .segment("4K")
-        .segment("16K")
-        .segment("64K")
-        .selected(cell_sel)
-        .on_select(move |ix, _, cx| {
-            let n = CELL_PRESETS[ix.min(CELL_PRESETS.len() - 1)];
-            cell_view.update(cx, |this, cx| this.set_max_cell_chars(n, cx));
-        });
-
-    // Column-stats distinct guard: the row threshold past which count(distinct) is
-    // withheld until clicked. "Always" computes it regardless of size.
-    const DISTINCT_PRESETS: [usize; 4] = [100_000, 1_000_000, 10_000_000, usize::MAX];
-    let distinct_sel = DISTINCT_PRESETS
-        .iter()
-        .position(|&n| n == state.settings.grid.stats_distinct_max_rows)
-        .unwrap_or(usize::MAX);
-    let distinct_view = view.clone();
-    let stats_distinct = Segmented::new("set-stats-distinct")
-        .segment("100K")
-        .segment("1M")
-        .segment("10M")
-        .segment("Always")
-        .selected(distinct_sel)
-        .on_select(move |ix, _, cx| {
-            let n = DISTINCT_PRESETS[ix.min(DISTINCT_PRESETS.len() - 1)];
-            distinct_view.update(cx, |this, cx| this.set_stats_distinct_max_rows(n, cx));
-        });
-
-    // Clipboard copy ceiling presets; a custom value (set in the file) shows none.
-    const COPY_PRESETS: [usize; 4] = [10_000, 100_000, 500_000, 1_000_000];
-    let copy_sel = COPY_PRESETS
-        .iter()
-        .position(|&n| n == state.settings.grid.copy_row_limit)
-        .unwrap_or(usize::MAX);
-    let copy_view = view.clone();
-    let copy_limit = Segmented::new("set-copy-limit")
-        .segment("10K")
-        .segment("100K")
-        .segment("500K")
-        .segment("1M")
-        .selected(copy_sel)
-        .on_select(move |ix, _, cx| {
-            let n = COPY_PRESETS[ix.min(COPY_PRESETS.len() - 1)];
-            copy_view.update(cx, |this, cx| this.set_copy_row_limit(n, cx));
-        });
-
-    settings_page_scaffold(
-        "Result grid",
-        div()
-            .flex()
-            .flex_col()
-            .child(setting_row(
-                "Row density",
-                "Vertical spacing of rows in the result grid.",
-                density,
-                &theme,
-            ))
-            .child(setting_row(
-                "Null display",
-                "How a SQL NULL renders in a cell.",
-                null_display,
-                &theme,
-            ))
-            .child(setting_row(
-                "Row numbers",
-                "Show the leading row-number gutter.",
-                row_numbers,
-                &theme,
-            ))
-            .child(settings_header("Performance", &theme))
-            .child(setting_row(
-                "Page size",
-                "Rows fetched per page as you scroll. Larger means fewer round-trips, \
-                 more resident rows.",
-                page_size,
-                &theme,
-            ))
-            .child(setting_row(
-                "Max cell size",
-                "Bytes of a single cell kept resident, the fat-cell memory rail. \
-                 Over-cap cells are clipped for display only; export stays full.",
-                max_cell,
-                &theme,
-            ))
-            .child(setting_row(
-                "Stats distinct limit",
-                "Result size past which the column-stats bar withholds count(distinct) \
-                 until you click compute, so it never scans a huge table by accident.",
-                stats_distinct,
-                &theme,
-            ))
-            .child(setting_row(
-                "Copy row limit",
-                "Rows a select-all or whole-column copy pulls into the clipboard. \
-                 Larger copies are clipped to this (with a warning) to bound memory.",
-                copy_limit,
-                &theme,
-            )),
-        &theme,
-    )
-    .into_any_element()
-}
-
-fn query_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
-    let theme = cx.theme().clone();
-    let view = cx.entity();
-
-    let limit_sel = match state.settings.query.auto_limit {
-        0 => 0,
-        100 => 1,
-        10000 => 3,
-        _ => 2,
-    };
-    let limit_view = view.clone();
-    let auto_limit = Segmented::new("set-auto-limit")
-        .segment("Off")
-        .segment("100")
-        .segment("1000")
-        .segment("10000")
-        .selected(limit_sel)
-        .on_select(move |ix, _, cx| {
-            let n = [0u32, 100, 1000, 10000][ix.min(3)];
-            limit_view.update(cx, |this, cx| this.set_auto_limit(n, cx));
-        });
-
-    // The confirmation threshold, least to most permissive left-to-right, so moving
-    // right is always "ask me less".
-    const CONFIRM_LEVELS: [ConfirmThreshold; 4] = [
-        ConfirmThreshold::Write,
-        ConfirmThreshold::Risky,
-        ConfirmThreshold::Critical,
-        ConfirmThreshold::Never,
-    ];
-    let confirm_sel = CONFIRM_LEVELS
-        .iter()
-        .position(|&l| l == state.settings.query.confirm_from)
-        .unwrap_or(1);
-    let confirm_view = view.clone();
-    let confirm = Segmented::new("set-confirm")
-        .segment("Any write")
-        .segment("Risky")
-        .segment("Destructive")
-        .segment("Never")
-        .selected(confirm_sel)
-        .on_select(move |ix, _, cx| {
-            let level = CONFIRM_LEVELS[ix.min(CONFIRM_LEVELS.len() - 1)];
-            confirm_view.update(cx, |this, cx| this.set_confirm_from(level, cx));
-        });
-
-    let ai_review = Toggle::new("set-ai-review", state.settings.query.ai_review)
-        .on_change(cx.listener(|this, on: &bool, _, cx| this.set_ai_review(*on, cx)));
-
-    // Statement-timeout presets, in seconds (0 = off); a custom value shows none.
-    const TIMEOUT_PRESETS: [u32; 4] = [0, 10, 30, 60];
-    let timeout_sel = TIMEOUT_PRESETS
-        .iter()
-        .position(|&n| n == state.settings.query.statement_timeout)
-        .unwrap_or(usize::MAX);
-    let timeout_view = view.clone();
-    let statement_timeout = Segmented::new("set-statement-timeout")
-        .segment("Off")
-        .segment("10s")
-        .segment("30s")
-        .segment("60s")
-        .selected(timeout_sel)
-        .on_select(move |ix, _, cx| {
-            let n = TIMEOUT_PRESETS[ix.min(TIMEOUT_PRESETS.len() - 1)];
-            timeout_view.update(cx, |this, cx| this.set_statement_timeout(n, cx));
-        });
-
-    settings_page_scaffold(
-        "Query",
-        div()
-            .flex()
-            .flex_col()
-            .child(settings_header("Large-result safety", &theme))
-            .child(setting_row(
-                "Auto-limit",
-                "Append LIMIT to a bare SELECT * so a fat table can't flood the grid.",
-                auto_limit,
-                &theme,
-            ))
-            .child(setting_row(
-                "Statement timeout",
-                "Abort a query (and its page/run fetches) that runs longer than this.",
-                statement_timeout,
-                &theme,
-            ))
-            .child(settings_header("Safety", &theme))
-            .child(setting_row(
-                "Confirm from",
-                "How dangerous a statement has to be before Red asks first. \"Risky\" \
-                 covers an UPDATE or DELETE with no WHERE, a privilege change, or a \
-                 MERGE; \"Destructive\" is a DROP or TRUNCATE, which is always confirmed \
-                 by typing the object's name. A connection marked Prod confirms from \
-                 Risky whatever this says.",
-                confirm,
-                &theme,
-            ))
-            .child(setting_row(
-                "Ask the assistant to review",
-                "Add a second opinion from your AI agent to the confirmation, for the \
-                 mistakes a keyword check can't see (a filter that looks inverted, say). \
-                 This sends the statement and a summary of your schema to the configured \
-                 provider. It is advice only: it never runs anything, and never unlocks \
-                 the confirmation.",
-                ai_review,
-                &theme,
-            )),
-        &theme,
-    )
-    .into_any_element()
 }
 
 /// The Keymap tab: a searchable list of every bindable action with its effective
@@ -848,11 +939,11 @@ fn keymap_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
         .bg(theme.bg_input)
         .border_1()
         .border_color(theme.border)
-        .text_size(theme.scale(13.))
+        .text_size(theme.scale(TEXT_CONTROL))
         .text_color(theme.text)
         .child(crate::icons::icon(
             "search",
-            theme.scale(14.),
+            theme.scale(TEXT_CONTROL),
             theme.text_faint,
         ))
         .child(div().flex_1().min_w_0().child(state.keymap_search.clone()));
@@ -895,32 +986,29 @@ fn keymap_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
         list = list.child(
             div()
                 .py_3()
-                .text_size(theme.scale(13.))
+                .text_size(theme.scale(TEXT_BODY))
                 .text_color(theme.text_faint)
                 .child("No actions match your search."),
         );
     }
-
-    let vim_toggle = Toggle::new("set-vim-mode", state.settings.keymap.vim_mode)
-        .on_change(cx.listener(|this, on: &bool, _, cx| this.set_vim_mode(*on, cx)));
 
     settings_page_scaffold(
         "Keymap",
         div()
             .flex()
             .flex_col()
-            .child(setting_row(
-                "Vim navigation",
-                "Adds hjkl / g / G / Ctrl-d / Ctrl-u motions to the result grid and the \
-                 history dock, alongside the arrow keys. Off by default; applies live.",
-                vim_toggle,
+            .child(registry_group(
+                SettingsTab::Keymap,
+                "Navigation",
+                state,
                 &theme,
+                cx,
             ))
             .child(
                 div()
                     .pt_3()
                     .pb_2()
-                    .text_size(theme.scale(12.))
+                    .text_size(theme.scale(TEXT_BODY))
                     .text_color(theme.text_muted)
                     .child(
                         "Rebind captures the next shortcut you press, even one already in use. \
@@ -973,7 +1061,7 @@ fn keymap_row(
             .gap_2()
             .child(
                 div()
-                    .text_size(theme.scale(14.))
+                    .text_size(theme.scale(TEXT_ROW))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme.text)
                     .child(SharedString::from(def.label.to_string())),
@@ -984,7 +1072,7 @@ fn keymap_row(
                         .px_1p5()
                         .rounded(theme.radius_sm)
                         .bg(theme.accent.opacity(0.14))
-                        .text_size(theme.scale(10.))
+                        .text_size(theme.scale(TEXT_BADGE))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme.accent)
                         .child("CUSTOM"),
@@ -994,7 +1082,7 @@ fn keymap_row(
     if let Some(note) = context_note {
         label = label.child(
             div()
-                .text_size(theme.scale(12.))
+                .text_size(theme.scale(TEXT_BODY))
                 .text_color(theme.text_faint)
                 .child(note),
         );
@@ -1028,7 +1116,7 @@ fn idle_control(
         .child(match effective {
             Some(k) => shortcut_chip(k, theme).into_any_element(),
             None => div()
-                .text_size(theme.scale(12.))
+                .text_size(theme.scale(TEXT_BODY))
                 .text_color(theme.text_faint)
                 .child("Unset")
                 .into_any_element(),
@@ -1064,7 +1152,7 @@ fn recording_affordance(theme: &Theme, cx: &mut Context<AppState>) -> impl IntoE
                 .border_1()
                 .border_color(theme.accent)
                 .bg(theme.accent.opacity(0.1))
-                .text_size(theme.scale(12.))
+                .text_size(theme.scale(TEXT_BODY))
                 .text_color(theme.accent)
                 .child("Press a shortcut… · Esc to cancel"),
         )
@@ -1120,7 +1208,7 @@ fn capture_confirm(
         .children(conflict_label.map(|other| {
             div()
                 .max_w(px(260.))
-                .text_size(theme.scale(11.))
+                .text_size(theme.scale(TEXT_MINOR))
                 .text_color(theme.yellow)
                 .child(SharedString::from(format!(
                     "Already bound to “{other}”; rebinding unbinds it."
@@ -1138,7 +1226,7 @@ fn shortcut_chip(keystroke: &str, theme: &Theme) -> impl IntoElement + use<> {
         .bg(theme.bg_active)
         .border_1()
         .border_color(theme.border_soft)
-        .text_size(theme.scale(12.))
+        .text_size(theme.scale(TEXT_BODY))
         .text_color(theme.text_muted)
         .child(SharedString::from(keystroke_glyphs(keystroke)))
 }
@@ -1181,56 +1269,25 @@ fn keystroke_glyphs(keystroke: &str) -> String {
         .join(" ")
 }
 
+/// The Behavior tab: startup behaviour, then the danger zone. The Redis
+/// auto-refresh row that used to sit here (the only engine setting in the whole
+/// panel, filed next to "Remove all RED data") now lives on the Key-value page.
 fn behavior_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     let theme = cx.theme().clone();
-    let view = cx.entity();
-
-    let restore = Toggle::new(
-        "set-restore-last-session",
-        state.settings.behavior.restore_last_session,
-    )
-    .on_change(cx.listener(|this, on: &bool, _, cx| this.set_restore_last_session(*on, cx)));
-
-    // Redis key auto-refresh default for new Browse tabs (0 = off). A preset
-    // segmented like the AI resource guards; a hand-edited off-preset value shows
-    // no selection rather than snapping.
-    const REFRESH_PRESETS: [u64; 5] = [0, 2, 5, 10, 30];
-    let refresh_sel = REFRESH_PRESETS
-        .iter()
-        .position(|&n| n == state.settings.redis.auto_refresh_secs)
-        .unwrap_or(usize::MAX);
-    let refresh_view = view.clone();
-    let redis_refresh = Segmented::new("set-redis-auto-refresh")
-        .segment("Off")
-        .segment("2s")
-        .segment("5s")
-        .segment("10s")
-        .segment("30s")
-        .selected(refresh_sel)
-        .on_select(move |ix, _, cx| {
-            let n = REFRESH_PRESETS[ix.min(REFRESH_PRESETS.len() - 1)];
-            refresh_view.update(cx, |this, cx| this.set_redis_auto_refresh_secs(n, cx));
-        });
 
     settings_page_scaffold(
         "Behavior",
         div()
             .flex()
             .flex_col()
-            .child(setting_row(
-                "Restore last session",
-                "Reconnect to the most recently used connection on launch (credentials \
-                 come from the keychain). Takes effect next launch.",
-                restore,
+            .child(registry_group(
+                SettingsTab::Behavior,
+                "Startup",
+                state,
                 &theme,
+                cx,
             ))
-            .child(setting_row(
-                "Redis: auto-refresh keys",
-                "How often a new Redis key-browser tab re-scans the keyspace. Off by \
-                 default; change it for an open tab from the browser's actions menu.",
-                redis_refresh,
-                &theme,
-            ))
+            .child(settings_header("Danger zone", &theme))
             .child(setting_row(
                 "Remove all RED data",
                 "Permanently delete RED's config and cached-data directories and every \
@@ -1247,147 +1304,14 @@ fn behavior_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     .into_any_element()
 }
 
-/// The AI tab: the master kill switch, the database-access tier (how much the
-/// assistant's tools can see), and the resource guards those tools run under.
-/// Everything here writes `[ai]` in `settings.toml` and is re-pushed to the
-/// backend live, so a tier change applies to the next turn and flipping the
-/// switch off removes the sidepanel immediately (see [`AppState::set_ai_enabled`]).
-/// Provider, model, and the agent command stay in the file: the convenience
-/// surface holds the safety knobs, the file holds the plumbing.
+/// The AI tab. The value rows (kill switch, access tier, resource guards, the
+/// thinking affordance) come from the registry; what stays hand-written is the
+/// prose that qualifies them, the folder picker, and the Accounts list. Provider,
+/// model, and the agent command stay in the file: the convenience surface holds
+/// the safety knobs, the file holds the plumbing.
 fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     let theme = cx.theme().clone();
-    let view = cx.entity();
     let ai = &state.settings.ai;
-    let enabled = ai.enabled;
-
-    // The master switch. Off is a true kill switch: no panel, no MCP server, no
-    // agent process. Flipping it off also closes any open panel.
-    let switch = Toggle::new("set-ai-enabled", enabled)
-        .on_change(cx.listener(|this, on: &bool, _, cx| this.set_ai_enabled(*on, cx)));
-
-    // Database access tier, the capability boundary. Out-of-tier tools are never
-    // even offered to the model (M-S7), so this is the real "how much can it see".
-    // Write adds the gated `propose_write` tool on top of the read catalog; every
-    // write still needs per-statement approval and is blocked on a read-only
-    // connection. A connection can narrow or widen this in connections.toml
-    // (`ai_tier`).
-    let tier_sel = match red_core::AiTier::parse(&ai.tier) {
-        red_core::AiTier::Off => 0,
-        red_core::AiTier::Schema => 1,
-        red_core::AiTier::Read => 2,
-        red_core::AiTier::Write => 3,
-    };
-    let tier_view = view.clone();
-    let tier = Segmented::new("set-ai-tier")
-        .segment("Off")
-        .segment("Schema")
-        .segment("Read")
-        .segment("Write")
-        .selected(tier_sel)
-        .on_select(move |ix, _, cx| {
-            let t = ["off", "schema", "read", "write"][ix.min(3)];
-            tier_view.update(cx, |this, cx| this.set_ai_tier(t, cx));
-        });
-
-    // Resource guards on the `read` tier. Each is a preset segmented; a hand-edited
-    // off-preset value shows no selection (usize::MAX) rather than snapping. The
-    // top segment on each row is a deliberately risky choice (well above the safe
-    // default, or an outright-disabled cap); selecting it flags a red warning.
-    const ROW_PRESETS: [usize; 5] = [100, 500, 1000, 5000, 50_000];
-    let rows_sel = ROW_PRESETS
-        .iter()
-        .position(|&n| n == ai.limits.max_rows)
-        .unwrap_or(usize::MAX);
-    let rows_view = view.clone();
-    let max_rows = Segmented::new("set-ai-max-rows")
-        .segment("100")
-        .segment("500")
-        .segment("1000")
-        .segment("5000")
-        .segment("50000")
-        .selected(rows_sel)
-        .on_select(move |ix, _, cx| {
-            let n = ROW_PRESETS[ix.min(ROW_PRESETS.len() - 1)];
-            rows_view.update(cx, |this, cx| this.set_ai_max_rows(n, cx));
-        });
-    // Risky once the ceiling climbs past the old safe top preset: the agent can
-    // then pull very large result sets in a single tool call.
-    let rows_warn = (ai.limits.max_rows > 5000).then(|| {
-        SharedString::from(
-            "Above the safe default: big result sets mean slower queries and higher cost.",
-        )
-    });
-
-    // Statement timeout, in milliseconds (0 = off).
-    const TIMEOUT_PRESETS: [u64; 4] = [0, 5_000, 15_000, 30_000];
-    let timeout_sel = TIMEOUT_PRESETS
-        .iter()
-        .position(|&n| n == ai.limits.statement_timeout_ms)
-        .unwrap_or(usize::MAX);
-    let timeout_view = view.clone();
-    let timeout = Segmented::new("set-ai-timeout")
-        .segment("Off")
-        .segment("5s")
-        .segment("15s")
-        .segment("30s")
-        .selected(timeout_sel)
-        .on_select(move |ix, _, cx| {
-            let n = TIMEOUT_PRESETS[ix.min(TIMEOUT_PRESETS.len() - 1)];
-            timeout_view.update(cx, |this, cx| this.set_ai_timeout(n, cx));
-        });
-
-    // Result byte cap (0 = off). The last two segments (5 MB, Off) are risky.
-    const BYTE_PRESETS: [usize; 5] = [64 * 1024, 256 * 1024, 1024 * 1024, 5 * 1024 * 1024, 0];
-    let bytes_sel = BYTE_PRESETS
-        .iter()
-        .position(|&n| n == ai.limits.max_result_bytes)
-        .unwrap_or(usize::MAX);
-    let bytes_view = view.clone();
-    let max_bytes = Segmented::new("set-ai-max-bytes")
-        .segment("64 KB")
-        .segment("256 KB")
-        .segment("1 MB")
-        .segment("5 MB")
-        .segment("Off")
-        .selected(bytes_sel)
-        .on_select(move |ix, _, cx| {
-            let n = BYTE_PRESETS[ix.min(BYTE_PRESETS.len() - 1)];
-            bytes_view.update(cx, |this, cx| this.set_ai_max_bytes(n, cx));
-        });
-    // Risky past the old safe top preset, or with the cap disabled entirely.
-    let bytes_warn = (ai.limits.max_result_bytes == 0 || ai.limits.max_result_bytes > 1024 * 1024)
-        .then(|| {
-            SharedString::from("Above the safe cap: large results flood the context and drive up cost. “Off” removes the cap.")
-        });
-
-    // Tool-call budget per conversation (0 = off). The last two segments are risky.
-    const CALL_PRESETS: [usize; 6] = [25, 50, 100, 200, 500, 0];
-    let calls_sel = CALL_PRESETS
-        .iter()
-        .position(|&n| n == ai.limits.max_tool_calls)
-        .unwrap_or(usize::MAX);
-    let calls_view = view.clone();
-    let max_calls = Segmented::new("set-ai-max-calls")
-        .segment("25")
-        .segment("50")
-        .segment("100")
-        .segment("200")
-        .segment("500")
-        .segment("Off")
-        .selected(calls_sel)
-        .on_select(move |ix, _, cx| {
-            let n = CALL_PRESETS[ix.min(CALL_PRESETS.len() - 1)];
-            calls_view.update(cx, |this, cx| this.set_ai_max_calls(n, cx));
-        });
-    // Risky past the old safe top preset, or with the budget disabled entirely.
-    let calls_warn = (ai.limits.max_tool_calls == 0 || ai.limits.max_tool_calls > 200).then(|| {
-        SharedString::from(
-            "Above the safe budget: a runaway agent loop can rack up cost. “Off” removes the cap.",
-        )
-    });
-
-    let show_thinking = Toggle::new("set-ai-thinking", ai.show_thinking)
-        .on_change(cx.listener(|this, on: &bool, _, cx| this.set_ai_show_thinking(*on, cx)));
 
     // Where `generate_report` writes finished HTML files. Empty falls back to the
     // system temp dir (the historical behavior); a chosen folder keeps reports
@@ -1414,7 +1338,7 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             div()
                 .max_w(px(280.))
                 .truncate()
-                .text_size(theme.scale(11.5))
+                .text_size(theme.scale(TEXT_MINOR))
                 .text_color(report_dir_color)
                 .child(report_dir_label),
         )
@@ -1443,26 +1367,20 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
         div()
             .flex()
             .flex_col()
-            .child(setting_row(
-                "Enable agent",
-                "The grounded chat sidepanel (⌘L). Off is a true kill switch.",
-                switch,
-                &theme,
-            ))
+            .child(registry_group(SettingsTab::Ai, "", state, &theme, cx))
             .child(settings_header("Database access", &theme))
-            .child(setting_row(
-                "Access tier",
-                "How much the agent can see. Off: nothing. Schema: structure only. \
-                 Read: capped SELECT/EXPLAIN. Write: adds INSERT/UPDATE/DELETE, each \
-                 needing per-statement approval.",
-                tier,
+            .child(registry_group(
+                SettingsTab::Ai,
+                "Database access",
+                state,
                 &theme,
+                cx,
             ))
             .child(
                 div()
                     .pt_2()
                     .pb_1()
-                    .text_size(theme.scale(12.))
+                    .text_size(theme.scale(TEXT_BODY))
                     .text_color(theme.text_muted)
                     .child(
                         "Writes never run DDL or an unqualified UPDATE/DELETE, and are \
@@ -1471,36 +1389,20 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                     ),
             )
             .child(settings_header("Read-tier resource guards", &theme))
-            .child(setting_row(
-                "Max rows per query",
-                "Ceiling on rows one tool SELECT returns; a larger LIMIT is clamped.",
-                risky_control("ai-max-rows-warn", rows_warn, max_rows, &theme),
+            .child(registry_group(
+                SettingsTab::Ai,
+                "Read-tier resource guards",
+                state,
                 &theme,
-            ))
-            .child(setting_row(
-                "Statement timeout",
-                "Abort a tool query that runs longer than this.",
-                timeout,
-                &theme,
-            ))
-            .child(setting_row(
-                "Result size cap",
-                "Trim a tool result larger than this before handing it to the model.",
-                risky_control("ai-max-bytes-warn", bytes_warn, max_bytes, &theme),
-                &theme,
-            ))
-            .child(setting_row(
-                "Tool calls per chat",
-                "Tool-call budget for one conversation; bounds a runaway loop.",
-                risky_control("ai-max-calls-warn", calls_warn, max_calls, &theme),
-                &theme,
+                cx,
             ))
             .child(settings_header("Display", &theme))
-            .child(setting_row(
-                "Show thinking",
-                "Show a summarized “thinking…” affordance while the model reasons.",
-                show_thinking,
+            .child(registry_group(
+                SettingsTab::Ai,
+                "Display",
+                state,
                 &theme,
+                cx,
             ))
             .child(settings_header("Reports", &theme))
             .child(setting_row(
@@ -1560,7 +1462,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
             .px_1p5()
             .rounded(px(4.))
             .bg(theme.bg_elevated)
-            .text_size(theme.scale(10.))
+            .text_size(theme.scale(TEXT_BADGE))
             .text_color(theme.text_muted)
             .child(if is_acp { "ACP" } else { "API" });
         // Which agent is the default was previously settable only by hand-editing
@@ -1572,7 +1474,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                 .px_1p5()
                 .rounded(px(4.))
                 .bg(theme.accent_ghost)
-                .text_size(theme.scale(10.))
+                .text_size(theme.scale(TEXT_BADGE))
                 .text_color(theme.accent)
                 .child("DEFAULT")
                 .into_any_element()
@@ -1608,7 +1510,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                 .hover(|s| s.bg(theme.border))
                 .child(crate::icons::icon(
                     "key-round",
-                    theme.scale(12.),
+                    theme.scale(TEXT_BODY),
                     theme.text_muted,
                 ))
                 .on_click(move |_, _, cx| {
@@ -1636,7 +1538,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                 .rounded(px(4.))
                 .border_1()
                 .border_color(theme.border)
-                .text_size(theme.scale(10.5))
+                .text_size(theme.scale(TEXT_MINOR))
                 .text_color(theme.text_muted)
                 .cursor_pointer()
                 .tooltip(flint::Tooltip::text("Sign out of this subscription"))
@@ -1676,7 +1578,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                 .rounded(px(4.))
                 .border_1()
                 .border_color(theme.border)
-                .text_size(theme.scale(10.5))
+                .text_size(theme.scale(TEXT_MINOR))
                 .text_color(theme.text_muted)
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.bg_elevated))
@@ -1708,7 +1610,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                             div()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(theme.scale(12.5))
+                                .text_size(theme.scale(TEXT_BODY))
                                 .text_color(theme.text)
                                 .child(SharedString::from(a.name.clone())),
                         )
@@ -1716,7 +1618,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                             div()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(theme.scale(10.5))
+                                .text_size(theme.scale(TEXT_MINOR))
                                 .text_color(status_color)
                                 .child(status),
                         ),
@@ -1777,7 +1679,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
         .gap_2()
         .child(
             div()
-                .text_size(theme.scale(12.))
+                .text_size(theme.scale(TEXT_BODY))
                 .text_color(theme.text_muted)
                 .child(
                     "Sign in or add API keys for the agents you use. An API agent needs a \
@@ -1835,7 +1737,7 @@ fn login_panel(
         None => {
             panel = panel.child(
                 div()
-                    .text_size(theme.scale(11.5))
+                    .text_size(theme.scale(TEXT_MINOR))
                     .text_color(theme.text_muted)
                     .child("Starting sign-in… a browser window will open shortly."),
             );
@@ -1845,7 +1747,7 @@ fn login_panel(
             panel = panel
                 .child(
                     div()
-                        .text_size(theme.scale(11.5))
+                        .text_size(theme.scale(TEXT_MINOR))
                         .text_color(theme.text_muted)
                         .child(
                             "A browser window opened; authorize there to finish signing in. \
@@ -1857,7 +1759,7 @@ fn login_panel(
                         .id("ai-login-open")
                         .role(gpui::Role::Button)
                         .cursor_pointer()
-                        .text_size(theme.scale(11.))
+                        .text_size(theme.scale(TEXT_MINOR))
                         .text_color(theme.accent)
                         .child("Didn't open? Open the sign-in page")
                         .on_click(
@@ -1868,7 +1770,7 @@ fn login_panel(
                 .child(
                     div()
                         .pt_1()
-                        .text_size(theme.scale(10.5))
+                        .text_size(theme.scale(TEXT_MINOR))
                         .text_color(theme.text_faint)
                         .child("If the browser shows a code instead, paste it here:"),
                 )
@@ -1899,7 +1801,7 @@ fn login_panel(
             if flow.submitting {
                 panel = panel.child(
                     div()
-                        .text_size(theme.scale(11.))
+                        .text_size(theme.scale(TEXT_MINOR))
                         .text_color(theme.text_muted)
                         .child("Finishing sign-in…"),
                 );
@@ -1909,7 +1811,7 @@ fn login_panel(
     if let Some(error) = &flow.error {
         panel = panel.child(
             div()
-                .text_size(theme.scale(11.))
+                .text_size(theme.scale(TEXT_MINOR))
                 .text_color(theme.red)
                 .child(error.clone()),
         );
@@ -1924,9 +1826,6 @@ fn about_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
     // build.rs (Phase 2) so a build is unambiguous in a bug report.
     let build = format!("{} · {}", env!("RED_GIT_SHA"), env!("RED_BUILD_DATE"));
 
-    let auto_update = Toggle::new("set-auto-update", state.settings.update.auto_update)
-        .on_change(cx.listener(|this, on: &bool, _, cx| this.set_auto_update(*on, cx)));
-
     settings_page_scaffold(
         "About",
         div()
@@ -1935,7 +1834,7 @@ fn about_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             .child(
                 div()
                     .pb_2()
-                    .text_size(theme.scale(14.))
+                    .text_size(theme.scale(TEXT_ROW))
                     .text_color(theme.text_muted)
                     .child("Red: Roughly Enough Data, a fast, native database explorer."),
             )
@@ -1967,12 +1866,12 @@ fn about_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 &theme,
             ))
             .child(settings_header("Updates", &theme))
-            .child(setting_row(
-                "Automatic updates",
-                "Check GitHub for newer signed builds in the background and stage \
-                 them for a one-click restart. macOS only.",
-                auto_update,
+            .child(registry_group(
+                SettingsTab::About,
+                "Updates",
+                state,
                 &theme,
+                cx,
             ))
             .child(update_status_row(state, &theme, cx))
             .child(settings_header("Feedback", &theme))
@@ -2050,7 +1949,7 @@ fn update_status_row<'a>(
 /// page.
 fn muted_value(text: impl Into<SharedString>, theme: &Theme) -> impl IntoElement {
     div()
-        .text_size(theme.scale(14.))
+        .text_size(theme.scale(TEXT_ROW))
         .text_color(theme.text_muted)
         .child(text.into())
 }
@@ -2063,11 +1962,36 @@ fn settings_page_scaffold(title: &str, body: impl IntoElement, theme: &Theme) ->
         .child(
             div()
                 .pb_2()
-                .text_size(theme.scale(18.))
+                .text_size(theme.scale(TEXT_TITLE))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.text)
                 .child(SharedString::from(title.to_string())),
         )
+        .child(body)
+}
+
+/// [`settings_page_scaffold`] for a registry page, adding the tab's subtitle: the
+/// line that says who the page is for, so a seam page reads as global defaults
+/// rather than as something about the connection currently open.
+fn page_scaffold(tab: SettingsTab, body: impl IntoElement, theme: &Theme) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .text_size(theme.scale(TEXT_TITLE))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text)
+                .child(tab.label()),
+        )
+        .children(tab.subtitle().map(|s| {
+            div()
+                .pt_0p5()
+                .text_size(theme.scale(TEXT_BODY))
+                .text_color(theme.text_muted)
+                .child(s)
+        }))
+        .child(div().pb_2())
         .child(body)
 }
 
@@ -2104,7 +2028,7 @@ fn settings_header(title: &str, theme: &Theme) -> impl IntoElement + use<> {
     div()
         .pt_4()
         .pb_1()
-        .text_size(theme.scale(12.))
+        .text_size(theme.scale(TEXT_BODY))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(theme.text_faint)
         .child(SharedString::from(title.to_uppercase()))
@@ -2167,7 +2091,7 @@ fn risky_control(
                 div()
                     .id(id)
                     .flex_none()
-                    .text_size(theme.scale(13.))
+                    .text_size(theme.scale(TEXT_CONTROL))
                     .text_color(theme.red)
                     .cursor_default()
                     .tooltip(flint::Tooltip::danger(msg))
@@ -2192,14 +2116,14 @@ fn setting_label(
         .min_w_0()
         .child(
             div()
-                .text_size(theme.scale(14.))
+                .text_size(theme.scale(TEXT_ROW))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme.text)
                 .child(title.into()),
         )
         .child(
             div()
-                .text_size(theme.scale(12.))
+                .text_size(theme.scale(TEXT_BODY))
                 .text_color(theme.text_muted)
                 .child(description.into()),
         )

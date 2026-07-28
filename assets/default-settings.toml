@@ -8,6 +8,18 @@
 # and shows a banner — it never resets the whole file. A missing file is fine; RED
 # launches on these defaults.
 #
+# Sections are cut by what a setting is *about*, not by which engine it came from:
+#
+#   app     [appearance] [editor] [keymap] [behavior] [update]
+#   data    [data]    — every grid: SQL results, Redis keys, MongoDB documents
+#   safety  [safety]  — every write path, every engine
+#   seam    [sql] [kv] [doc] — named for the driver seam, not for one engine
+#   agent   [ai]
+#
+# Renamed in 0.20: [grid] → [data], [redis] → [kv], and [query] split into [sql]
+# (execution) + [safety] (the cross-engine guards). Older files are migrated on
+# load and re-saved in the new shape, so nothing needs changing by hand.
+#
 # Location:
 #   macOS    ~/Library/Application Support/red/settings.toml
 #   Linux    ~/.config/red/settings.toml          (XDG)
@@ -33,56 +45,156 @@ theme = "One Dark"
 # Interface fonts: a sans family for chrome and a mono family for in-UI data
 # (result grid cells, schema identifiers). Both share `ui_font_size` (px, clamped
 # to 8–32); the whole UI scales from it. Match the two families for a uniform look.
-# Also settable from the Appearance panel. The SQL editor has its own [editor] font.
+# Also settable from the Appearance panel. The editor has its own [editor] font.
 ui_font_family = "IBM Plex Sans"
 ui_mono_family = "IBM Plex Mono"
 ui_font_size = 13
 
+# Suppress non-essential animation (currently the indeterminate progress sweep),
+# for motion sensitivity. RED has no OS "reduce motion" bridge yet, so this is the
+# manual opt-in.
+reduce_motion = false
+
 [editor]
-# SQL editor typography. A monospace family is recommended. `line_height` is a
-# multiple of the font size (clamped to 1.0–3.0). Family + size are also in the
-# Appearance panel; line_height and tab_width live here.
+# Code-editor typography, shared by the SQL editor, the JSON editor, and the Redis
+# console. A monospace family is recommended. `line_height` is a multiple of the
+# font size (clamped to 1.0–3.0).
 font_family = "IBM Plex Mono"
 font_size = 13
 line_height = 1.5
 tab_width = 2
 
-[grid]
-# Row spacing: "compact" | "comfortable" | "spacious".
+[keymap]
+# Layer vim-style motions (hjkl, g/G, Ctrl-d/Ctrl-u) onto the result grid and the
+# history dock, alongside the existing arrow keys. Applies live, no restart.
+# Per-key rebinds live in keymap.toml, not here.
+vim_mode = false
+
+[data]
+# Data-view defaults, shared by EVERY grid: the SQL result grid, the Redis key
+# list, and the MongoDB document grid. A few knobs only one seam can honour; those
+# say so below (and are badged in the settings panel).
+
+# Row spacing: "compact" | "comfortable" | "spacious". All grids.
 density = "comfortable"
 
-# What a SQL NULL renders as in a cell (e.g. "∅", "NULL", or "" for blank).
-null_display = "NULL"
-
-# Show the leading row-number gutter.
-row_numbers = true
+# Rows pulled per page as you scroll — the keyset/offset fetch window. Larger
+# pages mean fewer round-trips but more resident rows. Clamped to 20–5000.
+# Honored by the SQL result cursor, the MongoDB keyset window, and (as the soft
+# target per SCAN round trip) the Redis key list.
+page_size = 200
 
 # Hard cap on the characters of any one cell kept resident — the fat-cell memory
 # rail. The driver reads over-cap blobs by length only and clips long text to a
 # prefix, so a page of huge cells can't spike RAM. Export stays full-fidelity.
-# Clamped to 256–1048576.
+# Clamped to 256–1048576. SQL grid + MongoDB document cells.
 max_cell_chars = 4096
 
-# Rows pulled per page as you scroll — the keyset/offset fetch window. Larger
-# pages mean fewer round-trips but more resident rows. Clamped to 20–5000.
-page_size = 200
+# What a SQL NULL renders as in a cell (e.g. "∅", "NULL", or "" for blank).
+# SQL results only.
+null_display = "NULL"
 
-[query]
-# Append LIMIT n to a bare `SELECT *` so a fat table can't flood the grid.
-# Set to 0 to disable. Queries that write their own LIMIT are left untouched.
+# Show the leading row-number gutter. SQL results only.
+row_numbers = true
+
+# Result size past which the column-stats bar withholds count(distinct) until you
+# ask for it, so selecting a column never silently starts a full scan. SQL only.
+stats_distinct_max_rows = 1000000
+
+# Ceiling on rows a select-all / whole-column copy pulls into the clipboard; a
+# larger copy is clipped to this with a warning. Clamped to 1000–1000000.
+copy_row_limit = 100000
+
+[safety]
+# The guards between you and losing data. Cross-engine: one scale grades a SQL
+# statement, a Redis key delete, and a MongoDB document delete.
+
+# How dangerous an action has to be before RED asks first:
+#   "write"    — anything that writes at all, including a filtered UPDATE/DELETE
+#                and plain DDL. The most cautious, and noisy by design.
+#   "risky"    — anything that reaches further than it names: an unfiltered
+#                UPDATE/DELETE, a privilege change, a DROP, a Redis key delete,
+#                a MongoDB document delete. The default.
+#   "critical" — only what destroys a whole object (DROP TABLE, TRUNCATE).
+#   "never"    — nothing is confirmed.
+# A connection marked env = "prod" confirms from "risky" whatever this says, types
+# those confirmations out rather than clicking them, and offers no "don't ask
+# again"; env = "local" never asks below "critical".
+confirm_from = "risky"
+
+# Confirm before closing a tab that holds unsaved work.
+confirm_close_tab = true
+
+# Add an advisory AI second opinion to a confirmation RED already stopped, for the
+# mistakes a keyword check can't see. Off by default and off is the honest
+# default: enabling it sends the statement and a schema summary to the configured
+# provider. It is never a gate — the verdict is displayed and nothing more.
+ai_review = false
+
+[sql]
+# The SQL seam: knobs that only mean something for a SQL engine.
+
+# Append LIMIT n to a bare `SELECT *` so a fat table can't flood the grid. 0
+# disables it. Queries that write their own LIMIT are left untouched.
 auto_limit = 1000
-
-# Ask before running DROP / TRUNCATE / DELETE-without-WHERE and similar.
-confirm_destructive = true
 
 # Abort a query — and each of its page/run fetches — that runs longer than this
 # many seconds, at the engine. 0 disables the cap.
 statement_timeout = 0
 
+[kv]
+# The key-value seam: the Redis key browser today, and any future KvDriver engine
+# unchanged, which is why it's named for the seam and not for Redis.
+
+# How a new browse tab's filter box reads what you type:
+#   "glob"   — a raw SCAN … MATCH pattern (user:*). The default.
+#   "prefix" — a literal prefix; glob metacharacters match literally.
+#   "exact"  — one exact key name, resolved directly (no SCAN).
+#   "fuzzy"  — client-side fuzzy match over loaded keys.
+#   "value"  — substring search over string values; runs on Enter.
+# Changeable per tab from the filter dropdown.
+default_query_mode = "glob"
+
+# Seconds between automatic key re-scans in a NEW browse tab; 0 is off. Change it
+# for an already-open tab from the browser's actions menu. A non-zero value is
+# floored at 1s so a stray tiny setting can't spin the scanner.
+auto_refresh_secs = 0
+
+# Soft cap on the keys one browse tab keeps resident. The list is append-only with
+# evict-oldest beyond this, so a long unfiltered browse can't grow without bound.
+# Clamped to 1000–500000.
+max_resident_keys = 20000
+
+# Elements of a collection value (list, stream) the inspector pulls per fetch.
+# Clamped to 10–5000.
+preview_count = 200
+
+[doc]
+# The document seam: the MongoDB browser today, and any future DocDriver engine.
+# Page size and the cell cap are NOT here — those are [data], shared with every
+# other grid.
+
+# How a newly-opened collection renders: "table" | "list" | "json". Changeable per
+# tab from the collection toolbar.
+default_view = "table"
+
+# Top-level fields the sampled-column table shows. A wider document is still whole
+# in List, JSON, and the inspector. Clamped to 2–64.
+max_columns = 12
+
 [behavior]
 # Reconnect to the most recently used connection on launch (credentials come from
 # the OS keychain). Off shows the connection picker.
 restore_last_session = false
+
+[update]
+# Poll GitHub Releases for newer signed builds in the background and stage them
+# for a one-click restart. false is a true off switch: no timer, no network.
+auto_update = true
+
+# Hours between background checks (the first runs at launch). Floored at 1 so a
+# hand-edited 0 can't turn the updater into a tight network loop.
+check_interval_hours = 6
 
 [ai]
 # The master switch for the grounded chat agent (⌘L). false is a true kill
@@ -93,6 +205,7 @@ enabled = true
 # Which backend handles turns:
 #   "anthropic"    — the Claude Messages API, billed to an API key (keychain/env).
 #   "subscription" — Claude Code over ACP, billed to a Pro/Max subscription.
+# Legacy: superseded by [[ai.agents]] below once you define any.
 provider = "anthropic"
 
 # How much the agent's tools can see (the capability boundary):
@@ -114,6 +227,10 @@ model = "claude-opus-4-8"
 
 # Surface a summarized "thinking…" affordance while the model reasons.
 show_thinking = false
+
+# Folder the agent writes generated HTML reports to. Empty uses the system temp
+# dir; set it so reports land somewhere you can find them.
+report_dir = ""
 
 # Advanced: override the subscription agent's launch command. Empty uses the
 # default (npx -y @agentclientprotocol/claude-agent-acp).

@@ -1453,7 +1453,7 @@ impl AppState {
             let table = self.resolve_browse_table(&sql);
             // Guard a bare `SELECT *` against flooding the grid: append the
             // configured `LIMIT` unless the user wrote their own.
-            let sql = crate::sql::auto_limit(&sql, self.settings.query.auto_limit).unwrap_or(sql);
+            let sql = crate::sql::auto_limit(&sql, self.settings.sql.auto_limit).unwrap_or(sql);
             self.open_result("query", sql, table, cx);
             return;
         }
@@ -1501,7 +1501,7 @@ impl AppState {
         // point of the app, and the deterministic guards are what actually decide
         // whether to stop. This only ever adds a line to a dialog already open.
         self.confirm_review =
-            (self.settings.query.ai_review && assessment.level >= RiskLevel::Risky).then(|| {
+            (self.settings.safety.ai_review && assessment.level >= RiskLevel::Risky).then(|| {
                 // Which agent runs this isn't a separate setting: it follows the
                 // assistant panel. Carry its display name so the line can say who
                 // answered rather than leaving the user to guess.

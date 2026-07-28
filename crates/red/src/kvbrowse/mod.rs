@@ -36,8 +36,7 @@ use render::render_string_preview;
 /// The `SCAN ... COUNT` hint per round trip (default `10` is far too low for
 /// a large keyspace; see docs/plans/redis.md item 3).
 const SCAN_COUNT_HINT: u32 = 200;
-/// Soft target page size (see `ScanBudget::want`).
-const SCAN_WANT: usize = 150;
+
 /// Wall-clock budget per `KvFetchScan` round trip, so a selective `MATCH`
 /// pattern on a sparse keyspace can't block the UI thread waiting to fill a
 /// page.
@@ -45,24 +44,13 @@ const SCAN_BUDGET_MS: u64 = 250;
 /// Trigger a load-more once the visible range comes within this many rows of
 /// the end of what's loaded.
 const LOAD_AHEAD_ROWS: usize = 60;
-/// Soft cap on resident rows (see docs/plans/redis.md's "grid needs a third
-/// buffer mode": append-only, evict-oldest beyond a cap, since revisiting an
-/// evicted row means re-scanning anyway). A very long unfiltered browse
-/// session shouldn't grow this list forever.
-const MAX_RESIDENT_ROWS: usize = 20_000;
+
 /// How long to wait after the last keystroke before restarting the scan with
 /// the typed pattern, so a fast typist doesn't fire one `KvFetchScan` per
 /// character. Enter (`TextInputEvent::Submit`) bypasses this and restarts
 /// immediately.
 const FILTER_DEBOUNCE_MS: u64 = 300;
-/// A big list's inspector preview is a single static head window, not an
-/// infinite scroll (lists have no `LSCAN`; see docs/plans/redis.md's
-/// documented limitation on deep-middle list access).
-const LIST_PREVIEW_COUNT: usize = 200;
-/// How many stream entries to pull per `KvReadStreamPage` round trip. Unlike
-/// a list, a big stream *is* pageable (by entry-ID range, newest-first), so
-/// this is a page size the inspector grows on scroll, not a one-shot cap.
-const STREAM_PAGE_COUNT: usize = 200;
+
 /// How many pending entries to pull per group in the consumer-group view
 /// (`XPENDING ... - + count`). A bounded window, not the whole PEL: a group
 /// with a huge backlog still surfaces its head (the oldest, most-stuck
@@ -70,11 +58,15 @@ const STREAM_PAGE_COUNT: usize = 200;
 /// the inspector uses.
 const STREAM_PENDING_COUNT: usize = 100;
 
-fn scan_budget() -> ScanBudget {
+/// The per-round-trip scan budget. `want` is the soft target page size, which is
+/// `data.page_size` — the same knob the SQL result cursor and the document window
+/// take their page from, since "how much do I pull per round trip" is one
+/// question whatever the engine.
+fn scan_budget(want: usize) -> ScanBudget {
     ScanBudget {
         count_hint: SCAN_COUNT_HINT,
         wall_clock: Duration::from_millis(SCAN_BUDGET_MS),
-        want: SCAN_WANT,
+        want,
     }
 }
 
@@ -119,6 +111,23 @@ pub(crate) enum QueryMode {
     /// Substring search over string *values* (the driver reads scanned string
     /// values); runs on Enter, not per keystroke.
     Value,
+}
+
+/// The persisted `kv.default_query_mode` maps onto the in-tab mode. Two types for
+/// one concept on purpose: the settings enum owns the `settings.toml` vocabulary
+/// and carries no UI, this one carries the dropdown labels and the scan
+/// behaviour.
+impl From<crate::settings::KvQueryMode> for QueryMode {
+    fn from(mode: crate::settings::KvQueryMode) -> Self {
+        use crate::settings::KvQueryMode as M;
+        match mode {
+            M::Glob => QueryMode::Glob,
+            M::Prefix => QueryMode::Prefix,
+            M::Exact => QueryMode::Exact,
+            M::Fuzzy => QueryMode::Fuzzy,
+            M::Value => QueryMode::Value,
+        }
+    }
 }
 
 impl QueryMode {
@@ -403,7 +412,7 @@ pub(crate) struct BrowseState {
     meta_gen: u64,
     /// Rows accumulated this run, forward-only, oldest-evicted past the cap.
     /// Held behind an `Rc` so the per-frame render (and keyboard nav) share the
-    /// buffer by a refcount bump instead of deep-cloning up to `MAX_RESIDENT_ROWS`
+    /// buffer by a refcount bump instead of deep-cloning up to `kv.max_resident_keys`
     /// `KeyMeta` every frame; mutate only via [`BrowseState::rows_mut`].
     pub(crate) rows: Rc<Vec<KeyMeta>>,
     /// Bumped on every mutation of `rows` (via [`BrowseState::rows_mut`]) so the
@@ -449,7 +458,7 @@ pub(crate) struct BrowseState {
     pub(crate) big_keys: Option<BigKeysState>,
     /// `Some` while the "New key" popover is open (see `kv_open_create_key`).
     pub(crate) create_key: Option<CreateKeyState>,
-    /// Set once the resident-row cap (`MAX_RESIDENT_ROWS`) has evicted the
+    /// Set once the resident-row cap (`kv.max_resident_keys`) has evicted the
     /// oldest scanned keys, so the header can say the view is windowed rather
     /// than silently dropping keys off the top.
     pub(crate) evicted: bool,
@@ -466,7 +475,7 @@ pub(crate) struct BrowseState {
     /// ([`BrowseState::tree_rows`]) knows to rebuild.
     expand_gen: u64,
     /// Memoized flattened tree, valid while the row buffer and `expand_gen` are
-    /// unchanged — building the trie over up to `MAX_RESIDENT_ROWS` keys every
+    /// unchanged — building the trie over up to `kv.max_resident_keys` keys every
     /// frame would be wasteful (mirrors the fuzzy `visible_cache`).
     tree_cache: RefCell<Option<TreeCache>>,
     /// The active value-search needle (only ever set in [`QueryMode::Value`]),
@@ -793,7 +802,7 @@ pub(crate) struct KvInspector {
     /// `value` reports a `KvCollection::Large`. A list's elements reuse
     /// `KvElement::Member` (no separate variant; a list has no field/score,
     /// same shape as a set member for rendering purposes) and are fetched
-    /// once as a static head window, not paged (see `LIST_PREVIEW_COUNT`).
+    /// once as a static head window, not paged (see `kv.preview_count`).
     /// Behind an `Rc` so the per-frame grid render shares the buffer by a
     /// refcount bump instead of deep-cloning every paged element each frame;
     /// mutate via `Rc::make_mut`.
@@ -955,14 +964,16 @@ pub(crate) struct StreamGroupsState {
 }
 
 impl BrowseState {
-    pub(crate) fn new(session: SessionId, cx: &mut Context<AppState>) -> Self {
+    /// `mode` is `kv.default_query_mode`, captured when the tab opens; the
+    /// toolbar dropdown changes it per tab from there.
+    pub(crate) fn new(session: SessionId, mode: QueryMode, cx: &mut Context<AppState>) -> Self {
         // `bare()` so the box has no border/background of its own: it sits inside
         // the combined `[mode ▾ │ input]` search field, which owns the chrome
         // (see the toolbar in `render_kv_browse`).
         let filter = cx.new(|cx| {
             TextInput::new(cx)
                 .bare()
-                .with_placeholder(QueryMode::Glob.placeholder())
+                .with_placeholder(mode.placeholder())
         });
         cx.subscribe(&filter, move |this, input, event: &TextInputEvent, cx| {
             // Only the active (visible, focused) tab can receive input events
@@ -1034,7 +1045,7 @@ impl BrowseState {
             nav_row: None,
             filter,
             filter_gen: 0,
-            mode: QueryMode::Glob,
+            mode,
             mode_open: false,
             inspector: None,
             big_keys: None,
@@ -1312,9 +1323,14 @@ impl AnalysisState {
 impl RedisTabState {
     /// Build a fresh tab body of the given kind. Needs `cx` because several
     /// panels create persistent `TextInput` entities + subscriptions up front.
-    pub(crate) fn new(kind: KvPanel, session: SessionId, cx: &mut Context<AppState>) -> Self {
+    pub(crate) fn new(
+        kind: KvPanel,
+        session: SessionId,
+        mode: QueryMode,
+        cx: &mut Context<AppState>,
+    ) -> Self {
         match kind {
-            KvPanel::Browse => RedisTabState::Browse(Box::new(BrowseState::new(session, cx))),
+            KvPanel::Browse => RedisTabState::Browse(Box::new(BrowseState::new(session, mode, cx))),
             KvPanel::Console => {
                 RedisTabState::Console(crate::kvconsole::KvConsole::new(session, cx))
             }
@@ -1399,8 +1415,9 @@ impl SplitWorkspace for RedisView {
 }
 
 impl RedisView {
-    pub(crate) fn new(session: SessionId, cx: &mut Context<AppState>) -> Self {
-        let browse = RedisTabState::Browse(Box::new(BrowseState::new(session, cx)));
+    /// `mode` is `kv.default_query_mode`, for the first Browse tab.
+    pub(crate) fn new(session: SessionId, mode: QueryMode, cx: &mut Context<AppState>) -> Self {
+        let browse = RedisTabState::Browse(Box::new(BrowseState::new(session, mode, cx)));
         Self {
             tabs: vec![RedisTab {
                 id: 0,
@@ -1652,7 +1669,7 @@ impl AppState {
                 type_filter: None,
                 value_needle: None,
                 cursor: ScanCursor::START,
-                budget: scan_budget(),
+                budget: scan_budget(self.settings.data.page_size),
             },
         );
         cx.notify();
@@ -2051,7 +2068,7 @@ impl AppState {
         } else {
             Some(
                 self.settings
-                    .redis
+                    .kv
                     .auto_refresh_interval()
                     .unwrap_or(Duration::from_secs(5)),
             )
@@ -2326,7 +2343,7 @@ impl AppState {
         session: SessionId,
         cx: &mut Context<Self>,
     ) {
-        if let Some(interval) = self.settings.redis.auto_refresh_interval() {
+        if let Some(interval) = self.settings.kv.auto_refresh_interval() {
             self.kv_set_auto_refresh(session, Some(interval), cx);
         }
     }
@@ -2432,7 +2449,7 @@ impl AppState {
                 type_filter: plan.type_filter,
                 value_needle: plan.value_needle,
                 cursor: ScanCursor::START,
-                budget: scan_budget(),
+                budget: scan_budget(self.settings.data.page_size),
             },
         );
         cx.notify();
@@ -2478,7 +2495,7 @@ impl AppState {
                 type_filter,
                 value_needle,
                 cursor,
-                budget: scan_budget(),
+                budget: scan_budget(self.settings.data.page_size),
             },
         );
         cx.notify();
@@ -2624,6 +2641,7 @@ impl AppState {
             self.on_analysis_page(session, epoch, page, cx);
             return;
         }
+        let max_resident = self.settings.kv.max_resident_keys;
         let Some(browse) = self
             .conn_mut(session)
             .and_then(|a| a.kv_view.as_mut())
@@ -2632,8 +2650,8 @@ impl AppState {
             return; // superseded scan run, or no tab owns this epoch
         };
         browse.rows_mut().extend(page.keys);
-        if browse.rows.len() > MAX_RESIDENT_ROWS {
-            let drop = browse.rows.len() - MAX_RESIDENT_ROWS;
+        if browse.rows.len() > max_resident {
+            let drop = browse.rows.len() - max_resident;
             browse.rows_mut().drain(0..drop);
             browse.evicted = true;
             // Front eviction shifts every row index down by `drop`, so move the
@@ -2863,7 +2881,7 @@ impl AppState {
                 type_filter,
                 value_needle: None,
                 cursor,
-                budget: scan_budget(),
+                budget: scan_budget(self.settings.data.page_size),
             },
         );
         cx.notify();

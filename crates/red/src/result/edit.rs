@@ -701,7 +701,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let gutter = self.gutter();
-        let row_height = f32::from(self.settings.grid.density.row_height());
+        let row_height = f32::from(self.settings.data.density.row_height());
         let (ncols, locked, total) = match &self.phase {
             Phase::Connected(active) => match active.active_result() {
                 Some(g) => (

@@ -1468,6 +1468,7 @@ impl AppState {
                 &current.query_docs,
                 &current.query_columns,
                 &current.query_scroll,
+                self.settings.data.max_cell_chars,
                 theme,
             )
         };
@@ -1490,6 +1491,7 @@ impl AppState {
         theme: &Theme,
         view: &WeakEntity<AppState>,
     ) -> gpui::AnyElement {
+        let cell_cap = self.settings.data.max_cell_chars;
         let columns: Vec<Column> = current
             .columns
             .iter()
@@ -1506,7 +1508,7 @@ impl AppState {
         // Resolve (and possibly re-center) the virtual-scroll window for this
         // frame; the list lays out only `win.len` rows offset by `base`, so it
         // scrolls the whole collection without exceeding the `f32` layout ceiling.
-        let row_height = self.settings.grid.density.row_height();
+        let row_height = self.settings.data.density.row_height();
         let win = current
             .window
             .borrow()
@@ -1604,7 +1606,7 @@ impl AppState {
                 };
                 render_cols
                     .iter()
-                    .map(|col| match cell_string(doc, col) {
+                    .map(|col| match cell_string(doc, col, cell_cap) {
                         Some(text_val) => div()
                             .min_w_0()
                             .truncate()
@@ -1657,6 +1659,7 @@ impl AppState {
         theme: &Theme,
         view: &WeakEntity<AppState>,
     ) -> gpui::AnyElement {
+        let cell_cap = self.settings.data.max_cell_chars;
         // Per-row data the list closure indexes into (built once per render, not
         // per painted frame). The List mode lays out the resident window by local
         // index; expansion and selectable blocks are keyed by absolute ordinal.
@@ -1672,7 +1675,7 @@ impl AppState {
                 .map(|(i, doc)| {
                     let ord = anchor + i;
                     DocCardRow {
-                        id_label: SharedString::from(format!("_id: {}", doc.id.to_cell(CELL_CAP))),
+                        id_label: SharedString::from(format!("_id: {}", doc.id.to_cell(cell_cap))),
                         expanded: current.expanded_rows.contains(&ord),
                         label: current.list_labels.get(&ord).cloned(),
                     }
@@ -2125,6 +2128,7 @@ fn render_docs_table(
     docs: &[Document],
     columns: &[String],
     scroll: &UniformListScrollHandle,
+    cell_cap: usize,
     theme: &Theme,
 ) -> gpui::AnyElement {
     let cols: Vec<Column> = columns
@@ -2153,7 +2157,7 @@ fn render_docs_table(
             };
             render_cols
                 .iter()
-                .map(|col| match cell_string(doc, col) {
+                .map(|col| match cell_string(doc, col, cell_cap) {
                     Some(t) => div()
                         .min_w_0()
                         .truncate()

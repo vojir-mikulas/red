@@ -83,7 +83,9 @@ impl AppState {
         // load-on-scroll takes over from there.
         let epoch = crate::result::next_kv_epoch();
         let sender = self.service.command_sender(session);
-        let coll_view = CollView::new(epoch, db.clone(), coll.clone(), sender, cx);
+        let page = self.settings.data.page_size;
+        let view_mode = self.settings.doc.default_view.into();
+        let coll_view = CollView::new(epoch, db.clone(), coll.clone(), sender, page, view_mode, cx);
         coll_view.seed_browse();
         let Some(view) = self
             .conn_mut(Some(session))
@@ -151,7 +153,10 @@ impl AppState {
         // (which reads that filter) before borrowing the view.
         let epoch = crate::result::next_kv_epoch();
         let sender = self.service.command_sender(session);
-        let mut coll_view = CollView::new(epoch, db.clone(), coll.clone(), sender, cx);
+        let page = self.settings.data.page_size;
+        let view_mode = self.settings.doc.default_view.into();
+        let mut coll_view =
+            CollView::new(epoch, db.clone(), coll.clone(), sender, page, view_mode, cx);
         coll_view.filter = filter.clone();
         if let Some(f) = &filter {
             coll_view

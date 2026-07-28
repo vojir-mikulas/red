@@ -315,7 +315,7 @@ impl AppState {
                 .is_some_and(|t| t.needs_close_confirm(cx)),
             _ => return,
         };
-        if !confirm || !self.settings.query.confirm_close_tab {
+        if !confirm || !self.settings.safety.confirm_close_tab {
             self.close_many(vec![index], cx);
         } else {
             self.confirm_close_tab = Some(index);
@@ -357,7 +357,7 @@ impl AppState {
             }),
             _ => return,
         };
-        if any_dirty && self.settings.query.confirm_close_tab {
+        if any_dirty && self.settings.safety.confirm_close_tab {
             self.confirm_close_batch = Some(indices);
             self.focus_modal = true;
             cx.notify();

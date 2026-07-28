@@ -1500,8 +1500,9 @@ impl ActiveConn {
         cx: &mut Context<AppState>,
     ) -> Self {
         let tab = QueryTab::new("query 1".to_string(), cx);
-        let kv_view =
-            (config.kind == DbKind::Redis).then(|| crate::kvbrowse::RedisView::new(session, cx));
+        let kv_mode = cx.entity().read(cx).settings.kv.default_query_mode.into();
+        let kv_view = (config.kind == DbKind::Redis)
+            .then(|| crate::kvbrowse::RedisView::new(session, kv_mode, cx));
         let doc_view = (config.kind == DbKind::Mongo)
             .then(|| crate::docbrowse::MongoView::new(session, config.read_only, cx));
         let history_search = cx.new(|cx| TextInput::new(cx).with_placeholder("Search history…"));

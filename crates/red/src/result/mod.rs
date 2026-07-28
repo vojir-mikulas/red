@@ -1417,7 +1417,7 @@ impl AppState {
                     base_sql,
                     table,
                     sender,
-                    self.settings.grid.page_size,
+                    self.settings.data.page_size,
                 );
                 grid.filter = filter;
                 let opened = (
@@ -1575,7 +1575,7 @@ impl AppState {
     /// gutter occupies column 0, else `0`. A data column `d` sits at table column
     /// `d + gutter`; selection/copy/sort all map through this offset.
     pub(crate) fn gutter(&self) -> usize {
-        self.settings.grid.row_numbers as usize
+        self.settings.data.row_numbers as usize
     }
 
     /// Header click on a data column: toggle / set sort and re-open the result.
@@ -1920,7 +1920,7 @@ impl AppState {
         extend: bool,
         cx: &mut Context<Self>,
     ) {
-        let row_height = f32::from(self.settings.grid.density.row_height());
+        let row_height = f32::from(self.settings.data.density.row_height());
         let gutter = self.gutter();
         if let Phase::Connected(active) = &mut self.phase
             && let Some(grid) = active.active_result_mut()
@@ -2053,7 +2053,7 @@ impl AppState {
             return;
         }
         let gutter = self.gutter();
-        let distinct_max = self.settings.grid.stats_distinct_max_rows;
+        let distinct_max = self.settings.data.stats_distinct_max_rows;
         let req = match &mut self.phase {
             Phase::Connected(active) => match active.active_result_mut() {
                 Some(grid) if grid.ready && grid.error.is_none() => {
@@ -2539,7 +2539,7 @@ impl AppState {
     /// user typed (1-based). Scrolls the active result's grid to that exact row,
     /// clamped to the result's bounds. No-op when no result is open.
     pub(crate) fn go_to_row(&mut self, one_based: usize, cx: &mut Context<Self>) {
-        let row_height = f32::from(self.settings.grid.density.row_height());
+        let row_height = f32::from(self.settings.data.density.row_height());
         if let Phase::Connected(active) = &self.phase
             && let Some(grid) = active.active_result()
         {
@@ -2571,7 +2571,7 @@ impl AppState {
                 // Bound the clipboard re-fetch so a select-all can't pull an
                 // arbitrarily large selection into one Vec/String; warn the user
                 // when it clips instead of silently copying a partial selection.
-                let capped = limit.min(self.settings.grid.copy_row_limit);
+                let capped = limit.min(self.settings.data.copy_row_limit);
                 if capped < limit {
                     self.notify(
                         ToastVariant::Warning,

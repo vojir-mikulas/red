@@ -22,11 +22,11 @@ use red_service::{Command, CommandSender, Epoch};
 
 use crate::gridwindow::{WINDOW, WindowView, centered_base, scrollbar_metrics, window_decision};
 
-/// Documents fetched per keyset window. Every derived span scales from it: the
-/// resident margin (`MARGIN_PAGES * PAGE` rows kept beyond the viewport), the
-/// fling threshold (`FLING_PAGES * PAGE` rows/frame past which fetching pauses),
-/// and the jump gap (`JUMP_PAGES * PAGE` rows past the run that relocates it).
-const PAGE: usize = 200;
+/// Spans derived from the run's page size ([`DocWindow::page`], which comes from
+/// `data.page_size`): the resident margin (`MARGIN_PAGES * page` documents kept
+/// beyond the viewport), the fling threshold (`FLING_PAGES * page` rows/frame
+/// past which fetching pauses), and the jump gap (`JUMP_PAGES * page` rows past
+/// the run that relocates it).
 const MARGIN_PAGES: usize = 2;
 const FLING_PAGES: usize = 3;
 const JUMP_PAGES: usize = 2;
@@ -42,10 +42,16 @@ pub(super) struct FetchCtx<'a> {
     pub filter: Option<&'a str>,
 }
 
-/// The windowed document run. Holds at most ~`2 * MARGIN_PAGES * PAGE` documents
+/// The windowed document run. Holds at most ~`2 * MARGIN_PAGES * page` documents
 /// regardless of collection size; everything beyond the viewport margin is
 /// evicted each paint.
 pub(super) struct DocWindow {
+    /// Documents fetched per keyset window, from `data.page_size` when the run
+    /// was created. Fixed for the run's life, exactly like a SQL result keeps the
+    /// page its buffer was built with: `apply` judges a reply "short" against the
+    /// page the matching request asked for, so a mid-flight settings change can't
+    /// make a full page read as the end of the collection.
+    page: usize,
     /// The collection's total document count (honoring the filter), or `None`
     /// until the first window reports it. Drives the grid's `row_count` and the
     /// scrollbar, and pins the run's anchor when a short window touches the end.
@@ -72,8 +78,10 @@ pub(super) struct DocWindow {
 }
 
 impl DocWindow {
-    pub(super) fn new() -> Self {
+    /// A fresh run fetching `page` documents per window (`data.page_size`).
+    pub(super) fn new(page: usize) -> Self {
         Self {
+            page: page.max(1),
             total: None,
             anchor: 0,
             docs: VecDeque::new(),
@@ -177,7 +185,7 @@ impl DocWindow {
             coll: ctx.coll.to_string(),
             filter: ctx.filter.map(str::to_string),
             seek,
-            limit: PAGE,
+            limit: self.page,
             seq: self.seq,
             want_total,
         });
@@ -196,7 +204,7 @@ impl DocWindow {
         sender: &CommandSender,
     ) -> bool {
         let cap = self.total.unwrap_or(usize::MAX);
-        let margin = MARGIN_PAGES * PAGE;
+        let margin = MARGIN_PAGES * self.page;
         let lo = range.start.saturating_sub(margin);
         let hi = range.end.saturating_add(margin).min(cap);
         self.evict(lo, hi);
@@ -214,7 +222,7 @@ impl DocWindow {
         // spawn a fetch for each one; wait until the scroll slows near its rest.
         let settled = self
             .last_start
-            .is_none_or(|prev| range.start.abs_diff(prev) <= FLING_PAGES * PAGE);
+            .is_none_or(|prev| range.start.abs_diff(prev) <= FLING_PAGES * self.page);
         self.last_start = Some(range.start);
         if !settled {
             return false;
@@ -232,7 +240,7 @@ impl DocWindow {
             return;
         }
         let cap = self.total.unwrap_or(usize::MAX);
-        let margin = MARGIN_PAGES * PAGE;
+        let margin = MARGIN_PAGES * self.page;
         let lo = range.start.saturating_sub(margin);
         let hi = range.end.saturating_add(margin).min(cap);
 
@@ -261,7 +269,7 @@ impl DocWindow {
 
         // Far from the run: relocate it with one exact jump rather than chaining
         // keyset seeks across the gap.
-        let jump_gap = JUMP_PAGES * PAGE;
+        let jump_gap = JUMP_PAGES * self.page;
         if range.start >= run_end + jump_gap || range.end + jump_gap <= run_start {
             self.issue(
                 DocSeek::Jump {
@@ -312,7 +320,7 @@ impl DocWindow {
             self.total = Some(total);
         }
         let n = docs.len();
-        let short = n < PAGE;
+        let short = n < self.page;
         match seek {
             DocSeek::Forward { after } => {
                 if after != self.last_id() {
@@ -441,6 +449,10 @@ pub(super) fn place_window(
 mod tests {
     use super::*;
 
+    /// The page size these fixtures are built around. The run takes its page from
+    /// `data.page_size` now, so the tests pick one and hold it fixed.
+    const PAGE: usize = 200;
+
     fn doc(id: i64) -> Document {
         Document {
             id: DocValue::Int64(id),
@@ -463,7 +475,7 @@ mod tests {
 
     #[test]
     fn forward_from_start_is_exact() {
-        let mut w = pending(DocWindow::new(), 1);
+        let mut w = pending(DocWindow::new(PAGE), 1);
         w.apply(
             DocSeek::Forward { after: None },
             docs(1..=PAGE as i64),
@@ -491,7 +503,7 @@ mod tests {
 
     #[test]
     fn short_forward_pins_the_run_to_the_end() {
-        let mut w = pending(DocWindow::new(), 1);
+        let mut w = pending(DocWindow::new(PAGE), 1);
         w.total = Some(TOTAL);
         w.anchor = 9_950;
         w.docs = docs(9_951..=9_960).into();
@@ -504,7 +516,7 @@ mod tests {
 
     #[test]
     fn backward_prepends_ascending_rows_in_order() {
-        let mut w = pending(DocWindow::new(), 1);
+        let mut w = pending(DocWindow::new(PAGE), 1);
         w.total = Some(TOTAL);
         w.anchor = 500;
         w.docs = docs(501..=700).into();
@@ -527,7 +539,7 @@ mod tests {
 
     #[test]
     fn jump_lands_at_the_exact_ordinal() {
-        let mut w = pending(DocWindow::new(), 1);
+        let mut w = pending(DocWindow::new(PAGE), 1);
         w.total = Some(TOTAL);
         w.docs = docs(1..=10).into();
         w.apply(
@@ -543,7 +555,7 @@ mod tests {
 
     #[test]
     fn stale_and_mismatched_replies_are_dropped() {
-        let mut w = pending(DocWindow::new(), 2);
+        let mut w = pending(DocWindow::new(PAGE), 2);
         w.docs = docs(1..=10).into();
 
         // Wrong seq: a reply for a superseded request.
@@ -561,7 +573,7 @@ mod tests {
 
     #[test]
     fn eviction_trims_the_run_and_forfeits_end_flags() {
-        let mut w = DocWindow::new();
+        let mut w = DocWindow::new(PAGE);
         w.total = Some(TOTAL);
         w.anchor = 0;
         w.at_start = true;

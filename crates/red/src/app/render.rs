@@ -664,8 +664,12 @@ impl Render for AppState {
             .children(confirm_kv_delete)
             .children(confirm_close_batch)
             .children(confirm_delete)
-            .children(confirm_reset)
             .children(settings)
+            // Above `settings`, not below it: this confirmation is only reachable
+            // from the settings panel's Behavior page, so it is the one overlay
+            // that is always layered over an open panel. Siblings paint in order,
+            // so listing it first drew it *under* the panel that opened it.
+            .children(confirm_reset)
             .children(shortcuts)
             .children(whats_new)
             .children(import_wizard)

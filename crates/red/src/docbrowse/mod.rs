@@ -78,16 +78,18 @@ impl DocViewMode {
     ];
 }
 
-/// Display byte cap for a grid cell's text (nested values render as capped
-/// extended JSON; the inspector shows the full document). The red crate doesn't
-/// depend on `red-driver`, so this is a local budget rather than the shared
-/// `display_cell_cap`.
-const CELL_CAP: usize = 512;
-
-/// The most top-level fields the sampled-column grid shows; a wider document is
-/// still fully visible in the List/JSON modes and the inspector. Keeps the grid
-/// readable on documents with dozens of fields.
-const MAX_COLUMNS: usize = 12;
+/// The persisted `doc.default_view` maps onto the in-tab mode. Two types for one
+/// concept, kept apart deliberately: the settings enum owns the `settings.toml`
+/// vocabulary and carries no UI, this one carries the toolbar's display labels.
+impl From<crate::settings::DocView> for DocViewMode {
+    fn from(view: crate::settings::DocView) -> Self {
+        match view {
+            crate::settings::DocView::Table => DocViewMode::Table,
+            crate::settings::DocView::List => DocViewMode::List,
+            crate::settings::DocView::Json => DocViewMode::Json,
+        }
+    }
+}
 
 /// The per-kind state a Mongo tab holds. An `Empty` tab shows the "pick a
 /// collection" hint; a `Collection` tab holds a whole [`CollView`]. Boxed like
@@ -226,7 +228,7 @@ struct CollView {
     /// reports its total.
     loading: bool,
     /// The union of top-level field names seen across resident documents (`_id`
-    /// first), capped to [`MAX_COLUMNS`]; the grid's columns. Accumulated so
+    /// first), capped to `doc.max_columns`; the grid's columns. Accumulated so
     /// columns don't flicker as the window scrolls onto documents of other shapes.
     columns: Vec<String>,
     /// How the Documents panel renders each document (table / list / json).
@@ -301,11 +303,16 @@ struct CollView {
 }
 
 impl CollView {
+    /// `page` (`data.page_size`) and `view` (`doc.default_view`) are captured at
+    /// open: a live tab keeps the window it was built with, exactly as a SQL
+    /// result keeps its page, and re-picking the view per tab is a toolbar click.
     fn new(
         epoch: Epoch,
         db: String,
         coll: String,
         sender: CommandSender,
+        page: usize,
+        view: DocViewMode,
         cx: &mut Context<AppState>,
     ) -> Self {
         let filter_input = cx.new(|cx| {
@@ -364,10 +371,10 @@ impl CollView {
             db,
             coll,
             sender,
-            window: Rc::new(RefCell::new(DocWindow::new())),
+            window: Rc::new(RefCell::new(DocWindow::new(page))),
             loading: true,
             columns: Vec::new(),
-            view_mode: DocViewMode::Table,
+            view_mode: view,
             expanded_rows: BTreeSet::new(),
             inspector: None,
             inspector_doc: None,
@@ -792,6 +799,7 @@ impl AppState {
         total: Option<u64>,
         cx: &mut Context<Self>,
     ) {
+        let max_columns = self.settings.doc.max_columns;
         let Some(view) = self.conn_mut(session).and_then(|a| a.doc_view.as_mut()) else {
             return;
         };
@@ -820,7 +828,7 @@ impl AppState {
             .iter()
             .cloned()
             .collect();
-        merge_columns(&mut current.columns, &resident);
+        merge_columns(&mut current.columns, &resident, max_columns);
         let n = resident.len();
         current.list_labels.clear();
         current.json_labels.clear();
@@ -1066,6 +1074,7 @@ impl AppState {
     /// and selectable block are keyed by ordinal (so they survive the window
     /// sliding); the virtualized list re-measures the resident-local row.
     fn doc_toggle_row(&mut self, session: SessionId, ord: usize, cx: &mut Context<Self>) {
+        let cell_cap = self.settings.data.max_cell_chars;
         // Phase A: flip the expansion and, when opening, gather what the label
         // needs (its text + the selection group) without holding the borrow.
         let build = {
@@ -1081,11 +1090,12 @@ impl AppState {
                 None
             } else {
                 current.expanded_rows.insert(ord);
-                current
-                    .window
-                    .borrow()
-                    .doc_at(ord)
-                    .map(|doc| (doc_field_text(doc), current.selection_group.clone()))
+                current.window.borrow().doc_at(ord).map(|doc| {
+                    (
+                        doc_field_text(doc, cell_cap),
+                        current.selection_group.clone(),
+                    )
+                })
             }
         };
         // Phase B: build the label entity (needs `cx`), then store it back.
@@ -1252,6 +1262,7 @@ impl AppState {
         docs: Vec<Document>,
         cx: &mut Context<Self>,
     ) {
+        let max_columns = self.settings.doc.max_columns;
         let Some(view) = self.conn_mut(session).and_then(|a| a.doc_view.as_mut()) else {
             return;
         };
@@ -1259,7 +1270,7 @@ impl AppState {
             && current.db == db
             && current.coll == coll
         {
-            current.query_columns = sample_columns(&docs);
+            current.query_columns = sample_columns(&docs, max_columns);
             current.query_docs = docs;
             current.query_loading = false;
             cx.notify();
@@ -1296,7 +1307,7 @@ impl AppState {
         if matches!(nav, TableNav::Left | TableNav::Right) {
             return;
         }
-        let row_height = f32::from(self.settings.grid.density.row_height());
+        let row_height = f32::from(self.settings.data.density.row_height());
         let Some(current) = self.doc_focused_coll_mut(session) else {
             return;
         };
@@ -1817,7 +1828,13 @@ struct FieldRow {
 
 /// Flatten one field (recursing into objects/arrays) into `FieldRow` data, capped
 /// at [`MAX_FIELD_ROWS`].
-fn push_field_data(key: &str, value: &DocValue, depth: usize, out: &mut Vec<FieldRow>) {
+fn push_field_data(
+    key: &str,
+    value: &DocValue,
+    depth: usize,
+    cell_cap: usize,
+    out: &mut Vec<FieldRow>,
+) {
     if out.len() >= MAX_FIELD_ROWS {
         return;
     }
@@ -1830,26 +1847,26 @@ fn push_field_data(key: &str, value: &DocValue, depth: usize, out: &mut Vec<Fiel
         DocValue::Document(fields) if !fields.is_empty() => {
             out.push(row("{ }".to_string(), depth));
             for (k, v) in fields {
-                push_field_data(k, v, depth + 1, out);
+                push_field_data(k, v, depth + 1, cell_cap, out);
             }
         }
         DocValue::Array(items) if !items.is_empty() => {
             out.push(row(format!("[ {} ]", items.len()), depth));
             for (i, item) in items.iter().enumerate() {
-                push_field_data(&i.to_string(), item, depth + 1, out);
+                push_field_data(&i.to_string(), item, depth + 1, cell_cap, out);
             }
         }
-        other => out.push(row(other.to_cell(CELL_CAP).to_string(), depth)),
+        other => out.push(row(other.to_cell(cell_cap).to_string(), depth)),
     }
 }
 
 /// The selectable "key: value" block for one document's List-mode card: `_id`
 /// first, then each field, nested objects/arrays indented two spaces per level.
-fn doc_field_text(doc: &Document) -> String {
+fn doc_field_text(doc: &Document, cell_cap: usize) -> String {
     let mut fields = Vec::new();
-    push_field_data("_id", &doc.id, 0, &mut fields);
+    push_field_data("_id", &doc.id, 0, cell_cap, &mut fields);
     for (k, v) in &doc.fields {
-        push_field_data(k, v, 0, &mut fields);
+        push_field_data(k, v, 0, cell_cap, &mut fields);
     }
     let mut out = String::new();
     for (i, f) in fields.iter().enumerate() {
@@ -1866,24 +1883,24 @@ fn doc_field_text(doc: &Document) -> String {
     out
 }
 
-fn sample_columns(docs: &[Document]) -> Vec<String> {
+fn sample_columns(docs: &[Document], max_columns: usize) -> Vec<String> {
     let mut cols = vec!["_id".to_string()];
-    merge_columns(&mut cols, docs);
+    merge_columns(&mut cols, docs, max_columns);
     cols
 }
 
 /// Fold the top-level field names of `docs` into `cols` (first-seen order, `_id`
-/// always leading), capped at [`MAX_COLUMNS`]. Additive, so the grid's columns
+/// always leading), capped at `max_columns` (`doc.max_columns`). Additive, so the grid's columns
 /// accumulate as the window scrolls onto documents of other shapes rather than
 /// flickering when a field is absent from the current resident set. Seeds `_id`
 /// on an empty `cols`.
-fn merge_columns(cols: &mut Vec<String>, docs: &[Document]) {
+fn merge_columns(cols: &mut Vec<String>, docs: &[Document], max_columns: usize) {
     if cols.is_empty() {
         cols.push("_id".to_string());
     }
     for doc in docs {
         for (name, _) in &doc.fields {
-            if cols.len() >= MAX_COLUMNS {
+            if cols.len() >= max_columns {
                 return;
             }
             if !cols.iter().any(|c| c == name) {
@@ -1895,14 +1912,15 @@ fn merge_columns(cols: &mut Vec<String>, docs: &[Document]) {
 
 /// The display string for one grid cell: the document's value for `col`, or
 /// `None` when the field is absent (a schemaless gap). Nested values render as
-/// capped extended JSON; scalars map directly through [`DocValue::to_cell`].
-fn cell_string(doc: &Document, col: &str) -> Option<String> {
+/// extended JSON capped at `cell_cap` (`data.max_cell_chars`, the same fat-cell
+/// rail the SQL grid runs under); scalars map through [`DocValue::to_cell`].
+fn cell_string(doc: &Document, col: &str, cell_cap: usize) -> Option<String> {
     let value = if col == "_id" {
         Some(&doc.id)
     } else {
         doc.fields.iter().find(|(k, _)| k == col).map(|(_, v)| v)
     };
-    value.map(|v| v.to_cell(CELL_CAP).to_string())
+    value.map(|v| v.to_cell(cell_cap).to_string())
 }
 
 /// Compact document count for the tree (`1.2k`, `3.4M`), like the Redis size

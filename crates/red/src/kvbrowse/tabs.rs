@@ -78,7 +78,12 @@ impl AppState {
         kind: KvPanel,
         cx: &mut Context<Self>,
     ) {
-        let state = RedisTabState::new(kind, session, cx);
+        let state = RedisTabState::new(
+            kind,
+            session,
+            self.settings.kv.default_query_mode.into(),
+            cx,
+        );
         let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.kv_view.as_mut())

@@ -51,6 +51,7 @@ mod result;
 mod sample;
 mod schema;
 mod settings;
+mod settings_reg;
 mod settings_ui;
 mod settings_watch;
 mod shell;

@@ -489,7 +489,7 @@ impl AppState {
         // as a dim subtitle, like the design's typed headers (`email` + `text`).
         // The gutter occupies table column 0 when shown, so a data column's table
         // index is `data + gutter` (see the handlers in `mod.rs`).
-        let show_gutter = self.settings.grid.row_numbers;
+        let show_gutter = self.settings.data.row_numbers;
         let gutter = show_gutter as usize;
         let mut columns: Vec<Column> = Vec::with_capacity(grid.columns.len() + gutter);
         if show_gutter {
@@ -530,8 +530,8 @@ impl AppState {
         // Resolve (and possibly re-center) the virtual-scroll window for this
         // frame; everything below works in list-local coordinates offset by
         // `base`, so the list only ever lays out `win.len` rows.
-        let row_height = self.settings.grid.density.row_height();
-        let null_display: SharedString = self.settings.grid.null_display.clone().into();
+        let row_height = self.settings.data.density.row_height();
+        let null_display: SharedString = self.settings.data.null_display.clone().into();
         let win = grid.prepare_window(row_height);
         let base = win.base;
         // The selection is stored in absolute ordinals; translate it into the
@@ -1151,7 +1151,7 @@ impl AppState {
             theme.border_soft,
             theme.bg_panel,
         );
-        let null_display: SharedString = self.settings.grid.null_display.clone().into();
+        let null_display: SharedString = self.settings.data.null_display.clone().into();
         let cell_colors = CellColors {
             text,
             muted: theme.text_muted,
@@ -1160,7 +1160,7 @@ impl AppState {
             faint,
             accent: theme.accent,
         };
-        let row_height = self.settings.grid.density.row_height();
+        let row_height = self.settings.data.density.row_height();
         let mono_family = theme.mono_family.clone();
         let cell_size = theme.font_size;
         let gutter_px = gutter_width(grid.total);

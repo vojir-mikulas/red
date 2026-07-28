@@ -193,7 +193,7 @@ impl AppState {
         };
         match bar.target {
             FindTarget::Grid => {
-                let row_height = f32::from(self.settings.grid.density.row_height());
+                let row_height = f32::from(self.settings.data.density.row_height());
                 let gutter = self.gutter();
                 let target = bar.grid_matches.get(bar.current).copied();
                 if let Some((ord, dcol)) = target

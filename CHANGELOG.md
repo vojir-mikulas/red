@@ -33,8 +33,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   join tables and other multi-column keys no longer browse as read-only.
 - Bulk import into a ClickHouse table from the result toolbar, alongside the new
   draft-row insert.
+- Search across every setting, in the settings panel's sidebar. Typing a name
+  finds the setting wherever it is filed, so finding one no longer means guessing
+  which category it was put under. Each row also shows the key you would edit in
+  `settings.toml`, marks itself when it differs from the shipped default, and
+  offers a Reset that puts just that one back.
+- Settings pages for Redis and MongoDB. Redis gains the filter mode new browse
+  tabs start in, how many keys one tab keeps in memory, and how much of a list or
+  stream the inspector pulls at a time; MongoDB gains the view a collection opens
+  in (Table, List, or JSON) and how many columns the table samples. MongoDB had
+  no settings at all before, and Redis had a single row filed under Behavior.
 
 ### Changed
+- Settings are now organised by what a setting is about rather than by which
+  engine came first. Grid settings apply to every grid, and the confirmation
+  rules that already governed Redis and MongoDB deletes now live under Safety
+  instead of under Query. In the file, `[grid]` is now `[data]`, `[redis]` is
+  `[kv]`, and `[query]` has split into `[sql]` and `[safety]`. Existing settings
+  files are migrated on load and saved in the new shape, so nothing needs
+  changing by hand.
+- Row density, page size, and the maximum cell size now apply to the Redis key
+  browser and the MongoDB document grid as well as to SQL results. Those two
+  previously ignored your settings and used fixed values.
+- The reference settings file shipped with RED documents every section again.
+  Automatic updates, vim navigation, and the Redis settings had been missing from
+  it entirely.
 - Editing affordances now follow the table, not just the connection: a table the
   engine cannot modify, such as a ClickHouse `Memory` table or a view, shows a
   one-line reason under the grid instead of edit controls that would fail on use.

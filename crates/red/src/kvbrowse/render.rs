@@ -2609,7 +2609,7 @@ impl AppState {
     /// A list key's element view (small fully loaded, or a big list's head
     /// window). Each row carries inline edit (`LSET` by index) / delete
     /// (`LREM`) buttons on a writable connection, plus Prepend/Append in the
-    /// toolbar. A big list stays head-only (see `LIST_PREVIEW_COUNT`), so
+    /// toolbar. A big list stays head-only (see `kv.preview_count`), so
     /// editing reaches only the head window it shows.
     #[allow(clippy::too_many_arguments)]
     fn render_kv_list(

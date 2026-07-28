@@ -2,10 +2,15 @@
 //!
 //! These are app-wide presentation settings, not per-connection data, so they
 //! live in their own `settings.toml` beside `connections.toml` in the platform
-//! config dir. The flat key set grew into nested sections ([`AppearanceSettings`],
-//! [`GridSettings`], …); each is `#[serde(default)]` so a partial (or slightly
-//! wrong) file keeps every key it *can* read and defaults only the rest. A single
-//! bad key must never reset the whole file.
+//! config dir. The flat key set grew into nested sections cut by *scope* rather
+//! than by engine (see [`Settings`]); each is `#[serde(default)]` so a partial
+//! (or slightly wrong) file keeps every key it *can* read and defaults only the
+//! rest. A single bad key must never reset the whole file.
+//!
+//! Section names changed in 0.20 (`[grid]` → `[data]`, `[redis]` → `[kv]`,
+//! `[query]` → `[sql]` + `[safety]`). [`apply_legacy`] lifts every older shape
+//! forward on load and the file is re-saved in the new one, so an existing
+//! hand-written config keeps working untouched.
 //!
 //! Writes go through a temp-file + atomic rename; reads **never** fail. A missing
 //! or malformed file degrades to [`Settings::default`], because preferences are
@@ -26,18 +31,71 @@ use serde::{Deserialize, Serialize};
 use crate::assets::{FONT_MONO, FONT_UI};
 
 /// Persisted UI preferences, grouped into hand-editable sections.
+///
+/// Sections are cut by *what a setting is about*, not by which engine shipped
+/// first. Five scopes:
+///
+/// - **app** — [`appearance`](Self::appearance), [`editor`](Self::editor),
+///   [`keymap`](Self::keymap), [`behavior`](Self::behavior),
+///   [`update`](Self::update).
+/// - **data view** — [`data`](Self::data): every grid, whatever the seam.
+/// - **safety** — [`safety`](Self::safety): every write path, every engine.
+/// - **seam** — [`sql`](Self::sql) / [`kv`](Self::kv) / [`doc`](Self::doc),
+///   named for the driver seam (`DatabaseDriver` / `KvDriver` / `DocDriver`)
+///   rather than for one engine, so a second key-value or document engine
+///   inherits a configured section instead of starting empty.
+/// - **agent** — [`ai`](Self::ai).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub appearance: AppearanceSettings,
     pub editor: EditorSettings,
-    pub grid: GridSettings,
-    pub query: QuerySettings,
+    pub data: DataSettings,
+    pub safety: SafetySettings,
+    pub sql: SqlSettings,
+    pub kv: KvSettings,
+    pub doc: DocSettings,
     pub behavior: BehaviorSettings,
     pub update: UpdateSettings,
     pub ai: AiSettings,
-    pub redis: RedisSettings,
     pub keymap: KeymapSettings,
+}
+
+impl Settings {
+    /// Clamp every bounded knob into the range the app will accept, so a stray
+    /// hand-edit (`0`, negative, NaN, absurdly large) can't break layout, thrash
+    /// memory, or spin a scanner.
+    ///
+    /// Called on every load *and* after every in-app edit, so the two paths can't
+    /// disagree about what a valid value is. Silent by design: clamping isn't an
+    /// error, it's the floor of a knob the user reached past.
+    pub fn clamp(&mut self) {
+        self.appearance.ui_font_size = clamp_font_size(self.appearance.ui_font_size);
+        self.editor.font_size = clamp_font_size(self.editor.font_size);
+        self.editor.line_height = if self.editor.line_height.is_finite() {
+            self.editor.line_height.clamp(1.0, 3.0)
+        } else {
+            1.5
+        };
+        self.data.page_size = self.data.page_size.clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE);
+        self.data.max_cell_chars = self
+            .data
+            .max_cell_chars
+            .clamp(MIN_CELL_CHARS, MAX_CELL_CHARS);
+        self.data.copy_row_limit = self
+            .data
+            .copy_row_limit
+            .clamp(MIN_COPY_ROW_LIMIT, MAX_COPY_ROW_LIMIT);
+        self.kv.max_resident_keys = self
+            .kv
+            .max_resident_keys
+            .clamp(MIN_RESIDENT_KEYS, MAX_RESIDENT_KEYS);
+        self.kv.preview_count = self
+            .kv
+            .preview_count
+            .clamp(MIN_PREVIEW_COUNT, MAX_PREVIEW_COUNT);
+        self.doc.max_columns = self.doc.max_columns.clamp(MIN_DOC_COLUMNS, MAX_DOC_COLUMNS);
+    }
 }
 
 // --- keymap ------------------------------------------------------------------
@@ -179,34 +237,46 @@ impl Default for EditorSettings {
     }
 }
 
-// --- grid --------------------------------------------------------------------
+// --- data view ---------------------------------------------------------------
 
-/// Result-grid behaviour, tuned for fast browsing of large result sets.
+/// Data-view behaviour, tuned for fast browsing of large result sets, and shared
+/// by **every** grid: the SQL result grid, the Redis key list, and the MongoDB
+/// document grid. A knob that only one seam can honour says so on its field.
+///
+/// Was `[grid]` before 0.20, when the only grid was the SQL one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct GridSettings {
+pub struct DataSettings {
     pub density: Density,
-    /// Show the leading row-number gutter.
+    /// Show the leading row-number gutter. SQL results only; the key list and the
+    /// document grid have no gutter to show.
     pub row_numbers: bool,
-    /// What a SQL `NULL` renders as (e.g. `∅`, `NULL`, or blank).
+    /// What a SQL `NULL` renders as (e.g. `∅`, `NULL`, or blank). SQL results
+    /// only: a missing BSON field renders as an empty cell and a Redis value is
+    /// never null.
     pub null_display: String,
-    /// Hard cap on the characters of any one cell the grid keeps resident, the
-    /// fat-cell memory rail. Clamped to a sane floor on load.
+    /// Hard cap on the characters of any one cell a grid keeps resident, the
+    /// fat-cell memory rail. Honored by the SQL grid (pushed to the driver as the
+    /// display cell cap) and by the document grid's extended-JSON cells. Clamped
+    /// to a sane range.
     pub max_cell_chars: usize,
     /// The streaming/keyset fetch window: how many rows a page request pulls.
+    /// Honored by the SQL result cursor, the document keyset window, and (as the
+    /// soft target per `SCAN` round trip) the Redis key list.
     pub page_size: usize,
     /// Row threshold above which the column-stats bar withholds the (potentially
     /// full-scan) `count(distinct)` until the user explicitly asks for it, so
     /// selecting a column never silently launches a heavy query on a huge result.
+    /// SQL results only (the stats bar is a SQL surface).
     pub stats_distinct_max_rows: usize,
     /// Ceiling on rows a select-all / whole-column copy pulls into the clipboard.
     /// A clipboard is held whole in memory, so this bounds the worst-case spike of
     /// a runaway copy; the copy path warns the user when a selection is clipped.
-    /// Clamped to a sane range on load.
+    /// Clamped to a sane range.
     pub copy_row_limit: usize,
 }
 
-impl Default for GridSettings {
+impl Default for DataSettings {
     fn default() -> Self {
         Self {
             density: Density::default(),
@@ -233,13 +303,23 @@ pub enum Density {
 impl Density {
     pub const ALL: [Density; 3] = [Density::Compact, Density::Comfortable, Density::Spacious];
 
-    /// Index into [`Self::ALL`]; drives the segmented control.
-    pub fn index(self) -> usize {
+    /// The value's spelling in `settings.toml`. The settings panel round-trips
+    /// enums through these strings, so a control and the file always agree on the
+    /// vocabulary, and a panel row can name the exact key a user would hand-edit.
+    pub fn as_str(self) -> &'static str {
         match self {
-            Density::Compact => 0,
-            Density::Comfortable => 1,
-            Density::Spacious => 2,
+            Density::Compact => "compact",
+            Density::Comfortable => "comfortable",
+            Density::Spacious => "spacious",
         }
+    }
+
+    /// Parse a spelling from [`Self::as_str`]; anything else takes the default.
+    pub fn from_str(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|d| d.as_str() == s)
+            .unwrap_or_default()
     }
 
     /// Map a legacy persisted index (`0`/`1`/`2`) onto a variant for migration.
@@ -257,7 +337,7 @@ impl Density {
     }
 }
 
-// --- query -------------------------------------------------------------------
+// --- safety ------------------------------------------------------------------
 
 /// The lowest [`RiskLevel`] that has to be confirmed before it runs.
 ///
@@ -286,6 +366,34 @@ pub enum ConfirmThreshold {
 }
 
 impl ConfirmThreshold {
+    /// Least to most permissive, the order the settings control lays them out in,
+    /// so moving right is always "ask me less".
+    pub const ALL: [ConfirmThreshold; 4] = [
+        ConfirmThreshold::Write,
+        ConfirmThreshold::Risky,
+        ConfirmThreshold::Critical,
+        ConfirmThreshold::Never,
+    ];
+
+    /// The value's spelling in `settings.toml` (see [`Density::as_str`]).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConfirmThreshold::Write => "write",
+            ConfirmThreshold::Risky => "risky",
+            ConfirmThreshold::Critical => "critical",
+            ConfirmThreshold::Never => "never",
+        }
+    }
+
+    /// Parse a spelling from [`Self::as_str`]; anything else takes the default,
+    /// which is the *stricter* end of the scale rather than the permissive one.
+    pub fn from_str(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|t| t.as_str() == s)
+            .unwrap_or_default()
+    }
+
     /// Whether a statement graded `level` must be confirmed before it runs.
     pub fn requires(self, level: RiskLevel) -> bool {
         match self {
@@ -371,21 +479,21 @@ impl ConfirmPolicy {
     }
 }
 
-/// Query-execution safety rails: RED's on-brand big-result defaults.
+/// The guards that stand between the user and losing data. Cross-engine on
+/// purpose: [`confirm_from`](Self::confirm_from) grades a SQL statement, a Redis
+/// key delete, and a MongoDB document delete on one scale, so "how much does RED
+/// ask me" is one answer rather than three.
+///
+/// Was part of `[query]` before 0.20, which filed the cross-engine guards under a
+/// SQL-shaped name.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct QuerySettings {
-    /// Append `LIMIT n` to a bare `SELECT *` so a fat table can't flood the grid.
-    /// `0` disables the auto-limit.
-    pub auto_limit: u32,
-    /// How dangerous a statement has to be before RED asks first. Replaces the old
+pub struct SafetySettings {
+    /// How dangerous an action has to be before RED asks first. Replaces the old
     /// `confirm_destructive` boolean, which [`apply_legacy`] migrates.
     pub confirm_from: ConfirmThreshold,
-    /// Abort a query (and each of its page/run fetches) that runs longer than this
-    /// many seconds, so a runaway can't wedge the grid. `0` disables the cap.
-    pub statement_timeout: u32,
-    /// Confirm before closing a tab that holds a query or result. The tab-close
-    /// modal's "Don't ask again" checkbox flips this off.
+    /// Confirm before closing a tab that holds unsaved work. The tab-close modal's
+    /// "Don't ask again" checkbox flips this off.
     pub confirm_close_tab: bool,
     /// Ask the configured AI agent for a second opinion on a statement the confirm
     /// dialog already stopped, shown as one advisory line.
@@ -397,12 +505,10 @@ pub struct QuerySettings {
     pub ai_review: bool,
 }
 
-impl Default for QuerySettings {
+impl Default for SafetySettings {
     fn default() -> Self {
         Self {
-            auto_limit: 1000,
             confirm_from: ConfirmThreshold::default(),
-            statement_timeout: 0,
             confirm_close_tab: true,
             // Opt-in: it sends SQL off the machine.
             ai_review: false,
@@ -410,7 +516,33 @@ impl Default for QuerySettings {
     }
 }
 
-impl QuerySettings {
+// --- sql ---------------------------------------------------------------------
+
+/// The SQL seam: knobs that only mean something for a `DatabaseDriver` engine.
+/// RED's on-brand big-result defaults live here.
+///
+/// Was the rest of `[query]` before 0.20.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SqlSettings {
+    /// Append `LIMIT n` to a bare `SELECT *` so a fat table can't flood the grid.
+    /// `0` disables the auto-limit.
+    pub auto_limit: u32,
+    /// Abort a query (and each of its page/run fetches) that runs longer than this
+    /// many seconds, so a runaway can't wedge the grid. `0` disables the cap.
+    pub statement_timeout: u32,
+}
+
+impl Default for SqlSettings {
+    fn default() -> Self {
+        Self {
+            auto_limit: 1000,
+            statement_timeout: 0,
+        }
+    }
+}
+
+impl SqlSettings {
     /// The statement timeout as a duration, or `None` when disabled (`0`).
     pub fn timeout(&self) -> Option<std::time::Duration> {
         (self.statement_timeout > 0)
@@ -429,26 +561,163 @@ pub struct BehaviorSettings {
     pub restore_last_session: bool,
 }
 
-// --- redis -------------------------------------------------------------------
+// --- kv ----------------------------------------------------------------------
 
-/// Redis key-browser behaviour. `auto_refresh_secs` is the interval a new Browse
-/// tab starts auto-refreshing its key scan at (`0` = off, the default); it can
-/// be changed per-tab from the browse toolbar's actions menu. Clamped to a small
-/// floor by [`Self::auto_refresh_interval`] so a hand-edited tiny value can't
-/// turn the scan into a tight loop.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+/// The key-value seam: the Redis key browser today, and any future `KvDriver`
+/// engine unchanged (Valkey, DragonflyDB), which is why the section is named for
+/// the seam rather than for Redis.
+///
+/// Was `[redis]` before 0.20, where it held exactly one key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct RedisSettings {
+pub struct KvSettings {
+    /// The interval a new Browse tab starts auto-refreshing its key scan at
+    /// (`0` = off, the default); changeable per-tab from the browse toolbar's
+    /// actions menu. Clamped to a small floor by
+    /// [`Self::auto_refresh_interval`] so a hand-edited tiny value can't turn
+    /// the scan into a tight loop.
     pub auto_refresh_secs: u64,
+    /// The query mode a new Browse tab's filter box starts in.
+    pub default_query_mode: KvQueryMode,
+    /// Soft cap on the keys one browse tab keeps resident. The key list is
+    /// append-only with evict-oldest beyond this, so a very long unfiltered
+    /// browse session can't grow the list forever. Clamped.
+    pub max_resident_keys: usize,
+    /// How many elements of a collection value (list, stream) the inspector
+    /// pulls per preview window. Clamped.
+    pub preview_count: usize,
 }
 
-impl RedisSettings {
+impl Default for KvSettings {
+    fn default() -> Self {
+        Self {
+            auto_refresh_secs: 0,
+            default_query_mode: KvQueryMode::default(),
+            max_resident_keys: 20_000,
+            preview_count: 200,
+        }
+    }
+}
+
+impl KvSettings {
     /// The default auto-refresh interval as a `Duration`, or `None` when off
     /// (`0`). A non-zero value is clamped to a 1-second floor so a stray tiny
     /// setting can't spin the scanner.
     pub fn auto_refresh_interval(&self) -> Option<std::time::Duration> {
         (self.auto_refresh_secs > 0)
             .then(|| std::time::Duration::from_secs(self.auto_refresh_secs.max(1)))
+    }
+}
+
+/// How the key browser's filter box reads its text. The persisted mirror of the
+/// browse toolbar's query-mode dropdown; the config layer owns the vocabulary
+/// (like [`Density`]) and the UI maps onto it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KvQueryMode {
+    /// A raw `SCAN … MATCH` glob (`user:*`). How the box has always behaved.
+    #[default]
+    Glob,
+    /// A literal prefix, scanned as `MATCH <escaped>*`.
+    Prefix,
+    /// One exact key name, resolved directly (bypasses `SCAN`).
+    Exact,
+    /// Client-side fuzzy match over loaded keys.
+    Fuzzy,
+    /// Substring search over string *values*; runs on Enter.
+    Value,
+}
+
+impl KvQueryMode {
+    /// The modes in dropdown order.
+    pub const ALL: [KvQueryMode; 5] = [
+        KvQueryMode::Glob,
+        KvQueryMode::Prefix,
+        KvQueryMode::Exact,
+        KvQueryMode::Fuzzy,
+        KvQueryMode::Value,
+    ];
+
+    /// The value's spelling in `settings.toml` (see [`Density::as_str`]).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KvQueryMode::Glob => "glob",
+            KvQueryMode::Prefix => "prefix",
+            KvQueryMode::Exact => "exact",
+            KvQueryMode::Fuzzy => "fuzzy",
+            KvQueryMode::Value => "value",
+        }
+    }
+
+    /// Parse a spelling from [`Self::as_str`]; anything else takes the default.
+    pub fn from_str(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|m| m.as_str() == s)
+            .unwrap_or_default()
+    }
+}
+
+// --- doc ---------------------------------------------------------------------
+
+/// The document seam: the MongoDB browser today, and any future `DocDriver`
+/// engine unchanged. The page size and the cell cap are **not** here; those are
+/// [`DataSettings`], shared with every other grid.
+///
+/// New in 0.20; before that the document browser had no settings at all.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DocSettings {
+    /// The view a newly-opened collection tab starts in.
+    pub default_view: DocView,
+    /// The most top-level fields the sampled-column table shows. A wider document
+    /// is still whole in List/JSON and the inspector; this keeps the table
+    /// readable on documents with dozens of fields. Clamped.
+    pub max_columns: usize,
+}
+
+impl Default for DocSettings {
+    fn default() -> Self {
+        Self {
+            default_view: DocView::default(),
+            max_columns: 12,
+        }
+    }
+}
+
+/// How a document collection renders. The persisted mirror of the collection
+/// toolbar's view toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DocView {
+    /// A sampled-column table: the compact, spreadsheet-like default.
+    #[default]
+    Table,
+    /// One expandable card per document.
+    List,
+    /// One pretty extended-JSON block per document.
+    Json,
+}
+
+impl DocView {
+    /// The views in toggle order.
+    pub const ALL: [DocView; 3] = [DocView::Table, DocView::List, DocView::Json];
+
+    /// The value's spelling in `settings.toml` (see [`Density::as_str`]).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DocView::Table => "table",
+            DocView::List => "list",
+            DocView::Json => "json",
+        }
+    }
+
+    /// Parse a spelling from [`Self::as_str`]; anything else takes the default.
+    pub fn from_str(s: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|v| v.as_str() == s)
+            .unwrap_or_default()
     }
 }
 
@@ -794,37 +1063,18 @@ impl FileSettingsStore {
         let mut settings = Settings {
             appearance: section(&value, "appearance", &mut warnings),
             editor: section(&value, "editor", &mut warnings),
-            grid: section(&value, "grid", &mut warnings),
-            query: section(&value, "query", &mut warnings),
+            data: section(&value, "data", &mut warnings),
+            safety: section(&value, "safety", &mut warnings),
+            sql: section(&value, "sql", &mut warnings),
+            kv: section(&value, "kv", &mut warnings),
+            doc: section(&value, "doc", &mut warnings),
             behavior: section(&value, "behavior", &mut warnings),
             update: section(&value, "update", &mut warnings),
             ai: ai_section(&value, &mut warnings),
-            redis: section(&value, "redis", &mut warnings),
             keymap: section(&value, "keymap", &mut warnings),
         };
-        let migrated = apply_legacy(&mut settings, &value);
-
-        // Keep typography in a sane range so a stray hand-edit (0, negative, NaN,
-        // absurdly large) can't break layout. Silent; clamping isn't an "error".
-        settings.appearance.ui_font_size = clamp_font_size(settings.appearance.ui_font_size);
-        settings.editor.font_size = clamp_font_size(settings.editor.font_size);
-        settings.editor.line_height = if settings.editor.line_height.is_finite() {
-            settings.editor.line_height.clamp(1.0, 3.0)
-        } else {
-            1.5
-        };
-        // Grid fetch knobs feed the keyset window and the fat-cell rail directly,
-        // so a stray value (0, absurdly large) must clamp to a sane range rather
-        // than thrash memory or stall paging. Silent, like the typography clamp.
-        settings.grid.page_size = settings.grid.page_size.clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE);
-        settings.grid.max_cell_chars = settings
-            .grid
-            .max_cell_chars
-            .clamp(MIN_CELL_CHARS, MAX_CELL_CHARS);
-        settings.grid.copy_row_limit = settings
-            .grid
-            .copy_row_limit
-            .clamp(MIN_COPY_ROW_LIMIT, MAX_COPY_ROW_LIMIT);
+        let migrated = apply_legacy(&mut settings, &value, &mut warnings);
+        settings.clamp();
 
         LoadReport {
             settings,
@@ -860,23 +1110,39 @@ impl FileSettingsStore {
 pub const MIN_FONT_SIZE: f32 = 8.0;
 pub const MAX_FONT_SIZE: f32 = 32.0;
 
-/// The keyset/offset fetch window (`grid.page_size`) the grid will accept. Below
+/// The keyset/offset fetch window (`data.page_size`) a grid will accept. Below
 /// the floor paging stalls; above the ceiling a single page can spike RAM (the
 /// resident buffer is bounded by a multiple of the page).
 pub const MIN_PAGE_SIZE: usize = 20;
 pub const MAX_PAGE_SIZE: usize = 5_000;
 
-/// The fat-cell display rail (`grid.max_cell_chars`). The floor keeps a cell
+/// The fat-cell display rail (`data.max_cell_chars`). The floor keeps a cell
 /// readable; the ceiling bounds the per-cell bytes the driver materializes for a
 /// display page (export stays full-fidelity regardless).
 pub const MIN_CELL_CHARS: usize = 256;
 pub const MAX_CELL_CHARS: usize = 1_048_576;
 
-/// The clipboard copy ceiling (`grid.copy_row_limit`). The floor keeps a copy
+/// The clipboard copy ceiling (`data.copy_row_limit`). The floor keeps a copy
 /// useful; the ceiling matches the backend's hard `MAX_COPY_ROWS` backstop so the
 /// user-facing limit can never ask for more than the service will hand back.
 pub const MIN_COPY_ROW_LIMIT: usize = 1_000;
 pub const MAX_COPY_ROW_LIMIT: usize = 1_000_000;
+
+/// The key browser's resident-row rail (`kv.max_resident_keys`). The floor keeps
+/// a scroll-back worth having; the ceiling is the memory rail itself.
+pub const MIN_RESIDENT_KEYS: usize = 1_000;
+pub const MAX_RESIDENT_KEYS: usize = 500_000;
+
+/// The collection-preview window (`kv.preview_count`): how many list/stream
+/// elements one inspector fetch pulls.
+pub const MIN_PREVIEW_COUNT: usize = 10;
+pub const MAX_PREVIEW_COUNT: usize = 5_000;
+
+/// The document table's column budget (`doc.max_columns`). One column is
+/// useless; past the ceiling the table stops being readable and List/JSON is the
+/// right view anyway.
+pub const MIN_DOC_COLUMNS: usize = 2;
+pub const MAX_DOC_COLUMNS: usize = 64;
 
 fn clamp_font_size(size: f32) -> f32 {
     if size.is_finite() {
@@ -934,40 +1200,146 @@ fn ai_section(value: &toml::Value, warnings: &mut Vec<String>) -> AiSettings {
 /// upgrades cleanly. Returns `true` when anything was migrated (the caller re-saves
 /// in the new shape).
 ///
-/// Two generations are handled. The flat `theme` / `density` / `confirm_destructive`
-/// keys only ever existed at the *top* level, so reading them there is unambiguous
-/// against today's nested keys. The `confirm_destructive` boolean also had a second
-/// life under `[query]`, which is where all but the oldest files carry it.
+/// Three generations are handled, oldest first.
 ///
-/// Both spellings of the boolean map onto [`ConfirmThreshold`] the same way, and
-/// `false` deliberately becomes [`ConfirmThreshold::Critical`] rather than
-/// [`ConfirmThreshold::Never`]: the old switch was all-or-nothing, so almost
-/// everyone who turned it off did so to stop being asked about routine writes, not
-/// to consent to an unprompted `DROP DATABASE`. Anyone who did mean the latter can
-/// still say so explicitly.
-fn apply_legacy(settings: &mut Settings, value: &toml::Value) -> bool {
+/// **Gen 1 (flat).** `theme` / `density` / `confirm_destructive` only ever existed
+/// at the *top* level, so reading them there is unambiguous against today's nested
+/// keys.
+///
+/// **Gen 2 (`[query]`).** The `confirm_destructive` boolean had a second life
+/// under `[query]`, which is where all but the oldest files carry it. Both
+/// spellings map onto [`ConfirmThreshold`] the same way, and `false` deliberately
+/// becomes [`ConfirmThreshold::Critical`] rather than [`ConfirmThreshold::Never`]:
+/// the old switch was all-or-nothing, so almost everyone who turned it off did so
+/// to stop being asked about routine writes, not to consent to an unprompted
+/// `DROP DATABASE`. Anyone who did mean the latter can still say so explicitly.
+///
+/// **Gen 3 (pre-0.20 section names).** `[grid]` → `[data]`, `[redis]` → `[kv]`,
+/// and `[query]` split into `[sql]` (execution) + `[safety]` (the cross-engine
+/// guards). A *present* new section always wins: once a file has been migrated
+/// and re-saved, the old table is inert, so a stale `[grid]` left behind by hand
+/// can't fight the `[data]` the user is actually editing.
+///
+/// The lifts are field-wise, not table-wise, for the sections that split. A
+/// table-wise lift would drop the new section's other fields on the floor, and
+/// `[query]` has to feed two destinations.
+fn apply_legacy(settings: &mut Settings, value: &toml::Value, warnings: &mut Vec<String>) -> bool {
     let mut migrated = false;
+
+    // --- gen 1: flat top-level keys ---
     if let Some(theme) = value.get("theme").and_then(|v| v.as_str()) {
         settings.appearance.theme = ThemeSetting::Named(theme.to_string());
         migrated = true;
     }
     if let Some(density) = value.get("density").and_then(|v| v.as_integer()) {
-        settings.grid.density = Density::from_index(density.max(0) as usize);
+        settings.data.density = Density::from_index(density.max(0) as usize);
         migrated = true;
     }
+
+    // --- gen 3: [grid] -> [data] ---
+    if value.get("data").is_none()
+        && let Some(grid) = value.get("grid")
+    {
+        settings.data = lift(grid, "grid", "data", warnings);
+        migrated = true;
+    }
+
+    // --- gen 3: [redis] -> [kv] ---
+    // Field-wise: `[kv]` carries knobs `[redis]` never had, and a table-wise
+    // decode of the old shape would reset them to defaults rather than keep them.
+    if value.get("kv").is_none()
+        && let Some(secs) = value
+            .get("redis")
+            .and_then(|r| r.get("auto_refresh_secs"))
+            .and_then(toml::Value::as_integer)
+    {
+        settings.kv.auto_refresh_secs = secs.max(0) as u64;
+        migrated = true;
+    }
+
+    // --- gen 3: [query] -> [sql] + [safety] ---
+    if let Some(query) = value.get("query") {
+        if value.get("sql").is_none() {
+            if let Some(v) = query.get("auto_limit").and_then(toml::Value::as_integer) {
+                settings.sql.auto_limit = v.clamp(0, i64::from(u32::MAX)) as u32;
+                migrated = true;
+            }
+            if let Some(v) = query
+                .get("statement_timeout")
+                .and_then(toml::Value::as_integer)
+            {
+                settings.sql.statement_timeout = v.clamp(0, i64::from(u32::MAX)) as u32;
+                migrated = true;
+            }
+        }
+        if value.get("safety").is_none() {
+            if let Some(v) = query.get("confirm_from").cloned()
+                && let Ok(threshold) = v.try_into()
+            {
+                settings.safety.confirm_from = threshold;
+                migrated = true;
+            }
+            if let Some(v) = query
+                .get("confirm_close_tab")
+                .and_then(toml::Value::as_bool)
+            {
+                settings.safety.confirm_close_tab = v;
+                migrated = true;
+            }
+            if let Some(v) = query.get("ai_review").and_then(toml::Value::as_bool) {
+                settings.safety.ai_review = v;
+                migrated = true;
+            }
+        }
+    }
+
+    // --- gen 1 + 2: the confirm_destructive boolean, in either home ---
+    // Last, so it loses to an explicit `confirm_from` lifted just above: a file
+    // carrying both is one that already moved on from the boolean.
     let legacy_confirm = value
         .get("confirm_destructive")
         .or_else(|| value.get("query")?.get("confirm_destructive"))
-        .and_then(|v| v.as_bool());
-    if let Some(confirm) = legacy_confirm {
-        settings.query.confirm_from = if confirm {
+        .and_then(toml::Value::as_bool);
+    if let Some(confirm) = legacy_confirm
+        && value
+            .get("safety")
+            .and_then(|s| s.get("confirm_from"))
+            .is_none()
+        && value
+            .get("query")
+            .and_then(|q| q.get("confirm_from"))
+            .is_none()
+    {
+        settings.safety.confirm_from = if confirm {
             ConfirmThreshold::Risky
         } else {
             ConfirmThreshold::Critical
         };
         migrated = true;
     }
+
     migrated
+}
+
+/// Decode a whole legacy table into its renamed section, warning (and keeping
+/// defaults) if it won't read — the same degrade-in-place contract as [`section`],
+/// but naming both the old and new section so the message is actionable.
+fn lift<T: Default + DeserializeOwned>(
+    value: &toml::Value,
+    from: &str,
+    to: &str,
+    warnings: &mut Vec<String>,
+) -> T {
+    match value.clone().try_into() {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            warnings.push(format!(
+                "settings.toml: couldn't migrate [{from}] into [{to}] ({e}); keeping defaults for \
+                 that section"
+            ));
+            T::default()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1111,9 +1483,9 @@ mod tests {
         let t = temp_store();
         let mut settings = Settings::default();
         settings.appearance.theme = ThemeSetting::Named("GitHub Dark".into());
-        settings.grid.density = Density::Compact;
-        settings.query.confirm_from = ConfirmThreshold::Never;
-        settings.grid.null_display = "∅".into();
+        settings.data.density = Density::Compact;
+        settings.safety.confirm_from = ConfirmThreshold::Never;
+        settings.data.null_display = "∅".into();
         t.store.save(&settings).unwrap();
         assert_eq!(t.store.load_report().settings, settings);
     }
@@ -1157,61 +1529,104 @@ mod tests {
 
     #[test]
     fn partial_section_takes_field_defaults() {
-        // A file with only one grid key keeps every other default, in every section.
+        // A file with only one data key keeps every other default, in every section.
         let t = temp_store();
-        write(&t.store, "[grid]\nnull_display = \"—\"\n");
+        write(&t.store, "[data]\nnull_display = \"—\"\n");
         let loaded = t.store.load_report().settings;
-        assert_eq!(loaded.grid.null_display, "—");
-        assert_eq!(loaded.grid.density, Density::default());
-        assert_eq!(loaded.grid.page_size, GridSettings::default().page_size);
-        assert_eq!(loaded.query, QuerySettings::default());
+        assert_eq!(loaded.data.null_display, "—");
+        assert_eq!(loaded.data.density, Density::default());
+        assert_eq!(loaded.data.page_size, DataSettings::default().page_size);
+        assert_eq!(loaded.sql, SqlSettings::default());
+        assert_eq!(loaded.safety, SafetySettings::default());
         assert_eq!(loaded.appearance, AppearanceSettings::default());
     }
 
     #[test]
-    fn clamps_grid_fetch_knobs() {
-        // Out-of-range fetch knobs clamp to the floor / ceiling rather than thrash.
+    fn clamps_bounded_knobs_in_every_seam() {
+        // Out-of-range knobs clamp to the floor / ceiling rather than thrash, in
+        // each seam's section as well as the shared one.
         let t = temp_store();
         write(
             &t.store,
-            "[grid]\npage_size = 0\nmax_cell_chars = 1\ncopy_row_limit = 1\n",
+            "[data]\npage_size = 0\nmax_cell_chars = 1\ncopy_row_limit = 1\n\
+             \n[kv]\nmax_resident_keys = 1\npreview_count = 0\n\
+             \n[doc]\nmax_columns = 0\n",
         );
-        let g = t.store.load_report().settings.grid;
-        assert_eq!(g.page_size, MIN_PAGE_SIZE);
-        assert_eq!(g.max_cell_chars, MIN_CELL_CHARS);
-        assert_eq!(g.copy_row_limit, MIN_COPY_ROW_LIMIT);
+        let s = t.store.load_report().settings;
+        assert_eq!(s.data.page_size, MIN_PAGE_SIZE);
+        assert_eq!(s.data.max_cell_chars, MIN_CELL_CHARS);
+        assert_eq!(s.data.copy_row_limit, MIN_COPY_ROW_LIMIT);
+        assert_eq!(s.kv.max_resident_keys, MIN_RESIDENT_KEYS);
+        assert_eq!(s.kv.preview_count, MIN_PREVIEW_COUNT);
+        assert_eq!(s.doc.max_columns, MIN_DOC_COLUMNS);
 
         write(
             &t.store,
-            "[grid]\npage_size = 99999999\nmax_cell_chars = 999999999\ncopy_row_limit = 999999999\n",
+            "[data]\npage_size = 99999999\nmax_cell_chars = 999999999\ncopy_row_limit = 999999999\n\
+             \n[kv]\nmax_resident_keys = 999999999\npreview_count = 999999999\n\
+             \n[doc]\nmax_columns = 999999999\n",
         );
-        let g = t.store.load_report().settings.grid;
-        assert_eq!(g.page_size, MAX_PAGE_SIZE);
-        assert_eq!(g.max_cell_chars, MAX_CELL_CHARS);
-        assert_eq!(g.copy_row_limit, MAX_COPY_ROW_LIMIT);
+        let s = t.store.load_report().settings;
+        assert_eq!(s.data.page_size, MAX_PAGE_SIZE);
+        assert_eq!(s.data.max_cell_chars, MAX_CELL_CHARS);
+        assert_eq!(s.data.copy_row_limit, MAX_COPY_ROW_LIMIT);
+        assert_eq!(s.kv.max_resident_keys, MAX_RESIDENT_KEYS);
+        assert_eq!(s.kv.preview_count, MAX_PREVIEW_COUNT);
+        assert_eq!(s.doc.max_columns, MAX_DOC_COLUMNS);
+    }
+
+    /// `clamp` is the single definition of "a valid value", so the in-app edit
+    /// path (which calls it directly) can't disagree with the load path.
+    #[test]
+    fn clamp_is_idempotent_and_repairs_nonsense() {
+        let mut s = Settings::default();
+        s.appearance.ui_font_size = f32::NAN;
+        s.editor.line_height = 0.1;
+        s.data.page_size = usize::MAX;
+        s.clamp();
+        assert!(s.appearance.ui_font_size.is_finite());
+        assert_eq!(s.editor.line_height, 1.0);
+        assert_eq!(s.data.page_size, MAX_PAGE_SIZE);
+        let once = s.clone();
+        s.clamp();
+        assert_eq!(s, once);
     }
 
     #[test]
     fn statement_timeout_parses_and_maps_to_duration() {
-        let q: QuerySettings = toml::from_str("statement_timeout = 30").expect("timeout");
+        let q: SqlSettings = toml::from_str("statement_timeout = 30").expect("timeout");
         assert_eq!(q.statement_timeout, 30);
         assert_eq!(q.timeout(), Some(std::time::Duration::from_secs(30)));
         // The default (and an explicit 0) disables the cap.
-        assert_eq!(QuerySettings::default().timeout(), None);
+        assert_eq!(SqlSettings::default().timeout(), None);
     }
 
     #[test]
     fn one_bad_section_does_not_reset_the_rest() {
-        // `density` wants a string; an integer fails *only* the grid section.
+        // `density` wants a string; an integer fails *only* the data section.
         let t = temp_store();
-        write(
-            &t.store,
-            "[grid]\ndensity = 7\n\n[query]\nauto_limit = 50\n",
-        );
+        write(&t.store, "[data]\ndensity = 7\n\n[sql]\nauto_limit = 50\n");
         let report = t.store.load_report();
-        assert_eq!(report.settings.grid, GridSettings::default());
-        assert_eq!(report.settings.query.auto_limit, 50);
+        assert_eq!(report.settings.data, DataSettings::default());
+        assert_eq!(report.settings.sql.auto_limit, 50);
         assert_eq!(report.warnings.len(), 1);
+    }
+
+    #[test]
+    fn seam_sections_round_trip() {
+        let t = temp_store();
+        let mut settings = Settings::default();
+        settings.kv.default_query_mode = KvQueryMode::Fuzzy;
+        settings.kv.auto_refresh_secs = 5;
+        settings.doc.default_view = DocView::Json;
+        settings.doc.max_columns = 20;
+        t.store.save(&settings).unwrap();
+        let back = t.store.load_report().settings;
+        assert_eq!(back, settings);
+        assert_eq!(
+            back.kv.auto_refresh_interval(),
+            Some(std::time::Duration::from_secs(5))
+        );
     }
 
     #[test]
@@ -1347,11 +1762,11 @@ mod tests {
             report.settings.appearance.theme,
             ThemeSetting::Named("GitHub Dark".into())
         );
-        assert_eq!(report.settings.grid.density, Density::Compact);
+        assert_eq!(report.settings.data.density, Density::Compact);
         // The old boolean was all-or-nothing, so `false` becomes "confirm only what
         // destroys an object", not "never confirm": see `apply_legacy`.
         assert_eq!(
-            report.settings.query.confirm_from,
+            report.settings.safety.confirm_from,
             ConfirmThreshold::Critical
         );
     }
@@ -1367,17 +1782,135 @@ mod tests {
         );
         let report = t.store.load_report();
         assert!(report.migrated);
-        assert_eq!(report.settings.query.confirm_from, ConfirmThreshold::Risky);
+        assert_eq!(report.settings.safety.confirm_from, ConfirmThreshold::Risky);
         // Migrating one key must not disturb its neighbours.
-        assert_eq!(report.settings.query.auto_limit, 500);
+        assert_eq!(report.settings.sql.auto_limit, 500);
     }
 
     #[test]
     fn a_current_file_is_not_treated_as_legacy() {
         let t = temp_store();
-        write(&t.store, "[query]\nconfirm_from = \"never\"\n");
+        write(&t.store, "[safety]\nconfirm_from = \"never\"\n");
         let report = t.store.load_report();
         assert!(!report.migrated);
-        assert_eq!(report.settings.query.confirm_from, ConfirmThreshold::Never);
+        assert_eq!(report.settings.safety.confirm_from, ConfirmThreshold::Never);
+    }
+
+    // --- gen 3: the 0.20 section renames ---
+
+    /// The whole point of the rename migration: a file written by 0.19 keeps
+    /// every setting it had, under the new names, without the user touching it.
+    #[test]
+    fn migrates_the_pre_020_section_names() {
+        let t = temp_store();
+        write(
+            &t.store,
+            "[grid]\n\
+             density = \"compact\"\n\
+             page_size = 500\n\
+             null_display = \"∅\"\n\
+             row_numbers = false\n\
+             \n[query]\n\
+             auto_limit = 250\n\
+             statement_timeout = 30\n\
+             confirm_from = \"write\"\n\
+             confirm_close_tab = false\n\
+             ai_review = true\n\
+             \n[redis]\n\
+             auto_refresh_secs = 10\n",
+        );
+        let report = t.store.load_report();
+        assert!(report.migrated);
+        let s = report.settings;
+
+        // [grid] -> [data], whole table.
+        assert_eq!(s.data.density, Density::Compact);
+        assert_eq!(s.data.page_size, 500);
+        assert_eq!(s.data.null_display, "∅");
+        assert!(!s.data.row_numbers);
+
+        // [query] -> [sql] (execution) + [safety] (the cross-engine guards).
+        assert_eq!(s.sql.auto_limit, 250);
+        assert_eq!(s.sql.statement_timeout, 30);
+        assert_eq!(s.safety.confirm_from, ConfirmThreshold::Write);
+        assert!(!s.safety.confirm_close_tab);
+        assert!(s.safety.ai_review);
+
+        // [redis] -> [kv], with the section's new knobs at their defaults.
+        assert_eq!(s.kv.auto_refresh_secs, 10);
+        assert_eq!(s.kv.default_query_mode, KvQueryMode::default());
+        assert_eq!(
+            s.kv.max_resident_keys,
+            KvSettings::default().max_resident_keys
+        );
+
+        // The migrated file re-saves in the new shape and then reads back clean.
+        t.store.save(&s).unwrap();
+        let again = t.store.load_report();
+        assert!(!again.migrated, "a migrated file must not re-migrate");
+        assert_eq!(again.settings, s);
+    }
+
+    /// A half-migrated file (new section present, stale old one left behind by
+    /// hand) must not have the old table fight the one the user is editing.
+    #[test]
+    fn a_present_new_section_wins_over_a_stale_old_one() {
+        let t = temp_store();
+        write(
+            &t.store,
+            "[grid]\npage_size = 100\n\n[data]\npage_size = 1000\n\
+             \n[redis]\nauto_refresh_secs = 2\n\n[kv]\nauto_refresh_secs = 30\n\
+             \n[query]\nauto_limit = 1\n\n[sql]\nauto_limit = 777\n",
+        );
+        let s = t.store.load_report().settings;
+        assert_eq!(s.data.page_size, 1000);
+        assert_eq!(s.kv.auto_refresh_secs, 30);
+        assert_eq!(s.sql.auto_limit, 777);
+    }
+
+    /// `[query]` fed two destinations, so migrating it has to be field-wise: a
+    /// file that already has `[safety]` but no `[sql]` still gets its SQL keys.
+    #[test]
+    fn a_split_section_migrates_field_wise() {
+        let t = temp_store();
+        write(
+            &t.store,
+            "[query]\nauto_limit = 42\nconfirm_from = \"write\"\n\
+             \n[safety]\nconfirm_from = \"never\"\n",
+        );
+        let s = t.store.load_report().settings;
+        // The half that has already moved is left alone...
+        assert_eq!(s.safety.confirm_from, ConfirmThreshold::Never);
+        // ...and the half that hasn't still comes across.
+        assert_eq!(s.sql.auto_limit, 42);
+    }
+
+    /// The oldest boolean must not clobber a threshold the same file also
+    /// carries: `confirm_from` is the newer, more specific statement of intent.
+    #[test]
+    fn an_explicit_threshold_beats_the_legacy_boolean() {
+        let t = temp_store();
+        write(
+            &t.store,
+            "[query]\nconfirm_destructive = false\nconfirm_from = \"write\"\n",
+        );
+        let s = t.store.load_report().settings;
+        assert_eq!(s.safety.confirm_from, ConfirmThreshold::Write);
+    }
+
+    /// A malformed legacy table degrades to that section's defaults with a
+    /// warning, exactly like a malformed current one: a bad `[grid]` must not
+    /// take the rest of the file down with it.
+    #[test]
+    fn an_unreadable_legacy_section_warns_and_keeps_the_rest() {
+        let t = temp_store();
+        write(
+            &t.store,
+            "[grid]\ndensity = 7\n\n[query]\nauto_limit = 50\n",
+        );
+        let report = t.store.load_report();
+        assert_eq!(report.settings.data, DataSettings::default());
+        assert_eq!(report.settings.sql.auto_limit, 50);
+        assert_eq!(report.warnings.len(), 1);
     }
 }

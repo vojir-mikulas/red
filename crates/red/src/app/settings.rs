@@ -106,46 +106,111 @@ impl AppState {
         }
     }
 
-    /// Re-read `settings.toml` after an external edit and re-apply. Theme is
-    /// reinstalled here; per-frame settings (density, null display, page size)
-    /// take effect on the next render via `cx.notify`.
+    // --- settings: the one mutation path ---
+
+    /// **The** way settings change in-app: mutate through `f`, clamp, persist, and
+    /// apply whatever the change implies.
+    ///
+    /// Every knob goes through here rather than through a bespoke setter, because
+    /// the side effects are the part that's easy to forget: a statement timeout
+    /// that isn't pushed to the backend, a cell cap the driver never hears about,
+    /// an updater left armed at the old cadence. [`apply_settings_effects`] derives
+    /// all of that from a before/after diff, so a new setting inherits correct
+    /// behaviour by construction and the file-watcher path
+    /// ([`reload_settings`](Self::reload_settings)) runs the *same* code as the
+    /// panel instead of a hand-maintained copy of it.
+    ///
+    /// A no-op edit (a segmented control re-selecting its current value) writes
+    /// nothing and repaints nothing.
+    pub(crate) fn edit_settings(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Settings)) {
+        let before = self.settings.clone();
+        f(&mut self.settings);
+        // Clamp here, not in each caller: `Settings::clamp` is the single
+        // definition of a valid value, shared with the load path.
+        self.settings.clamp();
+        if self.settings == before {
+            return;
+        }
+        self.save_settings();
+        self.apply_settings_effects(&before, cx);
+        cx.notify();
+    }
+
+    /// Everything that has to *happen* when settings change, derived from what
+    /// actually moved between `before` and the current values.
+    ///
+    /// Each arm is guarded on its own section so an unrelated edit (a font size,
+    /// say) doesn't re-arm the updater or re-push the AI config. Shared by the
+    /// in-app edit path and the file watcher, which is the whole point: there is
+    /// no way to change a setting and skip its consequence.
+    fn apply_settings_effects(&mut self, before: &Settings, cx: &mut Context<Self>) {
+        // Theme + typography are one visual unit; the mono family and the UI size
+        // are theme tokens, so any appearance change reinstalls the theme.
+        if before.appearance != self.settings.appearance {
+            self.apply_theme(cx);
+        }
+        if before.sql.statement_timeout != self.settings.sql.statement_timeout {
+            self.service
+                .send_global(Command::SetStatementTimeout(self.settings.sql.timeout()));
+        }
+        if before.data.max_cell_chars != self.settings.data.max_cell_chars {
+            self.service.send_global(Command::SetDisplayCellCap(
+                self.settings.data.max_cell_chars,
+            ));
+        }
+        if before.update != self.settings.update {
+            // The backend only re-polls if the cadence actually moved.
+            self.service
+                .send_global(Command::ConfigureUpdates(update_config(&self.settings)));
+        }
+        if before.ai != self.settings.ai {
+            // Recompute the usable-agent list the panel selector draws from before
+            // pushing, so an edited `[[ai.agents]]` is reflected in both at once.
+            self.usable_agents = crate::app::usable_agents(&self.settings);
+            self.ai_configured = !self.usable_agents.is_empty();
+            self.service
+                .send_global(Command::ConfigureAi(crate::app::ai_config(&self.settings)));
+            // If that just flipped the master switch off (M-S7), close any open
+            // panel so the kill switch is immediate.
+            if self.assistant.is_some() && !self.ai_enabled() {
+                self.assistant = None;
+            }
+        }
+        if before.data.row_numbers != self.settings.data.row_numbers {
+            // The gutter is column `0` in the grid's coordinate system, so flipping
+            // it shifts the data-column offset; clear the selection (stored in
+            // table-column coords) so it can't point off by one.
+            if let Phase::Connected(active) = &mut self.phase
+                && let Some(grid) = active.active_result_mut()
+            {
+                grid.clear_selection();
+            }
+        }
+    }
+
+    /// Re-read `settings.toml` after an external edit and re-apply. Runs the same
+    /// [`apply_settings_effects`](Self::apply_settings_effects) diff as an in-app
+    /// edit, so a hand-edit can't reach a state the panel couldn't. Per-frame
+    /// settings (density, null display, page size) take effect on the next render
+    /// via `cx.notify`.
     pub(crate) fn reload_settings(&mut self, cx: &mut Context<Self>) {
         let Some(store) = &self.settings_store else {
             return;
         };
         let report = store.load_report();
-        self.settings = report.settings;
+        let before = std::mem::replace(&mut self.settings, report.settings);
         self.settings_warnings = report.warnings;
         // Push the reloaded sizes into the steppers so a hand-edit of the file is
         // reflected in the panel (set_value doesn't emit, so no write-back loop).
+        // Only on this path: in-app edits come *from* the steppers, and writing
+        // back mid-keystroke would fight the user's typing.
         let ui_size = self.settings.appearance.ui_font_size as f64;
         let editor_size = self.settings.editor.font_size as f64;
         self.ui_font_size_input
             .update(cx, |n, cx| n.set_value(ui_size, cx));
         self.editor_font_size_input
             .update(cx, |n, cx| n.set_value(editor_size, cx));
-        // A hand-edit of the file changes these too, so re-push to the backend.
-        self.service
-            .send_global(Command::SetStatementTimeout(self.settings.query.timeout()));
-        self.service.send_global(Command::SetDisplayCellCap(
-            self.settings.grid.max_cell_chars,
-        ));
-        // Re-arm the updater in case `[update]` changed (toggle / interval). The
-        // backend only re-polls if the cadence actually moved.
-        self.service
-            .send_global(Command::ConfigureUpdates(update_config(&self.settings)));
-        // Re-push the AI config in case `[ai]` (agents / tier / thinking) changed,
-        // and recompute the usable-agent list the panel selector draws from.
-        let ai = crate::app::ai_config(&self.settings);
-        self.usable_agents = crate::app::usable_agents(&self.settings);
-        self.ai_configured = !self.usable_agents.is_empty();
-        self.service.send_global(Command::ConfigureAi(ai));
-        // If the reload (or a per-connection override) just flipped the master
-        // switch off (M-S7), close any open panel so the kill switch is immediate.
-        if self.assistant.is_some() && !self.ai_enabled() {
-            self.assistant = None;
-        }
-        self.apply_theme(cx);
+        self.apply_settings_effects(&before, cx);
         cx.notify();
     }
 
@@ -444,6 +509,10 @@ impl AppState {
 
     pub(crate) fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = false;
+        // Drop the search, so reopening lands on a category page rather than on
+        // whatever was typed last time.
+        self.settings_search
+            .update(cx, |i, cx| i.set_content("", cx));
         // Tear down the keymap recorder if a capture was mid-flight; a leaked
         // keystroke interceptor would otherwise eat every keypress app-wide.
         self.keymap_recording = None;
@@ -456,6 +525,11 @@ impl AppState {
 
     pub(crate) fn set_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
         self.settings_tab = tab;
+        // Picking a category means "show me that page", so it ends the search;
+        // otherwise the results view would keep winning and the click would look
+        // like it did nothing.
+        self.settings_search
+            .update(cx, |i, cx| i.set_content("", cx));
         // Entering the AI tab: learn who is signed in on each ACP agent (lazy: only
         // agents not yet checked), so the rows can show identity.
         if tab == SettingsTab::Ai {
@@ -604,10 +678,9 @@ impl AppState {
         dark: String,
         cx: &mut Context<Self>,
     ) {
-        self.settings.appearance.theme = ThemeSetting::Modal { mode, light, dark };
-        self.apply_theme(cx);
-        self.save_settings();
-        cx.notify();
+        self.edit_settings(cx, |s| {
+            s.appearance.theme = ThemeSetting::Modal { mode, light, dark };
+        });
     }
 
     /// Switch how the theme tracks the OS: `System` follows the OS light/dark,
@@ -692,46 +765,11 @@ impl AppState {
         self.notify(ToastVariant::Success, format!("Removed theme “{name}”"), cx);
     }
 
-    pub(crate) fn set_density(&mut self, density: Density, cx: &mut Context<Self>) {
-        self.settings.grid.density = density;
-        self.save_settings();
-        cx.notify();
-    }
-
-    pub(crate) fn set_null_display(&mut self, value: &str, cx: &mut Context<Self>) {
-        self.settings.grid.null_display = value.to_string();
-        self.save_settings();
-        cx.notify();
-    }
-
-    pub(crate) fn set_auto_limit(&mut self, n: u32, cx: &mut Context<Self>) {
-        self.settings.query.auto_limit = n;
-        self.save_settings();
-        cx.notify();
-    }
-
     /// Make `id` the default agent: the one a new chat opens on, and the one the
     /// confirmation dialog asks for a review. Persists to `[ai] default_agent`.
     pub(crate) fn set_default_agent(&mut self, id: &str, cx: &mut Context<Self>) {
-        self.settings.ai.default_agent = id.to_string();
-        self.save_settings();
-        cx.notify();
-    }
-
-    /// Opt in or out of the confirmation dialog's advisory AI review. Opt-in
-    /// because enabling it sends the statement and a schema summary to the
-    /// configured provider.
-    pub(crate) fn set_ai_review(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.settings.query.ai_review = on;
-        self.save_settings();
-        cx.notify();
-    }
-
-    /// Set the confirmation threshold from the settings page.
-    pub(crate) fn set_confirm_from(&mut self, level: ConfirmThreshold, cx: &mut Context<Self>) {
-        self.settings.query.confirm_from = level;
-        self.save_settings();
-        cx.notify();
+        let id = id.to_string();
+        self.edit_settings(cx, |s| s.ai.default_agent = id);
     }
 
     /// The "Don't ask again" checkbox on a confirmation modal: start or stop asking
@@ -749,7 +787,7 @@ impl AppState {
     /// stricter threshold was set before. That only loses a setting the user is
     /// actively overriding in the same breath, and the direction is toward asking.
     pub(crate) fn set_confirms_at(&mut self, level: RiskLevel, ask: bool, cx: &mut Context<Self>) {
-        self.settings.query.confirm_from = match (level, ask) {
+        let threshold = match (level, ask) {
             (RiskLevel::Safe | RiskLevel::Write, true) => ConfirmThreshold::Write,
             (RiskLevel::Risky, true) => ConfirmThreshold::Risky,
             (RiskLevel::Critical, true) => ConfirmThreshold::Critical,
@@ -757,107 +795,20 @@ impl AppState {
             (RiskLevel::Risky, false) => ConfirmThreshold::Critical,
             (RiskLevel::Critical, false) => ConfirmThreshold::Never,
         };
-        self.save_settings();
-        cx.notify();
+        self.edit_settings(cx, |s| s.safety.confirm_from = threshold);
     }
 
     /// The tab-close modal's "Don't ask again" checkbox: flips off the
     /// unsaved-work confirmation for every future tab close.
     pub(crate) fn set_confirm_close_tab(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.settings.query.confirm_close_tab = on;
-        self.save_settings();
-        cx.notify();
-    }
-
-    /// Set the statement timeout (seconds; `0` disables) and push it to the backend
-    /// so it applies to the next query and its page/run fetches.
-    pub(crate) fn set_statement_timeout(&mut self, secs: u32, cx: &mut Context<Self>) {
-        self.settings.query.statement_timeout = secs;
-        self.save_settings();
-        self.service
-            .send_global(Command::SetStatementTimeout(self.settings.query.timeout()));
-        cx.notify();
-    }
-
-    /// Set the fat-cell display cap (bytes) and push it to the driver; it applies to
-    /// every subsequent display fetch. Clamped to a sane range.
-    pub(crate) fn set_max_cell_chars(&mut self, bytes: usize, cx: &mut Context<Self>) {
-        self.settings.grid.max_cell_chars = bytes.clamp(
-            crate::settings::MIN_CELL_CHARS,
-            crate::settings::MAX_CELL_CHARS,
-        );
-        self.save_settings();
-        self.service.send_global(Command::SetDisplayCellCap(
-            self.settings.grid.max_cell_chars,
-        ));
-        cx.notify();
-    }
-
-    /// Set the keyset/offset fetch window. Clamped; applies to results opened after
-    /// the change (a live result keeps the page its buffer was built with).
-    pub(crate) fn set_page_size(&mut self, rows: usize, cx: &mut Context<Self>) {
-        self.settings.grid.page_size = rows.clamp(
-            crate::settings::MIN_PAGE_SIZE,
-            crate::settings::MAX_PAGE_SIZE,
-        );
-        self.save_settings();
-        cx.notify();
-    }
-
-    /// Set the row threshold above which the column-stats bar withholds the
-    /// (potentially full-scan) `count(distinct)` until the user clicks "compute".
-    pub(crate) fn set_stats_distinct_max_rows(&mut self, rows: usize, cx: &mut Context<Self>) {
-        self.settings.grid.stats_distinct_max_rows = rows;
-        self.save_settings();
-        cx.notify();
-    }
-
-    /// Set the clipboard copy ceiling. Clamped; a select-all copy past this is
-    /// clipped to it (with a warning toast), bounding the worst-case RAM spike.
-    pub(crate) fn set_copy_row_limit(&mut self, rows: usize, cx: &mut Context<Self>) {
-        self.settings.grid.copy_row_limit = rows.clamp(
-            crate::settings::MIN_COPY_ROW_LIMIT,
-            crate::settings::MAX_COPY_ROW_LIMIT,
-        );
-        self.save_settings();
-        cx.notify();
-    }
-
-    /// Toggle the leading row-number gutter. The gutter is column `0` in the grid's
-    /// coordinate system, so flipping it shifts the data-column offset; clear the
-    /// active selection (stored in table-column coords) so it can't point off by one.
-    pub(crate) fn set_row_numbers(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.settings.grid.row_numbers = on;
-        if let Phase::Connected(active) = &mut self.phase
-            && let Some(grid) = active.active_result_mut()
-        {
-            grid.clear_selection();
-        }
-        self.save_settings();
-        cx.notify();
-    }
-
-    /// Toggle reconnect-on-launch. Takes effect next launch (see `ensure_observers`).
-    pub(crate) fn set_restore_last_session(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.settings.behavior.restore_last_session = on;
-        self.save_settings();
-        cx.notify();
-    }
-
-    /// Turn vim-style navigation on or off (the `[keymap] vim_mode` setting). Live:
-    /// the grid and history dock read the flag at render time, so a `cx.notify()`
-    /// re-render is all it takes for the new bindings to apply, no restart.
-    pub(crate) fn set_vim_mode(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.settings.keymap.vim_mode = on;
-        self.save_settings();
-        cx.notify();
+        self.edit_settings(cx, |s| s.safety.confirm_close_tab = on);
     }
 
     /// Flip vim mode (the palette command). Toasts the new state so the change is
     /// legible when triggered without the Settings toggle in view.
     pub(crate) fn toggle_vim_mode(&mut self, cx: &mut Context<Self>) {
         let on = !self.settings.keymap.vim_mode;
-        self.set_vim_mode(on, cx);
+        self.edit_settings(cx, |s| s.keymap.vim_mode = on);
         self.notify(
             ToastVariant::Info,
             if on {
@@ -874,46 +825,7 @@ impl AppState {
         self.settings.keymap.vim_mode
     }
 
-    /// The default Redis key auto-refresh interval for new Browse tabs, in
-    /// seconds (`0` = off). Persisted; applies to tabs opened afterwards, not
-    /// retroactively to open ones (change those from the browse actions menu).
-    pub(crate) fn set_redis_auto_refresh_secs(&mut self, secs: u64, cx: &mut Context<Self>) {
-        self.settings.redis.auto_refresh_secs = secs;
-        self.save_settings();
-        cx.notify();
-    }
-
     // --- settings: AI assistant ---
-
-    /// Re-push the full AI config to the backend so a knob change (tier, limits,
-    /// thinking) applies to the next turn for both backends.
-    fn push_ai_config(&mut self) {
-        self.service
-            .send_global(Command::ConfigureAi(crate::app::ai_config(&self.settings)));
-    }
-
-    /// Flip the master switch. Off is a true kill switch (M-S7): persist it, push
-    /// it to the backend (which stops spawning agents/MCP servers), and close any
-    /// open panel so the effect is immediate. Honors per-connection overrides via
-    /// [`Self::ai_enabled`].
-    pub(crate) fn set_ai_enabled(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.settings.ai.enabled = on;
-        self.save_settings();
-        self.push_ai_config();
-        if self.assistant.is_some() && !self.ai_enabled() {
-            self.assistant = None;
-        }
-        cx.notify();
-    }
-
-    /// Set the default database-access tier (`off` / `schema` / `read`). Re-pushed
-    /// so the catalog the model sees changes on the next turn.
-    pub(crate) fn set_ai_tier(&mut self, tier: &str, cx: &mut Context<Self>) {
-        self.settings.ai.tier = tier.to_string();
-        self.save_settings();
-        self.push_ai_config();
-        cx.notify();
-    }
 
     /// Open the inline key editor for an API agent's row (Settings → AI agents).
     /// Binds the shared `ai_key_input` to this agent id, clears it, and focuses it so
@@ -1134,41 +1046,6 @@ impl AppState {
         cx.notify();
     }
 
-    pub(crate) fn set_ai_max_rows(&mut self, n: usize, cx: &mut Context<Self>) {
-        self.settings.ai.limits.max_rows = n;
-        self.save_settings();
-        self.push_ai_config();
-        cx.notify();
-    }
-
-    pub(crate) fn set_ai_timeout(&mut self, ms: u64, cx: &mut Context<Self>) {
-        self.settings.ai.limits.statement_timeout_ms = ms;
-        self.save_settings();
-        self.push_ai_config();
-        cx.notify();
-    }
-
-    pub(crate) fn set_ai_max_bytes(&mut self, bytes: usize, cx: &mut Context<Self>) {
-        self.settings.ai.limits.max_result_bytes = bytes;
-        self.save_settings();
-        self.push_ai_config();
-        cx.notify();
-    }
-
-    pub(crate) fn set_ai_max_calls(&mut self, n: usize, cx: &mut Context<Self>) {
-        self.settings.ai.limits.max_tool_calls = n;
-        self.save_settings();
-        self.push_ai_config();
-        cx.notify();
-    }
-
-    pub(crate) fn set_ai_show_thinking(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.settings.ai.show_thinking = on;
-        self.save_settings();
-        self.push_ai_config();
-        cx.notify();
-    }
-
     /// Pick the folder generated reports are written to (Settings → AI agent). Async:
     /// the native directory dialog runs off-thread; the choice is persisted on return.
     /// Not pushed to the backend: the report folder rides in each turn's `AiContext`,
@@ -1186,9 +1063,8 @@ impl AppState {
                 && let Some(path) = paths.into_iter().next()
             {
                 this.update(cx, |this, cx| {
-                    this.settings.ai.report_dir = path.display().to_string();
-                    this.save_settings();
-                    cx.notify();
+                    let dir = path.display().to_string();
+                    this.edit_settings(cx, |s| s.ai.report_dir = dir);
                 })
                 .ok();
             }
@@ -1198,19 +1074,7 @@ impl AppState {
 
     /// Clear the configured report folder, so reports fall back to the system temp dir.
     pub(crate) fn clear_ai_report_dir(&mut self, cx: &mut Context<Self>) {
-        self.settings.ai.report_dir.clear();
-        self.save_settings();
-        cx.notify();
-    }
-
-    /// Toggle background self-updates. Re-arms the backend updater immediately:
-    /// turning it on kicks off a check; turning it off parks the timer + network.
-    pub(crate) fn set_auto_update(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.settings.update.auto_update = on;
-        self.save_settings();
-        self.service
-            .send_global(Command::ConfigureUpdates(update_config(&self.settings)));
-        cx.notify();
+        self.edit_settings(cx, |s| s.ai.report_dir.clear());
     }
 
     /// Open a URL (the update release page) with the OS default handler. Reuses
@@ -1221,44 +1085,32 @@ impl AppState {
         }
     }
 
+    // The typography setters keep their own names because they're driven by custom
+    // controls (searchable font combos, numeric steppers) rather than by a
+    // registry row. Reinstalling the theme is the `[appearance]` arm of the
+    // effects diff; the clamp is `Settings::clamp`.
+
     pub(crate) fn set_ui_font_family(&mut self, family: &str, cx: &mut Context<Self>) {
-        self.settings.appearance.ui_font_family = family.to_string();
-        self.save_settings();
-        self.apply_theme(cx);
-        cx.notify();
+        let family = family.to_string();
+        self.edit_settings(cx, |s| s.appearance.ui_font_family = family);
     }
 
     pub(crate) fn set_ui_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
-        self.settings.appearance.ui_font_size = size.clamp(
-            crate::settings::MIN_FONT_SIZE,
-            crate::settings::MAX_FONT_SIZE,
-        );
-        self.save_settings();
-        self.apply_theme(cx);
-        cx.notify();
+        self.edit_settings(cx, |s| s.appearance.ui_font_size = size);
     }
 
     pub(crate) fn set_ui_mono_family(&mut self, family: &str, cx: &mut Context<Self>) {
-        self.settings.appearance.ui_mono_family = family.to_string();
-        self.save_settings();
-        // The UI mono family is a theme token (result grid, schema identifiers).
-        self.apply_theme(cx);
-        cx.notify();
+        let family = family.to_string();
+        self.edit_settings(cx, |s| s.appearance.ui_mono_family = family);
     }
 
     pub(crate) fn set_editor_font_family(&mut self, family: &str, cx: &mut Context<Self>) {
-        self.settings.editor.font_family = family.to_string();
-        self.save_settings();
-        cx.notify();
+        let family = family.to_string();
+        self.edit_settings(cx, |s| s.editor.font_family = family);
     }
 
     pub(crate) fn set_editor_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
-        self.settings.editor.font_size = size.clamp(
-            crate::settings::MIN_FONT_SIZE,
-            crate::settings::MAX_FONT_SIZE,
-        );
-        self.save_settings();
-        cx.notify();
+        self.edit_settings(cx, |s| s.editor.font_size = size);
     }
 
     /// Dismiss the settings-warning banner until the next problematic load. Clears
@@ -1310,14 +1162,24 @@ impl AppState {
 
     /// Arm the "Remove all RED data" confirmation modal. The destructive work runs
     /// only from [`confirm_reset`](Self::confirm_reset_run) after the user accepts.
+    ///
+    /// Takes focus, like every other keyboard-driven modal: it opens *over* the
+    /// settings panel, which shares `modal_focus` with it, so without this the
+    /// panel underneath keeps the keyboard and the confirmation's own Esc/Enter
+    /// never fire.
     pub(crate) fn open_reset_confirm(&mut self, cx: &mut Context<Self>) {
         self.confirm_reset = true;
+        self.focus_modal = true;
         cx.notify();
     }
 
-    /// Dismiss the reset confirmation without doing anything.
+    /// Dismiss the reset confirmation without doing anything, handing the keyboard
+    /// back to the settings panel it opened over.
     pub(crate) fn cancel_reset(&mut self, cx: &mut Context<Self>) {
         self.confirm_reset = false;
+        if self.settings_open {
+            self.focus_modal = true;
+        }
         cx.notify();
     }
 

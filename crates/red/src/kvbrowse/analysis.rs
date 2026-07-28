@@ -44,7 +44,7 @@ impl AppState {
                 type_filter: None,
                 value_needle: None,
                 cursor: ScanCursor::START,
-                budget: scan_budget(),
+                budget: scan_budget(self.settings.data.page_size),
             },
         );
         cx.notify();
@@ -92,7 +92,7 @@ impl AppState {
                 type_filter: None,
                 value_needle: None,
                 cursor,
-                budget: scan_budget(),
+                budget: scan_budget(self.settings.data.page_size),
             },
         );
         cx.notify();
@@ -170,7 +170,7 @@ impl AppState {
                 type_filter: None,
                 value_needle: None,
                 cursor: ScanCursor::START,
-                budget: scan_budget(),
+                budget: scan_budget(self.settings.data.page_size),
             },
         );
         cx.notify();
@@ -248,7 +248,7 @@ impl AppState {
                     type_filter: None,
                     value_needle: None,
                     cursor,
-                    budget: scan_budget(),
+                    budget: scan_budget(self.settings.data.page_size),
                 },
             );
         }
