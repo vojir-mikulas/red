@@ -415,6 +415,9 @@ fn cmd_exec(args: ExecArgs) -> u8 {
             PRIMARY,
             Command::Execute {
                 sql: (*stmt).to_string(),
+                // No tab context in the CLI: the saved connection's own database
+                // applies, as for `red query`.
+                namespace: None,
             },
         );
         match wait_execute(&mut events) {

@@ -733,6 +733,11 @@ pub enum Command {
     /// with `Executed`.
     Execute {
         sql: String,
+        /// The namespace unqualified names in `sql` resolve against, exactly as for
+        /// [`Command::Query`] — a write has to bind the same database the read did,
+        /// or a `CREATE TRIGGER` typed against the picked database dies on MySQL's
+        /// 1046 while the `SELECT` beside it works.
+        namespace: Option<String>,
     },
     /// Apply a batch of guarded, identity-keyed data edits (Track B6) on the active
     /// session. The driver renders each `op` to dialect SQL and binds every value;

@@ -1572,7 +1572,10 @@ impl AppState {
             );
             return;
         }
-        self.send_active(Command::Execute { sql });
+        self.send_active(Command::Execute {
+            sql,
+            namespace: self.send_namespace(),
+        });
         cx.notify();
     }
 

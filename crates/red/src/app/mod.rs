@@ -1991,9 +1991,21 @@ impl AppState {
                     format!("{affected} row(s) affected")
                 };
                 self.notify(ToastVariant::Success, message, cx);
-                // A write may have changed the schema (CREATE/DROP); refresh the
-                // tree of the session that ran it.
-                if let Some(id) = session {
+                // A write may have changed the schema (CREATE/DROP), so refresh
+                // through the same path as ⌘R rather than a `LoadObjects` of its
+                // own: that reloads only the table/view skeleton, leaving both the
+                // lazily-loaded kinds (triggers, routines, sequences, types) and the
+                // per-namespace counts that decide whether a group is drawn at all
+                // stale. A freshly created trigger was invisible until reconnect,
+                // and the first one in a namespace doubly so -- its group is hidden
+                // while the count says zero.
+                //
+                // A session that isn't on screen keeps the narrow reload: the full
+                // refresh reaches into the *foreground* connection's tree state, so
+                // aiming it at a background session would clear the wrong tree.
+                if session.is_some() && session == self.foreground_session {
+                    self.refresh_schema();
+                } else if let Some(id) = session {
                     self.service.send_to(id, Command::LoadObjects);
                 }
             }

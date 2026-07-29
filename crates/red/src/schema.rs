@@ -231,6 +231,26 @@ fn default_open_group(kinds: &[ObjectKind], meta: &SchemaMeta) -> Option<ObjectK
     }
 }
 
+/// What opening `obj`'s row does. A relation has rows, so it browses; everything
+/// else — a trigger, routine, sequence or type — has only a definition, so that is
+/// what the row opens, and it is the only thing its menu offers either.
+///
+/// A free function over plain data for the same reason as [`default_open_group`]:
+/// `flatten` needs a `SchemaState`, which needs a GPUI context, so the rule is only
+/// testable out here.
+fn row_open(namespace: &str, obj: &red_core::ObjectMeta) -> RowOpen {
+    let (schema, name) = (namespace.to_string(), obj.name.clone());
+    if obj.kind.is_relation() {
+        RowOpen::Browse { schema, name }
+    } else {
+        RowOpen::Ddl {
+            schema,
+            name,
+            kind: obj.kind,
+        }
+    }
+}
+
 /// What a flattened visible row carries for rendering.
 enum RowContent {
     Schema {
@@ -257,13 +277,29 @@ enum RowContent {
 }
 
 /// One visible tree row: the structural `item` Flint's `Tree` draws, the content
-/// RED renders, the node's identity (for toggle/select), and (for an object)
-/// the `(schema, table)` a double-click previews.
+/// RED renders, the node's identity (for toggle/select), and what opening the row
+/// does.
 struct VisibleRow {
     item: TreeItem,
     content: RowContent,
     node: Option<NodeId>,
-    preview: Option<(String, String)>,
+    open: Option<RowOpen>,
+}
+
+/// What opening a row does — a body click, Enter, or a double-click. Only an object
+/// row has anything to open, and *which* thing depends on the kind: a relation has
+/// rows to browse, while a routine or trigger has only its definition to read.
+/// Carried on the row so the click sites don't re-derive the kind.
+#[derive(Clone)]
+enum RowOpen {
+    /// `SELECT * FROM schema.name` in a new tab.
+    Browse { schema: String, name: String },
+    /// The object's `CREATE` statement in a read-only tab.
+    Ddl {
+        schema: String,
+        name: String,
+        kind: ObjectKind,
+    },
 }
 
 /// Walk the schema model in display order into the currently-visible rows,
@@ -305,7 +341,7 @@ fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
                 count: schema.objects.len(),
             },
             node: Some(schema_node),
-            preview: None,
+            open: None,
         });
         if !schema_open {
             continue;
@@ -378,7 +414,7 @@ fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
                 },
                 content: RowContent::Group { kind, count: known },
                 node: Some(group_node),
-                preview: None,
+                open: None,
             });
             if !group_open || no_rows {
                 continue;
@@ -390,7 +426,7 @@ fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
                     item: TreeItem::leaf(2),
                     content: RowContent::Loading,
                     node: None,
-                    preview: None,
+                    open: None,
                 });
                 continue;
             }
@@ -404,8 +440,9 @@ fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
                 let force = filtering && !schema_match && !obj_match && col_hit;
                 let obj_open = s.expanded.contains(&obj_node) || force;
                 // Only a relation has columns to expand into, and only a relation
-                // can be previewed: activating a trigger row would build a
-                // `SELECT * FROM <trigger>`.
+                // can be browsed: opening a trigger row would build a
+                // `SELECT * FROM <trigger>`. What a routine or trigger has instead
+                // is its definition, so that is what opening one does.
                 let expandable = obj.kind.is_relation();
                 out.push(VisibleRow {
                     item: TreeItem::new(2, expandable, obj_open && expandable),
@@ -414,7 +451,7 @@ fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
                         name: obj.name.clone(),
                     },
                     node: Some(obj_node),
-                    preview: expandable.then(|| (schema.name.clone(), obj.name.clone())),
+                    open: Some(row_open(&schema.name, obj)),
                 });
                 if !obj_open || !expandable {
                     continue;
@@ -439,7 +476,7 @@ fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
                                     table: obj.name.clone(),
                                     name: col.name.clone(),
                                 }),
-                                preview: None,
+                                open: None,
                             });
                         }
                     }
@@ -447,7 +484,7 @@ fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
                         item: TreeItem::leaf(3),
                         content: RowContent::Loading,
                         node: None,
-                        preview: None,
+                        open: None,
                     }),
                 }
             }
@@ -710,16 +747,17 @@ impl AppState {
                 }
             })
             // A single body click acts on the row: a table/view opens in a query
-            // tab, a namespace folder expands/collapses, a column just highlights.
-            // (The chevron owns expansion for tables, so revealing a table's
-            // columns doesn't open it — see the Flint `Tree` chevron hit target.)
+            // tab, a routine or trigger opens its definition, a namespace folder
+            // expands/collapses, a column just highlights. (The chevron owns
+            // expansion for tables, so revealing a table's columns doesn't open it
+            // — see the Flint `Tree` chevron hit target.)
             .on_select(move |ix, _event, _window, cx| {
                 let node = rows_select[ix].node.clone();
-                let preview = rows_select[ix].preview.clone();
+                let open = rows_select[ix].open.clone();
                 sv.update(cx, |this, cx| match node {
                     Some(NodeId::Object { .. }) => {
-                        if let Some((schema, table)) = preview {
-                            this.schema_preview(schema, table, cx);
+                        if let Some(open) = open {
+                            this.schema_open_row(open, cx);
                         }
                     }
                     // A folder row (namespace or object group) has nothing to
@@ -734,8 +772,8 @@ impl AppState {
                 .ok();
             })
             .on_activate(move |ix, _window, cx| {
-                if let Some((schema, table)) = rows_activate[ix].preview.clone() {
-                    av.update(cx, |this, cx| this.schema_preview(schema, table, cx))
+                if let Some(open) = rows_activate[ix].open.clone() {
+                    av.update(cx, |this, cx| this.schema_open_row(open, cx))
                         .ok();
                 }
             })
@@ -887,17 +925,22 @@ impl AppState {
                         }),
                     ));
                 }
-                items = items
-                    .item(
-                        ContextMenuItem::new("schema-ddl", "Show DDL").on_click(cx.listener({
-                            let (sc, nm) = (sc.clone(), nm.clone());
-                            move |this, _, _, cx| {
-                                this.schema_close_menu(cx);
-                                this.open_object_ddl(sc.clone(), nm.clone(), kind, cx);
-                            }
-                        })),
-                    )
-                    .item(
+                items = items.item(ContextMenuItem::new("schema-ddl", "Show DDL").on_click(
+                    cx.listener({
+                        let (sc, nm) = (sc.clone(), nm.clone());
+                        move |this, _, _, cx| {
+                            this.schema_close_menu(cx);
+                            this.open_object_ddl(sc.clone(), nm.clone(), kind, cx);
+                        }
+                    }),
+                ));
+                // "New query here" is a *relation's* affordance: on a table it reads
+                // as "query this", which is what the user wants next. On a trigger or
+                // routine the same item opens a blank tab on the namespace, which
+                // isn't what the row is about — the definition is, and Show DDL above
+                // covers that. Same split the group rows already make.
+                if kind.is_relation() {
+                    items = items.item(
                         ContextMenuItem::new("schema-obj-new-query", "New query here").on_click(
                             cx.listener({
                                 let sc = sc.clone();
@@ -907,19 +950,20 @@ impl AppState {
                                 }
                             }),
                         ),
-                    )
-                    .separator()
-                    .item(
-                        ContextMenuItem::new("schema-copy-qualified", "Copy qualified name")
-                            .on_click(cx.listener({
-                                let (sc, nm) = (sc.clone(), nm.clone());
-                                move |this, _, _, cx| {
-                                    this.schema_close_menu(cx);
-                                    let qualified = format!("{sc}.{nm}");
-                                    this.copy_to_clipboard(qualified, "Name copied", cx);
-                                }
-                            })),
                     );
+                }
+                items = items.separator().item(
+                    ContextMenuItem::new("schema-copy-qualified", "Copy qualified name").on_click(
+                        cx.listener({
+                            let (sc, nm) = (sc.clone(), nm.clone());
+                            move |this, _, _, cx| {
+                                this.schema_close_menu(cx);
+                                let qualified = format!("{sc}.{nm}");
+                                this.copy_to_clipboard(qualified, "Name copied", cx);
+                            }
+                        }),
+                    ),
+                );
             }
             NodeId::Group { schema, kind } => {
                 // A lazy group is a cached fetch, so it is the one tree node with
@@ -1214,8 +1258,8 @@ impl AppState {
             TreeNav::Activate => {
                 let Some(i) = sel else { return };
                 let row = &flat[i];
-                if let Some((schema, table)) = row.preview.clone() {
-                    self.schema_preview(schema, table, cx);
+                if let Some(open) = row.open.clone() {
+                    self.schema_open_row(open, cx);
                 } else if row.item.has_children
                     && let Some(node) = row.node.clone()
                 {
@@ -1239,6 +1283,26 @@ impl AppState {
                 .scroll_to_item(ix, gpui::ScrollStrategy::Top);
         }
         cx.notify();
+    }
+
+    /// Open a tree row, whichever of the two that means for it (see [`RowOpen`]).
+    /// The one place a click, an Enter, and a double-click agree on what opening a
+    /// row does.
+    fn schema_open_row(&mut self, open: RowOpen, cx: &mut Context<Self>) {
+        match open {
+            RowOpen::Browse { schema, name } => self.schema_preview(schema, name, cx),
+            RowOpen::Ddl { schema, name, kind } => {
+                // Highlight it like a browse does, so the tree agrees with the tab
+                // that just opened.
+                if let Phase::Connected(active) = &mut self.phase {
+                    active.schema.selected = Some(NodeId::Object {
+                        schema: schema.clone(),
+                        name: name.clone(),
+                    });
+                }
+                self.open_object_ddl(schema, name, kind, cx);
+            }
+        }
     }
 
     /// Preview a table/view: open `SELECT * FROM schema.table` in a **new** query
@@ -1385,5 +1449,43 @@ mod group_default_tests {
         // must not depend on that: only relations are candidates.
         let m = meta("public", &[("f", ObjectKind::Function)]);
         assert_eq!(default_open_group(PG, &m), None);
+    }
+
+    /// Opening a row means the one thing the object has: rows for a relation, a
+    /// definition for everything else. A trigger used to open nothing at all.
+    #[test]
+    fn opening_a_row_browses_a_relation_and_reads_everything_else() {
+        let obj = |name: &str, kind| ObjectMeta {
+            name: name.to_string(),
+            kind,
+        };
+        for kind in [
+            ObjectKind::Table,
+            ObjectKind::View,
+            ObjectKind::MaterializedView,
+        ] {
+            assert!(
+                matches!(row_open("public", &obj("t", kind)), RowOpen::Browse { .. }),
+                "{kind:?} should browse"
+            );
+        }
+        for kind in [
+            ObjectKind::Trigger,
+            ObjectKind::Function,
+            ObjectKind::Procedure,
+            ObjectKind::Sequence,
+            ObjectKind::Type,
+        ] {
+            match row_open("public", &obj("x", kind)) {
+                RowOpen::Ddl {
+                    schema,
+                    name,
+                    kind: k,
+                } => {
+                    assert_eq!((schema.as_str(), name.as_str(), k), ("public", "x", kind));
+                }
+                RowOpen::Browse { .. } => panic!("{kind:?} has no rows to browse"),
+            }
+        }
     }
 }

@@ -12,7 +12,8 @@ use red_core::DbKind;
 // gate classifies as one statement is exactly what the engine is handed, and both
 // read-only gates reason over the same stripped copy with the same token lists.
 use red_core::sql::{
-    DANGEROUS_FNS, WRITE_TOKENS, first_keyword, has_word, split_statements, strip_noise,
+    DANGEROUS_FNS, WRITE_TOKENS, first_keyword, has_word, is_routine_ddl, split_statements,
+    statement_ranges, strip_noise,
 };
 
 /// SQL keywords, lowercase. Drives both highlighting and (upper-cased) completion.
@@ -90,6 +91,26 @@ pub const KEYWORDS: &[&str] = &[
     "returning",
     "true",
     "false",
+    // Trigger / stored-routine words. Highlighting them is the visible half; the
+    // load-bearing half is `is_keyword`, which several heuristics use to decide a
+    // bare word is syntax rather than a name (`FROM t FOR UPDATE` has no alias
+    // `for`, `FOR EACH ROW` names no columns).
+    "trigger",
+    "procedure",
+    "function",
+    "before",
+    "after",
+    "each",
+    "row",
+    "for",
+    "declare",
+    "return",
+    "returns",
+    "while",
+    "loop",
+    "repeat",
+    "until",
+    "elseif",
 ];
 
 /// SQL functions offered in completion as `(name, signature, guide)`. The
@@ -938,55 +959,19 @@ pub enum CompletionContext {
     Keyword,
 }
 
-/// The byte range of the `;`-delimited statement containing `cursor`, with string
-/// and comment boundaries respected so a `;` inside a literal or comment never
-/// splits. Completion scopes its analysis to this one statement.
+/// The byte range of the statement containing `cursor`. Delegates to
+/// [`red_core::sql::statement_ranges`] so the caret's statement, the confirm gate,
+/// and what the engine is actually handed can never disagree on where a statement
+/// ends. Completion scopes its analysis to this one statement.
 fn statement_bounds(content: &str, cursor: usize) -> Range<usize> {
-    let b = content.as_bytes();
-    let n = b.len();
-    let cur = cursor.min(n);
-    let mut start = 0;
-    let mut end = n;
-    let mut i = 0;
-    while i < n {
-        let c = b[i];
-        if c == b'-' && i + 1 < n && b[i + 1] == b'-' {
-            i += 2;
-            while i < n && b[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
-                i += 1;
-            }
-            i = (i + 2).min(n);
-            continue;
-        }
-        if c == b'\'' || c == b'"' {
-            let quote = c;
-            i += 1;
-            while i < n && b[i] != quote {
-                i += 1;
-            }
-            if i < n {
-                i += 1;
-            }
-            continue;
-        }
-        if c == b';' {
-            if i < cur {
-                start = i + 1;
-            } else {
-                end = i;
-                break;
-            }
-        }
-        i += 1;
-    }
-    start..end
+    let cur = cursor.min(content.len());
+    // The first span that has not already ended before the caret. Spans are in
+    // order and cover the buffer, so this is the one the caret sits in (a caret
+    // right on a separator belongs to the statement it terminates).
+    statement_ranges(content)
+        .into_iter()
+        .find(|r| cur <= r.end)
+        .unwrap_or(0..content.len())
 }
 
 /// A coarse lexical atom used only by completion's clause parsing; finer than
@@ -1287,50 +1272,6 @@ pub fn line_start_offset(content: &str, line: usize) -> usize {
     content.len()
 }
 
-/// The byte ranges of the `;`-delimited statements in `content`, using the same
-/// string/comment-aware boundary rules as [`statement_bounds`].
-fn statement_ranges(content: &str) -> Vec<Range<usize>> {
-    let b = content.as_bytes();
-    let n = b.len();
-    let mut out = Vec::new();
-    let mut start = 0;
-    let mut i = 0;
-    while i < n {
-        let c = b[i];
-        if c == b'-' && i + 1 < n && b[i + 1] == b'-' {
-            i += 2;
-            while i < n && b[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
-                i += 1;
-            }
-            i = (i + 2).min(n);
-            continue;
-        }
-        if c == b'\'' || c == b'"' {
-            let quote = c;
-            i += 1;
-            while i < n && b[i] != quote {
-                i += 1;
-            }
-            i = (i + 1).min(n);
-            continue;
-        }
-        if c == b';' {
-            out.push(start..i);
-            start = i + 1;
-        }
-        i += 1;
-    }
-    out.push(start..n);
-    out
-}
-
 /// The lower-cased names of the CTEs a statement defines (`WITH name AS ( … )`,
 /// including the comma-separated tail). Collected so a reference to a CTE isn't
 /// flagged as an unknown table. Over-collecting only suppresses diagnostics, so the
@@ -1404,6 +1345,18 @@ fn diagnose_statement(stmt: &str, base: usize, schema: &dyn SchemaView, out: &mu
             range: base + range.start..base + range.end,
             message: format!("Unknown table \u{201c}{table}\u{201d}"),
         });
+    }
+
+    // The column checks below read every bare word as a candidate column of the one
+    // table the statement mentions. That reasoning doesn't survive a trigger or
+    // routine declaration: its header and body are procedural (`BEFORE INSERT ON`,
+    // `FOR EACH ROW`, `DECLARE`, the routine's own name, `NEW.`/`OLD.` rows), while
+    // the only table in a scanned position is often one a subquery in the body reads
+    // — so every one of those words would underline as an unknown column of it. The
+    // table check above still stands, since a name in a FROM position is a table
+    // wherever it appears.
+    if is_routine_ddl(stmt) {
+        return;
     }
 
     // Alias/name → table (lower-cased), for resolving qualified columns.
@@ -1755,6 +1708,25 @@ mod tests {
         assert!(!is_blank("(SELECT 1)"));
     }
 
+    /// A compound routine body is one statement to the editor too: the caret runs
+    /// the whole thing, it counts as one, and it gets one gutter marker — not one
+    /// per `;` inside `BEGIN … END`.
+    #[test]
+    fn caret_runs_a_whole_compound_body() {
+        let trigger = "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW\n\
+                       BEGIN\n\
+                       \x20 DECLARE a INT;\n\
+                       \x20 SET a = 1;\n\
+                       END";
+        let content = format!("{trigger};\nSELECT 1");
+        // Caret inside the body, on the `DECLARE` line.
+        let cursor = content.find("DECLARE").expect("body present");
+        assert_eq!(statement_at(&content, cursor), trigger);
+        assert_eq!(statement_count(&content), 2);
+        // One marker for the trigger (line 0) and one for the `SELECT` after it.
+        assert_eq!(statement_start_lines(&content), vec![0, 5]);
+    }
+
     #[test]
     fn statement_count_ignores_empty_statements() {
         assert_eq!(statement_count("SELECT 1"), 1);
@@ -2047,6 +2019,53 @@ mod tests {
         // …but a table in a database we haven't loaded is left alone (can't validate).
         assert!(diag_pairs("SELECT * FROM other_db.ghost", &s).is_empty());
         assert!(diag_pairs("SELECT * FROM `other_db`.`ghost`", &s).is_empty());
+    }
+
+    #[test]
+    fn trigger_and_routine_ddl_gets_no_column_diagnostics() {
+        let s = TestSchema::new();
+        // The reported shape: the only table in a scanned position is the subquery's
+        // `orders`, against which every procedural word (the trigger's own name,
+        // BEFORE, FOR EACH ROW, NEW.*) used to underline as an unknown column.
+        let trigger = "CREATE TRIGGER trg_orders_before_insert\n\
+                       BEFORE INSERT ON main.orders\n\
+                       FOR EACH ROW\n\
+                       SET NEW.customer_id = (SELECT id FROM users WHERE id = NEW.customer_id)";
+        assert!(
+            diag_pairs(trigger, &s).is_empty(),
+            "{:?}",
+            diag_pairs(trigger, &s)
+        );
+        // Same for the other routine kinds, and past a DEFINER preamble.
+        for sql in [
+            "CREATE DEFINER=`root`@`localhost` PROCEDURE reap(IN days INT) DELETE FROM orders",
+            "CREATE OR REPLACE FUNCTION bump(n INT) RETURNS INT RETURN n + 1",
+            "DROP TRIGGER IF EXISTS trg_orders_before_insert",
+            "ALTER EVENT nightly ON SCHEDULE EVERY 1 DAY DO DELETE FROM orders",
+        ] {
+            assert!(diag_pairs(sql, &s).is_empty(), "{sql}");
+        }
+        // An unknown table inside a routine body is still worth saying: a name in a
+        // FROM position is a table wherever it appears.
+        assert_eq!(
+            diag_pairs(
+                "CREATE TRIGGER t BEFORE INSERT ON orders FOR EACH ROW \
+                        SET NEW.id = (SELECT id FROM ghost)",
+                &s
+            )
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect::<Vec<_>>(),
+            ["ghost"]
+        );
+        // A plain DDL statement keeps its column checks (the guard is narrow).
+        assert_eq!(
+            diag_pairs("UPDATE users SET emial = 'x'", &s)
+                .iter()
+                .map(|(t, _)| t.as_str())
+                .collect::<Vec<_>>(),
+            ["emial"]
+        );
     }
 
     #[test]

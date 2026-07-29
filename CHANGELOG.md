@@ -93,6 +93,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stream the inspector pulls at a time; MongoDB gains the view a collection opens
   in (Table, List, or JSON) and how many columns the table samples. MongoDB had
   no settings at all before, and Redis had a single row filed under Behavior.
+- Stored routines can be written in the editor. A `CREATE TRIGGER`, `PROCEDURE`,
+  `FUNCTION` or `EVENT` whose body is a `BEGIN … END` block now runs as the one
+  statement it is, instead of being cut at the first `;` inside the body and
+  bounced back as a syntax error. `DELIMITER $$` is honoured too, being a client
+  directive rather than SQL, so a script pasted from documentation runs as written
+  instead of reaching a server that has never heard of it. The caret's statement,
+  the gutter run markers, and the confirmation all treat the whole body as one
+  statement.
 
 ### Changed
 - The app is now called RED, in capitals, everywhere it names itself: the
@@ -122,6 +130,33 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   committing together or not at all, which was untrue on ClickHouse. It now says
   which engines roll back and warns that on ClickHouse the statements before a
   failure may have applied.
+
+### Fixed
+- A write or DDL statement run from the editor ignored the database picked for the
+  tab, so on a MySQL connection that dialled no database anything naming no
+  database of its own — a `CREATE TRIGGER`, most visibly — failed with "no
+  Database selected" while the `SELECT` beside it worked. Writes now resolve
+  unqualified names in the same database reads do.
+- On MySQL 8, a query run against one database could leave the connection there
+  for whatever ran next, because the server does not restore a pooled
+  connection's original database when it is reused. A tab left on the connection's
+  own database could therefore resolve unqualified names in another tab's
+  database. Every statement now binds the database it means, and a connection that
+  never switches database pays nothing for it.
+- Clicking a trigger, routine, sequence or type in the schema tree now opens its
+  definition, the way clicking a table opens its rows. Those rows previously did
+  nothing at all on a click, leaving the definition reachable only by right-click.
+  Their menu also no longer offers "New query here", which belongs to a table and
+  says nothing about a trigger.
+- Creating an object no longer leaves the schema tree showing the old one. A write
+  refreshed only the tables and views, so a newly created trigger, routine,
+  sequence or type stayed invisible until reconnect — and the first one of its kind
+  in a database doubly so, since a group whose count still said zero is not drawn
+  at all. A write now refreshes the tree the same way ⌘R does.
+- The editor no longer underlines a trigger or stored-routine definition as if its
+  syntax were unknown columns. `BEFORE`, `FOR EACH ROW`, and the trigger's own
+  name were each flagged as a column of whichever table the body happened to read.
+  Trigger and routine words are also highlighted as keywords now.
 
 ## [0.19.0] - 2026-07-28
 

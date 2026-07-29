@@ -64,10 +64,23 @@ pub struct MysqlDriver {
     /// touches query execution.
     namespace: Option<String>,
     /// The database the DSN itself named (`None` when its path segment is empty,
-    /// which is legal for MySQL). Every pooled connection already starts here, so
-    /// a `namespace` equal to this needs no `USE` — that's what keeps the default
-    /// path at its old cost.
+    /// which is legal for MySQL). Every pooled connection *starts* here, so until
+    /// [`Self::rebind`] flips, a `namespace` equal to this needs no `USE` — that's
+    /// what keeps the default path at its old cost.
     default_db: Option<String>,
+    /// Whether any handle over this pool has bound a database other than
+    /// [`Self::default_db`], meaning a borrowed connection can no longer be
+    /// assumed to sit in it.
+    ///
+    /// Shared by every handle [`scoped`](DatabaseDriver::scoped) off the same
+    /// pool, because the dirt is: MySQL 8 does not restore a connection's initial
+    /// database when the pool reclaims it, so one handle's `USE` is still in force
+    /// for the next borrower — an unscoped read would silently resolve in the
+    /// other handle's database. (MariaDB's reclaim does restore it; this costs it
+    /// one `USE` it did not strictly need.) Tracked rather than re-bound
+    /// unconditionally so a connection that never switches database keeps paying
+    /// nothing, which is the overwhelmingly common case.
+    rebind: Arc<AtomicBool>,
 }
 
 impl MysqlDriver {
@@ -104,6 +117,7 @@ impl MysqlDriver {
             scope: None,
             namespace: None,
             default_db,
+            rebind: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -121,7 +135,20 @@ impl MysqlDriver {
     /// write batch, never inside it.
     async fn conn(&self) -> Result<mysql_async::Conn> {
         let mut conn = self.pool.get_conn().await.map_err(driver_err)?;
-        if let Some(ns) = &self.namespace {
+        // The database to bind: this handle's own namespace, or — once any handle
+        // has moved a connection off it (see `rebind`) — `default_db` again, since
+        // the connection we were handed may still be in another handle's database.
+        // A connection that dialled no database at all can't be put back to "none"
+        // (`USE` takes a name), so there the leak stands; a query that names no
+        // database was never well-defined on such a connection anyway.
+        let bind = match &self.namespace {
+            Some(ns) => Some(ns),
+            None => self
+                .default_db
+                .as_ref()
+                .filter(|_| self.rebind.load(Ordering::SeqCst)),
+        };
+        if let Some(ns) = bind {
             conn.query_drop(format!("USE `{}`", escape_ident(ns)))
                 .await
                 .map_err(map_my_err)?;
@@ -241,13 +268,20 @@ impl DatabaseDriver for MysqlDriver {
         if requested == self.namespace {
             return self;
         }
+        let namespace = requested.filter(|n| Some(n) != self.default_db.as_ref());
+        // This handle will `USE` its way off `default_db`, so every handle over the
+        // pool has to re-bind from here on rather than trust what it's handed.
+        if namespace.is_some() {
+            self.rebind.store(true, Ordering::SeqCst);
+        }
         Arc::new(Self {
             pool: self.pool.clone(),
             version: self.version.clone(),
             read_only: self.read_only,
             scope: self.scope.clone(),
-            namespace: requested.filter(|n| Some(n) != self.default_db.as_ref()),
+            namespace,
             default_db: self.default_db.clone(),
+            rebind: self.rebind.clone(),
         })
     }
 
@@ -2099,9 +2133,31 @@ mod tests {
             .unwrap();
         assert_eq!(page.rows.len(), 2, "second window must stay in `{other}`");
 
+        // Writes bind the namespace too, not just the reads. An unqualified
+        // `CREATE TRIGGER` names no database at all, so where it lands *is* the
+        // bound namespace — and with none bound MySQL refuses it outright (1046).
+        scoped
+            .execute(
+                "CREATE TRIGGER ns_probe_bi BEFORE INSERT ON ns_probe \
+                 FOR EACH ROW SET NEW.id = NEW.id",
+            )
+            .await
+            .unwrap();
+        assert!(
+            trigger_exists(&driver, &other, "ns_probe_bi").await,
+            "an unqualified CREATE TRIGGER must land in the bound namespace"
+        );
+        assert!(
+            !trigger_exists(&driver, &home, "ns_probe_bi").await,
+            "…and not in the database the connection dialled"
+        );
+
         // The original handle is untouched: scoping is per handle, which is what
-        // lets two tabs sit on two databases over one pool.
-        assert_eq!(current_schema(&driver).await, home);
+        // lets two tabs sit on two databases over one pool. Read through `conn`,
+        // the seam every driver method takes its connection from, because the raw
+        // pool is exactly what hands back a connection still sitting in `other`
+        // (MySQL 8 doesn't restore the initial database on reclaim; see `rebind`).
+        assert_eq!(bound_schema(&driver).await, home);
         assert!(
             driver.count(sql, &abort).await.is_err(),
             "unscoped handle must not see `{other}`.ns_probe"
@@ -2111,6 +2167,28 @@ mod tests {
             .execute(&format!("DROP DATABASE `{other}`"))
             .await
             .unwrap();
+    }
+
+    /// The database `driver`'s own operations resolve unqualified names against,
+    /// read through the [`MysqlDriver::conn`] seam they all use.
+    async fn bound_schema(driver: &MysqlDriver) -> String {
+        let mut conn = driver.conn().await.unwrap();
+        let db: Option<String> = conn.query_first("SELECT DATABASE()").await.unwrap();
+        db.expect("connection must target a database")
+    }
+
+    /// Whether `schema` holds a trigger named `name`.
+    async fn trigger_exists(driver: &MysqlDriver, schema: &str, name: &str) -> bool {
+        let mut conn = driver.pool.get_conn().await.unwrap();
+        let found: Option<i64> = conn
+            .exec_first(
+                "SELECT 1 FROM information_schema.triggers \
+                 WHERE trigger_schema = ? AND trigger_name = ?",
+                (schema, name),
+            )
+            .await
+            .unwrap();
+        found.is_some()
     }
 
     /// The connection's current database: fixtures live here, so introspection

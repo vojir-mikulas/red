@@ -3719,7 +3719,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 });
             }
 
-            Command::Execute { sql } => {
+            Command::Execute { sql, namespace } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get(&id) else {
                     emit(&events, session_id, Event::Error("not connected".into()));
@@ -3733,6 +3733,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     );
                     continue;
                 };
+                // Bind the tab's database, same as `Command::Query`: a write and the
+                // read beside it must resolve unqualified names identically.
+                let driver = driver.scoped(namespace.as_deref());
                 let results = state.results.clone();
                 // A driver's `execute` runs exactly one statement (an unsplit script
                 // reaches SQLite as its *first* statement and silently drops the rest),

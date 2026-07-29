@@ -1308,6 +1308,7 @@ async fn mariadb_keyset_end_to_end() {
         &handle,
         Command::Execute {
             sql: format!("CREATE TABLE `{table}`(id BIGINT PRIMARY KEY, name VARCHAR(64))"),
+            namespace: None,
         },
     );
     assert!(matches!(
@@ -1320,6 +1321,7 @@ async fn mariadb_keyset_end_to_end() {
             sql: format!(
                 "INSERT INTO `{table}` SELECT seq, CONCAT('row ', seq) FROM seq_1_to_1000000"
             ),
+            namespace: None,
         },
     );
     match next(&mut events).await {
@@ -1452,8 +1454,212 @@ async fn mariadb_keyset_end_to_end() {
         &handle,
         Command::Execute {
             sql: format!("DROP TABLE `{table}`"),
+            namespace: None,
         },
     );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Executed { .. })
+    ));
+    send(&handle, Command::Shutdown);
+}
+
+/// A write typed into the editor binds the tab's database, like a read does.
+///
+/// The connection dials no database (legal for MySQL, so the tree can browse the
+/// whole server) and the statement names none either — the shape of a `CREATE
+/// TRIGGER`, whose object is unqualified. Without the namespace on the command the
+/// engine refuses it outright (1046, surfaced as `NamespaceRequired`), which is the
+/// regression: the picked database reached every read and no write.
+#[tokio::test]
+async fn execute_binds_the_commands_namespace() {
+    let Ok(url) = std::env::var("RED_TEST_MYSQL_URL") else {
+        eprintln!(
+            "SKIP {}::execute_binds_the_commands_namespace: RED_TEST_MYSQL_URL not set",
+            module_path!()
+        );
+        return;
+    };
+    let p = ConnectionConfig::parse_conn_str(&url).expect("parsable test url");
+    let database = p.database.clone();
+    let config = ConnectionConfig {
+        name: "maria-ns-test".into(),
+        kind: DbKind::Mysql,
+        host: p.host,
+        port: p.port,
+        user: p.user,
+        password: p.password,
+        // Dial no database: what makes an unqualified statement's namespace the
+        // command's business rather than the DSN's.
+        database: String::new(),
+        ..Default::default()
+    };
+    let table = format!("red_ns_exec_{}", std::process::id());
+
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(&handle, Command::Connect(config));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    let create = format!("CREATE TABLE `{table}`(id INT PRIMARY KEY)");
+    // No namespace and none dialled: the engine has nowhere to put the table.
+    send(
+        &handle,
+        Command::Execute {
+            sql: create.clone(),
+            namespace: None,
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::Error(e)) => assert!(e.contains("selected"), "unexpected error: {e}"),
+        other => panic!("expected a no-database error, got {other:?}"),
+    }
+    // The same statement with the tab's database bound lands.
+    send(
+        &handle,
+        Command::Execute {
+            sql: create,
+            namespace: Some(database.clone()),
+        },
+    );
+    assert!(
+        matches!(next(&mut events).await, Some(Event::Executed { .. })),
+        "a namespaced write must reach the picked database"
+    );
+
+    send(
+        &handle,
+        Command::Execute {
+            sql: format!("DROP TABLE `{database}`.`{table}`"),
+            namespace: None,
+        },
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Executed { .. })
+    ));
+    send(&handle, Command::Shutdown);
+}
+
+/// A stored routine typed into the editor reaches the engine whole.
+///
+/// The end-to-end shape of the reported break: a trigger whose `BEGIN … END` body
+/// holds `;` of its own used to be split into fragments, so the server got a
+/// statement that ended mid-body. This drives the same path the editor's Run does —
+/// `Command::Execute` with the tab's namespace — and asserts one statement went out
+/// and the trigger it declared actually fires.
+#[tokio::test]
+async fn a_compound_routine_body_executes_as_one_statement() {
+    let Ok(url) = std::env::var("RED_TEST_MYSQL_URL") else {
+        eprintln!(
+            "SKIP {}::a_compound_routine_body_executes_as_one_statement: \
+             RED_TEST_MYSQL_URL not set",
+            module_path!()
+        );
+        return;
+    };
+    let p = ConnectionConfig::parse_conn_str(&url).expect("parsable test url");
+    let database = p.database.clone();
+    let config = ConnectionConfig {
+        name: "maria-routine-test".into(),
+        kind: DbKind::Mysql,
+        host: p.host,
+        port: p.port,
+        user: p.user,
+        password: p.password,
+        database: String::new(),
+        ..Default::default()
+    };
+    let table = format!("red_routine_{}", std::process::id());
+
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(&handle, Command::Connect(config));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    let exec = |sql: String| Command::Execute {
+        sql,
+        namespace: Some(database.clone()),
+    };
+    send(
+        &handle,
+        exec(format!("CREATE TABLE `{table}`(n INT NOT NULL)")),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Executed { .. })
+    ));
+
+    // The body's three `;` are not statement boundaries: one statement goes out.
+    send(
+        &handle,
+        exec(format!(
+            "CREATE TRIGGER `trg_{table}` BEFORE INSERT ON `{table}`\n\
+             FOR EACH ROW\n\
+             BEGIN\n\
+             \x20 DECLARE msg VARCHAR(64);\n\
+             \x20 IF NEW.n < 0 THEN\n\
+             \x20   SET msg = 'n must not be negative';\n\
+             \x20   SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = msg;\n\
+             \x20 END IF;\n\
+             END"
+        )),
+    );
+    match next(&mut events).await {
+        Some(Event::Executed { statements, .. }) => assert_eq!(statements, 1),
+        other => panic!("the routine body did not go out whole: {other:?}"),
+    }
+
+    // It is a real trigger, not just an accepted string: the guard fires.
+    send(&handle, exec(format!("INSERT INTO `{table}` VALUES (-1)")));
+    match next(&mut events).await {
+        Some(Event::Error(e)) => assert!(e.contains("must not be negative"), "got: {e}"),
+        other => panic!("expected the trigger to reject the row, got {other:?}"),
+    }
+    send(&handle, exec(format!("INSERT INTO `{table}` VALUES (1)")));
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Executed { affected: 1, .. })
+    ));
+
+    // What the schema tree asks for after a write must already see it. Both halves
+    // matter: the count is what decides whether the Triggers group is drawn at all,
+    // and the group listing is what fills it.
+    let trigger = format!("trg_{table}");
+    send(&handle, Command::LoadObjectCounts);
+    match next(&mut events).await {
+        Some(Event::ObjectCountsReady { counts }) => assert!(
+            counts.iter().any(|(ns, kind, n)| {
+                *ns == database && *kind == red_core::ObjectKind::Trigger && *n > 0
+            }),
+            "no trigger counted in `{database}`: {counts:?}"
+        ),
+        other => panic!("expected ObjectCountsReady, got {other:?}"),
+    }
+    send(
+        &handle,
+        Command::LoadObjectGroup {
+            namespace: database.clone(),
+            kind: red_core::ObjectKind::Trigger,
+        },
+    );
+    match next(&mut events).await {
+        // MySQL labels a trigger `<name> on <table>`, the table being the half that
+        // tells two same-named triggers apart.
+        Some(Event::ObjectGroupLoaded { objects, .. }) => assert!(
+            objects.iter().any(|o| o.name.starts_with(&trigger)),
+            "`{trigger}` missing from the group listing: {objects:?}"
+        ),
+        other => panic!("expected ObjectGroupLoaded, got {other:?}"),
+    }
+
+    send(&handle, exec(format!("DROP TABLE `{table}`")));
     assert!(matches!(
         next(&mut events).await,
         Some(Event::Executed { .. })
@@ -1560,6 +1766,7 @@ async fn executes_multi_statement_script() {
                   CREATE INDEX t_note ON t(note);\n\
                   INSERT INTO t VALUES (1, 'hi'), (2, 'yo');"
                 .into(),
+            namespace: None,
         },
     );
     match next(&mut events).await {
@@ -1615,6 +1822,7 @@ async fn failed_script_rolls_back_earlier_statements() {
             sql: "CREATE TABLE keep(id INTEGER);\n\
                   INSERT INTO no_such_table VALUES (1);"
                 .into(),
+            namespace: None,
         },
     );
     assert!(matches!(next(&mut events).await, Some(Event::Error(_))));
