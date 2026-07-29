@@ -125,14 +125,35 @@ pub(crate) async fn abort_after_completion_is_noop(driver: &dyn DatabaseDriver, 
     );
 }
 
-/// The introspection shape: `list_objects` surfaces the fixture tables and view
-/// under `schema` with the right kinds, and `describe_table` reports the primary
-/// key, a NOT NULL column, the foreign key, and the secondary index.
+/// The connect-time counts agree with what expanding actually returns.
 ///
-/// The caller creates the fixtures with its own dialect first; this asserts the
-/// engine-agnostic result. Fixtures: a `books` table with an integer primary key
-/// `id`, a NOT NULL `title`, an `author_id` foreign key to `authors(id)`, and an
-/// index over `author_id`; plus a `recent` view.
+/// This is what lets the tree hide a group without opening it, so a count that
+/// over-reports puts back the dead-end click the counts exist to remove, and one
+/// that under-reports hides objects the user has. `namespace` must be one the
+/// engine reports counts for.
+pub(crate) async fn object_counts_match_their_contents(
+    driver: &dyn DatabaseDriver,
+    namespace: &str,
+    kind: ObjectKind,
+) {
+    let counts = driver.object_group_counts().await.unwrap();
+    let counted = counts
+        .iter()
+        .find(|(ns, k, _)| ns == namespace && *k == kind)
+        .map(|(_, _, n)| *n)
+        // Absent means zero, which is the contract the UI reads it under.
+        .unwrap_or(0);
+    let actual = driver
+        .list_object_group(namespace, kind)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(
+        counted, actual,
+        "the {kind:?} count for {namespace} disagrees with what expanding it returns"
+    );
+}
+
 /// The lazy object groups obey their two contracts: a group only ever answers
 /// with objects of the kind that was asked for (so the tree cannot file a
 /// trigger under Functions), and asking for a *relation* kind is empty, because
@@ -174,6 +195,14 @@ pub(crate) async fn object_groups_answer_only_their_kind(
     }
 }
 
+/// The introspection shape: `list_objects` surfaces the fixture tables and view
+/// under `schema` with the right kinds, and `describe_table` reports the primary
+/// key, a NOT NULL column, the foreign key, and the secondary index.
+///
+/// The caller creates the fixtures with its own dialect first; this asserts the
+/// engine-agnostic result. Fixtures: a `books` table with an integer primary key
+/// `id`, a NOT NULL `title`, an `author_id` foreign key to `authors(id)`, and an
+/// index over `author_id`; plus a `recent` view.
 pub(crate) async fn introspects_tables_columns_fks_and_indexes(
     driver: &dyn DatabaseDriver,
     schema: &str,

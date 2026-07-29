@@ -2208,6 +2208,23 @@ impl ObjectKind {
         }
     }
 
+    /// Parse a token produced by [`as_str`](Self::as_str). Used by the drivers'
+    /// count queries, which label each row with the kind it counted rather than
+    /// running one query per kind.
+    pub fn from_token(token: &str) -> Option<Self> {
+        Some(match token {
+            "table" => Self::Table,
+            "view" => Self::View,
+            "matview" => Self::MaterializedView,
+            "function" => Self::Function,
+            "procedure" => Self::Procedure,
+            "trigger" => Self::Trigger,
+            "sequence" => Self::Sequence,
+            "type" => Self::Type,
+            _ => return None,
+        })
+    }
+
     /// A stable wire/persistence token, so a group can be named across the
     /// `Command`/`Event` boundary without leaking the Rust variant spelling.
     pub const fn as_str(self) -> &'static str {

@@ -165,6 +165,10 @@ impl AppState {
                 // background-prefetch the FK graph (Track B7) so grid FK columns can be
                 // marked before any click. Both run off the connect path.
                 self.service.send_to(id, Command::LoadObjects);
+                // One aggregate query for the whole connection, so the tree can
+                // hide the object groups that would turn out to be empty rather
+                // than making the user click one to find out.
+                self.service.send_to(id, Command::LoadObjectCounts);
                 self.service.send_to(id, Command::LoadForeignKeys);
             }
             self.rebuild_switcher(cx);

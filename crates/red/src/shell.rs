@@ -302,26 +302,66 @@ impl AppState {
         // group and truncate with an ellipsis so the window can shrink without
         // shoving the right-hand status / assistant button off-screen. The dot and
         // the read-only badge stay `flex_shrink_0`; only the text gives way.
+        // The endpoint chip *is* the Server panel's control: clicking
+        // `red@localhost:3307` opens what that server is doing. The panel is about
+        // the connection, so it hangs off the thing that names the connection
+        // rather than off a separate icon whose refresh glyph promised the wrong
+        // action. Not offered on an engine with no server behind it (SQLite is a
+        // file), where the chip stays plain text.
+        let can_open_server = self.has_server_panel();
+        let running = self.running_mutations();
+        let endpoint_hue = if active.server_open {
+            theme.accent
+        } else {
+            theme.text_muted
+        };
+        let endpoint = div()
+            .id("statusbar-endpoint")
+            .flex()
+            .items_center()
+            .min_w_0()
+            .gap_1p5()
+            .px_2()
+            .rounded(px(4.))
+            .text_color(endpoint_hue)
+            .child(
+                // Connection state, not server state: it stays green while
+                // connected so the two signals never fight over one dot.
+                div()
+                    .flex_shrink_0()
+                    .size(px(6.))
+                    .rounded_full()
+                    .bg(theme.green),
+            )
+            .child(div().min_w_0().truncate().child(config.display_target()))
+            // Background work outliving its submit keeps its amber marker, moved
+            // here from the retired icon so it is still visible with the panel shut.
+            .when(running > 0, |d| {
+                d.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(theme.scale(10.))
+                        .text_color(theme.yellow)
+                        .child(format!("{running} running")),
+                )
+            })
+            .when(can_open_server, |d| {
+                d.cursor_pointer()
+                    .hover(|s| s.bg(theme.bg_elevated))
+                    .when(active.server_open, |s| s.bg(theme.bg_elevated))
+                    .tooltip(Tooltip::text(if running > 0 {
+                        format!("Server sessions and background work ({running} running)")
+                    } else {
+                        "Server sessions and background work".to_string()
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_server_panel(cx)))
+            });
+
         let status_left = div()
             .flex()
             .items_center()
             .min_w_0()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .min_w_0()
-                    .gap_1p5()
-                    .px_2()
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .size(px(6.))
-                            .rounded_full()
-                            .bg(theme.green),
-                    )
-                    .child(div().min_w_0().truncate().child(config.display_target())),
-            )
+            .child(endpoint)
             .child(div().min_w_0().truncate().px_2().child(config.name.clone()))
             .child(
                 div()
@@ -444,41 +484,6 @@ impl AppState {
             ))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_columns_panel(cx)));
 
-        // Server panel toggle (Sessions + Mutations), offered on any engine with a
-        // server behind it. Tinted amber while a background mutation is still
-        // running, so an edit that outlived its submit stays visible without the
-        // panel open -- the whole point being that a grid which hasn't changed yet
-        // reads as "it didn't work" and invites a retry that doubles the cost.
-        let running = self.running_mutations();
-        let mutations_toggle = self.has_server_panel().then(|| {
-            div()
-                .id("toggle-server-panel")
-                .mr_1()
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(20.))
-                .rounded(px(4.))
-                .cursor_pointer()
-                .tooltip(Tooltip::text(if running == 0 {
-                    "Toggle the server panel (sessions, mutations)".to_string()
-                } else {
-                    format!("Toggle the server panel  ({running} mutations running)")
-                }))
-                .hover(|s| s.bg(theme.bg_elevated))
-                .child(crate::icons::icon(
-                    "refresh-cw",
-                    theme.scale(14.),
-                    match (active.server_open, running) {
-                        (_, n) if n > 0 => theme.yellow,
-                        (true, _) => theme.accent,
-                        _ => theme.text_muted,
-                    },
-                ))
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_server_panel(cx)))
-        });
-
         // Assistant toggle, pinned to the far-right of the status bar (mirrors the
         // schema sidebar toggle on the left). Accent-tinted while the panel is open.
         // Hidden entirely when the assistant is disabled for this connection (the
@@ -534,7 +539,6 @@ impl AppState {
                     .child(history_toggle)
                     .child(sidebar_toggle)
                     .child(columns_toggle)
-                    .children(mutations_toggle)
                     .child(status_left),
             )
             .child(

@@ -203,6 +203,10 @@ pub enum Command {
         name: String,
         kind: ObjectKind,
     },
+    /// Count the lazily-fetched object kinds across every namespace, in one
+    /// query, so the tree can hide the groups that would turn out to be empty.
+    /// Sent once after `LoadObjects` and again on refresh.
+    LoadObjectCounts,
     /// Load one lazily-fetched object kind for one namespace, sent when the user
     /// expands that group node in the tree. The relations (table / view /
     /// materialized view) arrive with `LoadObjects`; the columnless kinds
@@ -1176,6 +1180,12 @@ pub enum Event {
     ObjectDdlFailed {
         epoch: Epoch,
         message: String,
+    },
+    /// Per-namespace counts of the lazy object kinds, in response to
+    /// `LoadObjectCounts`. A pair absent from `counts` is **zero**, not unknown:
+    /// the event arriving at all is what tells the tree the engine answered.
+    ObjectCountsReady {
+        counts: Vec<(String, ObjectKind, usize)>,
     },
     /// One expanded object group, in response to `LoadObjectGroup`. Echoes the
     /// namespace and kind so a reply that arrives after the user collapsed the

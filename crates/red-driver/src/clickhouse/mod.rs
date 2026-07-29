@@ -731,6 +731,39 @@ impl DatabaseDriver for ClickhouseDriver {
         Ok(schemas)
     }
 
+    async fn object_group_counts(&self) -> Result<Vec<(String, ObjectKind, usize)>> {
+        // ClickHouse UDFs are server-wide, not per database, so the same count is
+        // reported for every database. That mirrors `list_object_group`, which
+        // returns the same list under whichever database is asked. The wart is
+        // that the tree has no server-level node to hang them off; reporting them
+        // per database at least keeps the count and the contents agreeing.
+        let (_, _, rows) = self
+            .run_simple(
+                "SELECT d.name, (SELECT count() FROM system.functions \
+                                  WHERE origin = 'SQLUserDefined') \
+                   FROM system.databases d \
+                  WHERE d.name NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA')"
+                    .to_string(),
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let name = row.first().and_then(Json::as_str)?;
+                let count = row
+                    .get(1)
+                    .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+                    .unwrap_or(0);
+                Some((
+                    name.to_string(),
+                    ObjectKind::Function,
+                    count.max(0) as usize,
+                ))
+            })
+            .collect())
+    }
+
     async fn list_object_group(
         &self,
         namespace: &str,

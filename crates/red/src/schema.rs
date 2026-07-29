@@ -56,6 +56,14 @@ pub(crate) struct SchemaState {
     /// Groups with a `LoadObjectGroup` in flight, so a second expand does not
     /// fire a second fetch and the row can show "loading…".
     pub groups_loading: HashSet<(String, ObjectKind)>,
+    /// How many objects each lazy kind holds per namespace, from one query at
+    /// connect (`Event::ObjectCountsReady`). Absent while `counts_loaded` is
+    /// false; absent *after* it is true means zero.
+    counts: HashMap<(String, ObjectKind), usize>,
+    /// Whether the engine answered the count query at all. Without it a missing
+    /// entry would be ambiguous between "none" and "not asked", and the tree
+    /// would hide groups it has no business hiding.
+    counts_loaded: bool,
     /// Namespaces whose default group expansion has already been applied (see
     /// [`Self::apply_objects`]). A refresh re-runs `apply_objects`, and without
     /// this it would re-open a group the user had deliberately collapsed.
@@ -97,6 +105,8 @@ impl SchemaState {
             kinds: kind.object_kinds(),
             groups: HashMap::new(),
             groups_loading: HashSet::new(),
+            counts: HashMap::new(),
+            counts_loaded: false,
             seeded: HashSet::new(),
             details: HashMap::new(),
             expanded: HashSet::new(),
@@ -138,6 +148,31 @@ impl SchemaState {
         }
         self.schemas = schemas;
         self.loading = false;
+    }
+
+    /// Install the per-namespace object counts.
+    pub fn apply_object_counts(&mut self, counts: Vec<(String, ObjectKind, usize)>) {
+        self.counts = counts
+            .into_iter()
+            .map(|(ns, kind, n)| ((ns, kind), n))
+            .collect();
+        self.counts_loaded = true;
+    }
+
+    /// How many objects of `kind` the namespace holds, when that is known: from
+    /// the fetched contents if they are in hand, otherwise from the connect-time
+    /// count. `None` means genuinely unknown, which only happens on an engine
+    /// that could not answer the count query.
+    ///
+    /// The contents win when both exist: they are newer, and asserting the two
+    /// agree would fail for a routine dropped between connect and expand.
+    fn known_count(&self, namespace: &str, kind: ObjectKind) -> Option<usize> {
+        let key = (namespace.to_string(), kind);
+        if let Some(objects) = self.groups.get(&key) {
+            return Some(objects.len());
+        }
+        self.counts_loaded
+            .then(|| self.counts.get(&key).copied().unwrap_or(0))
     }
 
     /// Install one expanded group's objects. An empty list is stored, not
@@ -279,15 +314,29 @@ fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
         for &kind in s.kinds {
             let members = s.objects_of(schema, kind);
             let loaded = kind.is_relation() || s.groups.contains_key(&(schema.name.clone(), kind));
-            // An empty relation group is not drawn at all (a namespace with no
-            // views should not grow a "Views" row). An empty *lazy* group is
-            // drawn until it has been fetched, because "empty" is not yet known.
+            // What the namespace holds, when it is known: the fetched contents,
+            // else the connect-time count. Relations are always known, since
+            // their names are in the skeleton.
+            let known = if kind.is_relation() {
+                Some(members.len())
+            } else {
+                s.known_count(&schema.name, kind)
+            };
+            // Empty and known so *in advance*: never drawn. This is the whole
+            // point of the counts. A row that advertises content it does not have
+            // and then deflates under the cursor is worse than no row.
+            if known == Some(0) && !loaded {
+                continue;
+            }
+            // A relation group's emptiness is always known in advance, since its
+            // names are in the skeleton.
             if kind.is_relation() && members.is_empty() {
                 continue;
             }
-            if loaded && members.is_empty() && filtering {
-                continue;
-            }
+            // Emptiness discovered by *expanding* (an engine that answered no
+            // counts) keeps its row for the rest of the session, dimmed and
+            // labelled "none". Removing it here would make the row vanish under
+            // the cursor that just clicked it, which is its own small betrayal.
 
             let group_node = NodeId::Group {
                 schema: schema.name.clone(),
@@ -317,25 +366,21 @@ fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
                 continue;
             }
 
-            // A group known to be empty is a **leaf**: no chevron, nothing to
-            // open. Claiming `has_children` there is what made an expanded-but-
-            // empty group indistinguishable from a collapsed one, so expanding
-            // Triggers on a server with none read as the row closing itself.
-            let known_empty = loaded && members.is_empty();
+            // A loaded group that filtered down to nothing is still a leaf: it has
+            // no rows to disclose *right now*, and a chevron over nothing reads as
+            // a group that closed itself.
+            let no_rows = loaded && group_rows.is_empty();
             out.push(VisibleRow {
-                item: if known_empty {
+                item: if no_rows {
                     TreeItem::leaf(1)
                 } else {
                     TreeItem::new(1, true, group_open)
                 },
-                content: RowContent::Group {
-                    kind,
-                    count: loaded.then_some(members.len()),
-                },
+                content: RowContent::Group { kind, count: known },
                 node: Some(group_node),
                 preview: None,
             });
-            if !group_open || known_empty {
+            if !group_open || no_rows {
                 continue;
             }
             // Expanded but still in flight: one placeholder row, same shape the

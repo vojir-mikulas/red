@@ -408,3 +408,26 @@ pub(super) async fn diff_schemas(
         },
     );
 }
+
+/// `LoadObjectCounts`: how many routines/triggers/sequences/types each namespace
+/// holds, in one query.
+///
+/// Silent on failure, like the FK graph: an engine that cannot answer leaves the
+/// tree on its click-to-discover path, which still works. Emitting an error
+/// event would toast at someone who merely connected.
+pub(super) async fn load_object_counts(
+    sessions: &HashMap<SessionId, SessionState>,
+    session_id: Option<SessionId>,
+    events: &Events,
+) {
+    let Some(id) = session_id else { return };
+    let Some(state) = sessions.get(&id) else {
+        return;
+    };
+    let Some(driver) = state.driver.as_sql().cloned() else {
+        return;
+    };
+    if let Ok(counts) = driver.object_group_counts().await {
+        emit(events, session_id, Event::ObjectCountsReady { counts });
+    }
+}

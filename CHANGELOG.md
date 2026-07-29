@@ -16,7 +16,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stopped; RED never offers to stop its own connection, never offers either on a
   read-only connection, and never exposes stopping a session to the AI assistant.
   The ClickHouse mutations list now lives in this panel as a second view rather
-  than a dock of its own.
+  than a dock of its own. It opens from the connection itself: click
+  `user@host:port` in the status bar, where the green dot is. Background work
+  still running shows its count on that same chip, so an edit that outlived its
+  submit stays visible with the panel shut.
 - Show DDL, on any object in the schema tree. Tables, views, routines, triggers,
   sequences and types open their definition in a read-only tab with the SQL
   highlighted, plus Copy and "Open as query", which pastes the text into an
@@ -173,9 +176,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The Tables group in the schema tree could not be collapsed: it reopened itself
   on the next repaint. Its default expansion is now applied once when the schema
   loads, so collapsing it sticks, including across a refresh.
-- An object group with nothing in it (Triggers on a server with no triggers) drew
-  an open chevron over an empty space, which read as the group closing itself.
-  Such a group is now a plain dimmed row labelled "none", with nothing to expand.
+- An object group with nothing in it (Triggers on a server with no triggers) is
+  no longer shown at all. It used to appear like any other group, and clicking it
+  was the only way to find out it was empty. RED now counts the routines,
+  triggers, sequences and types of every namespace in a single query when it
+  connects, so a group you can see always has something in it, and its count is
+  on the row before you open it.
 - Connecting crashed the app outright, on every engine. Building the workspace
   for a new connection tried to read the application's own settings back through
   a handle it was already holding, which aborts the process rather than failing

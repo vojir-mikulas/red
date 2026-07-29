@@ -1634,6 +1634,12 @@ impl AppState {
                     self.refresh_completions(cx);
                 }
             }
+            Event::ObjectCountsReady { counts } => {
+                if let Some(active) = self.conn_mut(session) {
+                    active.schema.apply_object_counts(counts);
+                }
+                cx.notify();
+            }
             Event::ObjectGroupLoaded {
                 namespace,
                 kind,

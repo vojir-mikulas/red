@@ -364,6 +364,54 @@ impl DatabaseDriver for MysqlDriver {
         Ok(schemas)
     }
 
+    async fn object_group_counts(&self) -> Result<Vec<(String, ObjectKind, usize)>> {
+        let mut conn = self.conn().await?;
+        // Routines and triggers in one statement. Sequences are asked for
+        // separately below because `information_schema.sequences` does not exist
+        // on MySQL at all, and a missing table fails the *whole* union rather
+        // than just its arm.
+        let rows: Vec<(String, String, i64)> = conn
+            .query(
+                "SELECT routine_schema, \
+                        IF(routine_type = 'FUNCTION', 'function', 'procedure'), COUNT(*) \
+                   FROM information_schema.routines GROUP BY 1, 2 \
+                 UNION ALL \
+                 SELECT trigger_schema, 'trigger', COUNT(*) \
+                   FROM information_schema.triggers GROUP BY 1",
+            )
+            .await
+            .map_err(driver_err)?;
+
+        let mut out: Vec<(String, ObjectKind, usize)> = rows
+            .into_iter()
+            .filter_map(|(schema, token, count)| {
+                Some((
+                    schema,
+                    ObjectKind::from_token(&token)?,
+                    count.max(0) as usize,
+                ))
+            })
+            .collect();
+
+        // MariaDB only. On MySQL this returns nothing, which the caller reads as
+        // "no sequences anywhere", which is exactly right for an engine that has
+        // none: the group is never drawn rather than being drawn and then
+        // deflating on click.
+        let sequences: Vec<(String, i64)> = conn
+            .query(
+                "SELECT table_schema, COUNT(*) FROM information_schema.tables \
+                  WHERE table_type = 'SEQUENCE' GROUP BY 1",
+            )
+            .await
+            .unwrap_or_default();
+        out.extend(
+            sequences
+                .into_iter()
+                .map(|(schema, count)| (schema, ObjectKind::Sequence, count.max(0) as usize)),
+        );
+        Ok(out)
+    }
+
     async fn list_object_group(
         &self,
         namespace: &str,

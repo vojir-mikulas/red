@@ -316,6 +316,56 @@ impl DatabaseDriver for PostgresDriver {
         Ok(schemas)
     }
 
+    async fn object_group_counts(&self) -> Result<Vec<(String, ObjectKind, usize)>> {
+        // One statement, five arms, every namespace at once. Each arm labels its
+        // rows with the kind it counted so the caller can route them without
+        // knowing the arm order.
+        let rows = self
+            .client
+            .query(
+                "SELECT n.nspname::text, 'function', count(*)::bigint \
+                   FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                  WHERE p.prokind = 'f' GROUP BY 1 \
+                 UNION ALL \
+                 SELECT n.nspname::text, 'procedure', count(*)::bigint \
+                   FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                  WHERE p.prokind = 'p' GROUP BY 1 \
+                 UNION ALL \
+                 SELECT n.nspname::text, 'trigger', count(*)::bigint \
+                   FROM pg_trigger t \
+                   JOIN pg_class c ON c.oid = t.tgrelid \
+                   JOIN pg_namespace n ON n.oid = c.relnamespace \
+                  WHERE NOT t.tgisinternal GROUP BY 1 \
+                 UNION ALL \
+                 SELECT n.nspname::text, 'sequence', count(*)::bigint \
+                   FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                  WHERE c.relkind = 'S' GROUP BY 1 \
+                 UNION ALL \
+                 SELECT n.nspname::text, 'type', count(*)::bigint \
+                   FROM pg_type t \
+                   JOIN pg_namespace n ON n.oid = t.typnamespace \
+                   LEFT JOIN pg_class c ON c.oid = t.typrelid \
+                  WHERE t.typtype IN ('e', 'c') \
+                    AND (t.typrelid = 0 OR c.relkind = 'c') GROUP BY 1",
+                &[],
+            )
+            .await
+            .map_err(driver_err)?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let namespace: String = row.get(0);
+                let token: &str = row.get(1);
+                let count: i64 = row.get(2);
+                Some((
+                    namespace,
+                    ObjectKind::from_token(token)?,
+                    count.max(0) as usize,
+                ))
+            })
+            .collect())
+    }
+
     async fn list_object_group(
         &self,
         namespace: &str,

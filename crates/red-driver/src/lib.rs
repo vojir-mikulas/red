@@ -1123,6 +1123,26 @@ pub trait DatabaseDriver: Send + Sync {
     /// user expands a table, so the initial tree load stays light.
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableDetail>;
 
+    /// How many objects of each lazily-loaded kind live in each namespace, as
+    /// `(namespace, kind, count)`.
+    ///
+    /// **One query for the whole connection**, not one per namespace: these
+    /// catalogs are server-wide tables that group by schema, so the connect
+    /// budget grows by exactly one round trip. That is the difference between
+    /// this and fetching the names, which really is proportional to the schema.
+    ///
+    /// It exists so the tree never draws a group that turns out to be empty. A
+    /// row you can click that then deflates to "none" is worse than no row: it
+    /// advertises content it does not have.
+    ///
+    /// A namespace/kind pair **absent from the result is zero**, not unknown, so
+    /// a driver only reports what it found. An engine that cannot answer returns
+    /// an empty vec and its groups fall back to click-to-discover; the caller
+    /// tells the two apart by whether the call succeeded.
+    async fn object_group_counts(&self) -> Result<Vec<(String, red_core::ObjectKind, usize)>> {
+        Ok(Vec::new())
+    }
+
     /// The names of one *programmatic* object kind (routine, trigger, sequence,
     /// user type) in one namespace, loaded when the user expands that group node
     /// in the tree rather than at connect.

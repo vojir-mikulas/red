@@ -128,6 +128,36 @@ impl DatabaseDriver for SqliteDriver {
             .map_err(driver_err)?
     }
 
+    async fn object_group_counts(&self) -> Result<Vec<(String, ObjectKind, usize)>> {
+        // Triggers are SQLite's only lazy kind, and `sqlite_master` already holds
+        // them next to the tables, so this is a count over a table the skeleton
+        // query has read anyway. One pass per attached database.
+        let path = self.path.clone();
+        let read_only = self.read_only;
+        tokio::task::spawn_blocking(move || {
+            let conn = SqliteDriver::open(&path, read_only)?;
+            let names: Vec<String> = {
+                let mut stmt = conn.prepare("PRAGMA database_list").map_err(driver_err)?;
+                stmt.query_map([], |row| row.get::<_, String>(1))
+                    .map_err(driver_err)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(driver_err)?
+            };
+            let mut out = Vec::new();
+            for name in names {
+                let sql = format!(
+                    "SELECT COUNT(*) FROM {}.sqlite_master WHERE type = 'trigger'",
+                    quote_ident(&name)
+                );
+                let count: i64 = conn.query_row(&sql, [], |row| row.get(0)).unwrap_or(0);
+                out.push((name, ObjectKind::Trigger, count.max(0) as usize));
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(driver_err)?
+    }
+
     async fn list_object_group(
         &self,
         namespace: &str,
@@ -1475,6 +1505,9 @@ mod tests {
             Some("books_touch"),
         )
         .await;
+        // The tree hides a group on the strength of its count alone, so the count
+        // and the contents must agree.
+        battery::object_counts_match_their_contents(&driver, "main", ObjectKind::Trigger).await;
 
         // SQLite-specific extras the shared battery doesn't assert: the column
         // default and the declared type round-trip through introspection.

@@ -268,6 +268,7 @@ impl AppState {
             s.groups_loading.extend(reload.iter().cloned());
         }
         self.send_active(Command::LoadObjects);
+        self.send_active(Command::LoadObjectCounts);
         for (namespace, kind) in reload {
             self.send_active(Command::LoadObjectGroup { namespace, kind });
         }

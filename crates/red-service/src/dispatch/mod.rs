@@ -1178,6 +1178,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::LoadObjects => schema_cmds::load_objects(&sessions, session_id, &events).await,
+            Command::LoadObjectCounts => {
+                schema_cmds::load_object_counts(&sessions, session_id, &events).await
+            }
             Command::LoadObjectGroup { namespace, kind } => {
                 schema_cmds::load_object_group(&sessions, session_id, &events, namespace, kind)
                     .await
