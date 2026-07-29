@@ -11,7 +11,7 @@
 
 use flint::{Palette, PaletteEvent, PaletteItem, ToastVariant};
 use gpui::{Context, ElementId, Entity, SharedString, actions, prelude::*};
-use red_core::{ColumnMap, ColumnMeta, CopyMode, ObjectKind, TableRef};
+use red_core::{ColumnMap, ColumnMeta, CopyMode, TableRef};
 use red_service::{Command, SessionId};
 
 use crate::app::{AppState, PendingCopyNewTable, PendingCopyPeek, Phase};
@@ -46,9 +46,9 @@ pub(crate) enum Cmd {
     ClearHistory,
     ToggleSidebar,
     ToggleColumnsPanel,
-    /// Show/hide the Mutations panel (ClickHouse: the engine's in-flight background
-    /// edits).
-    ToggleMutations,
+    /// Show/hide the Server panel: the server's live sessions, plus (on an engine
+    /// that has them) its in-flight background mutations.
+    ToggleServerPanel,
     RefreshSchema,
     Disconnect,
     /// Move keyboard focus to the schema / editor / grid pane.
@@ -97,10 +97,20 @@ pub(crate) enum Cmd {
     CompareRight(usize),
     /// Open the read-only schema ER diagram overlay.
     ErDiagram,
+    /// Open the connection's health report.
+    HealthReport,
+    /// Open the schema-comparison picker: choose the namespace to compare the
+    /// current one against.
+    CompareSchema,
+    /// Compare the current namespace against the namespace at this index; the
+    /// schema-comparison picker's activation.
+    CompareSchemaTarget(usize),
     /// EXPLAIN the active tab's query and open the plan view (B4).
     Explain,
     /// EXPLAIN ANALYZE the active tab's query (runs it; read queries only).
     ExplainAnalyze,
+    /// Toggle watch mode on the active tab's result (re-run on an interval).
+    ToggleWatch,
     /// Beautify the active editor's SQL in place.
     FormatSql,
     /// Submit the staged grid edits as one batch (Track B6). Opens the confirm.
@@ -293,7 +303,7 @@ impl AppState {
             Cmd::ClearHistory => self.clear_history(cx),
             Cmd::ToggleSidebar => self.toggle_sidebar(cx),
             Cmd::ToggleColumnsPanel => self.toggle_columns_panel(cx),
-            Cmd::ToggleMutations => self.toggle_mutations(cx),
+            Cmd::ToggleServerPanel => self.toggle_server_panel(cx),
             Cmd::RefreshSchema => self.refresh_schema(),
             Cmd::Disconnect => self.disconnect(cx),
             // Pane focus needs a `Window`; defer it to the next render (drained
@@ -321,8 +331,12 @@ impl AppState {
             Cmd::CompareLeft(index) => self.pick_compare_left(index, cx),
             Cmd::CompareRight(index) => self.pick_compare_right(index, cx),
             Cmd::ErDiagram => self.open_er_diagram(self.er_target_namespace(), cx),
+            Cmd::HealthReport => self.open_health_report(cx),
+            Cmd::CompareSchema => self.open_schema_compare_picker(cx),
+            Cmd::CompareSchemaTarget(index) => self.pick_schema_compare_target(index, cx),
             Cmd::Explain => self.explain_query(false, cx),
             Cmd::ExplainAnalyze => self.explain_query(true, cx),
+            Cmd::ToggleWatch => self.toggle_watch(cx),
             Cmd::FormatSql => self.format_active_sql(cx),
             Cmd::SubmitChanges => self.submit_changes(cx),
             Cmd::RevertChanges => self.revert_changes(cx),
@@ -595,6 +609,17 @@ impl AppState {
                             Cmd::ExplainAnalyze,
                         ));
                     }
+                    // Watch: offered only where it could act (a result is open),
+                    // so the palette never lists a command that would just toast.
+                    if active.active().is_some_and(|t| t.result.is_some()) {
+                        let on = active.active().is_some_and(|t| t.watch.is_some());
+                        let label = if on {
+                            "result: stop watching"
+                        } else {
+                            "result: watch (re-run on an interval)"
+                        };
+                        out.push((PaletteItem::new("cmd:watch", label), Cmd::ToggleWatch));
+                    }
                     out.push((
                         PaletteItem::new("cmd:format-sql", "editor: format SQL").hint("⌥⌘F"),
                         Cmd::FormatSql,
@@ -625,12 +650,22 @@ impl AppState {
                     PaletteItem::new("cmd:columns", "view: toggle columns panel").hint("⇧⌘C"),
                     Cmd::ToggleColumnsPanel,
                 ));
-                // Only where there are background mutations to watch; on every other
-                // engine a write is finished when the statement returns.
-                if self.tracks_mutations() {
+                // Only where there is a server behind the connection: SQLite is a
+                // file, with no other sessions and no background work to watch.
+                out.push((
+                    PaletteItem::new("cmd:health", "connection: health report"),
+                    Cmd::HealthReport,
+                ));
+                if active.schema.schemas.len() > 1 {
                     out.push((
-                        PaletteItem::new("cmd:mutations", "view: toggle mutations panel"),
-                        Cmd::ToggleMutations,
+                        PaletteItem::new("cmd:compare-schema", "schema: compare against…"),
+                        Cmd::CompareSchema,
+                    ));
+                }
+                if self.has_server_panel() {
+                    out.push((
+                        PaletteItem::new("cmd:server-panel", "view: toggle server panel"),
+                        Cmd::ToggleServerPanel,
                     ));
                 }
                 out.push((
@@ -1193,13 +1228,84 @@ impl AppState {
         let mut out = Vec::new();
         for ns in &active.schema.schemas {
             for o in &ns.objects {
-                if matches!(o.kind, ObjectKind::Table) {
+                // Any relation can be browsed, including a view or a matview;
+                // only the columnless programmatic kinds are excluded.
+                if o.kind.is_relation() {
                     let schema = (!ns.name.is_empty()).then(|| ns.name.clone());
                     out.push((active.session, schema, o.name.clone()));
                 }
             }
         }
         out
+    }
+
+    /// "schema: compare against…": pick which namespace to compare the tree's
+    /// current namespace against.
+    ///
+    /// Scoped to one connection for now. The backend command already takes a
+    /// `right_session`, so a cross-connection picker is a UI addition rather than
+    /// a protocol change, but same-connection is the case worth having first
+    /// (comparing `staging` against `public` on one server).
+    pub(crate) fn open_schema_compare_picker(&mut self, cx: &mut Context<Self>) {
+        let Phase::Connected(active) = &self.phase else {
+            return;
+        };
+        let Some(current) = self.er_target_namespace() else {
+            self.notify(ToastVariant::Info, "Select a schema in the tree first", cx);
+            return;
+        };
+        let others: Vec<String> = active
+            .schema
+            .schemas
+            .iter()
+            .map(|s| s.name.clone())
+            .filter(|n| *n != current)
+            .collect();
+        if others.is_empty() {
+            self.notify(
+                ToastVariant::Info,
+                "This connection has only one schema to compare",
+                cx,
+            );
+            return;
+        }
+        let entries: Vec<(PaletteItem, Cmd)> = others
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let id = ElementId::from(SharedString::from(format!("compare-schema:{i}")));
+                (
+                    PaletteItem::new(id, format!("against {name}")),
+                    Cmd::CompareSchemaTarget(i),
+                )
+            })
+            .collect();
+        self.compare_schemas = others;
+        self.open_command_picker(&format!("Compare {current} against…"), entries, cx);
+    }
+
+    /// Fire the comparison against the picked namespace.
+    fn pick_schema_compare_target(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(right) = self.compare_schemas.get(index).cloned() else {
+            return;
+        };
+        let Some(left) = self.er_target_namespace() else {
+            return;
+        };
+        let Phase::Connected(active) = &self.phase else {
+            return;
+        };
+        let session = active.session;
+        self.close_palette();
+        self.next_export_id += 1;
+        self.send_active(Command::DiffSchemas {
+            id: red_service::OpId::new(self.next_export_id),
+            left_namespace: left,
+            right_session: session,
+            right_namespace: right,
+        });
+        self.notify(ToastVariant::Info, "Comparing schemas…", cx);
+        cx.notify();
     }
 
     /// "table: compare against…": open a picker over the connection's tables to

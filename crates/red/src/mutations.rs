@@ -44,25 +44,6 @@ impl AppState {
         }
     }
 
-    /// Show or hide the Mutations panel, refreshing it on the way in so it never
-    /// opens on a stale list.
-    pub(crate) fn toggle_mutations(&mut self, cx: &mut Context<Self>) {
-        if !self.tracks_mutations() {
-            return;
-        }
-        let opened = match &mut self.phase {
-            Phase::Connected(active) => {
-                active.mutations_open = !active.mutations_open;
-                active.mutations_open
-            }
-            _ => false,
-        };
-        if opened {
-            self.refresh_mutations(cx);
-        }
-        cx.notify();
-    }
-
     /// Ask the backend for the current listing. Cheap (one catalog query), so this is
     /// also fired after every submit: a mutation that is still running is exactly
     /// what the user needs to see next.

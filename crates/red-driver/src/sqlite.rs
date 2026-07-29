@@ -128,6 +128,43 @@ impl DatabaseDriver for SqliteDriver {
             .map_err(driver_err)?
     }
 
+    async fn list_object_group(
+        &self,
+        namespace: &str,
+        kind: ObjectKind,
+    ) -> Result<Vec<ObjectMeta>> {
+        // `sqlite_master` is the whole catalog, so the only lazy kind is the
+        // trigger (indexes already ride inside `TableDetail`).
+        if kind != ObjectKind::Trigger {
+            return Ok(Vec::new());
+        }
+        let path = self.path.clone();
+        let read_only = self.read_only;
+        let namespace = namespace.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = SqliteDriver::open(&path, read_only)?;
+            let sql = format!(
+                "SELECT name || ' on ' || tbl_name FROM {}.sqlite_master \
+                 WHERE type = 'trigger' ORDER BY name",
+                quote_ident(&namespace)
+            );
+            let mut stmt = conn.prepare(&sql).map_err(driver_err)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(ObjectMeta {
+                        name: row.get(0)?,
+                        kind: ObjectKind::Trigger,
+                    })
+                })
+                .map_err(driver_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(driver_err)?;
+            Ok(rows)
+        })
+        .await
+        .map_err(driver_err)?
+    }
+
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableDetail> {
         let path = self.path.clone();
         let read_only = self.read_only;
@@ -463,6 +500,165 @@ impl DatabaseDriver for SqliteDriver {
         Err(RedError::Driver(
             "SQLite cannot add a foreign key to an existing table".to_string(),
         ))
+    }
+
+    async fn health(&self, _namespace: Option<&str>) -> Result<red_core::health::HealthReport> {
+        use crate::{human_bytes, now_unix};
+        use red_core::health::{
+            Finding, FindingKind, HealthReport, Severity, SizeTotals, TableSize, floors,
+        };
+
+        // Deliberately short. A SQLite file has no server, no statistics views, and
+        // no index usage counters, so the honest report is sizes plus the two
+        // things a file database can actually tell you: free pages and missing
+        // row identities. A stub full of "unavailable" would be noise.
+        let path = self.path.clone();
+        let read_only = self.read_only;
+        tokio::task::spawn_blocking(move || {
+            let conn = SqliteDriver::open(&path, read_only)?;
+            let mut report = HealthReport::new(red_core::DbKind::Sqlite, None, now_unix());
+
+            let page_size: i64 = conn
+                .query_row("PRAGMA page_size", [], |r| r.get(0))
+                .map_err(driver_err)?;
+            let page_count: i64 = conn
+                .query_row("PRAGMA page_count", [], |r| r.get(0))
+                .map_err(driver_err)?;
+            let freelist: i64 = conn
+                .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+                .map_err(driver_err)?;
+            let total = (page_size * page_count).max(0) as u64;
+            let free = (page_size * freelist).max(0) as u64;
+
+            // Per-table sizes need dbstat, which is a compile-time option. Rather
+            // than report zeroes, report the row estimate and let the file total
+            // carry the size story.
+            let mut tables: Vec<TableSize> = Vec::new();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' \
+                     AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name",
+                )
+                .map_err(driver_err)?;
+            let names: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(driver_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(driver_err)?;
+            for name in &names {
+                // `COUNT(*)` is affordable here in a way it is not on a server
+                // engine: SQLite is a local file and this is a report the user
+                // explicitly asked for, one row per table.
+                let count: i64 = conn
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {}", quote_ident(name)),
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                tables.push(TableSize {
+                    table: TableRef {
+                        schema: Some("main".to_string()),
+                        name: name.clone(),
+                    },
+                    bytes: 0,
+                    index_bytes: 0,
+                    estimated_rows: count,
+                });
+
+                // A rowid table without an explicit primary key: RED cannot offer
+                // in-grid editing on one, which is the consequence a user meets.
+                let has_pk: bool = conn
+                    .query_row(
+                        &format!(
+                            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{}') WHERE pk > 0)",
+                            name.replace('\'', "''")
+                        ),
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(true);
+                if !has_pk && count > floors::ROWS {
+                    report.findings.push(Finding {
+                        severity: Severity::Warn,
+                        kind: FindingKind::NoPrimaryKey,
+                        object: Some(TableRef {
+                            schema: Some("main".to_string()),
+                            name: name.clone(),
+                        }),
+                        title: format!("{name} has no primary key"),
+                        detail: format!(
+                            "{count} rows addressable only by rowid, so RED cannot edit \
+                             them in the grid and a copy cannot be re-keyed."
+                        ),
+                        suggested_sql: None,
+                    });
+                }
+            }
+            tables.sort_by_key(|t| std::cmp::Reverse(t.estimated_rows));
+            report.totals = SizeTotals {
+                bytes: total,
+                index_bytes: 0,
+                table_count: names.len() as u64,
+            };
+            report.tables = tables;
+
+            // A fifth of the file being free pages is worth a VACUUM; less is the
+            // normal churn of a database in use.
+            if free > 0 && total > 0 && free * 5 > total {
+                report.findings.push(Finding {
+                    severity: Severity::Info,
+                    kind: FindingKind::Fragmentation,
+                    object: None,
+                    title: "The file has substantial free space".to_string(),
+                    detail: format!(
+                        "{} of {} is free pages. VACUUM rewrites the file to reclaim it.",
+                        human_bytes(free),
+                        human_bytes(total)
+                    ),
+                    suggested_sql: Some("VACUUM;".to_string()),
+                });
+            }
+            Ok(report)
+        })
+        .await
+        .map_err(driver_err)?
+    }
+
+    async fn object_ddl(&self, namespace: &str, name: &str, kind: ObjectKind) -> Result<String> {
+        // `sqlite_master.sql` is the statement the object was created with,
+        // verbatim, which is as faithful as DDL gets. A trigger row is keyed by
+        // its own name; the tree shows "trigger on table", so take the head.
+        let path = self.path.clone();
+        let read_only = self.read_only;
+        let namespace = namespace.to_string();
+        let object = name.split(" on ").next().unwrap_or(name).to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = SqliteDriver::open(&path, read_only)?;
+            let sql = format!(
+                "SELECT sql FROM {}.sqlite_master WHERE name = ?1",
+                quote_ident(&namespace)
+            );
+            let ddl: Option<String> = match conn.query_row(&sql, [&object], |row| row.get(0)) {
+                Ok(text) => text,
+                // No such row: the object is gone or was never there. Same answer
+                // as a NULL `sql` below, which keeps the caller's shape simple.
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(driver_err(e)),
+            };
+            match ddl {
+                Some(text) => Ok(format!("{text};\n")),
+                // An auto-created object (an implicit index, `sqlite_sequence`)
+                // has a NULL `sql`, which is a fact worth stating rather than an
+                // error worth toasting.
+                None => Ok(format!(
+                    "-- {} {object} has no stored definition (created implicitly by SQLite).\n",
+                    kind.as_str()
+                )),
+            }
+        })
+        .await
+        .map_err(driver_err)?
     }
 
     async fn explain(&self, sql: &str, _analyze: bool) -> Result<QueryPlan> {
@@ -1224,6 +1420,8 @@ mod tests {
                  );
                  CREATE INDEX idx_books_author ON books(author_id);
                  CREATE VIEW recent_books AS SELECT * FROM books;
+                 CREATE TRIGGER books_touch AFTER UPDATE ON books
+                     BEGIN SELECT 1; END;
                  INSERT INTO authors(id, name) VALUES (1, 'Ada'), (2, 'Grace');
                  INSERT INTO books(id, title, author_id)
                      VALUES (1, 'a', 1), (2, 'b', 1), (3, 'c', 2), (4, 'd', NULL);",
@@ -1265,6 +1463,16 @@ mod tests {
             "author_id",
             "title",
             "author_id = 1",
+        )
+        .await;
+
+        // The lazy tier: SQLite's only programmatic kind is the trigger, and the
+        // relation kinds must stay empty here because they ride the skeleton.
+        battery::object_groups_answer_only_their_kind(
+            &driver,
+            "main",
+            ObjectKind::Trigger,
+            Some("books_touch"),
         )
         .await;
 

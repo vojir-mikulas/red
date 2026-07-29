@@ -257,6 +257,8 @@ impl AppState {
             theme.text,
         );
         let (num, cyan, red, accent) = (theme.orange, theme.cyan, theme.red, theme.accent);
+        // Watch-mode change flash (see `result::watch`).
+        let watch_green = theme.green;
         // Scaled chrome sizes snapshotted here (Pixels is Copy) so the result
         // pane's status/empty/error text tracks the UI font size even inside the
         // `'static` row closures below.
@@ -564,6 +566,35 @@ impl AppState {
             .map(|b| b.grid_matches.iter().copied().collect())
             .unwrap_or_default();
         let find_tint = Hsla { a: 0.20, ..accent };
+        // Watch-mode change flash: the cells a re-run changed, tinted until their
+        // flash window expires. Precomputed here into window-local coordinates so
+        // the tint hook stays a set lookup rather than a per-cell key rebuild.
+        //
+        // Under `reduce_motion` the tint still appears, it just does not fade:
+        // motion is the accessibility hazard, colour is the information.
+        let watch_hits: std::collections::HashSet<(usize, usize)> = active
+            .tabs
+            .get(tab_idx)
+            .and_then(|t| t.watch.as_ref())
+            .map(|w| {
+                let now = std::time::Instant::now();
+                (win.base..win.base.saturating_add(win.len))
+                    .filter_map(|abs| {
+                        let key = grid.watch_row_key(abs);
+                        let hits: Vec<(usize, usize)> = (0..grid.columns.len())
+                            .filter(|&c| w.is_flashing(&key, c, now))
+                            .map(|c| (abs, c))
+                            .collect();
+                        (!hits.is_empty()).then_some(hits)
+                    })
+                    .flatten()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let watch_tint = Hsla {
+            a: 0.22,
+            ..watch_green
+        };
         // The open inline editor's target cell (existing rows only; draft rows host
         // their own editor in the bottom zone), so the renderer swaps in its field.
         let inline: Option<(usize, usize, Entity<TextInput>)> = is_focused
@@ -645,6 +676,11 @@ impl AppState {
                 }
                 if table_col >= gutter && find_hits.contains(&(abs, table_col - gutter)) {
                     return Some(find_tint);
+                }
+                // Below find/edit (which are about what the *user* is doing) and
+                // above the joined-column wash (which is static structure).
+                if table_col >= gutter && watch_hits.contains(&(abs, table_col - gutter)) {
+                    return Some(watch_tint);
                 }
                 // A joined reference column (derived from a referenced table) gets a
                 // faint wash: lowest priority, so a find/edit/delete tint wins on top.

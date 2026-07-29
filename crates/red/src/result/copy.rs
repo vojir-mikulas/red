@@ -35,6 +35,9 @@ fn collect_targets(
     }
     for ns in &schema.schemas {
         for obj in &ns.objects {
+            // Write target: spelled `Table` deliberately, NOT `is_relation()`. A
+            // view is a relation and is not an INSERT target, and neither is any
+            // kind added later. See `ObjectKind::is_relation`'s doc comment.
             if matches!(obj.kind, ObjectKind::Table) {
                 out.push(CopyTargetCandidate {
                     session,
@@ -397,6 +400,7 @@ impl AppState {
         let s = &active.schema;
         let schema_name = match &s.selected {
             Some(crate::schema::NodeId::Schema(name)) => Some(name.clone()),
+            Some(crate::schema::NodeId::Group { schema, .. }) => Some(schema.clone()),
             Some(crate::schema::NodeId::Object { schema, .. }) => Some(schema.clone()),
             Some(crate::schema::NodeId::Column { schema, .. }) => Some(schema.clone()),
             None => None,
@@ -409,6 +413,7 @@ impl AppState {
             .map(|ns| {
                 ns.objects
                     .iter()
+                    // Write target: `Table` only, as above.
                     .filter(|o| matches!(o.kind, ObjectKind::Table))
                     .map(|o| o.name.clone())
                     .collect()

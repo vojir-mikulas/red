@@ -531,6 +531,14 @@ pub struct SqlSettings {
     /// Abort a query (and each of its page/run fetches) that runs longer than this
     /// many seconds, so a runaway can't wedge the grid. `0` disables the cap.
     pub statement_timeout: u32,
+    /// Interval a newly-opened watch starts at, in seconds. `0` leaves watch off
+    /// until asked for, which is the default: an interval that arms itself is a
+    /// repeated query nobody requested.
+    pub watch_default_secs: u64,
+    /// Floor under any watch interval, in seconds. A watch is a query on a loop,
+    /// so this is a load guard, not a preference; a production connection raises
+    /// it further (see `AppState::set_watch`).
+    pub watch_min_secs: u64,
 }
 
 impl Default for SqlSettings {
@@ -538,11 +546,21 @@ impl Default for SqlSettings {
         Self {
             auto_limit: 1000,
             statement_timeout: 0,
+            // Off: a watch is opt-in per tab.
+            watch_default_secs: 0,
+            watch_min_secs: 2,
         }
     }
 }
 
 impl SqlSettings {
+    /// The default watch interval, or `None` when watch is off by default.
+    pub fn watch_default(&self) -> Option<std::time::Duration> {
+        (self.watch_default_secs > 0).then(|| {
+            std::time::Duration::from_secs(self.watch_default_secs.max(self.watch_min_secs))
+        })
+    }
+
     /// The statement timeout as a duration, or `None` when disabled (`0`).
     pub fn timeout(&self) -> Option<std::time::Duration> {
         (self.statement_timeout > 0)

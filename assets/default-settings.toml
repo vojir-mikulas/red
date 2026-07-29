@@ -142,6 +142,17 @@ auto_limit = 1000
 # many seconds, at the engine. 0 disables the cap.
 statement_timeout = 0
 
+# Watch mode re-runs a result's query on an interval and flashes what changed.
+# This is the interval a newly-opened result arms itself at; 0 (the default)
+# means watch starts only when you ask for it, per tab. Setting it above 0 makes
+# every result you open a repeating query until you turn its watch off.
+watch_default_secs = 0
+
+# Floor under any watch interval, in seconds. A watch is a query on a loop, so
+# this is a load guard rather than a preference; a connection tagged `prod` is
+# floored at 10s regardless of what you put here.
+watch_min_secs = 2
+
 [kv]
 # The key-value seam: the Redis key browser today, and any future KvDriver engine
 # unchanged, which is why it's named for the seam and not for Redis.

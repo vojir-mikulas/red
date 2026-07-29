@@ -364,6 +364,55 @@ impl DatabaseDriver for MysqlDriver {
         Ok(schemas)
     }
 
+    async fn list_object_group(
+        &self,
+        namespace: &str,
+        kind: ObjectKind,
+    ) -> Result<Vec<ObjectMeta>> {
+        let mut conn = self.conn().await?;
+        let names: Vec<String> = match kind {
+            ObjectKind::Function | ObjectKind::Procedure => {
+                let routine_type = if matches!(kind, ObjectKind::Function) {
+                    "FUNCTION"
+                } else {
+                    "PROCEDURE"
+                };
+                conn.exec(
+                    "SELECT routine_name FROM information_schema.routines \
+                     WHERE routine_schema = ? AND routine_type = ? ORDER BY routine_name",
+                    (namespace, routine_type),
+                )
+                .await
+                .map_err(driver_err)?
+            }
+            ObjectKind::Trigger => conn
+                .exec(
+                    "SELECT CONCAT(trigger_name, ' on ', event_object_table) \
+                     FROM information_schema.triggers \
+                     WHERE trigger_schema = ? ORDER BY trigger_name",
+                    (namespace,),
+                )
+                .await
+                .map_err(driver_err)?,
+            // Sequences are MariaDB-only. On MySQL `information_schema.sequences`
+            // does not exist, and the resulting 1109 is "this engine has none",
+            // not a failure worth surfacing in the tree: the group renders empty.
+            ObjectKind::Sequence => conn
+                .exec(
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_schema = ? AND table_type = 'SEQUENCE' ORDER BY table_name",
+                    (namespace,),
+                )
+                .await
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        Ok(names
+            .into_iter()
+            .map(|name| ObjectMeta { name, kind })
+            .collect())
+    }
+
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableDetail> {
         let mut conn = self.conn().await?;
 
@@ -868,6 +917,338 @@ impl DatabaseDriver for MysqlDriver {
             format!("`{}`", escape_ident(id))
         });
         self.execute(&sql).await
+    }
+
+    async fn health(&self, namespace: Option<&str>) -> Result<red_core::health::HealthReport> {
+        use crate::{human_bytes, now_unix};
+        use red_core::health::{
+            Finding, FindingKind, HealthReport, Severity, SizeTotals, TableSize, UnavailableCheck,
+            floors,
+        };
+
+        let mut conn = self.conn().await?;
+        let scope = namespace.map(str::to_string).or_else(|| self.scope.clone());
+        let mut report = HealthReport::new(red_core::DbKind::Mysql, scope.clone(), now_unix());
+
+        // --- sizes -----------------------------------------------------------
+        // `data_length`/`index_length` are InnoDB's own estimates and `table_rows`
+        // is an estimate too, which is the point: neither costs a scan.
+        let rows: Vec<(
+            String,
+            String,
+            Option<u64>,
+            Option<u64>,
+            Option<i64>,
+            Option<String>,
+        )> = conn
+            .exec(
+                "SELECT table_schema, table_name, data_length, index_length, table_rows, engine \
+                 FROM information_schema.tables \
+                 WHERE table_type = 'BASE TABLE' \
+                   AND table_schema NOT IN \
+                       ('information_schema', 'performance_schema', 'mysql', 'sys') \
+                   AND (? IS NULL OR table_schema = ?) \
+                 ORDER BY (COALESCE(data_length, 0) + COALESCE(index_length, 0)) DESC LIMIT 100",
+                (scope.clone(), scope.clone()),
+            )
+            .await
+            .map_err(driver_err)?;
+
+        let mut totals = SizeTotals::default();
+        for (schema, name, data, index, table_rows, engine) in &rows {
+            let bytes = data.unwrap_or(0) + index.unwrap_or(0);
+            totals.bytes += bytes;
+            totals.index_bytes += index.unwrap_or(0);
+            totals.table_count += 1;
+            report.tables.push(TableSize {
+                table: TableRef {
+                    schema: Some(schema.clone()),
+                    name: name.clone(),
+                },
+                bytes,
+                index_bytes: index.unwrap_or(0),
+                estimated_rows: table_rows.unwrap_or(0),
+            });
+            // MyISAM has no crash recovery and no transactions. On a table anyone
+            // still writes to that is a correctness risk, not a preference.
+            if engine.as_deref() == Some("MyISAM") {
+                report.findings.push(Finding {
+                    severity: Severity::Warn,
+                    kind: FindingKind::LegacyEngine,
+                    object: Some(TableRef {
+                        schema: Some(schema.clone()),
+                        name: name.clone(),
+                    }),
+                    title: format!("{schema}.{name} is MyISAM"),
+                    detail: format!(
+                        "{} with no transactions and no crash recovery.",
+                        human_bytes(bytes)
+                    ),
+                    suggested_sql: Some(format!(
+                        "ALTER TABLE {}.{} ENGINE = InnoDB;",
+                        self.quote_ident(schema),
+                        self.quote_ident(name)
+                    )),
+                });
+            }
+        }
+        report.totals = totals;
+
+        // --- tables with no primary key --------------------------------------
+        let no_pk: Vec<(String, String, Option<i64>)> = conn
+            .exec(
+                "SELECT t.table_schema, t.table_name, t.table_rows \
+                 FROM information_schema.tables t \
+                 LEFT JOIN information_schema.table_constraints k \
+                   ON k.table_schema = t.table_schema AND k.table_name = t.table_name \
+                  AND k.constraint_type = 'PRIMARY KEY' \
+                 WHERE t.table_type = 'BASE TABLE' AND k.constraint_name IS NULL \
+                   AND t.table_schema NOT IN \
+                       ('information_schema', 'performance_schema', 'mysql', 'sys') \
+                   AND (? IS NULL OR t.table_schema = ?) AND t.table_rows > ? \
+                 ORDER BY t.table_rows DESC LIMIT 25",
+                (scope.clone(), scope.clone(), floors::ROWS),
+            )
+            .await
+            .unwrap_or_default();
+        for (schema, name, table_rows) in no_pk {
+            report.findings.push(Finding {
+                severity: Severity::Bad,
+                kind: FindingKind::NoPrimaryKey,
+                object: Some(TableRef {
+                    schema: Some(schema.clone()),
+                    name: name.clone(),
+                }),
+                title: format!("{schema}.{name} has no primary key"),
+                // Graded Bad rather than Warn on MySQL specifically: row-based
+                // replication has to scan the whole table per changed row without
+                // one, which is a production outage waiting for a big UPDATE.
+                detail: format!(
+                    "~{} rows. Row-based replication scans the whole table per changed \
+                     row when there is no key to find it by.",
+                    table_rows.unwrap_or(0)
+                ),
+                suggested_sql: None,
+            });
+        }
+
+        // --- unused / redundant indexes (sys schema) --------------------------
+        // MySQL 5.7+ ships `sys`; MariaDB does not. Absent means the check could
+        // not run, which is reported rather than read as "no unused indexes".
+        let unused: std::result::Result<Vec<(String, String, String)>, _> = conn
+            .query(
+                "SELECT object_schema, object_name, index_name \
+                 FROM sys.schema_unused_indexes LIMIT 50",
+            )
+            .await;
+        match unused {
+            Ok(rows) => {
+                for (schema, table, index) in rows {
+                    if scope.as_deref().is_some_and(|s| s != schema) {
+                        continue;
+                    }
+                    report.findings.push(Finding {
+                        severity: Severity::Warn,
+                        kind: FindingKind::UnusedIndex,
+                        object: Some(TableRef {
+                            schema: Some(schema.clone()),
+                            name: table.clone(),
+                        }),
+                        title: format!("Index {index} has never been used"),
+                        detail: format!(
+                            "No statement has used it on {schema}.{table} since the server \
+                             last started."
+                        ),
+                        suggested_sql: Some(format!(
+                            "ALTER TABLE {}.{} DROP INDEX {};",
+                            self.quote_ident(&schema),
+                            self.quote_ident(&table),
+                            self.quote_ident(&index)
+                        )),
+                    });
+                }
+            }
+            Err(_) => report.unavailable.push(UnavailableCheck {
+                kind: FindingKind::UnusedIndex,
+                reason: "needs the sys schema (MySQL 5.7+); MariaDB does not ship it".to_string(),
+            }),
+        }
+
+        let redundant: std::result::Result<Vec<(String, String, String, String)>, _> = conn
+            .query(
+                "SELECT table_schema, table_name, redundant_index_name, dominant_index_name \
+                 FROM sys.schema_redundant_indexes LIMIT 50",
+            )
+            .await;
+        match redundant {
+            Ok(rows) => {
+                for (schema, table, redundant, dominant) in rows {
+                    if scope.as_deref().is_some_and(|s| s != schema) {
+                        continue;
+                    }
+                    report.findings.push(Finding {
+                        severity: Severity::Info,
+                        kind: FindingKind::RedundantIndex,
+                        object: Some(TableRef {
+                            schema: Some(schema.clone()),
+                            name: table.clone(),
+                        }),
+                        title: format!("Index {redundant} duplicates {dominant}"),
+                        detail: format!(
+                            "{schema}.{table} carries both; the wider one already covers \
+                             every lookup the narrower one serves."
+                        ),
+                        suggested_sql: Some(format!(
+                            "ALTER TABLE {}.{} DROP INDEX {};",
+                            self.quote_ident(&schema),
+                            self.quote_ident(&table),
+                            self.quote_ident(&redundant)
+                        )),
+                    });
+                }
+            }
+            Err(_) => report.unavailable.push(UnavailableCheck {
+                kind: FindingKind::RedundantIndex,
+                reason: "needs the sys schema (MySQL 5.7+); MariaDB does not ship it".to_string(),
+            }),
+        }
+        Ok(report)
+    }
+
+    async fn server_sessions(&self) -> Result<(Vec<red_core::ServerSession>, bool)> {
+        let mut conn = self.conn().await?;
+        // `information_schema.processlist` takes an internal mutex and is not free
+        // on a server with thousands of threads, but it is the portable answer
+        // across MySQL and MariaDB; the cap and the panel's interval floor are what
+        // keep the cost bounded.
+        let rows: Vec<(
+            u64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<u64>,
+            Option<String>,
+        )> = conn
+            .query(
+                "SELECT id, user, host, db, command, time, info \
+                 FROM information_schema.processlist \
+                 WHERE command <> 'Daemon' ORDER BY time DESC LIMIT 500",
+            )
+            .await
+            .map_err(driver_err)?;
+
+        // Which thread is ours, so the panel can refuse to kill it.
+        let me: Option<u64> = conn
+            .query_first("SELECT CONNECTION_ID()")
+            .await
+            .map_err(driver_err)?;
+
+        // The lock graph, when performance_schema is available. Absent (or
+        // disabled) means no wait tree rather than a failed panel, which is why
+        // this is a separate, swallowed query.
+        let waits: Vec<(u64, u64)> = conn
+            .query(
+                "SELECT r.processlist_id, b.processlist_id \
+                 FROM performance_schema.data_lock_waits w \
+                 JOIN performance_schema.threads r \
+                   ON r.thread_id = w.requesting_thread_id \
+                 JOIN performance_schema.threads b \
+                   ON b.thread_id = w.blocking_thread_id",
+            )
+            .await
+            .unwrap_or_default();
+
+        // A role without PROCESS sees only its own thread, which is a privilege
+        // state to explain rather than an error to raise.
+        let restricted = rows.len() <= 1 && me.is_some();
+        let sessions = rows
+            .into_iter()
+            .map(
+                |(id, user, host, db, command, time, info)| red_core::ServerSession {
+                    key: red_core::SessionKey(id.to_string()),
+                    user,
+                    application: None,
+                    client_addr: host,
+                    database: db,
+                    state: command.unwrap_or_default(),
+                    wait: None,
+                    blocked_by: waits
+                        .iter()
+                        .filter(|(waiter, _)| *waiter == id)
+                        .map(|(_, blocker)| red_core::SessionKey(blocker.to_string()))
+                        .collect(),
+                    query: info.filter(|s| !s.is_empty()),
+                    elapsed_secs: time.unwrap_or(0) as f64,
+                    is_self: me == Some(id),
+                },
+            )
+            .collect();
+        Ok((sessions, restricted))
+    }
+
+    async fn kill_session(
+        &self,
+        key: &red_core::SessionKey,
+        mode: red_core::KillMode,
+    ) -> Result<()> {
+        if self.read_only {
+            return Err(RedError::Query("this connection is read-only".into()));
+        }
+        // Parsed rather than interpolated: `KILL` takes no placeholders on MySQL,
+        // so the only safe path is to prove the key is a number first.
+        let id: u64 = key
+            .0
+            .parse()
+            .map_err(|_| RedError::Driver(format!("not a MySQL thread id: {key}")))?;
+        let statement = match mode {
+            red_core::KillMode::Cancel => format!("KILL QUERY {id}"),
+            red_core::KillMode::Terminate => format!("KILL {id}"),
+        };
+        let mut conn = self.conn().await?;
+        conn.query_drop(statement).await.map_err(driver_err)
+    }
+
+    async fn object_ddl(&self, namespace: &str, name: &str, kind: ObjectKind) -> Result<String> {
+        let mut conn = self.conn().await?;
+        // The tree's trigger label is "trigger on table"; `SHOW CREATE TRIGGER`
+        // wants just the trigger.
+        let object = name.split(" on ").next().unwrap_or(name);
+        let qualified = format!(
+            "{}.{}",
+            self.quote_ident(namespace),
+            self.quote_ident(object.split('(').next().unwrap_or(object).trim())
+        );
+        // `SHOW CREATE …` returns the definition in a column whose *position*
+        // varies by object kind (2nd for a table, 3rd for a routine or trigger,
+        // where a `sql_mode` column comes first). Read the row untyped and take
+        // the longest text cell: the definition dwarfs the mode string and the
+        // name, and this stays correct across MySQL and MariaDB, which do not
+        // agree on the column list.
+        let statement = match kind {
+            ObjectKind::Table => format!("SHOW CREATE TABLE {qualified}"),
+            ObjectKind::View => format!("SHOW CREATE VIEW {qualified}"),
+            ObjectKind::Function => format!("SHOW CREATE FUNCTION {qualified}"),
+            ObjectKind::Procedure => format!("SHOW CREATE PROCEDURE {qualified}"),
+            ObjectKind::Trigger => format!("SHOW CREATE TRIGGER {qualified}"),
+            ObjectKind::Sequence => format!("SHOW CREATE SEQUENCE {qualified}"),
+            other => {
+                return Err(RedError::Driver(format!(
+                    "MySQL has no definition for a {}",
+                    other.as_str()
+                )));
+            }
+        };
+        let rows: Vec<mysql_async::Row> = conn.query(statement).await.map_err(driver_err)?;
+        let row = rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| RedError::Driver(format!("{name} not found in {namespace}")))?;
+        let ddl = (0..row.columns_ref().len())
+            .filter_map(|i| row.get::<String, usize>(i))
+            .max_by_key(String::len)
+            .ok_or_else(|| RedError::Driver("no definition returned".to_string()))?;
+        Ok(format!("{ddl};\n"))
     }
 
     async fn explain(&self, sql: &str, analyze: bool) -> Result<QueryPlan> {

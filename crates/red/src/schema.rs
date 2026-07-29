@@ -22,6 +22,13 @@ use crate::app::{ActiveConn, AppState, Phase, TabWorkspace};
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum NodeId {
     Schema(String),
+    /// One object-kind group inside a namespace ("Tables", "Functions"). The tier
+    /// between a namespace and its objects; expanding a *lazy* group is what
+    /// fetches it (see `Command::LoadObjectGroup`).
+    Group {
+        schema: String,
+        kind: ObjectKind,
+    },
     Object {
         schema: String,
         name: String,
@@ -36,7 +43,19 @@ pub(crate) enum NodeId {
 /// The schema explorer's state for one connection.
 pub(crate) struct SchemaState {
     /// The tree skeleton (namespaces + object names), from `ObjectsLoaded`.
+    /// Relations only: the columnless kinds live in [`Self::groups`].
     pub schemas: Vec<SchemaMeta>,
+    /// Which object kinds this engine has, in tree order
+    /// (`DbKind::object_kinds`). Held here so `flatten` stays a pure function of
+    /// the schema state and does not need the connection config threaded in.
+    pub kinds: &'static [ObjectKind],
+    /// Lazily-loaded programmatic objects, keyed by (namespace, kind). Absent =
+    /// never expanded; present-and-empty = the engine reported none, which is a
+    /// real answer and renders as an empty group rather than a spinner.
+    pub groups: HashMap<(String, ObjectKind), Vec<red_core::ObjectMeta>>,
+    /// Groups with a `LoadObjectGroup` in flight, so a second expand does not
+    /// fire a second fetch and the row can show "loading…".
+    pub groups_loading: HashSet<(String, ObjectKind)>,
     /// Per-object detail (columns / FKs / indexes), filled lazily on expand.
     pub details: HashMap<(String, String), TableDetail>,
     pub expanded: HashSet<NodeId>,
@@ -59,7 +78,10 @@ pub(crate) struct SchemaMenu {
 }
 
 impl SchemaState {
-    pub fn new(cx: &mut Context<AppState>) -> Self {
+    /// `kind` fixes which object groups this tree can ever draw
+    /// (`DbKind::object_kinds`), read once at connect because a connection's
+    /// engine never changes under it.
+    pub fn new(kind: DbKind, cx: &mut Context<AppState>) -> Self {
         let filter = cx.new(|cx| TextInput::new(cx).with_placeholder("Filter schema…"));
         // Re-render so the filter narrows the tree live as the user types.
         cx.subscribe(&filter, |_this, _input, _evt: &TextInputEvent, cx| {
@@ -68,6 +90,9 @@ impl SchemaState {
         .detach();
         Self {
             schemas: Vec::new(),
+            kinds: kind.object_kinds(),
+            groups: HashMap::new(),
+            groups_loading: HashSet::new(),
             details: HashMap::new(),
             expanded: HashSet::new(),
             selected: None,
@@ -88,6 +113,44 @@ impl SchemaState {
         self.schemas = schemas;
         self.loading = false;
     }
+
+    /// Install one expanded group's objects. An empty list is stored, not
+    /// discarded: "loaded and empty" is what stops the row spinning.
+    pub fn apply_object_group(
+        &mut self,
+        namespace: String,
+        kind: ObjectKind,
+        objects: Vec<red_core::ObjectMeta>,
+    ) {
+        self.groups_loading.remove(&(namespace.clone(), kind));
+        self.groups.insert((namespace, kind), objects);
+    }
+
+    /// The relations of one namespace that belong to `kind`. Relations live in
+    /// the skeleton, so this is a filter rather than a lookup.
+    fn relations<'a>(
+        &self,
+        schema: &'a SchemaMeta,
+        kind: ObjectKind,
+    ) -> Vec<&'a red_core::ObjectMeta> {
+        schema.objects.iter().filter(|o| o.kind == kind).collect()
+    }
+
+    /// Every object of `kind` in `schema`, from whichever tier holds it.
+    fn objects_of<'a>(
+        &'a self,
+        schema: &'a SchemaMeta,
+        kind: ObjectKind,
+    ) -> Vec<&'a red_core::ObjectMeta> {
+        if kind.is_relation() {
+            self.relations(schema, kind)
+        } else {
+            self.groups
+                .get(&(schema.name.clone(), kind))
+                .map(|v| v.iter().collect())
+                .unwrap_or_default()
+        }
+    }
 }
 
 /// What a flattened visible row carries for rendering.
@@ -95,6 +158,13 @@ enum RowContent {
     Schema {
         name: String,
         count: usize,
+    },
+    /// An object-kind group row ("Tables · 42"). `count` is `None` for a lazy
+    /// group that has not been fetched: showing one would mean counting at
+    /// connect, which is exactly the cost the lazy tier exists to avoid.
+    Group {
+        kind: ObjectKind,
+        count: Option<usize>,
     },
     Object {
         kind: ObjectKind,
@@ -131,19 +201,20 @@ fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
     for schema in &s.schemas {
         let schema_match = filtering && hit(&schema.name);
 
-        // Which objects survive the filter, and why (name vs. a column hit).
-        let mut visible = Vec::new();
-        for obj in &schema.objects {
-            let obj_match = !filtering || hit(&obj.name);
-            let col_hit = filtering
-                && s.details
-                    .get(&(schema.name.clone(), obj.name.clone()))
-                    .is_some_and(|d| d.columns.iter().any(|c| hit(&c.name)));
-            if !filtering || schema_match || obj_match || col_hit {
-                visible.push((obj, obj_match, col_hit));
-            }
-        }
-        if filtering && !schema_match && visible.is_empty() {
+        // Does anything under this namespace survive the filter? Checked across
+        // both tiers (skeleton relations and any group already fetched), so a
+        // namespace whose only match is a loaded function still shows.
+        let any_match = !filtering
+            || schema_match
+            || s.kinds.iter().any(|&kind| {
+                s.objects_of(schema, kind).iter().any(|obj| {
+                    hit(&obj.name)
+                        || s.details
+                            .get(&(schema.name.clone(), obj.name.clone()))
+                            .is_some_and(|d| d.columns.iter().any(|c| hit(&c.name)))
+                })
+            });
+        if !any_match {
             continue;
         }
 
@@ -162,56 +233,138 @@ fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
             continue;
         }
 
-        for (obj, obj_match, col_hit) in visible {
-            let obj_node = NodeId::Object {
-                schema: schema.name.clone(),
-                name: obj.name.clone(),
-            };
-            // Force open to reveal the matching columns when only a column hit.
-            let force = filtering && !schema_match && !obj_match && col_hit;
-            let obj_open = s.expanded.contains(&obj_node) || force;
-            out.push(VisibleRow {
-                item: TreeItem::new(1, true, obj_open),
-                content: RowContent::Object {
-                    kind: obj.kind,
-                    name: obj.name.clone(),
-                },
-                node: Some(obj_node),
-                preview: Some((schema.name.clone(), obj.name.clone())),
-            });
-            if !obj_open {
+        // Which relation groups this namespace actually has something in. When
+        // that is exactly one (SQLite's `main`, a Postgres schema of plain
+        // tables), it auto-expands: grouping should not cost the common case an
+        // extra click to see the list it has always shown.
+        let populated: Vec<ObjectKind> = s
+            .kinds
+            .iter()
+            .copied()
+            .filter(|k| k.is_relation() && !s.relations(schema, *k).is_empty())
+            .collect();
+        let lone_relation_group = (populated.len() == 1).then(|| populated[0]);
+
+        for &kind in s.kinds {
+            let members = s.objects_of(schema, kind);
+            let loaded = kind.is_relation() || s.groups.contains_key(&(schema.name.clone(), kind));
+            // An empty relation group is not drawn at all (a namespace with no
+            // views should not grow a "Views" row). An empty *lazy* group is
+            // drawn until it has been fetched, because "empty" is not yet known.
+            if kind.is_relation() && members.is_empty() {
+                continue;
+            }
+            if loaded && members.is_empty() && filtering {
                 continue;
             }
 
-            match s.details.get(&(schema.name.clone(), obj.name.clone())) {
-                Some(detail) => {
-                    for col in &detail.columns {
-                        // Narrowing by a column hit shows only matching columns.
-                        if filtering && !schema_match && !obj_match && !hit(&col.name) {
-                            continue;
-                        }
-                        let is_fk = detail.foreign_keys.iter().any(|fk| fk.column == col.name);
-                        out.push(VisibleRow {
-                            item: TreeItem::leaf(2),
-                            content: RowContent::Column {
-                                meta: col.clone(),
-                                is_fk,
-                            },
-                            node: Some(NodeId::Column {
-                                schema: schema.name.clone(),
-                                table: obj.name.clone(),
-                                name: col.name.clone(),
-                            }),
-                            preview: None,
-                        });
-                    }
-                }
-                None => out.push(VisibleRow {
+            let group_node = NodeId::Group {
+                schema: schema.name.clone(),
+                kind,
+            };
+            // A filter reveals through groups, so a match deep in a loaded group
+            // is visible without hand-expanding each tier.
+            let group_open = (filtering && loaded)
+                || s.expanded.contains(&group_node)
+                || lone_relation_group == Some(kind);
+
+            // The group's own rows after the filter, so an all-miss group can be
+            // skipped rather than drawn as an empty expanded folder.
+            let group_rows: Vec<_> = members
+                .iter()
+                .filter_map(|obj| {
+                    let obj_match = !filtering || hit(&obj.name);
+                    let col_hit = filtering
+                        && s.details
+                            .get(&(schema.name.clone(), obj.name.clone()))
+                            .is_some_and(|d| d.columns.iter().any(|c| hit(&c.name)));
+                    (!filtering || schema_match || obj_match || col_hit)
+                        .then_some((*obj, obj_match, col_hit))
+                })
+                .collect();
+            if filtering && !schema_match && group_rows.is_empty() {
+                continue;
+            }
+
+            out.push(VisibleRow {
+                item: TreeItem::new(1, true, group_open),
+                content: RowContent::Group {
+                    kind,
+                    count: loaded.then_some(members.len()),
+                },
+                node: Some(group_node),
+                preview: None,
+            });
+            if !group_open {
+                continue;
+            }
+            // Expanded but still in flight: one placeholder row, same shape the
+            // column list uses while `DescribeTable` is outstanding.
+            if !loaded {
+                out.push(VisibleRow {
                     item: TreeItem::leaf(2),
                     content: RowContent::Loading,
                     node: None,
                     preview: None,
-                }),
+                });
+                continue;
+            }
+
+            for (obj, obj_match, col_hit) in group_rows {
+                let obj_node = NodeId::Object {
+                    schema: schema.name.clone(),
+                    name: obj.name.clone(),
+                };
+                // Force open to reveal the matching columns when only a column hit.
+                let force = filtering && !schema_match && !obj_match && col_hit;
+                let obj_open = s.expanded.contains(&obj_node) || force;
+                // Only a relation has columns to expand into, and only a relation
+                // can be previewed: activating a trigger row would build a
+                // `SELECT * FROM <trigger>`.
+                let expandable = obj.kind.is_relation();
+                out.push(VisibleRow {
+                    item: TreeItem::new(2, expandable, obj_open && expandable),
+                    content: RowContent::Object {
+                        kind: obj.kind,
+                        name: obj.name.clone(),
+                    },
+                    node: Some(obj_node),
+                    preview: expandable.then(|| (schema.name.clone(), obj.name.clone())),
+                });
+                if !obj_open || !expandable {
+                    continue;
+                }
+
+                match s.details.get(&(schema.name.clone(), obj.name.clone())) {
+                    Some(detail) => {
+                        for col in &detail.columns {
+                            // Narrowing by a column hit shows only matching columns.
+                            if filtering && !schema_match && !obj_match && !hit(&col.name) {
+                                continue;
+                            }
+                            let is_fk = detail.foreign_keys.iter().any(|fk| fk.column == col.name);
+                            out.push(VisibleRow {
+                                item: TreeItem::leaf(3),
+                                content: RowContent::Column {
+                                    meta: col.clone(),
+                                    is_fk,
+                                },
+                                node: Some(NodeId::Column {
+                                    schema: schema.name.clone(),
+                                    table: obj.name.clone(),
+                                    name: col.name.clone(),
+                                }),
+                                preview: None,
+                            });
+                        }
+                    }
+                    None => out.push(VisibleRow {
+                        item: TreeItem::leaf(3),
+                        content: RowContent::Loading,
+                        node: None,
+                        preview: None,
+                    }),
+                }
             }
         }
     }
@@ -229,6 +382,23 @@ fn next_navigable(flat: &[VisibleRow], from: Option<usize>, forward: bool) -> Op
         (None, false) => (0..len).rev().find(|&i| has_node(i)),
         (Some(cur), true) => ((cur + 1)..len).find(|&i| has_node(i)),
         (Some(cur), false) => (0..cur).rev().find(|&i| has_node(i)),
+    }
+}
+
+/// The icon name + colour one [`ObjectKind`] is drawn with, shared by the tree,
+/// the group nodes, and any other surface that lists objects, so a function is
+/// never a table in one place and a routine in another.
+pub(crate) fn object_icon(kind: ObjectKind, cx: &App) -> (&'static str, gpui::Hsla) {
+    let theme = cx.theme();
+    match kind {
+        ObjectKind::Table => ("table", theme.text_muted),
+        ObjectKind::View => ("view", theme.cyan),
+        ObjectKind::MaterializedView => ("matview", theme.blue),
+        ObjectKind::Function => ("function", theme.purple),
+        ObjectKind::Procedure => ("procedure", theme.purple),
+        ObjectKind::Trigger => ("trigger", theme.orange),
+        ObjectKind::Sequence => ("sequence", theme.green),
+        ObjectKind::Type => ("udt", theme.yellow),
     }
 }
 
@@ -260,11 +430,35 @@ fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
             )
             .into_any_element(),
 
+        RowContent::Group { kind, count } => {
+            let (name_icon, color) = object_icon(*kind, cx);
+            let mut row = div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .gap_1p5()
+                .child(crate::icons::icon(name_icon, theme.scale(13.), color))
+                .child(
+                    div()
+                        .text_size(theme.scale(11.5))
+                        .text_color(muted)
+                        .child(kind.group_label()),
+                );
+            if let Some(n) = count {
+                row = row.child(
+                    div()
+                        .ml_auto()
+                        .font_family(theme.font_family.clone())
+                        .text_size(theme.scale(10.))
+                        .text_color(faint)
+                        .child(n.to_string()),
+                );
+            }
+            row.into_any_element()
+        }
+
         RowContent::Object { kind, name } => {
-            let (name_icon, color) = match kind {
-                ObjectKind::Table => ("table", muted),
-                ObjectKind::View => ("view", theme.cyan),
-            };
+            let (name_icon, color) = object_icon(*kind, cx);
             div()
                 .flex()
                 .items_center()
@@ -429,7 +623,9 @@ impl AppState {
                             this.schema_preview(schema, table, cx);
                         }
                     }
-                    Some(node @ NodeId::Schema(_)) => {
+                    // A folder row (namespace or object group) has nothing to
+                    // open, so a body click is the expand it looks like.
+                    Some(node @ (NodeId::Schema(_) | NodeId::Group { .. })) => {
                         this.schema_select(node.clone(), cx);
                         this.schema_toggle(node, cx);
                     }
@@ -566,13 +762,39 @@ impl AppState {
             }
             NodeId::Object { schema, name } => {
                 let (sc, nm) = (schema.clone(), name.clone());
-                items = items
-                    .item(
-                        ContextMenuItem::new("schema-browse", "Browse").on_click(cx.listener({
+                // The kind decides which actions make sense: a routine cannot be
+                // browsed, and its definition is the only thing there is to see.
+                let kind = active
+                    .schema
+                    .schemas
+                    .iter()
+                    .find(|ns| ns.name == *schema)
+                    .and_then(|ns| ns.objects.iter().find(|o| o.name == *name))
+                    .map(|o| o.kind)
+                    .or_else(|| {
+                        active.schema.groups.iter().find_map(|((ns, k), objs)| {
+                            (ns == schema && objs.iter().any(|o| o.name == *name)).then_some(*k)
+                        })
+                    })
+                    .unwrap_or(ObjectKind::Table);
+                if kind.is_relation() {
+                    items = items.item(ContextMenuItem::new("schema-browse", "Browse").on_click(
+                        cx.listener({
                             let (sc, nm) = (sc.clone(), nm.clone());
                             move |this, _, _, cx| {
                                 this.schema_close_menu(cx);
                                 this.schema_preview(sc.clone(), nm.clone(), cx);
+                            }
+                        }),
+                    ));
+                }
+                items = items
+                    .item(
+                        ContextMenuItem::new("schema-ddl", "Show DDL").on_click(cx.listener({
+                            let (sc, nm) = (sc.clone(), nm.clone());
+                            move |this, _, _, cx| {
+                                this.schema_close_menu(cx);
+                                this.open_object_ddl(sc.clone(), nm.clone(), kind, cx);
                             }
                         })),
                     )
@@ -600,6 +822,32 @@ impl AppState {
                             })),
                     );
             }
+            NodeId::Group { schema, kind } => {
+                // A lazy group is a cached fetch, so it is the one tree node with
+                // something to refresh: a routine created since the group was
+                // expanded is otherwise invisible until reconnect.
+                let (sc, k) = (schema.clone(), *kind);
+                if k.is_lazy() {
+                    items = items.item(
+                        ContextMenuItem::new("schema-group-refresh", "Refresh").on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.schema_close_menu(cx);
+                                this.schema_reload_group(sc.clone(), k, cx);
+                            }),
+                        ),
+                    );
+                } else {
+                    let ns = sc.clone();
+                    items = items.item(
+                        ContextMenuItem::new("schema-group-new-query", "New query here").on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.schema_close_menu(cx);
+                                this.schema_new_query_in(ns.clone(), window, cx);
+                            }),
+                        ),
+                    );
+                }
+            }
             // Filtered out before the menu opens.
             NodeId::Column { .. } => {}
         }
@@ -626,13 +874,28 @@ impl AppState {
     /// fires a lazy `DescribeTable`.
     pub(crate) fn schema_toggle(&mut self, node: NodeId, cx: &mut Context<Self>) {
         let mut describe = None;
+        let mut load_group = None;
         if let Phase::Connected(active) = &mut self.phase {
             let s = &mut active.schema;
             if !s.expanded.remove(&node) {
-                if let NodeId::Object { schema, name } = &node
-                    && !s.details.contains_key(&(schema.clone(), name.clone()))
-                {
-                    describe = Some((schema.clone(), name.clone()));
+                match &node {
+                    NodeId::Object { schema, name }
+                        if !s.details.contains_key(&(schema.clone(), name.clone())) =>
+                    {
+                        describe = Some((schema.clone(), name.clone()));
+                    }
+                    // Expanding a lazy group is what fetches it. Guarded on both
+                    // the cache and the in-flight set, so collapsing and
+                    // re-expanding does not re-query, and a slow catalog does not
+                    // collect one request per impatient click.
+                    NodeId::Group { schema, kind }
+                        if kind.is_lazy()
+                            && !s.groups.contains_key(&(schema.clone(), *kind))
+                            && s.groups_loading.insert((schema.clone(), *kind)) =>
+                    {
+                        load_group = Some((schema.clone(), *kind));
+                    }
+                    _ => {}
                 }
                 s.expanded.insert(node);
             }
@@ -640,6 +903,30 @@ impl AppState {
         if let Some((schema, table)) = describe {
             self.send_active(Command::DescribeTable { schema, table });
         }
+        if let Some((namespace, kind)) = load_group {
+            self.send_active(Command::LoadObjectGroup { namespace, kind });
+        }
+        cx.notify();
+    }
+
+    /// Drop one lazy group's cache and re-fetch it, keeping the node expanded so
+    /// the refresh reads as a reload rather than a collapse.
+    pub(crate) fn schema_reload_group(
+        &mut self,
+        namespace: String,
+        kind: ObjectKind,
+        cx: &mut Context<Self>,
+    ) {
+        if let Phase::Connected(active) = &mut self.phase {
+            let s = &mut active.schema;
+            s.groups.remove(&(namespace.clone(), kind));
+            s.groups_loading.insert((namespace.clone(), kind));
+            s.expanded.insert(NodeId::Group {
+                schema: namespace.clone(),
+                kind,
+            });
+        }
+        self.send_active(Command::LoadObjectGroup { namespace, kind });
         cx.notify();
     }
 
@@ -751,7 +1038,12 @@ impl AppState {
     }
 
     /// Copy `text` and confirm with a toast; the tree's copy-name actions.
-    fn copy_to_clipboard(&mut self, text: String, message: &'static str, cx: &mut Context<Self>) {
+    pub(crate) fn copy_to_clipboard(
+        &mut self,
+        text: String,
+        message: &'static str,
+        cx: &mut Context<Self>,
+    ) {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         self.notify(ToastVariant::Success, message, cx);
     }

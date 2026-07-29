@@ -234,6 +234,13 @@ pub(crate) struct ActiveQuery {
 /// switching between connections is instant: no reconnect, no schema reload.
 pub(crate) struct SessionState {
     pub(crate) driver: SessionDriver,
+    /// Which engine this session dialled, captured at connect.
+    ///
+    /// The driver knows, but only behind a trait with no "what am I" accessor, and
+    /// a job that needs it (the schema comparison, whose type equivalence is
+    /// engine-dependent) would otherwise have to be told by the UI, which is a
+    /// second source of truth for something the session already knows.
+    pub(crate) kind: red_core::DbKind,
     /// This connection's optional AI policy overrides (M-S7), captured at connect
     /// from its [`ConnectionConfig`](red_core::ConnectionConfig). Layered over the
     /// global `[ai]` policy when a turn runs on this session, so a sensitive
@@ -302,12 +309,14 @@ pub(crate) struct AiOverride {
 impl SessionState {
     pub(crate) fn new(
         driver: SessionDriver,
+        kind: red_core::DbKind,
         forward: Option<Forward>,
         ai_override: AiOverride,
         read_only: bool,
     ) -> Self {
         Self {
             driver,
+            kind,
             ai_override,
             read_only,
             _forward: forward,
@@ -384,6 +393,9 @@ pub(crate) enum ConnectOutcome {
         ai_override: AiOverride,
         /// The connection's read-only posture, captured at connect for the AI policy.
         read_only: bool,
+        /// Which engine was dialled, captured with the rest so the session can
+        /// answer "what am I" without a driver accessor.
+        kind: red_core::DbKind,
         result: Result<(SessionDriver, Option<Forward>), ConnectFail>,
     },
     /// A session-less `TestConnection` finished; carries the server version on
@@ -425,6 +437,7 @@ pub(crate) fn apply_connect_outcome(
             generation,
             ai_override,
             read_only,
+            kind,
             result,
         } => {
             // A newer `Connect` on this id superseded the one that produced this
@@ -437,7 +450,7 @@ pub(crate) fn apply_connect_outcome(
                     let version = driver.server_version();
                     sessions.insert(
                         id,
-                        SessionState::new(driver, forward, ai_override, read_only),
+                        SessionState::new(driver, kind, forward, ai_override, read_only),
                     );
                     // Evict any ACP conversation still bound to this id: it grounds in
                     // the prior connection's driver. The reconnect already fired an

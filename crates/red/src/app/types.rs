@@ -932,6 +932,22 @@ pub(crate) enum PendingWrite {
         prose: String,
         preview: String,
     },
+    /// A confirmed stop of someone else's server session (the Server panel).
+    ///
+    /// Rides this modal rather than a bespoke dialog so it inherits the whole
+    /// confirm posture: the production connection cannot silence it, the prose
+    /// names exactly what is being stopped, and the preview shows the statement
+    /// that will be interrupted. Terminate is graded harder than Cancel because it
+    /// rolls back an open transaction.
+    KillSession {
+        key: red_core::SessionKey,
+        mode: red_core::KillMode,
+        /// Who and what, for the prose: RED will not ask "stop session 4821?" when
+        /// it can ask "stop reporting's 40-minute query on orders_prod?".
+        who: String,
+        /// The statement being stopped, for the preview pane.
+        query: String,
+    },
     /// A confirmed table copy (result → another table). Carries everything to fire
     /// `Command::CopyToTable` on confirm plus the precomputed `prose`/`preview` (the
     /// name-based mapping) the dialog shows. The confirm offers two modes: Append (the
@@ -1187,6 +1203,20 @@ pub(crate) const EMPTY_QUERY: &str = "-- Write SQL, Ctrl+Enter to run\n";
 
 /// One query tab: its own SQL editor and result grid. A connection holds several
 /// of these; the schema sidebar, split sizes, and query history are shared.
+/// A whole-half tab body: a surface that stands in for the editor + result pair
+/// because there is no query behind it. Add a variant to add a body; the guards
+/// that ask "is this a query tab" need no change.
+pub(crate) enum TabView {
+    /// The read-only ER diagram (see [`crate::er`]).
+    Er(crate::er::ErView),
+    /// One object's `CREATE` statement (see [`crate::ddl`]).
+    Ddl(crate::ddl::DdlView),
+    /// The connection's health report (see [`crate::health`]).
+    Health(crate::health::HealthView),
+    /// A finished schema comparison (see [`crate::ddl`]).
+    SchemaDiff(crate::ddl::SchemaDiffView),
+}
+
 pub(crate) struct QueryTab {
     /// Tab label: "query N" for a blank tab, or "schema.table" for a preview.
     pub title: String,
@@ -1197,11 +1227,19 @@ pub(crate) struct QueryTab {
     /// The query plan (Track B4, EXPLAIN), when one is open. Occupies the result
     /// pane in place of the grid; running a query clears it. `None` is the grid.
     pub plan: Option<crate::plan::PlanView>,
-    /// The read-only ER diagram (see [`crate::er`]) when this tab is a diagram
-    /// rather than a query. Unlike `plan`, which shares the result slot with the
-    /// grid, a diagram replaces the **whole half**: there's no query behind it, so
-    /// an editor above it would be dead space. `None` for an ordinary query tab.
-    pub er: Option<crate::er::ErView>,
+    /// This tab's live watch (re-run on an interval), or `None`. Transient: a
+    /// watch dies with its tab and is never persisted, matching the Redis
+    /// browse's auto-refresh.
+    pub watch: Option<crate::result::watch::Watch>,
+    /// A body that replaces the **whole half** instead of the editor+result pair:
+    /// an ER diagram, an object's DDL. `None` is an ordinary query tab.
+    ///
+    /// An enum rather than one `Option` per body. These are mutually exclusive by
+    /// construction (a tab is a diagram or a DDL view or a query, never two), and
+    /// every query-shaped action guards on the same question -- "does this tab
+    /// have a query behind it" -- which is now [`QueryTab::is_view`] in one place
+    /// rather than a widening list of `!is_er() && !is_ddl() && ...` conditions.
+    pub view: Option<TabView>,
     /// Which split half owns this tab (Zed-style): each pane's tab strip shows only
     /// its own tabs, so the two halves never duplicate. Always `Primary` while the
     /// work area is unsplit; a drag across the divider (or `split_right`) reassigns it.
@@ -1272,7 +1310,8 @@ impl QueryTab {
             editor,
             result: None,
             plan: None,
-            er: None,
+            watch: None,
+            view: None,
             // New tabs join the focused pane; `push_tab` reassigns this when split.
             pane: SplitHalf::Primary,
             pinned: false,
@@ -1283,25 +1322,72 @@ impl QueryTab {
     /// A blank tab the user hasn't touched: no result and the default text still
     /// in the editor. Closing one of these doesn't warrant a confirmation.
     ///
-    /// An ER tab is never pristine. Its editor is untouched by construction (it has
-    /// none on screen), so without this it would read as blank and be swept up by
-    /// the "replace the empty tab" paths, taking the user's laid-out diagram with it.
+    /// A whole-half body (diagram, DDL) is never pristine. Its editor is untouched
+    /// by construction (it has none on screen), so without this it would read as
+    /// blank and be swept up by the "replace the empty tab" paths, taking the
+    /// user's laid-out diagram with it.
     pub(crate) fn is_pristine(&self, cx: &Context<AppState>) -> bool {
-        self.er.is_none() && self.result.is_none() && self.editor.read(cx).content() == EMPTY_QUERY
+        self.view.is_none()
+            && self.result.is_none()
+            && self.editor.read(cx).content() == EMPTY_QUERY
     }
 
-    /// Whether this tab shows an ER diagram instead of the editor/result pair. The
-    /// query-shaped actions (run, explain, export, filter) are meaningless on one.
+    /// Whether this tab shows a whole-half body instead of the editor/result pair.
+    /// The query-shaped actions (run, explain, export, filter) are meaningless on
+    /// one, and this is the single predicate they all guard on.
+    pub(crate) fn is_view(&self) -> bool {
+        self.view.is_some()
+    }
+
+    /// Whether this tab shows an ER diagram specifically, for the diagram-only
+    /// affordances (pan/zoom keys, "fit"). Prefer [`Self::is_view`] for anything
+    /// that only means "not a query".
     pub(crate) fn is_er(&self) -> bool {
-        self.er.is_some()
+        matches!(self.view, Some(TabView::Er(_)))
     }
 
-    /// Whether closing this tab should stop and ask. A diagram never does: it holds
-    /// no query and no unsaved edit, only a pan/zoom and any boxes the user dragged,
-    /// and reopening it from the tree is one right-click. Asking would be the same
-    /// "you may lose work" prompt the *query* tabs use, which would not be true here.
+    pub(crate) fn er(&self) -> Option<&crate::er::ErView> {
+        match &self.view {
+            Some(TabView::Er(er)) => Some(er),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn er_mut(&mut self) -> Option<&mut crate::er::ErView> {
+        match &mut self.view {
+            Some(TabView::Er(er)) => Some(er),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn health(&self) -> Option<&crate::health::HealthView> {
+        match &self.view {
+            Some(TabView::Health(h)) => Some(h),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn health_mut(&mut self) -> Option<&mut crate::health::HealthView> {
+        match &mut self.view {
+            Some(TabView::Health(h)) => Some(h),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn ddl(&self) -> Option<&crate::ddl::DdlView> {
+        match &self.view {
+            Some(TabView::Ddl(d)) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// Whether closing this tab should stop and ask. A whole-half body never does:
+    /// it holds no query and no unsaved edit, only a pan/zoom or a rendered
+    /// definition, and reopening it from the tree is one right-click. Asking would
+    /// be the same "you may lose work" prompt the *query* tabs use, which would
+    /// not be true here.
     pub(crate) fn needs_close_confirm(&self, cx: &Context<AppState>) -> bool {
-        !self.is_er() && !self.is_pristine(cx)
+        !self.is_view() && !self.is_pristine(cx)
     }
 }
 
@@ -1455,14 +1541,23 @@ pub(crate) struct ActiveConn {
     /// ([`DbKind::tracks_mutations`](red_core::DbKind::tracks_mutations)); on every
     /// other engine a write is finished when the statement returns and there would be
     /// nothing to show.
-    pub mutations_open: bool,
+    pub server_open: bool,
+    /// Which view the Server dock shows (Sessions / Mutations).
+    pub server_view: crate::server_panel::ServerView,
+    /// The last server-session listing, longest-running first.
+    pub sessions: Vec<red_core::ServerSession>,
+    /// The connected role could not see other sessions' SQL, so the panel says so
+    /// rather than reading as an idle server.
+    pub sessions_restricted: bool,
+    /// A listing is in flight.
+    pub sessions_loading: bool,
     /// The last `system.mutations` listing, unfinished first. Refreshed on open, on
     /// every submit, and while anything is still running.
     pub mutations: Vec<red_core::MutationInfo>,
     /// A listing is in flight (the panel shows it instead of an empty state).
     pub mutations_loading: bool,
-    pub mutations_w: Pixels,
-    pub mutations_drag: Option<DragAnchor>,
+    pub server_w: Pixels,
+    pub server_drag: Option<DragAnchor>,
     /// Whether the Columns panel (inline FK expansion, Track B7) is shown in the left
     /// dock, i.e. the recursive tree that picks referenced columns into the active
     /// browse.
@@ -1492,15 +1587,24 @@ pub(crate) struct ActiveConn {
 }
 
 impl ActiveConn {
+    /// `kv_mode` is passed in rather than read from settings here, and must stay
+    /// that way: this runs inside `on_connected`, which the backend-event pump
+    /// calls through `Entity::update`, so `AppState` is **leased** for the whole
+    /// call. Reaching back through `cx.entity().read(cx)` to fetch a setting is a
+    /// double-lease panic ("cannot read AppState while it is already being
+    /// updated") on every single connect. The caller has `&mut self` and can read
+    /// its own settings directly.
     pub(crate) fn new(
         session: SessionId,
         conn_id: String,
         config: ConnectionConfig,
         version: String,
+        kv_mode: crate::kvbrowse::QueryMode,
         cx: &mut Context<AppState>,
     ) -> Self {
         let tab = QueryTab::new("query 1".to_string(), cx);
-        let kv_mode = cx.entity().read(cx).settings.kv.default_query_mode.into();
+        // Read before `config` is moved into the struct below.
+        let kind = config.kind;
         let kv_view = (config.kind == DbKind::Redis)
             .then(|| crate::kvbrowse::RedisView::new(session, kv_mode, cx));
         let doc_view = (config.kind == DbKind::Mongo)
@@ -1530,7 +1634,7 @@ impl ActiveConn {
             editor_drag: None,
             inspector_w: px(360.),
             inspector_drag: None,
-            schema: SchemaState::new(cx),
+            schema: SchemaState::new(kind, cx),
             fk_graph: Vec::new(),
             lookup_cache: std::collections::HashMap::new(),
             enum_cache: std::collections::HashMap::new(),
@@ -1552,11 +1656,15 @@ impl ActiveConn {
             history_bucket_collapsed: std::collections::HashSet::new(),
             history_w: px(240.),
             history_drag: None,
-            mutations_open: false,
+            server_open: false,
+            server_view: crate::server_panel::ServerView::default(),
+            sessions: Vec::new(),
+            sessions_restricted: false,
+            sessions_loading: false,
             mutations: Vec::new(),
             mutations_loading: false,
-            mutations_w: px(320.),
-            mutations_drag: None,
+            server_w: px(320.),
+            server_drag: None,
             columns_open: false,
             columns_w: px(260.),
             columns_drag: None,

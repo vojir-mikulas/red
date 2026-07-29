@@ -533,6 +533,8 @@ fn list_tables(
     let tables = chosen
         .objects
         .iter()
+        // Migrate/copy source: `Table` only, never `is_relation()`. A view has no
+        // DDL this path can recreate on the target.
         .filter(|o| matches!(o.kind, ObjectKind::Table))
         .map(|o| o.name.clone())
         .collect();
@@ -552,6 +554,7 @@ fn target_table_names(
                 return Ok(schemas
                     .iter()
                     .flat_map(|s| s.objects.iter())
+                    // Write target: `Table` only, as above.
                     .filter(|o| matches!(o.kind, ObjectKind::Table))
                     .map(|o| o.name.to_ascii_lowercase())
                     .collect());

@@ -213,6 +213,9 @@ pub struct AppState {
     /// The find-in-result bar, when open (Track B2, Tier 1). Transient UI; it
     /// scans loaded rows and holds the matches + focused index in its own state.
     pub(crate) find_bar: Option<crate::find::FindBarState>,
+    /// Where the watch-interval popover is anchored, or `None` when closed.
+    /// Single-instance app state like the find bar: only one can be open.
+    pub(crate) watch_menu: Option<gpui::Point<gpui::Pixels>>,
     /// Window-coordinate anchor for the result cell's right-click context menu,
     /// when open. The right-click selects the cell first, so the menu's Inspect/
     /// Copy act on it; `None` keeps the menu closed.
@@ -428,6 +431,12 @@ pub struct AppState {
     /// saved report survives a restart and is shown when the Analysis panel
     /// reopens on that connection.
     pub(crate) redis_analysis: crate::redis_analysis::AnalysisStore,
+    /// The saved SQL health report per connection, the [`redis_analysis`] twin
+    /// for the `DatabaseDriver` seam.
+    pub(crate) health_store: crate::health_store::HealthStore,
+    /// The namespaces offered by the open schema-comparison picker, in the order
+    /// it listed them, so an activation index resolves back to a name.
+    pub(crate) compare_schemas: Vec<String>,
     /// Persisted per-connection "recently viewed keys" (see `recent_keys.rs`),
     /// loaded once at startup and seeded into a Redis view when it connects, so
     /// the inspector's browsing history survives a restart.
@@ -1197,6 +1206,7 @@ impl AppState {
             filter_mode: crate::filter::FilterMode::default(),
             filter_history: crate::filters::FilterHistory::load(),
             find_bar: None,
+            watch_menu: None,
             autoscroll: None,
             autoscroll_epoch: 0,
             cell_menu: None,
@@ -1263,6 +1273,8 @@ impl AppState {
             loaded_conversations: Vec::new(),
             query_history: crate::history::QueryHistory::load(),
             redis_analysis: crate::redis_analysis::AnalysisStore::load(),
+            health_store: crate::health_store::HealthStore::load(),
+            compare_schemas: Vec::new(),
             redis_recent_keys: crate::recent_keys::RecentKeysStore::load(),
             redis_key_meta: crate::key_meta::KeyMetaStore::load(),
             local_state,
@@ -1622,6 +1634,34 @@ impl AppState {
                     self.refresh_completions(cx);
                 }
             }
+            Event::ObjectGroupLoaded {
+                namespace,
+                kind,
+                objects,
+            } => {
+                if let Some(active) = self.conn_mut(session) {
+                    active.schema.apply_object_group(namespace, kind, objects);
+                }
+            }
+            Event::SchemaDiffFinished {
+                left, right, delta, ..
+            } => self.on_schema_diff(left, right, delta, cx),
+            Event::SchemaDiffFailed { message, .. } => self.on_schema_diff_failed(message, cx),
+            Event::HealthReportReady { report } => self.on_health_report(session, report, cx),
+            Event::HealthReportFailed { message } => {
+                self.on_health_report_failed(session, message, cx)
+            }
+            Event::ServerSessionsReady {
+                sessions,
+                restricted,
+            } => self.on_server_sessions(session, sessions, restricted, cx),
+            Event::ServerSessionKilled { .. } => self.on_server_session_killed(cx),
+            Event::ObjectDdlReady { epoch, ddl, .. } => {
+                self.on_object_ddl_ready(session, epoch, ddl, cx);
+            }
+            Event::ObjectDdlFailed { epoch, message } => {
+                self.on_object_ddl_failed(session, epoch, message);
+            }
             Event::TableDescribed {
                 schema,
                 table,
@@ -1877,8 +1917,16 @@ impl AppState {
                 rows,
                 estimated,
                 seq,
-            } => self.on_result_run(session, epoch, fetch, rows, estimated, seq, cx),
-            Event::ResultRunFailed { epoch, seq } => self.on_result_run_failed(session, epoch, seq),
+            } => {
+                self.on_result_run(session, epoch, fetch, rows, estimated, seq, cx);
+                // A watched result's rows landing is what closes a tick: it clears
+                // the in-flight flag and computes the change flashes + row delta.
+                self.watch_rows_landed(session, epoch);
+            }
+            Event::ResultRunFailed { epoch, seq } => {
+                self.on_result_run_failed(session, epoch, seq);
+                self.watch_run_failed(session, epoch, cx);
+            }
             Event::CopyRowsLoaded { id, rows } => self.on_copy_rows(id, rows, cx),
             // Column-stats bar (pushed-down aggregate summary).
             Event::ColumnStatsReady {
@@ -2148,6 +2196,7 @@ impl AppState {
                 self.submitted_batch = Some((epoch, sources));
                 self.send_active(Command::ApplyBatch { epoch, ops, mode });
             }
+            Some(PendingWrite::KillSession { key, mode, .. }) => self.run_kill_session(key, mode),
             Some(PendingWrite::Import {
                 path,
                 format,

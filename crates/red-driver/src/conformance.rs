@@ -133,6 +133,47 @@ pub(crate) async fn abort_after_completion_is_noop(driver: &dyn DatabaseDriver, 
 /// engine-agnostic result. Fixtures: a `books` table with an integer primary key
 /// `id`, a NOT NULL `title`, an `author_id` foreign key to `authors(id)`, and an
 /// index over `author_id`; plus a `recent` view.
+/// The lazy object groups obey their two contracts: a group only ever answers
+/// with objects of the kind that was asked for (so the tree cannot file a
+/// trigger under Functions), and asking for a *relation* kind is empty, because
+/// relations ride the `list_objects` skeleton instead.
+///
+/// `expect` names one object the engine should report for `kind`, or is `None`
+/// when the caller only wants the invariants checked.
+pub(crate) async fn object_groups_answer_only_their_kind(
+    driver: &dyn DatabaseDriver,
+    schema: &str,
+    kind: ObjectKind,
+    expect: Option<&str>,
+) {
+    let objects = driver.list_object_group(schema, kind).await.unwrap();
+    assert!(
+        objects.iter().all(|o| o.kind == kind),
+        "every object in a {kind:?} group is a {kind:?}"
+    );
+    if let Some(name) = expect {
+        assert!(
+            objects.iter().any(|o| o.name.contains(name)),
+            "{name} present in the {kind:?} group, got {:?}",
+            objects.iter().map(|o| &o.name).collect::<Vec<_>>()
+        );
+    }
+    for relation in [
+        ObjectKind::Table,
+        ObjectKind::View,
+        ObjectKind::MaterializedView,
+    ] {
+        assert!(
+            driver
+                .list_object_group(schema, relation)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{relation:?} is a relation and belongs to the skeleton, not a lazy group"
+        );
+    }
+}
+
 pub(crate) async fn introspects_tables_columns_fks_and_indexes(
     driver: &dyn DatabaseDriver,
     schema: &str,

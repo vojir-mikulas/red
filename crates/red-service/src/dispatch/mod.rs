@@ -614,6 +614,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // The connection's read-only posture, captured before `config` moves
                 // into the dial task, so the session can gate the AI write tool.
                 let read_only = config.read_only;
+                let kind = config.kind;
                 let tx = connect_tx.clone();
                 tokio::spawn(async move {
                     let result = attempt_connect(&config).await;
@@ -622,6 +623,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         generation,
                         ai_override,
                         read_only,
+                        kind,
                         result,
                     });
                 });
@@ -1176,6 +1178,47 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             }
 
             Command::LoadObjects => schema_cmds::load_objects(&sessions, session_id, &events).await,
+            Command::LoadObjectGroup { namespace, kind } => {
+                schema_cmds::load_object_group(&sessions, session_id, &events, namespace, kind)
+                    .await
+            }
+            Command::DiffSchemas {
+                id,
+                left_namespace,
+                right_session,
+                right_namespace,
+            } => {
+                schema_cmds::diff_schemas(
+                    &sessions,
+                    session_id,
+                    &events,
+                    id,
+                    left_namespace,
+                    right_session,
+                    right_namespace,
+                )
+                .await
+            }
+            Command::BuildHealthReport => {
+                schema_cmds::build_health_report(&sessions, session_id, &events).await
+            }
+            Command::ListServerSessions => {
+                schema_cmds::list_server_sessions(&sessions, session_id, &events).await
+            }
+            Command::KillServerSession { key, mode } => {
+                schema_cmds::kill_server_session(&sessions, session_id, &events, key, mode).await
+            }
+            Command::ObjectDdl {
+                epoch,
+                namespace,
+                name,
+                kind,
+            } => {
+                schema_cmds::object_ddl(
+                    &sessions, session_id, &events, epoch, namespace, name, kind,
+                )
+                .await
+            }
             Command::LoadForeignKeys => {
                 schema_cmds::load_foreign_keys(&sessions, session_id, &events).await
             }

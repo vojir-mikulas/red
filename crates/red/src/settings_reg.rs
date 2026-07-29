@@ -521,6 +521,44 @@ static DEFS: &[SettingDef] = &[
         set: |s, v| s.sql.statement_timeout = v.as_int().clamp(0, i64::from(u32::MAX)) as u32,
         warn: None,
     },
+    SettingDef {
+        key: "sql.watch_default_secs",
+        tab: SettingsTab::Sql,
+        group: "Watch",
+        label: "Default watch interval",
+        help: "Arm watch at this interval on every result that can take one. Off \
+               means watch starts only when you ask for it.",
+        applies: Applies::Sql,
+        control: Control::Segments(&[
+            seg("Off", int(0)),
+            seg("5s", int(5)),
+            seg("10s", int(10)),
+            seg("30s", int(30)),
+        ]),
+        get: |s| Value::Int(s.sql.watch_default_secs as i64),
+        set: |s, v| s.sql.watch_default_secs = v.as_int().max(0) as u64,
+        warn: Some(|s| {
+            (s.sql.watch_default_secs > 0).then_some(
+                "Every result you open will re-run on a loop until you turn its watch off.",
+            )
+        }),
+    },
+    SettingDef {
+        key: "sql.watch_min_secs",
+        tab: SettingsTab::Sql,
+        group: "Watch",
+        label: "Minimum watch interval",
+        help: "Floor under any watch interval. A watch is a query on a loop, so this \
+               is a load guard; production connections are floored at 10s regardless.",
+        applies: Applies::Sql,
+        control: Control::Segments(&[seg("1s", int(1)), seg("2s", int(2)), seg("5s", int(5))]),
+        get: |s| Value::Int(s.sql.watch_min_secs as i64),
+        set: |s, v| s.sql.watch_min_secs = v.as_int().clamp(1, 3600) as u64,
+        warn: Some(|s| {
+            (s.sql.watch_min_secs < 2)
+                .then_some("A 1s floor re-runs the query 60 times a minute, per watched tab.")
+        }),
+    },
     // --- kv seam ---
     SettingDef {
         key: "kv.default_query_mode",

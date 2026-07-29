@@ -275,11 +275,18 @@ impl DatabaseDriver for PostgresDriver {
         let mut schemas = Vec::with_capacity(schema_rows.len());
         for schema_row in schema_rows {
             let schema: String = schema_row.get(0);
+            // `information_schema.tables` does not list materialized views (they
+            // are not in the SQL standard), so the skeleton reads `pg_class`
+            // relkind instead: r/p = table, v = view, m = materialized view. One
+            // query per schema either way, so the connect cost is unchanged.
             let object_rows = self
                 .client
                 .query(
-                    "SELECT table_name, table_type FROM information_schema.tables \
-                     WHERE table_schema = $1 ORDER BY table_name",
+                    "SELECT c.relname, c.relkind::text \
+                     FROM pg_class c \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm') \
+                     ORDER BY c.relname",
                     &[&schema],
                 )
                 .await
@@ -288,13 +295,15 @@ impl DatabaseDriver for PostgresDriver {
                 .iter()
                 .map(|row| {
                     let name: String = row.get(0);
-                    let kind: String = row.get(1);
+                    let relkind: String = row.get(1);
                     ObjectMeta {
                         name,
-                        kind: if kind == "VIEW" {
-                            ObjectKind::View
-                        } else {
-                            ObjectKind::Table
+                        kind: match relkind.as_str() {
+                            "v" => ObjectKind::View,
+                            "m" => ObjectKind::MaterializedView,
+                            // 'r' (ordinary) and 'p' (partitioned parent) are both
+                            // selectable tables as far as the explorer cares.
+                            _ => ObjectKind::Table,
                         },
                     }
                 })
@@ -305,6 +314,71 @@ impl DatabaseDriver for PostgresDriver {
             });
         }
         Ok(schemas)
+    }
+
+    async fn list_object_group(
+        &self,
+        namespace: &str,
+        kind: ObjectKind,
+    ) -> Result<Vec<ObjectMeta>> {
+        // One statement per kind, each names-only and ordered, run when the user
+        // expands that group. Routines carry their argument list in the display
+        // name because Postgres overloads on signature: two `fn`s named the same
+        // are two different objects, and a bare name would draw one row for both.
+        let sql = match kind {
+            ObjectKind::Function => {
+                "SELECT p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' \
+                 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE n.nspname = $1 AND p.prokind = 'f' ORDER BY 1"
+            }
+            // `prokind` is PG 11+. On older servers procedures do not exist at
+            // all, and the query simply returns nothing rather than erroring,
+            // because `prokind` is still a valid column back to 11 and this
+            // driver's floor is well above the versions without it.
+            ObjectKind::Procedure => {
+                "SELECT p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' \
+                 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+                 WHERE n.nspname = $1 AND p.prokind = 'p' ORDER BY 1"
+            }
+            // `tgisinternal` excludes the triggers Postgres creates to enforce
+            // foreign keys; those are constraint plumbing, not user objects, and
+            // listing them would bury the handful a user actually wrote.
+            ObjectKind::Trigger => {
+                "SELECT t.tgname || ' on ' || c.relname \
+                 FROM pg_trigger t \
+                 JOIN pg_class c ON c.oid = t.tgrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND NOT t.tgisinternal ORDER BY 1"
+            }
+            ObjectKind::Sequence => {
+                "SELECT c.relname FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relkind = 'S' ORDER BY 1"
+            }
+            // Enums and composites. Postgres also auto-creates a composite type
+            // per table, so `typrelid = 0 OR relkind = 'c'` filters those out.
+            ObjectKind::Type => {
+                "SELECT t.typname FROM pg_type t \
+                 JOIN pg_namespace n ON n.oid = t.typnamespace \
+                 LEFT JOIN pg_class c ON c.oid = t.typrelid \
+                 WHERE n.nspname = $1 AND t.typtype IN ('e', 'c') \
+                   AND (t.typrelid = 0 OR c.relkind = 'c') ORDER BY 1"
+            }
+            // Relations arrive with the skeleton; nothing lazy to fetch.
+            _ => return Ok(Vec::new()),
+        };
+        let rows = self
+            .client
+            .query(sql, &[&namespace])
+            .await
+            .map_err(driver_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| ObjectMeta {
+                name: row.get(0),
+                kind,
+            })
+            .collect())
     }
 
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableDetail> {
@@ -883,6 +957,686 @@ impl DatabaseDriver for PostgresDriver {
     ) -> Result<u64> {
         let sql = crate::add_fk_sql(child, columns, parent, ref_columns, pg_quote);
         self.execute(&sql).await
+    }
+
+    async fn health(&self, namespace: Option<&str>) -> Result<red_core::health::HealthReport> {
+        use crate::{human_bytes, now_unix};
+        use red_core::health::{
+            Finding, FindingKind, HealthReport, Severity, SizeTotals, TableSize, UnavailableCheck,
+            floors,
+        };
+
+        let mut report = HealthReport::new(
+            red_core::DbKind::Postgres,
+            namespace.map(str::to_string),
+            now_unix(),
+        );
+        // One scope predicate, applied to every check, so a report scoped to a
+        // schema is scoped consistently rather than per query.
+        let scope: Option<String> = namespace.map(str::to_string);
+
+        // --- sizes -----------------------------------------------------------
+        // `pg_total_relation_size` includes indexes and TOAST, which is what "how
+        // big is this table" means to anyone asking. Row counts come from
+        // `reltuples` (the planner's estimate): a COUNT(*) per table would turn a
+        // report into a scan.
+        let rows = self
+            .client
+            .query(
+                "SELECT n.nspname, c.relname, pg_total_relation_size(c.oid), \
+                        pg_indexes_size(c.oid), c.reltuples::bigint \
+                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relkind IN ('r', 'p') \
+                   AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                   AND ($1::text IS NULL OR n.nspname = $1) \
+                 ORDER BY pg_total_relation_size(c.oid) DESC LIMIT 100",
+                &[&scope],
+            )
+            .await
+            .map_err(driver_err)?;
+        let mut totals = SizeTotals::default();
+        for row in &rows {
+            let (schema, name): (String, String) = (row.get(0), row.get(1));
+            let bytes: i64 = row.get(2);
+            let index_bytes: i64 = row.get(3);
+            totals.bytes += bytes.max(0) as u64;
+            totals.index_bytes += index_bytes.max(0) as u64;
+            totals.table_count += 1;
+            report.tables.push(TableSize {
+                table: TableRef {
+                    schema: Some(schema),
+                    name,
+                },
+                bytes: bytes.max(0) as u64,
+                index_bytes: index_bytes.max(0) as u64,
+                estimated_rows: row.get(4),
+            });
+        }
+        report.totals = totals;
+
+        // --- unused indexes --------------------------------------------------
+        // `idx_scan = 0` since the last stats reset. Unique/PK-backing indexes are
+        // excluded: they are constraints, not access paths, and dropping one is a
+        // different decision entirely.
+        match self
+            .client
+            .query(
+                "SELECT s.schemaname, s.relname, s.indexrelname, pg_relation_size(s.indexrelid) \
+                 FROM pg_stat_user_indexes s \
+                 JOIN pg_index i ON i.indexrelid = s.indexrelid \
+                 WHERE s.idx_scan = 0 AND NOT i.indisunique AND NOT i.indisprimary \
+                   AND ($1::text IS NULL OR s.schemaname = $1) \
+                   AND pg_relation_size(s.indexrelid) > $2 \
+                 ORDER BY pg_relation_size(s.indexrelid) DESC LIMIT 50",
+                &[&scope, &(floors::BYTES as i64)],
+            )
+            .await
+        {
+            Ok(rows) => {
+                for row in &rows {
+                    let (schema, table, index): (String, String, String) =
+                        (row.get(0), row.get(1), row.get(2));
+                    let bytes: i64 = row.get(3);
+                    report.findings.push(Finding {
+                        severity: Severity::Warn,
+                        kind: FindingKind::UnusedIndex,
+                        object: Some(TableRef {
+                            schema: Some(schema.clone()),
+                            name: table.clone(),
+                        }),
+                        title: format!("Index {index} has never been used"),
+                        detail: format!(
+                            "{} on {schema}.{table}, and no scan has hit it since the last \
+                             statistics reset. Confirm the reset time before dropping it.",
+                            human_bytes(bytes.max(0) as u64)
+                        ),
+                        suggested_sql: Some(format!(
+                            "DROP INDEX {}.{};",
+                            self.quote_ident(&schema),
+                            self.quote_ident(&index)
+                        )),
+                    });
+                }
+            }
+            Err(e) => report.unavailable.push(UnavailableCheck {
+                kind: FindingKind::UnusedIndex,
+                reason: format!("pg_stat_user_indexes is not readable: {e}"),
+            }),
+        }
+
+        // --- dead tuples / vacuum lag ---------------------------------------
+        match self
+            .client
+            .query(
+                "SELECT schemaname, relname, n_dead_tup, n_live_tup, \
+                        COALESCE(last_autovacuum, last_vacuum)::text \
+                 FROM pg_stat_user_tables \
+                 WHERE n_dead_tup > $2 AND n_dead_tup > n_live_tup * 0.2 \
+                   AND ($1::text IS NULL OR schemaname = $1) \
+                 ORDER BY n_dead_tup DESC LIMIT 25",
+                &[&scope, &floors::ROWS],
+            )
+            .await
+        {
+            Ok(rows) => {
+                for row in &rows {
+                    let (schema, table): (String, String) = (row.get(0), row.get(1));
+                    let (dead, live): (i64, i64) = (row.get(2), row.get(3));
+                    let vacuumed: Option<String> = row.get(4);
+                    report.findings.push(Finding {
+                        severity: Severity::Warn,
+                        kind: FindingKind::DeadTuples,
+                        object: Some(TableRef {
+                            schema: Some(schema.clone()),
+                            name: table.clone(),
+                        }),
+                        title: format!("{schema}.{table} is mostly dead tuples"),
+                        detail: format!(
+                            "{dead} dead against {live} live rows. Last vacuum: {}.",
+                            vacuumed.as_deref().unwrap_or("never")
+                        ),
+                        suggested_sql: Some(format!(
+                            "VACUUM (ANALYZE) {}.{};",
+                            self.quote_ident(&schema),
+                            self.quote_ident(&table)
+                        )),
+                    });
+                }
+            }
+            Err(e) => report.unavailable.push(UnavailableCheck {
+                kind: FindingKind::DeadTuples,
+                reason: format!("pg_stat_user_tables is not readable: {e}"),
+            }),
+        }
+
+        // --- sequential-scan-heavy tables ------------------------------------
+        match self
+            .client
+            .query(
+                "SELECT schemaname, relname, seq_scan, idx_scan, n_live_tup \
+                 FROM pg_stat_user_tables \
+                 WHERE n_live_tup > $2 AND seq_scan > COALESCE(idx_scan, 0) * 4 \
+                   AND seq_scan > 100 AND ($1::text IS NULL OR schemaname = $1) \
+                 ORDER BY seq_scan DESC LIMIT 25",
+                &[&scope, &floors::ROWS],
+            )
+            .await
+        {
+            Ok(rows) => {
+                for row in &rows {
+                    let (schema, table): (String, String) = (row.get(0), row.get(1));
+                    let (seq, idx, live): (i64, Option<i64>, i64) =
+                        (row.get(2), row.get(3), row.get(4));
+                    report.findings.push(Finding {
+                        severity: Severity::Warn,
+                        kind: FindingKind::SeqScanHeavy,
+                        object: Some(TableRef {
+                            schema: Some(schema.clone()),
+                            name: table.clone(),
+                        }),
+                        title: format!("{schema}.{table} is read by sequential scan"),
+                        detail: format!(
+                            "{seq} sequential scans against {} index scans, over ~{live} rows. \
+                             Something is querying it on an unindexed column.",
+                            idx.unwrap_or(0)
+                        ),
+                        suggested_sql: None,
+                    });
+                }
+            }
+            Err(e) => report.unavailable.push(UnavailableCheck {
+                kind: FindingKind::SeqScanHeavy,
+                reason: format!("pg_stat_user_tables is not readable: {e}"),
+            }),
+        }
+
+        // --- tables with no primary key --------------------------------------
+        if let Ok(rows) = self
+            .client
+            .query(
+                "SELECT n.nspname, c.relname, c.reltuples::bigint \
+                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relkind = 'r' \
+                   AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                   AND ($1::text IS NULL OR n.nspname = $1) \
+                   AND c.reltuples > $2 \
+                   AND NOT EXISTS (SELECT 1 FROM pg_constraint k \
+                                   WHERE k.conrelid = c.oid AND k.contype = 'p') \
+                 ORDER BY c.reltuples DESC LIMIT 25",
+                &[&scope, &(floors::ROWS as f32)],
+            )
+            .await
+        {
+            for row in &rows {
+                let (schema, table): (String, String) = (row.get(0), row.get(1));
+                let rows_est: i64 = row.get(2);
+                report.findings.push(Finding {
+                    severity: Severity::Warn,
+                    kind: FindingKind::NoPrimaryKey,
+                    object: Some(TableRef {
+                        schema: Some(schema.clone()),
+                        name: table.clone(),
+                    }),
+                    title: format!("{schema}.{table} has no primary key"),
+                    // Named for the consequence the user will actually meet: RED
+                    // itself cannot offer in-grid editing without a row identity.
+                    detail: format!(
+                        "~{rows_est} rows with no unique row identity. Replication, \
+                         de-duplication, and in-grid editing all need one."
+                    ),
+                    suggested_sql: None,
+                });
+            }
+        }
+
+        // --- foreign keys with no supporting index ---------------------------
+        // Computed from the catalog rather than from `foreign_keys()` so it is one
+        // round trip: the child-side index must have the FK columns as a prefix,
+        // which is what the array-prefix comparison below checks.
+        if let Ok(rows) = self
+            .client
+            .query(
+                "SELECT n.nspname, c.relname, con.conname \
+                 FROM pg_constraint con \
+                 JOIN pg_class c ON c.oid = con.conrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE con.contype = 'f' \
+                   AND ($1::text IS NULL OR n.nspname = $1) \
+                   AND c.reltuples > $2 \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM pg_index i \
+                     WHERE i.indrelid = con.conrelid \
+                       AND (i.indkey::int2[])[0:array_length(con.conkey, 1) - 1] \
+                           OPERATOR(pg_catalog.=) con.conkey) \
+                 ORDER BY c.reltuples DESC LIMIT 25",
+                &[&scope, &(floors::ROWS as f32)],
+            )
+            .await
+        {
+            for row in &rows {
+                let (schema, table, constraint): (String, String, String) =
+                    (row.get(0), row.get(1), row.get(2));
+                report.findings.push(Finding {
+                    severity: Severity::Bad,
+                    kind: FindingKind::MissingFkIndex,
+                    object: Some(TableRef {
+                        schema: Some(schema.clone()),
+                        name: table.clone(),
+                    }),
+                    title: format!("Foreign key {constraint} has no index"),
+                    detail: format!(
+                        "Every delete or key update on the parent scans {schema}.{table} \
+                         to check this constraint, and takes a lock while it does."
+                    ),
+                    suggested_sql: None,
+                });
+            }
+        }
+
+        // Bloat is deliberately not estimated here: the statistics-based estimate
+        // is famously wrong on tables with unusual column ordering, and RED will
+        // not add a pgstattuple dependency or ask anyone to install an extension.
+        report.unavailable.push(UnavailableCheck {
+            kind: FindingKind::Bloat,
+            reason: "not estimated: a statistics-based guess is unreliable. Install \
+                     pgstattuple and measure if you need the number."
+                .to_string(),
+        });
+        Ok(report)
+    }
+
+    async fn server_sessions(&self) -> Result<(Vec<red_core::ServerSession>, bool)> {
+        // `pg_blocking_pids` is the whole reason this is one query and not two: it
+        // resolves the lock graph server-side, so RED never walks pg_locks itself.
+        // Ordered longest-running first and capped, per the trait's contract.
+        let rows = self
+            .client
+            .query(
+                "SELECT pid, usename, application_name, client_addr::text, datname, \
+                        state, wait_event_type || ':' || wait_event AS wait, query, \
+                        EXTRACT(EPOCH FROM (now() - COALESCE(query_start, backend_start))), \
+                        pg_blocking_pids(pid), pid = pg_backend_pid() \
+                 FROM pg_stat_activity \
+                 WHERE backend_type = 'client backend' \
+                 ORDER BY COALESCE(query_start, backend_start) ASC NULLS LAST \
+                 LIMIT 500",
+                &[],
+            )
+            .await
+            .map_err(driver_err)?;
+
+        let mut restricted = false;
+        let sessions = rows
+            .iter()
+            .map(|row| {
+                let pid: i32 = row.get(0);
+                let query: Option<String> = row.get(7);
+                // Postgres substitutes this string for a role that may not read
+                // other backends' SQL. Surface it as "not visible" rather than as
+                // a statement that literally says that.
+                let hidden = query.as_deref() == Some("<insufficient privilege>");
+                restricted |= hidden;
+                let blocked: Vec<i32> = row.get(9);
+                red_core::ServerSession {
+                    key: red_core::SessionKey(pid.to_string()),
+                    user: row.get(1),
+                    application: row.get::<_, Option<String>>(2).filter(|s| !s.is_empty()),
+                    client_addr: row.get(3),
+                    database: row.get(4),
+                    state: row.get::<_, Option<String>>(5).unwrap_or_default(),
+                    wait: row.get(6),
+                    blocked_by: blocked
+                        .into_iter()
+                        .map(|p| red_core::SessionKey(p.to_string()))
+                        .collect(),
+                    query: if hidden { None } else { query },
+                    elapsed_secs: row.get::<_, Option<f64>>(8).unwrap_or(0.0),
+                    is_self: row.get(10),
+                }
+            })
+            .collect();
+        Ok((sessions, restricted))
+    }
+
+    async fn kill_session(
+        &self,
+        key: &red_core::SessionKey,
+        mode: red_core::KillMode,
+    ) -> Result<()> {
+        if self.read_only {
+            return Err(RedError::Query("this connection is read-only".into()));
+        }
+        // Parsed, not interpolated: the key came from this driver as a pid, and
+        // parsing it back is what guarantees no SQL can ride in on it.
+        let pid: i32 = key
+            .0
+            .parse()
+            .map_err(|_| RedError::Driver(format!("not a Postgres backend pid: {key}")))?;
+        let sql = match mode {
+            red_core::KillMode::Cancel => "SELECT pg_cancel_backend($1)",
+            red_core::KillMode::Terminate => "SELECT pg_terminate_backend($1)",
+        };
+        let row = self
+            .client
+            .query_one(sql, &[&pid])
+            .await
+            .map_err(driver_err)?;
+        // Both functions answer false when the pid is gone or out of reach, which
+        // is a real outcome and not an error the caller should swallow.
+        if row.get::<_, bool>(0) {
+            Ok(())
+        } else {
+            Err(RedError::Driver(format!(
+                "the server refused to stop backend {pid}: it may have already \
+                 finished, or your role may not be permitted to signal it"
+            )))
+        }
+    }
+
+    async fn object_ddl(&self, namespace: &str, name: &str, kind: ObjectKind) -> Result<String> {
+        // Postgres has no `SHOW CREATE`. Views and routines have a catalog
+        // function that returns their source exactly; a *table* does not, so it is
+        // assembled below from columns + constraints + indexes + comments.
+        match kind {
+            ObjectKind::View | ObjectKind::MaterializedView => {
+                let materialized = kind == ObjectKind::MaterializedView;
+                let row = self
+                    .client
+                    .query_opt(
+                        "SELECT pg_get_viewdef(c.oid, true) \
+                         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                         WHERE n.nspname = $1 AND c.relname = $2",
+                        &[&namespace, &name],
+                    )
+                    .await
+                    .map_err(driver_err)?
+                    .ok_or_else(|| RedError::Driver(format!("{name} not found in {namespace}")))?;
+                let body: String = row.get(0);
+                let what = if materialized {
+                    "MATERIALIZED VIEW"
+                } else {
+                    "VIEW"
+                };
+                return Ok(format!(
+                    "CREATE {what} {}.{} AS\n{}\n",
+                    self.quote_ident(namespace),
+                    self.quote_ident(name),
+                    body.trim_end()
+                ));
+            }
+            ObjectKind::Function | ObjectKind::Procedure => {
+                // The tree's routine label carries the identity arguments so
+                // overloads are distinguishable; `to_regprocedure` parses exactly
+                // that spelling back into the one routine it names.
+                let signature = format!("{}.{}", self.quote_ident(namespace), name);
+                let row = self
+                    .client
+                    .query_opt(
+                        "SELECT pg_get_functiondef(to_regprocedure($1)::oid)",
+                        &[&signature],
+                    )
+                    .await
+                    .map_err(driver_err)?
+                    .ok_or_else(|| RedError::Driver(format!("{name} not found in {namespace}")))?;
+                let body: Option<String> = row.get(0);
+                return body.map(|b| format!("{}\n", b.trim_end())).ok_or_else(|| {
+                    RedError::Driver(format!("no definition for {name} in {namespace}"))
+                });
+            }
+            ObjectKind::Trigger => {
+                let trigger = name.split(" on ").next().unwrap_or(name);
+                let row = self
+                    .client
+                    .query_opt(
+                        "SELECT pg_get_triggerdef(t.oid, true) \
+                         FROM pg_trigger t \
+                         JOIN pg_class c ON c.oid = t.tgrelid \
+                         JOIN pg_namespace n ON n.oid = c.relnamespace \
+                         WHERE n.nspname = $1 AND t.tgname = $2 AND NOT t.tgisinternal",
+                        &[&namespace, &trigger],
+                    )
+                    .await
+                    .map_err(driver_err)?
+                    .ok_or_else(|| RedError::Driver(format!("{name} not found in {namespace}")))?;
+                let body: String = row.get(0);
+                return Ok(format!("{};\n", body.trim_end()));
+            }
+            ObjectKind::Sequence => {
+                let row = self
+                    .client
+                    .query_opt(
+                        "SELECT data_type::text, start_value, increment, min_value, max_value, \
+                                cycle \
+                         FROM pg_sequences WHERE schemaname = $1 AND sequencename = $2",
+                        &[&namespace, &name],
+                    )
+                    .await
+                    .map_err(driver_err)?
+                    .ok_or_else(|| RedError::Driver(format!("{name} not found in {namespace}")))?;
+                let (ty, start, inc): (String, i64, i64) = (row.get(0), row.get(1), row.get(2));
+                let (min, max, cycle): (i64, i64, bool) = (row.get(3), row.get(4), row.get(5));
+                return Ok(format!(
+                    "CREATE SEQUENCE {}.{}\n    AS {ty}\n    START WITH {start}\n    \
+                     INCREMENT BY {inc}\n    MINVALUE {min}\n    MAXVALUE {max}\n    {};\n",
+                    self.quote_ident(namespace),
+                    self.quote_ident(name),
+                    if cycle { "CYCLE" } else { "NO CYCLE" },
+                ));
+            }
+            ObjectKind::Type => {
+                // Enums render as their label list; a composite as its attributes.
+                let labels = self
+                    .client
+                    .query(
+                        "SELECT e.enumlabel FROM pg_enum e \
+                         JOIN pg_type t ON t.oid = e.enumtypid \
+                         JOIN pg_namespace n ON n.oid = t.typnamespace \
+                         WHERE n.nspname = $1 AND t.typname = $2 ORDER BY e.enumsortorder",
+                        &[&namespace, &name],
+                    )
+                    .await
+                    .map_err(driver_err)?;
+                if !labels.is_empty() {
+                    let variants: Vec<String> = labels
+                        .iter()
+                        .map(|r| format!("    '{}'", r.get::<_, String>(0).replace('\'', "''")))
+                        .collect();
+                    return Ok(format!(
+                        "CREATE TYPE {}.{} AS ENUM (\n{}\n);\n",
+                        self.quote_ident(namespace),
+                        self.quote_ident(name),
+                        variants.join(",\n")
+                    ));
+                }
+                let attrs = self
+                    .client
+                    .query(
+                        "SELECT a.attname, format_type(a.atttypid, a.atttypmod) \
+                         FROM pg_attribute a \
+                         JOIN pg_class c ON c.oid = a.attrelid \
+                         JOIN pg_type t ON t.typrelid = c.oid \
+                         JOIN pg_namespace n ON n.oid = t.typnamespace \
+                         WHERE n.nspname = $1 AND t.typname = $2 AND a.attnum > 0 \
+                           AND NOT a.attisdropped ORDER BY a.attnum",
+                        &[&namespace, &name],
+                    )
+                    .await
+                    .map_err(driver_err)?;
+                let cols: Vec<String> = attrs
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "    {} {}",
+                            self.quote_ident(&r.get::<_, String>(0)),
+                            r.get::<_, String>(1)
+                        )
+                    })
+                    .collect();
+                return Ok(format!(
+                    "CREATE TYPE {}.{} AS (\n{}\n);\n",
+                    self.quote_ident(namespace),
+                    self.quote_ident(name),
+                    cols.join(",\n")
+                ));
+            }
+            ObjectKind::Table => {}
+        }
+
+        // --- Table: assembled, and honest about it. ---
+        //
+        // pg_dump is a large program because faithful Postgres DDL is genuinely
+        // hard (partitioning, inheritance, RLS, storage parameters, grants,
+        // ownership). RED assembles the parts a reader wants and states the rest
+        // as a limitation rather than silently dropping it. Nothing executes this.
+        let mut out = String::new();
+        out.push_str(
+            "-- Assembled by RED from the Postgres catalog. Covers columns, constraints,\n\
+             -- indexes, and comments. Does NOT cover: partitioning, inheritance, RLS,\n\
+             -- storage parameters, grants, or ownership. Use pg_dump for a migration.\n\n",
+        );
+
+        let columns = self
+            .client
+            .query(
+                "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, \
+                        pg_get_expr(d.adbin, d.adrelid), a.attidentity::text \
+                 FROM pg_attribute a \
+                 JOIN pg_class c ON c.oid = a.attrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+                 WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 \
+                   AND NOT a.attisdropped ORDER BY a.attnum",
+                &[&namespace, &name],
+            )
+            .await
+            .map_err(driver_err)?;
+        if columns.is_empty() {
+            return Err(RedError::Driver(format!("{name} not found in {namespace}")));
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+        for row in &columns {
+            let col: String = row.get(0);
+            let ty: String = row.get(1);
+            let not_null: bool = row.get(2);
+            let default: Option<String> = row.get(3);
+            let identity: String = row.get(4);
+            let mut line = format!("    {} {ty}", self.quote_ident(&col));
+            match identity.as_str() {
+                "a" => line.push_str(" GENERATED ALWAYS AS IDENTITY"),
+                "d" => line.push_str(" GENERATED BY DEFAULT AS IDENTITY"),
+                // A `serial` column is a plain integer with a nextval default, so
+                // it renders as its default rather than as an identity clause.
+                _ => {
+                    if let Some(d) = default {
+                        line.push_str(&format!(" DEFAULT {d}"));
+                    }
+                }
+            }
+            if not_null {
+                line.push_str(" NOT NULL");
+            }
+            parts.push(line);
+        }
+
+        // Table constraints, engine-rendered: `pg_get_constraintdef` spells PK,
+        // UNIQUE, CHECK, FK, and EXCLUDE correctly so RED does not have to.
+        let constraints = self
+            .client
+            .query(
+                "SELECT con.conname, pg_get_constraintdef(con.oid) \
+                 FROM pg_constraint con \
+                 JOIN pg_class c ON c.oid = con.conrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2 ORDER BY con.contype, con.conname",
+                &[&namespace, &name],
+            )
+            .await
+            .map_err(driver_err)?;
+        for row in &constraints {
+            let cname: String = row.get(0);
+            let def: String = row.get(1);
+            parts.push(format!("    CONSTRAINT {} {def}", self.quote_ident(&cname)));
+        }
+
+        out.push_str(&format!(
+            "CREATE TABLE {}.{} (\n{}\n);\n",
+            self.quote_ident(namespace),
+            self.quote_ident(name),
+            parts.join(",\n")
+        ));
+
+        // Indexes that are not already implied by a constraint above.
+        let indexes = self
+            .client
+            .query(
+                "SELECT pg_get_indexdef(i.indexrelid) \
+                 FROM pg_index i \
+                 JOIN pg_class c ON c.oid = i.indrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2 \
+                   AND NOT i.indisprimary AND NOT i.indisunique \
+                 ORDER BY 1",
+                &[&namespace, &name],
+            )
+            .await
+            .map_err(driver_err)?;
+        if !indexes.is_empty() {
+            out.push('\n');
+            for row in &indexes {
+                out.push_str(&format!("{};\n", row.get::<_, String>(0)));
+            }
+        }
+
+        // Comments last, the way pg_dump orders them.
+        let comments = self
+            .client
+            .query(
+                "SELECT a.attname, col_description(c.oid, a.attnum) \
+                 FROM pg_attribute a \
+                 JOIN pg_class c ON c.oid = a.attrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 \
+                   AND NOT a.attisdropped AND col_description(c.oid, a.attnum) IS NOT NULL \
+                 ORDER BY a.attnum",
+                &[&namespace, &name],
+            )
+            .await
+            .map_err(driver_err)?;
+        let table_comment = self
+            .client
+            .query_opt(
+                "SELECT obj_description(c.oid) FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2",
+                &[&namespace, &name],
+            )
+            .await
+            .map_err(driver_err)?
+            .and_then(|r| r.get::<_, Option<String>>(0));
+        if table_comment.is_some() || !comments.is_empty() {
+            out.push('\n');
+        }
+        if let Some(c) = table_comment {
+            out.push_str(&format!(
+                "COMMENT ON TABLE {}.{} IS '{}';\n",
+                self.quote_ident(namespace),
+                self.quote_ident(name),
+                c.replace('\'', "''")
+            ));
+        }
+        for row in &comments {
+            let col: String = row.get(0);
+            let c: String = row.get(1);
+            out.push_str(&format!(
+                "COMMENT ON COLUMN {}.{}.{} IS '{}';\n",
+                self.quote_ident(namespace),
+                self.quote_ident(name),
+                self.quote_ident(&col),
+                c.replace('\'', "''")
+            ));
+        }
+        Ok(out)
     }
 
     async fn explain(&self, sql: &str, analyze: bool) -> Result<QueryPlan> {

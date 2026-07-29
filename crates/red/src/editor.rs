@@ -142,9 +142,17 @@ fn build_index(
     let mut tables: Vec<TableCand> = Vec::new();
     for sc in schemas {
         for obj in &sc.objects {
+            // Only relations complete in a `FROM`. A function or a trigger is
+            // not a table name, and offering one here would make completion
+            // actively wrong the moment the lazy object groups are loaded.
+            if !obj.kind.is_relation() {
+                continue;
+            }
             tables.push(TableCand {
                 name: obj.name.clone().into(),
-                is_view: matches!(obj.kind, ObjectKind::View),
+                // "Not a plain table", i.e. not writable through the grid: a
+                // materialized view is as read-only as a view for this hint.
+                is_view: !matches!(obj.kind, ObjectKind::Table),
             });
         }
     }
@@ -1149,6 +1157,7 @@ impl AppState {
                         this.open_save_prompt(cx);
                     })),
             )
+            .children(self.render_watch_pill(active, tab_idx, half, cx))
             .children(ro_chip);
 
         div()

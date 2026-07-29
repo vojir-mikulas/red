@@ -1773,6 +1773,27 @@ impl AppState {
             PendingWrite::Copy { prose, preview, .. } => {
                 ("Copy to table", prose.clone(), preview.clone(), "Append")
             }
+            PendingWrite::KillSession {
+                mode, who, query, ..
+            } => (
+                match mode {
+                    red_core::KillMode::Cancel => "Stop this query",
+                    red_core::KillMode::Terminate => "Terminate this session",
+                },
+                match mode {
+                    red_core::KillMode::Cancel => {
+                        format!(
+                            "This stops the statement {who} is running. The session stays open."
+                        )
+                    }
+                    red_core::KillMode::Terminate => format!(
+                        "This drops {who}'s whole session and rolls back its open \
+                         transaction. It cannot be undone."
+                    ),
+                },
+                query.clone(),
+                mode.verb(),
+            ),
         };
         // A copy offers two actions, Append (keep the target's rows) and Replace all
         // (truncate first, behind the danger styling), rather than one run button.

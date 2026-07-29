@@ -1123,6 +1123,30 @@ pub trait DatabaseDriver: Send + Sync {
     /// user expands a table, so the initial tree load stays light.
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableDetail>;
 
+    /// The names of one *programmatic* object kind (routine, trigger, sequence,
+    /// user type) in one namespace, loaded when the user expands that group node
+    /// in the tree rather than at connect.
+    ///
+    /// This exists to keep [`list_objects`](Self::list_objects)'s cheapness
+    /// contract intact: Postgres already issues one query per schema there, and
+    /// folding five more catalog reads into that loop would multiply connect cost
+    /// on a server with many schemas, for a list nobody has asked to see yet. The
+    /// relations (table / view / materialized view) stay in the skeleton because
+    /// completion, browsing, and the ER diagram all need them up front.
+    ///
+    /// Names only, same contract as `list_objects`. An engine advertises which
+    /// kinds it has through [`DbKind::object_kinds`](red_core::DbKind::object_kinds);
+    /// nothing else is ever asked for, and the default answers empty so a driver
+    /// opts in per kind.
+    async fn list_object_group(
+        &self,
+        namespace: &str,
+        kind: red_core::ObjectKind,
+    ) -> Result<Vec<red_core::ObjectMeta>> {
+        let _ = (namespace, kind);
+        Ok(Vec::new())
+    }
+
     /// What in-grid row editing this table supports (see [`RowEditCaps`]), resolved
     /// once per browse next to its seek key. `detail` is the already-loaded
     /// [`describe_table`](Self::describe_table) result, so the relational default
@@ -1543,6 +1567,78 @@ pub trait DatabaseDriver: Send + Sync {
         ref_columns: &[String],
     ) -> Result<u64>;
 
+    /// A bounded health snapshot of this connection: sizes, plus the findings the
+    /// engine's own catalog can support (see
+    /// [`HealthReport`](red_core::health::HealthReport)).
+    ///
+    /// Every query inside is `ORDER BY … LIMIT`ed and runs under the session
+    /// statement timeout like any other read, so this is a handful of catalog
+    /// round trips and not a scan. Individual checks are individually fallible: a
+    /// missing `sys` schema or an insufficient privilege lands in
+    /// `unavailable` rather than failing the report, because a report that drops a
+    /// check silently reads as a clean bill of health.
+    ///
+    /// `namespace` scopes it when the connection has one bound.
+    async fn health(&self, namespace: Option<&str>) -> Result<red_core::health::HealthReport> {
+        let _ = namespace;
+        Err(RedError::Driver(
+            "no health report for this engine".to_string(),
+        ))
+    }
+
+    /// What the server is doing right now, longest-running first (see
+    /// [`ServerSession`](red_core::ServerSession)).
+    ///
+    /// Bounded by contract: the driver caps and orders the query itself, so the
+    /// panel can poll it without a size guard of its own. The default is empty
+    /// for an engine with no server behind it, matching
+    /// [`DbKind::session_caps`](red_core::DbKind::session_caps), which is what
+    /// keeps the panel from being offered there at all.
+    ///
+    /// A role without the privilege to see other sessions gets its own rows and
+    /// no error: that is a normal state on a locked-down server, and the second
+    /// return value says so, so the UI can explain rather than mislead.
+    async fn server_sessions(&self) -> Result<(Vec<red_core::ServerSession>, bool)> {
+        Ok((Vec::new(), false))
+    }
+
+    /// Stop `key`, either its statement or its whole session
+    /// ([`KillMode`](red_core::KillMode)).
+    ///
+    /// The most destructive-by-consequence call in this trait that is not itself a
+    /// write: terminating a session rolls back its transaction. A read-only driver
+    /// refuses it, the UI grades the confirmation by `ConnEnv`, and it is never
+    /// exposed as an AI or MCP tool at any tier.
+    async fn kill_session(
+        &self,
+        key: &red_core::SessionKey,
+        mode: red_core::KillMode,
+    ) -> Result<()> {
+        let _ = (key, mode);
+        Err(RedError::Driver(
+            "this engine has no server sessions to stop".to_string(),
+        ))
+    }
+
+    /// The object's definition, as SQL. Read-only, and the only way to see what a
+    /// view or a routine actually *is*.
+    ///
+    /// Three of the four engines have a `SHOW CREATE`-shaped statement and return
+    /// the server's own text verbatim, which is the honest answer. Postgres has
+    /// none, so its driver assembles the statement from the catalog and says so in
+    /// a header comment: this is a **reading** aid, not a migration artifact, and
+    /// nothing in RED executes what it returns (see
+    /// `docs/plans/todo/object-ddl-and-schema-diff.md`).
+    ///
+    /// No default impl: every engine can answer something for at least its tables,
+    /// and a silent empty default would ship as a blank panel.
+    async fn object_ddl(
+        &self,
+        namespace: &str,
+        name: &str,
+        kind: red_core::ObjectKind,
+    ) -> Result<String>;
+
     /// Run the engine's `EXPLAIN` for `sql` and return a normalized [`QueryPlan`]
     /// (Track B4). Plain `explain` (`analyze = false`) never executes the
     /// statement; it's read-only-safe for any SQL. `analyze = true` runs
@@ -1719,6 +1815,33 @@ pub(crate) fn refuse_if_read_only(read_only: bool) -> Result<()> {
         Err(RedError::Query("this connection is read-only".into()))
     } else {
         Ok(())
+    }
+}
+
+/// Wall-clock Unix seconds, for stamping a report. Clamped at 0 rather than
+/// panicking on a clock set before 1970: a nonsense timestamp on a report is a
+/// cosmetic problem, an unwrap here is a crash.
+pub(crate) fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// A byte count a human reads at a glance, for finding prose. Binary units, since
+/// that is what every engine's own size functions report in.
+pub(crate) fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 

@@ -152,22 +152,22 @@ impl AppState {
 
         // Mutations | (schema | columns | editor / results): sits between History and
         // Schema, since it's about the connection rather than the focused result.
-        let with_mutations = if active.mutations_open {
-            let pane = self.render_mutations(active, cx);
+        let with_mutations = if active.server_open {
+            let pane = self.render_server_panel(active, cx);
             let start = view.clone();
             let resize = view.clone();
             let end = view.clone();
             SplitPane::new("shell-split-mutations", Axis::Horizontal)
-                .size(active.mutations_w)
+                .size(active.server_w)
                 .gutter(px(1.))
-                .drag(active.mutations_drag)
+                .drag(active.server_drag)
                 .min_first(px(240.))
                 .max_first(px(560.))
                 .on_drag_start(move |anchor, _, cx| {
                     start
                         .update(cx, |this, cx| {
                             if let Phase::Connected(a) = &mut this.phase {
-                                a.mutations_drag = Some(anchor);
+                                a.server_drag = Some(anchor);
                             }
                             cx.notify();
                         })
@@ -177,7 +177,7 @@ impl AppState {
                     resize
                         .update(cx, |this, cx| {
                             if let Phase::Connected(a) = &mut this.phase {
-                                a.mutations_w = size;
+                                a.server_w = size;
                             }
                             cx.notify();
                         })
@@ -186,7 +186,7 @@ impl AppState {
                 .on_drag_end(move |_, cx| {
                     end.update(cx, |this, cx| {
                         if let Phase::Connected(a) = &mut this.phase {
-                            a.mutations_drag = None;
+                            a.server_drag = None;
                         }
                         cx.notify();
                     })
@@ -444,15 +444,15 @@ impl AppState {
             ))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_columns_panel(cx)));
 
-        // Mutations panel toggle, offered only on an engine whose row edits are
-        // asynchronous background work. Tinted amber while any is still running, so
-        // an edit that outlived its submit stays visible without the panel open --
-        // the whole point being that a grid which hasn't changed yet reads as
-        // "it didn't work" and invites a retry that doubles the cost.
+        // Server panel toggle (Sessions + Mutations), offered on any engine with a
+        // server behind it. Tinted amber while a background mutation is still
+        // running, so an edit that outlived its submit stays visible without the
+        // panel open -- the whole point being that a grid which hasn't changed yet
+        // reads as "it didn't work" and invites a retry that doubles the cost.
         let running = self.running_mutations();
-        let mutations_toggle = self.tracks_mutations().then(|| {
+        let mutations_toggle = self.has_server_panel().then(|| {
             div()
-                .id("toggle-mutations")
+                .id("toggle-server-panel")
                 .mr_1()
                 .flex_shrink_0()
                 .flex()
@@ -462,21 +462,21 @@ impl AppState {
                 .rounded(px(4.))
                 .cursor_pointer()
                 .tooltip(Tooltip::text(if running == 0 {
-                    "Toggle mutations".to_string()
+                    "Toggle the server panel (sessions, mutations)".to_string()
                 } else {
-                    format!("Toggle mutations  ({running} running)")
+                    format!("Toggle the server panel  ({running} mutations running)")
                 }))
                 .hover(|s| s.bg(theme.bg_elevated))
                 .child(crate::icons::icon(
                     "refresh-cw",
                     theme.scale(14.),
-                    match (active.mutations_open, running) {
+                    match (active.server_open, running) {
                         (_, n) if n > 0 => theme.yellow,
                         (true, _) => theme.accent,
                         _ => theme.text_muted,
                     },
                 ))
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_mutations(cx)))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_server_panel(cx)))
         });
 
         // Assistant toggle, pinned to the far-right of the status bar (mirrors the
@@ -566,6 +566,9 @@ impl AppState {
             .child(body)
             .child(statusbar)
             .children(schema_menu)
+            // Same reasoning as the schema menu: anchored in window coordinates
+            // from the run bar's caret, so it renders at the root.
+            .children(self.render_watch_menu(cx))
     }
 
     /// The top bar (connection switcher · self-update pill · disconnect ·
@@ -2079,6 +2082,70 @@ impl AppState {
         // it, there is no SQL behind a diagram, so the editor would only be shrinking
         // the canvas — but the strip stays, or the diagram would be a tab you can see
         // no way out of.
+        // A schema comparison takes the half like the other read-only bodies.
+        if active
+            .tabs
+            .get(tab_idx)
+            .is_some_and(|t| matches!(t.view, Some(crate::app::TabView::SchemaDiff(_))))
+        {
+            let body = div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(theme.bg_app)
+                .child(self.render_tab_strip(active, half, cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .child(self.render_schema_diff(active, tab_idx, cx)),
+                )
+                .into_any_element();
+            return self.wrap_half(body, half, is_focused, is_split, &theme, cx);
+        }
+
+        // The health report takes the half the same way: it is about the
+        // connection, not about any query.
+        if active
+            .tabs
+            .get(tab_idx)
+            .is_some_and(|t| t.health().is_some())
+        {
+            let body = div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(theme.bg_app)
+                .child(self.render_tab_strip(active, half, cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .child(self.render_health(active, tab_idx, cx)),
+                )
+                .into_any_element();
+            return self.wrap_half(body, half, is_focused, is_split, &theme, cx);
+        }
+
+        // A DDL view takes the half the same way, and for the same reason: there
+        // is no query behind a definition, so an editor above it is dead space.
+        if active.tabs.get(tab_idx).is_some_and(|t| t.ddl().is_some()) {
+            let body = div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(theme.bg_app)
+                .child(self.render_tab_strip(active, half, cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .child(self.render_ddl(active, tab_idx, cx)),
+                )
+                .into_any_element();
+            return self.wrap_half(body, half, is_focused, is_split, &theme, cx);
+        }
+
         if active.tabs.get(tab_idx).is_some_and(|t| t.is_er()) {
             let canvas = self.render_er(active, tab_idx, cx);
             let body = div()

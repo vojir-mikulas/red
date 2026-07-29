@@ -14,6 +14,7 @@ mod copy;
 mod edit;
 mod render;
 mod suggest;
+pub(crate) mod watch;
 
 pub(crate) use autoscroll::Autoscroll;
 pub(crate) use edit::{GridEdit, OpSource};
@@ -1467,6 +1468,14 @@ impl AppState {
             namespace: self.send_namespace(),
         });
         self.start_query_ticker(cx);
+        // Seed the tab's watch from the setting, when one is configured. Silent if
+        // the query is not watchable (a write, a multi-statement run): a default
+        // should never nag, and `set_watch` refuses those anyway.
+        if let Some(interval) = self.settings.sql.watch_default()
+            && self.watch_allowed(cx).is_ok()
+        {
+            self.set_watch(Some(interval.as_secs()), cx);
+        }
         cx.notify();
     }
 

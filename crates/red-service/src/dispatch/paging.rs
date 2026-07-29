@@ -566,6 +566,7 @@ mod checkpoint_tests {
         let (path, driver) = driver_with(1, "reap");
         let mut state = SessionState::new(
             SessionDriver::Sql(driver),
+            red_core::DbKind::Sqlite,
             None,
             AiOverride::default(),
             false,

@@ -711,10 +711,13 @@ impl DatabaseDriver for ClickhouseDriver {
                 .unwrap_or_default()
                 .to_string();
             let engine = row.get(2).and_then(Json::as_str).unwrap_or_default();
-            let kind = if engine.ends_with("View") {
-                ObjectKind::View
-            } else {
-                ObjectKind::Table
+            // A MaterializedView is a stored, incrementally-populated relation and
+            // a plain View is a query rewrite; they behave differently enough (one
+            // has parts and a size, the other does not) to draw apart.
+            let kind = match engine {
+                "MaterializedView" => ObjectKind::MaterializedView,
+                e if e.ends_with("View") => ObjectKind::View,
+                _ => ObjectKind::Table,
             };
             // Rows are ordered by database, so consecutive same-db rows group.
             match schemas.last_mut() {
@@ -726,6 +729,39 @@ impl DatabaseDriver for ClickhouseDriver {
             }
         }
         Ok(schemas)
+    }
+
+    async fn list_object_group(
+        &self,
+        namespace: &str,
+        kind: ObjectKind,
+    ) -> Result<Vec<ObjectMeta>> {
+        // Only user-defined functions are lazy here: ClickHouse has no triggers,
+        // sequences, or user types, and its materialized views ride the skeleton
+        // as relations. `origin = 'SQLUserDefined'` excludes the ~1500 built-ins,
+        // which are engine surface, not this database's objects.
+        //
+        // `system.functions` is server-wide, not per database, so the namespace is
+        // accepted and ignored rather than filtered on a column that is not there.
+        if kind != ObjectKind::Function {
+            return Ok(Vec::new());
+        }
+        let _ = namespace;
+        let (_, _, rows) = self
+            .run_simple(
+                "SELECT name FROM system.functions WHERE origin = 'SQLUserDefined' ORDER BY name"
+                    .to_string(),
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| row.first().and_then(Json::as_str))
+            .map(|name| ObjectMeta {
+                name: name.to_string(),
+                kind: ObjectKind::Function,
+            })
+            .collect())
     }
 
     async fn describe_table(&self, schema: &str, table: &str) -> Result<TableDetail> {
@@ -1313,6 +1349,212 @@ impl DatabaseDriver for ClickhouseDriver {
         Err(RedError::Driver(
             "foreign keys are not supported on ClickHouse (OLAP)".to_string(),
         ))
+    }
+
+    async fn health(&self, namespace: Option<&str>) -> Result<red_core::health::HealthReport> {
+        use crate::now_unix;
+        use red_core::health::{
+            Finding, FindingKind, HealthReport, Severity, SizeTotals, TableSize, UnavailableCheck,
+        };
+
+        let scope = namespace.map(str::to_string).or_else(|| self.scope.clone());
+        let mut report = HealthReport::new(red_core::DbKind::Clickhouse, scope.clone(), now_unix());
+
+        // Sizes come from `system.parts`, which is the only place they exist:
+        // ClickHouse stores a table as parts on disk and the compressed size is
+        // what "how big is this" means here.
+        let (_, _, rows) = self
+            .run_simple(
+                "SELECT `database`, `table`, sum(bytes_on_disk), sum(rows), count() \
+                 FROM system.parts WHERE active \
+                 GROUP BY `database`, `table` ORDER BY sum(bytes_on_disk) DESC LIMIT 100"
+                    .to_string(),
+                &[],
+            )
+            .await?;
+        let num = |row: &Vec<Json>, i: usize| -> i64 {
+            row.get(i)
+                .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+                .unwrap_or(0)
+        };
+        let mut totals = SizeTotals::default();
+        for row in &rows {
+            let db = row.first().and_then(Json::as_str).unwrap_or_default();
+            let name = row.get(1).and_then(Json::as_str).unwrap_or_default();
+            if scope.as_deref().is_some_and(|s| s != db) {
+                continue;
+            }
+            let bytes = num(row, 2).max(0) as u64;
+            totals.bytes += bytes;
+            totals.table_count += 1;
+            report.tables.push(TableSize {
+                table: TableRef {
+                    schema: Some(db.to_string()),
+                    name: name.to_string(),
+                },
+                bytes,
+                // Parts carry no separate index size: the sparse primary index is
+                // a rounding error next to the data and is not reported apart.
+                index_bytes: 0,
+                estimated_rows: num(row, 3),
+            });
+        }
+        report.totals = totals;
+
+        // Too many parts in one partition is *the* ClickHouse foot-gun: it is what
+        // small, frequent inserts produce, and it degrades reads until merges catch
+        // up (or the server starts refusing inserts outright).
+        let (_, _, parts) = self
+            .run_simple(
+                "SELECT `database`, `table`, partition, count() AS n FROM system.parts \
+                 WHERE active GROUP BY `database`, `table`, partition \
+                 HAVING n > 300 ORDER BY n DESC LIMIT 25"
+                    .to_string(),
+                &[],
+            )
+            .await
+            .unwrap_or_default();
+        for row in &parts {
+            let db = row.first().and_then(Json::as_str).unwrap_or_default();
+            let name = row.get(1).and_then(Json::as_str).unwrap_or_default();
+            if scope.as_deref().is_some_and(|s| s != db) {
+                continue;
+            }
+            let partition = row.get(2).and_then(Json::as_str).unwrap_or_default();
+            let n = num(row, 3);
+            report.findings.push(Finding {
+                severity: if n > 1000 {
+                    Severity::Bad
+                } else {
+                    Severity::Warn
+                },
+                kind: FindingKind::TooManyParts,
+                object: Some(TableRef {
+                    schema: Some(db.to_string()),
+                    name: name.to_string(),
+                }),
+                title: format!("{db}.{name} has {n} active parts in one partition"),
+                detail: format!(
+                    "Partition {partition}. This is what frequent small inserts produce; \
+                     reads slow down until merges catch up, and past the server's limit \
+                     inserts start being refused."
+                ),
+                suggested_sql: Some(format!(
+                    "OPTIMIZE TABLE {}.{} PARTITION {partition};",
+                    self.quote_ident(db),
+                    self.quote_ident(name)
+                )),
+            });
+        }
+
+        // The index-shaped checks have no ClickHouse meaning at all, which is worth
+        // saying: an empty findings list should not read as "nothing to look at".
+        report.unavailable.push(UnavailableCheck {
+            kind: FindingKind::UnusedIndex,
+            reason: "ClickHouse has no secondary-index usage statistics to read".to_string(),
+        });
+        Ok(report)
+    }
+
+    async fn server_sessions(&self) -> Result<(Vec<red_core::ServerSession>, bool)> {
+        // `system.processes` is the whole picture on ClickHouse: one row per
+        // in-flight query. There is no idle session to show (HTTP: a request is a
+        // session) and no lock manager, so no wait graph.
+        let (_, _, rows) = self
+            .run_simple(
+                "SELECT query_id, user, client_name, address, `database`, elapsed, query \
+                 FROM system.processes ORDER BY elapsed DESC LIMIT 500"
+                    .to_string(),
+                &[],
+            )
+            .await?;
+        let text = |row: &Vec<Json>, i: usize| {
+            row.get(i)
+                .and_then(Json::as_str)
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
+        };
+        let sessions = rows
+            .iter()
+            .map(|row| red_core::ServerSession {
+                key: red_core::SessionKey(text(row, 0).unwrap_or_default()),
+                user: text(row, 1),
+                application: text(row, 2),
+                client_addr: text(row, 3),
+                database: text(row, 4),
+                // ClickHouse reports no per-query state word; every row here is by
+                // definition executing, and saying so beats an empty column.
+                state: "executing".to_string(),
+                wait: None,
+                blocked_by: Vec::new(),
+                query: text(row, 6),
+                // `elapsed` is a Float64 that the JSON-compact reply may render as
+                // either a number or a quoted string depending on settings.
+                elapsed_secs: row
+                    .get(5)
+                    .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()))
+                    .unwrap_or(0.0),
+                // RED's own reads run under their own query ids and finish before
+                // this list is rendered, so nothing here is ever RED itself.
+                is_self: false,
+            })
+            .collect();
+        Ok((sessions, false))
+    }
+
+    async fn kill_session(
+        &self,
+        key: &red_core::SessionKey,
+        mode: red_core::KillMode,
+    ) -> Result<()> {
+        if self.read_only {
+            return Err(RedError::Query("this connection is read-only".into()));
+        }
+        if mode == red_core::KillMode::Terminate {
+            // `session_caps().can_terminate` is false, so the UI never offers this;
+            // the guard is here because a capability descriptor the driver does not
+            // also enforce is a comment, not a rule.
+            return Err(RedError::Driver(
+                "ClickHouse has no session to terminate apart from its query".to_string(),
+            ));
+        }
+        // Bound as a parameter, not interpolated: a query id is server-supplied
+        // text and must not reach the statement body.
+        self.run_simple(
+            "KILL QUERY WHERE query_id = {qid:String}".to_string(),
+            &[("param_qid".to_string(), key.0.clone())],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn object_ddl(&self, namespace: &str, name: &str, kind: ObjectKind) -> Result<String> {
+        // `SHOW CREATE` covers tables, views, and materialized views alike (they
+        // are all entries in `system.tables`); a UDF is `SHOW CREATE FUNCTION`.
+        let statement = match kind {
+            ObjectKind::Function => format!("SHOW CREATE FUNCTION {}", self.quote_ident(name)),
+            k if k.is_relation() => format!(
+                "SHOW CREATE TABLE {}.{}",
+                self.quote_ident(namespace),
+                self.quote_ident(name)
+            ),
+            other => {
+                return Err(RedError::Driver(format!(
+                    "ClickHouse has no definition for a {}",
+                    other.as_str()
+                )));
+            }
+        };
+        let (_, _, rows) = self.run_simple(statement, &[]).await?;
+        let ddl = rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(Json::as_str)
+            .ok_or_else(|| RedError::Driver(format!("{name} not found in {namespace}")))?;
+        // ClickHouse renders the statement with literal `\n` escapes in the
+        // JSON-compact reply; the JSON decode already resolved those, so this is
+        // the multi-line text as the server formats it.
+        Ok(format!("{ddl};\n"))
     }
 
     async fn explain(&self, sql: &str, _analyze: bool) -> Result<QueryPlan> {

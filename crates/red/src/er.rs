@@ -190,6 +190,9 @@ impl ErView {
                 continue;
             }
             for obj in &sc.objects {
+                // Tables only, not every relation: a view carries no foreign
+                // keys, so it would land as an edgeless box that only adds
+                // layout pressure to the diagram it appears in.
                 if obj.kind != ObjectKind::Table {
                     continue;
                 }
@@ -857,7 +860,7 @@ impl AppState {
         if let Some(i) = active
             .tabs
             .iter()
-            .position(|t| t.er.as_ref().is_some_and(|er| er.namespace == namespace))
+            .position(|t| t.er().is_some_and(|er| er.namespace == namespace))
         {
             self.set_active_tab(i, cx);
             return;
@@ -871,7 +874,7 @@ impl AppState {
         let Phase::Connected(active) = &self.phase else {
             return;
         };
-        tab.er = Some(ErView::build(active, namespace));
+        tab.view = Some(crate::app::TabView::Er(ErView::build(active, namespace)));
         self.push_tab(tab, cx);
         cx.notify();
     }
@@ -891,6 +894,7 @@ impl AppState {
         };
         let from_tree = active.schema.selected.as_ref().map(|node| match node {
             crate::schema::NodeId::Schema(s) => s.clone(),
+            crate::schema::NodeId::Group { schema, .. } => schema.clone(),
             crate::schema::NodeId::Object { schema, .. } => schema.clone(),
             crate::schema::NodeId::Column { schema, .. } => schema.clone(),
         });
@@ -905,7 +909,7 @@ impl AppState {
     /// The ER view held by tab `tab_idx`, if that tab is a diagram.
     fn er_mut(&mut self, tab_idx: usize) -> Option<&mut ErView> {
         match &mut self.phase {
-            Phase::Connected(active) => active.tabs.get_mut(tab_idx)?.er.as_mut(),
+            Phase::Connected(active) => active.tabs.get_mut(tab_idx)?.er_mut(),
             _ => None,
         }
     }
@@ -917,7 +921,7 @@ impl AppState {
     pub(crate) fn er_table_described(&mut self, schema: &str, table: &str, ncols: usize) {
         if let Phase::Connected(active) = &mut self.phase {
             for tab in &mut active.tabs {
-                if let Some(er) = tab.er.as_mut() {
+                if let Some(er) = tab.er_mut() {
                     er.remeasure(schema, table, ncols);
                 }
             }
@@ -961,7 +965,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let Some(er) = active.tabs.get(tab_idx).and_then(|t| t.er.as_ref()) else {
+        let Some(er) = active.tabs.get(tab_idx).and_then(|t| t.er()) else {
             return div().into_any_element();
         };
         let z = er.zoom;
@@ -1386,7 +1390,7 @@ impl AppState {
         let Phase::Connected(active) = &self.phase else {
             return;
         };
-        let Some(er) = active.tabs.get(tab_idx).and_then(|t| t.er.as_ref()) else {
+        let Some(er) = active.tabs.get(tab_idx).and_then(|t| t.er()) else {
             return;
         };
         let wanted = er.missing_details(&active.schema.details);

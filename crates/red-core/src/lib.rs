@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 pub mod diff;
 pub mod doc;
+pub mod health;
 pub mod kv;
+pub mod schema_diff;
 pub mod sql;
 pub mod typemap;
 
@@ -196,6 +198,105 @@ impl DbKind {
     /// other.
     pub const fn tracks_mutations(self) -> bool {
         matches!(self, DbKind::Clickhouse)
+    }
+
+    /// What this engine lets RED see and stop about the server's other sessions
+    /// (see [`ServerSession`]). Gates the Server panel and its kill affordances.
+    pub const fn session_caps(self) -> SessionCaps {
+        match self {
+            // `pg_stat_activity` plus a real lock manager: the full picture.
+            DbKind::Postgres => SessionCaps {
+                supported: true,
+                can_cancel: true,
+                can_terminate: true,
+                has_wait_graph: true,
+            },
+            // `information_schema.processlist` + `KILL QUERY` / `KILL`. The wait
+            // graph needs performance_schema, which is present by default on
+            // MySQL 5.7+ and degrades to an empty `blocked_by` when it is not.
+            DbKind::Mysql => SessionCaps {
+                supported: true,
+                can_cancel: true,
+                can_terminate: true,
+                has_wait_graph: true,
+            },
+            // `system.processes` + `KILL QUERY`. There is no session to terminate
+            // separately from its query (HTTP: one request, one session), and no
+            // lock manager to build a wait graph from.
+            DbKind::Clickhouse => SessionCaps {
+                supported: true,
+                can_cancel: true,
+                can_terminate: false,
+                has_wait_graph: false,
+            },
+            // A file, opened in-process. There is no server and no other session.
+            DbKind::Sqlite => SessionCaps {
+                supported: false,
+                can_cancel: false,
+                can_terminate: false,
+                has_wait_graph: false,
+            },
+            // Redis has its own equivalent already (the Monitor panel's CLIENT
+            // LIST / CLIENT KILL); Mongo's would ride `DocDriver`. Neither routes
+            // through this SQL-shaped descriptor.
+            DbKind::Redis | DbKind::Mongo => SessionCaps {
+                supported: false,
+                can_cancel: false,
+                can_terminate: false,
+                has_wait_graph: false,
+            },
+        }
+    }
+
+    /// Which [`ObjectKind`]s this engine has, in the order the schema tree draws
+    /// their group nodes. A kind absent here is never queried for and never
+    /// drawn, so SQLite grows no empty "Procedures" group.
+    ///
+    /// Relations come first (they are in the connect-time skeleton and are what a
+    /// user is usually looking for); the lazily-loaded programmatic kinds follow.
+    /// Another descriptor rather than an engine comparison, for the same reason
+    /// [`write_caps`](Self::write_caps) is one.
+    pub const fn object_kinds(self) -> &'static [ObjectKind] {
+        match self {
+            // The richest catalog: everything below exists, and `prokind`
+            // separates functions from procedures on PG 11+.
+            DbKind::Postgres => &[
+                ObjectKind::Table,
+                ObjectKind::View,
+                ObjectKind::MaterializedView,
+                ObjectKind::Function,
+                ObjectKind::Procedure,
+                ObjectKind::Trigger,
+                ObjectKind::Sequence,
+                ObjectKind::Type,
+            ],
+            // No materialized views and no user-defined types. Sequences are a
+            // MariaDB-only feature, so the group is offered and simply comes back
+            // empty on MySQL (`information_schema.sequences` is absent there,
+            // which the driver treats as "none", not as an error).
+            DbKind::Mysql => &[
+                ObjectKind::Table,
+                ObjectKind::View,
+                ObjectKind::Function,
+                ObjectKind::Procedure,
+                ObjectKind::Trigger,
+                ObjectKind::Sequence,
+            ],
+            // `sqlite_master` knows tables, views, triggers, and indexes; indexes
+            // already live inside `TableDetail`, so they are not a tree kind.
+            DbKind::Sqlite => &[ObjectKind::Table, ObjectKind::View, ObjectKind::Trigger],
+            // Materialized views are a table engine; UDFs live in
+            // `system.functions`. No triggers, sequences, or user types.
+            DbKind::Clickhouse => &[
+                ObjectKind::Table,
+                ObjectKind::View,
+                ObjectKind::MaterializedView,
+                ObjectKind::Function,
+            ],
+            // Neither engine is SQL-shaped and neither populates a `SchemaMeta`
+            // through this path at all.
+            DbKind::Redis | DbKind::Mongo => &[],
+        }
     }
 
     /// How this engine resolves the names in an *unqualified* query — the
@@ -1656,7 +1757,10 @@ pub enum EditOp {
 
 /// A (schema, name) table reference for an [`EditOp`]. `schema` is the namespace a
 /// browse came from (`OpenResult.table`); the renderer qualifies and quotes it.
+// Serializable because the persisted health report (`health::TableSize`) names its
+// objects with one; nothing else on this type depends on serde.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TableRef {
     pub schema: Option<String>,
     pub name: String,
@@ -1780,6 +1884,90 @@ pub struct MutationInfo {
     pub done: bool,
     /// Why it is stuck, when it is. `None` while healthy.
     pub fail_reason: Option<String>,
+}
+
+/// One unit of work a database server is doing for some client: a running
+/// statement, an idle-in-transaction session, a waiting backend.
+///
+/// The SQL twin of Redis's `CLIENT LIST` row. Named *session* rather than
+/// *activity* because [`ActivityKind`] is already the AI agent's timeline and
+/// the two would be indistinguishable in a protocol import list.
+// No `Eq`: `elapsed_secs` is a float.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerSession {
+    /// What a kill addresses this session by, engine-native (a Postgres backend
+    /// pid, a MySQL thread id, a ClickHouse query_id). Carried as text because
+    /// the three are not the same type and only the driver that minted one ever
+    /// interprets it.
+    pub key: SessionKey,
+    pub user: Option<String>,
+    pub application: Option<String>,
+    pub client_addr: Option<String>,
+    pub database: Option<String>,
+    /// The engine's own word for what this session is doing ("active", "idle in
+    /// transaction", "Sending data"), verbatim: translating it would lose the
+    /// distinctions an operator is looking for.
+    pub state: String,
+    /// What it is waiting on, when it is waiting. `None` while running.
+    pub wait: Option<String>,
+    /// Sessions blocking this one, for the wait tree. Empty when free.
+    pub blocked_by: Vec<SessionKey>,
+    /// The statement, as the server reports it. `None` when the connected role
+    /// may not see it, which is normal rather than an error.
+    pub query: Option<String>,
+    /// Seconds since the statement started, computed **server-side** so a wrong
+    /// clock on this machine cannot render a negative duration.
+    pub elapsed_secs: f64,
+    /// This is RED's own connection. Never offered a kill: shooting it produces a
+    /// reconnect dance and no useful outcome.
+    pub is_self: bool,
+}
+
+/// A server-side session handle. Opaque text; only the driver that produced one
+/// parses it back.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionKey(pub String);
+
+impl std::fmt::Display for SessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// How hard to stop a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillMode {
+    /// Stop the running statement, keep the session (`pg_cancel_backend`,
+    /// `KILL QUERY`). The reversible one.
+    Cancel,
+    /// Drop the whole session (`pg_terminate_backend`, `KILL`). Rolls back an
+    /// open transaction, so it is the strictly heavier hammer and is graded that
+    /// way by the confirmation ladder.
+    Terminate,
+}
+
+impl KillMode {
+    pub const fn verb(self) -> &'static str {
+        match self {
+            Self::Cancel => "Cancel query",
+            Self::Terminate => "Terminate session",
+        }
+    }
+}
+
+/// What a server lets RED see and do about its sessions. Another capability
+/// descriptor, for the same reason [`DbKind::write_caps`] is one: the UI holds a
+/// [`DbKind`] and never a driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionCaps {
+    /// Whether there is a server with other sessions at all. `false` hides the
+    /// panel outright (SQLite is a file).
+    pub supported: bool,
+    pub can_cancel: bool,
+    pub can_terminate: bool,
+    /// Whether `blocked_by` is ever populated, so the UI knows a flat list is the
+    /// engine's answer rather than "nothing is blocked right now".
+    pub has_wait_graph: bool,
 }
 
 /// How a batch of [`EditOp`]s should be applied. The two contracts are genuinely
@@ -1960,12 +2148,80 @@ impl PlanNode {
     }
 }
 
-/// What a schema object is. SQLite has tables and views; Postgres maps onto
-/// the same two for the explorer's purposes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a schema object is.
+///
+/// Split into two tiers by [`ObjectKind::is_relation`]. **Relations** (table,
+/// view, materialized view) have columns, can be selected from, and are what the
+/// connect-time tree skeleton carries. **Programmatic objects** (routines,
+/// triggers, sequences, types) have no columns and are loaded lazily when their
+/// group node is expanded, so widening this enum did not make connecting slower
+/// (see `docs/plans/todo/schema-object-kinds.md`).
+///
+/// Which of these an engine has at all is [`DbKind::object_kinds`]; a kind absent
+/// from that list is never queried for and never drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ObjectKind {
     Table,
     View,
+    MaterializedView,
+    Function,
+    Procedure,
+    Trigger,
+    Sequence,
+    /// A user-defined type: a Postgres enum or composite. Engines without one
+    /// simply never report it.
+    Type,
+}
+
+impl ObjectKind {
+    /// Has columns: can be described, selected from, browsed, diffed, and drawn
+    /// in an ER diagram.
+    ///
+    /// This is the predicate the read-side call sites want. It is deliberately
+    /// **not** what a write target should ask: a view is a relation but is not
+    /// insertable, so the copy/migrate paths keep spelling
+    /// `matches!(kind, ObjectKind::Table)` themselves. Widening a read filter is
+    /// additive; widening a write filter silently offers a procedure as an
+    /// INSERT target.
+    pub const fn is_relation(self) -> bool {
+        matches!(self, Self::Table | Self::View | Self::MaterializedView)
+    }
+
+    /// Loaded on expand rather than at connect. The inverse of
+    /// [`is_relation`](Self::is_relation), named for the call site that cares
+    /// (the tree's group nodes) rather than for the negation.
+    pub const fn is_lazy(self) -> bool {
+        !self.is_relation()
+    }
+
+    /// The plural group label the schema tree draws this kind's node with.
+    pub const fn group_label(self) -> &'static str {
+        match self {
+            Self::Table => "Tables",
+            Self::View => "Views",
+            Self::MaterializedView => "Materialized views",
+            Self::Function => "Functions",
+            Self::Procedure => "Procedures",
+            Self::Trigger => "Triggers",
+            Self::Sequence => "Sequences",
+            Self::Type => "Types",
+        }
+    }
+
+    /// A stable wire/persistence token, so a group can be named across the
+    /// `Command`/`Event` boundary without leaking the Rust variant spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::View => "view",
+            Self::MaterializedView => "matview",
+            Self::Function => "function",
+            Self::Procedure => "procedure",
+            Self::Trigger => "trigger",
+            Self::Sequence => "sequence",
+            Self::Type => "type",
+        }
+    }
 }
 
 /// A namespace of objects, the top level of the schema tree. For SQLite this is
@@ -3117,5 +3373,90 @@ mod ai_policy_tests {
         assert!(!tightened.enabled);
         assert_eq!(tightened.tier, AiTier::Schema);
         assert_eq!(tightened.limits, global.limits);
+    }
+
+    /// The relation tier is exactly the kinds with columns. This is the predicate
+    /// the browse/completion/ER paths widen to, so a kind sliding into it is a
+    /// behaviour change (a `SELECT * FROM <trigger>`), not a cosmetic one.
+    #[test]
+    fn only_column_bearing_kinds_are_relations() {
+        for kind in [
+            ObjectKind::Table,
+            ObjectKind::View,
+            ObjectKind::MaterializedView,
+        ] {
+            assert!(kind.is_relation(), "{kind:?} has columns");
+            assert!(!kind.is_lazy(), "{kind:?} rides the connect-time skeleton");
+        }
+        for kind in [
+            ObjectKind::Function,
+            ObjectKind::Procedure,
+            ObjectKind::Trigger,
+            ObjectKind::Sequence,
+            ObjectKind::Type,
+        ] {
+            assert!(!kind.is_relation(), "{kind:?} has no columns");
+            assert!(kind.is_lazy(), "{kind:?} loads on expand");
+        }
+    }
+
+    /// Every engine lists its relations before its lazy kinds and repeats none.
+    /// The tree draws groups in this order and keys them by kind, so a duplicate
+    /// would render two identical group rows fighting over one expansion state.
+    #[test]
+    fn object_kinds_are_ordered_relations_first_and_unique() {
+        for kind in [
+            DbKind::Postgres,
+            DbKind::Mysql,
+            DbKind::Sqlite,
+            DbKind::Clickhouse,
+            DbKind::Redis,
+            DbKind::Mongo,
+        ] {
+            let kinds = kind.object_kinds();
+            let mut seen = Vec::new();
+            let mut lazy_started = false;
+            for &k in kinds {
+                assert!(!seen.contains(&k), "{kind:?} lists {k:?} twice");
+                seen.push(k);
+                if k.is_lazy() {
+                    lazy_started = true;
+                } else {
+                    assert!(
+                        !lazy_started,
+                        "{kind:?} puts the relation {k:?} after a lazy kind"
+                    );
+                }
+            }
+            // A SQL engine always has tables; the two non-SQL seams have nothing
+            // in this model at all and must stay empty so no group is drawn.
+            if matches!(kind, DbKind::Redis | DbKind::Mongo) {
+                assert!(kinds.is_empty(), "{kind:?} populates no schema tree");
+            } else {
+                assert!(kinds.contains(&ObjectKind::Table), "{kind:?} has tables");
+            }
+        }
+    }
+
+    /// The wire token is unique per kind: it names a group across the
+    /// `Command`/`Event` boundary, so a collision would route a reply to the
+    /// wrong group node.
+    #[test]
+    fn object_kind_wire_tokens_are_distinct() {
+        let all = [
+            ObjectKind::Table,
+            ObjectKind::View,
+            ObjectKind::MaterializedView,
+            ObjectKind::Function,
+            ObjectKind::Procedure,
+            ObjectKind::Trigger,
+            ObjectKind::Sequence,
+            ObjectKind::Type,
+        ];
+        let mut tokens: Vec<&str> = all.iter().map(|k| k.as_str()).collect();
+        tokens.sort_unstable();
+        let before = tokens.len();
+        tokens.dedup();
+        assert_eq!(tokens.len(), before, "wire tokens collide");
     }
 }

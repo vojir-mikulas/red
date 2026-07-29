@@ -24,8 +24,9 @@ use red_core::kv::{
 use red_core::{
     ActivityId, ActivityKind, ActivityStatus, AiLimits, AiTier, BatchMode, Column, ColumnMap,
     ColumnMeta, ColumnStats, ConnectionConfig, CopyMode, EditOp, ExportFormat, FkEdge, FkJoin,
-    ImportFormat, KeySpec, LookupRow, PlanStep, QueryOptions, QueryPlan, ResultFilter, RowWindow,
-    SchemaMeta, SortDirection, StatsFlags, TableDetail, TableRef, UpdateState, Value,
+    ImportFormat, KeySpec, KillMode, LookupRow, ObjectKind, ObjectMeta, PlanStep, QueryOptions,
+    QueryPlan, ResultFilter, RowWindow, SchemaMeta, ServerSession, SessionKey, SortDirection,
+    StatsFlags, TableDetail, TableRef, UpdateState, Value,
 };
 
 /// Identifies one keep-alive backend session. Minted UI-side at connect start so
@@ -175,6 +176,43 @@ pub enum Command {
     },
     /// Load the schema-tree skeleton (namespaces + object names) for the sidebar.
     LoadObjects,
+    /// Build a health report for this connection (sizes + findings from the
+    /// engine's catalog). Read-only and bounded; the reply is persisted UI-side.
+    BuildHealthReport,
+    /// List what the server is doing right now, for the Server panel's Sessions
+    /// view. Read-only; polled while the panel is open.
+    ListServerSessions,
+    /// Stop one server session, either its statement (`Cancel`) or the whole
+    /// session (`Terminate`).
+    ///
+    /// Gated three ways before it can reach here: the connection must be
+    /// writable, the engine must advertise the mode in `session_caps`, and the UI
+    /// grades the confirmation by `ConnEnv`. Deliberately absent from every AI
+    /// tool catalog at every tier.
+    KillServerSession {
+        key: SessionKey,
+        mode: KillMode,
+    },
+    /// Fetch one object's `CREATE` statement for the read-only DDL tab. Read-only
+    /// on every engine: three of four answer with `SHOW CREATE`, Postgres
+    /// assembles from its catalog. Replied with `ObjectDdlReady`/`ObjectDdlFailed`,
+    /// both echoing `epoch` so a reply for a closed tab is dropped.
+    ObjectDdl {
+        epoch: Epoch,
+        namespace: String,
+        name: String,
+        kind: ObjectKind,
+    },
+    /// Load one lazily-fetched object kind for one namespace, sent when the user
+    /// expands that group node in the tree. The relations (table / view /
+    /// materialized view) arrive with `LoadObjects`; the columnless kinds
+    /// (routines, triggers, sequences, types) come through here so connect stays
+    /// one query per namespace. Replied with `ObjectGroupLoaded`, always, even
+    /// when the engine has none.
+    LoadObjectGroup {
+        namespace: String,
+        kind: ObjectKind,
+    },
     /// Describe one object's columns / FKs / indexes; sent lazily on tree expand.
     DescribeTable {
         schema: String,
@@ -839,6 +877,16 @@ pub enum Command {
     CancelDiff {
         id: OpId,
     },
+    /// Compare two schemas *structurally* (the `DiffTables` sibling: that one
+    /// compares rows, this one compares shape). The envelope's session is the
+    /// left side. Both sides are walked object-by-object, describing each
+    /// relation, so a wide schema streams rather than materializing.
+    DiffSchemas {
+        id: OpId,
+        left_namespace: String,
+        right_session: SessionId,
+        right_namespace: String,
+    },
     /// Migrate **many** tables in one job: the whole-database headline. The
     /// envelope's [`SessionId`] is the **source** session; `source_schema` names the
     /// namespace they live in and `tables` the table names to move. Each is created
@@ -1079,6 +1127,64 @@ pub enum Event {
     /// The schema-tree skeleton, in response to `LoadObjects`.
     ObjectsLoaded {
         schemas: Vec<SchemaMeta>,
+    },
+    /// A finished schema comparison, in response to `DiffSchemas`.
+    SchemaDiffFinished {
+        id: OpId,
+        left: String,
+        right: String,
+        delta: red_core::schema_diff::SchemaDelta,
+    },
+    SchemaDiffFailed {
+        id: OpId,
+        message: String,
+    },
+    /// A health report, in response to `BuildHealthReport`.
+    HealthReportReady {
+        report: red_core::health::HealthReport,
+    },
+    /// The health report could not be built at all (as opposed to an individual
+    /// check failing, which the report carries in `unavailable`).
+    HealthReportFailed {
+        message: String,
+    },
+    /// The server's current sessions, in response to `ListServerSessions`.
+    /// `restricted` means the connected role could not see other sessions' SQL,
+    /// which the panel explains rather than treating as an empty server.
+    ServerSessionsReady {
+        sessions: Vec<ServerSession>,
+        restricted: bool,
+    },
+    /// A kill was accepted by the server. The panel refreshes on it rather than
+    /// mutating its list, so what it shows is always what the server reports.
+    ServerSessionKilled {
+        key: SessionKey,
+        mode: KillMode,
+    },
+    /// One object's DDL, in response to `ObjectDdl`.
+    ObjectDdlReady {
+        epoch: Epoch,
+        namespace: String,
+        name: String,
+        kind: ObjectKind,
+        ddl: String,
+    },
+    /// The DDL fetch failed (no privilege, object dropped between click and
+    /// fetch, engine has no definition for that kind). Rendered in the tab rather
+    /// than toasted: the user asked this specific question and the answer belongs
+    /// where they asked it.
+    ObjectDdlFailed {
+        epoch: Epoch,
+        message: String,
+    },
+    /// One expanded object group, in response to `LoadObjectGroup`. Echoes the
+    /// namespace and kind so a reply that arrives after the user collapsed the
+    /// group (or expanded a different one) routes to the right node. An empty
+    /// `objects` is a valid answer meaning "this engine has none here".
+    ObjectGroupLoaded {
+        namespace: String,
+        kind: ObjectKind,
+        objects: Vec<ObjectMeta>,
     },
     /// One object's detail, in response to `DescribeTable`. Echoes `schema`/`table`
     /// so the async UI routes the detail to the right node regardless of order.

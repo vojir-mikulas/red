@@ -135,11 +135,15 @@ impl AppState {
             let is_redis = conn.config.kind == red_core::DbKind::Redis;
             let is_mongo = conn.config.kind == red_core::DbKind::Mongo;
             let conn_id = conn.conn_id.clone();
+            // Read here, not inside `ActiveConn::new`: that runs with `AppState`
+            // leased (see its doc comment), so it cannot read settings itself.
+            let kv_mode = self.settings.kv.default_query_mode.into();
             self.phase = Phase::Connected(Box::new(ActiveConn::new(
                 id,
                 conn.conn_id,
                 conn.config,
                 version,
+                kv_mode,
                 cx,
             )));
             self.foreground_session = Some(id);
@@ -579,5 +583,66 @@ impl AppState {
         self.refocus_root = true;
         self.rebuild_switcher(cx);
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod lease_guard_tests {
+    /// `AppState` must never read itself back through its own handle.
+    ///
+    /// Every backend event, every action, and every render runs with the entity
+    /// **leased** (gpui removes it from the entity map for the duration), so
+    /// `cx.entity().read(cx)` inside any of them aborts the process with "cannot
+    /// read AppState while it is already being updated". It compiles cleanly and
+    /// passes every type check, which is exactly why it needs a test: the settings
+    /// overhaul introduced one inside `ActiveConn::new` and it made *every*
+    /// connect, on every engine, a hard crash.
+    ///
+    /// A source scan rather than a runtime assertion because reproducing the panic
+    /// needs a live window. If a legitimate use ever appears (there is no obvious
+    /// one: anything with `&mut self` can read its own fields), narrow this rather
+    /// than delete it.
+    #[test]
+    fn app_state_never_reads_itself_through_its_own_handle() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (n, line) in text.lines().enumerate() {
+                    // The doc comment in `ActiveConn::new` names the pattern to
+                    // warn about it, so skip comment lines.
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with("//") {
+                        continue;
+                    }
+                    // Assembled at runtime so this scanner does not match its own
+                    // source and report itself.
+                    let needle = format!("cx.entity().{}(", "read");
+                    if line.contains(&needle) {
+                        offenders.push(format!("{}:{}", path.display(), n + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "AppState reads itself through its own handle (double-lease panic at \
+             runtime) at: {offenders:?}"
+        );
     }
 }

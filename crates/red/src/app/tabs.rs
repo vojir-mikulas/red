@@ -248,8 +248,29 @@ impl AppState {
     }
 
     /// Reload the schema tree from the backend (the ⌘R binding / palette command).
+    ///
+    /// Also drops the lazily-loaded object groups, so a refresh means the whole
+    /// tree and not just its skeleton. They re-fetch on the next expand; any
+    /// group currently open re-requests itself through `flatten`'s loading path.
     pub(crate) fn refresh_schema(&mut self) {
+        let mut reload: Vec<(String, red_core::ObjectKind)> = Vec::new();
+        if let Phase::Connected(active) = &mut self.phase {
+            let s = &mut active.schema;
+            s.groups.clear();
+            s.groups_loading.clear();
+            for node in &s.expanded {
+                if let crate::schema::NodeId::Group { schema, kind } = node
+                    && kind.is_lazy()
+                {
+                    reload.push((schema.clone(), *kind));
+                }
+            }
+            s.groups_loading.extend(reload.iter().cloned());
+        }
         self.send_active(Command::LoadObjects);
+        for (namespace, kind) in reload {
+            self.send_active(Command::LoadObjectGroup { namespace, kind });
+        }
     }
 
     /// ⌘R: refresh whatever the active connection shows — a Redis key browse

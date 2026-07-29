@@ -3356,11 +3356,7 @@ fn format_schema(schemas: &[red_core::SchemaMeta]) -> String {
     for sch in schemas {
         let _ = writeln!(out, "schema {} ({} objects):", sch.name, sch.objects.len());
         for obj in &sch.objects {
-            let kind = match obj.kind {
-                red_core::ObjectKind::Table => "table",
-                red_core::ObjectKind::View => "view",
-            };
-            let _ = writeln!(out, "  {kind} {}", obj.name);
+            let _ = writeln!(out, "  {} {}", obj.kind.as_str(), obj.name);
         }
     }
     if out.is_empty() {

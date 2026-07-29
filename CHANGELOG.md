@@ -7,6 +7,53 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Server panel for SQL connections, listing what the database is doing right now:
+  every session with its user, database, state, elapsed time, and statement,
+  longest-running first. Sessions waiting on a lock are marked, the ones blocking
+  them are marked too, and a summary line names how many are stuck behind how
+  few. A session can be stopped either by cancelling its statement or by
+  terminating it outright, behind a confirmation that names who and what is being
+  stopped; RED never offers to stop its own connection, never offers either on a
+  read-only connection, and never exposes stopping a session to the AI assistant.
+  The ClickHouse mutations list now lives in this panel as a second view rather
+  than a dock of its own.
+- Show DDL, on any object in the schema tree. Tables, views, routines, triggers,
+  sequences and types open their definition in a read-only tab with the SQL
+  highlighted, plus Copy and "Open as query", which pastes the text into an
+  ordinary tab rather than running it. Three engines answer with their own `SHOW
+  CREATE` verbatim; PostgreSQL, which has no such statement, gets a definition
+  assembled from the catalog that states in a header comment exactly what it does
+  and does not cover.
+- Schema comparison. Compare the current schema against another and get what
+  differs: objects on one side only, and per table the columns, indexes and
+  foreign keys added, removed or changed. Columns are compared by type rather
+  than by spelling, so a `varchar(255)` and a `character varying(255)` are
+  recognised as the same column across engines, and anything RED's type model
+  cannot classify is flagged as uncertain instead of asserted. The reconciling
+  DDL can be generated into a query tab; it is additive by default, comments out
+  every destructive statement unless you ask for them, and never runs itself.
+- Connection health report, the SQL counterpart to the Redis keyspace analysis:
+  what is big, what is unused, and what is about to hurt. Table and index sizes,
+  indexes that have never been used, foreign keys with no supporting index,
+  tables with no primary key, vacuum lag and sequential-scan-heavy tables on
+  PostgreSQL; sizes, missing keys, MyISAM tables and unused or redundant indexes
+  on MySQL; parts-per-partition on ClickHouse; free pages on SQLite. Checks that
+  cannot run on your server are listed as such rather than silently skipped, so
+  an empty findings list means the checks ran. The report is saved per connection
+  and survives a restart, and each finding's suggested fix is text to copy, never
+  something RED runs for you.
+- Watch mode for a result. Re-run this tab's query every few seconds, with the
+  cells that changed flashing, a row-count delta, and the scroll position kept.
+  It only ever re-runs read-only queries, pauses when the window is in the
+  background or the tab has unsaved edits, skips a tick while the previous run is
+  still going, stops itself after three consecutive failures, and floors its
+  interval higher on connections tagged as production. Configurable under
+  `[sql] watch_default_secs` / `watch_min_secs`.
+- The schema tree now shows materialized views, functions, procedures, triggers,
+  sequences and user-defined types, not just tables and views, grouped by kind
+  under each namespace. The programmatic kinds load when their group is expanded
+  rather than at connect, so connecting to a server with many schemas is exactly
+  as fast as before.
 - In-grid editing on ClickHouse. New rows can be added and submitted like on any
   other engine, and existing rows can be updated and deleted under a contract
   that matches what an OLAP engine can actually promise: each change is checked
@@ -123,6 +170,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   since it used to be the only way to stop being asked about ordinary writes.
 
 ### Fixed
+- Connecting crashed the app outright, on every engine. Building the workspace
+  for a new connection tried to read the application's own settings back through
+  a handle it was already holding, which aborts the process rather than failing
+  gracefully. The setting is now passed in by the caller, and a test fails the
+  build if that pattern reappears anywhere.
 - A multi-statement script run from the editor (a `CREATE TABLE` followed by its
   indexes and seed rows, say) executed only its first statement and reported
   success on SQLite, and failed with a bare engine error elsewhere. The whole
