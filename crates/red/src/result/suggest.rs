@@ -465,7 +465,13 @@ impl AppState {
             .text_size(size)
             .text_color(text);
         if s.loading && s.items.is_empty() {
-            list = list.child(div().px_2p5().py_1p5().text_color(dim).child("Loading…"));
+            list = list.child(
+                div()
+                    .px_2p5()
+                    .py_1p5()
+                    .text_color(dim)
+                    .child(crate::i18n::tr!("result.loading", "Loading…")),
+            );
         } else {
             for (pos, &item_idx) in s.filtered.iter().enumerate() {
                 let Some(row) = s.items.get(item_idx) else {

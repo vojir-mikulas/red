@@ -94,7 +94,9 @@ impl SchemaState {
     /// (`DbKind::object_kinds`), read once at connect because a connection's
     /// engine never changes under it.
     pub fn new(kind: DbKind, cx: &mut Context<AppState>) -> Self {
-        let filter = cx.new(|cx| TextInput::new(cx).with_placeholder("Filter schema…"));
+        let filter = cx.new(|cx| {
+            TextInput::new(cx).with_placeholder(crate::i18n::tr!("schema.filter", "Filter schema…"))
+        });
         // Re-render so the filter narrows the tree live as the user types.
         cx.subscribe(&filter, |_this, _input, _evt: &TextInputEvent, cx| {
             cx.notify()
@@ -648,7 +650,7 @@ fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
         RowContent::Loading => div()
             .text_size(theme.scale(11.))
             .text_color(faint)
-            .child("loading…")
+            .child(crate::i18n::tr!("common.loading", "loading…"))
             .into_any_element(),
     }
 }

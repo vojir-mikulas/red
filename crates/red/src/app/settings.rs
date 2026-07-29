@@ -144,6 +144,12 @@ impl AppState {
     /// in-app edit path and the file watcher, which is the whole point: there is
     /// no way to change a setting and skip its consequence.
     fn apply_settings_effects(&mut self, before: &Settings, cx: &mut Context<Self>) {
+        // Before the theme arm: the locale feeds every string the next render
+        // resolves, so switching it after a re-render would leave one frame in
+        // the old language.
+        if before.appearance.locale != self.settings.appearance.locale {
+            crate::i18n::apply(&self.settings.appearance.locale);
+        }
         // Theme + typography are one visual unit; the mono family and the UI size
         // are theme tokens, so any appearance change reinstalls the theme.
         if before.appearance != self.settings.appearance {
@@ -1204,9 +1210,10 @@ impl AppState {
                     let detail = report.errors.join("\n");
                     this.notify_detail(
                         ToastVariant::Error,
-                        format!(
-                            "Reset finished with {} problem(s); some data may remain",
-                            report.errors.len()
+                        crate::i18n::tr!(
+                            "notify.reset_problems",
+                            "Reset finished with {n} problem(s); some data may remain",
+                            n = report.errors.len()
                         ),
                         detail,
                         cx,

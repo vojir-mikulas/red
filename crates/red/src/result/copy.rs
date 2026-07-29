@@ -330,7 +330,7 @@ impl AppState {
 
     /// `CopyProgress`: advance the copy/migrate toast's row count + percentage.
     pub(crate) fn on_copy_progress(&mut self, id: OpId, rows: usize, cx: &mut Context<Self>) {
-        let (gerund, _, _) = self.copy_kind(id).copy_verbs();
+        let migrating = self.copy_kind(id) == TransferKind::Migrate;
         if let Some(n) = self
             .notifications
             .iter_mut()
@@ -339,8 +339,24 @@ impl AppState {
         {
             export.rows = rows;
             n.message = match rows.saturating_mul(100).checked_div(export.total) {
-                Some(pct) => format!("{gerund}… {}%", pct.min(100)).into(),
-                None => format!("{gerund}… {rows} row(s)").into(),
+                Some(pct) => {
+                    let pct = pct.min(100);
+                    if migrating {
+                        crate::i18n::tr!("copy.migrating_pct", "Migrating… {pct}%", pct = pct)
+                    } else {
+                        crate::i18n::tr!("copy.copying_pct", "Copying… {pct}%", pct = pct)
+                    }
+                }
+                None if migrating => {
+                    crate::i18n::tr!(
+                        "copy.migrating_rows",
+                        "Migrating… {rows} row(s)",
+                        rows = rows
+                    )
+                }
+                None => {
+                    crate::i18n::tr!("copy.copying_rows", "Copying… {rows} row(s)", rows = rows)
+                }
             };
         }
         cx.notify();
@@ -348,11 +364,16 @@ impl AppState {
 
     /// `CopyFinished`: drop the progress toast, leave an auto-dismissing success.
     pub(crate) fn on_copy_finished(&mut self, id: OpId, rows: usize, cx: &mut Context<Self>) {
-        let (_, past, _) = self.copy_kind(id).copy_verbs();
+        let migrating = self.copy_kind(id) == TransferKind::Migrate;
         if let Some(nid) = self.copy_notification_id(id) {
             self.dismiss(nid, cx);
         }
-        self.notify(ToastVariant::Success, format!("{past} {rows} row(s)"), cx);
+        let msg = if migrating {
+            crate::i18n::tr!("copy.migrated_rows", "Migrated {rows} row(s)", rows = rows)
+        } else {
+            crate::i18n::tr!("copy.copied_rows", "Copied {rows} row(s)", rows = rows)
+        };
+        self.notify(ToastVariant::Success, msg, cx);
     }
 
     /// `CopyFailed`: drop the progress toast, surface the error. Inserts commit per
@@ -364,28 +385,60 @@ impl AppState {
         message: String,
         cx: &mut Context<Self>,
     ) {
-        let (_, _, noun) = self.copy_kind(id).copy_verbs();
+        let migrating = self.copy_kind(id) == TransferKind::Migrate;
         if let Some(nid) = self.copy_notification_id(id) {
             self.dismiss(nid, cx);
         }
-        let msg = if rows > 0 {
-            format!("{noun} failed after {rows} row(s): {message}")
-        } else {
-            format!("{noun} failed: {message}")
+        let msg = match (migrating, rows > 0) {
+            (true, true) => crate::i18n::tr!(
+                "copy.migration_failed_after",
+                "Migration failed after {rows} row(s): {message}",
+                rows = rows,
+                message = message,
+            ),
+            (true, false) => {
+                crate::i18n::tr!(
+                    "copy.migration_failed",
+                    "Migration failed: {message}",
+                    message = message
+                )
+            }
+            (false, true) => crate::i18n::tr!(
+                "copy.copy_failed_after",
+                "Copy failed after {rows} row(s): {message}",
+                rows = rows,
+                message = message,
+            ),
+            (false, false) => {
+                crate::i18n::tr!(
+                    "copy.copy_failed",
+                    "Copy failed: {message}",
+                    message = message
+                )
+            }
         };
         self.notify(ToastVariant::Error, msg, cx);
     }
 
     /// `CopyCancelled`: drop the progress toast; earlier chunks stay committed.
     pub(crate) fn on_copy_cancelled(&mut self, id: OpId, rows: usize, cx: &mut Context<Self>) {
-        let (_, _, noun) = self.copy_kind(id).copy_verbs();
+        let migrating = self.copy_kind(id) == TransferKind::Migrate;
         if let Some(nid) = self.copy_notification_id(id) {
             self.dismiss(nid, cx);
         }
-        let msg = if rows > 0 {
-            format!("{noun} cancelled ({rows} row(s) kept)")
-        } else {
-            format!("{noun} cancelled")
+        let msg = match (migrating, rows > 0) {
+            (true, true) => crate::i18n::tr!(
+                "copy.migration_cancelled_kept",
+                "Migration cancelled ({rows} row(s) kept)",
+                rows = rows,
+            ),
+            (true, false) => crate::i18n::tr!("copy.migration_cancelled", "Migration cancelled"),
+            (false, true) => crate::i18n::tr!(
+                "copy.copy_cancelled_kept",
+                "Copy cancelled ({rows} row(s) kept)",
+                rows = rows,
+            ),
+            (false, false) => crate::i18n::tr!("copy.copy_cancelled", "Copy cancelled"),
         };
         self.notify(ToastVariant::Info, msg, cx);
     }
@@ -446,7 +499,11 @@ impl AppState {
             Notification {
                 id: 0,
                 variant: ToastVariant::Info,
-                message: format!("Migrating {n} table(s)…").into(),
+                message: crate::i18n::tr!(
+                    "notify.migrating_tables",
+                    "Migrating {n} table(s)…",
+                    n = n
+                ),
                 detail: None,
                 detail_label: None,
                 auto_dismiss: None,

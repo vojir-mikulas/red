@@ -135,7 +135,7 @@ impl AppState {
                 .gutter(false)
                 .resting_border(false)
                 .corner_radius(px(0.))
-                .a11y_label("Object definition")
+                .a11y_label(crate::i18n::tr!("schema.ddl_title", "Object definition"))
                 .with_content(ddl.clone());
             e.set_read_only(true, cx);
             e
@@ -281,7 +281,7 @@ impl AppState {
                 .p_3()
                 .text_size(theme.scale(11.5))
                 .text_color(theme.text_faint)
-                .child("loading…")
+                .child(crate::i18n::tr!("common.loading", "loading…"))
                 .into_any_element(),
             DdlState::Failed(message) => div()
                 .p_3()
@@ -570,7 +570,11 @@ impl AppState {
                 div()
                     .text_size(theme.scale(10.5))
                     .text_color(theme.text_faint)
-                    .child(format!("{} difference(s)", v.delta.count())),
+                    .child(crate::i18n::tr!(
+                        "schema.difference_count",
+                        "{n} difference(s)",
+                        n = v.delta.count()
+                    )),
             )
             .child(
                 div()

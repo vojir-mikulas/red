@@ -1216,7 +1216,7 @@ impl AppState {
                             .py(pad)
                             .text_size(row_size)
                             .text_color(theme.text_faint)
-                            .child("loading…"),
+                            .child(crate::i18n::tr!("common.loading", "loading…")),
                     );
                 }
             }

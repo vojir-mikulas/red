@@ -318,7 +318,7 @@ fn field_from_value(
     FormField {
         key: cx.new(|cx| {
             TextInput::new(cx)
-                .with_placeholder("field")
+                .with_placeholder(crate::i18n::tr!("doc.field", "field"))
                 .with_content(name)
         }),
         array_item,
@@ -363,7 +363,7 @@ fn value_from(
             let seed = scalar_seed(scalar);
             let input = cx.new(|cx| {
                 TextInput::new(cx)
-                    .with_placeholder("value")
+                    .with_placeholder(crate::i18n::tr!("doc.value", "value"))
                     .with_content(seed)
             });
             (scalar.doc_type(), FormValue::Scalar(input))
@@ -445,10 +445,15 @@ fn date_seed(ms: i64) -> String {
 fn empty_field(session: SessionId, next: &mut u64, cx: &mut Context<AppState>) -> FormField {
     let type_combo = make_type_combo(DocType::Str, session, next, cx);
     FormField {
-        key: cx.new(|cx| TextInput::new(cx).with_placeholder("field")),
+        key: cx
+            .new(|cx| TextInput::new(cx).with_placeholder(crate::i18n::tr!("doc.field", "field"))),
         array_item: false,
         ty: DocType::Str,
-        value: FormValue::Scalar(cx.new(|cx| TextInput::new(cx).with_placeholder("value"))),
+        value: FormValue::Scalar(
+            cx.new(|cx| {
+                TextInput::new(cx).with_placeholder(crate::i18n::tr!("doc.value", "value"))
+            }),
+        ),
         type_combo,
         collapsed: false,
     }
@@ -676,7 +681,7 @@ impl AppState {
         let new_input = scalar.then(|| {
             cx.new(|cx| {
                 TextInput::new(cx)
-                    .with_placeholder("value")
+                    .with_placeholder(crate::i18n::tr!("doc.value", "value"))
                     .with_content(seed)
             })
         });

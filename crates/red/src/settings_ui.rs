@@ -272,7 +272,7 @@ fn settings_banner(
                 .tab_index(0)
                 .focus(move |s| s.border_color(focus_ring))
                 .on_click(cx.listener(|this, _, _, cx| this.dismiss_settings_warnings(cx)))
-                .child("Dismiss"),
+                .child(crate::i18n::tr!("settings.ui_dismiss", "Dismiss")),
         )
 }
 
@@ -331,7 +331,7 @@ fn settings_nav_item(
         .id(SharedString::from(format!("settings-nav-{}", tab.label())))
         // A category selector; expose it as a tab to assistive tech.
         .role(gpui::Role::Tab)
-        .aria_label(tab.label())
+        .aria_label(tab.title())
         .flex()
         .items_center()
         .px_3()
@@ -353,7 +353,7 @@ fn settings_nav_item(
         .tab_index(0)
         .focus(move |s| s.border_color(focus_ring))
         .on_click(cx.listener(move |this, _, _, cx| this.set_settings_tab(tab, cx)))
-        .child(tab.label())
+        .child(tab.title())
 }
 
 /// The content page for the selected settings category.
@@ -391,7 +391,7 @@ fn registry_page(tab: SettingsTab, state: &AppState, cx: &mut Context<AppState>)
                     .count()
                     == 0)
             {
-                body = body.child(settings_header(group, &theme));
+                body = body.child(settings_header(&def.group_label(), &theme));
             }
         }
         first = false;
@@ -503,7 +503,7 @@ fn labelled(
                         .text_size(theme.scale(TEXT_ROW))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(theme.text)
-                        .child(def.label),
+                        .child(def.label()),
                 )
                 .children(badge.map(|b| {
                     div()
@@ -532,7 +532,7 @@ fn labelled(
             div()
                 .text_size(theme.scale(TEXT_BODY))
                 .text_color(theme.text_muted)
-                .child(def.help),
+                .child(def.help()),
         )
         .child(
             div()
@@ -583,7 +583,7 @@ fn registry_control(
             let view = cx.entity();
             let mut control = Segmented::new(SharedString::from(def.key));
             for segment in *segments {
-                control = control.segment(segment.label);
+                control = control.segment(def.segment_label(segment));
             }
             control
                 .selected(selected)
@@ -617,14 +617,17 @@ fn search_results(query: &str, state: &AppState, cx: &mut Context<AppState>) -> 
                 .py_4()
                 .text_size(theme.scale(TEXT_BODY))
                 .text_color(theme.text_faint)
-                .child("No settings match your search."),
+                .child(crate::i18n::tr!(
+                    "settings.ui_no_settings_match_your_search",
+                    "No settings match your search."
+                )),
         );
     }
     let mut tab = None;
     for def in hits {
         if tab != Some(def.tab) {
             tab = Some(def.tab);
-            body = body.child(settings_header(def.tab.label(), &theme));
+            body = body.child(settings_header(&def.tab.title(), &theme));
         }
         // Always badge in search results: a row lifted out of its page needs to
         // say which seam it affects.
@@ -640,7 +643,10 @@ fn search_results(query: &str, state: &AppState, cx: &mut Context<AppState>) -> 
                 .text_size(theme.scale(TEXT_TITLE))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.text)
-                .child("Search results"),
+                .child(crate::i18n::tr!(
+                    "settings.ui_search_results",
+                    "Search results"
+                )),
         )
         .child(body)
         .into_any_element()
@@ -840,10 +846,13 @@ fn theme_manager(state: &AppState, cx: &mut Context<AppState>) -> impl IntoEleme
 
     let mut list = div().flex().flex_col().gap_0p5().child(
         div().pb_1().child(
-            Button::new("theme-import", "Import theme…")
-                .variant(ButtonVariant::Secondary)
-                .size(ButtonSize::Sm)
-                .on_click(cx.listener(|this, _, _, cx| this.import_theme(cx))),
+            Button::new(
+                "theme-import",
+                crate::i18n::tr!("settings.ui_import_theme", "Import theme…"),
+            )
+            .variant(ButtonVariant::Secondary)
+            .size(ButtonSize::Sm)
+            .on_click(cx.listener(|this, _, _, cx| this.import_theme(cx))),
         ),
     );
     for entry in state.themes.entries() {
@@ -955,16 +964,22 @@ fn keymap_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
         .mb_1()
         .child(search)
         .child(
-            Button::new("keymap-open-file", "Open keymap file")
-                .variant(ButtonVariant::Secondary)
-                .size(ButtonSize::Sm)
-                .on_click(cx.listener(|this, _, _, cx| this.open_keymap_file(cx))),
+            Button::new(
+                "keymap-open-file",
+                crate::i18n::tr!("settings.ui_open_keymap_file", "Open keymap file"),
+            )
+            .variant(ButtonVariant::Secondary)
+            .size(ButtonSize::Sm)
+            .on_click(cx.listener(|this, _, _, cx| this.open_keymap_file(cx))),
         )
         .child(
-            Button::new("keymap-reset-all", "Reset all")
-                .variant(ButtonVariant::Ghost)
-                .size(ButtonSize::Sm)
-                .on_click(cx.listener(|this, _, _, cx| this.reset_all_keymap(cx))),
+            Button::new(
+                "keymap-reset-all",
+                crate::i18n::tr!("settings.ui_reset_all", "Reset all"),
+            )
+            .variant(ButtonVariant::Ghost)
+            .size(ButtonSize::Sm)
+            .on_click(cx.listener(|this, _, _, cx| this.reset_all_keymap(cx))),
         );
 
     let mut list = div().flex().flex_col();
@@ -973,7 +988,7 @@ fn keymap_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
         let eff = slots[i].as_deref();
         // Filter by label or effective keystroke.
         if !query.is_empty() {
-            let hit = d.label.to_lowercase().contains(&query)
+            let hit = d.label().to_lowercase().contains(&query)
                 || eff.is_some_and(|k| k.to_lowercase().contains(&query));
             if !hit {
                 continue;
@@ -988,7 +1003,10 @@ fn keymap_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 .py_3()
                 .text_size(theme.scale(TEXT_BODY))
                 .text_color(theme.text_faint)
-                .child("No actions match your search."),
+                .child(crate::i18n::tr!(
+                    "settings.ui_no_actions_match_your_search",
+                    "No actions match your search."
+                )),
         );
     }
 
@@ -1064,7 +1082,7 @@ fn keymap_row(
                     .text_size(theme.scale(TEXT_ROW))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme.text)
-                    .child(SharedString::from(def.label.to_string())),
+                    .child(def.label()),
             )
             .when(is_customized && pending.is_none() && !recording, |d| {
                 d.child(
@@ -1075,7 +1093,7 @@ fn keymap_row(
                         .text_size(theme.scale(TEXT_BADGE))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme.accent)
-                        .child("CUSTOM"),
+                        .child(crate::i18n::tr!("settings.ui_custom", "CUSTOM")),
                 )
             }),
     );
@@ -1118,7 +1136,7 @@ fn idle_control(
             None => div()
                 .text_size(theme.scale(TEXT_BODY))
                 .text_color(theme.text_faint)
-                .child("Unset")
+                .child(crate::i18n::tr!("settings.ui_unset", "Unset"))
                 .into_any_element(),
         })
         .child(
@@ -1154,13 +1172,19 @@ fn recording_affordance(theme: &Theme, cx: &mut Context<AppState>) -> impl IntoE
                 .bg(theme.accent.opacity(0.1))
                 .text_size(theme.scale(TEXT_BODY))
                 .text_color(theme.accent)
-                .child("Press a shortcut… · Esc to cancel"),
+                .child(crate::i18n::tr!(
+                    "settings.ui_press_a_shortcut_esc_to_cancel",
+                    "Press a shortcut… · Esc to cancel"
+                )),
         )
         .child(
-            Button::new("keymap-record-cancel", "Cancel")
-                .variant(ButtonVariant::Ghost)
-                .size(ButtonSize::Sm)
-                .on_click(cx.listener(|this, _, _, cx| this.cancel_keymap_record(cx))),
+            Button::new(
+                "keymap-record-cancel",
+                crate::i18n::tr!("settings.ui_cancel", "Cancel"),
+            )
+            .variant(ButtonVariant::Ghost)
+            .size(ButtonSize::Sm)
+            .on_click(cx.listener(|this, _, _, cx| this.cancel_keymap_record(cx))),
         )
 }
 
@@ -1173,7 +1197,7 @@ fn capture_confirm(
 ) -> impl IntoElement + use<> {
     let conflict_label = cap
         .conflict
-        .map(|j| crate::keymap::action_defs()[j].label.to_string());
+        .map(|j| crate::keymap::action_defs()[j].label().to_string());
 
     let confirm_label = if conflict_label.is_some() {
         "Rebind anyway"
@@ -1199,10 +1223,13 @@ fn capture_confirm(
                         .on_click(cx.listener(|this, _, _, cx| this.confirm_keymap_rebind(cx))),
                 )
                 .child(
-                    Button::new("keymap-confirm-cancel", "Cancel")
-                        .variant(ButtonVariant::Ghost)
-                        .size(ButtonSize::Sm)
-                        .on_click(cx.listener(|this, _, _, cx| this.cancel_keymap_record(cx))),
+                    Button::new(
+                        "keymap-confirm-cancel",
+                        crate::i18n::tr!("settings.ui_cancel", "Cancel"),
+                    )
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Sm)
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel_keymap_record(cx))),
                 ),
         )
         .children(conflict_label.map(|other| {
@@ -1293,10 +1320,13 @@ fn behavior_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 "Permanently delete RED's config and cached-data directories and every \
                  keychain secret (connection passwords, SSH keys, AI keys). Irreversible; \
                  does not touch the RED binary. RED quits when it's done.",
-                Button::new("reset-open", "Remove all RED data…")
-                    .variant(ButtonVariant::Danger)
-                    .size(ButtonSize::Sm)
-                    .on_click(cx.listener(|this, _, _, cx| this.open_reset_confirm(cx))),
+                Button::new(
+                    "reset-open",
+                    crate::i18n::tr!("settings.ui_remove_all_red_data", "Remove all RED data…"),
+                )
+                .variant(ButtonVariant::Danger)
+                .size(ButtonSize::Sm)
+                .on_click(cx.listener(|this, _, _, cx| this.open_reset_confirm(cx))),
                 &theme,
             )),
         &theme,
@@ -1347,17 +1377,23 @@ fn ai_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 .flex()
                 .gap_2()
                 .child(
-                    Button::new("ai-report-dir-pick", "Choose folder…")
-                        .variant(ButtonVariant::Secondary)
-                        .size(ButtonSize::Sm)
-                        .on_click(cx.listener(|this, _, _, cx| this.pick_ai_report_dir(cx))),
+                    Button::new(
+                        "ai-report-dir-pick",
+                        crate::i18n::tr!("settings.ui_choose_folder", "Choose folder…"),
+                    )
+                    .variant(ButtonVariant::Secondary)
+                    .size(ButtonSize::Sm)
+                    .on_click(cx.listener(|this, _, _, cx| this.pick_ai_report_dir(cx))),
                 )
                 .when(has_report_dir, |row| {
                     row.child(
-                        Button::new("ai-report-dir-reset", "Reset")
-                            .variant(ButtonVariant::Secondary)
-                            .size(ButtonSize::Sm)
-                            .on_click(cx.listener(|this, _, _, cx| this.clear_ai_report_dir(cx))),
+                        Button::new(
+                            "ai-report-dir-reset",
+                            crate::i18n::tr!("settings.ui_reset", "Reset"),
+                        )
+                        .variant(ButtonVariant::Secondary)
+                        .size(ButtonSize::Sm)
+                        .on_click(cx.listener(|this, _, _, cx| this.clear_ai_report_dir(cx))),
                     )
                 }),
         );
@@ -1476,7 +1512,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                 .bg(theme.accent_ghost)
                 .text_size(theme.scale(TEXT_BADGE))
                 .text_color(theme.accent)
-                .child("DEFAULT")
+                .child(crate::i18n::tr!("settings.ui_default", "DEFAULT"))
                 .into_any_element()
         } else {
             let id = a.id.clone();
@@ -1543,7 +1579,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                 .cursor_pointer()
                 .tooltip(flint::Tooltip::text("Sign out of this subscription"))
                 .hover(|s| s.bg(theme.bg_elevated))
-                .child("Sign out")
+                .child(crate::i18n::tr!("settings.ui_sign_out", "Sign out"))
                 .on_click(move |_, _, cx| {
                     cx.stop_propagation();
                     let id = signout_id.clone();
@@ -1654,19 +1690,22 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
                             .child(state.ai_key_input.clone()),
                     )
                     .child(
-                        Button::new("ai-key-save", "Save")
+                        Button::new("ai-key-save", crate::i18n::tr!("settings.ui_save", "Save"))
                             .variant(ButtonVariant::Primary)
                             .size(ButtonSize::Sm)
                             .on_click(cx.listener(|this, _, _, cx| this.save_agent_key(cx))),
                     )
                     .when(has_key, |row| {
                         row.child(
-                            Button::new("ai-key-remove", "Remove")
-                                .variant(ButtonVariant::Danger)
-                                .size(ButtonSize::Sm)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.clear_agent_key(&id_remove, cx)
-                                })),
+                            Button::new(
+                                "ai-key-remove",
+                                crate::i18n::tr!("settings.ui_remove", "Remove"),
+                            )
+                            .variant(ButtonVariant::Danger)
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| this.clear_agent_key(&id_remove, cx),
+                            )),
                         )
                     }),
             );
@@ -1695,10 +1734,13 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
         )
         .child(list)
         .child(
-            Button::new("ai-edit-agents-file", "Edit in settings file")
-                .variant(ButtonVariant::Secondary)
-                .size(ButtonSize::Sm)
-                .on_click(cx.listener(|this, _, _, cx| this.open_settings_file(cx))),
+            Button::new(
+                "ai-edit-agents-file",
+                crate::i18n::tr!("settings.ui_edit_in_settings_file", "Edit in settings file"),
+            )
+            .variant(ButtonVariant::Secondary)
+            .size(ButtonSize::Sm)
+            .on_click(cx.listener(|this, _, _, cx| this.open_settings_file(cx))),
         )
         .into_any_element()
 }
@@ -1739,7 +1781,10 @@ fn login_panel(
                 div()
                     .text_size(theme.scale(TEXT_MINOR))
                     .text_color(theme.text_muted)
-                    .child("Starting sign-in… a browser window will open shortly."),
+                    .child(crate::i18n::tr!(
+                        "settings.ui_starting_sign_in_a_browser_window_will_open_shor",
+                        "Starting sign-in… a browser window will open shortly."
+                    )),
             );
         }
         Some(url) => {
@@ -1761,7 +1806,10 @@ fn login_panel(
                         .cursor_pointer()
                         .text_size(theme.scale(TEXT_MINOR))
                         .text_color(theme.accent)
-                        .child("Didn't open? Open the sign-in page")
+                        .child(crate::i18n::tr!(
+                            "settings.ui_didn_t_open_open_the_sign_in_page",
+                            "Didn't open? Open the sign-in page"
+                        ))
                         .on_click(
                             cx.listener(move |this, _, _, cx| this.open_external(&url_open, cx)),
                         ),
@@ -1772,7 +1820,10 @@ fn login_panel(
                         .pt_1()
                         .text_size(theme.scale(TEXT_MINOR))
                         .text_color(theme.text_faint)
-                        .child("If the browser shows a code instead, paste it here:"),
+                        .child(crate::i18n::tr!(
+                            "settings.ui_if_the_browser_shows_a_code_instead_paste_it_her",
+                            "If the browser shows a code instead, paste it here:"
+                        )),
                 )
                 .child(
                     div()
@@ -1786,16 +1837,22 @@ fn login_panel(
                                 .child(state.ai_login_code.clone()),
                         )
                         .child(
-                            Button::new("ai-login-submit", "Submit")
-                                .variant(ButtonVariant::Secondary)
-                                .size(ButtonSize::Sm)
-                                .on_click(cx.listener(|this, _, _, cx| this.submit_login_code(cx))),
+                            Button::new(
+                                "ai-login-submit",
+                                crate::i18n::tr!("settings.ui_submit", "Submit"),
+                            )
+                            .variant(ButtonVariant::Secondary)
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(|this, _, _, cx| this.submit_login_code(cx))),
                         )
                         .child(
-                            Button::new("ai-login-cancel", "Cancel")
-                                .variant(ButtonVariant::Secondary)
-                                .size(ButtonSize::Sm)
-                                .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
+                            Button::new(
+                                "ai-login-cancel",
+                                crate::i18n::tr!("settings.ui_cancel", "Cancel"),
+                            )
+                            .variant(ButtonVariant::Secondary)
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
                         ),
                 );
             if flow.submitting {
@@ -1803,7 +1860,10 @@ fn login_panel(
                     div()
                         .text_size(theme.scale(TEXT_MINOR))
                         .text_color(theme.text_muted)
-                        .child("Finishing sign-in…"),
+                        .child(crate::i18n::tr!(
+                            "settings.ui_finishing_sign_in",
+                            "Finishing sign-in…"
+                        )),
                 );
             }
         }
@@ -1836,7 +1896,10 @@ fn about_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                     .pb_2()
                     .text_size(theme.scale(TEXT_ROW))
                     .text_color(theme.text_muted)
-                    .child("RED: Roughly Enough Data, a fast, native database explorer."),
+                    .child(crate::i18n::tr!(
+                        "settings.ui_red_roughly_enough_data_a_fast_native_database_e",
+                        "RED: Roughly Enough Data, a fast, native database explorer."
+                    )),
             )
             .child(settings_header("Build", &theme))
             .child(setting_row(
@@ -1854,15 +1917,18 @@ fn about_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
             .child(setting_row(
                 "What's new",
                 "Open the changelog for this and past releases.",
-                Button::new("about-changelog", "Open changelog…")
-                    .variant(ButtonVariant::Secondary)
-                    .size(ButtonSize::Sm)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        // Close Settings first so the What's New overlay isn't hidden
-                        // behind it; the focus flags resolve in the right order.
-                        this.close_settings(cx);
-                        this.open_whats_new(cx);
-                    })),
+                Button::new(
+                    "about-changelog",
+                    crate::i18n::tr!("settings.ui_open_changelog", "Open changelog…"),
+                )
+                .variant(ButtonVariant::Secondary)
+                .size(ButtonSize::Sm)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    // Close Settings first so the What's New overlay isn't hidden
+                    // behind it; the focus flags resolve in the right order.
+                    this.close_settings(cx);
+                    this.open_whats_new(cx);
+                })),
                 &theme,
             ))
             .child(settings_header("Updates", &theme))
@@ -1879,14 +1945,15 @@ fn about_page(state: &AppState, cx: &mut Context<AppState>) -> AnyElement {
                 "Report a bug",
                 "RED is in early development. Found something wrong? Open an \
                  issue on GitHub.",
-                Button::new("report-bug", "Report a bug…")
-                    .variant(ButtonVariant::Secondary)
-                    .size(ButtonSize::Sm)
-                    .on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.open_external(crate::app::ISSUES_URL, cx)
-                        }),
-                    ),
+                Button::new(
+                    "report-bug",
+                    crate::i18n::tr!("settings.ui_report_a_bug", "Report a bug…"),
+                )
+                .variant(ButtonVariant::Secondary)
+                .size(ButtonSize::Sm)
+                .on_click(
+                    cx.listener(|this, _, _, cx| this.open_external(crate::app::ISSUES_URL, cx)),
+                ),
                 &theme,
             )),
         &theme,
@@ -1927,17 +1994,23 @@ fn update_status_row<'a>(
         UpdateState::Unsupported { url, .. } => {
             let url = url.clone();
             Some(
-                Button::new("update-download", "Download…")
-                    .variant(ButtonVariant::Secondary)
-                    .size(ButtonSize::Sm)
-                    .on_click(cx.listener(move |this, _, _, cx| this.open_external(&url, cx))),
+                Button::new(
+                    "update-download",
+                    crate::i18n::tr!("settings.ui_download", "Download…"),
+                )
+                .variant(ButtonVariant::Secondary)
+                .size(ButtonSize::Sm)
+                .on_click(cx.listener(move |this, _, _, cx| this.open_external(&url, cx))),
             )
         }
         _ if enabled => Some(
-            Button::new("update-check", "Check for updates")
-                .variant(ButtonVariant::Secondary)
-                .size(ButtonSize::Sm)
-                .on_click(cx.listener(|this, _, _, cx| this.check_for_updates(cx))),
+            Button::new(
+                "update-check",
+                crate::i18n::tr!("settings.ui_check_for_updates", "Check for updates"),
+            )
+            .variant(ButtonVariant::Secondary)
+            .size(ButtonSize::Sm)
+            .on_click(cx.listener(|this, _, _, cx| this.check_for_updates(cx))),
         ),
         _ => None,
     };
@@ -1982,9 +2055,9 @@ fn page_scaffold(tab: SettingsTab, body: impl IntoElement, theme: &Theme) -> imp
                 .text_size(theme.scale(TEXT_TITLE))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.text)
-                .child(tab.label()),
+                .child(tab.title()),
         )
-        .children(tab.subtitle().map(|s| {
+        .children(tab.subtitle_text().map(|s| {
             div()
                 .pt_0p5()
                 .text_size(theme.scale(TEXT_BODY))
@@ -2011,13 +2084,16 @@ fn settings_footer(cx: &mut Context<AppState>) -> impl IntoElement + use<> {
         // sharp corner into it (the nav rounds the bottom-left).
         .rounded_br(px(10.))
         .child(
-            Button::new("set-open-file", "Open settings file")
-                .variant(ButtonVariant::Ghost)
-                .on_click(cx.listener(|this, _, _, cx| this.open_settings_file(cx))),
+            Button::new(
+                "set-open-file",
+                crate::i18n::tr!("settings.ui_open_settings_file", "Open settings file"),
+            )
+            .variant(ButtonVariant::Ghost)
+            .on_click(cx.listener(|this, _, _, cx| this.open_settings_file(cx))),
         )
         .child(div().flex_1())
         .child(
-            Button::new("set-done", "Done")
+            Button::new("set-done", crate::i18n::tr!("settings.ui_done", "Done"))
                 .variant(ButtonVariant::Primary)
                 .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
         )

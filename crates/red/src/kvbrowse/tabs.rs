@@ -550,15 +550,20 @@ impl AppState {
             (
                 ToastVariant::Success,
                 if copied == 1 {
-                    "Copied 1 key".to_string()
+                    crate::i18n::tr!("kv.copied_one_key", "Copied 1 key")
                 } else {
-                    format!("Copied {copied} keys")
+                    crate::i18n::tr!("kv.copied_keys_ok", "Copied {copied} keys", copied = copied)
                 },
             )
         } else {
             (
                 ToastVariant::Warning,
-                format!("Copied {copied} key(s), {failed} failed"),
+                crate::i18n::tr!(
+                    "kv.copied_keys",
+                    "Copied {copied} key(s), {failed} failed",
+                    copied = copied,
+                    failed = failed,
+                ),
             )
         };
         self.notify(variant, msg, cx);
@@ -596,9 +601,15 @@ impl AppState {
             .and_then(|c| self.redis_key_meta.get(c, &key))
             .map(|a| (a.note.clone(), a.tags.join(", ")))
             .unwrap_or_default();
-        let note = cx.new(|cx| TextInput::new(cx).with_placeholder("note…"));
+        let note =
+            cx.new(|cx| TextInput::new(cx).with_placeholder(crate::i18n::tr!("kv.note", "note…")));
         note.update(cx, |ti, cx| ti.set_content(note_text, cx));
-        let tags = cx.new(|cx| TextInput::new(cx).with_placeholder("tags, comma-separated…"));
+        let tags = cx.new(|cx| {
+            TextInput::new(cx).with_placeholder(crate::i18n::tr!(
+                "kv.tags_comma_separated",
+                "tags, comma-separated…"
+            ))
+        });
         tags.update(cx, |ti, cx| ti.set_content(tags_text, cx));
         if let Some(view) = self
             .conn_mut(Some(session))

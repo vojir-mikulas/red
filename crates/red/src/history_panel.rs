@@ -154,7 +154,13 @@ impl AppState {
             .font_family(ui_family.clone())
             .text_size(size_11)
             .text_color(muted)
-            .child(div().flex_1().min_w_0().truncate().child("History"))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(crate::i18n::tr!("history.title", "History")),
+            )
             .children(clear_btn)
             .child(close_btn);
 

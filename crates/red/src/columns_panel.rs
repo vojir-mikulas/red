@@ -151,7 +151,13 @@ impl AppState {
             .font_family(ui_family.clone())
             .text_size(size_11)
             .text_color(muted)
-            .child(div().flex_1().min_w_0().truncate().child("Columns"))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(crate::i18n::tr!("columns.title", "Columns")),
+            )
             .children(clear_btn)
             .child(close_btn);
 
@@ -167,7 +173,10 @@ impl AppState {
                 .px_4()
                 .text_size(size_11)
                 .text_color(faint)
-                .child("Open a table to add reference columns")
+                .child(crate::i18n::tr!(
+                    "columns.empty",
+                    "Open a table to add reference columns"
+                ))
                 .into_any_element()
         } else {
             div()
@@ -243,7 +252,7 @@ impl AppState {
                     .py(px(2.))
                     .text_size(size_10)
                     .text_color(faint)
-                    .child("loading…")
+                    .child(crate::i18n::tr!("common.loading", "loading…"))
                     .into_any_element(),
             );
             return;

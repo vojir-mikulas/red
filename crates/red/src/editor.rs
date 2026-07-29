@@ -273,8 +273,12 @@ fn filter_completion_provider(
                 {
                     seen.insert(name.to_lowercase());
                     out.push(
-                        CompletionItem::new(quoted, CompletionKind::Field)
-                            .documentation("result column"),
+                        CompletionItem::new(quoted, CompletionKind::Field).documentation(
+                            crate::i18n::tr!(
+                                "editor.completion_doc_result_column",
+                                "result column"
+                            ),
+                        ),
                     );
                 }
             }
@@ -435,19 +439,31 @@ fn hover_provider(
 fn column_item(col: &ColumnCand) -> CompletionItem {
     let item = CompletionItem::new(col.name.clone(), CompletionKind::Field);
     if col.ty.is_empty() {
-        item.documentation("column")
+        item.documentation(crate::i18n::tr!(
+            "editor.completion_doc_bare_column",
+            "column"
+        ))
     } else {
-        item.detail(col.ty.clone())
-            .documentation(SharedString::from(format!("{} column", col.ty)))
+        item.detail(col.ty.clone()).documentation(crate::i18n::tr!(
+            "editor.completion_doc_column",
+            "{ty} column",
+            ty = col.ty
+        ))
     }
 }
 
 /// Build a table/view completion: an `Object` badge plus table-vs-view text.
 fn table_item(t: &TableCand) -> CompletionItem {
     let (detail, doc) = if t.is_view {
-        ("view", "Database view.")
+        (
+            crate::i18n::tr!("editor.completion_kind_view", "view"),
+            crate::i18n::tr!("editor.completion_doc_view", "Database view."),
+        )
     } else {
-        ("table", "Database table.")
+        (
+            crate::i18n::tr!("editor.completion_kind_table", "table"),
+            crate::i18n::tr!("editor.completion_doc_table", "Database table."),
+        )
     };
     CompletionItem::new(t.name.clone(), CompletionKind::Object)
         .detail(detail)
@@ -456,7 +472,10 @@ fn table_item(t: &TableCand) -> CompletionItem {
 
 /// Build a keyword completion: a `Keyword` badge plus any one-line guide.
 fn keyword_item(kw: &SharedString) -> CompletionItem {
-    let item = CompletionItem::new(kw.clone(), CompletionKind::Keyword).detail("keyword");
+    let item = CompletionItem::new(kw.clone(), CompletionKind::Keyword).detail(crate::i18n::tr!(
+        "editor.completion_kind_keyword",
+        "keyword"
+    ));
     match crate::sql::keyword_doc(&kw.to_lowercase()) {
         Some(doc) => item.documentation(doc),
         None => item,
@@ -550,7 +569,7 @@ fn join_items(index: &CompletionIndex, content: &str, cursor: usize) -> Vec<Comp
             let label = format!("{} {} ON {}", t.name, alias, on);
             out.push(
                 CompletionItem::new(SharedString::from(label), CompletionKind::Object)
-                    .detail("join")
+                    .detail(crate::i18n::tr!("editor.completion_kind_join", "join"))
                     .documentation(SharedString::from(format!("joins {}", rel.other))),
             );
         }
@@ -966,7 +985,10 @@ impl AppState {
                     .border_l_1()
                     .border_color(border)
                     .cursor_pointer()
-                    .tooltip(Tooltip::text(crate::keymap::localize_hint("New tab  ⌘T")))
+                    .tooltip(Tooltip::text(crate::keymap::localize_hint(&format!(
+                        "{}  ⌘T",
+                        crate::i18n::tr!("editor.new_tab", "New tab")
+                    ))))
                     .text_color(faint)
                     .hover(|s| s.bg(bg_elevated).text_color(text))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1025,7 +1047,10 @@ impl AppState {
                 .justify_center()
                 .text_size(size_12)
                 .text_color(faint)
-                .child("No query tab open. Press ＋ to start");
+                .child(crate::i18n::tr!(
+                    "editor.no_tab_open",
+                    "No query tab open. Press ＋ to start"
+                ));
             return div()
                 .relative()
                 .size_full()
@@ -1111,7 +1136,7 @@ impl AppState {
                 .text_size(size_11)
                 .text_color(yellow)
                 .child(crate::icons::icon("lock", theme.scale(11.), yellow))
-                .child("read-only")
+                .child(crate::i18n::tr!("editor.read_only_badge", "read-only"))
         });
         let run_bar = div()
             .flex_shrink_0()
@@ -1128,19 +1153,25 @@ impl AppState {
             .border_t_1()
             .border_color(border)
             .child(
-                Button::new("sql-run", crate::keymap::localize_hint("Run  ⌘↵"))
-                    .variant(ButtonVariant::Primary)
-                    .size(ButtonSize::Sm)
-                    .icon(crate::icons::icon("play", theme.scale(11.), on_accent))
-                    // Aim the action at the half this bar lives in, not whichever
-                    // half currently holds focus (mirrors the tab/＋ handlers).
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_split_focus(half, cx);
-                        this.run_editor_query(cx);
-                    })),
+                Button::new(
+                    "sql-run",
+                    crate::keymap::localize_hint(&format!(
+                        "{}  ⌘↵",
+                        crate::i18n::tr!("editor.run", "Run")
+                    )),
+                )
+                .variant(ButtonVariant::Primary)
+                .size(ButtonSize::Sm)
+                .icon(crate::icons::icon("play", theme.scale(11.), on_accent))
+                // Aim the action at the half this bar lives in, not whichever
+                // half currently holds focus (mirrors the tab/＋ handlers).
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_split_focus(half, cx);
+                    this.run_editor_query(cx);
+                })),
             )
             .child(
-                Button::new("sql-explain", "Explain")
+                Button::new("sql-explain", crate::i18n::tr!("editor.explain", "Explain"))
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::Sm)
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1149,7 +1180,7 @@ impl AppState {
                     })),
             )
             .child(
-                Button::new("sql-save", "Save")
+                Button::new("sql-save", crate::i18n::tr!("editor.save", "Save"))
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::Sm)
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1433,7 +1464,10 @@ impl AppState {
         if read_only && assessment.level > RiskLevel::Safe {
             self.notify(
                 ToastVariant::Error,
-                "Connection is read-only; write statements are disabled.",
+                crate::i18n::tr!(
+                    "editor.read_only_blocked",
+                    "Connection is read-only; write statements are disabled."
+                ),
                 cx,
             );
             return;
@@ -1567,7 +1601,10 @@ impl AppState {
         if matches!(&self.phase, Phase::Connected(active) if active.config.read_only) {
             self.notify(
                 ToastVariant::Error,
-                "Connection is read-only; write statements are disabled.",
+                crate::i18n::tr!(
+                    "editor.read_only_blocked",
+                    "Connection is read-only; write statements are disabled."
+                ),
                 cx,
             );
             return;
@@ -1793,7 +1830,11 @@ impl AppState {
             },
             _ => (false, false, false, false),
         };
-        let pin_label = if pinned { "Unpin tab" } else { "Pin tab" };
+        let pin_label = if pinned {
+            crate::i18n::tr!("editor.unpin_tab", "Unpin tab")
+        } else {
+            crate::i18n::tr!("editor.pin_tab", "Pin tab")
+        };
         let menu = ContextMenu::new("tab-context-menu")
             .item(
                 ContextMenuItem::new("tab-pin", pin_label).on_click(cx.listener(
@@ -1805,44 +1846,54 @@ impl AppState {
             )
             .separator()
             .item(
-                ContextMenuItem::new("tab-close", "Close").on_click(cx.listener(
-                    move |this, _, _, cx| {
+                ContextMenuItem::new("tab-close", crate::i18n::tr!("editor.tab_close", "Close"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         this.tab_context_menu = None;
                         this.close_tab_group(index, TabCloseScope::One, cx);
-                    },
-                )),
-            )
-            .item(
-                ContextMenuItem::new("tab-close-others", "Close Others")
-                    .disabled(!has_others)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.tab_context_menu = None;
-                        this.close_tab_group(index, TabCloseScope::Others, cx);
                     })),
             )
             .item(
-                ContextMenuItem::new("tab-close-left", "Close Left")
-                    .disabled(!has_left)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.tab_context_menu = None;
-                        this.close_tab_group(index, TabCloseScope::Left, cx);
-                    })),
+                ContextMenuItem::new(
+                    "tab-close-others",
+                    crate::i18n::tr!("editor.tab_close_others", "Close Others"),
+                )
+                .disabled(!has_others)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.tab_context_menu = None;
+                    this.close_tab_group(index, TabCloseScope::Others, cx);
+                })),
             )
             .item(
-                ContextMenuItem::new("tab-close-right", "Close Right")
-                    .disabled(!has_right)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.tab_context_menu = None;
-                        this.close_tab_group(index, TabCloseScope::Right, cx);
-                    })),
+                ContextMenuItem::new(
+                    "tab-close-left",
+                    crate::i18n::tr!("editor.tab_close_left", "Close Left"),
+                )
+                .disabled(!has_left)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.tab_context_menu = None;
+                    this.close_tab_group(index, TabCloseScope::Left, cx);
+                })),
             )
             .item(
-                ContextMenuItem::new("tab-close-all", "Close All").on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        this.tab_context_menu = None;
-                        this.close_tab_group(index, TabCloseScope::All, cx);
-                    },
-                )),
+                ContextMenuItem::new(
+                    "tab-close-right",
+                    crate::i18n::tr!("editor.tab_close_right", "Close Right"),
+                )
+                .disabled(!has_right)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.tab_context_menu = None;
+                    this.close_tab_group(index, TabCloseScope::Right, cx);
+                })),
+            )
+            .item(
+                ContextMenuItem::new(
+                    "tab-close-all",
+                    crate::i18n::tr!("editor.tab_close_all", "Close All"),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.tab_context_menu = None;
+                    this.close_tab_group(index, TabCloseScope::All, cx);
+                })),
             );
         div()
             .absolute()

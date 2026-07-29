@@ -55,6 +55,15 @@ ui_font_size = 13
 # manual opt-in.
 reduce_motion = false
 
+# The interface language. "system" follows the OS; otherwise a locale code that
+# ships a catalog in `assets/i18n/`. English is the only translation so far, so
+# every value currently resolves to it. An unrecognised code falls back to English
+# rather than failing the load.
+#   locale = "system" | "en"
+# "en-XA" is a pseudolocale (English with accented letters, every string bracketed)
+# used to audit which strings are still hardcoded. Not a language.
+locale = "system"
+
 [editor]
 # Code-editor typography, shared by the SQL editor, the JSON editor, and the Redis
 # console. A monospace family is recommended. `line_height` is a multiple of the

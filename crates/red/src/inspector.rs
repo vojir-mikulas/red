@@ -1027,7 +1027,10 @@ impl AppState {
                     .text_size(s12)
                     .text_color(faint)
                     .font_family(ui_family.clone())
-                    .child("This row scrolled out of view; load it to inspect.")
+                    .child(crate::i18n::tr!(
+                        "inspector.row_evicted",
+                        "This row scrolled out of view; load it to inspect."
+                    ))
                     .into_any_element(),
                 Some(self.load_button(cx)),
             ),
@@ -1042,7 +1045,10 @@ impl AppState {
                     .text_size(s12)
                     .text_color(faint)
                     .font_family(ui_family.clone())
-                    .child("Select a cell to inspect its full value.")
+                    .child(crate::i18n::tr!(
+                        "inspector.empty",
+                        "Select a cell to inspect its full value."
+                    ))
                     .into_any_element(),
                 None,
             ),

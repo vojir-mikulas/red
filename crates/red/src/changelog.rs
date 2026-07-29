@@ -70,7 +70,7 @@ impl AppState {
         let theme = cx.theme().clone();
         let close_view = cx.entity().downgrade();
         Modal::new("whats-new")
-            .title("What's New")
+            .title(crate::i18n::tr!("changelog.title", "What's New"))
             .width(px(560.))
             .focus_handle(self.modal_focus.clone())
             .on_close(move |_, cx| {

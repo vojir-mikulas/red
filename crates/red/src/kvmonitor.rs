@@ -412,9 +412,13 @@ impl AppState {
                     .text_size(theme.scale(10.5))
                     .text_color(theme.text_muted)
                     .child(if mon.slowlog_loading {
-                        "Loading slow log…".to_string()
+                        crate::i18n::tr!("kv.slowlog_loading", "Loading slow log…")
                     } else {
-                        format!("{} slow command(s)", mon.slowlog.len())
+                        crate::i18n::tr!(
+                            "kv.slowlog_count",
+                            "{n} slow command(s)",
+                            n = mon.slowlog.len()
+                        )
                     }),
             )
             .child(
@@ -509,7 +513,10 @@ impl AppState {
                 .p_2()
                 .text_size(theme.scale(11.))
                 .text_color(theme.text_muted)
-                .child("No slow commands logged.")
+                .child(crate::i18n::tr!(
+                    "kv.no_slow_commands_logged",
+                    "No slow commands logged."
+                ))
                 .into_any_element()
         } else {
             div()
@@ -560,12 +567,23 @@ impl AppState {
 
         let status = if mon.monitoring {
             if mon.paused {
-                format!("paused — {} line(s) held", mon.lines.len())
+                crate::i18n::tr!(
+                    "kv.monitor_paused",
+                    "paused — {n} line(s) held",
+                    n = mon.lines.len()
+                )
             } else {
-                format!("streaming every command — {} line(s)", mon.lines.len())
+                crate::i18n::tr!(
+                    "kv.monitor_streaming",
+                    "streaming every command — {n} line(s)",
+                    n = mon.lines.len()
+                )
             }
         } else {
-            "stopped (MONITOR streams every command the server runs)".to_string()
+            crate::i18n::tr!(
+                "kv.monitor_stopped",
+                "stopped (MONITOR streams every command the server runs)"
+            )
         };
 
         let (pause_view, clear_view) = (cx.entity().downgrade(), cx.entity().downgrade());
@@ -676,9 +694,13 @@ impl AppState {
                     .text_size(theme.scale(10.5))
                     .text_color(theme.text_muted)
                     .child(if mon.clients_loading {
-                        "Loading clients…".to_string()
+                        crate::i18n::tr!("kv.clients_loading", "Loading clients…")
                     } else {
-                        format!("{} connected client(s)", mon.clients.len())
+                        crate::i18n::tr!(
+                            "kv.clients_count",
+                            "{n} connected client(s)",
+                            n = mon.clients.len()
+                        )
                     }),
             )
             .child(
@@ -782,7 +804,10 @@ impl AppState {
                 .p_2()
                 .text_size(theme.scale(11.))
                 .text_color(theme.text_muted)
-                .child("No connected clients.")
+                .child(crate::i18n::tr!(
+                    "kv.no_connected_clients",
+                    "No connected clients."
+                ))
                 .into_any_element()
         } else {
             div()

@@ -211,7 +211,7 @@ impl AppState {
                 div()
                     .text_size(theme.scale(12.))
                     .text_color(theme.text)
-                    .child("Server"),
+                    .child(crate::i18n::tr!("server.title", "Server")),
             )
             .children(switch)
             .child(
@@ -316,8 +316,11 @@ impl AppState {
                 .border_color(theme.border_soft)
                 .text_size(theme.scale(10.5))
                 .text_color(theme.orange)
-                .child(format!(
-                    "{blocking_count} session(s) blocking {blocked} other(s)"
+                .child(crate::i18n::tr!(
+                    "server.sessions_blocking",
+                    "{blocking_count} session(s) blocking {blocked} other(s)",
+                    blocking_count = blocking_count,
+                    blocked = blocked
                 ))
         });
 
@@ -400,7 +403,10 @@ impl AppState {
                         fmt_elapsed(s.elapsed_secs)
                     )))
                     .when(s.is_self, |d| {
-                        d.child(div().text_color(theme.text_faint).child("this connection"))
+                        d.child(div().text_color(theme.text_faint).child(crate::i18n::tr!(
+                            "server.this_connection",
+                            "this connection"
+                        )))
                     })
                     .when(can_kill && caps.can_cancel, |d| {
                         d.child(

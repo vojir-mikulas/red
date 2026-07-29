@@ -131,7 +131,7 @@ impl AppState {
                 theme.scale(12.),
                 theme.text_faint,
             ))
-            .child("Edit file")
+            .child(crate::i18n::tr!("connect.edit_file", "Edit file"))
             .tooltip(Tooltip::text("Open connections.toml"))
             .on_click(cx.listener(|this, _, _, cx| this.open_connections_file(cx)));
 
@@ -146,7 +146,10 @@ impl AppState {
                     .text_size(theme.scale(12.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme.text_dim)
-                    .child("Saved connections"),
+                    .child(crate::i18n::tr!(
+                        "connect.saved_connections",
+                        "Saved connections"
+                    )),
             )
             .child(div().flex_1().h(px(1.)).bg(theme.border_soft))
             .child(edit_file)
@@ -205,13 +208,13 @@ impl AppState {
         )
         .size(IconButtonSize::Sm)
         .tooltip(crate::keymap::localize_hint("Settings  ⌘,"))
-        .a11y_label("Settings")
+        .a11y_label(crate::i18n::tr!("common.settings", "Settings"))
         .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
 
         // Quiet footer: the import and bug-report links share one line to keep
         // the screen short. Both reuse existing seams.
         let footer_theme = cx.theme().clone();
-        let footer_link = |id: &'static str, label: &'static str| {
+        let footer_link = |id: &'static str, label: gpui::SharedString| {
             div()
                 .id(id)
                 .cursor_pointer()
@@ -228,13 +231,25 @@ impl AppState {
             .text_size(footer_theme.scale(12.))
             .text_color(footer_theme.text_faint)
             .child(
-                footer_link("connect-import", "Import from other database tools")
-                    .on_click(cx.listener(|this, _, _, cx| this.open_import_wizard(cx))),
+                footer_link(
+                    "connect-import",
+                    crate::i18n::tr!(
+                        "connect.import_from_other_database_tools",
+                        "Import from other database tools"
+                    ),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.open_import_wizard(cx))),
             )
             .child("·")
-            .child(footer_link("connect-report-bug", "Report a bug").on_click(
-                cx.listener(|this, _, _, cx| this.open_external(crate::app::ISSUES_URL, cx)),
-            ));
+            .child(
+                footer_link(
+                    "connect-report-bug",
+                    crate::i18n::tr!("connect.report_a_bug", "Report a bug"),
+                )
+                .on_click(
+                    cx.listener(|this, _, _, cx| this.open_external(crate::app::ISSUES_URL, cx)),
+                ),
+            );
 
         let theme = cx.theme();
 
@@ -260,10 +275,10 @@ impl AppState {
                     .text_color(theme.text)
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_size(theme.scale(24.))
-                    .child("RED"),
+                    .child(crate::i18n::tr!("connect.red", "RED")),
             );
 
-        let empty_note = |msg: &'static str, theme: &Theme| {
+        let empty_note = |msg: gpui::SharedString, theme: &Theme| {
             div()
                 .py_2()
                 .text_size(theme.scale(12.))
@@ -272,9 +287,21 @@ impl AppState {
                 .into_any_element()
         };
         let saved: AnyElement = if self.connections.is_empty() {
-            empty_note("No saved connections yet.", theme)
+            empty_note(
+                crate::i18n::tr!(
+                    "connect.no_saved_connections_yet",
+                    "No saved connections yet."
+                ),
+                theme,
+            )
         } else if cards.is_empty() {
-            empty_note("No connections match your search.", theme)
+            empty_note(
+                crate::i18n::tr!(
+                    "connect.no_connections_match_your_search",
+                    "No connections match your search."
+                ),
+                theme,
+            )
         } else {
             div()
                 .flex()
@@ -420,13 +447,16 @@ impl AppState {
             .justify_center()
             .gap_3()
             .child(
-                Button::new("connect-prev-page", "Previous")
-                    .variant(ButtonVariant::Ghost)
-                    .disabled(page == 0)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.connect_sel = page.saturating_sub(1) * CONNECTIONS_PER_PAGE;
-                        cx.notify();
-                    })),
+                Button::new(
+                    "connect-prev-page",
+                    crate::i18n::tr!("connect.btn_previous", "Previous"),
+                )
+                .variant(ButtonVariant::Ghost)
+                .disabled(page == 0)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.connect_sel = page.saturating_sub(1) * CONNECTIONS_PER_PAGE;
+                    cx.notify();
+                })),
             )
             .child(
                 div()
@@ -435,14 +465,17 @@ impl AppState {
                     .child(format!("Page {} of {page_count}", page + 1)),
             )
             .child(
-                Button::new("connect-next-page", "Next")
-                    .variant(ButtonVariant::Ghost)
-                    .disabled(page + 1 >= page_count)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.connect_sel =
-                            ((page + 1) * CONNECTIONS_PER_PAGE).min(total.saturating_sub(1));
-                        cx.notify();
-                    })),
+                Button::new(
+                    "connect-next-page",
+                    crate::i18n::tr!("connect.btn_next", "Next"),
+                )
+                .variant(ButtonVariant::Ghost)
+                .disabled(page + 1 >= page_count)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.connect_sel =
+                        ((page + 1) * CONNECTIONS_PER_PAGE).min(total.saturating_sub(1));
+                    cx.notify();
+                })),
             )
     }
 
@@ -569,7 +602,7 @@ impl AppState {
                 theme.scale(15.),
                 theme.text_muted,
             ))
-            .child("New connection")
+            .child(crate::i18n::tr!("connect.new_connection", "New connection"))
             .child(
                 div()
                     .ml_1()
@@ -712,7 +745,10 @@ impl AppState {
                                             theme.scale(10.),
                                             theme.yellow,
                                         ))
-                                        .child("read-only"),
+                                        .child(crate::i18n::tr!(
+                                            "connect.read_only_badge",
+                                            "read-only"
+                                        )),
                                 )
                             }),
                     )
@@ -784,7 +820,10 @@ impl AppState {
                                     crate::icons::icon("edit", theme.scale(14.), theme.text_muted),
                                 )
                                 .size(IconButtonSize::Sm)
-                                .tooltip("Edit connection")
+                                .tooltip(crate::i18n::tr!(
+                                    "connect.tip_edit_connection",
+                                    "Edit connection"
+                                ))
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         cx.stop_propagation();
@@ -798,7 +837,10 @@ impl AppState {
                                     crate::icons::icon("copy", theme.scale(14.), theme.text_muted),
                                 )
                                 .size(IconButtonSize::Sm)
-                                .tooltip("Duplicate connection")
+                                .tooltip(crate::i18n::tr!(
+                                    "connect.tip_duplicate_connection",
+                                    "Duplicate connection"
+                                ))
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         cx.stop_propagation();
@@ -812,7 +854,10 @@ impl AppState {
                                     crate::icons::icon("trash", theme.scale(14.), theme.red),
                                 )
                                 .size(IconButtonSize::Sm)
-                                .tooltip("Delete connection")
+                                .tooltip(crate::i18n::tr!(
+                                    "connect.tip_delete_connection",
+                                    "Delete connection"
+                                ))
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         cx.stop_propagation();
@@ -853,8 +898,13 @@ impl AppState {
 
         // Network engines get a live connection-string field that mirrors (and is
         // mirrored by) the structured fields. File engines have only a path.
-        let conn_str_field = (!is_file)
-            .then(|| labeled_field("Connection string", theme).child(self.conn_str_input.clone()));
+        let conn_str_field = (!is_file).then(|| {
+            labeled_field(
+                crate::i18n::tr!("connect.field_connection_string", "Connection string"),
+                theme,
+            )
+            .child(self.conn_str_input.clone())
+        });
 
         let footer = self.render_form_footer(form, cx);
 
@@ -882,11 +932,14 @@ impl AppState {
                     .max_h(px(540.))
                     .overflow_y_scroll()
                     .child(
-                        labeled_field("Name", theme)
+                        labeled_field(crate::i18n::tr!("connect.field_name", "Name"), theme)
                             .child(self.name_input.clone())
                             .children(field_error_line(theme, field_err(&errors, FormField::Name))),
                     )
-                    .child(labeled_field("Engine", theme).child(self.engine_combo.clone()))
+                    .child(
+                        labeled_field(crate::i18n::tr!("connect.field_engine", "Engine"), theme)
+                            .child(self.engine_combo.clone()),
+                    )
                     .children(conn_str_field)
                     .child(self.render_connection_fields(form, is_file, &errors, theme))
                     .children(self.render_ssh_section(form, is_file, &errors, theme, cx))
@@ -918,7 +971,7 @@ impl AppState {
             .gap_2()
             .child(
                 Toggle::new("ssh-enabled", form.ssh_enabled)
-                    .label("Tunnel via SSH")
+                    .label(crate::i18n::tr!("connect.tunnel_via_ssh", "Tunnel via SSH"))
                     .on_change(cx.listener(|this, checked: &bool, _, cx| {
                         this.set_form_ssh_enabled(*checked, cx)
                     })),
@@ -931,7 +984,7 @@ impl AppState {
                     } else {
                         theme.text_muted
                     })
-                    .child("Tunnel via SSH"),
+                    .child(crate::i18n::tr!("connect.tunnel_via_ssh", "Tunnel via SSH")),
             );
 
         if !form.ssh_enabled {
@@ -951,41 +1004,53 @@ impl AppState {
             .items_start()
             .gap_3()
             .child(
-                labeled_field("SSH host", theme)
-                    .flex_1()
-                    .child(self.ssh_host_input.clone())
-                    .children(field_error_line(
-                        theme,
-                        field_err(errors, FormField::SshHost),
-                    )),
+                labeled_field(
+                    crate::i18n::tr!("connect.field_ssh_host", "SSH host"),
+                    theme,
+                )
+                .flex_1()
+                .child(self.ssh_host_input.clone())
+                .children(field_error_line(
+                    theme,
+                    field_err(errors, FormField::SshHost),
+                )),
             )
             .child(
-                labeled_field("SSH port", theme)
-                    .w(px(88.))
-                    .flex_none()
-                    .child(self.ssh_port_input.clone()),
+                labeled_field(
+                    crate::i18n::tr!("connect.field_ssh_port", "SSH port"),
+                    theme,
+                )
+                .w(px(88.))
+                .flex_none()
+                .child(self.ssh_port_input.clone()),
             );
 
-        let user_row = labeled_field("SSH user", theme)
-            .child(self.ssh_user_input.clone())
-            .children(field_error_line(
-                theme,
-                field_err(errors, FormField::SshUser),
-            ));
-
-        let auth_row = labeled_field("Authentication", theme).child(self.render_ssh_auth_picker(
-            form.ssh_auth,
+        let user_row = labeled_field(
+            crate::i18n::tr!("connect.field_ssh_user", "SSH user"),
             theme,
-            cx,
+        )
+        .child(self.ssh_user_input.clone())
+        .children(field_error_line(
+            theme,
+            field_err(errors, FormField::SshUser),
         ));
+
+        let auth_row = labeled_field(
+            crate::i18n::tr!("connect.field_authentication", "Authentication"),
+            theme,
+        )
+        .child(self.render_ssh_auth_picker(form.ssh_auth, theme, cx));
 
         // Only the inputs the chosen auth mode needs. Agent needs none.
         let secret_row = match form.ssh_auth {
             SshAuthMode::Agent => None,
             SshAuthMode::Password => Some(
-                labeled_field("SSH password", theme)
-                    .child(self.ssh_password_input.clone())
-                    .into_any_element(),
+                labeled_field(
+                    crate::i18n::tr!("connect.field_ssh_password", "SSH password"),
+                    theme,
+                )
+                .child(self.ssh_password_input.clone())
+                .into_any_element(),
             ),
             SshAuthMode::Key => Some(
                 div()
@@ -993,16 +1058,25 @@ impl AppState {
                     .flex_col()
                     .gap_3()
                     .child(
-                        labeled_field("Private key file", theme)
-                            .child(self.ssh_key_path_input.clone())
-                            .children(field_error_line(
-                                theme,
-                                field_err(errors, FormField::SshKeyPath),
-                            )),
+                        labeled_field(
+                            crate::i18n::tr!("connect.field_private_key_file", "Private key file"),
+                            theme,
+                        )
+                        .child(self.ssh_key_path_input.clone())
+                        .children(field_error_line(
+                            theme,
+                            field_err(errors, FormField::SshKeyPath),
+                        )),
                     )
                     .child(
-                        labeled_field("Key passphrase (optional)", theme)
-                            .child(self.ssh_passphrase_input.clone()),
+                        labeled_field(
+                            crate::i18n::tr!(
+                                "connect.field_key_passphrase_optional",
+                                "Key passphrase (optional)"
+                            ),
+                            theme,
+                        )
+                        .child(self.ssh_passphrase_input.clone()),
                     )
                     .into_any_element(),
             ),
@@ -1043,7 +1117,10 @@ impl AppState {
             .gap_2()
             .child(
                 Toggle::new("proxy-enabled", form.proxy_enabled)
-                    .label("Connect via proxy")
+                    .label(crate::i18n::tr!(
+                        "connect.connect_via_proxy",
+                        "Connect via proxy"
+                    ))
                     .on_change(cx.listener(|this, checked: &bool, _, cx| {
                         this.set_form_proxy_enabled(*checked, cx)
                     })),
@@ -1056,7 +1133,10 @@ impl AppState {
                     } else {
                         theme.text_muted
                     })
-                    .child("Connect via proxy"),
+                    .child(crate::i18n::tr!(
+                        "connect.connect_via_proxy",
+                        "Connect via proxy"
+                    )),
             );
 
         if !form.proxy_enabled {
@@ -1070,36 +1150,51 @@ impl AppState {
             );
         }
 
-        let kind_row = labeled_field("Proxy type", theme).child(self.render_proxy_kind_picker(
-            form.proxy_kind,
+        let kind_row = labeled_field(
+            crate::i18n::tr!("connect.field_proxy_type", "Proxy type"),
             theme,
-            cx,
-        ));
+        )
+        .child(self.render_proxy_kind_picker(form.proxy_kind, theme, cx));
 
         let host_row = div()
             .flex()
             .items_start()
             .gap_3()
             .child(
-                labeled_field("Proxy host", theme)
-                    .flex_1()
-                    .child(self.proxy_host_input.clone())
-                    .children(field_error_line(
-                        theme,
-                        field_err(errors, FormField::ProxyHost),
-                    )),
+                labeled_field(
+                    crate::i18n::tr!("connect.field_proxy_host", "Proxy host"),
+                    theme,
+                )
+                .flex_1()
+                .child(self.proxy_host_input.clone())
+                .children(field_error_line(
+                    theme,
+                    field_err(errors, FormField::ProxyHost),
+                )),
             )
             .child(
-                labeled_field("Proxy port", theme)
-                    .w(px(88.))
-                    .flex_none()
-                    .child(self.proxy_port_input.clone()),
+                labeled_field(
+                    crate::i18n::tr!("connect.field_proxy_port", "Proxy port"),
+                    theme,
+                )
+                .w(px(88.))
+                .flex_none()
+                .child(self.proxy_port_input.clone()),
             );
 
-        let user_row =
-            labeled_field("Proxy user (optional)", theme).child(self.proxy_user_input.clone());
-        let secret_row = labeled_field("Proxy password (optional)", theme)
-            .child(self.proxy_password_input.clone());
+        let user_row = labeled_field(
+            crate::i18n::tr!("connect.field_proxy_user_optional", "Proxy user (optional)"),
+            theme,
+        )
+        .child(self.proxy_user_input.clone());
+        let secret_row = labeled_field(
+            crate::i18n::tr!(
+                "connect.field_proxy_password_optional",
+                "Proxy password (optional)"
+            ),
+            theme,
+        )
+        .child(self.proxy_password_input.clone());
 
         Some(
             div()
@@ -1197,13 +1292,16 @@ impl AppState {
         theme: &Theme,
     ) -> AnyElement {
         if is_file {
-            return labeled_field("Database file", theme)
-                .child(self.database_input.clone())
-                .children(field_error_line(
-                    theme,
-                    field_err(errors, FormField::Database),
-                ))
-                .into_any_element();
+            return labeled_field(
+                crate::i18n::tr!("connect.field_database_file", "Database file"),
+                theme,
+            )
+            .child(self.database_input.clone())
+            .children(field_error_line(
+                theme,
+                field_err(errors, FormField::Database),
+            ))
+            .into_any_element();
         }
         div()
             .flex()
@@ -1217,13 +1315,13 @@ impl AppState {
                     .items_start()
                     .gap_3()
                     .child(
-                        labeled_field("Host", theme)
+                        labeled_field(crate::i18n::tr!("connect.field_host", "Host"), theme)
                             .flex_1()
                             .child(self.host_input.clone())
                             .children(field_error_line(theme, field_err(errors, FormField::Host))),
                     )
                     .child(
-                        labeled_field("Port", theme)
+                        labeled_field(crate::i18n::tr!("connect.field_port", "Port"), theme)
                             .w(px(88.))
                             .flex_none()
                             .child(self.port_input.clone()),
@@ -1250,8 +1348,14 @@ impl AppState {
             // Sentinel address the driver resolves the master from.
             .when(form.kind == DbKind::Redis, |col| {
                 col.child(
-                    labeled_field("Sentinel master (optional)", theme)
-                        .child(self.sentinel_master_input.clone()),
+                    labeled_field(
+                        crate::i18n::tr!(
+                            "connect.field_sentinel_master_optional",
+                            "Sentinel master (optional)"
+                        ),
+                        theme,
+                    )
+                    .child(self.sentinel_master_input.clone()),
                 )
             })
             .child(
@@ -1259,14 +1363,17 @@ impl AppState {
                     .flex()
                     .gap_3()
                     .child(
-                        labeled_field("User", theme)
+                        labeled_field(crate::i18n::tr!("connect.field_user", "User"), theme)
                             .flex_1()
                             .child(self.user_input.clone()),
                     )
                     .child(
-                        labeled_field("Password", theme)
-                            .flex_1()
-                            .child(self.password_input.clone()),
+                        labeled_field(
+                            crate::i18n::tr!("connect.field_password", "Password"),
+                            theme,
+                        )
+                        .flex_1()
+                        .child(self.password_input.clone()),
                     ),
             )
             .into_any_element()
@@ -1287,7 +1394,11 @@ impl AppState {
             return None;
         }
         Some(
-            labeled_field("AI agent", theme).child(
+            labeled_field(
+                crate::i18n::tr!("connect.field_ai_agent", "AI agent"),
+                theme,
+            )
+            .child(
                 div()
                     .flex()
                     .flex_col()
@@ -1303,7 +1414,7 @@ impl AppState {
                             .h(px(24.))
                             .child(
                                 Toggle::new("ai-allow-writes", form.ai_allow_writes)
-                                    .label("Allow writes")
+                                    .label(crate::i18n::tr!("connect.allow_writes", "Allow writes"))
                                     .on_change(cx.listener(|this, checked: &bool, _, cx| {
                                         this.set_form_ai_allow_writes(*checked, cx)
                                     })),
@@ -1316,7 +1427,10 @@ impl AppState {
                                     } else {
                                         theme.text_muted
                                     })
-                                    .child("Allow writes"),
+                                    .child(crate::i18n::tr!(
+                                        "connect.allow_writes",
+                                        "Allow writes"
+                                    )),
                             ),
                     )
                     .child(
@@ -1418,17 +1532,22 @@ impl AppState {
                     .items_start()
                     .gap_3()
                     .child(
-                        labeled_field("Label", theme).child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(7.))
-                                .h(px(32.))
-                                .children(swatches),
-                        ),
+                        labeled_field(crate::i18n::tr!("connect.field_label", "Label"), theme)
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(7.))
+                                    .h(px(32.))
+                                    .children(swatches),
+                            ),
                     )
                     .child(
-                        labeled_field("Environment", theme).child(
+                        labeled_field(
+                            crate::i18n::tr!("connect.field_environment", "Environment"),
+                            theme,
+                        )
+                        .child(
                             div()
                                 .flex()
                                 .flex_col()
@@ -1439,73 +1558,77 @@ impl AppState {
                     ),
             )
             .child(
-                labeled_field("Access", theme).flex_none().child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .h(px(32.))
-                        .child(
-                            Toggle::new("read-only", form.read_only)
-                                .label("Read-only")
-                                .on_change(cx.listener(|this, checked: &bool, _, cx| {
-                                    this.set_form_read_only(*checked, cx)
-                                })),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .text_size(theme.scale(12.5))
-                                .text_color(if form.read_only {
-                                    theme.accent
-                                } else {
-                                    theme.text_muted
-                                })
-                                .child(crate::icons::icon(
-                                    "lock",
-                                    theme.scale(12.),
-                                    if form.read_only {
-                                        theme.accent
-                                    } else {
-                                        theme.text_muted
-                                    },
-                                ))
-                                .child("Read-only"),
-                        )
-                        // TLS toggle — network engines only (a file engine has no
-                        // wire to encrypt). See docs/plans/redis.md's TLS item.
-                        .when(!form.kind.is_file(), |row| {
-                            row.child(Toggle::new("tls", form.tls).label("TLS").on_change(
-                                cx.listener(|this, checked: &bool, _, cx| {
-                                    this.set_form_tls(*checked, cx)
-                                }),
-                            ))
+                labeled_field(crate::i18n::tr!("connect.field_access", "Access"), theme)
+                    .flex_none()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .h(px(32.))
+                            .child(
+                                Toggle::new("read-only", form.read_only)
+                                    .label(crate::i18n::tr!("connect.read_only", "Read-only"))
+                                    .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                        this.set_form_read_only(*checked, cx)
+                                    })),
+                            )
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
                                     .gap_1()
                                     .text_size(theme.scale(12.5))
-                                    .text_color(if form.tls {
+                                    .text_color(if form.read_only {
                                         theme.accent
                                     } else {
                                         theme.text_muted
                                     })
                                     .child(crate::icons::icon(
-                                        "key-round",
+                                        "lock",
                                         theme.scale(12.),
-                                        if form.tls {
+                                        if form.read_only {
                                             theme.accent
                                         } else {
                                             theme.text_muted
                                         },
                                     ))
-                                    .child("TLS"),
+                                    .child(crate::i18n::tr!("connect.read_only", "Read-only")),
                             )
-                        }),
-                ),
+                            // TLS toggle — network engines only (a file engine has no
+                            // wire to encrypt). See docs/plans/redis.md's TLS item.
+                            .when(!form.kind.is_file(), |row| {
+                                row.child(
+                                    Toggle::new("tls", form.tls)
+                                        .label(crate::i18n::tr!("connect.tls", "TLS"))
+                                        .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                                            this.set_form_tls(*checked, cx)
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .text_size(theme.scale(12.5))
+                                        .text_color(if form.tls {
+                                            theme.accent
+                                        } else {
+                                            theme.text_muted
+                                        })
+                                        .child(crate::icons::icon(
+                                            "key-round",
+                                            theme.scale(12.),
+                                            if form.tls {
+                                                theme.accent
+                                            } else {
+                                                theme.text_muted
+                                            },
+                                        ))
+                                        .child(crate::i18n::tr!("connect.tls", "TLS")),
+                                )
+                            }),
+                    ),
             )
     }
 
@@ -1547,24 +1670,30 @@ impl AppState {
                 ),
             )
             .child(
-                Button::new("form-cancel", "Cancel")
-                    .variant(ButtonVariant::Ghost)
-                    .on_click(cx.listener(|this, _, _, cx| this.close_form(cx))),
+                Button::new(
+                    "form-cancel",
+                    crate::i18n::tr!("connect.btn_cancel", "Cancel"),
+                )
+                .variant(ButtonVariant::Ghost)
+                .on_click(cx.listener(|this, _, _, cx| this.close_form(cx))),
             )
             .child(
-                Button::new("form-save", "Save")
+                Button::new("form-save", crate::i18n::tr!("connect.btn_save", "Save"))
                     .variant(ButtonVariant::Secondary)
                     .on_click(cx.listener(|this, _, _, cx| this.save_form(false, cx))),
             )
             .child(
-                Button::new("form-connect", "Connect")
-                    .variant(ButtonVariant::Primary)
-                    .icon(crate::icons::icon(
-                        "power",
-                        theme.scale(14.),
-                        theme.on_accent,
-                    ))
-                    .on_click(cx.listener(|this, _, _, cx| this.save_form(true, cx))),
+                Button::new(
+                    "form-connect",
+                    crate::i18n::tr!("connect.btn_connect", "Connect"),
+                )
+                .variant(ButtonVariant::Primary)
+                .icon(crate::icons::icon(
+                    "power",
+                    theme.scale(14.),
+                    theme.on_accent,
+                ))
+                .on_click(cx.listener(|this, _, _, cx| this.save_form(true, cx))),
             )
     }
 }
@@ -1591,7 +1720,7 @@ fn field_error_line(theme: &Theme, message: Option<&str>) -> Option<gpui::Div> {
 
 /// A small uppercase field caption, matching the design's form labels. Shared
 /// with the Redis "New key" modal (`kvbrowse`).
-pub(crate) fn field_label(text: impl Into<String>, theme: &Theme) -> impl IntoElement {
+pub(crate) fn field_label(text: impl Into<gpui::SharedString>, theme: &Theme) -> impl IntoElement {
     div()
         .text_size(theme.scale(10.5))
         .font_weight(FontWeight::MEDIUM)
@@ -1601,7 +1730,7 @@ pub(crate) fn field_label(text: impl Into<String>, theme: &Theme) -> impl IntoEl
 
 /// A labeled form field column: the caption above its control (passed as a
 /// child). Shared with the Redis "New key" modal (`kvbrowse`).
-pub(crate) fn labeled_field(label: impl Into<String>, theme: &Theme) -> gpui::Div {
+pub(crate) fn labeled_field(label: impl Into<gpui::SharedString>, theme: &Theme) -> gpui::Div {
     div()
         .flex()
         .flex_col()

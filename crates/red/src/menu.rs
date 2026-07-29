@@ -29,6 +29,7 @@ use flint::components::text_input::{
 };
 
 use crate::Quit;
+use crate::i18n::tr;
 use crate::keymap::{
     About, CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusOtherHalf,
     FocusSchema, FormatSql, NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, ReportBug,
@@ -46,71 +47,113 @@ use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 pub(crate) fn build_menus() -> Vec<Menu> {
     vec![
         // The app menu. macOS overrides the visible name with the bundle name.
+        // Not translated: the product name is the product name in every locale,
+        // and macOS overrides it with the bundle name anyway.
         Menu::new("RED").items([
-            MenuItem::action("About RED", About),
+            MenuItem::action(tr!("menu.app.about_red", "About RED"), About),
             MenuItem::separator(),
-            MenuItem::action("Settings…", Settings),
+            MenuItem::action(tr!("menu.app.settings", "Settings…"), Settings),
             MenuItem::separator(),
-            MenuItem::os_submenu("Services", SystemMenuType::Services),
+            MenuItem::os_submenu(
+                tr!("menu.app.services", "Services"),
+                SystemMenuType::Services,
+            ),
             MenuItem::separator(),
-            MenuItem::action("Quit RED", Quit),
+            MenuItem::action(tr!("menu.app.quit_red", "Quit RED"), Quit),
         ]),
-        Menu::new("Connection").items([
+        Menu::new(tr!("menu.connection.title", "Connection")).items([
             // Open the ⌘P switcher (active + recent connections), or start a new
             // connection (⌘N on the welcome screen). Both display their
             // accelerators via the keybinding registry.
-            MenuItem::action("Switch Connection…", SwitchConnection),
-            MenuItem::action("New Connection…", NewConnection),
+            MenuItem::action(
+                tr!("menu.connection.switch_connection", "Switch Connection…"),
+                SwitchConnection,
+            ),
+            MenuItem::action(
+                tr!("menu.connection.new_connection", "New Connection…"),
+                NewConnection,
+            ),
         ]),
-        Menu::new("Edit").items([
+        Menu::new(tr!("menu.edit.title", "Edit")).items([
             // Clipboard for text fields. Undo/Redo are intentionally omitted;
             // Flint's inputs have no undo stack yet (see `docs/deferred.md`).
-            MenuItem::os_action("Cut", InputCut, OsAction::Cut),
-            MenuItem::os_action("Copy", InputCopy, OsAction::Copy),
-            MenuItem::os_action("Paste", InputPaste, OsAction::Paste),
-            MenuItem::os_action("Select All", InputSelectAll, OsAction::SelectAll),
+            MenuItem::os_action(tr!("menu.edit.cut", "Cut"), InputCut, OsAction::Cut),
+            MenuItem::os_action(tr!("menu.edit.copy", "Copy"), InputCopy, OsAction::Copy),
+            MenuItem::os_action(tr!("menu.edit.paste", "Paste"), InputPaste, OsAction::Paste),
+            MenuItem::os_action(
+                tr!("menu.edit.select_all", "Select All"),
+                InputSelectAll,
+                OsAction::SelectAll,
+            ),
             MenuItem::separator(),
             // Copy the result grid's current selection (RED's own action).
-            MenuItem::action("Copy Result", CopyResult),
+            MenuItem::action(tr!("menu.edit.copy_result", "Copy Result"), CopyResult),
         ]),
-        Menu::new("View").items([
-            MenuItem::action("Toggle Sidebar", ToggleSidebar),
-            MenuItem::action("Toggle Split View", ToggleSplit),
+        Menu::new(tr!("menu.view.title", "View")).items([
+            MenuItem::action(
+                tr!("menu.view.toggle_sidebar", "Toggle Sidebar"),
+                ToggleSidebar,
+            ),
+            MenuItem::action(
+                tr!("menu.view.toggle_split_view", "Toggle Split View"),
+                ToggleSplit,
+            ),
             MenuItem::separator(),
-            MenuItem::action("Focus Schema", FocusSchema),
-            MenuItem::action("Focus Editor", FocusEditor),
-            MenuItem::action("Focus Grid", FocusGrid),
-            MenuItem::action("Focus Other Split Half", FocusOtherHalf),
+            MenuItem::action(tr!("menu.view.focus_schema", "Focus Schema"), FocusSchema),
+            MenuItem::action(tr!("menu.view.focus_editor", "Focus Editor"), FocusEditor),
+            MenuItem::action(tr!("menu.view.focus_grid", "Focus Grid"), FocusGrid),
+            MenuItem::action(
+                tr!("menu.view.focus_other_split_half", "Focus Other Split Half"),
+                FocusOtherHalf,
+            ),
             MenuItem::separator(),
-            MenuItem::action("Cycle Focus Next", CycleFocusNext),
-            MenuItem::action("Cycle Focus Previous", CycleFocusPrev),
+            MenuItem::action(
+                tr!("menu.view.cycle_focus_next", "Cycle Focus Next"),
+                CycleFocusNext,
+            ),
+            MenuItem::action(
+                tr!("menu.view.cycle_focus_previous", "Cycle Focus Previous"),
+                CycleFocusPrev,
+            ),
             MenuItem::separator(),
-            MenuItem::action("Search Schema", SearchSchema),
-            MenuItem::action("Command Palette…", ToggleCommandPalette),
+            MenuItem::action(
+                tr!("menu.view.search_schema", "Search Schema"),
+                SearchSchema,
+            ),
+            MenuItem::action(
+                tr!("menu.view.command_palette", "Command Palette…"),
+                ToggleCommandPalette,
+            ),
         ]),
-        Menu::new("Query").items([
+        Menu::new(tr!("menu.query.title", "Query")).items([
             // ⌘↵ runs the active tab's query, or tests the connection while the
             // connection form is open (the unified `RunQuery` action).
-            MenuItem::action("Run Query", RunQuery),
-            MenuItem::action("Format SQL", FormatSql),
-            MenuItem::action("ER Diagram", ShowErDiagram),
-            MenuItem::action("Refresh Schema", RefreshSchema),
+            MenuItem::action(tr!("menu.query.run_query", "Run Query"), RunQuery),
+            MenuItem::action(tr!("menu.query.format_sql", "Format SQL"), FormatSql),
+            MenuItem::action(tr!("menu.query.er_diagram", "ER Diagram"), ShowErDiagram),
+            MenuItem::action(
+                tr!("menu.query.refresh_schema", "Refresh Schema"),
+                RefreshSchema,
+            ),
             MenuItem::separator(),
-            MenuItem::action("Go to Row…", GoToRow),
+            MenuItem::action(tr!("menu.query.go_to_row", "Go to Row…"), GoToRow),
         ]),
-        Menu::new("Tabs").items([
-            MenuItem::action("New Tab", NewTab),
+        Menu::new(tr!("menu.tabs.title", "Tabs")).items([
+            MenuItem::action(tr!("menu.tabs.new_tab", "New Tab"), NewTab),
             MenuItem::separator(),
-            MenuItem::action("Next Tab", NextTab),
-            MenuItem::action("Previous Tab", PrevTab),
+            MenuItem::action(tr!("menu.tabs.next_tab", "Next Tab"), NextTab),
+            MenuItem::action(tr!("menu.tabs.previous_tab", "Previous Tab"), PrevTab),
             MenuItem::separator(),
-            MenuItem::action("Close Tab", CloseTab),
+            MenuItem::action(tr!("menu.tabs.close_tab", "Close Tab"), CloseTab),
         ]),
-        Menu::new("Help").items([
-            MenuItem::action("What's New", ShowChangelog),
-            MenuItem::action("Keyboard Shortcuts", ShowShortcuts),
+        Menu::new(tr!("menu.help.title", "Help")).items([
+            MenuItem::action(tr!("menu.help.whats_new", "What's New"), ShowChangelog),
+            MenuItem::action(
+                tr!("menu.help.keyboard_shortcuts", "Keyboard Shortcuts"),
+                ShowShortcuts,
+            ),
             MenuItem::separator(),
-            MenuItem::action("Report a Bug…", ReportBug),
+            MenuItem::action(tr!("menu.help.report_a_bug", "Report a Bug…"), ReportBug),
         ]),
     ]
 }

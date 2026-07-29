@@ -101,8 +101,12 @@ impl AppState {
             },
         )
         .detach();
-        let ttl_editor =
-            cx.new(|cx| TextInput::new(cx).with_placeholder("seconds, blank = no expiry"));
+        let ttl_editor = cx.new(|cx| {
+            TextInput::new(cx).with_placeholder(crate::i18n::tr!(
+                "kv.seconds_blank_no_expiry",
+                "seconds, blank = no expiry"
+            ))
+        });
         cx.subscribe(&ttl_editor, move |this, _, event: &TextInputEvent, cx| {
             if matches!(event, TextInputEvent::Submit) {
                 this.kv_submit_ttl_edit(session, cx);
@@ -119,7 +123,12 @@ impl AppState {
             },
         )
         .detach();
-        let claim_editor = cx.new(|cx| TextInput::new(cx).with_placeholder("claim to consumer…"));
+        let claim_editor = cx.new(|cx| {
+            TextInput::new(cx).with_placeholder(crate::i18n::tr!(
+                "kv.claim_to_consumer",
+                "claim to consumer…"
+            ))
+        });
         cx.subscribe(&claim_editor, move |this, _, event: &TextInputEvent, cx| {
             if matches!(event, TextInputEvent::Submit) {
                 this.kv_submit_claim(session, cx);
@@ -914,15 +923,27 @@ impl AppState {
             })
             .detach();
         };
-        let name = cx.new(|cx| TextInput::new(cx).with_placeholder("key name…"));
+        let name = cx.new(|cx| {
+            TextInput::new(cx).with_placeholder(crate::i18n::tr!("kv.key_name", "key name…"))
+        });
         sub(&name, cx);
-        let field = cx.new(|cx| TextInput::new(cx).with_placeholder("field…"));
+        let field = cx
+            .new(|cx| TextInput::new(cx).with_placeholder(crate::i18n::tr!("kv.field", "field…")));
         sub(&field, cx);
-        let value = cx.new(|cx| TextInput::new(cx).with_placeholder("value…"));
+        let value = cx
+            .new(|cx| TextInput::new(cx).with_placeholder(crate::i18n::tr!("kv.value", "value…")));
         sub(&value, cx);
-        let score = cx.new(|cx| TextInput::new(cx).with_placeholder("score (e.g. 1.0)"));
+        let score = cx.new(|cx| {
+            TextInput::new(cx)
+                .with_placeholder(crate::i18n::tr!("kv.score_e_g_1_0", "score (e.g. 1.0)"))
+        });
         sub(&score, cx);
-        let ttl = cx.new(|cx| TextInput::new(cx).with_placeholder("seconds (optional)"));
+        let ttl = cx.new(|cx| {
+            TextInput::new(cx).with_placeholder(crate::i18n::tr!(
+                "kv.seconds_optional",
+                "seconds (optional)"
+            ))
+        });
         sub(&ttl, cx);
 
         if let Some(browse) = self

@@ -293,7 +293,10 @@ impl AppState {
                         .justify_center()
                         .text_size(size_12)
                         .text_color(faint)
-                        .child("Double-click a table or run a query to see rows"),
+                        .child(crate::i18n::tr!(
+                            "result.empty_hint",
+                            "Double-click a table or run a query to see rows"
+                        )),
                 );
             }
         };
@@ -325,7 +328,7 @@ impl AppState {
                             .gap_2()
                             .text_size(size_11)
                             .text_color(red)
-                            .child("Query failed")
+                            .child(crate::i18n::tr!("result.query_failed", "Query failed"))
                             .child(div().text_color(faint).child(format!("· {elapsed}"))),
                     )
                     .child(div().text_size(size_12).text_color(text).child(err.clone()))
@@ -394,7 +397,10 @@ impl AppState {
                             None => Button::new("result-filter", "Filter")
                                 .variant(ButtonVariant::Ghost)
                                 .size(ButtonSize::Sm)
-                                .tooltip("Filter rows (⌘⇧F)")
+                                .tooltip(crate::i18n::tr!(
+                                    "result.filter_rows_tip",
+                                    "Filter rows (⌘⇧F)"
+                                ))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.toggle_filter_bar(window, cx)
                                 }))
@@ -421,7 +427,10 @@ impl AppState {
                                         crate::icons::icon("close", size_11, muted),
                                     )
                                     .size(IconButtonSize::Sm)
-                                    .tooltip("Clear filter")
+                                    .tooltip(crate::i18n::tr!(
+                                        "result.clear_filter",
+                                        "Clear filter"
+                                    ))
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.clear_result_filter(cx)),
                                     ),
@@ -852,7 +861,11 @@ impl AppState {
             .font_family(ui_family.clone())
             .text_size(size_11)
             .child(div().text_color(text).child(format!("{}", grid.total)))
-            .child(div().text_color(dim).child("rows"))
+            .child(
+                div()
+                    .text_color(dim)
+                    .child(crate::i18n::tr!("result.rows_unit", "rows")),
+            )
             .child(div().text_color(border_soft).child("·"))
             .child(div().text_color(dim).child(format!("{ncols} columns")))
             .child(div().text_color(border_soft).child("·"))
@@ -1087,11 +1100,10 @@ impl AppState {
 
         let Some(view) = grid.stats.as_ref() else {
             return row
-                .child(
-                    div()
-                        .text_color(faint)
-                        .child("Select a column to summarize"),
-                )
+                .child(div().text_color(faint).child(crate::i18n::tr!(
+                    "result.stats_pick_column",
+                    "Select a column to summarize"
+                )))
                 .into_any_element();
         };
         // The column name leads, then the summary (or its loading/failed state).
@@ -1099,11 +1111,18 @@ impl AppState {
         match &view.state {
             StatsState::Loading => row
                 .child(stat_dot(sep))
-                .child(div().text_color(faint).child("computing…"))
+                .child(
+                    div()
+                        .text_color(faint)
+                        .child(crate::i18n::tr!("result.stats_computing", "computing…")),
+                )
                 .into_any_element(),
             StatsState::Failed => row
                 .child(stat_dot(sep))
-                .child(div().text_color(faint).child("stats unavailable"))
+                .child(div().text_color(faint).child(crate::i18n::tr!(
+                    "result.stats_unavailable",
+                    "stats unavailable"
+                )))
                 .into_any_element(),
             StatsState::Ready(s) => {
                 let nulls = (s.total - s.non_null).max(0);
@@ -1127,7 +1146,11 @@ impl AppState {
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(div().text_color(dim).child("distinct"))
+                            .child(
+                                div()
+                                    .text_color(dim)
+                                    .child(crate::i18n::tr!("result.stats_distinct", "distinct")),
+                            )
                             .child(div().text_color(faint).child("—"))
                             .child(
                                 Button::new("stats-distinct", "compute")
@@ -1294,7 +1317,7 @@ impl AppState {
                             .border_color(line)
                             .text_color(faint)
                             .italic()
-                            .child("computed")
+                            .child(crate::i18n::tr!("result.column_computed", "computed"))
                             .into_any_element(),
                     );
                     continue;
@@ -1310,7 +1333,7 @@ impl AppState {
                     None => div()
                         .text_color(faint)
                         .italic()
-                        .child("default")
+                        .child(crate::i18n::tr!("result.column_default", "default"))
                         .into_any_element(),
                 };
                 cells.push(

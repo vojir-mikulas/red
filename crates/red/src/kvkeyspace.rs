@@ -381,13 +381,15 @@ impl AppState {
                 .map(|v| format!("flags \"{v}\""))
                 .unwrap_or_else(|| "disabled".to_string());
             if ks.watching {
-                format!(
-                    "watching {} — {} event(s), {cfg}",
-                    ks.scope.pattern(),
-                    ks.events.len()
+                crate::i18n::tr!(
+                    "kv.keyspace_watching",
+                    "watching {pattern} — {events} event(s), {cfg}",
+                    pattern = ks.scope.pattern(),
+                    events = ks.events.len(),
+                    cfg = cfg
                 )
             } else {
-                format!("not watching — {cfg}")
+                crate::i18n::tr!("kv.keyspace_idle", "not watching — {cfg}", cfg = cfg)
             }
         };
 

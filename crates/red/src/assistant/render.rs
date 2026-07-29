@@ -80,7 +80,7 @@ impl AppState {
                     theme.text_dim,
                 ))
                 .check(crate::icons::icon("check", theme.scale(13.), theme.text))
-                .placeholder("Default");
+                .placeholder(crate::i18n::tr!("assistant.default", "Default"));
             for choice in &opt.choices {
                 select = select.option(SharedString::from(choice.name.clone()));
             }
@@ -583,7 +583,7 @@ impl AppState {
                                 .text_size(theme.scale(10.))
                                 .text_color(theme.yellow)
                                 .child(crate::icons::icon("edit", theme.scale(10.), theme.yellow))
-                                .child("writes")
+                                .child(crate::i18n::tr!("assistant.writes", "writes"))
                                 .tooltip(flint::Tooltip::text(
                                     "This connection allows the agent to propose writes; \
                                          each one needs your approval.",
@@ -615,7 +615,7 @@ impl AppState {
             .text_size(theme.scale(12.))
             .text_color(theme.bg_app)
             .cursor_pointer()
-            .child("Save key")
+            .child(crate::i18n::tr!("assistant.save_key", "Save key"))
             .on_click(cx.listener(|this, _, _, cx| this.save_ai_key(cx)));
         div()
             .size_full()
@@ -637,7 +637,10 @@ impl AppState {
                         div()
                             .text_size(theme.scale(12.5))
                             .text_color(theme.text)
-                            .child("Add an Anthropic API key to use the agent."),
+                            .child(crate::i18n::tr!(
+                                "assistant.add_an_anthropic_api_key_to_use_the_agent",
+                                "Add an Anthropic API key to use the agent."
+                            )),
                     )
                     .child(
                         div()
@@ -823,7 +826,7 @@ impl AppState {
                 theme.scale(11.),
                 theme.text_muted,
             ))
-            .child("New chat")
+            .child(crate::i18n::tr!("assistant.new_chat", "New chat"))
             .on_click(cx.listener(|this, _, _, cx| this.new_chat(cx)));
         let footer = div()
             .flex_shrink_0()
@@ -1365,7 +1368,7 @@ fn render_plan(steps: &[red_core::PlanStep], theme: &flint::Theme) -> AnyElement
             div()
                 .text_size(theme.scale(10.))
                 .text_color(theme.text_muted)
-                .child("Plan"),
+                .child(crate::i18n::tr!("assistant.plan", "Plan")),
         );
     for step in steps {
         // Lucide status glyphs: a dashed ring for not-started, a spinner arc while
@@ -1545,7 +1548,12 @@ fn render_subagent_card(
             theme.scale(11.),
             theme.accent,
         ))
-        .child(div().flex_none().text_color(theme.accent).child("Subagent"));
+        .child(
+            div()
+                .flex_none()
+                .text_color(theme.accent)
+                .child(crate::i18n::tr!("assistant.subagent", "Subagent")),
+        );
     if let Some(label) = subagent_task_label(task) {
         header = header.child(
             div()
@@ -1565,7 +1573,7 @@ fn render_subagent_card(
             div()
                 .flex_none()
                 .text_color(theme.text_muted)
-                .child("working"),
+                .child(crate::i18n::tr!("assistant.working_badge", "working")),
         );
     } else if collapsed && !node.children.is_empty() {
         let n = node.children.len();
@@ -1618,7 +1626,7 @@ fn render_subagent_card(
                 div()
                     .text_size(theme.scale(11.))
                     .text_color(theme.text_muted)
-                    .child("Working…"),
+                    .child(crate::i18n::tr!("assistant.working", "Working…")),
             );
         }
     }
@@ -1662,7 +1670,7 @@ fn render_report_card(
             theme.scale(11.),
             theme.on_accent,
         ))
-        .child("Open")
+        .child(crate::i18n::tr!("assistant.open", "Open"))
         .on_click(cx.listener(move |this, _, _, cx| this.open_report(open_path.clone(), cx)));
 
     div()
@@ -1691,7 +1699,7 @@ fn render_report_card(
                     div()
                         .text_size(theme.scale(10.))
                         .text_color(theme.text_muted)
-                        .child("HTML report"),
+                        .child(crate::i18n::tr!("assistant.html_report", "HTML report")),
                 ),
         )
         .child(open)

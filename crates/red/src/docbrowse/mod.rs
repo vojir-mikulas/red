@@ -316,7 +316,10 @@ impl CollView {
         cx: &mut Context<AppState>,
     ) -> Self {
         let filter_input = cx.new(|cx| {
-            TextInput::new(cx).with_placeholder("filter, e.g. { \"status\": \"active\" }")
+            TextInput::new(cx).with_placeholder(crate::i18n::tr!(
+                "doc.filter_e_g_status_active",
+                "filter, e.g. { \"status\": \"active\" }"
+            ))
         });
         // Apply the filter on Enter, mirroring the SQL/Redis filter bars.
         cx.subscribe(&filter_input, |this, _input, event: &TextInputEvent, cx| {
@@ -331,10 +334,14 @@ impl CollView {
         let query_editor = cx.new(|cx| {
             CodeEditor::new(cx)
                 .soft_wrap(false)
-                .placeholder(
-                    "Aggregation pipeline, e.g. [ { \"$group\": … } ]. \u{2318}\u{21b5} runs.",
-                )
-                .a11y_label("MongoDB aggregation pipeline")
+                .placeholder(crate::i18n::tr!(
+                    "doc.aggregation_pipeline_e_g_group_runs",
+                    "Aggregation pipeline, e.g. [ { \"$group\": … } ]. \u{2318}\u{21b5} runs."
+                ))
+                .a11y_label(crate::i18n::tr!(
+                    "doc.mongodb_aggregation_pipeline",
+                    "MongoDB aggregation pipeline"
+                ))
         });
         cx.subscribe(
             &query_editor,
@@ -351,7 +358,10 @@ impl CollView {
         let inspector_editor = cx.new(|cx| {
             CodeEditor::new(cx)
                 .soft_wrap(false)
-                .a11y_label("MongoDB document editor")
+                .a11y_label(crate::i18n::tr!(
+                    "doc.mongodb_document_editor",
+                    "MongoDB document editor"
+                ))
         });
         // Cmd+Enter in the inspector saves (edit) or inserts (compose).
         cx.subscribe(
@@ -583,8 +593,12 @@ impl MongoView {
             actions_menu: None,
             tree_focus: cx.focus_handle(),
             tree_filter: {
-                let filter =
-                    cx.new(|cx| TextInput::new(cx).with_placeholder("Search collections…"));
+                let filter = cx.new(|cx| {
+                    TextInput::new(cx).with_placeholder(crate::i18n::tr!(
+                        "doc.search_collections",
+                        "Search collections…"
+                    ))
+                });
                 // Re-render so the filter narrows the tree live as the user types.
                 cx.subscribe(&filter, |_this, _input, _evt: &TextInputEvent, cx| {
                     cx.notify()

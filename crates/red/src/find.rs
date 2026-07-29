@@ -267,7 +267,11 @@ impl AppState {
             .bg(bg)
             .font_family(ui_family)
             .text_size(size)
-            .child(div().text_color(muted).child("Find"))
+            .child(
+                div()
+                    .text_color(muted)
+                    .child(crate::i18n::tr!("filter.find", "Find")),
+            )
             .child(div().flex_1().min_w(px(120.)).child(bar.input.clone()))
             .child(
                 Button::new("find-prev", "‹")

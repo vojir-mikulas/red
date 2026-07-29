@@ -1111,17 +1111,12 @@ pub(crate) enum TransferKind {
     Migrate,
 }
 
-impl TransferKind {
-    /// The (gerund, past, noun) verbs for the copy-family toasts: `Copy` and
-    /// `Migrate` share the streaming backend and `Copy*` events but read differently.
-    /// `Export`/`Import` have their own toasts and never call this.
-    pub(crate) fn copy_verbs(self) -> (&'static str, &'static str, &'static str) {
-        match self {
-            TransferKind::Migrate => ("Migrating", "Migrated", "Migration"),
-            _ => ("Copying", "Copied", "Copy"),
-        }
-    }
-}
+// `Copy` and `Migrate` share the streaming backend and the `Copy*` events but
+// read differently in a toast. That used to be a `copy_verbs()` returning the
+// (gerund, past, noun) to splice into a sentence, which does not survive
+// translation: in most languages the verb agrees with the gender and number of
+// its object, so a verb cannot be a substitutable fragment. Each toast now
+// carries its whole sentence per kind (`result/copy.rs`), one catalog key each.
 
 /// The live state of a streaming-transfer toast (export, import, *or* copy): how
 /// many rows have moved, keyed by the transfer `id` so a cancel / progress update
@@ -1283,7 +1278,7 @@ impl QueryTab {
                 })
                 .corner_radius(px(0.))
                 .resting_border(false)
-                .a11y_label("Query editor")
+                .a11y_label(crate::i18n::tr!("editor.a11y_query_editor", "Query editor"))
                 .with_content(EMPTY_QUERY)
         });
         // ⌘↵ runs the active tab's statement / selection; Esc (with no completion
@@ -1609,7 +1604,10 @@ impl ActiveConn {
             .then(|| crate::kvbrowse::RedisView::new(session, kv_mode, cx));
         let doc_view = (config.kind == DbKind::Mongo)
             .then(|| crate::docbrowse::MongoView::new(session, config.read_only, cx));
-        let history_search = cx.new(|cx| TextInput::new(cx).with_placeholder("Search history…"));
+        let history_search = cx.new(|cx| {
+            TextInput::new(cx)
+                .with_placeholder(crate::i18n::tr!("history.search", "Search history…"))
+        });
         // Re-render so the search narrows the dock live as the user types.
         cx.subscribe(
             &history_search,

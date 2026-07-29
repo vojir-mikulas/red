@@ -117,7 +117,7 @@ impl AppState {
                 div()
                     .text_size(theme.scale(12.))
                     .text_color(text)
-                    .child("Mutations"),
+                    .child(crate::i18n::tr!("server.mutations_title", "Mutations")),
             )
             .child(
                 div()

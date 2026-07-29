@@ -739,8 +739,11 @@ impl AppState {
             &settings.appearance,
         ));
         cx.set_global(flint::ReduceMotion(settings.appearance.reduce_motion));
+        crate::i18n::apply(&settings.appearance.locale);
 
-        let name_input = cx.new(|cx| TextInput::new(cx).with_placeholder("my database"));
+        let name_input = cx.new(|cx| {
+            TextInput::new(cx).with_placeholder(crate::i18n::tr!("connect.ph_name", "my database"))
+        });
         let host_input = cx.new(|cx| TextInput::new(cx).with_placeholder("localhost"));
         let port_input = cx.new(TextInput::new);
         let user_input = cx.new(|cx| TextInput::new(cx).with_placeholder("postgres"));
@@ -766,7 +769,9 @@ impl AppState {
         let proxy_host_input =
             cx.new(|cx| TextInput::new(cx).with_placeholder("proxy.example.com"));
         let proxy_port_input = cx.new(|cx| TextInput::new(cx).with_placeholder("1080"));
-        let proxy_user_input = cx.new(|cx| TextInput::new(cx).with_placeholder("optional"));
+        let proxy_user_input = cx.new(|cx| {
+            TextInput::new(cx).with_placeholder(crate::i18n::tr!("connect.ph_optional", "optional"))
+        });
         // The proxy auth password is obscured, like the SSH secrets.
         let proxy_password_input = cx.new(|cx| TextInput::new(cx).obscured());
 
@@ -882,7 +887,7 @@ impl AppState {
             TextInput::new(cx)
                 .bare()
                 .tab_stop(false)
-                .with_placeholder("Search connections…")
+                .with_placeholder(crate::i18n::tr!("connect.search", "Search connections…"))
         });
         cx.subscribe(
             &connect_search,
@@ -919,7 +924,10 @@ impl AppState {
             TextInput::new(cx)
                 .bare()
                 .tab_stop(false)
-                .with_placeholder("Search actions or shortcuts…")
+                .with_placeholder(crate::i18n::tr!(
+                    "palette.search_actions",
+                    "Search actions or shortcuts…"
+                ))
         });
         cx.subscribe(
             &keymap_search,
@@ -945,7 +953,7 @@ impl AppState {
             TextInput::new(cx)
                 .bare()
                 .tab_stop(false)
-                .with_placeholder("Search settings…")
+                .with_placeholder(crate::i18n::tr!("settings.ui_search", "Search settings…"))
         });
         cx.subscribe(
             &settings_search,
@@ -980,8 +988,12 @@ impl AppState {
 
         // Shared field for the pasted OAuth code during an ACP subscription sign-in.
         // Enter submits the code; Esc cancels the sign-in.
-        let ai_login_code =
-            cx.new(|cx| TextInput::new(cx).with_placeholder("paste the code from your browser"));
+        let ai_login_code = cx.new(|cx| {
+            TextInput::new(cx).with_placeholder(crate::i18n::tr!(
+                "settings.ui_paste_code",
+                "paste the code from your browser"
+            ))
+        });
         cx.subscribe(
             &ai_login_code,
             |this, _, event: &TextInputEvent, cx| match event {
@@ -1997,9 +2009,18 @@ impl AppState {
                 // since "0 row(s) affected" alone reads like nothing happened after a
                 // batch of DDL.
                 let message = if statements > 1 {
-                    format!("{statements} statement(s) run, {affected} row(s) affected")
+                    crate::i18n::tr!(
+                        "notify.statements_run",
+                        "{statements} statement(s) run, {affected} row(s) affected",
+                        statements = statements,
+                        affected = affected,
+                    )
                 } else {
-                    format!("{affected} row(s) affected")
+                    crate::i18n::tr!(
+                        "notify.rows_affected",
+                        "{affected} row(s) affected",
+                        affected = affected,
+                    )
                 };
                 self.notify(ToastVariant::Success, message, cx);
                 // A write may have changed the schema (CREATE/DROP), so refresh

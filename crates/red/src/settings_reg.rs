@@ -25,6 +25,8 @@
 
 use std::borrow::Cow;
 
+use gpui::SharedString;
+
 use crate::settings::{
     ConfirmThreshold, Density, DocView, KvQueryMode, MAX_DOC_COLUMNS, MAX_PREVIEW_COUNT,
     MAX_RESIDENT_KEYS, Settings,
@@ -62,13 +64,18 @@ impl Value {
 
 /// One choice in a [`Control::Segments`] row.
 pub(crate) struct Segment {
-    pub label: &'static str,
+    /// The English source text. Rendered through
+    /// [`SettingDef::segment_label`], which needs the owning row to build the
+    /// catalog key, so a preset can be translated in the context it appears in
+    /// ("Normal" spacing and "Normal" density are not one word in every
+    /// language).
+    pub en_label: &'static str,
     pub value: Value,
 }
 
 /// Shorthand for a segment, so the table below stays readable.
-const fn seg(label: &'static str, value: Value) -> Segment {
-    Segment { label, value }
+const fn seg(en_label: &'static str, value: Value) -> Segment {
+    Segment { en_label, value }
 }
 
 const fn int(n: i64) -> Value {
@@ -171,6 +178,22 @@ impl SettingsTab {
         SettingsTab::About,
     ];
 
+    /// This page's name in the active locale.
+    ///
+    /// Keyed on the variant name, not on [`label`](Self::label): the catalog key
+    /// has to survive a copy edit, and "Grids & results" is exactly the kind of
+    /// display text that gets reworded. `scripts/i18n-extract.py` reads the same
+    /// variant names out of the match below.
+    pub(crate) fn title(self) -> SharedString {
+        crate::i18n::tr_or(
+            &format!("settings.tab.{}", slug(&format!("{self:?}"))),
+            self.label(),
+        )
+    }
+
+    /// The English page name. Identity as well as text: element ids are built
+    /// from it, so it must not move when the locale does. Render
+    /// [`title`](Self::title).
     pub(crate) fn label(self) -> &'static str {
         match self {
             SettingsTab::Appearance => "Appearance",
@@ -204,6 +227,18 @@ impl SettingsTab {
     /// A line under the page title saying who the page is for, so an engine page
     /// is honest about being global defaults rather than about the connection
     /// currently open.
+    /// This page's one-line subtitle in the active locale, if it has one.
+    pub(crate) fn subtitle_text(self) -> Option<SharedString> {
+        self.subtitle().map(|english| {
+            crate::i18n::tr_or(
+                &format!("settings.tab.{}.subtitle", slug(&format!("{self:?}"))),
+                english,
+            )
+        })
+    }
+
+    /// The English subtitle source. See [`en_label`](SettingDef::en_label);
+    /// render [`subtitle_text`](Self::subtitle_text).
     pub(crate) fn subtitle(self) -> Option<&'static str> {
         match self {
             SettingsTab::Data => {
@@ -232,10 +267,20 @@ pub(crate) struct SettingDef {
     /// the panel teaches the file rather than competing with it, and searched.
     pub key: &'static str,
     pub tab: SettingsTab,
-    /// The header this row sits under within its page.
+    /// The header this row sits under within its page, in English. Identity as
+    /// well as text: [`for_group`] groups on it. Render [`group_label`] instead.
+    ///
+    /// [`group_label`]: SettingDef::group_label
     pub group: &'static str,
-    pub label: &'static str,
-    pub help: &'static str,
+    /// The English source text, which is what `scripts/i18n-extract.py` lifts into
+    /// `assets/i18n/en.toml`. Named for the language it is in because rendering it
+    /// directly would pin the UI to English; [`label`] is what the panel draws.
+    ///
+    /// [`label`]: SettingDef::label
+    pub en_label: &'static str,
+    /// The English source description. See [`en_label`](Self::en_label); render
+    /// [`help`](SettingDef::help).
+    pub en_help: &'static str,
     pub applies: Applies,
     pub control: Control,
     pub get: fn(&Settings) -> Value,
@@ -257,13 +302,64 @@ impl SettingDef {
         (self.get)(&Settings::default())
     }
 
+    /// This row's name in the active locale.
+    ///
+    /// The catalog key is derived from [`key`](Self::key) rather than stored,
+    /// which is what keeps a translated row the same size as an untranslated one:
+    /// the dotted `settings.toml` path a row already carries *is* its namespace.
+    pub(crate) fn label(&self) -> SharedString {
+        crate::i18n::tr_or(&format!("settings.{}.label", self.key), self.en_label)
+    }
+
+    /// This row's description in the active locale.
+    pub(crate) fn help(&self) -> SharedString {
+        crate::i18n::tr_or(&format!("settings.{}.help", self.key), self.en_help)
+    }
+
+    /// This row's group header in the active locale, empty for a row that sits
+    /// under no header (`group: ""`, a layout sentinel rather than text).
+    pub(crate) fn group_label(&self) -> SharedString {
+        if self.group.is_empty() {
+            return SharedString::default();
+        }
+        crate::i18n::tr_or(&format!("settings.group.{}", slug(self.group)), self.group)
+    }
+
+    /// One of this row's presets in the active locale.
+    pub(crate) fn segment_label(&self, segment: &Segment) -> SharedString {
+        crate::i18n::tr_or(
+            &format!("settings.{}.seg.{}", self.key, slug(segment.en_label)),
+            segment.en_label,
+        )
+    }
+
     /// Whether this row matches a lowercased search query, over everything a user
     /// might plausibly type: the label, the description, and the file key.
+    ///
+    /// Matches the *translated* text, so search works in the language on screen.
+    /// The key stays searchable in every locale because it is the file syntax,
+    /// not prose.
     pub(crate) fn matches(&self, query: &str) -> bool {
-        self.label.to_lowercase().contains(query)
-            || self.help.to_lowercase().contains(query)
+        self.label().to_lowercase().contains(query)
+            || self.help().to_lowercase().contains(query)
             || self.key.contains(query)
     }
+}
+
+/// The catalog-key form of a display string: lowercase, non-alphanumerics
+/// collapsed to `_`. Mirrors `slug()` in `scripts/i18n-extract.py`; the two must
+/// agree or a generated key will not be the key the UI looks up, which
+/// [`tests::every_registry_string_is_in_the_english_catalog`] catches.
+fn slug(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
 }
 
 /// Every registered setting, in page then group order.
@@ -287,14 +383,43 @@ pub(crate) fn for_group(
 
 // --- the table ---------------------------------------------------------------
 
+/// The Language row's choices.
+///
+/// Language names stay in their own language (an endonym: "Deutsch", not
+/// "German"), because someone who cannot read the current UI language still has
+/// to find their own in this list. Only "System" is translated. The pseudolocale
+/// is a coverage audit rather than a language, so it is offered in dev builds
+/// only; a user can still reach it by hand-editing `settings.toml`.
+#[cfg(debug_assertions)]
+static LOCALE_SEGMENTS: &[Segment] = &[
+    seg("System", text("system")),
+    seg("English", text("en")),
+    seg("Pseudo", text(crate::i18n::PSEUDO)),
+];
+#[cfg(not(debug_assertions))]
+static LOCALE_SEGMENTS: &[Segment] = &[seg("System", text("system")), seg("English", text("en"))];
+
 static DEFS: &[SettingDef] = &[
     // --- appearance ---
+    SettingDef {
+        key: "appearance.locale",
+        tab: SettingsTab::Appearance,
+        group: "Language",
+        en_label: "Language",
+        en_help: "The interface language. \"System\" follows the operating system, \
+               falling back to English when that language has no translation.",
+        applies: Applies::All,
+        control: Control::Segments(LOCALE_SEGMENTS),
+        get: |s| Value::Text(Cow::Owned(s.appearance.locale.clone())),
+        set: |s, v| s.appearance.locale = v.as_text().to_string(),
+        warn: None,
+    },
     SettingDef {
         key: "appearance.reduce_motion",
         tab: SettingsTab::Appearance,
         group: "Motion",
-        label: "Reduce motion",
-        help: "Suppress non-essential animation, for motion sensitivity.",
+        en_label: "Reduce motion",
+        en_help: "Suppress non-essential animation, for motion sensitivity.",
         applies: Applies::All,
         control: Control::Toggle,
         get: |s| Value::Bool(s.appearance.reduce_motion),
@@ -306,8 +431,8 @@ static DEFS: &[SettingDef] = &[
         key: "editor.line_height",
         tab: SettingsTab::Editor,
         group: "Layout",
-        label: "Line height",
-        help: "Editor line spacing, as a multiple of the font size.",
+        en_label: "Line height",
+        en_help: "Editor line spacing, as a multiple of the font size.",
         applies: Applies::All,
         control: Control::Segments(&[
             seg("Tight", int(12)),
@@ -324,8 +449,8 @@ static DEFS: &[SettingDef] = &[
         key: "editor.tab_width",
         tab: SettingsTab::Editor,
         group: "Layout",
-        label: "Tab width",
-        help: "Spaces a tab occupies in the SQL editor.",
+        en_label: "Tab width",
+        en_help: "Spaces a tab occupies in the SQL editor.",
         applies: Applies::All,
         control: Control::Segments(&[seg("2", int(2)), seg("4", int(4)), seg("8", int(8))]),
         get: |s| Value::Int(i64::from(s.editor.tab_width)),
@@ -337,8 +462,8 @@ static DEFS: &[SettingDef] = &[
         key: "keymap.vim_mode",
         tab: SettingsTab::Keymap,
         group: "Navigation",
-        label: "Vim navigation",
-        help: "Adds hjkl / g / G / Ctrl-d / Ctrl-u motions to the result grid and the \
+        en_label: "Vim navigation",
+        en_help: "Adds hjkl / g / G / Ctrl-d / Ctrl-u motions to the result grid and the \
                history dock, alongside the arrow keys. Applies live.",
         applies: Applies::All,
         control: Control::Toggle,
@@ -351,8 +476,8 @@ static DEFS: &[SettingDef] = &[
         key: "behavior.restore_last_session",
         tab: SettingsTab::Behavior,
         group: "Startup",
-        label: "Restore last session",
-        help: "Reconnect to the most recently used connection on launch (credentials come \
+        en_label: "Restore last session",
+        en_help: "Reconnect to the most recently used connection on launch (credentials come \
                from the keychain). Takes effect next launch.",
         applies: Applies::All,
         control: Control::Toggle,
@@ -365,8 +490,8 @@ static DEFS: &[SettingDef] = &[
         key: "data.density",
         tab: SettingsTab::Data,
         group: "Display",
-        label: "Row density",
-        help: "Vertical spacing of rows, in every grid.",
+        en_label: "Row density",
+        en_help: "Vertical spacing of rows, in every grid.",
         applies: Applies::All,
         control: Control::Segments(&[
             seg("Compact", text("compact")),
@@ -381,8 +506,8 @@ static DEFS: &[SettingDef] = &[
         key: "data.null_display",
         tab: SettingsTab::Data,
         group: "Display",
-        label: "Null display",
-        help: "How a SQL NULL renders in a cell. Set any other string in the file.",
+        en_label: "Null display",
+        en_help: "How a SQL NULL renders in a cell. Set any other string in the file.",
         applies: Applies::Sql,
         control: Control::Segments(&[
             seg("NULL", text("NULL")),
@@ -397,8 +522,8 @@ static DEFS: &[SettingDef] = &[
         key: "data.row_numbers",
         tab: SettingsTab::Data,
         group: "Display",
-        label: "Row numbers",
-        help: "Show the leading row-number gutter in SQL results.",
+        en_label: "Row numbers",
+        en_help: "Show the leading row-number gutter in SQL results.",
         applies: Applies::Sql,
         control: Control::Toggle,
         get: |s| Value::Bool(s.data.row_numbers),
@@ -409,8 +534,8 @@ static DEFS: &[SettingDef] = &[
         key: "data.page_size",
         tab: SettingsTab::Data,
         group: "Performance",
-        label: "Page size",
-        help: "Rows fetched per page as you scroll, in every grid. Larger means fewer \
+        en_label: "Page size",
+        en_help: "Rows fetched per page as you scroll, in every grid. Larger means fewer \
                round-trips and more resident rows.",
         applies: Applies::All,
         control: Control::Segments(&[
@@ -427,8 +552,8 @@ static DEFS: &[SettingDef] = &[
         key: "data.max_cell_chars",
         tab: SettingsTab::Data,
         group: "Performance",
-        label: "Max cell size",
-        help: "Bytes of a single cell kept resident, the fat-cell memory rail. Over-cap \
+        en_label: "Max cell size",
+        en_help: "Bytes of a single cell kept resident, the fat-cell memory rail. Over-cap \
                cells are clipped for display only; export stays full.",
         applies: Applies::All,
         control: Control::Segments(&[
@@ -445,8 +570,8 @@ static DEFS: &[SettingDef] = &[
         key: "data.stats_distinct_max_rows",
         tab: SettingsTab::Data,
         group: "Performance",
-        label: "Stats distinct limit",
-        help: "Result size past which the column-stats bar withholds count(distinct) until \
+        en_label: "Stats distinct limit",
+        en_help: "Result size past which the column-stats bar withholds count(distinct) until \
                you click compute, so it never scans a huge table by accident.",
         applies: Applies::Sql,
         control: Control::Segments(&[
@@ -469,8 +594,8 @@ static DEFS: &[SettingDef] = &[
         key: "data.copy_row_limit",
         tab: SettingsTab::Data,
         group: "Performance",
-        label: "Copy row limit",
-        help: "Rows a select-all or whole-column copy pulls into the clipboard. Larger \
+        en_label: "Copy row limit",
+        en_help: "Rows a select-all or whole-column copy pulls into the clipboard. Larger \
                copies are clipped to this (with a warning) to bound memory.",
         applies: Applies::Sql,
         control: Control::Segments(&[
@@ -488,8 +613,8 @@ static DEFS: &[SettingDef] = &[
         key: "sql.auto_limit",
         tab: SettingsTab::Sql,
         group: "Large-result safety",
-        label: "Auto-limit",
-        help: "Append LIMIT to a bare SELECT * so a fat table can't flood the grid.",
+        en_label: "Auto-limit",
+        en_help: "Append LIMIT to a bare SELECT * so a fat table can't flood the grid.",
         applies: Applies::Sql,
         control: Control::Segments(&[
             seg("Off", int(0)),
@@ -508,8 +633,8 @@ static DEFS: &[SettingDef] = &[
         key: "sql.statement_timeout",
         tab: SettingsTab::Sql,
         group: "Large-result safety",
-        label: "Statement timeout",
-        help: "Abort a query (and its page/run fetches) that runs longer than this.",
+        en_label: "Statement timeout",
+        en_help: "Abort a query (and its page/run fetches) that runs longer than this.",
         applies: Applies::Sql,
         control: Control::Segments(&[
             seg("Off", int(0)),
@@ -525,8 +650,8 @@ static DEFS: &[SettingDef] = &[
         key: "sql.watch_default_secs",
         tab: SettingsTab::Sql,
         group: "Watch",
-        label: "Default watch interval",
-        help: "Arm watch at this interval on every result that can take one. Off \
+        en_label: "Default watch interval",
+        en_help: "Arm watch at this interval on every result that can take one. Off \
                means watch starts only when you ask for it.",
         applies: Applies::Sql,
         control: Control::Segments(&[
@@ -547,8 +672,8 @@ static DEFS: &[SettingDef] = &[
         key: "sql.watch_min_secs",
         tab: SettingsTab::Sql,
         group: "Watch",
-        label: "Minimum watch interval",
-        help: "Floor under any watch interval. A watch is a query on a loop, so this \
+        en_label: "Minimum watch interval",
+        en_help: "Floor under any watch interval. A watch is a query on a loop, so this \
                is a load guard; production connections are floored at 10s regardless.",
         applies: Applies::Sql,
         control: Control::Segments(&[seg("1s", int(1)), seg("2s", int(2)), seg("5s", int(5))]),
@@ -564,8 +689,8 @@ static DEFS: &[SettingDef] = &[
         key: "kv.default_query_mode",
         tab: SettingsTab::Kv,
         group: "Browsing",
-        label: "Default filter mode",
-        help: "How a new browse tab's filter box reads what you type. Changeable per tab \
+        en_label: "Default filter mode",
+        en_help: "How a new browse tab's filter box reads what you type. Changeable per tab \
                from the filter dropdown.",
         applies: Applies::Kv,
         control: Control::Segments(&[
@@ -583,8 +708,8 @@ static DEFS: &[SettingDef] = &[
         key: "kv.auto_refresh_secs",
         tab: SettingsTab::Kv,
         group: "Browsing",
-        label: "Auto-refresh keys",
-        help: "How often a new key-browser tab re-scans the keyspace. Off by default; \
+        en_label: "Auto-refresh keys",
+        en_help: "How often a new key-browser tab re-scans the keyspace. Off by default; \
                change it for an open tab from the browser's actions menu.",
         applies: Applies::Kv,
         control: Control::Segments(&[
@@ -606,8 +731,8 @@ static DEFS: &[SettingDef] = &[
         key: "kv.max_resident_keys",
         tab: SettingsTab::Kv,
         group: "Performance",
-        label: "Max resident keys",
-        help: "Keys one browse tab keeps in memory before evicting the oldest, so a long \
+        en_label: "Max resident keys",
+        en_help: "Keys one browse tab keeps in memory before evicting the oldest, so a long \
                unfiltered browse can't grow without bound.",
         applies: Applies::Kv,
         control: Control::Segments(&[
@@ -627,8 +752,8 @@ static DEFS: &[SettingDef] = &[
         key: "kv.preview_count",
         tab: SettingsTab::Kv,
         group: "Performance",
-        label: "Collection preview size",
-        help: "Elements of a list or stream the inspector pulls per fetch.",
+        en_label: "Collection preview size",
+        en_help: "Elements of a list or stream the inspector pulls per fetch.",
         applies: Applies::Kv,
         control: Control::Segments(&[
             seg("50", int(50)),
@@ -645,8 +770,8 @@ static DEFS: &[SettingDef] = &[
         key: "doc.default_view",
         tab: SettingsTab::Doc,
         group: "Display",
-        label: "Default view",
-        help: "How a newly-opened collection renders. Changeable per tab from the \
+        en_label: "Default view",
+        en_help: "How a newly-opened collection renders. Changeable per tab from the \
                collection toolbar.",
         applies: Applies::Doc,
         control: Control::Segments(&[
@@ -662,8 +787,8 @@ static DEFS: &[SettingDef] = &[
         key: "doc.max_columns",
         tab: SettingsTab::Doc,
         group: "Display",
-        label: "Max table columns",
-        help: "Top-level fields the sampled-column table shows. A wider document is still \
+        en_label: "Max table columns",
+        en_help: "Top-level fields the sampled-column table shows. A wider document is still \
                whole in List, JSON, and the inspector.",
         applies: Applies::Doc,
         control: Control::Segments(&[
@@ -681,8 +806,8 @@ static DEFS: &[SettingDef] = &[
         key: "safety.confirm_from",
         tab: SettingsTab::Safety,
         group: "Confirmations",
-        label: "Confirm from",
-        help: "How dangerous an action has to be before RED asks first. \"Risky\" covers an \
+        en_label: "Confirm from",
+        en_help: "How dangerous an action has to be before RED asks first. \"Risky\" covers an \
                UPDATE or DELETE with no WHERE, a privilege change, a Redis key delete, or a \
                MongoDB document delete; \"Destructive\" is a DROP or TRUNCATE, always \
                confirmed by typing the object's name. A connection marked Prod confirms \
@@ -707,8 +832,8 @@ static DEFS: &[SettingDef] = &[
         key: "safety.confirm_close_tab",
         tab: SettingsTab::Safety,
         group: "Confirmations",
-        label: "Confirm closing a tab",
-        help: "Ask before closing a tab that holds unsaved work.",
+        en_label: "Confirm closing a tab",
+        en_help: "Ask before closing a tab that holds unsaved work.",
         applies: Applies::All,
         control: Control::Toggle,
         get: |s| Value::Bool(s.safety.confirm_close_tab),
@@ -719,8 +844,8 @@ static DEFS: &[SettingDef] = &[
         key: "safety.ai_review",
         tab: SettingsTab::Safety,
         group: "Review",
-        label: "Ask the assistant to review",
-        help: "Add a second opinion from your AI agent to the confirmation, for the mistakes \
+        en_label: "Ask the assistant to review",
+        en_help: "Add a second opinion from your AI agent to the confirmation, for the mistakes \
                a keyword check can't see (a filter that looks inverted, say). This sends the \
                statement and a summary of your schema to the configured provider. It is \
                advice only: it never runs anything, and never unlocks the confirmation.",
@@ -735,8 +860,8 @@ static DEFS: &[SettingDef] = &[
         key: "ai.enabled",
         tab: SettingsTab::Ai,
         group: "",
-        label: "Enable agent",
-        help: "The grounded chat sidepanel (⌘L). Off is a true kill switch.",
+        en_label: "Enable agent",
+        en_help: "The grounded chat sidepanel (⌘L). Off is a true kill switch.",
         applies: Applies::All,
         control: Control::Toggle,
         get: |s| Value::Bool(s.ai.enabled),
@@ -747,8 +872,8 @@ static DEFS: &[SettingDef] = &[
         key: "ai.tier",
         tab: SettingsTab::Ai,
         group: "Database access",
-        label: "Access tier",
-        help: "How much the agent can see. Off: nothing. Schema: structure only. Read: \
+        en_label: "Access tier",
+        en_help: "How much the agent can see. Off: nothing. Schema: structure only. Read: \
                capped SELECT/EXPLAIN. Write: adds INSERT/UPDATE/DELETE, each needing \
                per-statement approval.",
         applies: Applies::All,
@@ -772,8 +897,8 @@ static DEFS: &[SettingDef] = &[
         key: "ai.limits.max_rows",
         tab: SettingsTab::Ai,
         group: "Read-tier resource guards",
-        label: "Max rows per query",
-        help: "Ceiling on rows one tool SELECT returns; a larger LIMIT is clamped.",
+        en_label: "Max rows per query",
+        en_help: "Ceiling on rows one tool SELECT returns; a larger LIMIT is clamped.",
         applies: Applies::All,
         control: Control::Segments(&[
             seg("100", int(100)),
@@ -794,8 +919,8 @@ static DEFS: &[SettingDef] = &[
         key: "ai.limits.statement_timeout_ms",
         tab: SettingsTab::Ai,
         group: "Read-tier resource guards",
-        label: "Statement timeout",
-        help: "Abort a tool query that runs longer than this.",
+        en_label: "Statement timeout",
+        en_help: "Abort a tool query that runs longer than this.",
         applies: Applies::All,
         control: Control::Segments(&[
             seg("Off", int(0)),
@@ -811,8 +936,8 @@ static DEFS: &[SettingDef] = &[
         key: "ai.limits.max_result_bytes",
         tab: SettingsTab::Ai,
         group: "Read-tier resource guards",
-        label: "Result size cap",
-        help: "Trim a tool result larger than this before handing it to the model.",
+        en_label: "Result size cap",
+        en_help: "Trim a tool result larger than this before handing it to the model.",
         applies: Applies::All,
         control: Control::Segments(&[
             seg("64 KB", int(64 * 1024)),
@@ -832,8 +957,8 @@ static DEFS: &[SettingDef] = &[
         key: "ai.limits.max_tool_calls",
         tab: SettingsTab::Ai,
         group: "Read-tier resource guards",
-        label: "Tool calls per chat",
-        help: "Tool-call budget for one conversation; bounds a runaway loop.",
+        en_label: "Tool calls per chat",
+        en_help: "Tool-call budget for one conversation; bounds a runaway loop.",
         applies: Applies::All,
         control: Control::Segments(&[
             seg("25", int(25)),
@@ -854,8 +979,8 @@ static DEFS: &[SettingDef] = &[
         key: "ai.show_thinking",
         tab: SettingsTab::Ai,
         group: "Display",
-        label: "Show thinking",
-        help: "Show a summarized “thinking…” affordance while the model reasons.",
+        en_label: "Show thinking",
+        en_help: "Show a summarized “thinking…” affordance while the model reasons.",
         applies: Applies::All,
         control: Control::Toggle,
         get: |s| Value::Bool(s.ai.show_thinking),
@@ -867,8 +992,8 @@ static DEFS: &[SettingDef] = &[
         key: "update.auto_update",
         tab: SettingsTab::About,
         group: "Updates",
-        label: "Automatic updates",
-        help: "Check GitHub for newer signed builds in the background and stage them for a \
+        en_label: "Automatic updates",
+        en_help: "Check GitHub for newer signed builds in the background and stage them for a \
                one-click restart.",
         applies: Applies::All,
         control: Control::Toggle,
@@ -881,6 +1006,61 @@ static DEFS: &[SettingDef] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The English catalog has to reproduce the registry's source text exactly.
+    ///
+    /// `assets/i18n/en.toml` is generated from this table, so the two drift the
+    /// moment someone edits a label and does not re-run the extractor. The UI
+    /// renders the catalog, so that drift would silently ship the *old* wording,
+    /// with nothing on screen to suggest the code and the catalog disagree. This
+    /// also pins the key derivation: a slug computed differently here than in the
+    /// script shows up as a key resolving to itself.
+    ///
+    /// Looks the key up raw rather than through `label()` and friends: those fall
+    /// back to the English source when a key is missing, which is right for the UI
+    /// and would hide from this test the exact case it exists to catch.
+    #[test]
+    fn every_registry_string_is_in_the_english_catalog() {
+        crate::i18n::apply(crate::i18n::DEFAULT);
+
+        let mut stale = Vec::new();
+        let mut check = |key: String, want: &str| {
+            let got = crate::i18n::lookup(&key);
+            if got.as_ref() != want {
+                stale.push(format!("  {key}\n    catalog: {got}\n    code:    {want}"));
+            }
+        };
+
+        for tab in SettingsTab::ALL {
+            let id = slug(&format!("{tab:?}"));
+            check(format!("settings.tab.{id}"), tab.label());
+            if let Some(want) = tab.subtitle() {
+                check(format!("settings.tab.{id}.subtitle"), want);
+            }
+        }
+        for def in defs() {
+            check(format!("settings.{}.label", def.key), def.en_label);
+            check(format!("settings.{}.help", def.key), def.en_help);
+            if !def.group.is_empty() {
+                check(format!("settings.group.{}", slug(def.group)), def.group);
+            }
+            if let Control::Segments(segments) = &def.control {
+                for segment in *segments {
+                    check(
+                        format!("settings.{}.seg.{}", def.key, slug(segment.en_label)),
+                        segment.en_label,
+                    );
+                }
+            }
+        }
+
+        assert!(
+            stale.is_empty(),
+            "assets/i18n/settings/en.ftl is out of date with settings_reg.rs:\n{}\n\n\
+             Re-run: python3 scripts/i18n-extract.py",
+            stale.join("\n")
+        );
+    }
 
     /// Every registry entry must round-trip: applying a segment's value has to
     /// make `get` return it. A typo in a `set` (writing the wrong field, or a
@@ -903,7 +1083,7 @@ mod tests {
                     segment.value,
                     "{}: segment “{}” didn't round-trip",
                     def.key,
-                    segment.label
+                    segment.en_label
                 );
             }
         }

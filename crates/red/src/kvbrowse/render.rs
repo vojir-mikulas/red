@@ -388,7 +388,7 @@ impl AppState {
             .text_color(theme.text_muted)
             .cursor_pointer()
             .hover(|s| s.bg(theme.bg_hover))
-            .child("Actions")
+            .child(crate::i18n::tr!("kv.actions", "Actions"))
             .child(crate::icons::icon(
                 "chevron-down",
                 theme.scale(12.),
@@ -632,7 +632,10 @@ impl AppState {
                         } else {
                             "Group keys into a namespace tree"
                         })
-                        .a11y_label("Toggle namespace tree")
+                        .a11y_label(crate::i18n::tr!(
+                            "kv.toggle_namespace_tree",
+                            "Toggle namespace tree"
+                        ))
                         .on_click(move |_, _, cx| {
                             tree_view
                                 .update(cx, |this, cx| this.kv_toggle_tree_mode(session, cx))
@@ -776,7 +779,10 @@ impl AppState {
                         } else {
                             "Show favourites only"
                         })
-                        .a11y_label("Toggle favourites-only filter")
+                        .a11y_label(crate::i18n::tr!(
+                            "kv.toggle_favourites_only_filter",
+                            "Toggle favourites-only filter"
+                        ))
                         .on_click(move |_, _, cx| {
                             fav_view
                                 .update(cx, |this, cx| this.kv_toggle_fav_only(session, cx))
@@ -911,7 +917,7 @@ impl AppState {
 
         Some(
             Modal::new("kv-create-key")
-                .title("New key")
+                .title(crate::i18n::tr!("kv.new_key", "New key"))
                 .width(px(440.))
                 // The shared modal focus handle traps Tab and lets Esc close; the
                 // name field is focused on open (see `focus_create_key`).
@@ -1118,7 +1124,7 @@ impl AppState {
                 div()
                     .text_size(theme.scale(12.))
                     .text_color(theme.text_muted)
-                    .child("Importing…"),
+                    .child(crate::i18n::tr!("kv.importing", "Importing…")),
             )
         } else if let Some(e) = imp.error.clone() {
             Some(
@@ -1132,7 +1138,11 @@ impl AppState {
                 div()
                     .text_size(theme.scale(12.))
                     .text_color(theme.text)
-                    .child(format!("{count} command(s) ready to run")),
+                    .child(crate::i18n::tr!(
+                        "kv.commands_ready",
+                        "{count} command(s) ready to run",
+                        count = count
+                    )),
             )
         } else {
             None
@@ -1184,7 +1194,7 @@ impl AppState {
 
         Some(
             Modal::new("kv-import")
-                .title("Import keys")
+                .title(crate::i18n::tr!("kv.import_keys", "Import keys"))
                 .width(px(460.))
                 .focus_handle(self.modal_focus.clone())
                 .on_close(move |_, cx| {
@@ -1237,7 +1247,10 @@ impl AppState {
                 div()
                     .text_size(theme.scale(11.))
                     .text_color(theme.text_muted)
-                    .child("This can't be undone."),
+                    .child(crate::i18n::tr!(
+                        "kv.this_cant_be_undone",
+                        "This can't be undone."
+                    )),
             )
             .children(self.confirm_policy().allow_quiet.then(|| {
                 div().pt_1().child(self.dont_ask_destructive_checkbox(
@@ -1276,7 +1289,7 @@ impl AppState {
 
         Some(
             Modal::new("kv-delete-key")
-                .title("Delete key")
+                .title(crate::i18n::tr!("kv.delete_key", "Delete key"))
                 .width(px(380.))
                 .focus_handle(self.modal_focus.clone())
                 .on_close(move |_, cx| {
@@ -1714,8 +1727,8 @@ impl AppState {
                             crate::icons::icon("edit", theme.scale(12.), theme.text_muted),
                         )
                         .size(IconButtonSize::Sm)
-                        .tooltip("Rename key")
-                        .a11y_label("Rename key")
+                        .tooltip(crate::i18n::tr!("kv.rename_key", "Rename key"))
+                        .a11y_label(crate::i18n::tr!("kv.rename_key", "Rename key"))
                         .active(inspector.editing_key)
                         .on_click(move |_, _, cx| {
                             rename_view
@@ -1774,7 +1787,7 @@ impl AppState {
             } else {
                 "Favourite key"
             })
-            .a11y_label("Toggle favourite")
+            .a11y_label(crate::i18n::tr!("kv.toggle_favourite", "Toggle favourite"))
             .on_click(move |_, _, cx| {
                 fav_view
                     .update(cx, |this, cx| {
@@ -1791,8 +1804,8 @@ impl AppState {
                 crate::icons::icon("trash", theme.scale(13.), theme.red),
             )
             .size(IconButtonSize::Sm)
-            .tooltip("Delete key")
-            .a11y_label("Delete key")
+            .tooltip(crate::i18n::tr!("kv.delete_key", "Delete key"))
+            .a11y_label(crate::i18n::tr!("kv.delete_key", "Delete key"))
             .on_click(move |_, _, cx| {
                 delete_view
                     .update(cx, |this, cx| this.kv_request_delete(session, cx))
@@ -1821,8 +1834,8 @@ impl AppState {
                     crate::icons::icon("x", theme.scale(13.), theme.text_muted),
                 )
                 .size(IconButtonSize::Sm)
-                .tooltip("Close")
-                .a11y_label("Close inspector")
+                .tooltip(crate::i18n::tr!("kv.close", "Close"))
+                .a11y_label(crate::i18n::tr!("kv.close_inspector", "Close inspector"))
                 .on_click(move |_, _, cx| {
                     close_view
                         .update(cx, |this, cx| this.kv_close_inspector(session, cx))
@@ -2290,10 +2303,12 @@ impl AppState {
                                 // The whole value is bigger than the preview:
                                 // say so, so the truncation reads as deliberate.
                                 .child(
-                                    div()
-                                        .text_size(theme.scale(11.))
-                                        .text_color(dim)
-                                        .child("Preview truncated"),
+                                    div().text_size(theme.scale(11.)).text_color(dim).child(
+                                        crate::i18n::tr!(
+                                            "kv.preview_truncated",
+                                            "Preview truncated"
+                                        ),
+                                    ),
                                 )
                             })
                             .when(writable && editable, |d| {
@@ -2668,8 +2683,8 @@ impl AppState {
                                 crate::icons::icon("edit", icon_sz, edit_color),
                             )
                             .size(IconButtonSize::Sm)
-                            .tooltip("Edit")
-                            .a11y_label("Edit item")
+                            .tooltip(crate::i18n::tr!("kv.edit", "Edit"))
+                            .a11y_label(crate::i18n::tr!("kv.edit_item", "Edit item"))
                             .on_click(move |_, _, cx| {
                                 let v = value_edit.clone();
                                 edit_view
@@ -2691,8 +2706,8 @@ impl AppState {
                                 crate::icons::icon("trash", icon_sz, del_color),
                             )
                             .size(IconButtonSize::Sm)
-                            .tooltip("Delete")
-                            .a11y_label("Delete item")
+                            .tooltip(crate::i18n::tr!("kv.delete", "Delete"))
+                            .a11y_label(crate::i18n::tr!("kv.delete_item", "Delete item"))
                             .on_click(move |_, _, cx| {
                                 del_view
                                     .update(cx, |this, cx| {
@@ -3050,7 +3065,7 @@ impl AppState {
                         .py_0p5()
                         .text_size(text_size)
                         .text_color(dim)
-                        .child("No consumers."),
+                        .child(crate::i18n::tr!("kv.no_consumers", "No consumers.")),
                 )
             })
             .children(consumer_rows)
@@ -3062,7 +3077,10 @@ impl AppState {
                         .py_0p5()
                         .text_size(text_size)
                         .text_color(dim)
-                        .child("Nothing pending — all delivered entries are acknowledged."),
+                        .child(crate::i18n::tr!(
+                            "kv.nothing_pending_all_delivered_entries_are_acknowledged",
+                            "Nothing pending — all delivered entries are acknowledged."
+                        )),
                 )
             })
             .children(pending_rows)
@@ -3393,8 +3411,8 @@ fn collection_row_actions(
                 crate::icons::icon("edit", icon_sz, edit_color),
             )
             .size(IconButtonSize::Sm)
-            .tooltip("Edit")
-            .a11y_label("Edit element")
+            .tooltip(crate::i18n::tr!("kv.edit", "Edit"))
+            .a11y_label(crate::i18n::tr!("kv.edit_element", "Edit element"))
             .on_click(move |_, _, cx| {
                 let (k, n, v) = (edit_kind.clone(), seed_name.clone(), seed_value.clone());
                 edit_view
@@ -3410,8 +3428,8 @@ fn collection_row_actions(
                 crate::icons::icon("trash", icon_sz, del_color),
             )
             .size(IconButtonSize::Sm)
-            .tooltip("Delete")
-            .a11y_label("Delete element")
+            .tooltip(crate::i18n::tr!("kv.delete", "Delete"))
+            .a11y_label(crate::i18n::tr!("kv.delete_element", "Delete element"))
             .on_click(move |_, _, cx| {
                 let ident = ident.clone();
                 del_view

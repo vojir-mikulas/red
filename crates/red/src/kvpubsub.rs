@@ -30,8 +30,12 @@ pub(crate) struct KvPubSub {
 
 impl KvPubSub {
     pub(crate) fn new(cx: &mut Context<AppState>) -> Self {
-        let pattern_input =
-            cx.new(|cx| TextInput::new(cx).with_placeholder("Channel pattern, e.g. news.*"));
+        let pattern_input = cx.new(|cx| {
+            TextInput::new(cx).with_placeholder(crate::i18n::tr!(
+                "kv.channel_pattern_e_g_news",
+                "Channel pattern, e.g. news.*"
+            ))
+        });
         Self {
             epoch: crate::result::next_kv_epoch(),
             pattern_input,
@@ -193,11 +197,13 @@ impl AppState {
             .child(toggle);
 
         let status = match &pubsub.subscribed {
-            Some(pattern) => format!(
-                "listening on \"{pattern}\", {} message(s)",
-                pubsub.messages.len()
+            Some(pattern) => crate::i18n::tr!(
+                "kv.pubsub_listening",
+                "listening on \"{pattern}\", {messages} message(s)",
+                pattern = pattern,
+                messages = pubsub.messages.len()
             ),
-            None => "not subscribed".to_string(),
+            None => crate::i18n::tr!("kv.pubsub_idle", "not subscribed"),
         };
 
         let mono = theme.mono_family.clone();

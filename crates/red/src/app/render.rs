@@ -105,7 +105,7 @@ impl AppState {
                     div()
                         .text_color(theme.text_muted)
                         .text_size(theme.scale(12.))
-                        .child("Verify the fingerprint, then trust this host to add it to ~/.ssh/known_hosts."),
+                        .child(crate::i18n::tr!("connect.trust_host_body", "Verify the fingerprint, then trust this host to add it to ~/.ssh/known_hosts.")),
                 ),
         };
 
@@ -762,7 +762,10 @@ impl AppState {
                     .border_1()
                     .border_color(theme.border_soft)
                     .text_color(theme.text_muted)
-                    .child("Downloading update…")
+                    .child(crate::i18n::tr!(
+                        "notify.downloading_update",
+                        "Downloading update…"
+                    ))
                     .into_any_element(),
             ),
             UpdateState::ReadyToRestart { version } => Some(
@@ -1026,7 +1029,7 @@ impl AppState {
                     .on_click(cx.listener(|this, _, _, cx| this.confirm_close(cx))),
             );
         Modal::new("confirm-close-tab")
-            .title("Close tab")
+            .title(crate::i18n::tr!("editor.confirm_close_tab", "Close tab"))
             .width(px(420.))
             .focus_handle(self.modal_focus.clone())
             .footer(footer)
@@ -1077,7 +1080,7 @@ impl AppState {
                     .on_click(cx.listener(|this, _, _, cx| this.confirm_close_batch_accept(cx))),
             );
         Modal::new("confirm-close-tab-batch")
-            .title("Close tabs")
+            .title(crate::i18n::tr!("editor.confirm_close_tabs", "Close tabs"))
             .width(px(420.))
             .focus_handle(self.modal_focus.clone())
             .footer(footer)
@@ -1115,7 +1118,7 @@ impl AppState {
                 div()
                     .text_size(theme.scale(12.))
                     .text_color(theme.text_muted)
-                    .child("Don't ask again"),
+                    .child(crate::i18n::tr!("common.dont_ask_again", "Don't ask again")),
             )
     }
 
@@ -1161,7 +1164,7 @@ impl AppState {
                 div()
                     .text_size(theme.scale(12.))
                     .text_color(theme.text_muted)
-                    .child("Don't ask again"),
+                    .child(crate::i18n::tr!("common.dont_ask_again", "Don't ask again")),
             )
             .into_any_element()
     }
@@ -1194,7 +1197,10 @@ impl AppState {
                     .on_click(cx.listener(|this, _, _, cx| this.confirm_delete_connection(cx))),
             );
         Modal::new("confirm-delete-conn")
-            .title("Delete connection")
+            .title(crate::i18n::tr!(
+                "connect.confirm_delete",
+                "Delete connection"
+            ))
             .width(px(420.))
             .focus_handle(self.modal_focus.clone())
             .footer(footer)
@@ -1239,17 +1245,19 @@ impl AppState {
                         "• {conn_count} saved connection(s) and their keychain secrets \
                          (passwords, SSH keys)"
                     )))
-                    .child(div().child("• AI provider API keys in the keychain"))
+                    .child(div().child(crate::i18n::tr!(
+                        "settings.reset_item_ai_keys",
+                        "• AI provider API keys in the keychain"
+                    )))
                     .child(div().child(
                         "• the config and cached-data directories (settings, history, \
                          saved queries, themes)",
                     )),
             )
-            .child(
-                div()
-                    .text_color(theme.text_muted)
-                    .child("The RED application binary itself is not removed."),
-            );
+            .child(div().text_color(theme.text_muted).child(crate::i18n::tr!(
+                "settings.reset_binary_kept",
+                "The RED application binary itself is not removed."
+            )));
         let footer = div()
             .flex()
             .justify_end()
@@ -1265,7 +1273,10 @@ impl AppState {
                     .on_click(cx.listener(|this, _, _, cx| this.confirm_reset_run(cx))),
             );
         Modal::new("confirm-reset")
-            .title("Remove all RED data")
+            .title(crate::i18n::tr!(
+                "settings.reset_title",
+                "Remove all RED data"
+            ))
             .width(px(460.))
             .focus_handle(self.modal_focus.clone())
             .footer(footer)
@@ -1297,7 +1308,7 @@ impl AppState {
             .flex_col()
             .gap_2()
             .child(div().text_color(theme.text_muted).child(
-                "This key and its value will be permanently deleted from Redis. This can't be undone.",
+                crate::i18n::tr!("kv.confirm_delete_key_body", "This key and its value will be permanently deleted from Redis. This can't be undone."),
             ))
             .child(
                 div()
@@ -1328,7 +1339,7 @@ impl AppState {
                     .on_click(cx.listener(|this, _, _, cx| this.kv_confirm_delete_key(cx))),
             );
         Modal::new("confirm-kv-delete")
-            .title("Delete key")
+            .title(crate::i18n::tr!("kv.confirm_delete_key", "Delete key"))
             .width(px(440.))
             .focus_handle(self.modal_focus.clone())
             .footer(footer)
@@ -1381,7 +1392,7 @@ impl AppState {
             body = body.child(section);
         }
         Modal::new("keyboard-shortcuts")
-            .title("Keyboard shortcuts")
+            .title(crate::i18n::tr!("shortcuts.title", "Keyboard shortcuts"))
             .width(px(460.))
             .focus_handle(self.modal_focus.clone())
             .on_close(move |_, cx| {

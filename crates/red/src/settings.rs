@@ -131,6 +131,11 @@ pub struct AppearanceSettings {
     /// Off by default; RED has no OS "reduce motion" bridge yet, so this is the
     /// manual opt-in. Honored by Flint via its `ReduceMotion` global.
     pub reduce_motion: bool,
+    /// The UI language: `"system"` to follow the OS, or a locale code with a
+    /// catalog compiled in (`crate::i18n::available`). An unrecognised value
+    /// degrades to English rather than failing the load, so a typo here costs a
+    /// language and not the app.
+    pub locale: String,
 }
 
 impl Default for AppearanceSettings {
@@ -142,6 +147,7 @@ impl Default for AppearanceSettings {
             // The design's base UI size.
             ui_font_size: 13.0,
             reduce_motion: false,
+            locale: "system".to_string(),
         }
     }
 }

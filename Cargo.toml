@@ -138,6 +138,16 @@ rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 # --- Live config reload (watch settings.toml, re-apply without a restart) ---
 notify = "6"
 
+# --- UI localization ---
+# Fluent rather than a plain key-value catalog, because Czech (the first target
+# language) selects between three plural forms and Polish and Russian do the
+# same. Fluent carries the CLDR rules, so a translator writes the forms in the
+# `.ftl` and no Rust code decides grammar per language; the alternative is
+# English-shaped "row(s)", which is not a word in most of them.
+# `concurrent` gives a thread-safe bundle, so the catalogs live in a static.
+fluent-bundle = { version = "0.16", default-features = false }
+unic-langid = "0.9"
+
 # --- Internal crates ---
 red-core = { path = "crates/red-core" }
 red-config = { path = "crates/red-config" }

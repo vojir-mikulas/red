@@ -1,6 +1,7 @@
-//! Embedded fonts and the [`gpui::AssetSource`] that serves them. Everything
-//! under the workspace `assets/` dir is baked into the binary at compile time,
-//! so the shipped app needs no sidecar files.
+//! Embedded fonts, locale catalogs, and the [`gpui::AssetSource`] that serves
+//! them. Assets are baked into the binary at compile time so the shipped app
+//! needs no sidecar files, but only via the `#[include]` allowlist below: a new
+//! directory under `assets/` ships when it is listed here and not before.
 
 use std::borrow::Cow;
 
@@ -29,6 +30,8 @@ const FONT_FILES: &[&str] = &[
 #[include = "fonts/*"]
 #[include = "icons/*"]
 #[include = "red.svg"]
+// One `.ftl` per domain per locale, read by `crate::i18n` at first lookup.
+#[include = "i18n/**/*.ftl"]
 pub struct Assets;
 
 /// The bundled, fully-commented reference settings, RED's settings docs. Baked

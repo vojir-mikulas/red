@@ -226,7 +226,10 @@ pub(crate) struct KvConsole {
 impl KvConsole {
     pub(crate) fn new(session: SessionId, cx: &mut Context<AppState>) -> Self {
         let input = cx.new(|cx| {
-            TextInput::new(cx).with_placeholder("Type a command, e.g. GET mykey, then Enter…")
+            TextInput::new(cx).with_placeholder(crate::i18n::tr!(
+                "kv.type_a_command_e_g_get_mykey_then_enter",
+                "Type a command, e.g. GET mykey, then Enter…"
+            ))
         });
         cx.subscribe(&input, move |this, input, event: &TextInputEvent, cx| {
             if matches!(event, TextInputEvent::Submit) {
@@ -239,10 +242,14 @@ impl KvConsole {
         let batch_input = cx.new(|cx| {
             CodeEditor::new(cx)
                 .soft_wrap(false)
-                .placeholder(
-                    "One command per line. # comments and blanks are skipped. ⌘↵ runs all.",
-                )
-                .a11y_label("Redis batch composer")
+                .placeholder(crate::i18n::tr!(
+                    "kv.console_hint",
+                    "One command per line. # comments and blanks are skipped. ⌘↵ runs all."
+                ))
+                .a11y_label(crate::i18n::tr!(
+                    "kv.redis_batch_composer",
+                    "Redis batch composer"
+                ))
         });
         cx.subscribe(&batch_input, move |this, _, event: &CodeEditorEvent, cx| {
             if matches!(event, CodeEditorEvent::Run) {
@@ -657,12 +664,25 @@ impl AppState {
         let (variant, msg) = match (aborted, failed) {
             (true, _) => (
                 ToastVariant::Warning,
-                format!("Batch stopped — {ok} ok, {failed} failed"),
+                crate::i18n::tr!(
+                    "kv.batch_stopped",
+                    "Batch stopped — {ok} ok, {failed} failed",
+                    ok = ok,
+                    failed = failed,
+                ),
             ),
-            (false, 0) => (ToastVariant::Success, format!("Batch ran {ok} command(s)")),
+            (false, 0) => (
+                ToastVariant::Success,
+                crate::i18n::tr!("kv.batch_ran", "Batch ran {ok} command(s)", ok = ok),
+            ),
             (false, _) => (
                 ToastVariant::Warning,
-                format!("Batch: {ok} ok, {failed} failed"),
+                crate::i18n::tr!(
+                    "kv.batch_partial",
+                    "Batch: {ok} ok, {failed} failed",
+                    ok = ok,
+                    failed = failed,
+                ),
             ),
         };
         self.notify(variant, msg, cx);
@@ -1012,9 +1032,11 @@ impl AppState {
                         .flex_1()
                         .text_size(theme.scale(11.5))
                         .text_color(theme.text)
-                        .child(format!(
-                            "This batch contains {destructive} destructive command(s). Run all {} line(s)?",
-                            commands.len()
+                        .child(crate::i18n::tr!(
+                            "kv.batch_destructive_confirm",
+                            "This batch contains {destructive} destructive command(s). Run all {total} line(s)?",
+                            destructive = destructive,
+                            total = commands.len()
                         )),
                 )
                 .child(
@@ -1140,7 +1162,7 @@ impl AppState {
                 div()
                     .text_size(theme.scale(10.))
                     .text_color(dim)
-                    .child("Tab to complete"),
+                    .child(crate::i18n::tr!("kv.tab_to_complete", "Tab to complete")),
             )
         });
 

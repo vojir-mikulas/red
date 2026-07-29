@@ -158,6 +158,36 @@ pub(crate) enum PromptKind {
     CopyNewTable,
 }
 
+/// A palette row with a translated label, keyed on the row's own stable id.
+///
+/// Every command already carries an id the palette uses for identity (`cmd:run`),
+/// so the catalog key derives from it rather than being written out a second time
+/// beside the text: there is no pair to keep in sync, and renaming a command
+/// moves its id and its key together. `scripts/i18n-extract.py` reads these call
+/// sites the same way it reads the settings and keymap tables.
+///
+/// Rows whose label interpolates data (`connect: {name}`) are not built here yet;
+/// they need the placeholder story, which is a separate decision.
+fn item(id: &'static str, en_label: &'static str) -> PaletteItem {
+    PaletteItem::new(id, crate::i18n::tr_or(&item_key(id), en_label))
+}
+
+/// The catalog key for a palette row id: `cmd:kv-new-tab` becomes
+/// `palette.cmd_kv_new_tab`. Mirrored by `slug()` in the extractor; the drift test
+/// fails if the two ever disagree.
+fn item_key(id: &str) -> String {
+    let mut key = String::with_capacity(id.len() + 8);
+    key.push_str("palette.");
+    for ch in id.chars() {
+        if ch.is_ascii_alphanumeric() {
+            key.push(ch.to_ascii_lowercase());
+        } else if !key.ends_with('_') {
+            key.push('_');
+        }
+    }
+    key
+}
+
 impl AppState {
     /// ⌘K: open the command palette, or close it if it's already open. The
     /// palette focuses its own field on first paint, so no `Window` is needed.
@@ -443,80 +473,76 @@ impl AppState {
             Phase::Connected(active) if active.kv_view.is_some() => {
                 use crate::kvbrowse::KvPanel;
                 out.push((
-                    PaletteItem::new("cmd:kv-new-tab", "redis: new tab").hint("⌘T"),
+                    item("cmd:kv-new-tab", "redis: new tab").hint("⌘T"),
                     Cmd::KvNewTab,
                 ));
                 out.push((
-                    PaletteItem::new("cmd:kv-tree", "redis: toggle namespace tree"),
+                    item("cmd:kv-tree", "redis: toggle namespace tree"),
                     Cmd::KvToggleTree,
                 ));
                 out.push((
-                    PaletteItem::new("cmd:kv-bigkeys", "redis: find biggest keys"),
+                    item("cmd:kv-bigkeys", "redis: find biggest keys"),
                     Cmd::KvFindBigKeys,
                 ));
                 out.push((
-                    PaletteItem::new("cmd:kv-analyze", "redis: analyze keyspace"),
+                    item("cmd:kv-analyze", "redis: analyze keyspace"),
                     Cmd::KvOpenPanel(KvPanel::Analysis),
                 ));
                 out.push((
-                    PaletteItem::new("cmd:kv-console", "redis: open console"),
+                    item("cmd:kv-console", "redis: open console"),
                     Cmd::KvOpenPanel(KvPanel::Console),
                 ));
                 out.push((
-                    PaletteItem::new("cmd:kv-monitor", "redis: open monitor (slow log · clients)"),
+                    item("cmd:kv-monitor", "redis: open monitor (slow log · clients)"),
                     Cmd::KvOpenPanel(KvPanel::Monitor),
                 ));
                 out.push((
-                    PaletteItem::new("cmd:kv-keyspace", "redis: watch keyspace notifications"),
+                    item("cmd:kv-keyspace", "redis: watch keyspace notifications"),
                     Cmd::KvOpenPanel(KvPanel::Keyspace),
                 ));
                 out.push((
-                    PaletteItem::new("cmd:kv-pubsub", "redis: open pub/sub"),
+                    item("cmd:kv-pubsub", "redis: open pub/sub"),
                     Cmd::KvOpenPanel(KvPanel::PubSub),
                 ));
                 // Connection switching, settings, shortcuts, etc. come from the
                 // shared tail appended after this match.
             }
             Phase::Connected(active) => {
+                out.push((item("cmd:run", "query: run").hint("⌘↵"), Cmd::RunQuery));
                 out.push((
-                    PaletteItem::new("cmd:run", "query: run").hint("⌘↵"),
-                    Cmd::RunQuery,
-                ));
-                out.push((
-                    PaletteItem::new("cmd:new-tab", "query: new tab").hint("⌘T"),
+                    item("cmd:new-tab", "query: new tab").hint("⌘T"),
                     Cmd::NewTab,
                 ));
                 // Tab management: close needs an open tab; switching needs two.
                 if active.active().is_some() {
                     out.push((
-                        PaletteItem::new("cmd:close-tab", "query: close tab").hint("⌘W"),
+                        item("cmd:close-tab", "query: close tab").hint("⌘W"),
                         Cmd::CloseTab,
                     ));
                 }
                 if active.tabs.len() > 1 {
                     out.push((
-                        PaletteItem::new("cmd:next-tab", "query: next tab").hint("⌃Tab"),
+                        item("cmd:next-tab", "query: next tab").hint("⌃Tab"),
                         Cmd::NextTab,
                     ));
                     out.push((
-                        PaletteItem::new("cmd:prev-tab", "query: previous tab").hint("⌃⇧Tab"),
+                        item("cmd:prev-tab", "query: previous tab").hint("⌃⇧Tab"),
                         Cmd::PrevTab,
                     ));
                 }
                 // Side-by-side split: offer open/focus while split, else open.
                 if active.split.is_some() {
                     out.push((
-                        PaletteItem::new("cmd:unsplit", "view: unsplit").hint("⌘\\"),
+                        item("cmd:unsplit", "view: unsplit").hint("⌘\\"),
                         Cmd::Unsplit,
                     ));
                     out.push((
-                        PaletteItem::new("cmd:focus-other-half", "view: focus other split half")
-                            .hint("⌥⌘\\"),
+                        item("cmd:focus-other-half", "view: focus other split half").hint("⌥⌘\\"),
                         Cmd::FocusOtherHalf,
                     ));
                 } else if active.active().is_some() {
                     out.push((
-                        PaletteItem::new("cmd:split-right", "view: split right").hint("⌘\\"),
+                        item("cmd:split-right", "view: split right").hint("⌘\\"),
                         Cmd::SplitRight,
                     ));
                 }
@@ -524,7 +550,7 @@ impl AppState {
                 // has tables to move (the handler picks the target database).
                 if self.migrate_source().is_some() {
                     out.push((
-                        PaletteItem::new("cmd:migrate-schema", "schema: migrate to…"),
+                        item("cmd:migrate-schema", "schema: migrate to…"),
                         Cmd::MigrateSchema,
                     ));
                 }
@@ -532,22 +558,19 @@ impl AppState {
                 // two tables to compare (the handler picks left then right).
                 if self.compare_candidates().len() >= 2 {
                     out.push((
-                        PaletteItem::new("cmd:compare-table", "table: compare against…"),
+                        item("cmd:compare-table", "table: compare against…"),
                         Cmd::CompareTable,
                     ));
                 }
                 // Only meaningful with rows on screen to navigate / copy.
                 if active.active_result().is_some() {
+                    out.push((item("cmd:goto-row", "go to row…").hint("⌃G"), Cmd::GoToRow));
                     out.push((
-                        PaletteItem::new("cmd:goto-row", "go to row…").hint("⌃G"),
-                        Cmd::GoToRow,
-                    ));
-                    out.push((
-                        PaletteItem::new("cmd:copy", "result: copy selection").hint("⌘C"),
+                        item("cmd:copy", "result: copy selection").hint("⌘C"),
                         Cmd::CopySelection,
                     ));
                     out.push((
-                        PaletteItem::new("cmd:copy-to-table", "result: copy to table…"),
+                        item("cmd:copy-to-table", "result: copy to table…"),
                         Cmd::CopyToTable,
                     ));
                 }
@@ -561,38 +584,38 @@ impl AppState {
                         .is_some_and(|g| g.insertable_browse())
                 {
                     out.push((
-                        PaletteItem::new("cmd:add-row", "data: add row").hint("⌥⌘N"),
+                        item("cmd:add-row", "data: add row").hint("⌥⌘N"),
                         Cmd::AddRow,
                     ));
                 }
                 if self.has_pending_changes() {
                     out.push((
-                        PaletteItem::new("cmd:submit-changes", "data: submit changes").hint("⌘↵"),
+                        item("cmd:submit-changes", "data: submit changes").hint("⌘↵"),
                         Cmd::SubmitChanges,
                     ));
                     out.push((
-                        PaletteItem::new("cmd:revert-changes", "data: revert changes").hint("⌥⌘Z"),
+                        item("cmd:revert-changes", "data: revert changes").hint("⌥⌘Z"),
                         Cmd::RevertChanges,
                     ));
                 }
                 out.push((
-                    PaletteItem::new("cmd:history", "query: toggle history"),
+                    item("cmd:history", "query: toggle history"),
                     Cmd::ToggleHistory,
                 ));
                 out.push((
-                    PaletteItem::new("cmd:clear-history", "query: clear history"),
+                    item("cmd:clear-history", "query: clear history"),
                     Cmd::ClearHistory,
                 ));
                 // Saved queries (B3): save needs an open tab to save *from*; the
                 // picker is always offered (it reports "none yet" when empty).
                 if active.active().is_some() {
                     out.push((
-                        PaletteItem::new("cmd:save-query", "query: save…").hint("⇧⌘S"),
+                        item("cmd:save-query", "query: save…").hint("⇧⌘S"),
                         Cmd::SaveQuery,
                     ));
                 }
                 out.push((
-                    PaletteItem::new("cmd:open-saved", "query: open saved…").hint("⇧⌘O"),
+                    item("cmd:open-saved", "query: open saved…").hint("⇧⌘O"),
                     Cmd::OpenSavedQueries,
                 ));
                 // EXPLAIN (B4): explain needs a query to explain; analyze runs the
@@ -600,12 +623,12 @@ impl AppState {
                 // SQLite, which has no ANALYZE).
                 if active.active().is_some() {
                     out.push((
-                        PaletteItem::new("cmd:explain", "query: explain plan").hint("⇧⌘E"),
+                        item("cmd:explain", "query: explain plan").hint("⇧⌘E"),
                         Cmd::Explain,
                     ));
                     if active.config.kind != red_core::DbKind::Sqlite {
                         out.push((
-                            PaletteItem::new("cmd:explain-analyze", "query: explain analyze"),
+                            item("cmd:explain-analyze", "query: explain analyze"),
                             Cmd::ExplainAnalyze,
                         ));
                     }
@@ -621,69 +644,66 @@ impl AppState {
                         out.push((PaletteItem::new("cmd:watch", label), Cmd::ToggleWatch));
                     }
                     out.push((
-                        PaletteItem::new("cmd:format-sql", "editor: format SQL").hint("⌥⌘F"),
+                        item("cmd:format-sql", "editor: format SQL").hint("⌥⌘F"),
                         Cmd::FormatSql,
                     ));
                 }
                 // Pane focus.
                 out.push((
-                    PaletteItem::new("cmd:focus-schema", "focus: schema sidebar").hint("⌥⌘1"),
+                    item("cmd:focus-schema", "focus: schema sidebar").hint("⌥⌘1"),
                     Cmd::FocusSchema,
                 ));
                 out.push((
-                    PaletteItem::new("cmd:focus-editor", "focus: editor").hint("⌥⌘2"),
+                    item("cmd:focus-editor", "focus: editor").hint("⌥⌘2"),
                     Cmd::FocusEditor,
                 ));
                 out.push((
-                    PaletteItem::new("cmd:focus-grid", "focus: result grid").hint("⌥⌘3"),
+                    item("cmd:focus-grid", "focus: result grid").hint("⌥⌘3"),
                     Cmd::FocusGrid,
                 ));
                 out.push((
-                    PaletteItem::new("cmd:search-schema", "schema: search").hint("⌘F"),
+                    item("cmd:search-schema", "schema: search").hint("⌘F"),
                     Cmd::SearchSchema,
                 ));
                 out.push((
-                    PaletteItem::new("cmd:sidebar", "view: toggle sidebar").hint("⌘B"),
+                    item("cmd:sidebar", "view: toggle sidebar").hint("⌘B"),
                     Cmd::ToggleSidebar,
                 ));
                 out.push((
-                    PaletteItem::new("cmd:columns", "view: toggle columns panel").hint("⇧⌘C"),
+                    item("cmd:columns", "view: toggle columns panel").hint("⇧⌘C"),
                     Cmd::ToggleColumnsPanel,
                 ));
                 // Only where there is a server behind the connection: SQLite is a
                 // file, with no other sessions and no background work to watch.
                 out.push((
-                    PaletteItem::new("cmd:health", "connection: health report"),
+                    item("cmd:health", "connection: health report"),
                     Cmd::HealthReport,
                 ));
                 if active.schema.schemas.len() > 1 {
                     out.push((
-                        PaletteItem::new("cmd:compare-schema", "schema: compare against…"),
+                        item("cmd:compare-schema", "schema: compare against…"),
                         Cmd::CompareSchema,
                     ));
                 }
                 if self.has_server_panel() {
                     out.push((
-                        PaletteItem::new("cmd:server-panel", "view: toggle server panel"),
+                        item("cmd:server-panel", "view: toggle server panel"),
                         Cmd::ToggleServerPanel,
                     ));
                 }
                 out.push((
-                    PaletteItem::new("cmd:refresh", "schema: refresh").hint("⌘R"),
+                    item("cmd:refresh", "schema: refresh").hint("⌘R"),
                     Cmd::RefreshSchema,
                 ));
+                out.push((item("cmd:er-diagram", "schema: ER diagram"), Cmd::ErDiagram));
                 out.push((
-                    PaletteItem::new("cmd:er-diagram", "schema: ER diagram"),
-                    Cmd::ErDiagram,
-                ));
-                out.push((
-                    PaletteItem::new("cmd:disconnect", "connection: disconnect"),
+                    item("cmd:disconnect", "connection: disconnect"),
                     Cmd::Disconnect,
                 ));
                 // Assistant conversation history (M-S5), only with the panel open.
                 if self.assistant.is_some() {
                     out.push((
-                        PaletteItem::new("cmd:ai-new-chat", "agent: new chat"),
+                        item("cmd:ai-new-chat", "agent: new chat"),
                         Cmd::AssistantNewChat,
                     ));
                     // With more than one agent configured, offer a direct
@@ -703,11 +723,11 @@ impl AppState {
                         }
                     }
                     out.push((
-                        PaletteItem::new("cmd:ai-history", "agent: conversation history…"),
+                        item("cmd:ai-history", "agent: conversation history…"),
                         Cmd::AssistantHistory,
                     ));
                     out.push((
-                        PaletteItem::new("cmd:ai-storage", "agent: open conversation storage"),
+                        item("cmd:ai-storage", "agent: open conversation storage"),
                         Cmd::RevealConversationStorage,
                     ));
                 }
@@ -721,7 +741,7 @@ impl AppState {
                     ));
                 }
                 out.push((
-                    PaletteItem::new("cmd:new-conn", "connection: new").hint("⌘N"),
+                    item("cmd:new-conn", "connection: new").hint("⌘N"),
                     Cmd::NewConnection,
                 ));
                 out.push((
@@ -737,31 +757,31 @@ impl AppState {
         }
 
         out.push((
-            PaletteItem::new("cmd:switch-conn", "connection: switch…").hint("⌘P"),
+            item("cmd:switch-conn", "connection: switch…").hint("⌘P"),
             Cmd::SwitchConnection,
         ));
         out.push((
-            PaletteItem::new("cmd:shortcuts", "view: keyboard shortcuts").hint("⌘/"),
+            item("cmd:shortcuts", "view: keyboard shortcuts").hint("⌘/"),
             Cmd::ShowShortcuts,
         ));
         out.push((
-            PaletteItem::new("cmd:whats-new", "help: what's new"),
+            item("cmd:whats-new", "help: what's new"),
             Cmd::ShowChangelog,
         ));
         out.push((
-            PaletteItem::new("cmd:settings", "view: settings").hint("⌘,"),
+            item("cmd:settings", "view: settings").hint("⌘,"),
             Cmd::OpenSettings,
         ));
         out.push((
-            PaletteItem::new("cmd:settings-file", "settings: open file"),
+            item("cmd:settings-file", "settings: open file"),
             Cmd::OpenSettingsFile,
         ));
         out.push((
-            PaletteItem::new("cmd:settings-default", "settings: open default settings"),
+            item("cmd:settings-default", "settings: open default settings"),
             Cmd::OpenDefaultSettings,
         ));
         out.push((
-            PaletteItem::new("cmd:keymap-file", "keymap: customize keybindings"),
+            item("cmd:keymap-file", "keymap: customize keybindings"),
             Cmd::OpenKeymapFile,
         ));
         out.push((
@@ -776,7 +796,7 @@ impl AppState {
             Cmd::ToggleVimMode,
         ));
         out.push((
-            PaletteItem::new("cmd:remove-all-data", "danger: remove all RED data…"),
+            item("cmd:remove-all-data", "danger: remove all RED data…"),
             Cmd::RemoveAllData,
         ));
 
@@ -1179,8 +1199,16 @@ impl AppState {
             .enumerate()
             .map(|(i, ns)| {
                 let id = ElementId::from(SharedString::from(format!("migrate-target:{i}")));
-                let item = PaletteItem::new(id, format!("{} ({table_count} table(s))", ns.schema))
-                    .hint(ns.conn_name.clone());
+                let item = PaletteItem::new(
+                    id,
+                    crate::i18n::tr!(
+                        "palette.migrate_target",
+                        "{schema} ({table_count} table(s))",
+                        schema = ns.schema,
+                        table_count = table_count
+                    ),
+                )
+                .hint(ns.conn_name.clone());
                 (item, Cmd::MigrateTarget(i))
             })
             .collect();
@@ -1421,5 +1449,74 @@ fn compare_label(t: &(SessionId, Option<String>, String)) -> String {
     match &t.1 {
         Some(s) => format!("{s}.{}", t.2),
         None => t.2.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The English catalog has to reproduce every palette label exactly.
+    ///
+    /// `assets/i18n/palette/en.ftl` is generated from these call sites, so the
+    /// two drift the moment someone edits a label without re-running the
+    /// extractor. This also pins [`item_key`] against the extractor's `slug()`:
+    /// if the two ever derive a different key from the same id, the lookup misses
+    /// and the assertion below reports the key echoing itself.
+    ///
+    /// Reads the source rather than a table, because the rows are built inside a
+    /// long `match` on [`Phase`] and no single call enumerates them all.
+    #[test]
+    fn every_palette_label_is_in_the_english_catalog() {
+        crate::i18n::apply(crate::i18n::DEFAULT);
+
+        let src = include_str!("palette.rs");
+        let mut checked = 0;
+        let mut stale = Vec::new();
+
+        for (idx, _) in src.match_indices("item(\"") {
+            let rest = &src[idx + "item(\"".len()..];
+            let Some((id, rest)) = rest.split_once('"') else {
+                continue;
+            };
+            // Only the two-literal form; a row with an interpolated label is not
+            // built through `item` and has nothing to check here.
+            let Some(rest) = rest.trim_start().strip_prefix(",") else {
+                continue;
+            };
+            let Some(rest) = rest.trim_start().strip_prefix('"') else {
+                continue;
+            };
+            let Some((en_label, _)) = rest.split_once('"') else {
+                continue;
+            };
+
+            checked += 1;
+            let key = item_key(id);
+            let got = crate::i18n::lookup(&key);
+            if got.as_ref() != en_label {
+                stale.push(format!(
+                    "  {key}\n    catalog: {got}\n    code:    {en_label}"
+                ));
+            }
+        }
+
+        assert!(
+            checked > 40,
+            "only found {checked} palette rows; the `item(..)` shape changed and \
+             this test stopped covering anything"
+        );
+        assert!(
+            stale.is_empty(),
+            "assets/i18n/palette/en.ftl is out of date with palette.rs:\n{}\n\n\
+             Re-run: python3 scripts/i18n-extract.py",
+            stale.join("\n")
+        );
+    }
+
+    #[test]
+    fn item_key_slugs_the_command_id() {
+        assert_eq!(item_key("cmd:kv-new-tab"), "palette.cmd_kv_new_tab");
+        assert_eq!(item_key("cmd:run"), "palette.cmd_run");
     }
 }

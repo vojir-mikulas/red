@@ -363,11 +363,10 @@ impl AppState {
             .flex()
             .flex_col()
             .gap_3()
-            .child(
-                div()
-                    .text_color(theme.text_muted)
-                    .child("Choose which tools to import saved connections from."),
-            )
+            .child(div().text_color(theme.text_muted).child(crate::i18n::tr!(
+                "connect.import_intro",
+                "Choose which tools to import saved connections from."
+            )))
             .child(list_frame(theme).child(list));
 
         let footer = wizard_footer(theme).child(div()).child(
@@ -388,7 +387,10 @@ impl AppState {
         );
 
         Modal::new("import-wizard")
-            .title("Import connections")
+            .title(crate::i18n::tr!(
+                "connect.import_title",
+                "Import connections"
+            ))
             .width(px(520.))
             .focus_handle(self.modal_focus.clone())
             .footer(footer)
@@ -475,7 +477,10 @@ impl AppState {
                     div()
                         .text_size(theme.scale(11.5))
                         .text_color(theme.text_faint)
-                        .child("Already added"),
+                        .child(crate::i18n::tr!(
+                            "connect.import_already_added",
+                            "Already added"
+                        )),
                 );
             } else if let Some(warning) = &item.imported.warning {
                 info = info.child(
@@ -537,7 +542,11 @@ impl AppState {
                 import_checkbox("import-select-all-box", all_selected, theme)
                     .disabled(selectable == 0),
             )
-            .child(div().text_color(theme.text_muted).child("Select all"));
+            .child(
+                div()
+                    .text_color(theme.text_muted)
+                    .child(crate::i18n::tr!("connect.import_select_all", "Select all")),
+            );
         if selectable > 0 {
             select_all =
                 select_all
@@ -591,7 +600,10 @@ impl AppState {
             );
 
         Modal::new("import-wizard")
-            .title("Select connections")
+            .title(crate::i18n::tr!(
+                "connect.import_select_title",
+                "Select connections"
+            ))
             .width(px(560.))
             .focus_handle(self.modal_focus.clone())
             .footer(footer)

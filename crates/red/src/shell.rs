@@ -605,7 +605,7 @@ impl AppState {
                 theme.scale(13.),
                 theme.text_muted,
             ))
-            .child("Disconnect")
+            .child(crate::i18n::tr!("shell.disconnect", "Disconnect"))
             .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx)));
 
         // Settings gear lives in the top bar (mirrors the welcome screen's
@@ -616,7 +616,7 @@ impl AppState {
         )
         .size(IconButtonSize::Sm)
         .tooltip(crate::keymap::localize_hint("Settings  ⌘,"))
-        .a11y_label("Settings")
+        .a11y_label(crate::i18n::tr!("common.settings", "Settings"))
         .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx)));
 
         // The self-update pill ("Downloading…" / "Restart to update") sits to the
@@ -1201,7 +1201,10 @@ impl AppState {
                     .font_family(theme.font_family.clone())
                     .text_size(theme.scale(13.))
                     .text_color(theme.text_muted)
-                    .child("Choose what to open in this tab  ·  press 1–6 or ↵"),
+                    .child(crate::i18n::tr!(
+                        "shell.tab_chooser_hint",
+                        "Choose what to open in this tab  ·  press 1–6 or ↵"
+                    )),
             )
             .child(cards)
     }

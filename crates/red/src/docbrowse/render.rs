@@ -249,7 +249,7 @@ impl AppState {
                 .ml_2()
                 .text_color(theme.yellow)
                 .child(crate::icons::icon("lock", theme.scale(11.), theme.yellow))
-                .child("read-only")
+                .child(crate::i18n::tr!("doc.read_only", "read-only"))
         });
         let status_left = div()
             .flex()
@@ -993,7 +993,7 @@ impl AppState {
                     }),
             );
         Modal::new("doc-confirm")
-            .title("Confirm")
+            .title(crate::i18n::tr!("doc.confirm", "Confirm"))
             .width(px(420.))
             .focus_handle(self.modal_focus.clone())
             .footer(footer)
@@ -1263,7 +1263,7 @@ impl AppState {
                             .ok();
                     },
                 )
-                .child("Actions")
+                .child(crate::i18n::tr!("doc.actions", "Actions"))
                 .child(crate::icons::icon(
                     "chevron-down",
                     theme.scale(11.),
@@ -1432,7 +1432,10 @@ impl AppState {
                 div()
                     .flex_1()
                     .text_color(theme.text_muted)
-                    .child("Aggregation pipeline (extended JSON array of stages)"),
+                    .child(crate::i18n::tr!(
+                        "doc.aggregation_pipeline_extended_json_array_of_stag",
+                        "Aggregation pipeline (extended JSON array of stages)"
+                    )),
             )
             .child(
                 Button::new("doc-run-agg", "Run")
@@ -1976,7 +1979,10 @@ fn render_doc_empty(theme: &Theme) -> gpui::AnyElement {
             theme.scale(28.),
             theme.text_faint,
         ))
-        .child("Select a collection from the sidebar to open it here.")
+        .child(crate::i18n::tr!(
+            "doc.select_a_collection_from_the_sidebar_to_open_it_",
+            "Select a collection from the sidebar to open it here."
+        ))
         .into_any_element()
 }
 

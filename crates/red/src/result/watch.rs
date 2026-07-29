@@ -574,7 +574,10 @@ impl AppState {
                     .ml_1()
                     .text_size(theme.scale(10.5))
                     .text_color(theme.text_faint)
-                    .child("fully refreshed"),
+                    .child(crate::i18n::tr!(
+                        "result.watch_fully_refreshed",
+                        "fully refreshed"
+                    )),
             );
         } else if let Some(d) = delta {
             let (label, colour) = if d > 0 {

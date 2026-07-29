@@ -34,6 +34,13 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
+      # The locale catalogs are generated from the source strings, so "committed
+      # output matches the code" is the one check covering every domain. The
+      # per-table drift tests below cannot see call-site `tr!` strings, which no
+      # runtime test can enumerate.
+      - name: i18n catalogs
+        run: python3 scripts/i18n-extract.py --check
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

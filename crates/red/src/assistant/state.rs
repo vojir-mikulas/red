@@ -122,8 +122,11 @@ impl AppState {
                         // Prose composer: wrap long lines to the width instead of
                         // scrolling horizontally.
                         .soft_wrap(true)
-                        .a11y_label("Agent prompt")
-                        .placeholder("Message Claude Agent (/ for commands)")
+                        .a11y_label(crate::i18n::tr!("assistant.agent_prompt", "Agent prompt"))
+                        .placeholder(crate::i18n::tr!(
+                            "assistant.message_claude_agent_for_commands",
+                            "Message Claude Agent (/ for commands)"
+                        ))
                         // `/`-command picker: offer the agent's commands when the
                         // word under the cursor is a slash command (see
                         // `slash_candidates`); the popup shows each command's name
@@ -159,7 +162,10 @@ impl AppState {
                 TextInput::new(cx)
                     .bare()
                     .tab_stop(false)
-                    .with_placeholder("Search conversations…")
+                    .with_placeholder(crate::i18n::tr!(
+                        "assistant.search_conversations",
+                        "Search conversations…"
+                    ))
             });
             // A Change on the search box re-renders the filtered list.
             let search_sub = cx.subscribe(&list_search, |this, _, e: &TextInputEvent, cx| {
@@ -1670,9 +1676,12 @@ impl AppState {
                 let names: Vec<String> = (0..cols)
                     .filter_map(|c| grid.column_meta(c).map(|(name, _)| name))
                     .collect();
-                s.push_str(&format!(
-                    ", showing a result of {rows} row(s) × {cols} column(s): {}",
-                    names.join(", ")
+                s.push_str(&crate::i18n::tr!(
+                    "assistant.result_shape",
+                    ", showing a result of {rows} row(s) × {cols} column(s): {names}",
+                    rows = rows,
+                    cols = cols,
+                    names = names.join(", ")
                 ));
             }
             s

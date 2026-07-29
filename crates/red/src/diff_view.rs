@@ -80,7 +80,11 @@ impl AppState {
         if let Some(nid) = self.diff_notif
             && let Some(n) = self.notifications.iter_mut().find(|n| n.id == nid)
         {
-            n.message = format!("Comparing… {scanned} row(s) scanned").into();
+            n.message = crate::i18n::tr!(
+                "diff.comparing",
+                "Comparing… {scanned} row(s) scanned",
+                scanned = scanned
+            );
             cx.notify();
         }
     }
@@ -326,7 +330,7 @@ impl AppState {
                     .py_2()
                     .text_size(theme.scale(11.))
                     .text_color(theme.yellow)
-                    .child("The diff exceeded the stored-row cap; totals are exact but some differing rows aren't listed.")
+                    .child(crate::i18n::tr!("diff.row_cap_note", "The diff exceeded the stored-row cap; totals are exact but some differing rows aren't listed."))
                     .into_any_element(),
             );
         }
@@ -336,7 +340,10 @@ impl AppState {
                     .px_3()
                     .py_4()
                     .text_color(theme.text_muted)
-                    .child("No differing rows for this filter.")
+                    .child(crate::i18n::tr!(
+                        "diff.no_rows",
+                        "No differing rows for this filter."
+                    ))
                     .into_any_element(),
             );
         }

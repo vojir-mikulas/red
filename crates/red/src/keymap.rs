@@ -28,7 +28,9 @@
 use std::collections::BTreeMap;
 
 use flint::{CodeEditor, ComboBox, Modal, Palette, SelectableLabel, Switcher, TextInput};
-use gpui::{App, KeyBinding, KeyBindingContextPredicate, Keystroke, NoAction, actions};
+use gpui::{
+    App, KeyBinding, KeyBindingContextPredicate, Keystroke, NoAction, SharedString, actions,
+};
 
 use crate::Quit;
 use crate::keymap_config::KeymapBlock;
@@ -147,113 +149,225 @@ pub(crate) struct SwitchToConnectionSlot(pub usize);
 /// The keyboard reference, grouped, for the shortcuts overlay (`⌘/`) and the
 /// docs. Kept beside the bindings above so the two don't drift; the overlay is
 /// built from this rather than hand-maintained in the view.
-pub(crate) fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
-    vec![
-        (
-            "Global",
-            vec![
-                ("⌘K", "Command palette"),
-                ("⌘P", "Switch connection"),
-                ("⌘⇧P", "Switch to previous connection"),
-                ("⌘1–9", "Jump to connection by position"),
-                ("⌘/", "Keyboard shortcuts"),
-                ("⌘,", "Settings"),
-                ("⌘N", "New connection (welcome screen)"),
-                ("⌘Q", "Quit"),
-            ],
-        ),
-        (
-            "Panes",
-            vec![
-                ("⌥⌘1 / ⌥⌘2 / ⌥⌘3", "Focus schema / editor / grid"),
-                ("F6 / ⇧F6", "Cycle focus forward / back"),
-                ("⌘B", "Toggle schema sidebar"),
-                ("⌘\\", "Split view (two tabs side by side)"),
-                ("⌥⌘\\", "Focus other split half"),
-            ],
-        ),
-        (
-            "Query tabs",
-            vec![
-                ("⌘T", "New tab"),
-                ("⌘W", "Close tab"),
-                ("⌃Tab / ⌃⇧Tab", "Next / previous tab"),
-                ("⌘↵", "Run query"),
-                ("⌥⌘F", "Format SQL"),
-                ("⌘F", "Find in query…"),
-                ("⇧⌘E", "Explain query (plan)"),
-                ("⇧⌘S", "Save query"),
-                ("⇧⌘O", "Open saved query…"),
-                ("Esc", "Leave the editor for the result grid"),
-            ],
-        ),
-        (
-            "Result grid",
-            vec![
-                ("↑ ↓ ← →", "Move cell cursor"),
-                ("⇧ + arrows", "Extend selection"),
-                ("⌘← / ⌘→", "Row start / end"),
-                ("⌘↑ / ⌘↓", "First / last row"),
-                ("PgUp / PgDn", "Page up / down"),
-                ("⌘A", "Select all"),
-                ("⌃G", "Go to row…"),
-                ("⌘C", "Copy selection"),
-                ("⌘I", "Inspect cell"),
-                ("⌘F", "Find in loaded rows…"),
-                ("⌘⇧F", "Filter rows…"),
-            ],
-        ),
-        (
-            "Editing data",
-            vec![
-                ("↵ / F2", "Edit the focused cell"),
-                ("⌘↵", "Submit staged changes"),
-                ("⌥⌘Z", "Revert staged changes"),
-                ("⌘⌫", "Mark row(s) for deletion"),
-                ("⌥⌘N", "Add a new row"),
-                ("⌥⌘0", "Set cell to NULL"),
-            ],
-        ),
-        (
-            "Schema tree",
-            vec![
-                ("↑ / ↓", "Move selection"),
-                ("← / →", "Collapse / expand"),
-                ("↵", "Open table preview"),
-                ("⌘F", "Search schema (focus filter)"),
-                ("⌘R", "Refresh schema"),
-            ],
-        ),
-        (
-            "MongoDB browser",
-            vec![
-                ("↑ / ↓", "Move selection (collection tree, document grid)"),
-                ("← / →", "Collapse / expand a database"),
-                ("↵ / F2", "Open the highlighted collection / document"),
-                ("⌥⌘1 / ⌥⌘3", "Focus collection tree / document grid"),
-                ("⌘F", "Search collections (tree) / filter documents (grid)"),
-            ],
-        ),
-        (
-            "Dialogs",
-            vec![
-                ("↵", "Confirm / connect"),
-                ("Esc", "Cancel / close"),
-                ("Tab / ⇧Tab", "Cycle controls (trapped)"),
-            ],
-        ),
-        (
-            "Welcome screen",
-            vec![
-                ("↑ / ↓", "Move between saved connections"),
-                ("↵", "Connect to the highlighted one"),
-                ("E", "Edit the highlighted connection"),
-                ("⌫", "Remove the highlighted connection"),
-                ("⌘N", "New connection"),
-            ],
-        ),
-    ]
+///
+/// Each row carries a stable id alongside its English text, and the catalog key
+/// is built from it (`shortcuts.<group>.<row>`). Deriving the key from the
+/// description instead would orphan every translation the moment someone reworded
+/// a line, which is exactly the copy edit a reference table invites.
+pub(crate) fn shortcuts() -> Vec<(SharedString, Vec<(&'static str, SharedString)>)> {
+    SHORTCUTS
+        .iter()
+        .map(|(gid, gen_label, rows)| {
+            let title = crate::i18n::tr_or(&format!("shortcuts.{gid}.title"), gen_label);
+            let rows = rows
+                .iter()
+                .map(|(rid, keys, desc)| {
+                    (
+                        *keys,
+                        crate::i18n::tr_or(&format!("shortcuts.{gid}.{rid}"), desc),
+                    )
+                })
+                .collect();
+            (title, rows)
+        })
+        .collect()
 }
+
+/// The English source for [`shortcuts`]: `(group id, group name, rows)`, each row
+/// `(row id, keystroke, description)`. Keystrokes are symbols and never
+/// translated; `localize_hint` already rewrites the modifier per platform.
+type ShortcutGroup = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str, &'static str)],
+);
+
+static SHORTCUTS: &[ShortcutGroup] = &[
+    (
+        "global",
+        "Global",
+        &[
+            ("command_palette", "⌘K", "Command palette"),
+            ("switch_connection", "⌘P", "Switch connection"),
+            (
+                "switch_to_previous_connection",
+                "⌘⇧P",
+                "Switch to previous connection",
+            ),
+            (
+                "jump_to_connection_by_position",
+                "⌘1–9",
+                "Jump to connection by position",
+            ),
+            ("keyboard_shortcuts", "⌘/", "Keyboard shortcuts"),
+            ("settings", "⌘,", "Settings"),
+            (
+                "new_connection_welcome_screen",
+                "⌘N",
+                "New connection (welcome screen)",
+            ),
+            ("quit", "⌘Q", "Quit"),
+        ],
+    ),
+    (
+        "panes",
+        "Panes",
+        &[
+            (
+                "focus_schema_editor_grid",
+                "⌥⌘1 / ⌥⌘2 / ⌥⌘3",
+                "Focus schema / editor / grid",
+            ),
+            (
+                "cycle_focus_forward_back",
+                "F6 / ⇧F6",
+                "Cycle focus forward / back",
+            ),
+            ("toggle_schema_sidebar", "⌘B", "Toggle schema sidebar"),
+            (
+                "split_view_two_tabs_side_by_side",
+                "⌘\\",
+                "Split view (two tabs side by side)",
+            ),
+            ("focus_other_split_half", "⌥⌘\\", "Focus other split half"),
+        ],
+    ),
+    (
+        "query_tabs",
+        "Query tabs",
+        &[
+            ("new_tab", "⌘T", "New tab"),
+            ("close_tab", "⌘W", "Close tab"),
+            ("next_previous_tab", "⌃Tab / ⌃⇧Tab", "Next / previous tab"),
+            ("run_query", "⌘↵", "Run query"),
+            ("format_sql", "⌥⌘F", "Format SQL"),
+            ("find_in_query", "⌘F", "Find in query…"),
+            ("explain_query_plan", "⇧⌘E", "Explain query (plan)"),
+            ("save_query", "⇧⌘S", "Save query"),
+            ("open_saved_query", "⇧⌘O", "Open saved query…"),
+            (
+                "leave_the_editor_for_the_result_grid",
+                "Esc",
+                "Leave the editor for the result grid",
+            ),
+        ],
+    ),
+    (
+        "result_grid",
+        "Result grid",
+        &[
+            ("move_cell_cursor", "↑ ↓ ← →", "Move cell cursor"),
+            ("extend_selection", "⇧ + arrows", "Extend selection"),
+            ("row_start_end", "⌘← / ⌘→", "Row start / end"),
+            ("first_last_row", "⌘↑ / ⌘↓", "First / last row"),
+            ("page_up_down", "PgUp / PgDn", "Page up / down"),
+            ("select_all", "⌘A", "Select all"),
+            ("go_to_row", "⌃G", "Go to row…"),
+            ("copy_selection", "⌘C", "Copy selection"),
+            ("inspect_cell", "⌘I", "Inspect cell"),
+            ("find_in_loaded_rows", "⌘F", "Find in loaded rows…"),
+            ("filter_rows", "⌘⇧F", "Filter rows…"),
+        ],
+    ),
+    (
+        "editing_data",
+        "Editing data",
+        &[
+            ("edit_the_focused_cell", "↵ / F2", "Edit the focused cell"),
+            ("submit_staged_changes", "⌘↵", "Submit staged changes"),
+            ("revert_staged_changes", "⌥⌘Z", "Revert staged changes"),
+            ("mark_row_s_for_deletion", "⌘⌫", "Mark row(s) for deletion"),
+            ("add_a_new_row", "⌥⌘N", "Add a new row"),
+            ("set_cell_to_null", "⌥⌘0", "Set cell to NULL"),
+        ],
+    ),
+    (
+        "schema_tree",
+        "Schema tree",
+        &[
+            ("move_selection", "↑ / ↓", "Move selection"),
+            ("collapse_expand", "← / →", "Collapse / expand"),
+            ("open_table_preview", "↵", "Open table preview"),
+            (
+                "search_schema_focus_filter",
+                "⌘F",
+                "Search schema (focus filter)",
+            ),
+            ("refresh_schema", "⌘R", "Refresh schema"),
+        ],
+    ),
+    (
+        "mongodb_browser",
+        "MongoDB browser",
+        &[
+            (
+                "move_selection_collection_tree_document_grid",
+                "↑ / ↓",
+                "Move selection (collection tree, document grid)",
+            ),
+            (
+                "collapse_expand_a_database",
+                "← / →",
+                "Collapse / expand a database",
+            ),
+            (
+                "open_the_highlighted_collection_document",
+                "↵ / F2",
+                "Open the highlighted collection / document",
+            ),
+            (
+                "focus_collection_tree_document_grid",
+                "⌥⌘1 / ⌥⌘3",
+                "Focus collection tree / document grid",
+            ),
+            (
+                "search_collections_tree_filter_documents_grid",
+                "⌘F",
+                "Search collections (tree) / filter documents (grid)",
+            ),
+        ],
+    ),
+    (
+        "dialogs",
+        "Dialogs",
+        &[
+            ("confirm_connect", "↵", "Confirm / connect"),
+            ("cancel_close", "Esc", "Cancel / close"),
+            (
+                "cycle_controls_trapped",
+                "Tab / ⇧Tab",
+                "Cycle controls (trapped)",
+            ),
+        ],
+    ),
+    (
+        "welcome_screen",
+        "Welcome screen",
+        &[
+            (
+                "move_between_saved_connections",
+                "↑ / ↓",
+                "Move between saved connections",
+            ),
+            (
+                "connect_to_the_highlighted_one",
+                "↵",
+                "Connect to the highlighted one",
+            ),
+            (
+                "edit_the_highlighted_connection",
+                "E",
+                "Edit the highlighted connection",
+            ),
+            (
+                "remove_the_highlighted_connection",
+                "⌫",
+                "Remove the highlighted connection",
+            ),
+            ("new_connection", "⌘N", "New connection"),
+        ],
+    ),
+];
 
 /// Rewrite RED's canonical `cmd-*` chords onto the key GPUI actually matches per
 /// platform. `cmd` is the primary modifier (the Cmd key) only on macOS; on
@@ -346,12 +460,25 @@ fn localize_token(token: &str) -> String {
 pub(crate) struct ActionDef {
     /// The default keystroke, in `keymap.toml`'s canonical form (`cmd-shift-f`).
     pub keystroke: &'static str,
-    /// The action name: the allowlist key and what `keymap.toml` writes.
+    /// The action name: the allowlist key and what `keymap.toml` writes. Also the
+    /// catalog namespace this row's label is translated under, for the same
+    /// reason the settings registry keys on its `settings.toml` path: the name a
+    /// row already answers to in its config file is the one identity that will
+    /// not move when someone rewords the label.
     pub action: &'static str,
-    /// The human label the editor shows for this row.
-    pub label: &'static str,
+    /// The English source text. Named for the language it is in because rendering
+    /// it directly would pin the UI to English; [`label`](ActionDef::label) is
+    /// what the editor draws.
+    pub en_label: &'static str,
     /// The key-context, or `None` for a true global.
     pub context: Option<&'static str>,
+}
+
+impl ActionDef {
+    /// This action's title in the active locale.
+    pub(crate) fn label(&self) -> gpui::SharedString {
+        crate::i18n::tr_or(&format!("keymap.{}.label", self.action), self.en_label)
+    }
 }
 
 /// The full bindable-action registry: RED's built-in keybindings and the source
@@ -554,13 +681,13 @@ const DEFAULTS: &[ActionDef] = &[
 const fn def(
     keystroke: &'static str,
     action: &'static str,
-    label: &'static str,
+    en_label: &'static str,
     context: Option<&'static str>,
 ) -> ActionDef {
     ActionDef {
         keystroke,
         action,
-        label,
+        en_label,
         context,
     }
 }
@@ -888,6 +1015,91 @@ fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<Ke
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The English catalog has to reproduce this table's source text exactly.
+    ///
+    /// `assets/i18n/keymap/en.ftl` is generated from `DEFAULTS`, so the two drift
+    /// the moment someone edits a label without re-running the extractor. Looks
+    /// the key up raw rather than through [`ActionDef::label`], which falls back
+    /// to the English source and would hide exactly that.
+    #[test]
+    fn every_action_label_is_in_the_english_catalog() {
+        crate::i18n::apply(crate::i18n::DEFAULT);
+
+        let stale: Vec<_> = DEFAULTS
+            .iter()
+            .filter_map(|d| {
+                let key = format!("keymap.{}.label", d.action);
+                let got = crate::i18n::lookup(&key);
+                (got.as_ref() != d.en_label)
+                    .then(|| format!("  {key}\n    catalog: {got}\n    code:    {}", d.en_label))
+            })
+            .collect();
+
+        assert!(
+            stale.is_empty(),
+            "assets/i18n/keymap/en.ftl is out of date with keymap.rs:\n{}\n\n\
+             Re-run: python3 scripts/i18n-extract.py",
+            stale.join("\n")
+        );
+    }
+
+    /// The English catalog has to reproduce the keyboard reference exactly.
+    ///
+    /// Counts the rows as well as checking them: the extractor reads this table
+    /// with a regex, and rustfmt is free to wrap a long row across lines. A
+    /// pattern that stops matching the wrapped ones under-extracts silently,
+    /// which is how nine rows went missing the first time.
+    #[test]
+    fn every_shortcut_is_in_the_english_catalog() {
+        crate::i18n::apply(crate::i18n::DEFAULT);
+
+        let mut checked = 0;
+        let mut stale = Vec::new();
+        let mut check = |key: String, want: &str| {
+            let got = crate::i18n::lookup(&key);
+            if got.as_ref() != want {
+                stale.push(format!("  {key}\n    catalog: {got}\n    code:    {want}"));
+            }
+        };
+
+        for (gid, gname, rows) in SHORTCUTS {
+            checked += 1;
+            check(format!("shortcuts.{gid}.title"), gname);
+            for (rid, _keys, desc) in *rows {
+                checked += 1;
+                check(format!("shortcuts.{gid}.{rid}"), desc);
+            }
+        }
+
+        assert!(
+            stale.is_empty(),
+            "assets/i18n/shortcuts/en.ftl is out of date with keymap.rs:\n{}\n\n\
+             Re-run: python3 scripts/i18n-extract.py",
+            stale.join("\n")
+        );
+        assert_eq!(
+            checked,
+            SHORTCUTS.len() + SHORTCUTS.iter().map(|(_, _, r)| r.len()).sum::<usize>(),
+            "the walk above missed rows"
+        );
+    }
+
+    /// An action bound to two default keystrokes appears twice, and both rows must
+    /// carry the same label: they collapse to one catalog key, so a mismatch would
+    /// silently relabel one of them.
+    #[test]
+    fn an_action_has_one_label() {
+        let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+        for d in DEFAULTS {
+            let first = seen.entry(d.action).or_insert(d.en_label);
+            assert_eq!(
+                *first, d.en_label,
+                "{} is labelled two ways: {:?} and {:?}",
+                d.action, first, d.en_label
+            );
+        }
+    }
 
     /// Every default the table holds resolves to a binding (catches a typo'd name
     /// or an invalid keystroke/context in `DEFAULTS` at test time, not on launch).

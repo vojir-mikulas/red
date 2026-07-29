@@ -29,6 +29,7 @@ mod health;
 mod health_store;
 mod history;
 mod history_panel;
+mod i18n;
 mod icons;
 mod import;
 mod inspector;

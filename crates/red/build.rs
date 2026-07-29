@@ -26,6 +26,12 @@ fn main() {
     // Re-run when HEAD moves so the SHA tracks the working commit. Best-effort;
     // a missing path (e.g. a git worktree or tarball) just means "always re-run".
     println!("cargo:rerun-if-changed=../../.git/HEAD");
+
+    // `RustEmbed` bakes the locale catalogs in at compile time, but Cargo does not
+    // know those files are build inputs. Without this, editing a `.ftl` leaves the
+    // previous strings embedded, which is impossible to tell apart from a broken
+    // catalog.
+    println!("cargo:rerun-if-changed=../../assets/i18n");
 }
 
 /// Today's UTC date as `YYYY-MM-DD`. Converts the Unix day count to a civil date

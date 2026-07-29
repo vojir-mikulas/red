@@ -228,7 +228,10 @@ impl AppState {
                 // out of view and raise a scrollbar over a one-line buffer.
                 .vertical_padding(px(0.))
                 .corner_radius(px(0.))
-                .a11y_label("Filter expression")
+                .a11y_label(crate::i18n::tr!(
+                    "filter.filter_expression",
+                    "Filter expression"
+                ))
                 .placeholder(FilterMode::Where.placeholder())
         });
         // `Column` mode's literal box. Plain text; the chosen column's declared
@@ -865,7 +868,10 @@ impl AppState {
                             crate::icons::icon("close", theme.scale(11.), dim),
                         )
                         .size(IconButtonSize::Sm)
-                        .tooltip("Forget this filter")
+                        .tooltip(crate::i18n::tr!(
+                            "filter.forget_this_filter",
+                            "Forget this filter"
+                        ))
                         .on_click(
                             cx.listener(move |this, _, _, cx| this.forget_recent_filter(ix, cx)),
                         ),
@@ -1066,8 +1072,14 @@ impl AppState {
                             crate::icons::icon("plus", theme.scale(13.), muted),
                         )
                         .size(IconButtonSize::Sm)
-                        .tooltip("Add this term to the filter (AND)")
-                        .a11y_label("Add filter term")
+                        .tooltip(crate::i18n::tr!(
+                            "filter.add_this_term_to_the_filter_and",
+                            "Add this term to the filter (AND)"
+                        ))
+                        .a11y_label(crate::i18n::tr!(
+                            "filter.add_filter_term",
+                            "Add filter term"
+                        ))
                         .on_click(cx.listener(|this, _, _, cx| this.add_filter_term(cx))),
                     );
                 (el.into_any_element(), bg_input)
@@ -1086,8 +1098,11 @@ impl AppState {
                         crate::icons::icon("history", theme.scale(13.), muted),
                     )
                     .size(IconButtonSize::Sm)
-                    .tooltip("Recent filters for this table (↑/↓ in the box)")
-                    .a11y_label("Recent filters")
+                    .tooltip(crate::i18n::tr!(
+                        "filter.recent_filters_for_this_table_in_the_box",
+                        "Recent filters for this table (↑/↓ in the box)"
+                    ))
+                    .a11y_label(crate::i18n::tr!("filter.recent_filters", "Recent filters"))
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_filter_history(cx))),
                 )
                 // Invisible overlay recording the button's window rect, so the
@@ -1135,7 +1150,11 @@ impl AppState {
             .py(px(4.))
             .font_family(ui_family)
             .text_size(size)
-            .child(div().text_color(muted).child("Filter"))
+            .child(
+                div()
+                    .text_color(muted)
+                    .child(crate::i18n::tr!("filter.filter", "Filter")),
+            )
             .child(field)
             .child(
                 Button::new("filter-apply", "Apply")
@@ -1181,7 +1200,10 @@ impl AppState {
                                 crate::icons::icon("close", theme.scale(11.), muted),
                             )
                             .size(IconButtonSize::Sm)
-                            .tooltip("Remove this term")
+                            .tooltip(crate::i18n::tr!(
+                                "filter.remove_this_term",
+                                "Remove this term"
+                            ))
                             .on_click(
                                 cx.listener(move |this, _, _, cx| this.remove_filter_term(ix, cx)),
                             ),
@@ -1212,7 +1234,10 @@ impl AppState {
                     Button::new("filter-revert", "Revert filter")
                         .variant(ButtonVariant::Ghost)
                         .size(ButtonSize::Sm)
-                        .tooltip("Re-apply the last filter that returned rows")
+                        .tooltip(crate::i18n::tr!(
+                            "filter.re_apply_the_last_filter_that_returned_rows",
+                            "Re-apply the last filter that returned rows"
+                        ))
                         .on_click(cx.listener(|this, _, _, cx| this.revert_filter(cx))),
                 )
         });

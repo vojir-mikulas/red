@@ -178,7 +178,7 @@ impl AppState {
                     div()
                         .text_size(theme.scale(10.5))
                         .text_color(theme.text_faint)
-                        .child("refreshing…"),
+                        .child(crate::i18n::tr!("health.refreshing", "refreshing…")),
                 )
             })
             .child(
@@ -201,7 +201,7 @@ impl AppState {
                 .p_3()
                 .text_size(theme.scale(11.5))
                 .text_color(theme.text_faint)
-                .child("building the report…")
+                .child(crate::i18n::tr!("health.building", "building the report…"))
                 .into_any_element(),
             (_, Some(r)) => self.render_health_body(r, view, cx),
         };
@@ -251,7 +251,7 @@ impl AppState {
                 .py_2()
                 .text_size(size_11)
                 .text_color(theme.green)
-                .child("No findings.")
+                .child(crate::i18n::tr!("health.no_findings", "No findings."))
                 .into_any_element()
         } else {
             div()

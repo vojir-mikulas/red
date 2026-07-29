@@ -2241,14 +2241,23 @@ impl AppState {
         }
         self.refocus_root = true;
         let (variant, msg) = if failed == 0 {
-            (ToastVariant::Success, format!("Imported {ok} command(s)"))
+            (
+                ToastVariant::Success,
+                crate::i18n::tr!("kv.imported_commands", "Imported {ok} command(s)", ok = ok),
+            )
         } else {
             let detail = first_error
                 .map(|e| format!(" (first error — {e})"))
                 .unwrap_or_default();
             (
                 ToastVariant::Warning,
-                format!("Imported {ok}, {failed} failed{detail}"),
+                crate::i18n::tr!(
+                    "kv.imported_with_failures",
+                    "Imported {ok}, {failed} failed{detail}",
+                    ok = ok,
+                    failed = failed,
+                    detail = detail,
+                ),
             )
         };
         self.notify(variant, msg, cx);

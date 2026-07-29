@@ -2276,7 +2276,12 @@ impl AppState {
             Notification {
                 id: 0,
                 variant: ToastVariant::Success,
-                message: format!("Exported {rows} row(s) to {path}").into(),
+                message: crate::i18n::tr!(
+                    "notify.exported_rows",
+                    "Exported {rows} row(s) to {path}",
+                    rows = rows,
+                    path = path,
+                ),
                 detail: None,
                 detail_label: None,
                 auto_dismiss: Some(TOAST_AUTO_DISMISS),
@@ -2311,7 +2316,11 @@ impl AppState {
             if let Some(t) = &mut n.export {
                 t.rows = rows;
             }
-            n.message = format!("Importing… {rows} row(s)").into();
+            n.message = crate::i18n::tr!(
+                "notify.importing_rows",
+                "Importing… {rows} row(s)",
+                rows = rows
+            );
         }
         cx.notify();
     }
@@ -2321,7 +2330,15 @@ impl AppState {
         if let Some(nid) = self.export_notification_id(id) {
             self.dismiss(nid, cx);
         }
-        self.notify(ToastVariant::Success, format!("Imported {rows} row(s)"), cx);
+        self.notify(
+            ToastVariant::Success,
+            crate::i18n::tr!(
+                "notify.imported_rows",
+                "Imported {rows} row(s)",
+                rows = rows
+            ),
+            cx,
+        );
     }
 
     /// `ImportFailed`: drop the progress toast, surface the error. Inserts commit per
@@ -2337,9 +2354,18 @@ impl AppState {
             self.dismiss(nid, cx);
         }
         let msg = if rows > 0 {
-            format!("Import failed after {rows} row(s): {message}")
+            crate::i18n::tr!(
+                "notify.import_failed",
+                "Import failed after {rows} row(s): {message}",
+                rows = rows,
+                message = message,
+            )
         } else {
-            format!("Import failed: {message}")
+            crate::i18n::tr!(
+                "notify.import_failed_bare",
+                "Import failed: {message}",
+                message = message
+            )
         };
         self.notify(ToastVariant::Error, msg, cx);
     }
@@ -2350,9 +2376,13 @@ impl AppState {
             self.dismiss(nid, cx);
         }
         let msg = if rows > 0 {
-            format!("Import cancelled ({rows} row(s) kept)")
+            crate::i18n::tr!(
+                "notify.import_cancelled",
+                "Import cancelled ({rows} row(s) kept)",
+                rows = rows,
+            )
         } else {
-            "Import cancelled".to_string()
+            crate::i18n::tr!("notify.import_cancelled_bare", "Import cancelled")
         };
         self.notify(ToastVariant::Info, msg, cx);
     }

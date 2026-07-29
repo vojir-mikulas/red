@@ -49,6 +49,8 @@ toml.workspace = true
 dirs.workspace = true
 sqlformat.workspace = true
 notify.workspace = true
+fluent-bundle.workspace = true
+unic-langid.workspace = true
 # Headless CLI mode (src/cli/): argv parsing for `red query|exec|test|connections`.
 clap.workspace = true
 

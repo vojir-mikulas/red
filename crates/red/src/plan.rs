@@ -238,7 +238,7 @@ impl AppState {
                 .justify_center()
                 .text_size(s12)
                 .text_color(faint)
-                .child("Explaining…")
+                .child(crate::i18n::tr!("plan.explaining", "Explaining…"))
                 .into_any_element(),
             PlanState::Failed(message) => div()
                 .id("plan-error")
@@ -250,7 +250,12 @@ impl AppState {
                 .flex_col()
                 .gap_2()
                 .font_family(mono_family.clone())
-                .child(div().text_size(s11).text_color(red).child("EXPLAIN failed"))
+                .child(
+                    div()
+                        .text_size(s11)
+                        .text_color(red)
+                        .child(crate::i18n::tr!("plan.explain_failed", "EXPLAIN failed")),
+                )
                 .child(div().text_size(s12).text_color(text).child(message.clone()))
                 .into_any_element(),
             PlanState::Ready(plan) if plan.nodes.is_empty() => div()

@@ -101,6 +101,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   instead of reaching a server that has never heard of it. The caret's statement,
   the gutter run markers, and the confirmation all treat the whole body as one
   statement.
+- Groundwork for translating RED's interface, with a Language setting under
+  Appearance that follows the operating system by default. English is still the
+  only language available, so nothing changes on screen yet; a language that is
+  only partly translated will fall back to English string by string rather than
+  leaving gaps.
 
 ### Changed
 - The app is now called RED, in capitals, everywhere it names itself: the
