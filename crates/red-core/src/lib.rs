@@ -2194,6 +2194,29 @@ impl ObjectKind {
         !self.is_relation()
     }
 
+    /// Whether an object of this kind is replaced *wholesale* — dropped and
+    /// created again from one full `CREATE` statement — rather than altered in
+    /// place.
+    ///
+    /// This is the predicate that makes an editable definition tractable: the
+    /// edited text *is* the whole object, so applying it needs no comparison of
+    /// before against after, and therefore no SQL parser (`crate::sql` is a lexer
+    /// by design). A table is the counterexample and is deliberately excluded:
+    /// changing one means `ALTER`, which means diffing two shapes — a structured
+    /// editor over the catalog, planned separately in
+    /// `docs/plans/todo/table-editing.md`.
+    ///
+    /// Three kinds are droppable but still excluded, because the drop is not
+    /// harmless: a materialized view has stored rows to lose, a sequence has
+    /// column defaults drawing from its counter, and a type cannot be dropped
+    /// while a column still uses it.
+    pub const fn is_replaceable(self) -> bool {
+        matches!(
+            self,
+            Self::View | Self::Function | Self::Procedure | Self::Trigger
+        )
+    }
+
     /// The plural group label the schema tree draws this kind's node with.
     pub const fn group_label(self) -> &'static str {
         match self {

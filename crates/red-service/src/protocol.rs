@@ -1177,6 +1177,12 @@ pub enum Event {
         name: String,
         kind: ObjectKind,
         ddl: String,
+        /// The statement that clears the way for re-creating this object, when it
+        /// is one that is replaced wholesale — see
+        /// [`DatabaseDriver::drop_object_sql`](red_driver::DatabaseDriver::drop_object_sql).
+        /// Pre-fills the editable definition; the UI runs what the user sees, never
+        /// this on its own.
+        drop_statement: Option<String>,
     },
     /// The DDL fetch failed (no privilege, object dropped between click and
     /// fetch, engine has no definition for that kind). Rendered in the tab rather

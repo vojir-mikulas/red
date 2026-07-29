@@ -1383,6 +1383,32 @@ impl DatabaseDriver for PostgresDriver {
         }
     }
 
+    /// A routine gets `None`: `pg_get_functiondef` already returns `CREATE OR
+    /// REPLACE FUNCTION`, so a drop is not only unnecessary but harmful — bare
+    /// `DROP FUNCTION f` is ambiguous the moment `f` is overloaded.
+    ///
+    /// A trigger is the one kind that needs its table in the statement, which is
+    /// exactly the half the tree's `<name> on <table>` label carries.
+    fn drop_object_sql(&self, namespace: &str, name: &str, kind: ObjectKind) -> Option<String> {
+        match kind {
+            ObjectKind::View => Some(format!(
+                "DROP VIEW IF EXISTS {}.{}",
+                self.quote_ident(namespace),
+                self.quote_ident(name)
+            )),
+            ObjectKind::Trigger => {
+                let (trigger, table) = name.split_once(" on ")?;
+                Some(format!(
+                    "DROP TRIGGER IF EXISTS {} ON {}.{}",
+                    self.quote_ident(trigger.trim()),
+                    self.quote_ident(namespace),
+                    self.quote_ident(table.trim())
+                ))
+            }
+            _ => None,
+        }
+    }
+
     async fn object_ddl(&self, namespace: &str, name: &str, kind: ObjectKind) -> Result<String> {
         // Postgres has no `SHOW CREATE`. Views and routines have a catalog
         // function that returns their source exactly; a *table* does not, so it is

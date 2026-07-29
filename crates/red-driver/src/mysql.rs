@@ -1291,15 +1291,29 @@ impl DatabaseDriver for MysqlDriver {
         conn.query_drop(statement).await.map_err(driver_err)
     }
 
+    /// Every replaceable kind drops by qualified name here — MySQL needs no table
+    /// for `DROP TRIGGER`, unlike Postgres.
+    fn drop_object_sql(&self, namespace: &str, name: &str, kind: ObjectKind) -> Option<String> {
+        let what = match kind {
+            ObjectKind::View => "VIEW",
+            ObjectKind::Function => "FUNCTION",
+            ObjectKind::Procedure => "PROCEDURE",
+            ObjectKind::Trigger => "TRIGGER",
+            _ => return None,
+        };
+        Some(format!(
+            "DROP {what} IF EXISTS {}.{}",
+            self.quote_ident(namespace),
+            self.quote_ident(object_ident(name))
+        ))
+    }
+
     async fn object_ddl(&self, namespace: &str, name: &str, kind: ObjectKind) -> Result<String> {
         let mut conn = self.conn().await?;
-        // The tree's trigger label is "trigger on table"; `SHOW CREATE TRIGGER`
-        // wants just the trigger.
-        let object = name.split(" on ").next().unwrap_or(name);
         let qualified = format!(
             "{}.{}",
             self.quote_ident(namespace),
-            self.quote_ident(object.split('(').next().unwrap_or(object).trim())
+            self.quote_ident(object_ident(name))
         );
         // `SHOW CREATE …` returns the definition in a column whose *position*
         // varies by object kind (2nd for a table, 3rd for a routine or trigger,
@@ -1675,6 +1689,16 @@ fn escape_ident(s: &str) -> String {
     s.replace('`', "``")
 }
 
+/// The bare identifier inside a schema-tree object *label*. A trigger is labelled
+/// `<trigger> on <table>` (the table is what tells two same-named triggers apart)
+/// and a routine may carry its `(args)`; neither belongs in the statement that
+/// names the object. Shared by the definition read and the drop that precedes a
+/// re-create, so the two can never disagree on which object they mean.
+fn object_ident(label: &str) -> &str {
+    let head = label.split(" on ").next().unwrap_or(label);
+    head.split('(').next().unwrap_or(head).trim()
+}
+
 /// Map a failed dial to a *fatal* [`RedError::Auth`] (a credential/target the
 /// user must fix) or a transient [`RedError::Connect`]. 1045 = access denied,
 /// 1044 = access denied to database, 1049 = unknown database; none retry away.
@@ -1724,6 +1748,18 @@ mod tests {
 
     fn test_url() -> Option<String> {
         std::env::var("RED_TEST_MYSQL_URL").ok()
+    }
+
+    /// The tree labels an object for a human; a statement needs the identifier out
+    /// of it. Getting this wrong would drop the wrong object, or nothing.
+    #[test]
+    fn object_ident_strips_the_labels_decoration() {
+        assert_eq!(object_ident("trg_x on order_items"), "trg_x");
+        assert_eq!(object_ident("f(integer, text)"), "f");
+        assert_eq!(object_ident("plain_name"), "plain_name");
+        // A table whose own name contains " on " is not a thing to be clever about,
+        // but the split must at least not corrupt an undecorated name.
+        assert_eq!(object_ident("orders"), "orders");
     }
 
     /// A unique fixture-table suffix so concurrent tests don't collide on a shared
@@ -2089,6 +2125,45 @@ mod tests {
         )
         .await;
         driver.execute(&format!("DROP TABLE `{t}`")).await.unwrap();
+    }
+
+    /// The drop that precedes a re-create: qualified, `IF EXISTS`, and naming the
+    /// object rather than the tree's label. `None` for the kinds an edited
+    /// definition must never be applied to wholesale.
+    #[tokio::test]
+    async fn drop_object_sql_covers_the_replaceable_kinds() {
+        let url = url_or_skip!();
+        let driver = MysqlDriver::connect(&url, false).await.unwrap();
+        assert_eq!(
+            driver
+                .drop_object_sql("shop", "trg_x on order_items", ObjectKind::Trigger)
+                .as_deref(),
+            Some("DROP TRIGGER IF EXISTS `shop`.`trg_x`")
+        );
+        assert_eq!(
+            driver
+                .drop_object_sql("shop", "v_sales", ObjectKind::View)
+                .as_deref(),
+            Some("DROP VIEW IF EXISTS `shop`.`v_sales`")
+        );
+        assert_eq!(
+            driver
+                .drop_object_sql("shop", "reap", ObjectKind::Procedure)
+                .as_deref(),
+            Some("DROP PROCEDURE IF EXISTS `shop`.`reap`")
+        );
+        // A table is altered, not replaced; the others' drops are not harmless.
+        for kind in [
+            ObjectKind::Table,
+            ObjectKind::Sequence,
+            ObjectKind::MaterializedView,
+            ObjectKind::Type,
+        ] {
+            assert!(
+                driver.drop_object_sql("shop", "x", kind).is_none(),
+                "{kind:?} must not offer a wholesale replace"
+            );
+        }
     }
 
     /// A `scoped` handle rebinds the default database for real, and — the part

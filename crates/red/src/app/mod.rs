@@ -1621,6 +1621,12 @@ impl AppState {
                 tracing::error!(?session, "{message}");
                 self.on_result_error(session, &message);
                 self.notify_detail(ToastVariant::Error, "Error", message, cx);
+                // A DDL Apply that the engine rejected: stay in edit mode with the
+                // buffer intact, so the user fixes the statement rather than
+                // retyping it.
+                if session.is_some() && session == self.foreground_session {
+                    self.ddl_on_write_settled(false, cx);
+                }
             }
 
             // --- schema explorer ---
@@ -1662,8 +1668,13 @@ impl AppState {
                 restricted,
             } => self.on_server_sessions(session, sessions, restricted, cx),
             Event::ServerSessionKilled { .. } => self.on_server_session_killed(cx),
-            Event::ObjectDdlReady { epoch, ddl, .. } => {
-                self.on_object_ddl_ready(session, epoch, ddl, cx);
+            Event::ObjectDdlReady {
+                epoch,
+                ddl,
+                drop_statement,
+                ..
+            } => {
+                self.on_object_ddl_ready(session, epoch, ddl, drop_statement, cx);
             }
             Event::ObjectDdlFailed { epoch, message } => {
                 self.on_object_ddl_failed(session, epoch, message);
@@ -2005,6 +2016,9 @@ impl AppState {
                 // aiming it at a background session would clear the wrong tree.
                 if session.is_some() && session == self.foreground_session {
                     self.refresh_schema();
+                    // An Apply from a DDL tab: re-read the definition so the tab
+                    // shows what the server stored, not what was typed.
+                    self.ddl_on_write_settled(true, cx);
                 } else if let Some(id) = session {
                     self.service.send_to(id, Command::LoadObjects);
                 }
@@ -2288,6 +2302,10 @@ impl AppState {
         self.confirm_input = None;
         self.confirm_count = None;
         self.confirm_review = None;
+        // A DDL Apply that never ran: drop the in-flight mark but keep the edits, so
+        // cancelling the confirm returns the user to the buffer they were editing
+        // rather than throwing it away.
+        self.ddl_clear_applying();
         self.refocus_root = true;
         cx.notify();
     }

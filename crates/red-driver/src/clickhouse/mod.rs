@@ -1561,6 +1561,24 @@ impl DatabaseDriver for ClickhouseDriver {
         .map(|_| ())
     }
 
+    /// ClickHouse has views and UDFs; no triggers and no procedures. A UDF is
+    /// server-wide, not per-database, so it drops unqualified — the same asymmetry
+    /// `object_ddl` below already has to observe.
+    fn drop_object_sql(&self, namespace: &str, name: &str, kind: ObjectKind) -> Option<String> {
+        match kind {
+            ObjectKind::Function => Some(format!(
+                "DROP FUNCTION IF EXISTS {}",
+                self.quote_ident(name)
+            )),
+            ObjectKind::View => Some(format!(
+                "DROP VIEW IF EXISTS {}.{}",
+                self.quote_ident(namespace),
+                self.quote_ident(name)
+            )),
+            _ => None,
+        }
+    }
+
     async fn object_ddl(&self, namespace: &str, name: &str, kind: ObjectKind) -> Result<String> {
         // `SHOW CREATE` covers tables, views, and materialized views alike (they
         // are all entries in `system.tables`); a UDF is `SHOW CREATE FUNCTION`.

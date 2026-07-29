@@ -110,17 +110,26 @@ pub(super) async fn object_ddl(
         return;
     };
     match driver.object_ddl(&namespace, &name, kind).await {
-        Ok(ddl) => emit(
-            events,
-            session_id,
-            Event::ObjectDdlReady {
-                epoch,
-                namespace,
-                name,
-                kind,
-                ddl,
-            },
-        ),
+        Ok(ddl) => {
+            // Rendered alongside the definition rather than on request: it costs a
+            // string, and the tab needs it the moment the user clicks Edit.
+            let drop_statement = kind
+                .is_replaceable()
+                .then(|| driver.drop_object_sql(&namespace, &name, kind))
+                .flatten();
+            emit(
+                events,
+                session_id,
+                Event::ObjectDdlReady {
+                    epoch,
+                    namespace,
+                    name,
+                    kind,
+                    ddl,
+                    drop_statement,
+                },
+            )
+        }
         Err(e) => emit(
             events,
             session_id,

@@ -655,6 +655,22 @@ impl DatabaseDriver for SqliteDriver {
         .map_err(driver_err)?
     }
 
+    /// SQLite has views and triggers and no routines at all. A trigger drops by its
+    /// own name, so the tree's `<name> on <table>` label sheds its tail here.
+    fn drop_object_sql(&self, namespace: &str, name: &str, kind: ObjectKind) -> Option<String> {
+        let what = match kind {
+            ObjectKind::View => "VIEW",
+            ObjectKind::Trigger => "TRIGGER",
+            _ => return None,
+        };
+        let object = name.split(" on ").next().unwrap_or(name).trim();
+        Some(format!(
+            "DROP {what} IF EXISTS {}.{}",
+            quote_ident(namespace),
+            quote_ident(object)
+        ))
+    }
+
     async fn object_ddl(&self, namespace: &str, name: &str, kind: ObjectKind) -> Result<String> {
         // `sqlite_master.sql` is the statement the object was created with,
         // verbatim, which is as faithful as DDL gets. A trigger row is keyed by

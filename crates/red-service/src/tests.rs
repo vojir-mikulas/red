@@ -1659,6 +1659,42 @@ async fn a_compound_routine_body_executes_as_one_statement() {
         other => panic!("expected ObjectGroupLoaded, got {other:?}"),
     }
 
+    // The DDL tab's Apply, minus the UI: read the definition, take the drop the
+    // driver renders with it, and run the two as one script. This is the whole
+    // point of editable definitions — that the round trip closes.
+    send(
+        &handle,
+        Command::ObjectDdl {
+            epoch: crate::Epoch::new(7),
+            namespace: database.clone(),
+            name: format!("{trigger} on {table}"),
+            kind: red_core::ObjectKind::Trigger,
+        },
+    );
+    let (definition, drop_statement) = match next(&mut events).await {
+        Some(Event::ObjectDdlReady {
+            ddl,
+            drop_statement,
+            ..
+        }) => (ddl, drop_statement.expect("a trigger is replaceable")),
+        other => panic!("expected ObjectDdlReady, got {other:?}"),
+    };
+    assert!(
+        drop_statement.contains(&trigger) && !drop_statement.contains(" on "),
+        "the drop must name the trigger, not the tree's label: {drop_statement}"
+    );
+    send(&handle, exec(format!("{drop_statement};\n{definition}")));
+    match next(&mut events).await {
+        Some(Event::Executed { statements, .. }) => assert_eq!(statements, 2),
+        other => panic!("re-creating from the edited definition failed: {other:?}"),
+    }
+    // Re-created, not merely accepted: the guard still fires.
+    send(&handle, exec(format!("INSERT INTO `{table}` VALUES (-2)")));
+    match next(&mut events).await {
+        Some(Event::Error(e)) => assert!(e.contains("must not be negative"), "got: {e}"),
+        other => panic!("the re-created trigger does not fire: {other:?}"),
+    }
+
     send(&handle, exec(format!("DROP TABLE `{table}`")));
     assert!(matches!(
         next(&mut events).await,

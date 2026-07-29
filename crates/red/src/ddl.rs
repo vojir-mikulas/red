@@ -10,11 +10,17 @@
 //! a scope header on Postgres, which has no such statement. This module is purely
 //! the UI: the tab body, its lifecycle, and the two terminal-event handlers.
 //!
-//! Nothing here executes anything. "Open as query" pastes the text into an
-//! ordinary query tab, so a `CREATE`/`DROP` that a user chooses to run passes
-//! through the same risk assessment, destructive confirm, and read-only lock as
-//! any hand-typed statement. A DDL tab is a reader, and the safety rails stay
-//! where they already are.
+//! Nothing here runs anything *of its own*. "Open as query" pastes the text into
+//! an ordinary query tab, and Apply hands the buffer to the same `execute_sql`
+//! seam the editor's Run uses — so every `CREATE`/`DROP` that leaves this tab
+//! passes through the same risk assessment, destructive confirm, and read-only
+//! lock as a hand-typed statement. The safety rails stay where they already are.
+//!
+//! Editing is offered only for the kinds that are replaced *wholesale*
+//! ([`ObjectKind::is_replaceable`]): the edited text is the whole object, so
+//! applying it is a drop plus the user's `CREATE`, with nothing to diff and so no
+//! SQL parser involved. A table needs `ALTER` and is deliberately not editable
+//! here (see `docs/plans/todo/table-editing.md`).
 
 use flint::prelude::*;
 use flint::{Button, ButtonSize, ButtonVariant, ToastVariant};
@@ -33,17 +39,29 @@ pub(crate) struct DdlView {
     pub name: String,
     pub kind: ObjectKind,
     pub state: DdlState,
+    /// An Apply from this tab is in flight (awaiting the confirm dialog, then the
+    /// engine). Set so the terminal event can land back *here*: a success re-reads
+    /// the definition, so the tab shows what the server now has rather than what
+    /// the user typed, and a failure leaves the edits in place to fix.
+    pub applying: bool,
 }
 
 pub(crate) enum DdlState {
     Loading,
     /// The definition, as the engine (or the Postgres assembler) rendered it.
-    /// Held both as text (for Copy / Open as query) and as a read-only
+    /// Held both as text (for Copy / Open as query / reverting an edit) and as a
     /// `CodeEditor`, which is what makes the body selectable and SQL-highlighted;
-    /// the same seam the cell inspector uses for a shown value.
+    /// the same seam the cell inspector uses for a shown value. The editor is
+    /// read-only until the user chooses to edit.
     Ready {
         text: String,
         editor: gpui::Entity<CodeEditor>,
+        /// What to drop before re-creating, when the engine can express it. `None`
+        /// for a definition that already says `CREATE OR REPLACE`, which needs no
+        /// drop at all.
+        drop_statement: Option<String>,
+        /// The buffer is editable and the header offers Apply/Cancel.
+        editing: bool,
     },
     /// No privilege, object dropped, or a kind this engine cannot define.
     Failed(String),
@@ -75,12 +93,20 @@ impl AppState {
 
         let epoch = crate::result::new_epoch();
         let mut tab = crate::app::QueryTab::new(format!("DDL: {name}"), cx);
+        // Pin the tab to the object's own namespace rather than letting it inherit
+        // the focused tab's. An Apply from here re-creates *this* object, so it has
+        // to resolve in the database the object lives in, whatever database some
+        // query tab happens to point at — and a connection that dialled none would
+        // otherwise send the write unscoped and hit MySQL's 1046.
+        // `namespace_for_send` still decides whether an engine uses it at all.
+        tab.namespace = Some(namespace.clone());
         tab.view = Some(TabView::Ddl(DdlView {
             epoch,
             namespace: namespace.clone(),
             name: name.clone(),
             kind,
             state: DdlState::Loading,
+            applying: false,
         }));
         self.push_tab(tab, cx);
         self.send_active(Command::ObjectDdl {
@@ -98,6 +124,7 @@ impl AppState {
         session: Option<red_service::SessionId>,
         epoch: red_service::Epoch,
         ddl: String,
+        drop_statement: Option<String>,
         cx: &mut Context<Self>,
     ) {
         // Built once here, not per frame: a wide table's DDL is a real string and
@@ -114,7 +141,15 @@ impl AppState {
             e
         });
         if let Some(view) = self.ddl_by_epoch(session, epoch) {
-            view.state = DdlState::Ready { text: ddl, editor };
+            // A re-read after a successful Apply lands here too, so it also ends
+            // the edit: the buffer now holds the server's rendering.
+            view.applying = false;
+            view.state = DdlState::Ready {
+                text: ddl,
+                editor,
+                drop_statement,
+                editing: false,
+            };
         }
     }
 
@@ -189,31 +224,56 @@ impl AppState {
                     .child(view.kind.as_str()),
             );
 
+        let editing = matches!(&view.state, DdlState::Ready { editing: true, .. });
         if let Some(ddl) = ddl_text.clone() {
             let copy = ddl.clone();
-            header = header.child(
-                div()
-                    .ml_auto()
-                    .flex()
-                    .items_center()
-                    .gap_1()
+            let mut actions = div().ml_auto().flex().items_center().gap_1();
+            if editing {
+                // Apply leads, because the buffer is dirty and applying it is what
+                // the mode is for.
+                actions = actions
                     .child(
-                        Button::new("ddl-copy", "Copy")
+                        Button::new("ddl-cancel", "Cancel")
                             .size(ButtonSize::Sm)
                             .variant(ButtonVariant::Ghost)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.copy_to_clipboard(copy.clone(), "DDL copied", cx);
-                            })),
+                            .on_click(cx.listener(|this, _, _, cx| this.ddl_cancel_edit(cx))),
                     )
                     .child(
-                        Button::new("ddl-open-query", "Open as query")
+                        Button::new("ddl-apply", "Apply")
+                            .size(ButtonSize::Sm)
+                            .variant(ButtonVariant::Primary)
+                            .on_click(cx.listener(|this, _, _, cx| this.ddl_apply(cx))),
+                    );
+            } else {
+                actions = actions.child(
+                    Button::new("ddl-copy", "Copy")
+                        .size(ButtonSize::Sm)
+                        .variant(ButtonVariant::Ghost)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.copy_to_clipboard(copy.clone(), "DDL copied", cx);
+                        })),
+                );
+                // Editable only for a kind that is replaced wholesale, and never on
+                // a read-only connection — the same gate `execute_sql` enforces,
+                // shown rather than left to fail on use.
+                if view.kind.is_replaceable() && !active.config.read_only {
+                    actions = actions.child(
+                        Button::new("ddl-edit", "Edit")
                             .size(ButtonSize::Sm)
                             .variant(ButtonVariant::Ghost)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.ddl_open_as_query(ddl.clone(), cx);
-                            })),
-                    ),
-            );
+                            .on_click(cx.listener(|this, _, _, cx| this.ddl_begin_edit(cx))),
+                    );
+                }
+                actions = actions.child(
+                    Button::new("ddl-open-query", "Open as query")
+                        .size(ButtonSize::Sm)
+                        .variant(ButtonVariant::Ghost)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.ddl_open_as_query(ddl.clone(), cx);
+                        })),
+                );
+            }
+            header = header.child(actions);
         }
 
         let body = match &view.state {
@@ -244,6 +304,162 @@ impl AppState {
             .child(header)
             .child(div().flex_1().min_h(px(0.)).child(body))
             .into_any_element()
+    }
+
+    /// Enter edit mode on the focused DDL tab: unlock the buffer and pre-fill it
+    /// with the whole replace script, the drop ahead of the definition.
+    ///
+    /// The script is a *pre-fill*, not a hidden plan — it is the buffer, so the user
+    /// reads and can change every statement that will run, including the drop. That
+    /// is the same contract the schema-diff script has.
+    fn ddl_begin_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.ddl_active_mut() else {
+            return;
+        };
+        let DdlState::Ready {
+            text,
+            editor,
+            drop_statement,
+            editing,
+        } = &mut view.state
+        else {
+            return;
+        };
+        if *editing {
+            return;
+        }
+        *editing = true;
+        let script = match drop_statement {
+            Some(drop) => format!("{drop};\n\n{}", text.trim_start()),
+            None => text.clone(),
+        };
+        let editor = editor.clone();
+        editor.update(cx, |e, cx| {
+            e.set_read_only(false, cx);
+            e.set_content(script, cx);
+        });
+        cx.notify();
+    }
+
+    /// Leave edit mode, restoring the definition as the engine rendered it.
+    fn ddl_cancel_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.ddl_active_mut() else {
+            return;
+        };
+        view.applying = false;
+        let DdlState::Ready {
+            text,
+            editor,
+            editing,
+            ..
+        } = &mut view.state
+        else {
+            return;
+        };
+        *editing = false;
+        let (text, editor) = (text.clone(), editor.clone());
+        editor.update(cx, |e, cx| {
+            e.set_content(text, cx);
+            e.set_read_only(true, cx);
+        });
+        cx.notify();
+    }
+
+    /// Apply the edited buffer. Hands it to [`Self::execute_sql`], the single seam
+    /// every write leaves the UI through, so the read-only gate, the risk grading,
+    /// and the destructive confirm all apply exactly as they do to a typed
+    /// statement. The tab is marked `applying` so the outcome comes back here.
+    fn ddl_apply(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.ddl_active_mut() else {
+            return;
+        };
+        let DdlState::Ready {
+            editor, editing, ..
+        } = &view.state
+        else {
+            return;
+        };
+        if !editing {
+            return;
+        }
+        let sql = editor.read(cx).content();
+        if crate::sql::is_blank(&sql) {
+            return;
+        }
+        view.applying = true;
+        self.execute_sql(sql, cx);
+    }
+
+    /// A write finished while a DDL tab was applying: re-read the definition, so
+    /// what the tab shows is what the server stored rather than what was typed.
+    /// Called for the *foreground* connection only, like the schema refresh beside
+    /// it, since that is the only tab strip on screen.
+    pub(crate) fn ddl_on_write_settled(&mut self, ok: bool, cx: &mut Context<Self>) {
+        let Some((epoch, namespace, name, kind)) = self.phase_ddl_applying() else {
+            return;
+        };
+        if !ok {
+            // Leave the edits in the buffer to fix; the error is already toasted.
+            if let Some(view) = self.ddl_by_epoch_any(epoch) {
+                view.applying = false;
+            }
+            cx.notify();
+            return;
+        }
+        // The reply flips `applying` off and leaves edit mode (see
+        // `on_object_ddl_ready`).
+        self.send_active(Command::ObjectDdl {
+            epoch,
+            namespace,
+            name,
+            kind,
+        });
+    }
+
+    /// Drop the in-flight mark without touching the buffer — the confirm dialog was
+    /// dismissed, so nothing ran and the edits are still the user's to finish.
+    pub(crate) fn ddl_clear_applying(&mut self) {
+        if let Phase::Connected(active) = &mut self.phase {
+            for tab in &mut active.tabs {
+                if let Some(TabView::Ddl(d)) = &mut tab.view {
+                    d.applying = false;
+                }
+            }
+        }
+    }
+
+    /// The identity of the foreground connection's applying DDL tab, if any.
+    fn phase_ddl_applying(&self) -> Option<(red_service::Epoch, String, String, ObjectKind)> {
+        let Phase::Connected(active) = &self.phase else {
+            return None;
+        };
+        active
+            .tabs
+            .iter()
+            .filter_map(|t| t.ddl())
+            .find(|d| d.applying)
+            .map(|d| (d.epoch, d.namespace.clone(), d.name.clone(), d.kind))
+    }
+
+    fn ddl_by_epoch_any(&mut self, epoch: red_service::Epoch) -> Option<&mut DdlView> {
+        let Phase::Connected(active) = &mut self.phase else {
+            return None;
+        };
+        active.tabs.iter_mut().find_map(|t| match &mut t.view {
+            Some(TabView::Ddl(d)) if d.epoch == epoch => Some(d),
+            _ => None,
+        })
+    }
+
+    /// The focused tab's DDL view, when the focused tab is one.
+    fn ddl_active_mut(&mut self) -> Option<&mut DdlView> {
+        let Phase::Connected(active) = &mut self.phase else {
+            return None;
+        };
+        match &mut active.active_mut()?.view {
+            Some(TabView::Ddl(d)) => Some(d),
+            _ => None,
+        }
     }
 
     /// Paste a definition into a fresh query tab. Deliberately does not run it:

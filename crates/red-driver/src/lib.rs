@@ -1659,6 +1659,32 @@ pub trait DatabaseDriver: Send + Sync {
         kind: red_core::ObjectKind,
     ) -> Result<String>;
 
+    /// The statement that clears the way for re-creating this object, so an edited
+    /// definition can be applied as `drop` + the user's `CREATE`. Rendered, never
+    /// run: it is a *pre-fill* the user sees and can change before anything
+    /// executes.
+    ///
+    /// `None` means "no drop needed or expressible", and covers three distinct
+    /// cases the caller treats alike — the object's own definition already says
+    /// `CREATE OR REPLACE` (every Postgres routine), the kind is not replaceable at
+    /// all (see [`ObjectKind::is_replaceable`](red_core::ObjectKind::is_replaceable)),
+    /// or this engine has no such object. Defaults to `None`, so an engine opts in
+    /// per kind rather than inheriting a guess.
+    ///
+    /// Lives behind the driver seam because dropping an object needs both dialect
+    /// syntax *and* the identity the tree only shows as a label: MySQL and SQLite
+    /// label a trigger `<name> on <table>`, and Postgres needs that table in the
+    /// statement (`DROP TRIGGER … ON …`) while the others must strip it.
+    fn drop_object_sql(
+        &self,
+        namespace: &str,
+        name: &str,
+        kind: red_core::ObjectKind,
+    ) -> Option<String> {
+        let _ = (namespace, name, kind);
+        None
+    }
+
     /// Run the engine's `EXPLAIN` for `sql` and return a normalized [`QueryPlan`]
     /// (Track B4). Plain `explain` (`analyze = false`) never executes the
     /// statement; it's read-only-safe for any SQL. `analyze = true` runs

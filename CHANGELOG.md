@@ -143,6 +143,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   own database could therefore resolve unqualified names in another tab's
   database. Every statement now binds the database it means, and a connection that
   never switches database pays nothing for it.
+- A definition can now be edited from the tab that shows it. Views, triggers,
+  functions and procedures — the objects a database replaces wholesale rather than
+  alters — get an Edit button beside Copy, which unlocks the definition and
+  pre-fills the drop that has to precede re-creating it. Apply runs the buffer, so
+  what executes is what you read, through the same confirmation and read-only lock
+  as a typed statement, and the tab then re-reads the object so it shows what the
+  server stored. Tables are deliberately not editable here: changing one means
+  `ALTER`, which is a different feature.
 - Clicking a trigger, routine, sequence or type in the schema tree now opens its
   definition, the way clicking a table opens its rows. Those rows previously did
   nothing at all on a click, leaving the definition reachable only by right-click.
