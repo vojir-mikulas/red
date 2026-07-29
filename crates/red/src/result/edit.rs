@@ -512,6 +512,9 @@ impl AppState {
                         .get(&data_col)
                         .cloned()
                         .unwrap_or(Value::Null);
+                    // Tab off the last cell walks to the next draft (see
+                    // `advance_grid_edit`), which may sit below the zone's fold.
+                    g.draft_scroll.scroll_to_item(index);
                     (g.epoch, decl, cur)
                 }
                 _ => return,
@@ -933,6 +936,10 @@ impl AppState {
             // resolved key (unlike an update or a delete).
             if grid.insertable_browse() {
                 grid.pending.inserts.push(DraftRow::default());
+                // Past the zone's visible rows the new draft lands below the fold,
+                // which reads as "+ Row did nothing" — so bring it into view.
+                grid.draft_scroll
+                    .scroll_to_item(grid.pending.inserts.len() - 1);
             }
         }
         cx.notify();

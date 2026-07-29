@@ -7,13 +7,14 @@ use std::rc::Rc;
 use flint::TextInput;
 use flint::prelude::*;
 use gpui::{
-    Axis, Entity, Hsla, MouseButton, Pixels, Point, SharedString, Window, div, prelude::*, px,
+    Axis, Entity, Hsla, MouseButton, Pixels, Point, SharedString, Window, div, point, prelude::*,
+    px,
 };
 use red_core::{CmpOp, ExportFormat, Value};
 
 use super::buffer::{CellKind, DisplayCell};
 use super::edit::EditSlot;
-use super::{DATA_COL_WIDTH, gutter_width};
+use super::{DATA_COL_WIDTH, DRAFT_ZONE_ROWS, gutter_width};
 use crate::app::{ActiveConn, AppState, Pane, Phase};
 
 /// Group a number's digits in threes (`1234567` → `1,234,567`) so large row
@@ -1051,10 +1052,6 @@ impl AppState {
         }
     }
 
-    /// The draft (insert) rows zone (Track B6), pinned below the grid: one row per
-    /// staged `INSERT`, each cell click-to-edit, a leading ✕ to drop the draft.
-    /// Shares the grid's horizontal scroll so its columns track the grid's. `None`
-    /// when there are no drafts.
     /// The column-stats bar: a thin summary line below the grid showing the
     /// selected column's pushed-down aggregates (count · distinct · nulls · min ·
     /// max, plus sum · avg for numerics). Shown only while the toggle is on; the
@@ -1170,6 +1167,11 @@ impl AppState {
         }
     }
 
+    /// The draft (insert) rows zone (Track B6), pinned below the grid: one row per
+    /// staged `INSERT`, each cell click-to-edit, a leading ✕ to drop the draft.
+    /// Tracks the grid's horizontal scroll so its columns stay column-aligned with
+    /// the grid, and scrolls vertically on its own handle past
+    /// [`DRAFT_ZONE_ROWS`] drafts. `None` when there are no drafts.
     fn render_draft_rows(
         &self,
         grid: &super::ResultGrid,
@@ -1343,20 +1345,78 @@ impl AppState {
             );
         }
 
+        // Two nested scroll containers, one per axis: the outer tracks the grid's
+        // `h_scroll` (so the drafts' columns stay under the grid's), the inner owns
+        // the zone's vertical offset. `restrict_scroll_to_axis` on both keeps a
+        // single-axis wheel from being redirected into the other container's axis,
+        // which — with the two nested — would otherwise scroll both at once.
+        let row_h = f32::from(row_height);
+        let mut vscroll = div()
+            .id("draft-rows-scroll")
+            // Fixed to the columns' combined width and unshrinkable, so the rows
+            // keep their extent inside the (narrower) horizontal viewport instead
+            // of being squeezed to fit it — that extent is what x-scrolls. At
+            // least the viewport's width, so a wheel over the strip beside
+            // narrower columns still lands on this (the vertical) container.
+            .w(px(content_w))
+            .min_w(gpui::relative(1.))
+            .flex_shrink_0()
+            .max_h(px(row_h * DRAFT_ZONE_ROWS))
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            .track_scroll(&grid.draft_scroll)
+            .children(rows);
+        vscroll.style().restrict_scroll_to_axis = Some(true);
+        let mut hscroll = div()
+            .id("draft-rows")
+            .w_full()
+            .flex_shrink_0()
+            .overflow_x_scroll()
+            .track_scroll(&grid.h_scroll)
+            .child(vscroll);
+        hscroll.style().restrict_scroll_to_axis = Some(true);
+
+        // The zone's own scrollbar, so a change-set taller than the zone reads as
+        // scrollable rather than truncated. Every draft row is exactly
+        // `row_height` tall, so the thumb comes straight from the row counts.
+        let ndrafts = grid.pending.inserts.len() as f32;
+        let content_h = ndrafts * row_h;
+        let viewport_h = ndrafts.min(DRAFT_ZONE_ROWS) * row_h;
+        let max_scroll = content_h - viewport_h;
+        let fraction = if max_scroll > 0. {
+            (-f32::from(grid.draft_scroll.offset().y) / max_scroll).clamp(0., 1.)
+        } else {
+            0.
+        };
+        let scrub_handle = grid.draft_scroll.clone();
+        let scrub_view = cx.entity();
+
         Some(
             div()
-                .id("draft-rows")
+                // A column, so the zone's height follows its rows while the
+                // scroller still stretches to the pane's width; `relative` seats
+                // the scrollbar overlay at the zone's right edge.
+                .relative()
+                .flex()
+                .flex_col()
                 .flex_shrink_0()
-                .max_h(px(f32::from(row_height) * 6.0))
-                .overflow_x_scroll()
-                .overflow_y_scroll()
                 .bg(bg)
                 .border_t_1()
                 .border_color(border)
                 .font_family(mono_family)
                 .text_size(cell_size)
-                .track_scroll(&grid.h_scroll)
-                .child(div().flex().flex_col().w(px(content_w)).children(rows))
+                .child(hscroll)
+                .child(
+                    Scrollbar::new("draft-scrollbar", &grid.draft_scrollbar)
+                        .fraction(fraction)
+                        .thumb(viewport_h / content_h)
+                        .on_scrub(move |fraction, _, cx| {
+                            let off = scrub_handle.offset();
+                            scrub_handle.set_offset(point(off.x, px(-fraction * max_scroll)));
+                            scrub_view.update(cx, |_, cx| cx.notify());
+                        }),
+                )
                 .into_any_element(),
         )
     }

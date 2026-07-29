@@ -165,6 +165,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   syntax were unknown columns. `BEFORE`, `FOR EACH ROW`, and the trigger's own
   name were each flagged as a column of whichever table the body happened to read.
   Trigger and routine words are also highlighted as keywords now.
+- Staging more than six new rows in the grid no longer hides the ones past the
+  sixth. The zone below the grid stops growing there so it never eats the results,
+  but it now scrolls through the whole change-set, with a scrollbar when there is
+  more than fits, and adding or tabbing into a row brings that row into view.
 
 ## [0.19.0] - 2026-07-28
 

@@ -77,6 +77,12 @@ pub(crate) fn new_epoch() -> red_service::Epoch {
 pub(in crate::result) const DATA_COL_WIDTH: f32 = 180.0;
 pub(in crate::result) const GUTTER_WIDTH: f32 = 56.0;
 
+/// How many draft (insert) rows the zone below the grid shows before it starts
+/// scrolling — it is pinned over the results, so it must never eat the grid.
+/// Shared by the renderer (which caps the zone's height) and the zone's
+/// scrollbar (which derives the thumb from the same arithmetic).
+pub(in crate::result) const DRAFT_ZONE_ROWS: f32 = 6.0;
+
 /// Width for the row-number gutter, sized to fit the widest ordinal it shows:
 /// the grouped last-row number (`1,000,000`) plus a possible `≈` estimate
 /// prefix, so large row numbers never clip. Never narrower than
@@ -285,8 +291,16 @@ pub(crate) struct ResultGrid {
     pub(in crate::result) sender: CommandSender,
     pub(in crate::result) scroll: UniformListScrollHandle,
     pub(in crate::result) h_scroll: ScrollHandle,
+    /// The draft (insert) zone's *vertical* scroll. It can't share
+    /// [`h_scroll`](Self::h_scroll) (which the zone still tracks for x, to stay
+    /// column-aligned with the grid): a `ScrollHandle` carries one offset for both
+    /// axes, and the table's x-only container clamps that offset's y to 0 on every
+    /// prepaint — so a shared handle would leave the zone stuck at its first row.
+    pub(in crate::result) draft_scroll: ScrollHandle,
     /// The overlay scrollbar's in-flight drag.
     pub(in crate::result) scrollbar: ScrollbarState,
+    /// The draft zone's own scrollbar drag, separate from the grid's.
+    pub(in crate::result) draft_scrollbar: ScrollbarState,
     /// Virtual-scroll window: the absolute ordinal that list-local index 0 maps
     /// to. `Rc` so the scrollbar's scrub closure can move it; `Cell` because
     /// `Table`/`uniform_list` are stateless across frames, so the base lives
@@ -364,7 +378,9 @@ impl ResultGrid {
             page_size,
             scroll: UniformListScrollHandle::new(),
             h_scroll: ScrollHandle::new(),
+            draft_scroll: ScrollHandle::new(),
             scrollbar: ScrollbarState::new(),
+            draft_scrollbar: ScrollbarState::new(),
             window_base: Rc::new(Cell::new(0)),
             epoch: next_epoch(),
             query_started: Instant::now(),
