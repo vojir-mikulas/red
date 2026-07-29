@@ -170,6 +170,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   since it used to be the only way to stop being asked about ordinary writes.
 
 ### Fixed
+- The Tables group in the schema tree could not be collapsed: it reopened itself
+  on the next repaint. Its default expansion is now applied once when the schema
+  loads, so collapsing it sticks, including across a refresh.
+- An object group with nothing in it (Triggers on a server with no triggers) drew
+  an open chevron over an empty space, which read as the group closing itself.
+  Such a group is now a plain dimmed row labelled "none", with nothing to expand.
 - Connecting crashed the app outright, on every engine. Building the workspace
   for a new connection tried to read the application's own settings back through
   a handle it was already holding, which aborts the process rather than failing

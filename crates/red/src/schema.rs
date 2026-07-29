@@ -56,6 +56,10 @@ pub(crate) struct SchemaState {
     /// Groups with a `LoadObjectGroup` in flight, so a second expand does not
     /// fire a second fetch and the row can show "loading…".
     pub groups_loading: HashSet<(String, ObjectKind)>,
+    /// Namespaces whose default group expansion has already been applied (see
+    /// [`Self::apply_objects`]). A refresh re-runs `apply_objects`, and without
+    /// this it would re-open a group the user had deliberately collapsed.
+    seeded: HashSet<String>,
     /// Per-object detail (columns / FKs / indexes), filled lazily on expand.
     pub details: HashMap<(String, String), TableDetail>,
     pub expanded: HashSet<NodeId>,
@@ -93,6 +97,7 @@ impl SchemaState {
             kinds: kind.object_kinds(),
             groups: HashMap::new(),
             groups_loading: HashSet::new(),
+            seeded: HashSet::new(),
             details: HashMap::new(),
             expanded: HashSet::new(),
             selected: None,
@@ -104,11 +109,32 @@ impl SchemaState {
     }
 
     /// Install the loaded skeleton. A lone namespace auto-expands so the user
-    /// lands directly on the table list (the common SQLite `main` case).
+    /// lands directly on the table list (the common SQLite `main` case), and a
+    /// namespace whose only populated relation group is Tables opens that group,
+    /// so grouping costs the common case no extra click.
+    ///
+    /// Both are **seeded defaults, not invariants**: they write into `expanded`
+    /// once and `flatten` never re-asserts them, so a group the user collapses
+    /// stays collapsed. Seeding the group default straight into the open test was
+    /// the bug that made Tables uncollapsable; `seeded` is what keeps a refresh
+    /// (which calls this again) from re-opening it.
     pub fn apply_objects(&mut self, schemas: Vec<SchemaMeta>) {
         if schemas.len() == 1 {
             self.expanded
                 .insert(NodeId::Schema(schemas[0].name.clone()));
+        }
+        for meta in &schemas {
+            // `insert` returns false for a namespace already defaulted, which is
+            // every namespace on every refresh after the first.
+            if !self.seeded.insert(meta.name.clone()) {
+                continue;
+            }
+            if let Some(kind) = default_open_group(self.kinds, meta) {
+                self.expanded.insert(NodeId::Group {
+                    schema: meta.name.clone(),
+                    kind,
+                });
+            }
         }
         self.schemas = schemas;
         self.loading = false;
@@ -150,6 +176,23 @@ impl SchemaState {
                 .map(|v| v.iter().collect())
                 .unwrap_or_default()
         }
+    }
+}
+
+/// The relation group a namespace should open by default: the only populated
+/// one, when there is exactly one.
+///
+/// `None` when a namespace has several populated groups (opening one would be an
+/// arbitrary choice) or none at all. A free function over plain data, so the rule
+/// is unit-testable without a GPUI context, which `SchemaState` needs.
+fn default_open_group(kinds: &[ObjectKind], meta: &SchemaMeta) -> Option<ObjectKind> {
+    let mut populated = kinds
+        .iter()
+        .copied()
+        .filter(|k| k.is_relation() && meta.objects.iter().any(|o| o.kind == *k));
+    match (populated.next(), populated.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
     }
 }
 
@@ -233,18 +276,6 @@ fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
             continue;
         }
 
-        // Which relation groups this namespace actually has something in. When
-        // that is exactly one (SQLite's `main`, a Postgres schema of plain
-        // tables), it auto-expands: grouping should not cost the common case an
-        // extra click to see the list it has always shown.
-        let populated: Vec<ObjectKind> = s
-            .kinds
-            .iter()
-            .copied()
-            .filter(|k| k.is_relation() && !s.relations(schema, *k).is_empty())
-            .collect();
-        let lone_relation_group = (populated.len() == 1).then(|| populated[0]);
-
         for &kind in s.kinds {
             let members = s.objects_of(schema, kind);
             let loaded = kind.is_relation() || s.groups.contains_key(&(schema.name.clone(), kind));
@@ -263,10 +294,10 @@ fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
                 kind,
             };
             // A filter reveals through groups, so a match deep in a loaded group
-            // is visible without hand-expanding each tier.
-            let group_open = (filtering && loaded)
-                || s.expanded.contains(&group_node)
-                || lone_relation_group == Some(kind);
+            // is visible without hand-expanding each tier. Nothing else forces a
+            // group open: the default expansion is seeded once into `expanded`
+            // (see `apply_objects`), so collapsing one sticks.
+            let group_open = (filtering && loaded) || s.expanded.contains(&group_node);
 
             // The group's own rows after the filter, so an all-miss group can be
             // skipped rather than drawn as an empty expanded folder.
@@ -286,8 +317,17 @@ fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
                 continue;
             }
 
+            // A group known to be empty is a **leaf**: no chevron, nothing to
+            // open. Claiming `has_children` there is what made an expanded-but-
+            // empty group indistinguishable from a collapsed one, so expanding
+            // Triggers on a server with none read as the row closing itself.
+            let known_empty = loaded && members.is_empty();
             out.push(VisibleRow {
-                item: TreeItem::new(1, true, group_open),
+                item: if known_empty {
+                    TreeItem::leaf(1)
+                } else {
+                    TreeItem::new(1, true, group_open)
+                },
                 content: RowContent::Group {
                     kind,
                     count: loaded.then_some(members.len()),
@@ -295,7 +335,7 @@ fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
                 node: Some(group_node),
                 preview: None,
             });
-            if !group_open {
+            if !group_open || known_empty {
                 continue;
             }
             // Expanded but still in flight: one placeholder row, same shape the
@@ -432,16 +472,24 @@ fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
 
         RowContent::Group { kind, count } => {
             let (name_icon, color) = object_icon(*kind, cx);
+            // A group known to hold nothing dims itself, icon included, so a
+            // namespace's empty kinds recede instead of reading as unexplored.
+            let empty = *count == Some(0);
+            let (label_color, icon_color) = if empty {
+                (faint, faint)
+            } else {
+                (muted, color)
+            };
             let mut row = div()
                 .flex()
                 .flex_1()
                 .items_center()
                 .gap_1p5()
-                .child(crate::icons::icon(name_icon, theme.scale(13.), color))
+                .child(crate::icons::icon(name_icon, theme.scale(13.), icon_color))
                 .child(
                     div()
                         .text_size(theme.scale(11.5))
-                        .text_color(muted)
+                        .text_color(label_color)
                         .child(kind.group_label()),
                 );
             if let Some(n) = count {
@@ -451,7 +499,13 @@ fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
                         .font_family(theme.font_family.clone())
                         .text_size(theme.scale(10.))
                         .text_color(faint)
-                        .child(n.to_string()),
+                        // "0" next to a folder invites a click that does nothing;
+                        // "none" says the question has already been answered.
+                        .child(if empty {
+                            "none".to_string()
+                        } else {
+                            n.to_string()
+                        }),
                 );
             }
             row.into_any_element()
@@ -1224,5 +1278,67 @@ impl AppState {
         };
         editor.update(cx, |editor, cx| editor.set_content(sql.clone(), cx));
         self.open_result_filtered(label, sql, Some(table_ref), filter, cx);
+    }
+}
+
+#[cfg(test)]
+mod group_default_tests {
+    use super::*;
+    use red_core::ObjectMeta;
+
+    fn meta(name: &str, objects: &[(&str, ObjectKind)]) -> SchemaMeta {
+        SchemaMeta {
+            name: name.to_string(),
+            objects: objects
+                .iter()
+                .map(|(n, k)| ObjectMeta {
+                    name: n.to_string(),
+                    kind: *k,
+                })
+                .collect(),
+        }
+    }
+
+    const PG: &[ObjectKind] = &[
+        ObjectKind::Table,
+        ObjectKind::View,
+        ObjectKind::MaterializedView,
+        ObjectKind::Function,
+    ];
+
+    /// The common case: a namespace of plain tables opens its Tables group, so
+    /// grouping costs nobody an extra click on the list RED always showed.
+    #[test]
+    fn a_namespace_of_only_tables_defaults_that_group_open() {
+        let m = meta(
+            "public",
+            &[("a", ObjectKind::Table), ("b", ObjectKind::Table)],
+        );
+        assert_eq!(default_open_group(PG, &m), Some(ObjectKind::Table));
+    }
+
+    /// With more than one populated group, opening either would be an arbitrary
+    /// choice, so the namespace opens nothing and the user picks.
+    #[test]
+    fn several_populated_groups_default_to_none_open() {
+        let m = meta(
+            "public",
+            &[("a", ObjectKind::Table), ("v", ObjectKind::View)],
+        );
+        assert_eq!(default_open_group(PG, &m), None);
+        let m = meta("public", &[("v", ObjectKind::View)]);
+        assert_eq!(default_open_group(PG, &m), Some(ObjectKind::View));
+        assert_eq!(default_open_group(PG, &meta("empty", &[])), None);
+    }
+
+    /// The lazily-loaded kinds are not counted: their contents are unknown at
+    /// this point, so treating one as "the only populated group" would open a
+    /// group RED cannot yet fill.
+    #[test]
+    fn lazy_kinds_never_win_the_default() {
+        // A function in the skeleton is not a thing that happens, but the rule
+        // must not depend on that: only relations are candidates.
+        let m = meta("public", &[("f", ObjectKind::Function)]);
+        assert_eq!(default_open_group(PG, &m), None);
     }
 }
