@@ -1225,7 +1225,7 @@ pub trait DatabaseDriver: Send + Sync {
     /// **builds** (cell "Filter by", Column mode) rather than takes as typed SQL.
     /// [`eq_predicate`](Self::eq_predicate)'s sibling across the full
     /// [`CmpOp`] set, with the same no-cast, index-usable shape; see
-    /// [`cmp_clause`], which every impl delegates to with its own identifier
+    /// `cmp_clause`, which every impl delegates to with its own identifier
     /// quoting. Values are rendered as escaped literals, **never** interpolated
     /// raw — this is the only path a UI-built comparison reaches the engine by.
     /// Synchronous string building. An empty `preds` returns an empty string,

@@ -114,7 +114,8 @@ impl AppState {
     /// Every knob goes through here rather than through a bespoke setter, because
     /// the side effects are the part that's easy to forget: a statement timeout
     /// that isn't pushed to the backend, a cell cap the driver never hears about,
-    /// an updater left armed at the old cadence. [`apply_settings_effects`] derives
+    /// an updater left armed at the old cadence.
+    /// [`apply_settings_effects`](Self::apply_settings_effects) derives
     /// all of that from a before/after diff, so a new setting inherits correct
     /// behaviour by construction and the file-watcher path
     /// ([`reload_settings`](Self::reload_settings)) runs the *same* code as the

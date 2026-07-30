@@ -39,6 +39,10 @@ pub(crate) struct StoredConfigOption {
     pub category: String,
     pub current_value: String,
     pub choices: Vec<StoredConfigChoice>,
+    /// An on/off switch rather than a dropdown. Defaulted so files written before
+    /// switches existed still load (as selectors, which is what they were).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub boolean: bool,
 }
 
 /// One choice within a [`StoredConfigOption`].
@@ -219,6 +223,7 @@ mod tests {
                 name: "Opus".into(),
                 description: None,
             }],
+            boolean: false,
         }];
         s.set_ai_config("subscription", opts.clone());
         assert_eq!(s.ai_config_all().get("subscription"), Some(&opts));

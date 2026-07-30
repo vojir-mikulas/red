@@ -100,6 +100,7 @@ pub(super) fn to_stored(
                     description: c.description.clone(),
                 })
                 .collect(),
+            boolean: o.boolean,
         })
         .collect()
 }
@@ -125,6 +126,7 @@ pub(super) fn from_stored(
                     description: c.description.clone(),
                 })
                 .collect(),
+            boolean: o.boolean,
         })
         .collect()
 }
@@ -348,6 +350,7 @@ mod tests {
             category: red_service::AiConfigCategory::Model,
             current_value: "auto".into(),
             choices: vec![choice("auto"), choice("opus"), choice("haiku")],
+            boolean: false,
         };
         let reasoning = red_service::AiConfigOption {
             id: "reasoning".into(),
@@ -355,6 +358,7 @@ mod tests {
             category: red_service::AiConfigCategory::Reasoning,
             current_value: "default".into(),
             choices: vec![choice("default"), choice("hard")],
+            boolean: false,
         };
         let mode = red_service::AiConfigOption {
             id: "mode".into(),
@@ -362,6 +366,7 @@ mod tests {
             category: red_service::AiConfigCategory::Mode,
             current_value: "default".into(),
             choices: vec![choice("default"), choice("acceptEdits"), choice("bypass")],
+            boolean: false,
         };
         let opts = vec![model, reasoning, mode];
 

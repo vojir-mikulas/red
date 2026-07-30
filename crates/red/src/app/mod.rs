@@ -431,7 +431,7 @@ pub struct AppState {
     /// saved report survives a restart and is shown when the Analysis panel
     /// reopens on that connection.
     pub(crate) redis_analysis: crate::redis_analysis::AnalysisStore,
-    /// The saved SQL health report per connection, the [`redis_analysis`] twin
+    /// The saved SQL health report per connection, the `redis_analysis` twin
     /// for the `DatabaseDriver` seam.
     pub(crate) health_store: crate::health_store::HealthStore,
     /// The namespaces offered by the open schema-comparison picker, in the order
@@ -2857,7 +2857,7 @@ impl AppState {
     ///
     /// Also mints the focus handle of any pane born since the last frame — this is
     /// the first point after a layout change that holds an `App`, and the pane
-    /// bodies rendered below need their handles (see [`crate::panes::PaneUi`]).
+    /// bodies rendered below need their handles (see `PaneUi`).
     pub(crate) fn sync_split_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase {
             active.layout.ensure_focus_handles(cx);

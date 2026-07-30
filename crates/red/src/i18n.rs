@@ -210,7 +210,7 @@ pub(crate) fn lookup(key: &str) -> SharedString {
     SharedString::from(format(key, None).unwrap_or_else(|| key.to_string()))
 }
 
-/// Like [`lookup`], but falls back to the English source text a caller holds.
+/// Like `lookup`, but falls back to the English source text a caller holds.
 ///
 /// Callers that carry their own English (the settings registry does, as
 /// `en_label` / `en_help`) render that instead of a raw key, so a string added

@@ -15,7 +15,7 @@
 //!   real fix for "I can never find that option".
 //! - **Modified / Reset**, by comparing against [`Settings::default`].
 //! - A **test** that every field of every section is registered
-//!   ([`tests::every_section_is_covered`]), so a setting can't be added to the
+//!   (`tests::every_section_is_covered`), so a setting can't be added to the
 //!   file format and stay invisible in the UI.
 //!
 //! Complex controls (the theme and font pickers, the AI account list, the keymap
@@ -349,7 +349,7 @@ impl SettingDef {
 /// The catalog-key form of a display string: lowercase, non-alphanumerics
 /// collapsed to `_`. Mirrors `slug()` in `scripts/i18n-extract.py`; the two must
 /// agree or a generated key will not be the key the UI looks up, which
-/// [`tests::every_registry_string_is_in_the_english_catalog`] catches.
+/// `tests::every_registry_string_is_in_the_english_catalog` catches.
 fn slug(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {

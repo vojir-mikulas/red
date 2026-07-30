@@ -18,7 +18,7 @@ use agent_client_protocol::schema::{
     McpServerHttp, NewSessionRequest, PermissionOption, PermissionOptionId, PermissionOptionKind,
     PlanEntry, PlanEntryStatus, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
     SessionConfigSelectOptions, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, StopReason, TextContent, ToolCall, ToolCallContent,
     ToolCallStatus, ToolCallUpdate, ToolKind,
@@ -64,10 +64,12 @@ enum Cmd {
         done: TurnReply,
     },
     Cancel,
-    /// Change a session config selector (model / reasoning) between turns.
+    /// Change a session config control (model / reasoning / a boolean switch)
+    /// between turns.
     SetConfig {
         config_id: String,
         value: String,
+        boolean: bool,
         done: ConfigReply,
     },
 }
@@ -115,19 +117,24 @@ impl AcpConversation {
         let _ = self.cmd_tx.send(Cmd::Cancel);
     }
 
-    /// Change a session config selector (model / reasoning) by `config_id`/`value`
-    /// (maps to `session/set_config_option`). The returned receiver resolves with the
-    /// refreshed option set, or an error.
+    /// Change a session config control (model / reasoning / a boolean switch) by
+    /// `config_id`/`value` (maps to `session/set_config_option`). `boolean` mirrors
+    /// [`AcpConfigOption::boolean`]: set it and `value` is parsed as `"true"`/
+    /// `"false"` and sent as a JSON boolean, which is what the agent's boolean
+    /// options expect. The returned receiver resolves with the refreshed option
+    /// set, or an error.
     pub fn set_config(
         &self,
         config_id: String,
         value: String,
+        boolean: bool,
     ) -> oneshot::Receiver<Result<Vec<AcpConfigOption>, AcpError>> {
         let (done, done_rx) = oneshot::channel();
         if let Err(mpsc::error::SendError(Cmd::SetConfig { done, .. })) =
             self.cmd_tx.send(Cmd::SetConfig {
                 config_id,
                 value,
+                boolean,
                 done,
             })
         {
@@ -330,13 +337,21 @@ async fn run_turns(
             Cmd::SetConfig {
                 config_id,
                 value,
+                boolean,
                 done,
             } => {
+                // A boolean option wants a JSON boolean on the wire; a selector
+                // wants its opaque value id.
+                let value: SessionConfigOptionValue = if boolean {
+                    (value == "true").into()
+                } else {
+                    value.as_str().into()
+                };
                 let reply = conn
                     .send_request(SetSessionConfigOptionRequest::new(
                         session_id.clone(),
                         config_id,
-                        value.as_str(),
+                        value,
                     ))
                     .block_task()
                     .await
@@ -602,31 +617,57 @@ fn map_plan_entry(entry: &PlanEntry) -> PlanStep {
     }
 }
 
-/// Map ACP `config_options` to RED's [`AcpConfigOption`], keeping only single-select
-/// selectors (the only kind on the stable build) and flattening grouped choices.
+/// Map ACP `config_options` to RED's [`AcpConfigOption`]: single-select selectors
+/// (flattening grouped choices) and boolean switches. Any future option kind is
+/// dropped rather than guessed at.
 fn map_config_options(options: &[SessionConfigOption]) -> Vec<AcpConfigOption> {
     options.iter().filter_map(map_config_option).collect()
 }
 
 fn map_config_option(option: &SessionConfigOption) -> Option<AcpConfigOption> {
-    let SessionConfigKind::Select(select) = &option.kind else {
-        return None;
-    };
-    let choices = match &select.options {
-        SessionConfigSelectOptions::Ungrouped(opts) => opts.iter().map(map_choice).collect(),
-        SessionConfigSelectOptions::Grouped(groups) => groups
-            .iter()
-            .flat_map(|g| g.options.iter())
-            .map(map_choice)
-            .collect(),
-        _ => Vec::new(),
+    let (current_value, choices, boolean) = match &option.kind {
+        SessionConfigKind::Select(select) => {
+            let choices = match &select.options {
+                SessionConfigSelectOptions::Ungrouped(opts) => {
+                    opts.iter().map(map_choice).collect()
+                }
+                SessionConfigSelectOptions::Grouped(groups) => groups
+                    .iter()
+                    .flat_map(|g| g.options.iter())
+                    .map(map_choice)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            (select.current_value.0.to_string(), choices, false)
+        }
+        // A boolean gets a synthetic Off/On choice pair so it round-trips through
+        // the same `(id, value)` shape as a selector; `boolean` tells the setter
+        // to send a JSON boolean rather than a value id.
+        SessionConfigKind::Boolean(toggle) => (
+            toggle.current_value.to_string(),
+            vec![
+                AcpConfigChoice {
+                    value: "false".to_string(),
+                    name: "Off".to_string(),
+                    description: None,
+                },
+                AcpConfigChoice {
+                    value: "true".to_string(),
+                    name: "On".to_string(),
+                    description: None,
+                },
+            ],
+            true,
+        ),
+        _ => return None,
     };
     Some(AcpConfigOption {
         id: option.id.0.to_string(),
         name: option.name.clone(),
         category: map_category(option.category.as_ref()),
-        current_value: select.current_value.0.to_string(),
+        current_value,
         choices,
+        boolean,
     })
 }
 

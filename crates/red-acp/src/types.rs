@@ -49,18 +49,25 @@ pub struct AcpCommand {
     pub description: String,
 }
 
-/// One session configuration selector the agent advertises (ACP `config_options`),
-/// e.g. a model picker or a reasoning-level picker. Only single-select (`Select`)
-/// options are surfaced; the UI renders each as a dropdown. The `id`/`value` strings
-/// are opaque agent identifiers round-tripped back via `AcpConversation::set_config`.
+/// One session configuration control the agent advertises (ACP `config_options`),
+/// e.g. a model picker, a reasoning-level picker, or an on/off switch such as
+/// Claude Code's fast mode. Single-select (`Select`) options become dropdowns and
+/// boolean options become switches. The `id`/`value` strings are opaque agent
+/// identifiers round-tripped back via `AcpConversation::set_config`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcpConfigOption {
     pub id: String,
     pub name: String,
     pub category: AcpConfigCategory,
-    /// The currently-selected choice's `value`.
+    /// The currently-selected choice's `value`; `"true"` / `"false"` when
+    /// [`boolean`](Self::boolean).
     pub current_value: String,
     pub choices: Vec<AcpConfigChoice>,
+    /// An on/off switch rather than a dropdown (ACP's boolean option kind). Its
+    /// `choices` are a synthetic Off/On pair so a caller that only understands
+    /// selectors still renders something sane, but the value must be sent back
+    /// to the agent as a JSON boolean — see `AcpConversation::set_config`.
+    pub boolean: bool,
 }
 
 /// One choice within an [`AcpConfigOption`]'s dropdown.

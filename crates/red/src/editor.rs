@@ -853,11 +853,11 @@ impl AppState {
         // that changes it are the same widget. (It used to be a separate chip down
         // in the run bar, which put the answer among the action buttons and let it
         // disagree with the crumb next to it.)
-        let ns_segment = self.render_namespace_picker(active, cx);
+        let ns_segment = self.render_namespace_picker(active, tab_idx, pane, cx);
         // A browse tab is titled "db.table"; with the database as its own crumb the
         // prefix is redundant, so drop it when the two agree. When they don't, the
         // qualified title is the honest thing to show and it stays.
-        let crumb_title = match active.namespace_for_send() {
+        let crumb_title = match active.namespace_for_tab(tab_idx) {
             Some(ns) => tab
                 .title
                 .strip_prefix(&format!("{ns}."))
@@ -1018,9 +1018,16 @@ impl AppState {
     /// `connection / title` form. Shows the tab's override when it has one, else
     /// the connection's; picking writes the *tab* override, so two tabs in a split
     /// can sit on two databases.
+    ///
+    /// Everything here is scoped to (`tab_idx`, `pane`) rather than to whatever
+    /// holds focus: in a split each pane draws its own crumb, so a focus-scoped
+    /// one would read the other half's database, and a connection-wide open flag
+    /// would drop a menu into every half at once.
     fn render_namespace_picker(
         &self,
         active: &ActiveConn,
+        tab_idx: usize,
+        pane: crate::app::PaneId,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement + use<>> {
         let caps = active.config.kind.namespace_caps();
@@ -1031,7 +1038,7 @@ impl AppState {
         let (muted, text, yellow) = (theme.text_muted, theme.text, theme.yellow);
         let hover_bg = theme.bg_panel_2;
         let (radius, size_11, icon_sz) = (theme.radius_sm, theme.scale(11.), theme.scale(10.));
-        let current = active.namespace_for_send();
+        let current = active.namespace_for_tab(tab_idx);
         let names: Vec<String> = active
             .schema
             .schemas
@@ -1054,19 +1061,25 @@ impl AppState {
         // trail's typography, so the affordance here is only a hover tint plus a
         // chevron. (If this shape recurs, it's the spike for a Flint breadcrumb
         // component — see CONTRIBUTING's "spike in RED first".)
-        let menu = active.namespace_menu_open.then(|| {
-            let mut menu = ContextMenu::new("sql-namespace-menu");
+        let menu = (active.namespace_menu_pane == Some(pane)).then(|| {
+            // Ids are per-pane: two panes rendering the same id would collide in
+            // GPUI's element tree.
+            let mut menu =
+                ContextMenu::new(SharedString::from(format!("sql-namespace-menu-{}", pane.0)));
             for name in &names {
                 let is_current = current.as_deref() == Some(name.as_str());
                 let mut item = ContextMenuItem::new(
-                    SharedString::from(format!("ns-opt-{name}")),
+                    SharedString::from(format!("ns-opt-{}-{name}", pane.0)),
                     name.clone(),
                 )
                 .on_click(cx.listener({
                     let name = name.clone();
                     move |this, _, _, cx| {
                         this.close_namespace_menu(cx);
-                        this.set_tab_namespace(Some(name.clone()), cx);
+                        // Picking in a half aims at that half, like the run bar's
+                        // buttons and the tab strip.
+                        this.set_split_focus(pane, cx);
+                        this.set_tab_namespace(pane, Some(name.clone()), cx);
                     }
                 }));
                 // The trailing slot right-aligns the mark, so the names stay flush
@@ -1093,7 +1106,10 @@ impl AppState {
                 .relative()
                 .child(
                     div()
-                        .id("sql-namespace-crumb")
+                        .id(SharedString::from(format!(
+                            "sql-namespace-crumb-{}",
+                            pane.0
+                        )))
                         .flex()
                         .items_center()
                         .gap_1()
@@ -1119,7 +1135,10 @@ impl AppState {
                                 caps.label.to_lowercase()
                             )))
                         })
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_namespace_menu(cx))),
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_split_focus(pane, cx);
+                            this.toggle_namespace_menu(pane, cx);
+                        })),
                 )
                 .children(menu),
         )

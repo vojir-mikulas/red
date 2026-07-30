@@ -15,7 +15,7 @@ use gpui::{App, Context, Entity, UniformListScrollHandle, Window, div, prelude::
 use red_core::{ColumnMeta, DbKind, ObjectKind, ResultFilter, SchemaMeta, TableDetail};
 use red_service::Command;
 
-use crate::app::{ActiveConn, AppState, Phase, TabWorkspace};
+use crate::app::{ActiveConn, AppState, PaneId, Phase, TabWorkspace};
 
 /// A stable identity for a tree node, surviving re-render and filtering so
 /// expansion + selection track the right node regardless of row position.
@@ -1154,29 +1154,43 @@ impl AppState {
         cx.notify();
     }
 
-    /// Open/close the breadcrumb's database dropdown.
-    pub(crate) fn toggle_namespace_menu(&mut self, cx: &mut Context<Self>) {
+    /// Open `pane`'s breadcrumb database dropdown, closing whichever pane held it
+    /// (clicking the same crumb again closes it). At most one is open at a time:
+    /// two open menus would each dismiss on the other's mouse-down.
+    pub(crate) fn toggle_namespace_menu(&mut self, pane: PaneId, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase {
-            active.namespace_menu_open = !active.namespace_menu_open;
+            active.namespace_menu_pane = match active.namespace_menu_pane {
+                Some(open) if open == pane => None,
+                _ => Some(pane),
+            };
             cx.notify();
         }
     }
 
     pub(crate) fn close_namespace_menu(&mut self, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase
-            && std::mem::take(&mut active.namespace_menu_open)
+            && active.namespace_menu_pane.take().is_some()
         {
             cx.notify();
         }
     }
 
-    /// Point the *focused tab* at `namespace` (the breadcrumb picker). Scoped to the
-    /// tab rather than the connection so a split view can hold two databases; the
-    /// tree's "Set as active" is the connection-wide counterpart.
-    pub(crate) fn set_tab_namespace(&mut self, namespace: Option<String>, cx: &mut Context<Self>) {
+    /// Point `pane`'s active tab at `namespace` (the breadcrumb picker). Scoped to
+    /// the tab rather than the connection so a split view can hold two databases;
+    /// the tree's "Set as active" is the connection-wide counterpart.
+    ///
+    /// Aimed at the pane whose crumb was clicked rather than at whichever pane
+    /// holds focus, so picking in an unfocused half changes that half.
+    pub(crate) fn set_tab_namespace(
+        &mut self,
+        pane: PaneId,
+        namespace: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         if let Phase::Connected(active) = &mut self.phase
             && active.config.kind.namespace_caps().settable
-            && let Some(tab) = active.active_mut()
+            && let Some(i) = active.pane_active(pane)
+            && let Some(tab) = active.tabs.get_mut(i)
         {
             tab.namespace = namespace;
         }

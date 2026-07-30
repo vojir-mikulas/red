@@ -229,7 +229,7 @@ impl AppState {
     /// The schema context for the confirm dialog's advisory review, focused on the
     /// one table the statement targets.
     ///
-    /// Deliberately *not* [`Self::ai_schema_summary`], which is only a list of
+    /// Deliberately *not* `summarize_schema`, which is only a list of
     /// object names. A reviewer given nothing but names cannot do the job it exists
     /// for: it can't tell an inverted predicate from a correct one without the
     /// columns, and it can't say what a `DROP` would strand without the foreign
@@ -1071,13 +1071,20 @@ impl AppState {
         chat.config_defaults_applied = true;
         let to_apply = default_config_changes(&chat.config_options, &model, &reasoning, &mode);
         for (config_id, value) in to_apply {
-            self.send_set_config_option(conversation_id, config_id, value, cx);
+            // Only the three selector categories carry stored defaults, and none of
+            // them is a boolean switch — see `default_config_changes`.
+            self.send_set_config_option(conversation_id, config_id, value, false, cx);
         }
     }
 
-    /// The composer dropdown changed a selector: optimistically reflect it on the
-    /// chat, persist it as the central default for future chats (last choice wins;
-    /// existing chats untouched), and tell the backend to apply it to this session.
+    /// The composer changed a config control (a dropdown pick or a switch flip):
+    /// optimistically reflect it on the chat, persist a selector choice as the
+    /// central default for future chats (last choice wins; existing chats
+    /// untouched), and tell the backend to apply it to this session.
+    ///
+    /// Switches (`boolean`) aren't persisted as a RED default: they're the agent's
+    /// own session state, and re-asserting one on every new chat would fight
+    /// whatever the agent itself remembers.
     pub(crate) fn change_config_option(
         &mut self,
         config_id: String,
@@ -1091,12 +1098,15 @@ impl AppState {
         let conversation_id = state.active().conversation_id;
         let agent = state.active().provider.clone();
         let chat = state.active_mut();
-        // Optimistic local update + remember the category for the settings write.
+        // Optimistic local update + remember the category and kind for the
+        // settings write / the wire encoding.
         let mut category = None;
+        let mut boolean = false;
         for opt in &mut chat.config_options {
             if opt.id == config_id {
                 opt.current_value = value.clone();
                 category = Some(opt.category);
+                boolean = opt.boolean;
             }
         }
         // Mirror the pick into the pre-session cache for this agent too, so a pick
@@ -1108,10 +1118,12 @@ impl AppState {
                 if opt.id == config_id {
                     opt.current_value = value.clone();
                     category = category.or(Some(opt.category));
+                    boolean |= opt.boolean;
                 }
             }
         }
-        // Persist as the central default for new chats (not retroactive).
+        // Persist as the central default for new chats (not retroactive). Switches
+        // are the agent's own state, so they're deliberately not stored here.
         match category {
             Some(red_service::AiConfigCategory::Model) => {
                 self.settings.ai.subscription_model = value.clone();
@@ -1127,7 +1139,7 @@ impl AppState {
             }
             _ => {}
         }
-        self.send_set_config_option(conversation_id, config_id, value, cx);
+        self.send_set_config_option(conversation_id, config_id, value, boolean, cx);
         cx.notify();
     }
 
@@ -1138,6 +1150,7 @@ impl AppState {
         conversation_id: red_service::ConversationId,
         config_id: String,
         value: String,
+        boolean: bool,
         _cx: &mut Context<Self>,
     ) {
         if let Phase::Connected(active) = &self.phase {
@@ -1147,6 +1160,7 @@ impl AppState {
                     conversation_id,
                     config_id,
                     value,
+                    boolean,
                 },
             );
         }

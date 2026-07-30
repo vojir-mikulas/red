@@ -266,7 +266,7 @@ impl DatabaseDriver for MysqlDriver {
 
     /// Rebind the default database. Shares the `Pool` (an `Arc` internally), so
     /// this is a field copy, not a new dial. A namespace matching what the DSN
-    /// already dialled is stored as `None`, so [`Self::conn`] skips the `USE`
+    /// already dialled is stored as `None`, so `Self::conn` skips the `USE`
     /// entirely and the common path costs exactly what it did before.
     fn scoped(self: Arc<Self>, namespace: Option<&str>) -> Arc<dyn DatabaseDriver> {
         let requested = namespace.filter(|n| !n.is_empty()).map(str::to_owned);

@@ -1042,14 +1042,16 @@ pub enum Command {
     AiCheckAuthStatus {
         agent_id: String,
     },
-    /// Change a session config selector (model / reasoning) on the subscription path.
-    /// `config_id`/`value` are the opaque agent identifiers from the advertised
-    /// `AiConfigOptionsAvailable`. The agent re-advertises the refreshed set, which
+    /// Change a session config control (model / reasoning / a boolean switch) on the
+    /// subscription path. `config_id`/`value` are the opaque agent identifiers from
+    /// the advertised `AiConfigOptionsAvailable`, and `boolean` mirrors that option's
+    /// [`AiConfigOption::boolean`]. The agent re-advertises the refreshed set, which
     /// comes back as another `AiConfigOptionsAvailable`. A no-op on the API-key path.
     AiSetConfigOption {
         conversation_id: ConversationId,
         config_id: String,
         value: String,
+        boolean: bool,
     },
     Shutdown,
 }
@@ -2108,18 +2110,23 @@ pub struct AiAuthStatus {
     pub method: Option<String>,
 }
 
-/// One session config selector the subscription agent advertises (the
-/// `AiConfigOptionsAvailable` payload): a model or reasoning-level dropdown. The
-/// `id`/`value` strings are opaque agent identifiers round-tripped via
-/// `Command::AiSetConfigOption`.
+/// One session config control the subscription agent advertises (the
+/// `AiConfigOptionsAvailable` payload): a model / reasoning-level dropdown, or an
+/// on/off switch such as the agent's fast mode. The `id`/`value` strings are
+/// opaque agent identifiers round-tripped via `Command::AiSetConfigOption`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiConfigOption {
     pub id: String,
     pub name: String,
     pub category: AiConfigCategory,
-    /// The currently-selected choice's `value`.
+    /// The currently-selected choice's `value`; `"true"` / `"false"` when
+    /// [`boolean`](Self::boolean).
     pub current_value: String,
     pub choices: Vec<AiConfigChoice>,
+    /// An on/off switch rather than a dropdown. The composer renders it as a
+    /// toggle, and the flag rides back on `Command::AiSetConfigOption` so the
+    /// agent gets a JSON boolean rather than a value id.
+    pub boolean: bool,
 }
 
 /// One choice within an [`AiConfigOption`] dropdown.
@@ -2148,6 +2155,11 @@ pub struct AiUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
+    /// The agent's total context window, when it reports one (subscription path).
+    /// With `input_tokens` carrying the tokens *currently in context*, the pair is
+    /// a "how full is the context" gauge; `0` means the backend didn't say, and
+    /// the panel falls back to a bare token count.
+    pub context_tokens: u64,
     /// Running session cost in USD, when the backend reports it (subscription
     /// path). `None` on the API-key path, which prices nothing.
     pub cost_usd: Option<f64>,

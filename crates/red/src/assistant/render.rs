@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use flint::prelude::*;
 use gpui::{
-    Animation, AnimationExt, AnyElement, Context, MouseButton, Pixels, Point, SharedString, div,
-    prelude::*, px,
+    Animation, AnimationExt, AnyElement, Context, MouseButton, Pixels, Point, SharedString, canvas,
+    div, prelude::*, px,
 };
 
 use crate::app::{AppState, Phase};
@@ -21,108 +21,299 @@ use super::{
     PendingPermission, QuickAction, Rename, RowKey, RowStatus,
 };
 
+/// The session-config selectors the composer always keeps a slot for, in the
+/// order they're drawn, each with the name to fall back on before the agent has
+/// said what it calls the control. They're drawn even before the agent advertises
+/// them so the composer's shape is stable from the first frame; an unadvertised
+/// slot is inert and reads "—".
+const CONFIG_SLOTS: [(red_service::AiConfigCategory, &str); 3] = [
+    (red_service::AiConfigCategory::Model, "Model"),
+    (red_service::AiConfigCategory::Reasoning, "Thinking"),
+    // The agent's permission mode (default / accept edits / auto / bypass),
+    // advertised as a `Mode` selector; round-trips like the others.
+    (red_service::AiConfigCategory::Mode, "Mode"),
+];
+
 impl AppState {
-    /// The composer's model + reasoning dropdowns (subscription path), to the left of
-    /// Send. One `flint::Select` per advertised Model/Reasoning selector; empty (so
-    /// Send sits alone) on the API-key path or before the agent's session opens.
-    /// Dimmed and non-interactive while a turn streams.
-    fn render_config_selectors(
+    /// The config controls the composer should render for `chat`: the chat's own
+    /// advertised set once its session is up, else this agent's cached set (seeded
+    /// from disk on open, or from an earlier session this run) so the controls
+    /// still show before the first turn. A pre-session pick persists via settings
+    /// and applies on session open.
+    fn config_options<'a>(
+        &self,
+        state: &'a AssistantState,
+        chat: &'a ChatSession,
+    ) -> &'a [red_service::AiConfigOption] {
+        if chat.config_options.is_empty() && self.agent_is_acp(&chat.provider) {
+            state
+                .provider_config_options
+                .get(&chat.provider)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+        } else {
+            chat.config_options.as_slice()
+        }
+    }
+
+    /// The composer's settings row: one equal-width, captioned slot per selector in
+    /// [`CONFIG_SLOTS`], so Model / Thinking / Mode read as a set rather than as
+    /// three differently-sized dropdowns that reflow whenever a label changes
+    /// length. Every slot is always present on the subscription path — a selector
+    /// the agent hasn't advertised (yet) renders inert with a placeholder instead
+    /// of vanishing.
+    ///
+    /// `None` on the API-key path, which has no session config at all: the model is
+    /// a setting there, and there is no thinking level or permission mode to pick.
+    /// Dimmed and non-interactive while a turn streams (config applies between turns).
+    fn render_config_row(
         &self,
         state: &AssistantState,
         chat: &ChatSession,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let streaming = chat.streaming;
-        let open = state.open_config.clone();
+    ) -> Option<AnyElement> {
+        if !self.agent_is_acp(&chat.provider) {
+            return None;
+        }
         let theme = cx.theme().clone();
-        // Before this chat opens its own session it has no advertised selectors yet;
-        // fall back to this agent's cached set (seeded from disk on open, or from an
-        // earlier session this run) so the dropdowns still show. A pre-session pick
-        // persists via settings and applies on session open.
-        let cached = state.provider_config_options.get(&chat.provider);
-        let options = if chat.config_options.is_empty() && self.agent_is_acp(&chat.provider) {
-            cached.map(Vec::as_slice).unwrap_or(&[])
-        } else {
-            chat.config_options.as_slice()
+        let options = self.config_options(state, chat);
+        let mut row = div()
+            .flex()
+            .items_stretch()
+            .gap_1p5()
+            .min_w(px(0.))
+            .px_2()
+            .pt_1p5();
+        for slot in CONFIG_SLOTS {
+            let opt = options
+                .iter()
+                .find(|o| o.category == slot.0 && !o.boolean && !o.choices.is_empty());
+            row = row.child(self.render_config_slot(state, chat, slot, opt, &theme, cx));
+        }
+        Some(row.into_any_element())
+    }
+
+    /// One slot in the settings row: a borderless [`Select`] filling a bordered
+    /// box. `opt` is `None` for a selector the agent hasn't advertised, which
+    /// draws the same box with a dim "—".
+    ///
+    /// The slots carry no printed caption — three of them in a sidebar this narrow
+    /// is a line of vertical space for a label the fixed left-to-right order
+    /// already teaches. What each one controls is on its hover tooltip, and the
+    /// open dropdown names it too.
+    ///
+    /// The slot is a *block* container on purpose: its children then stretch to
+    /// the slot's width, which is what makes every dropdown the same size no
+    /// matter how long its current label is.
+    fn render_config_slot(
+        &self,
+        state: &AssistantState,
+        chat: &ChatSession,
+        slot: (red_service::AiConfigCategory, &str),
+        opt: Option<&red_service::AiConfigOption>,
+        theme: &flint::Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (cat, name) = slot;
+        let streaming = chat.streaming;
+        // Prefer the agent's own wording for the control over RED's fallback.
+        let title = opt.map_or_else(|| name.to_string(), |o| o.name.clone());
+        let slot = div()
+            .id(SharedString::from(format!("ai-config-slot-{cat:?}")))
+            .flex_1()
+            .min_w(px(0.))
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.bg_elevated);
+
+        let Some(opt) = opt else {
+            // Advertised-later placeholder: same box, same rhythm, nothing to click.
+            return slot
+                .opacity(0.6)
+                .tooltip(flint::Tooltip::text(SharedString::from(format!(
+                    "{title} — offered once the agent's session is up"
+                ))))
+                .child(
+                    div()
+                        .h(px(24.))
+                        .flex()
+                        .items_center()
+                        .px_2()
+                        .text_size(theme.font_size_xs())
+                        .text_color(theme.text_faint)
+                        .child("—"),
+                )
+                .into_any_element();
         };
-        let mut row = div().flex().items_center().gap_1p5().min_w(px(0.));
-        let mut any = false;
-        for cat in [
-            red_service::AiConfigCategory::Model,
-            red_service::AiConfigCategory::Reasoning,
-            // The agent's permission mode (default / accept edits / auto / bypass),
-            // advertised as a `Mode` selector; round-trips like the others.
-            red_service::AiConfigCategory::Mode,
-        ] {
-            let Some(opt) = options
-                .iter()
-                .find(|o| o.category == cat && !o.choices.is_empty())
-            else {
-                continue;
-            };
-            any = true;
-            let selected = opt
-                .choices
-                .iter()
-                .position(|c| c.value == opt.current_value)
-                .unwrap_or(usize::MAX);
-            let is_open = !streaming && open.as_deref() == Some(opt.id.as_str());
-            let mut select = Select::new(SharedString::from(format!("ai-config-{}", opt.id)))
-                .selected(selected)
-                .open(is_open)
-                // Neutral, not accent-colored: these toolbar dropdowns shouldn't
-                // compete with the Send button for emphasis.
-                .accent(false)
-                // Lucide disclosure + check glyphs, matching the app's other dropdowns.
-                .chevron(crate::icons::icon(
-                    "chevron-down",
-                    theme.scale(14.),
-                    theme.text_dim,
-                ))
-                .check(crate::icons::icon("check", theme.scale(13.), theme.text))
-                .placeholder(crate::i18n::tr!("assistant.default", "Default"));
-            for choice in &opt.choices {
-                select = select.option(SharedString::from(choice.name.clone()));
-            }
+        let slot = slot.tooltip(flint::Tooltip::text(SharedString::from(title)));
+
+        let selected = opt
+            .choices
+            .iter()
+            .position(|c| c.value == opt.current_value)
+            .unwrap_or(usize::MAX);
+        let is_open = !streaming && state.open_config.as_deref() == Some(opt.id.as_str());
+        let mut select = Select::new(SharedString::from(format!("ai-config-{}", opt.id)))
+            .selected(selected)
+            .open(is_open)
+            // The slot draws the box; the trigger only draws its label + chevron.
+            .seamless()
+            // Neutral, not accent-colored: these toolbar dropdowns shouldn't
+            // compete with the Send button for emphasis.
+            .accent(false)
+            // Lucide disclosure + check glyphs, matching the app's other dropdowns.
+            .chevron(crate::icons::icon(
+                "chevron-down",
+                theme.scale(13.),
+                theme.text_dim,
+            ))
+            .check(crate::icons::icon("check", theme.scale(13.), theme.text))
+            .placeholder(crate::i18n::tr!("assistant.default", "Default"));
+        for choice in &opt.choices {
+            select = select.option(SharedString::from(choice.name.clone()));
+        }
+        if !streaming {
+            let view = cx.entity();
+            let id_toggle = opt.id.clone();
+            select = select.on_toggle(move |_, cx| {
+                view.update(cx, |this, cx| {
+                    if let Some(s) = this.assistant.as_mut() {
+                        s.open_config = if s.open_config.as_deref() == Some(id_toggle.as_str()) {
+                            None
+                        } else {
+                            Some(id_toggle.clone())
+                        };
+                        cx.notify();
+                    }
+                });
+            });
+            let view = cx.entity();
+            let id_select = opt.id.clone();
+            let values: Vec<String> = opt.choices.iter().map(|c| c.value.clone()).collect();
+            select = select.on_select(move |ix, _, cx| {
+                if let Some(value) = values.get(ix).cloned() {
+                    let id = id_select.clone();
+                    view.update(cx, |this, cx| this.change_config_option(id, value, cx));
+                }
+            });
+        }
+        slot.when(streaming, |d| d.opacity(0.5))
+            .child(select)
+            .into_any_element()
+    }
+
+    /// The composer's on/off switches: one per boolean session-config control the
+    /// agent advertises. On Claude Code that's fast mode — a higher-throughput
+    /// decode on the Opus models that support it — but nothing here is specific to
+    /// it: any boolean the agent offers gets a switch.
+    ///
+    /// When the agent advertises none (it isn't connected yet, or its model has no
+    /// such option), a disabled "Fast" switch stands in so the control is
+    /// discoverable rather than appearing out of nowhere later.
+    fn render_config_switches(
+        &self,
+        state: &AssistantState,
+        chat: &ChatSession,
+        theme: &flint::Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.agent_is_acp(&chat.provider) {
+            return None;
+        }
+        let streaming = chat.streaming;
+        let switches: Vec<&red_service::AiConfigOption> = self
+            .config_options(state, chat)
+            .iter()
+            .filter(|o| o.boolean)
+            .collect();
+
+        let pill = |theme: &flint::Theme| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .h(px(22.))
+                .px_1p5()
+                .rounded(theme.radius)
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.bg_elevated)
+        };
+
+        if switches.is_empty() {
+            return Some(
+                pill(theme)
+                    .id("ai-fast-placeholder")
+                    .opacity(0.5)
+                    .tooltip(flint::Tooltip::text(
+                        "Fast mode: offered by the agent once its session is up, on \
+                         models that support it.",
+                    ))
+                    .child(crate::icons::icon(
+                        "zap",
+                        theme.scale(11.),
+                        theme.text_faint,
+                    ))
+                    .child(
+                        div()
+                            .text_size(theme.scale(10.))
+                            .text_color(theme.text_faint)
+                            .child(crate::i18n::tr!("assistant.fast", "Fast")),
+                    )
+                    .child(flint::Toggle::new("ai-fast-off", false).disabled(true))
+                    .into_any_element(),
+            );
+        }
+
+        let mut row = div().flex().items_center().gap_1p5();
+        for opt in switches {
+            let on = opt.current_value == "true";
+            // A `zap` for anything fast-mode-shaped, a plain dot otherwise, so the
+            // switch reads at a glance without relying on the truncated label.
+            let fast = opt.id.to_lowercase().contains("fast")
+                || opt.name.to_lowercase().contains("fast")
+                || opt.name.to_lowercase().contains("speed");
+            let tint = if on { theme.accent } else { theme.text_faint };
+            let mut toggle =
+                flint::Toggle::new(SharedString::from(format!("ai-switch-{}", opt.id)), on)
+                    .label(SharedString::from(opt.name.clone()))
+                    .disabled(streaming);
             if !streaming {
                 let view = cx.entity();
-                let id_toggle = opt.id.clone();
-                select = select.on_toggle(move |_, cx| {
-                    view.update(cx, |this, cx| {
-                        if let Some(s) = this.assistant.as_mut() {
-                            s.open_config = if s.open_config.as_deref() == Some(id_toggle.as_str())
-                            {
-                                None
-                            } else {
-                                Some(id_toggle.clone())
-                            };
-                            cx.notify();
-                        }
-                    });
-                });
-                let view = cx.entity();
-                let id_select = opt.id.clone();
-                let values: Vec<String> = opt.choices.iter().map(|c| c.value.clone()).collect();
-                select = select.on_select(move |ix, _, cx| {
-                    if let Some(value) = values.get(ix).cloned() {
-                        let id = id_select.clone();
-                        view.update(cx, |this, cx| this.change_config_option(id, value, cx));
-                    }
+                let id = opt.id.clone();
+                toggle = toggle.on_change(move |next, _, cx| {
+                    let (id, value) = (id.clone(), next.to_string());
+                    view.update(cx, |this, cx| this.change_config_option(id, value, cx));
                 });
             }
             row = row.child(
-                div()
-                    // Each dropdown may shrink below its label width so all of them
-                    // (plus Send) fit the narrowest sidebar; the label truncates.
-                    .min_w(px(0.))
-                    .when(streaming, |d| d.opacity(0.5))
-                    .child(select),
+                pill(theme)
+                    .id(SharedString::from(format!("ai-switch-pill-{}", opt.id)))
+                    .when(on, |p| p.border_color(theme.accent.opacity(0.5)))
+                    .when(streaming, |p| p.opacity(0.5))
+                    .tooltip(flint::Tooltip::text(SharedString::from(format!(
+                        "{} — {}",
+                        opt.name,
+                        if on { "on" } else { "off" }
+                    ))))
+                    .child(crate::icons::icon(
+                        if fast { "zap" } else { "toggle-left" },
+                        theme.scale(11.),
+                        tint,
+                    ))
+                    .child(
+                        div()
+                            .max_w(px(64.))
+                            .truncate()
+                            .text_size(theme.scale(10.))
+                            .text_color(tint)
+                            .child(SharedString::from(opt.name.clone())),
+                    )
+                    .child(toggle),
             );
         }
-        if !any {
-            return div().into_any_element();
-        }
-        row.into_any_element()
+        Some(row.into_any_element())
     }
 
     /// The assistant panel body, docked right of the workspace by the shell.
@@ -247,9 +438,9 @@ impl AppState {
                 .into_any_element()
         };
 
-        // A bordered, rounded composer card (Zed-style): the multiline input on top,
-        // a slim toolbar row below with the model/reasoning selectors on the left and
-        // the send/stop button on the right.
+        // A bordered, rounded composer card (Zed-style), stacked top to bottom:
+        // the multiline input, a settings row of equal-width selector slots, and a
+        // status row carrying the usage ring, the agent's switches, and send/stop.
         let composer = div()
             .flex_shrink_0()
             .m_2()
@@ -267,6 +458,9 @@ impl AppState {
                     .pt_1p5()
                     .child(state.input.clone()),
             )
+            .when_some(self.render_config_row(state, chat, cx), |card, row| {
+                card.child(row)
+            })
             .child(
                 div()
                     .flex()
@@ -274,10 +468,21 @@ impl AppState {
                     .justify_between()
                     .gap_2()
                     .px_2()
-                    .pt_2()
+                    .pt_1p5()
                     .pb_1p5()
-                    .child(self.render_config_selectors(state, chat, cx))
-                    .child(action),
+                    .child(render_usage(chat.last_usage.as_ref(), &theme))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .flex_shrink_0()
+                            .when_some(
+                                self.render_config_switches(state, chat, &theme, cx),
+                                |row, switches| row.child(switches),
+                            )
+                            .child(action),
+                    ),
             );
 
         let view = div()
@@ -296,9 +501,6 @@ impl AppState {
                 col.child(chips)
             })
             .child(composer)
-            .when_some(chat.last_usage, |col, usage| {
-                col.child(render_usage(&usage, &theme))
-            })
             .into_any_element();
         self.with_agent_menu(view, cx)
     }
@@ -1822,14 +2024,33 @@ fn stream_caret(theme: &flint::Theme, reduce_motion: bool) -> AnyElement {
     .into_any_element()
 }
 
-/// The token/cost footer: a compact, dim strip under the composer showing
-/// the latest turn's accounting. The subscription path reports the tokens in
-/// context plus a running session cost; the API-key path reports per-turn tokens
-/// and no cost. Only non-zero/present fields render.
-fn render_usage(usage: &red_service::AiUsage, theme: &flint::Theme) -> AnyElement {
+/// How full the context window is, as a 0..=1 fraction, when the backend reported
+/// both the tokens in context and the window they sit in. `None` whenever the
+/// share can't be computed — the API-key path reports per-turn tokens with no
+/// window, so there is no "how full" to draw.
+fn context_fraction(usage: &red_service::AiUsage) -> Option<f32> {
+    (usage.context_tokens > 0)
+        .then(|| (usage.input_tokens as f32 / usage.context_tokens as f32).clamp(0., 1.))
+}
+
+/// The full accounting, as the ring's hover tooltip: the context share, the token
+/// breakdown, and the running session cost. This is the detail the composer's
+/// footer used to spend a whole strip on; the ring carries it now. One line, since
+/// the tooltip is a single text run.
+fn usage_tooltip(usage: &red_service::AiUsage) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if usage.input_tokens > 0 {
-        parts.push(format!("{} in", compact_count(usage.input_tokens)));
+    match context_fraction(usage) {
+        Some(f) => parts.push(format!(
+            "Context {} of {} ({:.0}%)",
+            compact_count(usage.input_tokens),
+            compact_count(usage.context_tokens),
+            f * 100.
+        )),
+        // No window reported (API-key path): the raw per-turn counts are all there is.
+        None if usage.input_tokens > 0 => {
+            parts.push(format!("{} in", compact_count(usage.input_tokens)));
+        }
+        None => {}
     }
     if usage.output_tokens > 0 {
         parts.push(format!("{} out", compact_count(usage.output_tokens)));
@@ -1842,24 +2063,122 @@ fn render_usage(usage: &red_service::AiUsage, theme: &flint::Theme) -> AnyElemen
     }
     if let Some(cost) = usage.cost_usd {
         // Sub-cent sessions still read as a real number rather than "$0.00".
-        parts.push(format!("${cost:.4}"));
+        parts.push(format!("${cost:.4} this session"));
     }
-    let label = if parts.is_empty() {
-        "—".to_string()
+    if parts.is_empty() {
+        "No usage reported yet".to_string()
     } else {
         parts.join(" · ")
+    }
+}
+
+/// The usage gauge in the composer's status row: a ring filled by the share of
+/// the context window in use, with the percentage beside it. The full token and
+/// cost breakdown moved into its hover tooltip — the numbers matter when you go
+/// looking for them, the "am I running out of room" signal matters at a glance.
+///
+/// The ring stays put with no usage yet (an empty track and a dim "—") so the row
+/// doesn't jump the moment the first turn finishes.
+fn render_usage(usage: Option<&red_service::AiUsage>, theme: &flint::Theme) -> AnyElement {
+    let fraction = usage.and_then(context_fraction);
+    // Amber past three quarters, red past nine tenths: the point where trimming
+    // the conversation stops being optional.
+    let color = match fraction {
+        Some(f) if f >= 0.9 => theme.red,
+        Some(f) if f >= 0.75 => theme.yellow,
+        Some(_) => theme.accent,
+        None => theme.text_faint,
+    };
+    let label = match (fraction, usage) {
+        (Some(f), _) => format!("{:.0}%", f * 100.),
+        // No window reported (API-key path): fall back to the raw token count.
+        (None, Some(u)) if u.input_tokens > 0 => compact_count(u.input_tokens),
+        _ => "—".to_string(),
     };
     div()
-        .flex_shrink_0()
+        .id("assistant-usage")
         .flex()
         .items_center()
-        .justify_end()
-        .px_3()
-        .pb_1p5()
-        .text_size(theme.scale(10.))
-        .text_color(theme.text_muted)
-        .child(label)
+        .gap_1p5()
+        .min_w(px(0.))
+        .tooltip(flint::Tooltip::text(SharedString::from(usage.map_or_else(
+            || "No usage reported yet".to_string(),
+            usage_tooltip,
+        ))))
+        .child(usage_ring(fraction, color, theme.border_strong))
+        .child(
+            div()
+                .truncate()
+                .text_size(theme.scale(10.))
+                .text_color(if fraction.is_some() {
+                    theme.text_muted
+                } else {
+                    theme.text_faint
+                })
+                .child(SharedString::from(label)),
+        )
         .into_any_element()
+}
+
+/// A 16px donut: a full-circle track plus a `fraction` arc from 12 o'clock,
+/// clockwise. Painted rather than assembled from divs — an arc is the one shape
+/// a box model can't make.
+fn usage_ring(fraction: Option<f32>, color: gpui::Hsla, track: gpui::Hsla) -> AnyElement {
+    const SIZE: f32 = 16.;
+    const STROKE: f32 = 2.5;
+    let filled = fraction.unwrap_or(0.).clamp(0., 1.);
+    // The size goes on the canvas itself: it has no intrinsic one, and a bare
+    // `canvas` would lay out zero-high and paint the ring off its own bounds.
+    canvas(
+        |_, _, _| {},
+        move |bounds, (), window, _| {
+            let center = gpui::point(
+                bounds.origin.x + px(SIZE / 2.),
+                bounds.origin.y + px(SIZE / 2.),
+            );
+            let radius = (SIZE - STROKE) / 2.;
+            paint_arc(window, center, radius, 1., track, STROKE);
+            if filled > 0. {
+                paint_arc(window, center, radius, filled, color, STROKE);
+            }
+        },
+    )
+    .size(px(SIZE))
+    .flex_shrink_0()
+    .into_any_element()
+}
+
+/// Stroke `turns` of a circle (0..=1) clockwise from 12 o'clock as a polyline —
+/// `PathBuilder` has no arc primitive, and at ring scale the segments read as a
+/// smooth curve.
+fn paint_arc(
+    window: &mut gpui::Window,
+    center: Point<Pixels>,
+    radius: f32,
+    turns: f32,
+    color: gpui::Hsla,
+    stroke: f32,
+) {
+    // Enough segments that a full circle stays smooth at this size, scaled down
+    // for shorter arcs so a 5% sliver doesn't pay for 48 of them.
+    let steps = ((48. * turns).ceil() as usize).max(2);
+    let mut pb = gpui::PathBuilder::stroke(px(stroke));
+    for i in 0..=steps {
+        let angle = -std::f32::consts::FRAC_PI_2
+            + std::f32::consts::TAU * turns * (i as f32 / steps as f32);
+        let p = gpui::point(
+            center.x + px(radius * angle.cos()),
+            center.y + px(radius * angle.sin()),
+        );
+        if i == 0 {
+            pb.move_to(p);
+        } else {
+            pb.line_to(p);
+        }
+    }
+    if let Ok(path) = pb.build() {
+        window.paint_path(path, color);
+    }
 }
 
 /// Render a token count compactly: `1234 → 1.2k`, `2_000_000 → 2.0M`.
@@ -1883,5 +2202,58 @@ mod tests {
         assert_eq!(compact_count(999), "999");
         assert_eq!(compact_count(1_200), "1.2k");
         assert_eq!(compact_count(2_000_000), "2.0M");
+    }
+
+    #[test]
+    fn context_fraction_needs_a_reported_window() {
+        // The subscription path reports both, so the ring can fill.
+        let acp = red_service::AiUsage {
+            input_tokens: 50_000,
+            context_tokens: 200_000,
+            ..Default::default()
+        };
+        assert_eq!(context_fraction(&acp), Some(0.25));
+        // Over-full clamps rather than overdrawing the ring.
+        let full = red_service::AiUsage {
+            input_tokens: 300_000,
+            context_tokens: 200_000,
+            ..Default::default()
+        };
+        assert_eq!(context_fraction(&full), Some(1.0));
+        // The API-key path reports tokens with no window: nothing to fill.
+        let api_key = red_service::AiUsage {
+            input_tokens: 4_000,
+            output_tokens: 900,
+            ..Default::default()
+        };
+        assert_eq!(context_fraction(&api_key), None);
+        assert_eq!(context_fraction(&red_service::AiUsage::default()), None);
+    }
+
+    #[test]
+    fn usage_tooltip_carries_the_detail_the_ring_drops() {
+        let acp = red_service::AiUsage {
+            input_tokens: 30_800,
+            context_tokens: 200_000,
+            cost_usd: Some(0.1647),
+            ..Default::default()
+        };
+        assert_eq!(
+            usage_tooltip(&acp),
+            "Context 30.8k of 200.0k (15%) · $0.1647 this session"
+        );
+        // No window: fall back to the raw per-turn counts.
+        let api_key = red_service::AiUsage {
+            input_tokens: 4_000,
+            output_tokens: 900,
+            cache_read_input_tokens: 2_000,
+            ..Default::default()
+        };
+        assert_eq!(usage_tooltip(&api_key), "4.0k in · 900 out · 2.0k cached");
+        // Nothing reported reads as such rather than as an empty tooltip.
+        assert_eq!(
+            usage_tooltip(&red_service::AiUsage::default()),
+            "No usage reported yet"
+        );
     }
 }

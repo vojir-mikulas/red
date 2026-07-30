@@ -105,7 +105,7 @@ pub enum DropKind {
 /// than pre-worded, so the phrasing stays with the layer that displays it.
 ///
 /// A `table` / `name` of `None` means the object could not be extracted, not that
-/// there isn't one; see [`target_object`].
+/// there isn't one; see `target_object`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Risk {
     /// An `UPDATE`/`DELETE` with no `WHERE` at all: it rewrites or removes every

@@ -3,7 +3,7 @@
 //!
 //! The structural sibling of [`crate::diff`], which compares *data*. Both are
 //! pure: no drivers, no cursors, no UI, no runtime. This one takes the
-//! introspection types RED already loads ([`SchemaMeta`] + [`TableDetail`]) and
+//! introspection types RED already loads ([`SchemaMeta`] + [`crate::TableDetail`]) and
 //! answers what changed; the service walks the objects and feeds it, the UI
 //! renders the result.
 //!

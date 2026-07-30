@@ -19,17 +19,40 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   splits it downward (both repeatable), ⌥⌘\ cycles focus, ⌥⌘W closes a pane and
   folds its tabs into its neighbour, ⌘⇧↩ zooms a pane to fill the work area, and
   ⌥⌘0 resets every divider to even shares.
+- The AI assistant's composer now offers whichever on/off settings the agent
+  exposes for the session as switches — on Claude Code that includes fast mode,
+  the higher-throughput decode available on the models that support it.
 
 ### Changed
+- The AI assistant's composer settings now read as a set: model, thinking level
+  and permission mode sit in three equal slots on one line, keeping their place
+  from the first frame instead of resizing and reshuffling as the agent reports
+  what it supports. Each names itself on hover; a setting the agent has not
+  offered yet shows as an inert slot rather than appearing out of nowhere once
+  the session is up.
+- Context usage in the AI assistant is now a ring showing how full the context
+  window is, amber past three quarters and red past nine tenths, in place of the
+  strip of token counts below the composer. The full breakdown — tokens in
+  context, cached and out, and the running session cost — is on its tooltip.
 - ⌘\ now splits the focused pane rather than toggling a fixed two-pane split;
   existing `keymap.toml` files that bind it keep working unchanged. Pane widths
   are held as proportions, so resizing the window now widens every pane in step
   instead of stretching only the last one.
 
 ### Fixed
+- The breadcrumb's database picker now belongs to the pane it sits in. In a
+  split it used to open in every visible pane at once, and picking a database
+  then did nothing at all — each of the duplicate menus dismissed the click
+  meant for the others. Each pane's crumb also names that pane's own database
+  rather than the focused pane's, and picking one changes the half you picked
+  it in.
 - Each pane now keeps its own tab-strip scroll position and editor/result
   divider; previously the two halves of a split shared both, so scrolling one
   strip scrolled the other.
+- Superseding a Postgres query now reliably stops it at the server. A cancel
+  that arrived in the moment between the statement being prepared and being run
+  was discarded by the engine, so a flung scrollbar or a re-sort could leave the
+  old query scanning to completion on the server while RED had already moved on.
 
 ## [0.20.0] - 2026-07-30
 

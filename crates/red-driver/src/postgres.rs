@@ -90,12 +90,50 @@ fn lock<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// An out-of-band cancel for `client`: a separate cancel request over a fresh
 /// connection (not a dropped future). `client` is one connection, so this cancels
 /// exactly that connection's in-flight query.
+///
+/// Only sound where the query is already executing when the token is armed, as a
+/// cursor's is: its stream is open before the token exists. A one-shot fetch arms
+/// *before* it issues, so it needs [`pg_cancel_token_until`].
 fn pg_cancel_token(client: &Client) -> CancelToken {
     let token = client.cancel_token();
     CancelToken::new(move || {
         let token = token.clone();
         tokio::spawn(async move {
             let _ = token.cancel_query(NoTls).await;
+        });
+    })
+}
+
+/// Pause between re-sent cancels, and the cap on how long to keep re-sending
+/// before conceding that the backend will not stop.
+const CANCEL_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+const CANCEL_ATTEMPTS: usize = 200;
+
+/// An out-of-band cancel for `client`, re-sent until `done` is set.
+///
+/// Postgres honours a cancel request only against a backend that is *executing*.
+/// One that lands while the backend sits idle -- between the `Parse` and the
+/// `Execute` of a one-shot fetch -- is discarded by the server, and the fetch then
+/// runs to completion uncancelled while the caller believes it was superseded. The
+/// window is a single round trip, so a lone request loses the race whenever the
+/// engine is slow to start; re-sending until the fetch reports `done` closes it.
+fn pg_cancel_token_until(client: &Client, done: Arc<AtomicBool>) -> CancelToken {
+    let token = client.cancel_token();
+    CancelToken::new(move || {
+        let token = token.clone();
+        let done = done.clone();
+        tokio::spawn(async move {
+            for _ in 0..CANCEL_ATTEMPTS {
+                if done.load(Ordering::SeqCst) {
+                    break;
+                }
+                // A request that fails means the connection is gone, and with it
+                // anything there was to cancel.
+                if token.cancel_query(NoTls).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(CANCEL_RETRY).await;
+            }
         });
     })
 }
@@ -230,12 +268,16 @@ impl PostgresDriver {
         Fut: std::future::Future<Output = Result<T>>,
     {
         let client = self.acquire().await?;
-        let guard = abort.arm(pg_cancel_token(&client));
+        // Set the moment the fetch ends, so a cancel stops re-sending before the
+        // connection is reusable.
+        let done = Arc::new(AtomicBool::new(false));
+        let guard = abort.arm(pg_cancel_token_until(&client, done.clone()));
         let result = if abort.is_aborted() {
             Err(RedError::Interrupted)
         } else {
             f(client.clone()).await
         };
+        done.store(true, Ordering::SeqCst);
         drop::<ArmGuard>(guard); // disarm before the connection is reusable
         self.release(client);
         result

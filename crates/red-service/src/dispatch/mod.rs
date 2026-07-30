@@ -1062,9 +1062,10 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 conversation_id,
                 config_id,
                 value,
+                boolean,
             } => {
-                // Change a model / reasoning selector on the subscription path. Off
-                // the loop; it awaits the agent's reply, then emits the refreshed set.
+                // Change a selector or switch on the subscription path. Off the
+                // loop; it awaits the agent's reply, then emits the refreshed set.
                 tokio::spawn(crate::acp::set_config_option(
                     ai_acp.clone(),
                     events.clone(),
@@ -1072,6 +1073,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     conversation_id,
                     config_id,
                     value,
+                    boolean,
                 ));
             }
 

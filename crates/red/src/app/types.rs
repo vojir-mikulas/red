@@ -993,7 +993,7 @@ pub(crate) struct PendingConfirm {
 #[derive(Clone)]
 pub(crate) enum PendingWrite {
     /// A graded editor statement, run verbatim via `execute_sql` on confirm. The
-    /// [`Assessment`] rides along so the modal can show *why* it stopped and, at
+    /// [`Assessment`](red_core::sql::Assessment) rides along so the modal can show *why* it stopped and, at
     /// [`RiskLevel::Critical`](red_core::sql::RiskLevel::Critical), which object the
     /// user has to type out.
     EditorSql {
@@ -1601,9 +1601,13 @@ pub(crate) struct ActiveConn {
     ///
     /// Only meaningful when `config.kind.namespace_caps().settable`.
     pub namespace: Option<String>,
-    /// Whether the run bar's namespace picker is showing its option list. Flint's
-    /// `Select` is caller-controlled, so the open state lives here.
-    pub namespace_menu_open: bool,
+    /// Which pane's breadcrumb namespace picker is showing its option list, if
+    /// any. The menu is caller-controlled, so the open state lives here — and it
+    /// is keyed by pane rather than a bare `bool`, because every visible pane
+    /// renders its own breadcrumb: a shared flag opened the dropdown in all of
+    /// them at once, and each copy's outside-click dismissal then swallowed the
+    /// mouse-down aimed at another copy's item, so picking did nothing.
+    pub namespace_menu_pane: Option<PaneId>,
     /// Open query tabs. May be empty: closing every tab leaves the strip bare and
     /// the shell shows a placeholder, with the connection still open.
     pub tabs: Vec<QueryTab>,
@@ -1616,7 +1620,7 @@ pub(crate) struct ActiveConn {
     /// Focus anchor for the schema sidebar, so keyboard focus can move between
     /// docks and each can receive its own navigation keys. The editor focuses its
     /// own `CodeEditor` and each pane's grid its own handle (see
-    /// [`crate::panes::PaneUi`]).
+    /// `PaneUi`).
     pub schema_focus: FocusHandle,
     /// Which of the shell's three areas holds focus; drives focus cycling and the
     /// focus ring.
@@ -1734,7 +1738,7 @@ impl ActiveConn {
             // whose database segment is optional and was left blank (MySQL).
             namespace: (!config.database.is_empty() && config.kind.namespace_caps().settable)
                 .then(|| config.database.clone()),
-            namespace_menu_open: false,
+            namespace_menu_pane: None,
             session,
             conn_id,
             config,
@@ -1791,7 +1795,7 @@ impl ActiveConn {
 
     /// The focus handle for `pane`'s result grid; each pane has its own so
     /// keyboard focus never lands on two grids at once. `None` before the first
-    /// frame after the pane appeared (see [`crate::panes::PaneUi::grid_focus`]).
+    /// frame after the pane appeared (see `PaneUi::grid_focus`).
     pub(crate) fn grid_focus_for(&self, pane: PaneId) -> Option<&FocusHandle> {
         self.layout.grid_focus(pane)
     }
@@ -1818,6 +1822,20 @@ impl ActiveConn {
             return None;
         }
         self.active()
+            .and_then(|t| t.namespace.clone())
+            .or_else(|| self.namespace.clone())
+    }
+
+    /// The namespace of the tab at `tab_idx`, for rendering *that* tab's
+    /// breadcrumb. In a split every pane draws a crumb, so reading
+    /// [`namespace_for_send`](Self::namespace_for_send) there would have shown
+    /// the focused pane's database in all of them.
+    pub(crate) fn namespace_for_tab(&self, tab_idx: usize) -> Option<String> {
+        if !self.config.kind.namespace_caps().settable {
+            return None;
+        }
+        self.tabs
+            .get(tab_idx)
             .and_then(|t| t.namespace.clone())
             .or_else(|| self.namespace.clone())
     }

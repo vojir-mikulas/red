@@ -665,7 +665,7 @@ pub fn first_keyword(sql: &str) -> &str {
 ///
 /// **Byte-offset preserving.** Each blanked byte becomes one space (newlines
 /// survive, keeping line structure), so an offset found in the result indexes the
-/// *original* string at the same place. [`risk::count_preflight`] relies on this
+/// *original* string at the same place. [`preflight::count_preflight`] relies on this
 /// to locate a `WHERE` in the stripped copy and then slice the predicate out of
 /// the real SQL, which is the only way to find it without a parser and still emit
 /// the literals verbatim.

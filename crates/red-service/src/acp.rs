@@ -877,9 +877,9 @@ async fn config_relay(
     }
 }
 
-/// Apply a model / reasoning change on a conversation (`Command::AiSetConfigOption`):
-/// issue the ACP `session/set_config_option` and emit the refreshed selector set so
-/// the UI reconciles. A request for an unknown/dead conversation, or a failure, is
+/// Apply a config change on a conversation (`Command::AiSetConfigOption`): issue
+/// the ACP `session/set_config_option` and emit the refreshed control set so the UI
+/// reconciles. A request for an unknown/dead conversation, or a failure, is
 /// surfaced as an `AiError` on that conversation. A no-op if the conversation isn't
 /// live yet (its agent starts on the first turn).
 pub(crate) async fn set_config_option(
@@ -889,6 +889,7 @@ pub(crate) async fn set_config_option(
     conversation_id: ConversationId,
     config_id: String,
     value: String,
+    boolean: bool,
 ) {
     let agent = {
         let guard = manager.lock().await;
@@ -897,7 +898,7 @@ pub(crate) async fn set_config_option(
     let Some(agent) = agent else {
         return;
     };
-    match agent.set_config(config_id, value).await {
+    match agent.set_config(config_id, value, boolean).await {
         Ok(Ok(options)) => emit(
             &events,
             session,
@@ -945,19 +946,22 @@ fn map_config_option(option: &AcpConfigOption) -> AiConfigOption {
                 description: c.description.clone(),
             })
             .collect(),
+        boolean: option.boolean,
     }
 }
 
 /// ACP reports cumulative session figures, not per-turn input/output: the tokens
-/// currently in context and a running cost. Surface the context tokens in the
-/// footer's input slot and pass the cost through (the panel labels it as the
-/// session total). A per-turn input/output split isn't something the agent breaks
-/// out, so the other slots stay zero.
+/// currently in context, the context window they sit in, and a running cost.
+/// Surface the context tokens in the footer's input slot, pass the window size
+/// through so the panel can draw a "how full" gauge, and pass the cost through
+/// (the panel labels it as the session total). A per-turn input/output split
+/// isn't something the agent breaks out, so the other slots stay zero.
 fn map_usage(usage: &red_acp::AcpUsage) -> AiUsage {
     AiUsage {
         input_tokens: usage.used_tokens,
         output_tokens: 0,
         cache_read_input_tokens: 0,
+        context_tokens: usage.context_tokens,
         cost_usd: usage.cost_usd,
     }
 }

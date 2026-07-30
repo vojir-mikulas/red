@@ -420,7 +420,7 @@ impl AppState {
     /// writable, the engine has *some* edit contract, and the table this result
     /// browses reported one (see [`red_core::RowEditCaps`]).
     ///
-    /// [`EditMode::None`] means no update/delete affordances at all -- read-only is
+    /// [`EditMode::None`](red_core::EditMode::None) means no update/delete affordances at all -- read-only is
     /// the safe default at every level.
     pub(crate) fn row_edit_mode(&self) -> red_core::EditMode {
         let Phase::Connected(active) = &self.phase else {
