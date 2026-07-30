@@ -26,12 +26,15 @@ pub(crate) struct SavedQuery {
     /// The header `description:`, shown as a hint in the picker.
     pub description: Option<String>,
     /// The header `tags:` (comma-separated), retained for a future filter.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "parsed and retained for a planned saved-query filter"
+    )]
     pub tags: Vec<String>,
     /// The complete file contents: what drops into the editor, runnable as-is.
     pub sql: String,
     /// The backing `.sql` file, for a future rename / delete.
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "retained for a planned saved-query rename/delete")]
     pub path: PathBuf,
 }
 

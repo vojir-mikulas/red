@@ -29,6 +29,12 @@ use crate::app::{ActiveConn, AppState};
 
 /// Newest entries retained per connection. Past this, the oldest for that
 /// connection are dropped on the next record/delete.
+/// The most SQL bytes one history entry stores. A 10MB pasted script recorded
+/// verbatim would be re-cloned, re-serialized, and fsynced on every subsequent
+/// run; past this the entry keeps a head + a marker so the log stays light while
+/// still showing what ran.
+const MAX_ENTRY_SQL_BYTES: usize = 16 * 1024;
+
 const MAX_PER_CONN: usize = 100;
 /// Global backstop across all connections, so a hundred connections can't grow
 /// the file without bound.
@@ -114,7 +120,7 @@ impl QueryHistory {
             0,
             HistoryEntry {
                 id,
-                sql: sql.to_string(),
+                sql: cap_entry_sql(sql),
                 conn_id: conn_id.to_string(),
                 ran_unix: crate::conversations::now_unix(),
             },
@@ -177,6 +183,24 @@ impl QueryHistory {
             tracing::warn!("failed to save query history: {e}");
         }
     }
+}
+
+/// Cap one entry's SQL to [`MAX_ENTRY_SQL_BYTES`], keeping a head slice plus a
+/// truncation marker on a char boundary. A short statement (the overwhelming
+/// case) is stored verbatim.
+fn cap_entry_sql(sql: &str) -> String {
+    if sql.len() <= MAX_ENTRY_SQL_BYTES {
+        return sql.to_string();
+    }
+    let mut cut = MAX_ENTRY_SQL_BYTES;
+    while cut > 0 && !sql.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}\n-- … (truncated in history; {} total)",
+        &sql[..cut],
+        sql.len()
+    )
 }
 
 /// Serialize `entries` to `path` via a temp file + rename, owner-only on Unix.

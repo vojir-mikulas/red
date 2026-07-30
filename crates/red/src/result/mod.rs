@@ -1968,7 +1968,7 @@ impl AppState {
             let (new_row, new_col) = match mv {
                 TableNav::Up => (row.saturating_sub(1), col),
                 TableNav::Down => ((row + 1).min(last_row), col),
-                TableNav::Left => (row, (col - 1).max(first_col)),
+                TableNav::Left => (row, col.saturating_sub(1).max(first_col)),
                 TableNav::Right => (row, (col + 1).min(last_col)),
                 TableNav::RowStart => (row, first_col),
                 TableNav::RowEnd => (row, last_col),

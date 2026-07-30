@@ -1156,13 +1156,50 @@ impl AppState {
                  Blank lines and lines starting with # are ignored. Commands run in order.",
             );
 
+        // The destructive pre-scan's findings: the file runs end to end on one
+        // click, so anything that would have been parked behind the console's
+        // confirm must be readable here first.
+        let destructive = (!imp.destructive.is_empty() && !imp.running).then(|| {
+            const SHOWN: usize = 5;
+            let total = imp.destructive.len();
+            let mut warn = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .text_size(theme.scale(12.))
+                .text_color(theme.red)
+                .child(crate::i18n::tr!(
+                    "kv.import_destructive",
+                    "{count} destructive command(s) in this file:",
+                    count = total
+                ));
+            for line in imp.destructive.iter().take(SHOWN) {
+                warn = warn.child(
+                    div()
+                        .font_family(theme.mono_family.clone())
+                        .text_size(theme.scale(11.))
+                        .truncate()
+                        .child(line.clone()),
+                );
+            }
+            if total > SHOWN {
+                warn = warn.child(
+                    div()
+                        .text_size(theme.scale(11.))
+                        .child(format!("… and {} more", total - SHOWN)),
+                );
+            }
+            warn
+        });
+
         let body = div()
             .flex()
             .flex_col()
             .gap_3()
             .child(hint)
             .child(file_row)
-            .children(status);
+            .children(status)
+            .children(destructive);
 
         let (run_view, cancel_view, close_view) = (view.clone(), view.clone(), view.clone());
         let footer = div()
@@ -1182,7 +1219,14 @@ impl AppState {
             )
             .child(
                 Button::new("kv-import-run", "Import")
-                    .variant(ButtonVariant::Primary)
+                    // Danger styling when the pre-scan found destructive
+                    // commands: the click runs them all, so the button itself
+                    // must not read as a routine primary action.
+                    .variant(if imp.destructive.is_empty() {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::Danger
+                    })
                     .size(ButtonSize::Sm)
                     .disabled(!can_import)
                     .on_click(move |_, _, cx| {

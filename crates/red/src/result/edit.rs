@@ -1164,7 +1164,10 @@ impl AppState {
             grid.pending = PendingChanges::default();
         }
         if reload {
-            self.reload_active_result(cx);
+            // Reload the tab that *owns this epoch*, not the focused one: a
+            // delete staged on tab A and submitted while tab B is focused must
+            // reopen A (its rows moved), not reset B's buffer and scroll.
+            self.reload_result_epoch(epoch, cx);
         }
         self.notify(ToastVariant::Success, "Changes submitted", cx);
         cx.notify();
@@ -1232,7 +1235,9 @@ impl AppState {
             grid.unstage_finished(&sources, &done);
         }
         if reload {
-            self.reload_active_result(cx);
+            // Reload the epoch's own tab, not the focused one (see
+            // `on_batch_applied`).
+            self.reload_result_epoch(epoch, cx);
         }
         // The mutations this submit started are the connection's newest, so refresh
         // the listing whether or not the panel is open: the status-bar indicator
@@ -1274,11 +1279,15 @@ impl AppState {
     /// used after a structural submit (deletes/inserts) or a foreign FK-column edit
     /// so the result re-resolves. Reuses [`ResultGrid::reopen_spec`] so the inline FK
     /// expansion (the `LEFT JOIN` set) is carried through the reload rather than lost.
-    fn reload_active_result(&mut self, cx: &mut Context<Self>) {
-        let reopen = match &mut self.phase {
-            Phase::Connected(active) => active.active_result_mut().map(|grid| grid.reopen_spec()),
-            _ => None,
-        };
+    /// Reopen the result carrying `epoch` wherever it lives — after a structural
+    /// submit (delete/insert) or a foreign FK-column edit — with its current sort
+    /// and filter, under a fresh epoch. Keyed by epoch rather than focus:
+    /// `reopen_spec` rebinds that grid's own epoch, so the reopened rows route
+    /// back to it even when another tab is on screen. Reuses
+    /// [`ResultGrid::reopen_spec`] so the inline FK `LEFT JOIN` set is carried
+    /// through rather than lost.
+    fn reload_result_epoch(&mut self, epoch: red_service::Epoch, cx: &mut Context<Self>) {
+        let reopen = self.result_by_epoch(epoch).map(|grid| grid.reopen_spec());
         self.apply_reopen(reopen, cx);
     }
 }

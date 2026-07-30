@@ -37,5 +37,3 @@ assistant-agent_prompt = Agent prompt
 assistant-message_claude_agent_for_commands = Message Claude Agent (/ for commands)
 
 assistant-search_conversations = Search conversations…
-
-assistant-result_shape = , showing a result of { $rows } row(s) × { $cols } column(s): { $names }

@@ -808,8 +808,15 @@ impl DatabaseDriver for MysqlDriver {
         }))
     }
 
-    async fn execute(&self, sql: &str) -> Result<u64> {
+    async fn execute_abort(&self, sql: &str, abort: &AbortSignal) -> Result<u64> {
         let mut conn = self.conn().await?;
+        // `KILL QUERY` armed for the write's duration (same shape as the fetch
+        // paths): a statement wedged on a metadata/row lock is stoppable, and
+        // the kill surfaces as Interrupted with the transaction rolled back.
+        let _guard = self.arm_kill(abort, conn.id());
+        if abort.is_aborted() {
+            return Err(RedError::Interrupted);
+        }
         conn.query_drop(self.begin_stmt())
             .await
             .map_err(map_my_err)?;
@@ -826,11 +833,19 @@ impl DatabaseDriver for MysqlDriver {
         }
     }
 
-    async fn execute_batch(&self, statements: &[String]) -> Result<Vec<u64>> {
+    async fn execute_batch_abort(
+        &self,
+        statements: &[String],
+        abort: &AbortSignal,
+    ) -> Result<Vec<u64>> {
         if statements.is_empty() {
             return Ok(Vec::new());
         }
         let mut conn = self.conn().await?;
+        let _guard = self.arm_kill(abort, conn.id());
+        if abort.is_aborted() {
+            return Err(RedError::Interrupted);
+        }
         conn.query_drop(self.begin_stmt())
             .await
             .map_err(map_my_err)?;
@@ -973,6 +988,17 @@ impl DatabaseDriver for MysqlDriver {
 
     fn quote_ident(&self, ident: &str) -> String {
         format!("`{}`", escape_ident(ident))
+    }
+
+    fn diff_order_clause(&self, key: &str, key_is_text: bool) -> String {
+        // MySQL's default collations are case-insensitive (utf8mb4_0900_ai_ci),
+        // which disagrees with the merge-walk's byte order; a binary cast sorts
+        // the UTF-8 bytes. NULLs already sort first ascending.
+        if key_is_text {
+            format!("CAST(`{}` AS BINARY)", escape_ident(key))
+        } else {
+            self.quote_ident(key)
+        }
     }
 
     async fn create_index(
@@ -1575,12 +1601,22 @@ fn my_value(value: Option<&MyValue>, col: &MyColumn, max: Option<usize>) -> Valu
 
 /// `TEXT` and `BLOB` share type codes and differ only by charset: the binary
 /// charset (`63`) marks genuine binary. `JSON` reports the binary charset but is
-/// UTF-8 text, so it's the one exception that stays `Text`. With a display cap
-/// (`max`), a non-key blob keeps only its length and over-cap text its prefix;
-/// `mysql_async` already owns the row's bytes, but capping keeps a *page* of fat
-/// cells from accumulating (and skips the second copy into the `Value`).
+/// UTF-8 text, and `DECIMAL`/`NEWDECIMAL` do too while arriving as ASCII digit
+/// strings — all three must decode as `Text`, or a price column shows
+/// `<7 bytes>` and a table copy inserts the digits as a blob. `BIT` stays
+/// binary on purpose: its wire form is a big-endian bit string, not characters.
+/// With a display cap (`max`), a non-key blob keeps only its length and
+/// over-cap text its prefix; `mysql_async` already owns the row's bytes, but
+/// capping keeps a *page* of fat cells from accumulating (and skips the second
+/// copy into the `Value`).
 fn bytes_value(bytes: &[u8], col: &MyColumn, max: Option<usize>) -> Value {
-    let is_binary = col.character_set() == 63 && col.column_type() != ColumnType::MYSQL_TYPE_JSON;
+    let text_shaped = matches!(
+        col.column_type(),
+        ColumnType::MYSQL_TYPE_JSON
+            | ColumnType::MYSQL_TYPE_DECIMAL
+            | ColumnType::MYSQL_TYPE_NEWDECIMAL
+    );
+    let is_binary = col.character_set() == 63 && !text_shaped;
     if is_binary {
         match max {
             Some(_) => Value::capped_blob(bytes.len()),
@@ -1833,6 +1869,41 @@ mod tests {
         .await;
         battery::pre_aborted_fetch_returns_immediately(&driver, heavy).await;
         battery::abort_after_completion_is_noop(&driver, "SELECT 1").await;
+    }
+
+    /// DECIMAL arrives from the wire as bytes in the binary charset, exactly
+    /// like a BLOB — the regression this pins is a price column decoding as
+    /// `Value::Blob` (`<7 bytes>` in the grid, bytea in a table copy) instead
+    /// of its digits.
+    #[tokio::test]
+    async fn decimal_decodes_as_text_not_blob() {
+        let url = url_or_skip!();
+        let driver = MysqlDriver::connect(&url, false).await.unwrap();
+        let t = tag("dec");
+        driver
+            .execute(&format!(
+                "CREATE TABLE `{t}` (id INT PRIMARY KEY, price DECIMAL(10,2), qty NUMERIC(6,3))"
+            ))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!("INSERT INTO `{t}` VALUES (1, 1234.56, -0.125)"))
+            .await
+            .unwrap();
+        let abort = AbortSignal::new();
+        let page = driver
+            .fetch_page(
+                &format!("SELECT price, qty FROM `{t}` ORDER BY id"),
+                0,
+                10,
+                PageCap::Display { key: None },
+                &abort,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.rows[0][0], Value::Text("1234.56".into()));
+        assert_eq!(page.rows[0][1], Value::Text("-0.125".into()));
+        driver.execute(&format!("DROP TABLE `{t}`")).await.unwrap();
     }
 
     #[tokio::test]

@@ -796,7 +796,7 @@ async fn preflight_counts_the_rows_a_statement_would_affect() {
         (5, "DROP TABLE orders", 5),
         (6, "TRUNCATE TABLE orders", 5),
     ] {
-        let sql = red_core::sql::count_preflight(statement)
+        let sql = red_core::sql::count_preflight(statement, red_core::sql::Dialect::Sqlite)
             .unwrap_or_else(|| panic!("count_preflight declined {statement}"));
         send(
             &handle,

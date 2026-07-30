@@ -44,6 +44,8 @@ kv-importing = [Ímpörtíñg…]
 
 kv-commands_ready = [{ $count } çömmáñd(s) réády tö rúñ]
 
+kv-import_destructive = [{ $count } déstrúçtívé çömmáñd(s) íñ thís fílé:]
+
 kv-import_keys = [Ímpört kéys]
 
 kv-this_cant_be_undone = [Thís çáñ't bé úñdöñé.]

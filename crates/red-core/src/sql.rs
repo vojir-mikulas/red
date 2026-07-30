@@ -35,6 +35,8 @@
 
 use std::ops::Range;
 
+use crate::DbKind;
+
 pub mod preflight;
 pub mod risk;
 
@@ -42,6 +44,84 @@ pub use preflight::count_preflight;
 pub use risk::{
     Assessment, DANGEROUS_FNS, DropKind, MutateVerb, Risk, RiskLevel, WRITE_TOKENS, assess,
 };
+
+/// The lexical profile of an engine's SQL: which comment forms exist and how
+/// string escapes work. The scanner must match the engine byte for byte in both
+/// directions — treating live SQL as a comment hides it from the safety gates
+/// while the engine still runs it, and treating a comment as live SQL executes
+/// text the user never wrote as code (a `DROP` after a `;` inside a MySQL `#`
+/// comment). Neither direction is safe to guess, so every entry point takes the
+/// dialect explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dialect {
+    /// The profile used when no engine is at hand (engine-less tooling, tests):
+    /// `#` is not a comment (the conservative reading — Postgres uses it as an
+    /// operator) and backslash escapes apply inside strings.
+    #[default]
+    Generic,
+    MySql,
+    Postgres,
+    Sqlite,
+    ClickHouse,
+}
+
+impl Dialect {
+    /// The dialect of an engine kind; the non-SQL kinds lex as [`Dialect::Generic`]
+    /// (they never reach the SQL scanner).
+    pub fn of(kind: DbKind) -> Self {
+        match kind {
+            DbKind::Postgres => Dialect::Postgres,
+            DbKind::Mysql => Dialect::MySql,
+            DbKind::Sqlite => Dialect::Sqlite,
+            DbKind::Clickhouse => Dialect::ClickHouse,
+            DbKind::Redis | DbKind::Mongo => Dialect::Generic,
+        }
+    }
+
+    /// MySQL alone speaks `#`-to-end-of-line comments. Everywhere else `#` is an
+    /// operator (Postgres JSONB `#>`, `#` XOR), so reading it as a comment would
+    /// hide live SQL from every gate that scans the stripped copy.
+    fn hash_comments(self) -> bool {
+        matches!(self, Dialect::MySql)
+    }
+
+    /// Whether `--` at `i` opens a line comment. MySQL requires whitespace (or
+    /// end of input) after the dashes — `SELECT 5--3` is arithmetic there — and
+    /// that is the *unsafe* direction to get wrong: text the engine executes
+    /// must not be invisible to the gates.
+    fn dash_comment_at(self, b: &[u8], i: usize) -> bool {
+        if !(i + 1 < b.len() && b[i] == b'-' && b[i + 1] == b'-') {
+            return false;
+        }
+        match self {
+            Dialect::MySql => b.get(i + 2).is_none_or(|c| c.is_ascii_whitespace()),
+            _ => true,
+        }
+    }
+
+    /// Whether a backslash escapes the next character inside a `'…'`/`"…"`
+    /// string. MySQL and ClickHouse say yes; Postgres (under
+    /// `standard_conforming_strings`, its default since 9.1) and SQLite treat
+    /// `\` as an ordinary character, so `'C:\'` is a complete literal there.
+    /// Postgres `E'…'` strings *do* escape — handled at the quote site, where
+    /// the prefix is visible ([`quote_escapes`]).
+    fn backslash_in_strings(self) -> bool {
+        matches!(
+            self,
+            Dialect::Generic | Dialect::MySql | Dialect::ClickHouse
+        )
+    }
+
+    /// Whether `$$`/`$tag$` opens a dollar-quoted body (Postgres, and
+    /// ClickHouse's heredoc). MySQL has none — with a `DELIMITER $$` in force a
+    /// `$` inside a routine body is just a byte.
+    fn dollar_quotes(self) -> bool {
+        matches!(
+            self,
+            Dialect::Generic | Dialect::Postgres | Dialect::ClickHouse
+        )
+    }
+}
 
 /// Break `sql` into its top-level statements, each trimmed, with blank and
 /// separator-only stretches dropped. A trailing statement without a final
@@ -51,8 +131,8 @@ pub use risk::{
 /// that care whether it's runnable check for a leading keyword.
 ///
 /// See [`statement_ranges`] for what is and isn't a separator.
-pub fn split_statements(sql: &str) -> Vec<&str> {
-    statement_ranges(sql)
+pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<&str> {
+    statement_ranges(sql, dialect)
         .into_iter()
         .map(|r| sql[r].trim())
         .filter(|s| !s.is_empty())
@@ -70,7 +150,7 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
 /// A separator inside any of these is not a boundary: a string literal, a quoted
 /// identifier, a line or block comment, a Postgres dollar-quoted body, or the
 /// compound body of a routine (see [`is_routine_ddl`]) whose blocks are still open.
-pub fn statement_ranges(sql: &str) -> Vec<Range<usize>> {
+pub fn statement_ranges(sql: &str, dialect: Dialect) -> Vec<Range<usize>> {
     let b = sql.as_bytes();
     let n = b.len();
     let mut out = Vec::new();
@@ -102,18 +182,20 @@ pub fn statement_ranges(sql: &str) -> Vec<Range<usize>> {
             // String literals and quoted identifiers. Backtick is MySQL's
             // identifier quote; single/double are SQL string / identifier.
             q @ (b'\'' | b'"' | b'`') => {
-                i = skip_quoted(b, i, q);
+                i = skip_quoted(b, i, q, quote_escapes(b, i, q, dialect));
                 fresh = false;
             }
             // `-- line comment` to end of line. Leaves `fresh` alone: a comment
             // above a statement is not part of it.
-            b'-' if i + 1 < n && b[i + 1] == b'-' => i = skip_line_comment(b, i),
+            b'-' if dialect.dash_comment_at(b, i) => i = line_comment_end(b, i + 2),
+            // MySQL `# line comment` to end of line.
+            b'#' if dialect.hash_comments() => i = line_comment_end(b, i + 1),
             // `/* block comment */`.
             b'/' if i + 1 < n && b[i + 1] == b'*' => i = skip_block_comment(b, i),
-            // Postgres dollar-quoted body (`$$…$$` / `$tag$…$tag$`). Falls through
-            // to a normal byte when the `$` isn't actually a dollar-quote opener
+            // Dollar-quoted body (`$$…$$` / `$tag$…$tag$`). Falls through to a
+            // normal byte when the `$` isn't actually a dollar-quote opener
             // (e.g. a `$1` positional parameter).
-            b'$' => {
+            b'$' if dialect.dollar_quotes() => {
                 i = match dollar_quote_end(b, i) {
                     Some(end) => end,
                     None => i + 1,
@@ -153,7 +235,7 @@ pub fn statement_ranges(sql: &str) -> Vec<Range<usize>> {
                     {
                         i = next_end;
                     }
-                } else if opens_block(b, word, i) {
+                } else if opens_block(b, word, i, dialect) {
                     depth += 1;
                 }
             }
@@ -169,23 +251,74 @@ pub fn statement_ranges(sql: &str) -> Vec<Range<usize>> {
     out
 }
 
-/// Whether `word` at `sql[..from]` opens a block that an `END` closes. `IF` and
-/// `REPEAT` are also functions (`IF(a, b, c)`), and `IF` also introduces the
-/// `IF [NOT] EXISTS` of a header, so neither spelling counts as a block.
-fn opens_block(b: &[u8], word: &[u8], from: usize) -> bool {
+/// Whether `word` at `sql[..from]` opens a block that an `END` closes.
+///
+/// `IF` and `REPEAT` are also functions, which is the one ambiguity here.
+/// Written call-style — `(` hard against the word — they are calls
+/// (`IF(a, b, c)`), matching how MySQL's own lexer reads built-ins. A *spaced*
+/// `(` after `IF` is usually a parenthesized block condition
+/// (`IF (available < NEW.quantity) THEN`), but can still be a call; only a
+/// top-level `THEN` before the statement ends settles it. `WHILE`, `CASE` and
+/// `LOOP` have no function form, so their parenthesized conditions always open
+/// blocks. `IF` also introduces the `IF [NOT] EXISTS` of a header, which opens
+/// nothing.
+fn opens_block(b: &[u8], word: &[u8], from: usize, dialect: Dialect) -> bool {
     if !is_block_kind(word) && !word.eq_ignore_ascii_case(b"begin") {
         return false;
     }
-    match next_word(b, from) {
-        // A function call, not a block: the `(` follows with nothing between.
-        None if b[from..].iter().find(|c| !c.is_ascii_whitespace()) == Some(&b'(') => false,
-        Some((next, _))
-            if next.eq_ignore_ascii_case(b"not") || next.eq_ignore_ascii_case(b"exists") =>
-        {
-            false
+    if word.eq_ignore_ascii_case(b"if") || word.eq_ignore_ascii_case(b"repeat") {
+        if b.get(from) == Some(&b'(') {
+            return false;
         }
-        _ => true,
+        let mut at = from;
+        while at < b.len() && b[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        if b.get(at) == Some(&b'(') {
+            return word.eq_ignore_ascii_case(b"if") && then_follows(b, at, dialect);
+        }
     }
+    !matches!(
+        next_word(b, from),
+        Some((next, _)) if next.eq_ignore_ascii_case(b"not") || next.eq_ignore_ascii_case(b"exists")
+    )
+}
+
+/// Whether a top-level `THEN` appears at or after `from` before the statement's
+/// own `;` — how a spaced `IF (…)` is told apart from a spaced call: the block
+/// form must reach a `THEN` (`IF (a) OR (b) THEN`), while a call's statement
+/// ends without one (`SET x = IF (a, b, c);`). Strings, comments and nested
+/// parens are skipped so a `then` inside any of them doesn't decide anything.
+fn then_follows(b: &[u8], from: usize, dialect: Dialect) -> bool {
+    let n = b.len();
+    let mut depth = 0usize;
+    let mut i = from;
+    while i < n {
+        match b[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b';' if depth == 0 => return false,
+            q @ (b'\'' | b'"' | b'`') => i = skip_quoted(b, i, q, quote_escapes(b, i, q, dialect)),
+            b'-' if dialect.dash_comment_at(b, i) => i = line_comment_end(b, i + 2),
+            b'#' if dialect.hash_comments() => i = line_comment_end(b, i + 1),
+            b'/' if i + 1 < n && b[i + 1] == b'*' => i = skip_block_comment(b, i),
+            c if is_word_byte(c) => {
+                let end = word_end(b, i);
+                if depth == 0 && b[i..end].eq_ignore_ascii_case(b"then") {
+                    return true;
+                }
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 /// The block kinds an `END` can close, as `END <kind>`. `BEGIN` is deliberately
@@ -228,6 +361,17 @@ fn routine_ddl_at(b: &[u8], from: usize) -> bool {
             .any(|k| word.eq_ignore_ascii_case(k.as_bytes()))
         {
             return true;
+        }
+        // A structural DDL kind settles the question before the window can reach
+        // an *object name* that happens to read like a routine kind: without
+        // this, `CREATE TABLE event (…)` would arm compound mode.
+        if [
+            "table", "view", "index", "database", "schema", "sequence", "user", "role",
+        ]
+        .iter()
+        .any(|k| word.eq_ignore_ascii_case(k.as_bytes()))
+        {
+            return false;
         }
         at = next;
     }
@@ -290,29 +434,47 @@ fn next_header_word(b: &[u8], from: usize) -> Option<(&[u8], usize)> {
     Some((&b[i..end], end))
 }
 
-/// The trimmed remainder of the line starting at `from` (a `DELIMITER` directive's
-/// token) with the index just past the newline.
+/// The `DELIMITER` directive's token: the first whitespace-separated word of the
+/// line's remainder — the mysql client reads one token, so a trailing comment
+/// (`DELIMITER $$ -- note`) must not become part of the separator — with the
+/// index just past the newline.
 fn rest_of_line(b: &[u8], from: usize) -> (&[u8], usize) {
     let mut end = from;
     while end < b.len() && b[end] != b'\n' {
         end += 1;
     }
-    let token = &b[from..end];
-    let lead = token.len() - token.iter().take_while(|c| c.is_ascii_whitespace()).count();
-    let token = &token[token.len() - lead..];
-    let trailing = token
+    let line = &b[from..end];
+    let lead = line.iter().take_while(|c| c.is_ascii_whitespace()).count();
+    let len = line[lead..]
         .iter()
-        .rev()
-        .take_while(|c| c.is_ascii_whitespace())
+        .take_while(|c| !c.is_ascii_whitespace())
         .count();
-    (&token[..token.len() - trailing], (end + 1).min(b.len()))
+    (&line[lead..lead + len], (end + 1).min(b.len()))
+}
+
+/// Whether a backslash escapes the next character inside the quote opened at `i`:
+/// never inside a backtick identifier, otherwise per the dialect's string rule,
+/// plus the Postgres `E'…'` escape-string form, recognised by the `e`/`E` hard
+/// against the opening quote that starts its own token.
+fn quote_escapes(b: &[u8], i: usize, q: u8, dialect: Dialect) -> bool {
+    if q == b'`' {
+        return false;
+    }
+    if dialect.backslash_in_strings() {
+        return true;
+    }
+    dialect == Dialect::Postgres
+        && q == b'\''
+        && i >= 1
+        && (b[i - 1] == b'e' || b[i - 1] == b'E')
+        && (i < 2 || !is_word_byte(b[i - 2]))
 }
 
 /// Index just past the closing quote of the literal/identifier opened at `i`
 /// (whose quote char is `q`). Handles the doubled-quote escape (`''`, `""`,
-/// ` `` `) and, for string quotes only, a backslash escape (`\'`). An unterminated
-/// quote consumes to end-of-input.
-fn skip_quoted(b: &[u8], i: usize, q: u8) -> usize {
+/// ` `` `) and, when `escapes` (see [`quote_escapes`]), a backslash escape
+/// (`\'`). An unterminated quote consumes to end-of-input.
+fn skip_quoted(b: &[u8], i: usize, q: u8, escapes: bool) -> usize {
     let n = b.len();
     let mut j = i + 1;
     while j < n {
@@ -324,8 +486,7 @@ fn skip_quoted(b: &[u8], i: usize, q: u8) -> usize {
             }
             return j + 1;
         }
-        // Backslash escapes apply inside '…' / "…" (MySQL), never in `…`.
-        if b[j] == b'\\' && q != b'`' && j + 1 < n {
+        if b[j] == b'\\' && escapes && j + 1 < n {
             j += 2;
             continue;
         }
@@ -334,11 +495,12 @@ fn skip_quoted(b: &[u8], i: usize, q: u8) -> usize {
     n
 }
 
-/// Index of the newline ending the `--` comment opened at `i` (or end-of-input).
-/// The newline itself is left for the main loop to step over.
-fn skip_line_comment(b: &[u8], i: usize) -> usize {
+/// Index of the newline ending the line comment whose *body* starts at `from`
+/// (just past the `--` or `#` marker), or end-of-input. The newline itself is
+/// left for the main loop to step over.
+fn line_comment_end(b: &[u8], from: usize) -> usize {
     let n = b.len();
-    let mut j = i + 2;
+    let mut j = from.min(n);
     while j < n && b[j] != b'\n' {
         j += 1;
     }
@@ -388,10 +550,14 @@ fn dollar_quote_end(b: &[u8], i: usize) -> Option<usize> {
 /// whitespace. Empty when the statement has no leading word at all: blank,
 /// comment-only, or paren-led (`(SELECT 1) UNION …`). Callers use that emptiness
 /// as "nothing runnable here" when filtering [`split_statements`] output.
+///
+/// Dialect-free on purpose: a leading `--` or `#` line can only be a comment (no
+/// dialect starts a statement with either operator), so skipping both is safe
+/// for every engine.
 pub fn first_keyword(sql: &str) -> &str {
     let mut s = sql.trim_start();
     loop {
-        if let Some(rest) = s.strip_prefix("--") {
+        if let Some(rest) = s.strip_prefix("--").or_else(|| s.strip_prefix('#')) {
             s = rest
                 .split_once('\n')
                 .map_or("", |(_, after)| after)
@@ -422,71 +588,72 @@ pub fn first_keyword(sql: &str) -> &str {
 /// Blanking rather than deleting keeps the surrounding tokens separated, so a
 /// stripped statement still lexes into the same words.
 ///
-/// **Byte-offset preserving.** Each blanked character becomes as many spaces as it
-/// had UTF-8 bytes, so an offset found in the result indexes the *original* string
-/// at the same place. [`risk::count_preflight`] relies on this to locate a `WHERE`
-/// in the stripped copy and then slice the predicate out of the real SQL, which is
-/// the only way to find it without a parser and still emit the literals verbatim.
-pub fn strip_noise(sql: &str) -> String {
-    // Blank one source character: same byte width, no content.
-    fn blank(out: &mut String, c: char) {
-        for _ in 0..c.len_utf8() {
-            out.push(' ');
+/// **Byte-offset preserving.** Each blanked byte becomes one space (newlines
+/// survive, keeping line structure), so an offset found in the result indexes the
+/// *original* string at the same place. [`risk::count_preflight`] relies on this
+/// to locate a `WHERE` in the stripped copy and then slice the predicate out of
+/// the real SQL, which is the only way to find it without a parser and still emit
+/// the literals verbatim.
+///
+/// Built on the same quote/comment helpers as [`statement_ranges`], with the same
+/// [`Dialect`], so the two can never disagree about where a literal or comment
+/// ends — the drift the module doc says these primitives exist to prevent.
+pub fn strip_noise(sql: &str, dialect: Dialect) -> String {
+    let b = sql.as_bytes();
+    let n = b.len();
+    let mut out = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        let from = i;
+        match b[i] {
+            q @ (b'\'' | b'"' | b'`') => {
+                i = skip_quoted(b, i, q, quote_escapes(b, i, q, dialect));
+                blank_span(&mut out, b, from, i);
+            }
+            b'-' if dialect.dash_comment_at(b, i) => {
+                i = line_comment_end(b, i + 2);
+                blank_span(&mut out, b, from, i);
+            }
+            b'#' if dialect.hash_comments() => {
+                i = line_comment_end(b, i + 1);
+                blank_span(&mut out, b, from, i);
+            }
+            b'/' if i + 1 < n && b[i + 1] == b'*' => {
+                i = skip_block_comment(b, i);
+                blank_span(&mut out, b, from, i);
+            }
+            // A dollar-quoted body is a string literal by another name; its
+            // content must be as invisible to the gates as any other literal.
+            b'$' if dialect.dollar_quotes() => match dollar_quote_end(b, i) {
+                Some(end) => {
+                    i = end;
+                    blank_span(&mut out, b, from, i);
+                }
+                None => {
+                    out.push(b'$');
+                    i += 1;
+                }
+            },
+            c => {
+                out.push(c);
+                i += 1;
+            }
         }
     }
-    let mut out = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            // String literal / quoted identifier: consume to the matching close,
-            // honoring the doubled-quote escape (`''`, `""`).
-            '\'' | '"' | '`' => {
-                blank(&mut out, c);
-                while let Some(&n) = chars.peek() {
-                    chars.next();
-                    if n == c {
-                        if chars.peek() == Some(&c) {
-                            chars.next();
-                            blank(&mut out, n);
-                            blank(&mut out, c);
-                            continue;
-                        }
-                        break;
-                    }
-                    blank(&mut out, n);
-                }
-                blank(&mut out, c);
-            }
-            // Line comment `-- …` to end of line. The newline survives so the
-            // statement keeps its line structure.
-            '-' if chars.peek() == Some(&'-') => {
-                blank(&mut out, c);
-                while let Some(&n) = chars.peek() {
-                    if n == '\n' {
-                        break;
-                    }
-                    chars.next();
-                    blank(&mut out, n);
-                }
-            }
-            // Block comment `/* … */`.
-            '/' if chars.peek() == Some(&'*') => {
-                blank(&mut out, c);
-                chars.next();
-                out.push(' '); // the `*`
-                while let Some(n) = chars.next() {
-                    blank(&mut out, n);
-                    if n == '*' && chars.peek() == Some(&'/') {
-                        chars.next();
-                        out.push(' ');
-                        break;
-                    }
-                }
-            }
-            other => out.push(other),
-        }
-    }
-    out
+    // Blanked spans begin and end on ASCII bytes and everything else is copied
+    // verbatim, so the buffer is valid UTF-8 by construction; the fallback is
+    // unreachable but cheaper than a panic path.
+    String::from_utf8(out).unwrap_or_else(|_| sql.to_string())
+}
+
+/// Blank `b[from..to]` into `out` as spaces, keeping newlines so the copy holds
+/// its line structure (and its byte length) exactly.
+fn blank_span(out: &mut Vec<u8>, b: &[u8], from: usize, to: usize) {
+    out.extend(
+        b[from..to]
+            .iter()
+            .map(|&c| if c == b'\n' { b'\n' } else { b' ' }),
+    );
 }
 
 /// Whether `word` appears in `haystack` as a whole word rather than as a fragment
@@ -501,7 +668,116 @@ pub fn has_word(haystack: &str, word: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_keyword, has_word, split_statements, strip_noise};
+    use super::{Dialect, first_keyword, has_word};
+
+    /// Tests that don't probe a dialect difference run under [`Dialect::Generic`];
+    /// the dialect-specific behaviours have their own tests below.
+    fn split_statements(sql: &str) -> Vec<&str> {
+        super::split_statements(sql, Dialect::Generic)
+    }
+
+    fn strip_noise(sql: &str) -> String {
+        super::strip_noise(sql, Dialect::Generic)
+    }
+
+    /// MySQL's `#` comment hides everything to end of line — including a `;` and
+    /// a `DROP` after it, which must not become a statement RED executes. To
+    /// Postgres `#` is an operator, so the `;` after it is a real boundary.
+    #[test]
+    fn hash_comments_follow_the_dialect() {
+        let s = super::split_statements("SELECT 1 # tidy; DROP TABLE users", Dialect::MySql);
+        assert_eq!(s.len(), 1, "got {s:#?}");
+        let s = super::split_statements("SELECT a # b; SELECT 2", Dialect::Postgres);
+        assert_eq!(s.len(), 2, "got {s:#?}");
+    }
+
+    /// A parenthesized block condition opens a block — `IF (cond) THEN` is the
+    /// most common MySQL routine style — while the function spellings still open
+    /// nothing.
+    #[test]
+    fn parenthesized_block_conditions_open_blocks() {
+        for script in [
+            "CREATE PROCEDURE p() BEGIN \
+             IF (1 > 0) THEN SET @a = 1; END IF; SET @b = 2; END; SELECT 1",
+            "CREATE PROCEDURE p() BEGIN \
+             WHILE (1 > 0) DO SET @a = 1; END WHILE; END; SELECT 1",
+            "CREATE PROCEDURE p() BEGIN \
+             CASE (1) WHEN 1 THEN SET @a = 1; END CASE; END; SELECT 1",
+            // A multi-group condition reaches its THEN too.
+            "CREATE PROCEDURE p() BEGIN \
+             IF (1 > 0) OR (2 > 1) THEN SET @a = 1; END IF; END; SELECT 1",
+            // Function calls — packed and spaced — open no block.
+            "CREATE PROCEDURE p() BEGIN \
+             SET @a = IF(1 > 0, 1, 0); SET @b = IF (1, 2, 3); END; SELECT 1",
+        ] {
+            let s = super::split_statements(script, Dialect::MySql);
+            assert_eq!(s.len(), 2, "{script}\ngot {s:#?}");
+            assert_eq!(s[1], "SELECT 1", "{script}");
+        }
+    }
+
+    /// Postgres treats `\` as an ordinary character in a plain string
+    /// (`standard_conforming_strings`, its default), so `'C:\'` is closed; MySQL
+    /// treats it as an escape, so the same bytes stay open. Postgres `E'…'`
+    /// strings do escape.
+    #[test]
+    fn backslash_handling_follows_the_dialect() {
+        let sql = "INSERT INTO t VALUES ('C:\\'); DELETE FROM t WHERE id = 1;";
+        assert_eq!(super::split_statements(sql, Dialect::Postgres).len(), 2);
+        assert_eq!(super::split_statements(sql, Dialect::MySql).len(), 1);
+        let sql = "SELECT E'it\\'s; one'; SELECT 2";
+        assert_eq!(super::split_statements(sql, Dialect::Postgres).len(), 2);
+    }
+
+    /// MySQL only opens a `--` comment when whitespace (or end of input)
+    /// follows: `5--3` is arithmetic there, and hiding it from the gates while
+    /// the engine runs it would be the unsafe direction.
+    #[test]
+    fn mysql_dash_dash_needs_whitespace() {
+        let sql = "SELECT 5--3; SELECT 1";
+        assert_eq!(super::split_statements(sql, Dialect::MySql).len(), 2);
+        assert_eq!(super::split_statements(sql, Dialect::Postgres).len(), 1);
+    }
+
+    /// `DELIMITER $$ -- note` sets `$$`, not the whole trimmed tail.
+    #[test]
+    fn delimiter_token_stops_at_whitespace() {
+        let s = super::split_statements(
+            "DELIMITER $$ -- note\nSELECT 1$$\nSELECT 2$$",
+            Dialect::MySql,
+        );
+        assert_eq!(s, vec!["SELECT 1", "SELECT 2"]);
+    }
+
+    /// An object *named* like a routine kind must not arm compound mode.
+    #[test]
+    fn create_table_named_event_is_not_routine_ddl() {
+        assert!(!super::is_routine_ddl("CREATE TABLE event (id INT)"));
+        assert!(super::is_routine_ddl(
+            "CREATE EVENT e ON SCHEDULE EVERY 1 DAY DO SELECT 1"
+        ));
+    }
+
+    /// The splitter and the stripper share their lexing: under MySQL `'don\'t'`
+    /// is one literal to both, so the real `WHERE` stays visible to the confirm
+    /// gate — the divergence that used to report a false "UPDATE with no WHERE".
+    #[test]
+    fn strip_noise_matches_the_splitter_on_escapes() {
+        let sql = "UPDATE t SET a='don\\'t' WHERE id=1";
+        let stripped = super::strip_noise(sql, Dialect::MySql);
+        assert!(
+            has_word(&stripped.to_ascii_lowercase(), "where"),
+            "{stripped:?}"
+        );
+        assert_eq!(stripped.len(), sql.len());
+        // A dollar-quoted body is a literal too; its content must not reach a scan.
+        let stripped = super::strip_noise("SELECT $$delete$$ AS x", Dialect::Postgres);
+        assert!(!has_word(&stripped.to_ascii_lowercase(), "delete"));
+        // And a MySQL `#` comment is blanked with its `;` and its `DROP`.
+        let stripped = super::strip_noise("SELECT 1 # drop; DROP TABLE t", Dialect::MySql);
+        assert!(!has_word(&stripped.to_ascii_lowercase(), "drop"));
+        assert!(!stripped.contains(';'));
+    }
 
     #[test]
     fn splits_plain_statements() {
@@ -661,13 +937,13 @@ SELECT 1;";
     #[test]
     fn ranges_address_the_source_and_exclude_separators() {
         let sql = "SELECT 1;\nSELECT 2";
-        let r = super::statement_ranges(sql);
+        let r = super::statement_ranges(sql, Dialect::Generic);
         assert_eq!(r.len(), 2);
         assert_eq!(&sql[r[0].clone()], "SELECT 1");
         assert_eq!(&sql[r[1].clone()], "\nSELECT 2");
         // A blank tail after the final separator is a span of its own (the caret can
         // sit there); `split_statements` is what drops it.
-        let r = super::statement_ranges("SELECT 1;");
+        let r = super::statement_ranges("SELECT 1;", Dialect::Generic);
         assert_eq!(r.len(), 2);
         assert!(r[1].is_empty());
     }

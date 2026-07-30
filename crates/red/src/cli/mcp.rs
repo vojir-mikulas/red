@@ -32,6 +32,27 @@ pub(crate) fn cmd_mcp(args: McpArgs) -> u8 {
         }
     };
     let (svc, mut events) = start();
+    // The GUI sends the `[ai]` policy at launch; headless must do the same or the
+    // backend runs at `AiPolicy::default()` (enabled, read tier), which would
+    // serve tools on a connection whose assistant the user disabled. Agent
+    // profiles are irrelevant to tool serving (and would cost keychain reads),
+    // so only the policy fields are carried.
+    let settings = crate::settings::FileSettingsStore::open_default()
+        .map(|s| s.load_report().settings)
+        .unwrap_or_default();
+    svc.send_global(Command::ConfigureAi(red_service::AiConfig {
+        agents: Vec::new(),
+        default_agent: String::new(),
+        show_thinking: false,
+        enabled: settings.ai.enabled,
+        tier: red_service::AiTier::parse(&settings.ai.tier),
+        limits: red_service::AiLimits {
+            max_rows: settings.ai.limits.max_rows,
+            statement_timeout_ms: settings.ai.limits.statement_timeout_ms,
+            max_result_bytes: settings.ai.limits.max_result_bytes,
+            max_tool_calls: settings.ai.limits.max_tool_calls,
+        },
+    }));
     if let Err(code) = connect(&svc, &mut events, config) {
         shutdown(&svc);
         return code;

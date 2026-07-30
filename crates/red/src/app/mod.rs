@@ -740,6 +740,11 @@ impl AppState {
         ));
         cx.set_global(flint::ReduceMotion(settings.appearance.reduce_motion));
         crate::i18n::apply(&settings.appearance.locale);
+        // Rebuild the macOS menu bar now that the locale is applied: `main.rs`
+        // calls `set_menus` *before* this, so the first build used the default
+        // locale and every `menu.*` key would otherwise render in English (or
+        // the pseudolocale) regardless of the user's choice.
+        cx.set_menus(crate::menu::build_menus());
 
         let name_input = cx.new(|cx| {
             TextInput::new(cx).with_placeholder(crate::i18n::tr!("connect.ph_name", "my database"))
@@ -1456,16 +1461,20 @@ impl AppState {
         let auto_dismiss = notification.auto_dismiss;
         self.notifications.push(notification);
         // Persistent (error / warning) toasts are removed only by a user click, so
-        // a burst of query errors could pile up unbounded. Cap the stack: drop the
-        // oldest persistent, non-export toast first (transient ones self-dismiss;
-        // an export toast owns live cancel state, so it's never auto-dropped).
+        // a burst of query errors could pile up unbounded. Cap the stack: prefer to
+        // drop the oldest persistent, non-export toast; failing that (a burst of
+        // *transient* toasts inside their dismiss window), drop the oldest
+        // non-export transient one. An export toast owns live cancel state, so it
+        // is never auto-dropped — the only reason the cap can still be exceeded.
         while self.notifications.len() > MAX_NOTIFICATIONS {
-            let Some(stale) = self
+            let oldest_persistent = self
                 .notifications
                 .iter()
-                .position(|n| n.auto_dismiss.is_none() && n.export.is_none())
-            else {
-                break;
+                .position(|n| n.auto_dismiss.is_none() && n.export.is_none());
+            let stale = oldest_persistent
+                .or_else(|| self.notifications.iter().position(|n| n.export.is_none()));
+            let Some(stale) = stale else {
+                break; // only export toasts remain; leave them
             };
             self.notifications.remove(stale);
         }
@@ -1669,7 +1678,7 @@ impl AppState {
             }
             Event::SchemaDiffFinished {
                 left, right, delta, ..
-            } => self.on_schema_diff(left, right, delta, cx),
+            } => self.on_schema_diff(session, left, right, delta, cx),
             Event::SchemaDiffFailed { message, .. } => self.on_schema_diff_failed(message, cx),
             Event::HealthReportReady { report } => self.on_health_report(session, report, cx),
             Event::HealthReportFailed { message } => {
@@ -2568,7 +2577,7 @@ impl AppState {
             }
             _ => return,
         };
-        let mut tab = QueryTab::new(title, cx);
+        let mut tab = QueryTab::new(title, self.active_dialect(), cx);
         tab.pane = SplitHalf::Secondary;
         if let Phase::Connected(active) = &mut self.phase {
             active.tabs.push(tab);

@@ -24,6 +24,7 @@ mod er;
 mod filter;
 mod filters;
 mod find;
+mod fmt;
 mod gridwindow;
 mod health;
 mod health_store;

@@ -38,8 +38,6 @@ connect-import_from_other_database_tools = Import from other database tools
 
 connect-report_a_bug = Report a bug
 
-connect-red = RED
-
 connect-no_saved_connections_yet = No saved connections yet.
 
 connect-no_connections_match_your_search = No connections match your search.

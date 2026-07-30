@@ -275,7 +275,9 @@ impl AppState {
                     .text_color(theme.text)
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_size(theme.scale(24.))
-                    .child(crate::i18n::tr!("connect.red", "RED")),
+                    // The product name is invariant across locales (per
+                    // `menu.rs`), so the wordmark is a literal, not a `tr!` key.
+                    .child("RED"),
             );
 
         let empty_note = |msg: gpui::SharedString, theme: &Theme| {

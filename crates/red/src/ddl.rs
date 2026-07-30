@@ -92,7 +92,7 @@ impl AppState {
         }
 
         let epoch = crate::result::new_epoch();
-        let mut tab = crate::app::QueryTab::new(format!("DDL: {name}"), cx);
+        let mut tab = crate::app::QueryTab::new(format!("DDL: {name}"), self.active_dialect(), cx);
         // Pin the tab to the object's own namespace rather than letting it inherit
         // the focused tab's. An Apply from here re-creates *this* object, so it has
         // to resolve in the database the object lives in, whatever database some
@@ -501,16 +501,22 @@ pub(crate) struct SchemaDiffView {
 }
 
 impl AppState {
-    /// A comparison finished: open it in a tab.
+    /// A comparison finished: open it in a tab **on the connection that started
+    /// it** (`session`), not whatever is foreground now — the diff and its
+    /// "Open script" DDL belong to that server.
     pub(crate) fn on_schema_diff(
         &mut self,
+        session: Option<red_service::SessionId>,
         left: String,
         right: String,
         delta: red_core::schema_diff::SchemaDelta,
         cx: &mut Context<Self>,
     ) {
+        let dialect = self
+            .conn_dialect(session)
+            .unwrap_or_else(|| self.active_dialect());
         let title = format!("Diff: {left} ↔ {right}");
-        let mut tab = crate::app::QueryTab::new(title, cx);
+        let mut tab = crate::app::QueryTab::new(title, dialect, cx);
         tab.view = Some(TabView::SchemaDiff(SchemaDiffView {
             left,
             right,
@@ -518,7 +524,7 @@ impl AppState {
             include_drops: false,
             scroll: gpui::ScrollHandle::new(),
         }));
-        self.push_tab(tab, cx);
+        self.push_tab_to(session, tab, cx);
         cx.notify();
     }
 

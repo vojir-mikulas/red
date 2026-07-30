@@ -119,6 +119,10 @@ struct CompletionIndex {
     functions: Vec<(&'static str, &'static str, &'static str)>,
     /// The upper-cased SQL keywords.
     keywords: Vec<SharedString>,
+    /// The engine's lexical dialect, so every scan this index feeds
+    /// (diagnostics, completion scoping, hover) splits statements exactly the
+    /// way the engine will.
+    dialect: crate::sql::Dialect,
 }
 
 impl crate::sql::SchemaView for CompletionIndex {
@@ -237,6 +241,7 @@ fn build_index(
         columns_lower,
         functions: crate::sql::functions_for(kind),
         keywords,
+        dialect: crate::sql::Dialect::of(kind),
     }
 }
 
@@ -304,7 +309,7 @@ fn filter_decoration_provider(
     let prefix = filter_wrapper(table.as_deref());
     let shift = prefix.len();
     move |content| {
-        crate::sql::diagnostics(&format!("{prefix}{content}"), index.as_ref())
+        crate::sql::diagnostics(&format!("{prefix}{content}"), index.as_ref(), index.dialect)
             .into_iter()
             .filter_map(|d| {
                 let start = d.range.start.checked_sub(shift)?;
@@ -334,21 +339,62 @@ fn quote_column(name: &str) -> SharedString {
     }
 }
 
+/// Memoize a per-paint buffer analysis on a hash of the buffer text, so a repaint
+/// that didn't change the content (cursor blink, grid scroll, a resize) reuses the
+/// prior result instead of re-tokenizing and re-parsing the whole buffer. The
+/// hash is one linear pass; the analyses it guards are each linear-or-worse plus a
+/// full parse, and they run on the GPUI thread every frame. Single-slot: the
+/// editor only ever asks about its current content, so one cached (hash, result)
+/// pair is all that's needed.
+fn memoize_by_content<T: Clone + 'static>(
+    f: impl Fn(&str) -> T + 'static,
+) -> impl Fn(&str) -> T + 'static {
+    use std::cell::RefCell;
+    use std::hash::{Hash, Hasher};
+    let cache: RefCell<Option<(u64, T)>> = RefCell::new(None);
+    move |content: &str| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        content.hash(&mut hasher);
+        let key = hasher.finish();
+        if let Some((cached_key, value)) = cache.borrow().as_ref()
+            && *cached_key == key
+        {
+            return value.clone();
+        }
+        let value = f(content);
+        *cache.borrow_mut() = Some((key, value.clone()));
+        value
+    }
+}
+
+/// The SQL highlighter for the editor, memoized on buffer content so a repaint
+/// that changed nothing doesn't re-tokenize the whole buffer.
+pub(crate) fn memoized_highlighter() -> impl Fn(&str) -> Vec<(std::ops::Range<usize>, TokenStyle)> {
+    memoize_by_content(crate::sql::tokenize)
+}
+
+/// The gutter run-marker lines for the editor, memoized on buffer content: the
+/// underlying [`crate::sql::statement_start_lines`] splits the whole buffer.
+pub(crate) fn memoized_gutter_markers(dialect: crate::sql::Dialect) -> impl Fn(&str) -> Vec<usize> {
+    memoize_by_content(move |content| crate::sql::statement_start_lines(content, dialect))
+}
+
 /// The diagnostics provider handed to the editor's decoration seam: it runs the
 /// schema-aware [`crate::sql::diagnostics`] pass against the live buffer each paint
-/// and maps each finding to an error-styled wavy underline.
+/// and maps each finding to an error-styled wavy underline. Memoized on buffer
+/// content so a repaint that changed nothing doesn't re-run the whole pass.
 fn decoration_provider(
     index: Rc<CompletionIndex>,
 ) -> impl Fn(&str) -> Vec<flint::Decoration> + 'static {
-    move |content| {
-        crate::sql::diagnostics(content, index.as_ref())
+    memoize_by_content(move |content| {
+        crate::sql::diagnostics(content, index.as_ref(), index.dialect)
             .into_iter()
             .map(|d| flint::Decoration {
                 range: d.range,
                 style: flint::DecorationStyle::Error,
             })
             .collect()
-    }
+    })
 }
 
 /// The token covering byte `offset`: its text and style — the thing a hover peeks
@@ -370,7 +416,7 @@ fn hover_provider(
 ) -> impl Fn(&str, usize) -> Option<SharedString> + 'static {
     move |content, offset| {
         // A diagnostic under the pointer wins — surface its message.
-        if let Some(d) = crate::sql::diagnostics(content, index.as_ref())
+        if let Some(d) = crate::sql::diagnostics(content, index.as_ref(), index.dialect)
             .into_iter()
             .find(|d| d.range.contains(&offset))
         {
@@ -416,7 +462,7 @@ fn hover_provider(
         }
 
         // A column of a table the statement references → its type.
-        for (_, table) in crate::sql::referenced_tables_at(content, offset) {
+        for (_, table) in crate::sql::referenced_tables_at(content, offset, index.dialect) {
             if let Some(cols) = index.columns_by_table.get(&table.to_lowercase())
                 && let Some(c) = cols.iter().find(|c| c.name.to_lowercase() == wl)
             {
@@ -544,7 +590,7 @@ fn fk_hints(index: &CompletionIndex, table_key: &str) -> HashMap<String, String>
 /// to the current statement contribute nothing here (the caller still appends the
 /// plain table list as a fallback).
 fn join_items(index: &CompletionIndex, content: &str, cursor: usize) -> Vec<CompletionItem> {
-    let referenced = crate::sql::referenced_tables_at(content, cursor);
+    let referenced = crate::sql::referenced_tables_at(content, cursor, index.dialect);
     let taken: HashSet<String> = referenced.iter().map(|(a, _)| a.clone()).collect();
     let mut out = Vec::new();
     for t in &index.tables {
@@ -585,7 +631,7 @@ fn completion_provider(
 ) -> impl Fn(&str, usize) -> Vec<CompletionItem> + 'static {
     move |content, cursor| {
         let prefix = crate::sql::word_prefix(content, cursor).to_lowercase();
-        let context = crate::sql::analyze(content, cursor);
+        let context = crate::sql::analyze(content, cursor, index.dialect);
 
         // Only member access (`table.`) suggests with nothing typed; elsewhere we
         // wait for a prefix so the popup doesn't open on every space.
@@ -599,7 +645,7 @@ fn completion_provider(
         match &context {
             CompletionContext::Dot { qualifier } => {
                 let q = qualifier.to_lowercase();
-                let real = crate::sql::referenced_tables_at(content, cursor)
+                let real = crate::sql::referenced_tables_at(content, cursor, index.dialect)
                     .into_iter()
                     .find(|(alias, _)| *alias == q)
                     .map(|(_, table)| table.to_lowercase())
@@ -624,7 +670,7 @@ fn completion_provider(
             CompletionContext::Column => {
                 // Columns of the tables this statement actually references rank
                 // first, then the rest of the schema, then functions, tables, keywords.
-                for (_, table) in crate::sql::referenced_tables_at(content, cursor) {
+                for (_, table) in crate::sql::referenced_tables_at(content, cursor, index.dialect) {
                     let key = table.to_lowercase();
                     let hints = fk_hints(&index, &key);
                     if let Some(cols) = index.columns_by_table.get(&key) {
@@ -1387,6 +1433,35 @@ impl AppState {
         self.run_editor_query_impl(Some(offset), cx);
     }
 
+    /// The SQL lexical dialect of the active connection's engine, for every
+    /// scanner call made on the run path; [`crate::sql::Dialect::Generic`] when
+    /// nothing is connected (those paths bail before running anything).
+    pub(crate) fn active_dialect(&self) -> crate::sql::Dialect {
+        match &self.phase {
+            Phase::Connected(active) => crate::sql::Dialect::of(active.config.kind),
+            _ => crate::sql::Dialect::Generic,
+        }
+    }
+
+    /// The dialect of a *specific* session's engine (foreground or parked), for a
+    /// background reply that must be scanned against the connection that asked
+    /// for it rather than whatever is on screen. `None` when that session isn't
+    /// live.
+    pub(crate) fn conn_dialect(
+        &self,
+        session: Option<red_service::SessionId>,
+    ) -> Option<crate::sql::Dialect> {
+        let id = session?;
+        if self.foreground_session == Some(id)
+            && let Phase::Connected(active) = &self.phase
+        {
+            return Some(crate::sql::Dialect::of(active.config.kind));
+        }
+        self.parked
+            .get(&id)
+            .map(|a| crate::sql::Dialect::of(a.config.kind))
+    }
+
     fn run_editor_query_impl(&mut self, force_offset: Option<usize>, cx: &mut Context<Self>) {
         // A Redis session has no SQL editor — its `query 1` tab is a phantom that
         // is never rendered (the Redis shell replaces the editor). ⌘↵ / gutter-run
@@ -1399,6 +1474,7 @@ impl AppState {
         if matches!(&self.phase, Phase::Connected(a) if a.active().is_some_and(|t| t.is_er())) {
             return;
         }
+        let dialect = self.active_dialect();
         let sql = match &self.phase {
             Phase::Connected(active) => match active.active() {
                 Some(tab) => {
@@ -1407,7 +1483,7 @@ impl AppState {
                         // A clicked gutter marker runs exactly its statement.
                         Some(off) => {
                             let content = editor.content();
-                            crate::sql::statement_at(&content, off).to_string()
+                            crate::sql::statement_at(&content, off, dialect).to_string()
                         }
                         // An explicit selection runs verbatim; otherwise run just the
                         // statement under the caret, not the whole buffer: a buffer of
@@ -1418,7 +1494,7 @@ impl AppState {
                             Some(sel) => sel,
                             None => {
                                 let content = editor.content();
-                                crate::sql::statement_at(&content, editor.cursor_offset())
+                                crate::sql::statement_at(&content, editor.cursor_offset(), dialect)
                                     .to_string()
                             }
                         },
@@ -1455,7 +1531,7 @@ impl AppState {
         // Grade the statement: `Safe` streams into the grid, everything else executes
         // in a transaction, and the configured threshold decides which of those first
         // stop to ask.
-        let assessment = red_core::sql::assess(&sql);
+        let assessment = red_core::sql::assess(&sql, dialect);
 
         // On a read-only connection, refuse writes up front instead of letting
         // them round-trip to the engine and bounce back as a cryptic error. The
@@ -1479,7 +1555,7 @@ impl AppState {
             // `;`-separated batch makes a syntax error. Only an explicit
             // multi-statement selection reaches here (a no-selection run already
             // narrowed to the caret's statement); say so plainly.
-            if crate::sql::statement_count(&sql) > 1 {
+            if crate::sql::statement_count(&sql, dialect) > 1 {
                 self.notify(
                     ToastVariant::Error,
                     "Select a single statement to run; \
@@ -1531,7 +1607,8 @@ impl AppState {
             Phase::Connected(active) => active.namespace_for_send(),
             _ => None,
         };
-        self.confirm_count = red_core::sql::count_preflight(&sql).map(|count_sql| {
+        let dialect = self.active_dialect();
+        self.confirm_count = red_core::sql::count_preflight(&sql, dialect).map(|count_sql| {
             self.send_active(Command::CountMatching {
                 sql: count_sql,
                 namespace,
@@ -1727,7 +1804,7 @@ impl AppState {
     ) {
         let has_tab = matches!(&self.phase, Phase::Connected(a) if a.active().is_some());
         if !replace_current || !has_tab {
-            let tab = crate::app::QueryTab::new(history_label(&sql), cx);
+            let tab = crate::app::QueryTab::new(history_label(&sql), self.active_dialect(), cx);
             self.push_tab(tab, cx);
             self.pending_focus = Some(crate::app::Pane::Editor);
         }

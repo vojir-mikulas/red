@@ -225,6 +225,15 @@ impl DocDriver for MongoDriver {
         // A Backward window queries `_id` descending so the `limit` takes the rows
         // nearest the boundary, then reverses to ascending before returning, so it
         // prepends onto the resident run in order. Forward and Jump read ascending.
+        //
+        // KNOWN LIMITATION: `$gt`/`$lt` compare only *within* a BSON type bracket,
+        // while `sort {_id: 1}` orders *across* brackets by canonical type. A
+        // collection with heterogeneous `_id` types (mixed ObjectId/int/string,
+        // common in imported data) will page through one bracket and then return
+        // empty at its boundary while `count` reports the rest — the scroll stops
+        // early. A correct cross-bracket keyset needs a (type-rank, value) tuple
+        // comparison Mongo can't express in one bound; tracked for a follow-up.
+        // Homogeneous `_id` (the overwhelming default) pages correctly.
         let (query, ascending) = match &seek {
             DocSeek::Forward { after: Some(id) } => (and_id_bound(base, "$gt", id), true),
             DocSeek::Forward { after: None } | DocSeek::Jump { .. } => (base, true),

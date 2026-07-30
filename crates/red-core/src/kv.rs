@@ -546,6 +546,22 @@ pub enum RespValue {
     Error(String),
 }
 
+impl RespValue {
+    /// A rough resident-byte estimate of the reply tree: the string payloads plus
+    /// a small per-node overhead. The console keeps replies for its scrollback, so
+    /// a `LRANGE bigkey 0 -1` on a huge list would otherwise pin the whole thing;
+    /// callers use this to cap what they retain.
+    pub fn approx_bytes(&self) -> usize {
+        match self {
+            RespValue::Simple(s) | RespValue::Bulk(s) | RespValue::Error(s) => s.len() + 16,
+            RespValue::Array(items) => {
+                16 + items.iter().map(RespValue::approx_bytes).sum::<usize>()
+            }
+            _ => 16,
+        }
+    }
+}
+
 pub use crate::OpClass;
 
 /// Every read-only-safe command this build knows about. Anything not listed
@@ -602,14 +618,28 @@ const READ_COMMANDS: &[&str] = &[
     "TIME",
     "COMMAND",
     "OBJECT",
-    "MEMORY",
     "LASTSAVE",
     "RANDOMKEY",
     "DUMP",
 ];
 
+/// `(command, subcommand)` pairs whose *specific form* is a read, for commands
+/// whose other subcommands are not (`MEMORY PURGE` mutates allocator state, so
+/// `MEMORY` can't sit on the whole-command read list).
+const READ_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("MEMORY", "USAGE"),
+    ("MEMORY", "STATS"),
+    ("MEMORY", "DOCTOR"),
+    ("MEMORY", "MALLOC-STATS"),
+];
+
 /// Commands that are destructive purely by name (any invocation), gated behind
 /// the confirm even on a writable connection.
+///
+/// `EVAL`/`EVALSHA`/`FCALL` are here because a script runs *any* command —
+/// `EVAL "redis.call('flushall')" 0` is `FLUSHALL` with extra steps — so a
+/// name-based gate that skipped them would be a one-line bypass. `MIGRATE`
+/// moves keys to an arbitrary remote server (exfiltration shaped like a copy).
 const DESTRUCTIVE_COMMANDS: &[&str] = &[
     "FLUSHALL",
     "FLUSHDB",
@@ -621,11 +651,17 @@ const DESTRUCTIVE_COMMANDS: &[&str] = &[
     "REPLICAOF",
     "SLAVEOF",
     "FAILOVER",
+    "EVAL",
+    "EVALSHA",
+    "FCALL",
+    "MIGRATE",
 ];
 
 /// `(command, subcommand)` pairs that are destructive only in a specific form,
 /// so the read/introspection form of the same command (`CONFIG GET`,
-/// `CLIENT LIST`, `ACL WHOAMI`, ...) stays non-destructive.
+/// `CLIENT LIST`, `ACL WHOAMI`, ...) stays non-destructive. The `LOAD`/`RESTORE`
+/// forms persist server-side code, the flip side of the `FLUSH` forms already
+/// gated here.
 const DESTRUCTIVE_SUBCOMMANDS: &[(&str, &str)] = &[
     ("CONFIG", "SET"),
     ("CONFIG", "RESETSTAT"),
@@ -636,7 +672,11 @@ const DESTRUCTIVE_SUBCOMMANDS: &[(&str, &str)] = &[
     ("ACL", "DELUSER"),
     ("ACL", "LOAD"),
     ("SCRIPT", "FLUSH"),
+    ("SCRIPT", "LOAD"),
     ("FUNCTION", "FLUSH"),
+    ("FUNCTION", "LOAD"),
+    ("FUNCTION", "RESTORE"),
+    ("FUNCTION", "DELETE"),
     ("CLUSTER", "RESET"),
     ("CLUSTER", "FAILOVER"),
     ("CLUSTER", "FORGET"),
@@ -661,7 +701,11 @@ pub fn classify_command(argv: &[String]) -> OpClass {
             .is_some_and(|s| DESTRUCTIVE_SUBCOMMANDS.contains(&(upper.as_str(), s)));
     if destructive {
         OpClass::Destructive
-    } else if READ_COMMANDS.contains(&upper.as_str()) {
+    } else if READ_COMMANDS.contains(&upper.as_str())
+        || sub
+            .as_deref()
+            .is_some_and(|s| READ_SUBCOMMANDS.contains(&(upper.as_str(), s)))
+    {
         OpClass::Read
     } else {
         OpClass::Write
@@ -1050,6 +1094,34 @@ mod tests {
         assert_eq!(
             classify_command(&["ACL".into(), "SETUSER".into(), "bob".into()]),
             OpClass::Destructive
+        );
+        // Script execution is any command with extra steps
+        // (`EVAL "redis.call('flushall')" 0`), and MIGRATE ships keys to an
+        // arbitrary remote — the name gate must not be a one-line bypass.
+        for cmd in ["EVAL", "EVALSHA", "FCALL", "MIGRATE", "eval"] {
+            assert_eq!(
+                classify_command(&[cmd.into(), "x".into()]),
+                OpClass::Destructive,
+                "{cmd} should be destructive"
+            );
+        }
+        // Persisting server-side code is the flip side of the gated FLUSH forms.
+        assert_eq!(
+            classify_command(&["SCRIPT".into(), "LOAD".into(), "return 1".into()]),
+            OpClass::Destructive
+        );
+        assert_eq!(
+            classify_command(&["FUNCTION".into(), "LOAD".into(), "…".into()]),
+            OpClass::Destructive
+        );
+        // MEMORY is read only in its introspection forms; PURGE mutates.
+        assert_eq!(
+            classify_command(&["MEMORY".into(), "USAGE".into(), "k".into()]),
+            OpClass::Read
+        );
+        assert_eq!(
+            classify_command(&["MEMORY".into(), "PURGE".into()]),
+            OpClass::Write
         );
     }
 

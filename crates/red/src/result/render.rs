@@ -588,7 +588,20 @@ impl AppState {
             .and_then(|t| t.watch.as_ref())
             .map(|w| {
                 let now = std::time::Instant::now();
-                (win.base..win.base.saturating_add(win.len))
+                // Only the *visible* rows (plus a screen of margin so a flash on
+                // a row scrolled just off-screen resolves cleanly), not the whole
+                // resident window: `win.len` is `total.min(100k)`, so scanning it
+                // was ~1M HashMap probes + 200k allocations per frame on a large
+                // watched result. The tint hook only ever asks about painted
+                // cells, so an off-screen hit would never be read anyway.
+                let rh = f32::from(row_height);
+                let viewport = grid.viewport_rows(rh).max(1);
+                let first = grid.first_visible_row(rh);
+                let lo = first.saturating_sub(viewport);
+                let hi = first
+                    .saturating_add(viewport.saturating_mul(2))
+                    .min(win.base.saturating_add(win.len));
+                (lo.max(win.base)..hi)
                     .filter_map(|abs| {
                         let key = grid.watch_row_key(abs);
                         let hits: Vec<(usize, usize)> = (0..grid.columns.len())

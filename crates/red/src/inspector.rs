@@ -190,8 +190,8 @@ pub(crate) struct InspectorState {
 struct PreviewView {
     editor: Entity<CodeEditor>,
     key: PreviewKey,
-    #[allow(dead_code)]
-    sub: gpui::Subscription,
+    /// RAII: held only to keep the subscription alive; never read.
+    _sub: gpui::Subscription,
 }
 
 /// Identifies which value a [`PreviewView`] shows, so a stale one (the cursor
@@ -221,8 +221,8 @@ struct InspectorEdit {
     editor: Entity<CodeEditor>,
     ctx: EditContext,
     prefill: String,
-    #[allow(dead_code)]
-    sub: gpui::Subscription,
+    /// RAII: held only to keep the subscription alive; never read.
+    _sub: gpui::Subscription,
 }
 
 impl InspectorState {
@@ -459,7 +459,10 @@ impl AppState {
                 if insp.preview.as_ref().map(|p| &p.key) == Some(&key) {
                     return; // unchanged; keep the editor and its selection
                 }
-                let editor = build_readonly_value_editor("Cell value", body, wrap, cx);
+                // Materialize the String only now, on a genuine rebuild: `body`
+                // is a cheap-clone SharedString, so an unchanged frame never
+                // copies the (up to 10MB) loaded value it once did per paint.
+                let editor = build_readonly_value_editor("Cell value", body.to_string(), wrap, cx);
                 // Esc from the focused preview closes the pane, matching Esc from the
                 // grid (the editor's own Escape action swallows the key otherwise).
                 let sub = cx.subscribe(&editor, |this, _, event: &CodeEditorEvent, cx| {
@@ -467,7 +470,11 @@ impl AppState {
                         this.close_inspector(cx);
                     }
                 });
-                insp.preview = Some(PreviewView { editor, key, sub });
+                insp.preview = Some(PreviewView {
+                    editor,
+                    key,
+                    _sub: sub,
+                });
             }
         }
     }
@@ -475,7 +482,11 @@ impl AppState {
     /// The body to show in the selectable preview: a loaded full value, or a whole
     /// resident value. `None` for a capped (not-yet-loaded), evicted, or absent
     /// cell; those render their own non-selectable stand-in with a Load button.
-    fn preview_target(&self) -> Option<(PreviewKey, String, bool)> {
+    ///
+    /// The body is a `SharedString` (cheap-clone), not a materialized `String`:
+    /// [`reconcile_preview`](Self::reconcile_preview) copies it only on a genuine
+    /// rebuild, so the unchanged-frame path never memcpys a multi-megabyte cell.
+    fn preview_target(&self) -> Option<(PreviewKey, SharedString, bool)> {
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
@@ -491,16 +502,15 @@ impl AppState {
             && full.row == row
             && full.col == col
         {
-            let body = full.view.body.to_string();
             let key = PreviewKey {
                 epoch,
                 row,
                 col,
-                len: body.len(),
+                len: full.view.body.len(),
                 wrap: full.view.wrap,
                 format: fmt,
             };
-            return Some((key, body, full.view.wrap));
+            return Some((key, full.view.body.clone(), full.view.wrap));
         }
         // Otherwise the resident value, when it's whole. A capped cell only has its
         // head, so it isn't selectable here (load it first).
@@ -508,16 +518,15 @@ impl AppState {
             Value::Capped(_) => None,
             v => {
                 let view = format_value(&v, fmt);
-                let body = view.body.to_string();
                 let key = PreviewKey {
                     epoch,
                     row,
                     col,
-                    len: body.len(),
+                    len: view.body.len(),
                     wrap: view.wrap,
                     format: fmt,
                 };
-                Some((key, body, view.wrap))
+                Some((key, view.body, view.wrap))
             }
         }
     }
@@ -699,7 +708,7 @@ impl AppState {
                 editor,
                 ctx,
                 prefill,
-                sub,
+                _sub: sub,
             });
         }
         self.focus_inspector_edit = true;

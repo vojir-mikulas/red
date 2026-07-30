@@ -420,22 +420,30 @@ impl DatabaseDriver for SqliteDriver {
         .map_err(driver_err)?
     }
 
-    async fn execute(&self, sql: &str) -> Result<u64> {
+    async fn execute_abort(&self, sql: &str, abort: &AbortSignal) -> Result<u64> {
         let path = self.path.clone();
         let read_only = self.read_only;
         let sql = sql.to_string();
-        tokio::task::spawn_blocking(move || execute_blocking(&path, read_only, &sql))
+        let abort = abort.clone();
+        tokio::task::spawn_blocking(move || execute_blocking(&path, read_only, &sql, &abort))
             .await
             .map_err(driver_err)?
     }
 
-    async fn execute_batch(&self, statements: &[String]) -> Result<Vec<u64>> {
+    async fn execute_batch_abort(
+        &self,
+        statements: &[String],
+        abort: &AbortSignal,
+    ) -> Result<Vec<u64>> {
         let path = self.path.clone();
         let read_only = self.read_only;
         let statements = statements.to_vec();
-        tokio::task::spawn_blocking(move || execute_batch_blocking(&path, read_only, &statements))
-            .await
-            .map_err(driver_err)?
+        let abort = abort.clone();
+        tokio::task::spawn_blocking(move || {
+            execute_batch_blocking(&path, read_only, &statements, &abort)
+        })
+        .await
+        .map_err(driver_err)?
     }
 
     async fn apply_edits(&self, ops: &[EditOp]) -> Result<u64> {
@@ -504,6 +512,17 @@ impl DatabaseDriver for SqliteDriver {
 
     fn quote_ident(&self, ident: &str) -> String {
         quote_ident(ident)
+    }
+
+    fn diff_order_clause(&self, key: &str, key_is_text: bool) -> String {
+        // SQLite's default is already byte order + NULLs first, but a column
+        // declared `COLLATE NOCASE` carries its collation into ORDER BY;
+        // forcing BINARY pins the byte order the merge-walk compares with.
+        if key_is_text {
+            format!("{} COLLATE BINARY", quote_ident(key))
+        } else {
+            self.quote_ident(key)
+        }
     }
 
     async fn create_index(
@@ -758,8 +777,12 @@ impl DatabaseDriver for SqliteDriver {
 }
 
 /// Run one statement inside a transaction: commit on success, roll back on error.
-fn execute_blocking(path: &Path, read_only: bool, sql: &str) -> Result<u64> {
+fn execute_blocking(path: &Path, read_only: bool, sql: &str, abort: &AbortSignal) -> Result<u64> {
     let conn = SqliteDriver::open(path, read_only)?;
+    let _guard = arm_interrupt(&conn, abort);
+    if abort.is_aborted() {
+        return Err(RedError::Interrupted);
+    }
     conn.execute_batch("BEGIN").map_err(driver_err)?;
     match conn.execute(sql, []) {
         Ok(affected) => {
@@ -776,11 +799,20 @@ fn execute_blocking(path: &Path, read_only: bool, sql: &str) -> Result<u64> {
 /// Run several statements in one transaction: commit on success, roll the whole
 /// batch back on the first error. Returns per-statement affected counts. An empty
 /// batch opens no transaction.
-fn execute_batch_blocking(path: &Path, read_only: bool, statements: &[String]) -> Result<Vec<u64>> {
+fn execute_batch_blocking(
+    path: &Path,
+    read_only: bool,
+    statements: &[String],
+    abort: &AbortSignal,
+) -> Result<Vec<u64>> {
     if statements.is_empty() {
         return Ok(Vec::new());
     }
     let conn = SqliteDriver::open(path, read_only)?;
+    let _guard = arm_interrupt(&conn, abort);
+    if abort.is_aborted() {
+        return Err(RedError::Interrupted);
+    }
     conn.execute_batch("BEGIN").map_err(driver_err)?;
     let mut affected = Vec::with_capacity(statements.len());
     for sql in statements {
@@ -1043,6 +1075,9 @@ fn describe_table_blocking(
     table: &str,
 ) -> Result<TableDetail> {
     let conn = SqliteDriver::open(path, read_only)?;
+    // An unqualified caller (a job holding only a `TableRef` with no schema)
+    // means the main database; `PRAGMA "".table_info` is an error.
+    let schema = if schema.is_empty() { "main" } else { schema };
     let (sq, tq) = (quote_ident(schema), quote_ident(table));
 
     // table_info: cid, name, type, notnull, dflt_value, pk

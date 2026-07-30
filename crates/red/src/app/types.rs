@@ -1185,9 +1185,27 @@ pub(crate) struct RecycleBatch {
     pub keys: Vec<RecycledKey>,
 }
 
+impl RecycleBatch {
+    /// A rough resident-byte estimate: the `DUMP` payloads plus key names. Drives
+    /// the recycle bin's byte budget, since a count cap alone lets a handful of
+    /// batches of large values pin gigabytes until app exit.
+    pub(crate) fn bytes(&self) -> usize {
+        self.keys
+            .iter()
+            .map(|k| k.payload.len() + k.key.len())
+            .sum()
+    }
+}
+
 /// How many recent delete batches the recycle bin keeps before evicting the
 /// oldest. A soft cap so a long session of deletes can't grow the bin unbounded.
 pub(crate) const RECYCLE_BIN_CAP: usize = 25;
+
+/// The recycle bin's resident-byte ceiling: the oldest batches are evicted until
+/// the total is under this, so deleting a few large values can't pin gigabytes
+/// of `DUMP` payloads for the app's lifetime. 128 MiB is generous for an undo
+/// buffer while bounded.
+pub(crate) const RECYCLE_BIN_BYTE_CAP: usize = 128 * 1024 * 1024;
 
 /// The default editor text a fresh query tab opens with. A tab still holding
 /// exactly this (and no result) is "pristine"; closing it needs no confirmation.
@@ -1255,7 +1273,11 @@ pub(crate) struct QueryTab {
 }
 
 impl QueryTab {
-    pub(crate) fn new(title: String, cx: &mut Context<AppState>) -> Self {
+    pub(crate) fn new(
+        title: String,
+        dialect: crate::sql::Dialect,
+        cx: &mut Context<AppState>,
+    ) -> Self {
         let editor = cx.new(|cx| {
             // A play run marker in the gutter on each statement's first line.
             // gpui's `svg()` paints only when the svg element's *own* `text_color`
@@ -1265,8 +1287,11 @@ impl QueryTab {
             // affects tabs opened afterwards.
             let (marker_fg, marker_accent) = (cx.theme().text_faint, cx.theme().accent);
             CodeEditor::new(cx)
-                .highlighter(crate::sql::tokenize)
-                .gutter_markers(crate::sql::statement_start_lines)
+                // Both passes split the whole buffer per paint; memoize each on a
+                // hash of the content so an unchanged frame (cursor blink, scroll)
+                // reuses the prior result.
+                .highlighter(crate::editor::memoized_highlighter())
+                .gutter_markers(crate::editor::memoized_gutter_markers(dialect))
                 .gutter_marker_icon(move || {
                     gpui::svg()
                         .path("icons/play.svg")
@@ -1597,7 +1622,11 @@ impl ActiveConn {
         kv_mode: crate::kvbrowse::QueryMode,
         cx: &mut Context<AppState>,
     ) -> Self {
-        let tab = QueryTab::new("query 1".to_string(), cx);
+        let tab = QueryTab::new(
+            "query 1".to_string(),
+            crate::sql::Dialect::of(config.kind),
+            cx,
+        );
         // Read before `config` is moved into the struct below.
         let kind = config.kind;
         let kv_view = (config.kind == DbKind::Redis)

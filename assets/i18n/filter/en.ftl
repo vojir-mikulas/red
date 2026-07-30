@@ -24,7 +24,13 @@ filter-recent_filters = Recent filters
 
 filter-filter = Filter
 
+filter-apply = Apply
+
+filter-clear = Clear
+
 filter-remove_this_term = Remove this term
+
+filter-revert = Revert filter
 
 filter-re_apply_the_last_filter_that_returned_rows = Re-apply the last filter that returned rows
 

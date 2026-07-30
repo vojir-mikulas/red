@@ -6,10 +6,15 @@
 //! materializes either table whole; the same [`DiffAccumulator::step`] logic is
 //! exercised by [`diff_sorted`] over in-memory vectors in tests.
 //!
-//! **Alignment assumption:** both sides arrive sorted by the *same* key column in
-//! the *same* engine, so the engine's `ORDER BY` and this module's [`compare_keys`]
-//! agree. That holds for a same-engine diff (the shipped scope); a cross-engine
-//! diff with an unusual collation is best-effort (documented in the plan).
+//! **Alignment assumption:** both sides arrive sorted the way [`compare_keys`]
+//! compares — text by bytes, NULLs first. The feeding job *enforces* that with a
+//! per-engine `ORDER BY` decoration (`DatabaseDriver::diff_order_clause`: byte
+//! collation for text keys, `NULLS FIRST` where the engine defaults last), since
+//! an engine's own default (Postgres locale collation, NULLS LAST) would report
+//! rows present on both sides as added **and** removed instead of pairing them.
+//! Residual gaps: an enum-typed key falls back to the engine's order, and
+//! duplicate key values pair arbitrarily (the user-picked key isn't checked for
+//! uniqueness).
 
 use std::cmp::Ordering;
 
@@ -128,12 +133,12 @@ impl DiffAccumulator {
         }
     }
 
-    fn key_of(&self, row: &[Value]) -> String {
-        row.get(self.key_index).map(render_key).unwrap_or_default()
-    }
-
-    fn store(&mut self, row: DiffRow) {
+    /// Store the row `build` produces, or just mark truncation once the cap is
+    /// hit — the closure keeps the row's clones from being paid for rows that
+    /// were only ever going to be dropped.
+    fn store(&mut self, build: impl FnOnce() -> DiffRow) {
         if self.rows.len() < self.cap {
+            let row = build();
             self.rows.push(row);
         } else {
             self.truncated = true;
@@ -142,10 +147,10 @@ impl DiffAccumulator {
 
     fn added(&mut self, right: &[Value]) {
         self.summary.added += 1;
-        let key = self.key_of(right);
-        self.store(DiffRow {
+        let key_index = self.key_index;
+        self.store(|| DiffRow {
             kind: DiffKind::Added,
-            key,
+            key: right.get(key_index).map(render_key).unwrap_or_default(),
             left: Vec::new(),
             right: right.to_vec(),
             changed: Vec::new(),
@@ -154,10 +159,10 @@ impl DiffAccumulator {
 
     fn removed(&mut self, left: &[Value]) {
         self.summary.removed += 1;
-        let key = self.key_of(left);
-        self.store(DiffRow {
+        let key_index = self.key_index;
+        self.store(|| DiffRow {
             kind: DiffKind::Removed,
-            key,
+            key: left.get(key_index).map(render_key).unwrap_or_default(),
             left: left.to_vec(),
             right: Vec::new(),
             changed: Vec::new(),
@@ -165,13 +170,17 @@ impl DiffAccumulator {
     }
 
     fn pair(&mut self, left: &[Value], right: &[Value]) {
-        let changed: Vec<bool> = left.iter().zip(right.iter()).map(|(l, r)| l != r).collect();
+        let changed: Vec<bool> = left
+            .iter()
+            .zip(right.iter())
+            .map(|(l, r)| !cell_eq(l, r))
+            .collect();
         if changed.iter().any(|&c| c) {
             self.summary.changed += 1;
-            let key = self.key_of(left);
-            self.store(DiffRow {
+            let key_index = self.key_index;
+            self.store(move || DiffRow {
                 kind: DiffKind::Changed,
-                key,
+                key: left.get(key_index).map(render_key).unwrap_or_default(),
                 left: left.to_vec(),
                 right: right.to_vec(),
                 changed,
@@ -200,16 +209,35 @@ pub fn compare_keys(left: &[Value], right: &[Value], key_index: usize) -> Orderi
 fn key_cmp(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
-        (Value::Real(x), Value::Real(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-        (Value::Integer(x), Value::Real(y)) => {
-            (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
-        }
-        (Value::Real(x), Value::Integer(y)) => {
-            x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
-        }
+        (Value::Real(x), Value::Real(y)) => total_f64(*x, *y),
+        (Value::Integer(x), Value::Real(y)) => total_f64(*x as f64, *y),
+        (Value::Real(x), Value::Integer(y)) => total_f64(*x, *y as f64),
         (Value::Text(x), Value::Text(y)) => x.as_ref().cmp(y.as_ref()),
         (Value::Null, Value::Null) => Ordering::Equal,
         _ => key_rank(a).cmp(&key_rank(b)),
+    }
+}
+
+/// A total order over doubles: NaN equals NaN and sorts after everything else,
+/// matching Postgres' float ordering (the one engine that stores NaN). Falling
+/// back to `Equal` on `partial_cmp`'s NaN case would pair a NaN key with
+/// whatever row happened to be opposite it.
+fn total_f64(x: f64, y: f64) -> Ordering {
+    x.partial_cmp(&y)
+        .unwrap_or_else(|| match (x.is_nan(), y.is_nan()) {
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            _ => Ordering::Equal,
+        })
+}
+
+/// Cell equality for the changed-mask: like `Value::eq`, except a NaN on both
+/// sides is "unchanged" — under IEEE `NaN != NaN`, such a cell would read as a
+/// difference that can never clear.
+fn cell_eq(l: &Value, r: &Value) -> bool {
+    match (l, r) {
+        (Value::Real(a), Value::Real(b)) if a.is_nan() && b.is_nan() => true,
+        _ => l == r,
     }
 }
 

@@ -631,7 +631,7 @@ impl AppState {
         };
         let is_err = matches!(result, RespValue::Error(_));
         if let Some(entry) = console.history.iter_mut().find(|e| e.req == req) {
-            entry.result = Some(Ok(result));
+            entry.result = Some(Ok(cap_reply(result)));
         }
         if let Some(run) = console.batch.as_mut() {
             run.done += 1;
@@ -817,9 +817,30 @@ impl AppState {
             return;
         };
         if let Some(entry) = console.history.iter_mut().find(|e| e.req == req) {
-            entry.result = Some(Ok(result));
+            entry.result = Some(Ok(cap_reply(result)));
         }
         cx.notify();
+    }
+}
+
+/// The most bytes a single retained console reply may hold in scrollback: past
+/// this it's replaced with a notice, so a `LRANGE bigkey 0 -1` on a 100MB list
+/// can't pin 100MB (times the entry cap) in memory. Generous for a readable reply.
+const MAX_CONSOLE_REPLY_BYTES: usize = 1024 * 1024;
+
+/// Replace an oversized reply with a short notice, so the console's scrollback
+/// stays bounded regardless of how much a single command returned. The full
+/// value is still on the server; the user can page it in the browser or narrow
+/// the command.
+fn cap_reply(result: RespValue) -> RespValue {
+    if result.approx_bytes() > MAX_CONSOLE_REPLY_BYTES {
+        RespValue::Simple(format!(
+            "(reply omitted: ~{} exceeds the {} console limit; narrow the command)",
+            crate::fmt::human_bytes(result.approx_bytes() as u64),
+            crate::fmt::human_bytes(MAX_CONSOLE_REPLY_BYTES as u64),
+        ))
+    } else {
+        result
     }
 }
 

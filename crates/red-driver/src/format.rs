@@ -306,6 +306,10 @@ pub(crate) fn json_value(value: &Value) -> String {
     match value {
         Value::Null => "null".to_string(),
         Value::Integer(n) => n.to_string(),
+        // JSON has no NaN/Infinity literal, and `f64::to_string` emits bare
+        // `NaN`/`inf` that fails every parser; render them as `null` (the
+        // conventional JSON stand-in) rather than writing an unparseable file.
+        Value::Real(x) if !x.is_finite() => "null".to_string(),
         Value::Real(x) => x.to_string(),
         Value::Text(s) => json_string(s),
         Value::Blob(b) => json_string(&format!("<{} bytes>", b.len())),
@@ -328,6 +332,18 @@ pub(crate) fn sql_value(value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_string(),
         Value::Integer(n) => n.to_string(),
+        // `VALUES (NaN)` / `(inf)` load in no engine (bare `NaN` is a syntax
+        // error). Postgres accepts the quoted `'NaN'`/`'Infinity'` float forms,
+        // and other engines have no NaN at all, so the portable choice is a
+        // single-quoted spelling that Postgres reads and others reject cleanly
+        // rather than mis-parsing.
+        Value::Real(x) if x.is_nan() => "'NaN'".to_string(),
+        Value::Real(x) if x.is_infinite() => if *x < 0.0 {
+            "'-Infinity'"
+        } else {
+            "'Infinity'"
+        }
+        .to_string(),
         Value::Real(x) => x.to_string(),
         Value::Text(s) => sql_string(s),
         Value::Blob(b) => sql_string(&format!("<{} bytes>", b.len())),
@@ -335,9 +351,17 @@ pub(crate) fn sql_value(value: &Value) -> String {
     }
 }
 
-/// Single-quote a string literal, doubling embedded quotes.
+/// Single-quote a string literal, doubling embedded quotes **and** backslashes.
+/// This is a **portable** `.sql` dump, so it is written for the stricter reader:
+/// MySQL (by default) and ClickHouse honour `\` as an escape inside `'…'`, and
+/// without the doubled backslash a value ending in `\` swallows the closing
+/// quote — a hostile cell like `\', 1); DROP TABLE users; -- ` then breaks out of
+/// the literal when the dump is reloaded. Engines that treat `\` literally
+/// (Postgres/SQLite under standard-conforming strings) would reimport a doubled
+/// backslash; that data-fidelity nit is the deliberate price of an
+/// injection-safe portable dump. Mirrors the driver's own `sql_literal`.
 fn sql_string(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 /// Derive a target table name for a SQL `INSERT` export from the destination file
@@ -422,6 +446,36 @@ mod tests {
     #[test]
     fn html_report_blob_is_a_length_marker() {
         assert_eq!(html_cell(&Value::Blob(vec![0u8; 5])), "&lt;5 bytes&gt;");
+    }
+
+    /// A SQL literal doubles both quotes and backslashes, so a hostile cell can't
+    /// break out of the string when the dump is reloaded into MySQL/ClickHouse.
+    #[test]
+    fn sql_string_escapes_quotes_and_backslashes() {
+        // A trailing backslash: without doubling it would escape the close quote.
+        assert_eq!(
+            sql_value(&Value::Text("C:\\".into())),
+            "'C:\\\\'",
+            "trailing backslash must be doubled"
+        );
+        // The injection payload from the review: the literal must terminate.
+        assert_eq!(
+            sql_value(&Value::Text("\\', 1); DROP TABLE users; -- ".into())),
+            "'\\\\'', 1); DROP TABLE users; -- '"
+        );
+    }
+
+    /// Non-finite floats are unparseable as bare `NaN`/`inf`; export writes a
+    /// form each target reads or rejects cleanly, never a broken file.
+    #[test]
+    fn non_finite_floats_export_safely() {
+        assert_eq!(json_value(&Value::Real(f64::NAN)), "null");
+        assert_eq!(json_value(&Value::Real(f64::INFINITY)), "null");
+        assert_eq!(sql_value(&Value::Real(f64::NAN)), "'NaN'");
+        assert_eq!(sql_value(&Value::Real(f64::INFINITY)), "'Infinity'");
+        assert_eq!(sql_value(&Value::Real(f64::NEG_INFINITY)), "'-Infinity'");
+        // A finite float is still bare.
+        assert_eq!(sql_value(&Value::Real(1.5)), "1.5");
     }
 
     /// SQL export emits one `INSERT` per row with quoted identifiers, ANSI string

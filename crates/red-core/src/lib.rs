@@ -1367,7 +1367,12 @@ impl ConnectionConfig {
 
 /// The fields recovered from a pasted connection string by
 /// [`ConnectionConfig::parse_conn_str`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is hand-written to **redact the password**, matching every sibling
+/// config type: a derived `Debug` over a `pub password: String` would print the
+/// secret the moment any call site logged a `ParsedDsn`, defeating the deliberate
+/// no-plaintext discipline.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ParsedDsn {
     pub kind: DbKind,
     pub host: String,
@@ -1379,6 +1384,20 @@ pub struct ParsedDsn {
     /// `sslmode`/`require_ssl`/`ssl=true` query flag), used to pre-check the
     /// form's TLS toggle.
     pub tls: bool,
+}
+
+impl std::fmt::Debug for ParsedDsn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParsedDsn")
+            .field("kind", &self.kind)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .field("database", &self.database)
+            .field("tls", &self.tls)
+            .finish()
+    }
 }
 
 impl ParsedDsn {
@@ -1414,6 +1433,14 @@ fn encode(s: &str) -> String {
     for b in s.bytes() {
         match b {
             b'@' | b':' | b'/' | b'?' | b'#' | b'[' | b']' | b'%' | b' ' => {
+                out.push('%');
+                out.push_str(&format!("{b:02X}"));
+            }
+            // A non-ASCII byte must be %-escaped too, never pushed `as char`:
+            // byte 0xC3 is the *char* U+00C3, which re-encodes as two bytes —
+            // a password `pässword` would reach every driver as mojibake and
+            // authentication would simply fail.
+            b if !b.is_ascii() => {
                 out.push('%');
                 out.push_str(&format!("{b:02X}"));
             }
@@ -2543,10 +2570,16 @@ impl KeySpec {
                 direction,
             });
         }
-        // A nullable non-PK lead disqualifies keyset, the same posture `from_detail`
-        // takes for nullable keys.
+        // A nullable non-PK lead disqualifies keyset, unconditionally. The Int
+        // exemption `from_detail` carries is for SQLite's `INTEGER PRIMARY KEY`
+        // reporting `notnull=0` — a *key* column that can't actually be null —
+        // and that case lands in the PK branch above. An ordinary nullable INT
+        // lead (any FK column) genuinely holds NULLs, and a seek bound of NULL
+        // compares as neither `>` nor `<` anything: the scroll silently stops
+        // with rows missing (NULLs-first engines) or never reaches the NULL run
+        // (Postgres, NULLS LAST) while the count includes it.
         let kind = key_kind(lead);
-        (lead.not_null || kind == KeyKind::Int).then(|| KeySpec {
+        lead.not_null.then(|| KeySpec {
             column: lead.name.clone(),
             kind,
             column_type: lead.type_name.clone(),
@@ -3030,6 +3063,29 @@ mod conn_tests {
             cfg.dsn(),
             "postgres://postgres:p%40ss%3Aword@localhost:5432/analytics"
         );
+    }
+
+    /// A non-ASCII password must survive the DSN round trip byte for byte: each
+    /// UTF-8 byte is %-escaped, and decoding restores the original text. The
+    /// old `b as char` path re-encoded byte 0xC3 as two bytes — mojibake the
+    /// server rejects as a wrong password.
+    #[test]
+    fn dsn_percent_encodes_non_ascii_credentials() {
+        let cfg = ConnectionConfig {
+            kind: DbKind::Postgres,
+            host: "localhost".into(),
+            port: Some(5432),
+            user: "renée".into(),
+            password: "pässword".into(),
+            database: "db".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.dsn(),
+            "postgres://ren%C3%A9e:p%C3%A4ssword@localhost:5432/db"
+        );
+        assert_eq!(decode("p%C3%A4ssword"), "pässword");
+        assert_eq!(decode(&encode("pässword")), "pässword");
     }
 
     #[test]

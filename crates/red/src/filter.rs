@@ -141,12 +141,10 @@ pub(crate) struct FilterBarState {
     /// ↑/↓ readline recall position: an index into the current mode's recent
     /// filters while walking them, `None` on a line the user typed themselves.
     pub(crate) recall: Option<usize>,
-    #[allow(dead_code)]
-    pub(crate) sub: gpui::Subscription,
-    #[allow(dead_code)]
-    pub(crate) expr_sub: gpui::Subscription,
-    #[allow(dead_code)]
-    pub(crate) value_sub: gpui::Subscription,
+    /// RAII: held to keep these input subscriptions alive; never read.
+    pub(crate) _sub: gpui::Subscription,
+    pub(crate) _expr_sub: gpui::Subscription,
+    pub(crate) _value_sub: gpui::Subscription,
 }
 
 impl FilterBarState {
@@ -304,9 +302,9 @@ impl AppState {
             mode_open: false,
             history_open: false,
             recall: None,
-            sub,
-            expr_sub,
-            value_sub,
+            _sub: sub,
+            _expr_sub: expr_sub,
+            _value_sub: value_sub,
         });
         self.refresh_filter_completions(cx);
         // The Window isn't in hand here; focus the box on the next render.
@@ -1157,14 +1155,14 @@ impl AppState {
             )
             .child(field)
             .child(
-                Button::new("filter-apply", "Apply")
+                Button::new("filter-apply", crate::i18n::tr!("filter.apply", "Apply"))
                     .variant(ButtonVariant::Primary)
                     .size(ButtonSize::Sm)
                     .on_click(cx.listener(|this, _, _, cx| this.submit_filter(cx))),
             );
         if has_filter {
             row = row.child(
-                Button::new("filter-clear", "Clear")
+                Button::new("filter-clear", crate::i18n::tr!("filter.clear", "Clear"))
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::Sm)
                     .on_click(cx.listener(|this, _, _, cx| this.clear_result_filter(cx))),
@@ -1231,14 +1229,17 @@ impl AppState {
                         .child(message),
                 )
                 .child(
-                    Button::new("filter-revert", "Revert filter")
-                        .variant(ButtonVariant::Ghost)
-                        .size(ButtonSize::Sm)
-                        .tooltip(crate::i18n::tr!(
-                            "filter.re_apply_the_last_filter_that_returned_rows",
-                            "Re-apply the last filter that returned rows"
-                        ))
-                        .on_click(cx.listener(|this, _, _, cx| this.revert_filter(cx))),
+                    Button::new(
+                        "filter-revert",
+                        crate::i18n::tr!("filter.revert", "Revert filter"),
+                    )
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Sm)
+                    .tooltip(crate::i18n::tr!(
+                        "filter.re_apply_the_last_filter_that_returned_rows",
+                        "Re-apply the last filter that returned rows"
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.revert_filter(cx))),
                 )
         });
 

@@ -740,6 +740,12 @@ pub(crate) struct ImportState {
     pub(crate) path: Option<String>,
     /// The tokenized commands to run (blank/`#`-comment lines dropped).
     pub(crate) commands: Vec<Vec<String>>,
+    /// The destructive commands found in the file, rendered for the modal's
+    /// warning block. The same `classify_command` pre-scan the Batch console
+    /// runs: a "seed data" file whose 400th line is a `FLUSHALL` (or a
+    /// `CONFIG SET dir …` takeover pair) must be visible *before* the click
+    /// that runs the whole file.
+    pub(crate) destructive: Vec<String>,
     /// A read/parse problem to surface inline (e.g. unreadable file, no commands).
     pub(crate) error: Option<String>,
     /// True once the import is in flight (buttons disabled until `KvImportDone`).
@@ -925,9 +931,9 @@ pub(crate) enum CollectionEditKind {
 /// `PreviewView`. Built by [`AppState::kv_rebuild_str_preview`].
 pub(crate) struct KvStrPreview {
     pub(crate) editor: Entity<CodeEditor>,
-    /// Kept alive for the editor's Escape → close-inspector subscription.
-    #[allow(dead_code)]
-    sub: Subscription,
+    /// RAII: kept alive for the editor's Escape → close-inspector subscription;
+    /// never read.
+    _sub: Subscription,
 }
 
 /// Which stream sub-view the inspector shows: the entries grid (the default)
@@ -2116,6 +2122,7 @@ impl AppState {
             view.import = Some(ImportState {
                 path: None,
                 commands: Vec::new(),
+                destructive: Vec::new(),
                 error: None,
                 running: false,
             });
@@ -2184,12 +2191,25 @@ impl AppState {
                                 .is_empty()
                                 .then(|| "No commands found in this file".to_string());
                             imp.path = Some(path);
+                            // The same destructive pre-scan the Batch console
+                            // runs over identical `tokenize_command` output, so
+                            // two files through the same tokenizer can't take
+                            // two different safety paths.
+                            imp.destructive = commands
+                                .iter()
+                                .filter(|argv| {
+                                    red_core::kv::classify_command(argv)
+                                        == red_core::kv::OpClass::Destructive
+                                })
+                                .map(|argv| argv.join(" "))
+                                .collect();
                             imp.commands = commands;
                         }
                         Err(e) => {
                             imp.error = Some(format!("Couldn't read the file: {e}"));
                             imp.path = None;
                             imp.commands.clear();
+                            imp.destructive.clear();
                         }
                     }
                 }
@@ -3011,34 +3031,11 @@ fn fmt_ttl(ttl: Option<Duration>) -> String {
     }
 }
 
-/// Human-readable byte count (`MEMORY USAGE`'s sampled estimate), coarse on
-/// purpose (it's an estimate, not an exact size).
-fn fmt_bytes(n: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    if n >= MB {
-        format!("{:.1} MB", n as f64 / MB as f64)
-    } else if n >= KB {
-        format!("{:.1} KB", n as f64 / KB as f64)
-    } else {
-        format!("{n} B")
-    }
-}
-
-/// A coarse "N ago" from an already-computed seconds delta, for the analysis
-/// report's "as of …" line (mirrors the slow-log's relative time).
-fn fmt_ago_secs(d: i64) -> String {
-    let d = d.max(0);
-    if d < 60 {
-        "just now".to_string()
-    } else if d < 3600 {
-        format!("{}m ago", d / 60)
-    } else if d < 86_400 {
-        format!("{}h ago", d / 3600)
-    } else {
-        format!("{}d ago", d / 86_400)
-    }
-}
+// Byte sizes (`MEMORY USAGE`'s sampled estimate) and relative times now come
+// from the shared `crate::fmt`; re-exported so `render.rs`'s `use super::*`
+// keeps resolving them. `fmt_bytes` moved from a `KB/MB` spelling to `human_bytes`'
+// `KiB/MiB`, matching the health report.
+pub(super) use crate::fmt::{fmt_ago_secs, human_bytes as fmt_bytes};
 
 /// One labelled proportion bar for the analysis report: `label` on the left,
 /// `right` note on the right, and a fill sized to `value/max` behind them.

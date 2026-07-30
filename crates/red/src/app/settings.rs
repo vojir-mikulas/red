@@ -393,8 +393,26 @@ impl AppState {
     }
 
     /// Open the bundled, fully-commented reference defaults: RED's settings docs.
+    ///
+    /// Written under `<config>/red/` (like the seeded `keymap.toml`), never the
+    /// shared temp dir: a fixed name in a world-writable `/tmp` is a symlink
+    /// target on multi-user Linux, and this file documents `[ai] agent_command`
+    /// — attacker-authored "reference defaults" copied into real settings would
+    /// be code execution.
     pub(crate) fn open_default_settings(&mut self, cx: &mut Context<Self>) {
-        let path = std::env::temp_dir().join("red-default-settings.toml");
+        let Some(dir) = dirs::config_dir() else {
+            self.notify(
+                ToastVariant::Error,
+                "No config directory available on this platform.",
+                cx,
+            );
+            return;
+        };
+        let path = dir.join("red").join("default-settings.toml");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Rewritten on every open so it always matches this build of RED.
         if let Err(e) = std::fs::write(&path, crate::assets::DEFAULT_SETTINGS) {
             tracing::warn!("failed to materialize default settings: {e}");
             self.notify(

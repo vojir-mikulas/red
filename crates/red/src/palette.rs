@@ -931,7 +931,7 @@ impl AppState {
         if !matches!(self.phase, Phase::Connected(_)) {
             return;
         }
-        let tab = crate::app::QueryTab::new(query.name, cx);
+        let tab = crate::app::QueryTab::new(query.name, self.active_dialect(), cx);
         let at = self.push_tab(tab, cx);
         let editor = match &self.phase {
             Phase::Connected(active) => active.tabs.get(at).map(|t| t.editor.clone()),

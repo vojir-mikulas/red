@@ -1384,7 +1384,19 @@ pub trait DatabaseDriver: Send + Sync {
 
     /// Run a non-row-returning statement wrapped in a transaction, returning the
     /// number of rows affected. A read-only driver rejects the write at the engine.
-    async fn execute(&self, sql: &str) -> Result<u64>;
+    ///
+    /// `abort` arms the engine's out-of-band cancel (KILL QUERY / pg_cancel /
+    /// interrupt) for the duration, exactly like the fetch paths: a write wedged
+    /// on a metadata or row lock held elsewhere must be stoppable, or quitting
+    /// the app is the only recovery. Firing it surfaces as
+    /// [`RedError::Interrupted`] with the transaction rolled back.
+    async fn execute_abort(&self, sql: &str, abort: &AbortSignal) -> Result<u64>;
+
+    /// [`execute_abort`](Self::execute_abort) with a fresh, never-fired signal —
+    /// for DDL helpers, jobs, and fixtures that offer no cancel affordance.
+    async fn execute(&self, sql: &str) -> Result<u64> {
+        self.execute_abort(sql, &AbortSignal::new()).await
+    }
 
     /// Run several data-modifying statements as ONE atomic transaction: BEGIN, run
     /// each in order, COMMIT; on any error ROLLBACK the whole batch and return the
@@ -1395,7 +1407,18 @@ pub trait DatabaseDriver: Send + Sync {
     /// batch is a no-op returning an empty vec without opening a transaction. A
     /// read-only driver rejects the writes at the engine. (An engine without
     /// multi-statement transactions runs them sequentially; it documents that.)
-    async fn execute_batch(&self, statements: &[String]) -> Result<Vec<u64>>;
+    /// `abort` cancels the in-flight statement out-of-band, rolling the batch back.
+    async fn execute_batch_abort(
+        &self,
+        statements: &[String],
+        abort: &AbortSignal,
+    ) -> Result<Vec<u64>>;
+
+    /// [`execute_batch_abort`](Self::execute_batch_abort) with a fresh signal.
+    async fn execute_batch(&self, statements: &[String]) -> Result<Vec<u64>> {
+        self.execute_batch_abort(statements, &AbortSignal::new())
+            .await
+    }
 
     /// Apply a batch of guarded, PK-keyed data edits (Track B6) **atomically** in a
     /// single transaction: render each `op` to dialect SQL with every value **bound**
@@ -1558,6 +1581,19 @@ pub trait DatabaseDriver: Send + Sync {
     /// interpolating raw identifiers. Pure string, no I/O; each driver delegates to its
     /// own identifier-quoting helper (the same one `quote_table` uses per segment).
     fn quote_ident(&self, ident: &str) -> String;
+
+    /// The `ORDER BY` term for a data-diff key read. The diff merge-walk
+    /// compares text keys by *bytes* and ranks NULLs *first*, so the stream
+    /// must arrive in exactly that order — an engine sorting by locale
+    /// collation or NULLS LAST makes rows present on both sides report as
+    /// added **and** removed instead of pairing. Engines whose defaults differ
+    /// override this; `key_is_text` gates the byte-collation decoration to
+    /// collatable columns (a `COLLATE` on an int column is an error on
+    /// Postgres). Pure string, no I/O.
+    fn diff_order_clause(&self, key: &str, key_is_text: bool) -> String {
+        let _ = key_is_text;
+        self.quote_ident(key)
+    }
 
     /// Create a secondary index on `table` over `columns` (optionally `unique`) in this
     /// engine's dialect: the migration's **deferred index pass**, run after the data

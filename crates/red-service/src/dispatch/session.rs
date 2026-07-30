@@ -89,14 +89,18 @@ impl SessionDriver {
     }
 }
 
-/// Ground an AI turn in whichever seam this session holds. `AiBackend` carries
-/// the same three driver arms as `SessionDriver`, so the mapping is mechanical;
-/// this one impl replaces the match that was otherwise spelled out at each AI
-/// entry point (subscription, ACP, MCP tool context).
-impl From<&SessionDriver> for crate::ai::AiBackend {
-    fn from(driver: &SessionDriver) -> Self {
-        match driver {
-            SessionDriver::Sql(d) => crate::ai::AiBackend::Sql(d.clone()),
+impl SessionDriver {
+    /// Ground an AI turn in whichever seam this session holds. `AiBackend`
+    /// carries the same three driver arms as `SessionDriver`, so the mapping is
+    /// mechanical; this one method replaces the match that was otherwise spelled
+    /// out at each AI entry point (subscription, ACP, MCP tool context). `kind`
+    /// supplies the SQL dialect the agent's statement gates must scan with.
+    pub(crate) fn ai_backend(&self, kind: red_core::DbKind) -> crate::ai::AiBackend {
+        match self {
+            SessionDriver::Sql(d) => crate::ai::AiBackend::Sql {
+                driver: d.clone(),
+                dialect: red_core::sql::Dialect::of(kind),
+            },
             SessionDriver::Kv(d) => crate::ai::AiBackend::Kv(d.clone()),
             SessionDriver::Doc(d) => crate::ai::AiBackend::Doc(d.clone()),
         }
@@ -261,6 +265,11 @@ pub(crate) struct SessionState {
     pub(crate) results: ResultMap,
     pub(crate) inflight: HashMap<crate::Epoch, InFlight>,
     pub(crate) exports: Arc<Mutex<HashMap<OpId, Arc<AtomicBool>>>>,
+    /// In-flight writes (`Execute`), keyed by a monotonic id, so
+    /// `Command::Cancel` (the UI's stop affordance) and teardown can fire each
+    /// one's engine-level cancel. Shared `Arc` because writes run in spawned
+    /// tasks off the command pump; each task removes its own entry on finish.
+    pub(crate) writes: Arc<Mutex<HashMap<u64, red_driver::AbortSignal>>>,
     /// In-use pin against idle eviction: the number of background jobs currently
     /// reading from or writing to this session. A table copy reads from a session
     /// that is, by definition, *not* the foreground (you copy A→B; at most one side
@@ -324,6 +333,7 @@ impl SessionState {
             results: Arc::new(Mutex::new(HashMap::new())),
             inflight: HashMap::new(),
             exports: Arc::new(Mutex::new(HashMap::new())),
+            writes: Arc::new(Mutex::new(HashMap::new())),
             busy: Arc::new(AtomicUsize::new(0)),
             last_used: Instant::now(),
         }
@@ -338,6 +348,12 @@ impl SessionState {
         // UI considers gone (each export's per-row check picks the flag up).
         for cancel in lock(&self.exports).values() {
             cancel.store(true, Ordering::Relaxed);
+        }
+        // Cancel in-flight writes at the engine: their spawned tasks own driver
+        // clones, so nothing else would stop a statement wedged on a lock once
+        // the session is gone.
+        for abort in lock(&self.writes).values() {
+            abort.abort();
         }
         lock(&self.results).clear();
     }

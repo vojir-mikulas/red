@@ -48,6 +48,9 @@ pub struct CopyArgs {
     /// Write mode: add rows, or clear the target first.
     #[arg(long, value_enum, default_value_t = ModeArg::Append)]
     mode: ModeArg,
+    /// Skip the destructive-mode confirmation prompt (for scripts / CI).
+    #[arg(long)]
+    yes: bool,
     /// Print what would be copied (target, mode, column mapping) and exit without
     /// writing.
     #[arg(long)]
@@ -183,6 +186,22 @@ pub fn cmd_copy(args: CopyArgs) -> u8 {
         );
         shutdown(&svc);
         return EXIT_OK;
+    }
+
+    // `--mode replace` clears the target first (`TruncateInsert`), the same
+    // destructive op the GUI gates behind a confirm. Prompt (or require --yes)
+    // so a headless replace can't silently wipe a table.
+    if matches!(args.mode, ModeArg::Replace)
+        && let Some(code) = super::confirm_destructive(
+            args.yes,
+            &format!(
+                "This clears every row of {} before inserting. This is irreversible.",
+                target.name
+            ),
+        )
+    {
+        shutdown(&svc);
+        return code;
     }
 
     svc.send_to(

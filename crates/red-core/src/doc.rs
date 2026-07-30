@@ -639,6 +639,48 @@ pub fn classify_doc_op(op: &DocWrite) -> OpClass {
     }
 }
 
+/// The first pipeline stage that writes (`$out`/`$merge`), if any. Aggregation is
+/// the one *read* surface that can write — `$merge` can even target another
+/// database — so both the human `DocAggregate` path and the AI's read-tier
+/// `aggregate` tool must refuse these when the connection is read-only.
+pub fn pipeline_write_stage(stages: &[DocValue]) -> Option<&'static str> {
+    stages.iter().find_map(|stage| match stage {
+        DocValue::Document(fields) => fields.iter().find_map(|(k, _)| match k.as_str() {
+            "$out" => Some("$out"),
+            "$merge" => Some("$merge"),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
+/// The first operator anywhere in `value` that executes server-side JavaScript
+/// (`$where`, `$function`, `$accumulator`), if any. These turn a "read-only"
+/// filter into arbitrary code running inside mongod, so the AI tools refuse them
+/// in every user- or model-supplied document. Walked with an explicit stack so a
+/// hostile deeply-nested tree cannot overflow ours.
+pub fn server_js_operator(value: &DocValue) -> Option<&'static str> {
+    let mut stack = vec![value];
+    while let Some(v) = stack.pop() {
+        match v {
+            DocValue::Document(fields) => {
+                for (k, child) in fields {
+                    match k.as_str() {
+                        "$where" => return Some("$where"),
+                        "$function" => return Some("$function"),
+                        "$accumulator" => return Some("$accumulator"),
+                        _ => {}
+                    }
+                    stack.push(child);
+                }
+            }
+            DocValue::Array(items) => stack.extend(items.iter()),
+            _ => {}
+        }
+    }
+    None
+}
+
 // --- hand-rolled extended-JSON helpers (no serde_json) -----------------------
 
 /// Append `s` as a JSON string literal (quotes + minimal escaping), matching
@@ -732,6 +774,58 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A document helper for guard tests: `doc([("k", v)])`.
+    fn doc(fields: Vec<(&str, DocValue)>) -> DocValue {
+        DocValue::Document(
+            fields
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn pipeline_write_stage_spots_out_and_merge() {
+        let read = vec![doc(vec![("$match", doc(vec![]))])];
+        assert_eq!(pipeline_write_stage(&read), None);
+        let out = vec![
+            doc(vec![("$match", doc(vec![]))]),
+            doc(vec![("$out", DocValue::Str("orders_backup".into()))]),
+        ];
+        assert_eq!(pipeline_write_stage(&out), Some("$out"));
+        let merge = vec![doc(vec![("$merge", doc(vec![]))])];
+        assert_eq!(pipeline_write_stage(&merge), Some("$merge"));
+        // A field *named* `$out` nested inside another stage's argument is not a
+        // stage; only top-level stage keys count.
+        let nested = vec![doc(vec![(
+            "$match",
+            doc(vec![("$out", DocValue::Int32(1))]),
+        )])];
+        assert_eq!(pipeline_write_stage(&nested), None);
+    }
+
+    #[test]
+    fn server_js_operator_is_found_at_any_depth() {
+        let clean = doc(vec![("status", DocValue::Str("active".into()))]);
+        assert_eq!(server_js_operator(&clean), None);
+        let top = doc(vec![("$where", DocValue::Str("sleep(1000)".into()))]);
+        assert_eq!(server_js_operator(&top), Some("$where"));
+        // Buried under $or → array → document, the way an injection would hide it.
+        let buried = doc(vec![(
+            "$or",
+            DocValue::Array(vec![
+                doc(vec![("a", DocValue::Int32(1))]),
+                doc(vec![("$function", doc(vec![]))]),
+            ]),
+        )]);
+        assert_eq!(server_js_operator(&buried), Some("$function"));
+        let group = doc(vec![(
+            "$group",
+            doc(vec![("total", doc(vec![("$accumulator", doc(vec![]))]))]),
+        )]);
+        assert_eq!(server_js_operator(&group), Some("$accumulator"));
+    }
 
     #[test]
     fn extjson_scalars() {

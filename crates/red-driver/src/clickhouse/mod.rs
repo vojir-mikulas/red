@@ -1142,13 +1142,19 @@ impl DatabaseDriver for ClickhouseDriver {
         }))
     }
 
-    async fn execute(&self, sql: &str) -> Result<u64> {
+    async fn execute_abort(&self, sql: &str, abort: &AbortSignal) -> Result<u64> {
         // DDL / INSERT from the SQL editor. A read-only connection carries
         // `readonly=1`, so the engine refuses the write (defense in depth). On a
         // writable connection, `wait_end_of_query=1` makes ClickHouse finish before
         // responding so the `X-ClickHouse-Summary` (carrying `written_rows`) is known
         // at the response head rather than only as a streamed trailer.
         let qid = new_query_id();
+        // `KILL QUERY WHERE query_id` armed for the write's duration, same as
+        // the fetch paths: a long mutation is stoppable at the engine.
+        let _guard = abort.arm(self.kill_token(&qid));
+        if abort.is_aborted() {
+            return Err(RedError::Interrupted);
+        }
         let settings: Vec<(String, String)> = if self.read_only {
             Vec::new()
         } else {
@@ -1172,14 +1178,18 @@ impl DatabaseDriver for ClickhouseDriver {
         Ok(summary.as_deref().and_then(parse_written_rows).unwrap_or(0))
     }
 
-    async fn execute_batch(&self, statements: &[String]) -> Result<Vec<u64>> {
+    async fn execute_batch_abort(
+        &self,
+        statements: &[String],
+        abort: &AbortSignal,
+    ) -> Result<Vec<u64>> {
         // ClickHouse has no multi-statement transactions, so this is NOT atomic: the
         // statements run in order and a failure leaves earlier ones applied (the error
         // stops the rest). Acceptable because ClickHouse is a rarely-written OLAP
         // target here; the SQL engines above wrap the same call in a real transaction.
         let mut affected = Vec::with_capacity(statements.len());
         for sql in statements {
-            affected.push(self.execute(sql).await?);
+            affected.push(self.execute_abort(sql, abort).await?);
         }
         Ok(affected)
     }
@@ -1355,6 +1365,12 @@ impl DatabaseDriver for ClickhouseDriver {
 
     fn quote_ident(&self, ident: &str) -> String {
         ch_quote(ident)
+    }
+
+    fn diff_order_clause(&self, key: &str, _key_is_text: bool) -> String {
+        // ClickHouse String ordering is already byte order, but a Nullable key
+        // sorts NULLS LAST by default while the merge-walk ranks NULLs first.
+        format!("{} ASC NULLS FIRST", ch_quote(key))
     }
 
     async fn create_index(

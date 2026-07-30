@@ -1366,7 +1366,7 @@ impl AppState {
             }
         } else {
             // No pristine tab to reuse (incl. the empty-strip case), so open one.
-            let tab = crate::app::QueryTab::new(label.clone(), cx);
+            let tab = crate::app::QueryTab::new(label.clone(), self.active_dialect(), cx);
             self.push_tab(tab, cx);
         }
         // Browsing a table moves the tab into that table's database, so the

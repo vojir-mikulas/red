@@ -362,8 +362,8 @@ pub(crate) enum RowKey {
 pub(crate) struct Rename {
     pub(super) key: RowKey,
     pub(crate) input: Entity<TextInput>,
-    #[allow(dead_code)]
-    pub(super) sub: gpui::Subscription,
+    /// RAII: held to keep the rename-input subscription alive; never read.
+    pub(super) _sub: gpui::Subscription,
 }
 
 /// The lifecycle state a history row reflects through its leading dot, replacing
@@ -415,14 +415,11 @@ pub(crate) struct AssistantState {
     pub(crate) key_input: Entity<TextInput>,
     /// The history sidebar's search box; filters the merged list by title.
     pub(crate) list_search: Entity<TextInput>,
-    /// Submit listeners (prompt + key); held here so closing the panel drops them.
-    #[allow(dead_code)]
-    pub(super) sub: gpui::Subscription,
-    #[allow(dead_code)]
-    pub(super) key_sub: gpui::Subscription,
-    /// Re-renders the sidebar as the search query changes.
-    #[allow(dead_code)]
-    pub(super) search_sub: gpui::Subscription,
+    /// Submit listeners (prompt + key) and the search re-render; RAII, held here
+    /// so closing the panel drops them. Never read.
+    pub(super) _sub: gpui::Subscription,
+    pub(super) _key_sub: gpui::Subscription,
+    pub(super) _search_sub: gpui::Subscription,
     /// The open conversations (M-S6). Never empty while the panel is open.
     pub(crate) chats: Vec<ChatSession>,
     /// Index of the active chat in `chats`: the one the composer/transcript show.
@@ -465,14 +462,16 @@ pub(crate) struct AssistantState {
 }
 
 impl AssistantState {
-    /// The active chat (the one shown). `chats` is never empty, so this can't fail.
+    /// The active chat (the one shown). `chats` is never empty (construction
+    /// seeds one; `close_chat` refills), so this can't fail; the saturating
+    /// clamp keeps a future violation an indexing panic, not a silent wrap.
     pub(super) fn active(&self) -> &ChatSession {
-        &self.chats[self.active.min(self.chats.len() - 1)]
+        &self.chats[self.active.min(self.chats.len().saturating_sub(1))]
     }
 
     /// The active chat, mutably.
     pub(super) fn active_mut(&mut self) -> &mut ChatSession {
-        let i = self.active.min(self.chats.len() - 1);
+        let i = self.active.min(self.chats.len().saturating_sub(1));
         &mut self.chats[i]
     }
 

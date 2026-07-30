@@ -190,9 +190,9 @@ impl AppState {
                 input,
                 key_input,
                 list_search,
-                sub,
-                key_sub,
-                search_sub,
+                _sub: sub,
+                _key_sub: key_sub,
+                _search_sub: search_sub,
                 chats: vec![ChatSession::new(conversation_id, provider)],
                 active: 0,
                 show_list: false,
@@ -773,7 +773,11 @@ impl AppState {
             | TextInputEvent::Down => {}
         });
         if let Some(state) = self.assistant.as_mut() {
-            state.renaming = Some(Rename { key, input, sub });
+            state.renaming = Some(Rename {
+                key,
+                input,
+                _sub: sub,
+            });
         }
         self.focus_rename = true;
         cx.notify();
@@ -917,7 +921,7 @@ impl AppState {
             tab.editor
                 .update(cx, |e, cx| e.set_content(sql.clone(), cx));
         }
-        if crate::sql::is_read_only(&sql) {
+        if crate::sql::is_read_only(&sql, self.active_dialect()) {
             self.run_editor_query(cx);
         }
         cx.notify();
@@ -1676,12 +1680,14 @@ impl AppState {
                 let names: Vec<String> = (0..cols)
                     .filter_map(|c| grid.column_meta(c).map(|(name, _)| name))
                     .collect();
-                s.push_str(&crate::i18n::tr!(
-                    "assistant.result_shape",
-                    ", showing a result of {rows} row(s) × {cols} column(s): {names}",
-                    rows = rows,
-                    cols = cols,
-                    names = names.join(", ")
+                // Deliberately NOT localized: this string is spliced into the
+                // model's grounding context (`ai_context`), not rendered. A
+                // translated (or pseudolocale) build would silently change the
+                // language of the prompt the model reasons over, so it stays
+                // hardcoded English.
+                s.push_str(&format!(
+                    ", showing a result of {rows} row(s) × {cols} column(s): {}",
+                    names.join(", ")
                 ));
             }
             s

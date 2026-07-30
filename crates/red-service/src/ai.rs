@@ -20,7 +20,7 @@ use red_ai::{
 };
 use red_core::doc::{
     CollKind, DocPlan, DocSchema, DocUpdate, DocValue, DocWrite, Document, FindQuery, IndexInfo,
-    IndexSpec, OpClass, classify_doc_op,
+    IndexSpec, OpClass, classify_doc_op, pipeline_write_stage, server_js_operator,
 };
 use red_core::kv::{
     KeyMeta, KvCollection, KvValue, RespValue, ScanBudget, ScanCursor, analyze_keyspace,
@@ -28,7 +28,7 @@ use red_core::kv::{
 // The read gate below and the write gate in `write_shape` share their stripping,
 // their whole-word test, and their token lists with the UI's own gates, so a fix to
 // one can't leave the others behind.
-use red_core::sql::{DANGEROUS_FNS, WRITE_TOKENS, has_word, strip_noise};
+use red_core::sql::{DANGEROUS_FNS, Dialect, WRITE_TOKENS, has_word, strip_noise};
 use red_core::{
     ActivityKind, ActivityStatus, AiLimits, AiPolicy, AiTier, RedError, TableRef, Value,
 };
@@ -47,7 +47,14 @@ use crate::{Event, SessionId};
 /// `kv_*` read tools; a SQL turn the schema/query tools.
 #[derive(Clone)]
 pub(crate) enum AiBackend {
-    Sql(Arc<dyn DatabaseDriver>),
+    Sql {
+        driver: Arc<dyn DatabaseDriver>,
+        /// The engine's lexical dialect, threaded into every gate that scans SQL
+        /// (`is_read_only_select`, `write_shape`): scanning a statement with the
+        /// wrong string/comment rules is a gate bypass, not a nicety — e.g.
+        /// Postgres ends `'a\'` at the second quote, so what follows is live SQL.
+        dialect: Dialect,
+    },
     Kv(Arc<dyn KvDriver>),
     Doc(Arc<dyn DocDriver>),
 }
@@ -57,16 +64,25 @@ impl AiBackend {
     /// the SQL schema/query tools, the Redis `kv_*` tools, or the MongoDB doc tools.
     pub(crate) fn catalog(&self, policy: &AiPolicy) -> Vec<ToolDef> {
         match self {
-            AiBackend::Sql(_) => tool_catalog(policy),
+            AiBackend::Sql { .. } => tool_catalog(policy),
             AiBackend::Kv(_) => kv_tool_catalog(policy),
             AiBackend::Doc(_) => doc_tool_catalog(policy),
+        }
+    }
+
+    /// The SQL lexical dialect the gates must scan with; [`Dialect::Generic`]
+    /// for the non-SQL backends (their gates never lex SQL).
+    pub(crate) fn dialect(&self) -> Dialect {
+        match self {
+            AiBackend::Sql { dialect, .. } => *dialect,
+            AiBackend::Kv(_) | AiBackend::Doc(_) => Dialect::Generic,
         }
     }
 
     /// The full grounding system prompt for this backend under `ctx`/`policy`.
     pub(crate) fn system_prompt(&self, ctx: &AiContext, policy: &AiPolicy) -> String {
         match self {
-            AiBackend::Sql(_) => system_prompt(ctx, policy),
+            AiBackend::Sql { .. } => system_prompt(ctx, policy),
             AiBackend::Kv(_) => kv_system_prompt(ctx, policy),
             AiBackend::Doc(_) => doc_system_prompt(ctx, policy),
         }
@@ -96,7 +112,9 @@ impl AiBackend {
         report: &ReportSink,
     ) -> (String, bool) {
         match self {
-            AiBackend::Sql(d) => run_tool(d, name, input, policy, cancel, report).await,
+            AiBackend::Sql { driver, dialect } => {
+                run_tool(driver, *dialect, name, input, policy, cancel, report).await
+            }
             AiBackend::Kv(d) => kv_run_tool(d, name, input, policy, cancel, report).await,
             AiBackend::Doc(d) => doc_run_tool(d, name, input, policy, cancel, report).await,
         }
@@ -535,7 +553,7 @@ pub(crate) async fn run_turn(
             // UPDATE/DELETE) is reported to the model without ever prompting; an
             // allowed shape surfaces the exact SQL as an Allow/Deny prompt and runs
             // only on Allow. A read tool falls straight through.
-            match assess_write(name, input, &policy) {
+            match assess_write(name, input, &policy, backend.dialect()) {
                 WriteAssessment::Reject(why) => {
                     results.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
@@ -598,17 +616,9 @@ pub(crate) async fn run_turn(
                     },
                 },
             );
-            let (content, ok) = match &backend {
-                AiBackend::Sql(driver) => {
-                    run_tool(driver, name, input, &policy, &cancel, &report).await
-                }
-                AiBackend::Kv(driver) => {
-                    kv_run_tool(driver, name, input, &policy, &cancel, &report).await
-                }
-                AiBackend::Doc(driver) => {
-                    doc_run_tool(driver, name, input, &policy, &cancel, &report).await
-                }
-            };
+            let (content, ok) = backend
+                .run_tool(name, input, &policy, &cancel, &report)
+                .await;
             emit(
                 &events,
                 session,
@@ -697,7 +707,7 @@ async fn run_subagent(
 ) -> (String, bool) {
     // The child runs the parent's backend, narrowed to reads (see the catalogs).
     let (tools, system) = match backend {
-        AiBackend::Sql(_) => (subagent_catalog(policy), subagent_system_prompt(task)),
+        AiBackend::Sql { .. } => (subagent_catalog(policy), subagent_system_prompt(task)),
         AiBackend::Kv(_) => (kv_subagent_catalog(policy), kv_subagent_system_prompt(task)),
         AiBackend::Doc(_) => (
             doc_subagent_catalog(policy),
@@ -788,11 +798,7 @@ async fn run_subagent(
                     false,
                 )
             } else {
-                match backend {
-                    AiBackend::Sql(d) => run_tool(d, name, input, policy, cancel, report).await,
-                    AiBackend::Kv(d) => kv_run_tool(d, name, input, policy, cancel, report).await,
-                    AiBackend::Doc(d) => doc_run_tool(d, name, input, policy, cancel, report).await,
-                }
+                backend.run_tool(name, input, policy, cancel, report).await
             };
             emit(
                 events,
@@ -1835,17 +1841,7 @@ pub(crate) async fn kv_run_tool(
             }
         }
         "kv_delete" => {
-            let mut targets: Vec<String> = Vec::new();
-            if let Some(k) = input
-                .get("key")
-                .and_then(Json::as_str)
-                .filter(|k| !k.is_empty())
-            {
-                targets.push(k.to_string());
-            }
-            if let Some(arr) = input.get("keys").and_then(Json::as_array) {
-                targets.extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
-            }
+            let mut targets = kv_delete_targets(input);
             let mut note = "";
             if targets.is_empty()
                 && let Some(pattern) = input
@@ -2154,6 +2150,7 @@ fn kv_bytes(n: u64) -> String {
 
 pub(crate) async fn run_tool(
     driver: &Arc<dyn DatabaseDriver>,
+    dialect: Dialect,
     name: &str,
     input: &Json,
     policy: &AiPolicy,
@@ -2195,7 +2192,7 @@ pub(crate) async fn run_tool(
         }
         "run_select" => {
             let sql = input.get("sql").and_then(Json::as_str).unwrap_or("").trim();
-            if !is_read_only_select(sql) {
+            if !is_read_only_select(sql, dialect) {
                 return (
                     "error: only a single SELECT or WITH...SELECT query is allowed".into(),
                     false,
@@ -2311,7 +2308,7 @@ pub(crate) async fn run_tool(
             // statement shape are all re-checked, never trusting that the caller
             // already gated it. By here the per-call user approval has been granted
             // (run_turn / the ACP permission flow); we only *run* an allowed shape.
-            match assess_write(name, input, policy) {
+            match assess_write(name, input, policy, dialect) {
                 WriteAssessment::NeedsApproval { sql } => match driver.execute(&sql).await {
                     Ok(affected) => {
                         // Durable record of what the agent actually changed (Feature B).
@@ -2338,7 +2335,7 @@ pub(crate) async fn run_tool(
             // `execute_batch`: one transaction where the engine has them (all commit
             // or none do), sequential on ClickHouse, which has none. Approval was
             // already granted above.
-            match assess_write(name, input, policy) {
+            match assess_write(name, input, policy, dialect) {
                 WriteAssessment::NeedsApproval { .. } => {
                     let statements = changeset_statements(input);
                     match driver.execute_batch(&statements).await {
@@ -2447,8 +2444,8 @@ fn cap_result_bytes(mut content: String, max: usize) -> String {
 /// always run such a query by hand in a query tab. (Defense in depth: opening the
 /// AI's reads on an engine-level read-only connection would make this belt-and-
 /// suspenders: a worthwhile follow-up, but it needs a per-call driver seam.)
-fn is_read_only_select(sql: &str) -> bool {
-    let stripped = strip_noise(sql);
+fn is_read_only_select(sql: &str, dialect: Dialect) -> bool {
+    let stripped = strip_noise(sql, dialect);
     let trimmed = stripped.trim().trim_end_matches(';').trim();
     if trimmed.is_empty() {
         return false;
@@ -2556,7 +2553,12 @@ pub(crate) enum WriteAssessment {
 /// Vet a tool call for the write gate. A `propose_write` is allowed only at the
 /// `Write` tier, on a writable connection, and for a safe statement shape; anything
 /// else is rejected (never silently run, never even prompted).
-pub(crate) fn assess_write(name: &str, input: &Json, policy: &AiPolicy) -> WriteAssessment {
+pub(crate) fn assess_write(
+    name: &str,
+    input: &Json,
+    policy: &AiPolicy,
+    dialect: Dialect,
+) -> WriteAssessment {
     if !is_write_tool(name) {
         return WriteAssessment::NotWrite;
     }
@@ -2578,10 +2580,10 @@ pub(crate) fn assess_write(name: &str, input: &Json, policy: &AiPolicy) -> Write
         return assess_doc_write(name, input);
     }
     if name == "propose_changeset" {
-        return assess_changeset(input);
+        return assess_changeset(input, dialect);
     }
     let sql = input.get("sql").and_then(Json::as_str).unwrap_or("").trim();
-    match write_shape(sql) {
+    match write_shape(sql, dialect) {
         WriteShape::Ok => WriteAssessment::NeedsApproval {
             sql: sql.to_string(),
         },
@@ -2630,6 +2632,24 @@ fn matches_whole_keyspace(pattern: &str) -> bool {
 /// shapes (a keyspace-wide DELETE or EXPIRE) even with approval — mirroring the
 /// SQL gate's refusal of an unqualified UPDATE/DELETE. Tier + read-only were
 /// already checked by [`assess_write`].
+/// The explicit key targets of a `kv_delete` input: `key` and `keys` combined,
+/// in that order. The one accumulation both the approval prompt and the executor
+/// use, so what the user approves is exactly what gets deleted.
+fn kv_delete_targets(input: &Json) -> Vec<String> {
+    let mut targets: Vec<String> = Vec::new();
+    if let Some(k) = input
+        .get("key")
+        .and_then(Json::as_str)
+        .filter(|k| !k.is_empty())
+    {
+        targets.push(k.to_string());
+    }
+    if let Some(arr) = input.get("keys").and_then(Json::as_array) {
+        targets.extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
+    }
+    targets
+}
+
 fn assess_kv_write(name: &str, input: &Json) -> WriteAssessment {
     let s = |k: &str| {
         input
@@ -2664,23 +2684,18 @@ fn assess_kv_write(name: &str, input: &Json) -> WriteAssessment {
             WriteAssessment::NeedsApproval { sql: action }
         }
         "kv_delete" => {
-            let keys: Vec<String> = input
-                .get("keys")
-                .and_then(Json::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str())
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
-            if let Some(k) = s("key") {
+            // Built from the SAME accumulation the executor deletes
+            // (`kv_delete_targets`): the input schema permits `key` and `keys`
+            // simultaneously, so a prompt built from `key` alone would show one
+            // key while everything in `keys` rides along unseen.
+            let targets = kv_delete_targets(input);
+            if let [one] = targets.as_slice() {
                 WriteAssessment::NeedsApproval {
-                    sql: format!("DELETE key `{k}`"),
+                    sql: format!("DELETE key `{one}`"),
                 }
-            } else if !keys.is_empty() {
+            } else if !targets.is_empty() {
                 WriteAssessment::NeedsApproval {
-                    sql: format!("DELETE {} key(s): {}", keys.len(), keys.join(", ")),
+                    sql: format!("DELETE {} key(s): {}", targets.len(), targets.join(", ")),
                 }
             } else if let Some(p) = s("pattern") {
                 if matches_whole_keyspace(p) {
@@ -2785,7 +2800,7 @@ fn changeset_statements(input: &Json) -> Vec<String> {
 /// single write (DML only, WHERE required, no DDL, no chaining). Any failure rejects
 /// the *whole* changeset — it's atomic, so a bad statement means nothing runs. On
 /// success the approval prompt shows the numbered statements as one reviewable unit.
-fn assess_changeset(input: &Json) -> WriteAssessment {
+fn assess_changeset(input: &Json, dialect: Dialect) -> WriteAssessment {
     let statements = changeset_statements(input);
     if statements.is_empty() {
         return WriteAssessment::Reject(
@@ -2795,7 +2810,7 @@ fn assess_changeset(input: &Json) -> WriteAssessment {
         );
     }
     for (i, stmt) in statements.iter().enumerate() {
-        match write_shape(stmt) {
+        match write_shape(stmt, dialect) {
             WriteShape::Ok => {}
             WriteShape::NotWrite => {
                 return WriteAssessment::Reject(format!(
@@ -2838,8 +2853,8 @@ enum WriteShape {
 /// identifiers, and comments blanked) so a keyword or `;` *inside a literal* can't
 /// fool the gate; e.g. `UPDATE t SET note = 'see where'` (no real WHERE) is still
 /// blocked, and a `;` inside a string isn't read as statement chaining.
-fn write_shape(sql: &str) -> WriteShape {
-    let stripped = strip_noise(sql);
+fn write_shape(sql: &str, dialect: Dialect) -> WriteShape {
+    let stripped = strip_noise(sql, dialect);
     let trimmed = stripped.trim().trim_end_matches(';').trim();
     if trimmed.is_empty() {
         return WriteShape::Blocked("the statement is empty");
@@ -3962,8 +3977,14 @@ pub(crate) async fn doc_run_tool(
                 Ok(v) => v,
                 Err(e) => return (format!("error: {e}"), false),
             };
-            let projection = doc_arg_value(driver, input, "projection").ok().flatten();
-            let sort = doc_arg_value(driver, input, "sort").ok().flatten();
+            let projection = match doc_arg_value(driver, input, "projection") {
+                Ok(v) => v,
+                Err(e) => return (format!("error: {e}"), false),
+            };
+            let sort = match doc_arg_value(driver, input, "sort") {
+                Ok(v) => v,
+                Err(e) => return (format!("error: {e}"), false),
+            };
             let query = FindQuery {
                 db: db().to_string(),
                 coll: coll().to_string(),
@@ -4025,7 +4046,10 @@ pub(crate) async fn doc_run_tool(
             if field.is_empty() {
                 return ("error: `field` is required".into(), false);
             }
-            let filter = doc_arg_value(driver, input, "filter").ok().flatten();
+            let filter = match doc_arg_value(driver, input, "filter") {
+                Ok(v) => v,
+                Err(e) => return (format!("error: {e}"), false),
+            };
             match driver.distinct(db(), coll(), field, filter.as_ref()).await {
                 Ok(values) => {
                     let rendered: Vec<String> = values
@@ -4049,7 +4073,10 @@ pub(crate) async fn doc_run_tool(
             }
         }
         "explain_query" => {
-            let filter = doc_arg_value(driver, input, "filter").ok().flatten();
+            let filter = match doc_arg_value(driver, input, "filter") {
+                Ok(v) => v,
+                Err(e) => return (format!("error: {e}"), false),
+            };
             let query = FindQuery {
                 db: db().to_string(),
                 coll: coll().to_string(),
@@ -4096,41 +4123,30 @@ pub(crate) async fn doc_run_tool(
 /// Parse a tool-input value (`filter`/`projection`/`sort`/`pipeline`) into a
 /// [`DocValue`] via the driver's extended-JSON parser. The model may pass it as a
 /// JSON object/array (the usual case) or as an extended-JSON string.
+///
+/// Every model-supplied document is refused here if it smuggles a server-side
+/// JavaScript operator (`$where`/`$function`/`$accumulator`): those execute code
+/// inside mongod, which no tool in the catalog is described as doing, and a
+/// stored prompt-injection payload could plant one in an otherwise-read call.
 fn doc_arg_value(
     driver: &Arc<dyn DocDriver>,
     input: &Json,
     key: &str,
 ) -> Result<Option<DocValue>, String> {
-    match input.get(key) {
-        None | Some(Json::Null) => Ok(None),
-        Some(Json::String(s)) if s.trim().is_empty() => Ok(None),
-        Some(Json::String(s)) => driver
-            .parse_ext_json(s)
-            .map(Some)
-            .map_err(|e| e.to_string()),
+    let parsed = match input.get(key) {
+        None | Some(Json::Null) => return Ok(None),
+        Some(Json::String(s)) if s.trim().is_empty() => return Ok(None),
+        Some(Json::String(s)) => driver.parse_ext_json(s).map_err(|e| e.to_string())?,
         Some(other) => driver
             .parse_ext_json(&other.to_string())
-            .map(Some)
-            .map_err(|e| e.to_string()),
+            .map_err(|e| e.to_string())?,
+    };
+    if let Some(op) = server_js_operator(&parsed) {
+        return Err(format!(
+            "`{op}` executes server-side JavaScript and is not allowed in `{key}`"
+        ));
     }
-}
-
-/// The first write stage (`$out`/`$merge`) in a pipeline, if any — rejected in a
-/// read-only aggregate.
-fn pipeline_write_stage(stages: &[DocValue]) -> Option<&'static str> {
-    for stage in stages {
-        if let DocValue::Document(fields) = stage {
-            for (k, _) in fields {
-                if k == "$out" {
-                    return Some("$out");
-                }
-                if k == "$merge" {
-                    return Some("$merge");
-                }
-            }
-        }
-    }
-    None
+    Ok(Some(parsed))
 }
 
 /// Build an [`IndexSpec`] from a `propose_index` input (`keys` object of
@@ -4296,7 +4312,10 @@ async fn doc_execute_write(
 async fn doc_index_advice(driver: &Arc<dyn DocDriver>, input: &Json) -> (String, bool) {
     let db = input.get("db").and_then(Json::as_str).unwrap_or("");
     let coll = input.get("coll").and_then(Json::as_str).unwrap_or("");
-    let filter = doc_arg_value(driver, input, "filter").ok().flatten();
+    let filter = match doc_arg_value(driver, input, "filter") {
+        Ok(v) => v,
+        Err(e) => return (format!("error: {e}"), false),
+    };
     let fields: Vec<String> = match &filter {
         Some(DocValue::Document(f)) => f
             .iter()
@@ -4522,6 +4541,30 @@ fn fmt_doc_plan(plan: &DocPlan) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gate tests probe statement shapes, not dialect lexing, so they run
+    /// under [`Dialect::Generic`]; the dialect-sensitive cases have their own
+    /// tests below.
+    fn is_read_only_select(sql: &str) -> bool {
+        super::is_read_only_select(sql, Dialect::Generic)
+    }
+
+    fn assess_write(name: &str, input: &Json, policy: &AiPolicy) -> WriteAssessment {
+        super::assess_write(name, input, policy, Dialect::Generic)
+    }
+
+    /// Postgres does not backslash-escape in a plain literal, so `'a\'` is a
+    /// complete string and the `DELETE` after it is live SQL: the gate must see
+    /// it. Under the old unconditional-backslash lexing the whole payload
+    /// blanked as one string and *passed* the read gate.
+    #[test]
+    fn read_gate_lexes_strings_per_dialect() {
+        let payload = "SELECT 'a\\'; DELETE FROM t; --'";
+        assert!(!super::is_read_only_select(payload, Dialect::Postgres));
+        // Under MySQL the backslash escapes the quote, so it really is one
+        // SELECT with a string argument — allowed.
+        assert!(super::is_read_only_select(payload, Dialect::MySql));
+    }
 
     #[test]
     fn whole_keyspace_glob_catches_wildcard_equivalents() {
@@ -4895,6 +4938,7 @@ mod tests {
         // Success: both statements commit together.
         let (content, ok) = run_tool(
             &driver,
+            Dialect::Sqlite,
             "propose_changeset",
             &json!({ "statements": [
                 "UPDATE t SET n = 20 WHERE id = 1",
@@ -4912,6 +4956,7 @@ mod tests {
         // back — the first UPDATE must NOT stick (n stays 20, not 99).
         let (content, ok) = run_tool(
             &driver,
+            Dialect::Sqlite,
             "propose_changeset",
             &json!({ "statements": [
                 "UPDATE t SET n = 99 WHERE id = 1",
@@ -4953,6 +4998,7 @@ mod tests {
         let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
         let (content, ok) = run_tool(
             &driver,
+            Dialect::Sqlite,
             "profile_table",
             &json!({ "schema": "main", "table": "child" }),
             &AiPolicy::default(),
@@ -5002,6 +5048,7 @@ mod tests {
 
         let (content, ok) = run_tool(
             &driver,
+            Dialect::Sqlite,
             "save_query",
             &json!({
                 "name": "Monthly revenue",
@@ -5034,6 +5081,7 @@ mod tests {
         // Missing name or sql is refused, and nothing is announced.
         let (_content, ok) = run_tool(
             &driver,
+            Dialect::Sqlite,
             "save_query",
             &json!({ "name": "", "sql": "SELECT 1" }),
             &AiPolicy::default(),
@@ -5058,6 +5106,7 @@ mod tests {
 
         let (content, ok) = run_tool(
             &driver,
+            Dialect::Sqlite,
             "generate_report",
             &json!({
                 "title": "Widgets",
@@ -5095,6 +5144,7 @@ mod tests {
         // An empty body is refused, and nothing is announced.
         let (_content, ok) = run_tool(
             &driver,
+            Dialect::Sqlite,
             "generate_report",
             &json!({ "html": "   " }),
             &AiPolicy::default(),
@@ -5123,6 +5173,7 @@ mod tests {
 
         let (_content, ok) = run_tool(
             &driver,
+            Dialect::Sqlite,
             "generate_report",
             &json!({ "title": "Here", "html": "<h1>Here</h1>" }),
             &AiPolicy::default(),
@@ -5159,6 +5210,7 @@ mod tests {
 
         let (content, ok) = run_tool(
             &driver,
+            Dialect::Sqlite,
             "generate_report",
             &json!({
                 "title": "Sales",
@@ -5214,6 +5266,7 @@ mod tests {
 
         let (content, ok) = run_tool(
             &driver,
+            Dialect::Sqlite,
             "generate_report",
             &json!({
                 "title": "Sales",
@@ -5259,6 +5312,7 @@ mod tests {
 
         let (content, ok) = run_tool(
             &driver,
+            Dialect::Sqlite,
             "generate_report",
             &json!({
                 "title": "Sales",
@@ -5578,6 +5632,23 @@ mod tests {
             assess_write("kv_rename", &json!({ "from": "a", "to": "b" }), &write),
             WriteAssessment::NeedsApproval { .. }
         ));
+        // `key` and `keys` passed together: the prompt must name every target
+        // the executor will delete, not just `key` — the drift that let 50k
+        // keys ride behind a one-key approval.
+        match assess_write(
+            "kv_delete",
+            &json!({ "key": "scratch:1", "keys": ["a", "b", "c"] }),
+            &write,
+        ) {
+            WriteAssessment::NeedsApproval { sql } => {
+                for k in ["scratch:1", "a", "b", "c"] {
+                    assert!(sql.contains(k), "prompt must name `{k}`: {sql}");
+                }
+                assert!(sql.contains("4 key(s)"), "{sql}");
+            }
+            WriteAssessment::Reject(why) => panic!("expected NeedsApproval, got Reject({why})"),
+            WriteAssessment::NotWrite => panic!("expected NeedsApproval, got NotWrite"),
+        }
         // Keyspace-wide delete/expire is refused outright, even at Write tier.
         assert!(matches!(
             assess_write("kv_delete", &json!({ "pattern": "*" }), &write),
@@ -5739,7 +5810,10 @@ mod tests {
 
         let turn = tokio::spawn(run_turn(
             provider,
-            AiBackend::Sql(driver.clone()),
+            AiBackend::Sql {
+                driver: driver.clone(),
+                dialect: Dialect::Sqlite,
+            },
             tx,
             state.clone(),
             None,

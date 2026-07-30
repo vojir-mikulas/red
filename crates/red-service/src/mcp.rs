@@ -343,9 +343,16 @@ mod tests {
             .unwrap();
         }
         let driver: Arc<dyn DatabaseDriver> = Arc::new(SqliteDriver::new(path, true));
-        let server = McpServer::start(AiBackend::Sql(driver), policy, ReportSink::disabled())
-            .await
-            .unwrap();
+        let server = McpServer::start(
+            AiBackend::Sql {
+                driver,
+                dialect: red_core::sql::Dialect::Sqlite,
+            },
+            policy,
+            ReportSink::disabled(),
+        )
+        .await
+        .unwrap();
         (server, reqwest::Client::new())
     }
 
@@ -530,7 +537,10 @@ mod tests {
         }
         let driver: Arc<dyn DatabaseDriver> = Arc::new(SqliteDriver::new(path, false));
         let server = McpServer::start(
-            AiBackend::Sql(driver),
+            AiBackend::Sql {
+                driver,
+                dialect: red_core::sql::Dialect::Sqlite,
+            },
             AiPolicy {
                 tier: red_core::AiTier::Write,
                 ..AiPolicy::default()

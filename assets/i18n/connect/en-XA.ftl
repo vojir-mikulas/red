@@ -38,8 +38,6 @@ connect-import_from_other_database_tools = [Ímpört fröm öthér dátábásé 
 
 connect-report_a_bug = [Répört á búg]
 
-connect-red = [RÉD]
-
 connect-no_saved_connections_yet = [Ñö sávéd çöññéçtíöñs yét.]
 
 connect-no_connections_match_your_search = [Ñö çöññéçtíöñs mátçh yöúr séárçh.]

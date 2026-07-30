@@ -427,7 +427,20 @@ pub fn load() -> Vec<StoredConnection> {
     let raw = match toml::from_str::<RawConfigFile>(&text) {
         Ok(cfg) => cfg,
         Err(e) => {
-            tracing::warn!("ignoring malformed config at {}: {e}", path.display());
+            // Preserve the unparsable file before returning empty: with the
+            // live-reload watcher, a hand-edit typo loads as an empty list and
+            // the *next* save (a pin toggle, a connect updating `last_accessed`)
+            // atomically rewrites the file from that empty state, losing every
+            // saved connection. A `.bak` copy is the escape hatch.
+            let backup = path.with_extension("toml.bak");
+            if let Err(be) = std::fs::write(&backup, &text) {
+                tracing::warn!("failed to back up malformed config: {be}");
+            }
+            tracing::warn!(
+                "ignoring malformed config at {} ({e}); saved a copy to {}",
+                path.display(),
+                backup.display()
+            );
             return Vec::new();
         }
     };

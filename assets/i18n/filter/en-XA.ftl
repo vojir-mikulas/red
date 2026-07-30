@@ -24,7 +24,13 @@ filter-recent_filters = [Réçéñt fíltérs]
 
 filter-filter = [Fíltér]
 
+filter-apply = [Ápply]
+
+filter-clear = [Çléár]
+
 filter-remove_this_term = [Rémövé thís térm]
+
+filter-revert = [Révért fíltér]
 
 filter-re_apply_the_last_filter_that_returned_rows = [Ré-ápply thé lást fíltér thát rétúrñéd röws]
 

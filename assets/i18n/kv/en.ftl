@@ -44,6 +44,8 @@ kv-importing = Importing…
 
 kv-commands_ready = { $count } command(s) ready to run
 
+kv-import_destructive = { $count } destructive command(s) in this file:
+
 kv-import_keys = Import keys
 
 kv-this_cant_be_undone = This can't be undone.

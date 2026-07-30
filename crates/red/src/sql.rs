@@ -11,6 +11,7 @@ use red_core::DbKind;
 // The service splits a script the same way before running it, so what the confirm
 // gate classifies as one statement is exactly what the engine is handed, and both
 // read-only gates reason over the same stripped copy with the same token lists.
+pub use red_core::sql::Dialect;
 use red_core::sql::{
     DANGEROUS_FNS, WRITE_TOKENS, first_keyword, has_word, is_routine_ddl, split_statements,
     statement_ranges, strip_noise,
@@ -534,8 +535,8 @@ pub fn tokenize(src: &str) -> Vec<(Range<usize>, TokenStyle)> {
 /// `EXPLAIN` or a bare `VALUES`, where the assistant's `run_select` may not. False
 /// positives are fine: a rejected read just doesn't auto-run; the user can still
 /// press Run.
-pub fn is_read_only(sql: &str) -> bool {
-    let stripped = strip_noise(sql);
+pub fn is_read_only(sql: &str, dialect: Dialect) -> bool {
+    let stripped = strip_noise(sql, dialect);
     let trimmed = stripped.trim().trim_end_matches(';').trim();
     if trimmed.is_empty() {
         return false;
@@ -564,15 +565,15 @@ pub fn is_read_only(sql: &str) -> bool {
 /// the one under the caret, not the whole buffer: the `SELECT * FROM (<sql>)`
 /// paging wrap can't accept a `;`-separated batch and would bounce back a bare
 /// syntax error. Returns the trimmed slice; empty only when there's no statement.
-pub fn statement_at(content: &str, cursor: usize) -> &str {
-    let bounds = statement_bounds(content, cursor);
+pub fn statement_at(content: &str, cursor: usize, dialect: Dialect) -> &str {
+    let bounds = statement_bounds(content, cursor, dialect);
     let stmt = content[bounds.clone()].trim();
     if !first_keyword(stmt).is_empty() {
         return stmt;
     }
     // Caret in a blank region: fall back to the last non-empty statement before
     // it rather than running nothing.
-    split_statements(&content[..bounds.start])
+    split_statements(&content[..bounds.start], dialect)
         .into_iter()
         .map(str::trim)
         .rfind(|s| !first_keyword(s).is_empty())
@@ -593,8 +594,8 @@ pub fn is_blank(sql: &str) -> bool {
 /// How many non-empty `;`-delimited statements `sql` holds. Lets the run path tell
 /// a single statement (opens as a result) from a batch (which the paging wrap
 /// can't run) so the latter gets a clear message, not a cryptic engine error.
-pub fn statement_count(sql: &str) -> usize {
-    split_statements(sql)
+pub fn statement_count(sql: &str, dialect: Dialect) -> usize {
+    split_statements(sql, dialect)
         .into_iter()
         .filter(|s| !first_keyword(s).is_empty())
         .count()
@@ -963,15 +964,27 @@ pub enum CompletionContext {
 /// [`red_core::sql::statement_ranges`] so the caret's statement, the confirm gate,
 /// and what the engine is actually handed can never disagree on where a statement
 /// ends. Completion scopes its analysis to this one statement.
-fn statement_bounds(content: &str, cursor: usize) -> Range<usize> {
+fn statement_bounds(content: &str, cursor: usize, dialect: Dialect) -> Range<usize> {
     let cur = cursor.min(content.len());
     // The first span that has not already ended before the caret. Spans are in
-    // order and cover the buffer, so this is the one the caret sits in (a caret
-    // right on a separator belongs to the statement it terminates).
-    statement_ranges(content)
-        .into_iter()
-        .find(|r| cur <= r.end)
-        .unwrap_or(0..content.len())
+    // order, so this is the one the caret sits in (a caret right on a separator
+    // belongs to the statement it terminates).
+    let ranges = statement_ranges(content, dialect);
+    let Some(ix) = ranges.iter().position(|r| cur <= r.end) else {
+        return 0..content.len();
+    };
+    if cur >= ranges[ix].start {
+        return ranges[ix].clone();
+    }
+    // The caret sits *inside* a multi-byte separator (`$$`, `//`) or a consumed
+    // `DELIMITER` line, which belongs to no span. Give it the statement the
+    // separator terminates; when there is none (a leading directive line), an
+    // empty span at the caret — never an out-of-range one, which would underflow
+    // every offset computed against it.
+    match ix.checked_sub(1) {
+        Some(prev) => ranges[prev].clone(),
+        None => cur..cur,
+    }
 }
 
 /// A coarse lexical atom used only by completion's clause parsing; finer than
@@ -1054,12 +1067,16 @@ fn atomize(s: &str) -> Vec<Atom> {
 
 /// Classify the completion context at `cursor` (a byte offset into `content`),
 /// scoped to the statement under the cursor.
-pub fn analyze(content: &str, cursor: usize) -> CompletionContext {
-    let stmt = statement_bounds(content, cursor);
-    let local = cursor.min(content.len()) - stmt.start;
+pub fn analyze(content: &str, cursor: usize, dialect: Dialect) -> CompletionContext {
+    let stmt = statement_bounds(content, cursor, dialect);
+    // Saturating on both steps: a caret inside a separator (bounds clamp to an
+    // empty span at the caret) or a word-shaped delimiter under it (`DELIMITER
+    // GO` — the prefix walks back across bytes outside the span) must degrade to
+    // "no local context", not underflow.
+    let local = cursor.min(content.len()).saturating_sub(stmt.start);
     let s = &content[stmt];
     let prefix = word_prefix(content, cursor);
-    let before = &s[..local - prefix.len()];
+    let before = &s[..local.saturating_sub(prefix.len())];
 
     // `qualifier.` (optionally followed by the word being typed) → table columns.
     let trimmed = before.trim_end();
@@ -1112,8 +1129,12 @@ pub fn analyze(content: &str, cursor: usize) -> CompletionContext {
 /// `cursor`, scanning its whole FROM/JOIN/UPDATE/INTO clause (which may sit after
 /// the cursor). Scopes column suggestions and resolves `alias.` completions. The
 /// alias key is lower-cased; the table name keeps its original case.
-pub fn referenced_tables_at(content: &str, cursor: usize) -> Vec<(String, String)> {
-    let stmt = statement_bounds(content, cursor);
+pub fn referenced_tables_at(
+    content: &str,
+    cursor: usize,
+    dialect: Dialect,
+) -> Vec<(String, String)> {
+    let stmt = statement_bounds(content, cursor, dialect);
     referenced_tables(&content[stmt])
 }
 
@@ -1230,9 +1251,9 @@ pub struct Diagnostic {
 /// * an unknown *unqualified* column, but only when the statement references exactly
 ///   one table (so there's no ambiguity about which table owns it) and that table's
 ///   columns are loaded.
-pub fn diagnostics(content: &str, schema: &dyn SchemaView) -> Vec<Diagnostic> {
+pub fn diagnostics(content: &str, schema: &dyn SchemaView, dialect: Dialect) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    for srange in statement_ranges(content) {
+    for srange in statement_ranges(content, dialect) {
         diagnose_statement(&content[srange.clone()], srange.start, schema, &mut out);
     }
     out
@@ -1241,17 +1262,30 @@ pub fn diagnostics(content: &str, schema: &dyn SchemaView) -> Vec<Diagnostic> {
 /// The 0-based line of each non-empty statement's first line — the editor's gutter
 /// run markers. A whitespace/comment-only statement gets none; leading blank lines
 /// are skipped so the marker sits on the line that actually holds SQL.
-pub fn statement_start_lines(content: &str) -> Vec<usize> {
-    statement_ranges(content)
-        .into_iter()
-        .filter(|r| !is_blank(&content[r.clone()]))
-        .map(|r| {
-            let stmt = &content[r.clone()];
-            let lead = stmt.len() - stmt.trim_start().len();
-            let start = r.start + lead;
-            content[..start].bytes().filter(|&b| b == b'\n').count()
-        })
-        .collect()
+pub fn statement_start_lines(content: &str, dialect: Dialect) -> Vec<usize> {
+    // Ranges are in ascending order, so walk the newline count forward once
+    // rather than rescanning `content[..start]` per statement — the latter is
+    // O(n·statements), ~25M byte-scans on a 500-statement migration, every
+    // frame. `cursor`/`line` advance monotonically to each statement's start.
+    let bytes = content.as_bytes();
+    let mut cursor = 0usize;
+    let mut line = 0usize;
+    let mut out = Vec::new();
+    for r in statement_ranges(content, dialect) {
+        if is_blank(&content[r.clone()]) {
+            continue;
+        }
+        let stmt = &content[r.clone()];
+        let start = r.start + (stmt.len() - stmt.trim_start().len());
+        while cursor < start {
+            if bytes[cursor] == b'\n' {
+                line += 1;
+            }
+            cursor += 1;
+        }
+        out.push(line);
+    }
+    out
 }
 
 /// The byte offset at the start of 0-based `line` in `content` (clamped to the
@@ -1493,12 +1527,34 @@ mod tests {
 
     fn ctx(src: &str) -> CompletionContext {
         let (content, cursor) = at(src);
-        analyze(&content, cursor)
+        analyze(&content, cursor, Dialect::Generic)
     }
 
     fn refs(src: &str) -> Vec<(String, String)> {
         let (content, cursor) = at(src);
-        referenced_tables_at(&content, cursor)
+        referenced_tables_at(&content, cursor, Dialect::Generic)
+    }
+
+    /// Shape tests run under [`Dialect::Generic`]; the dialect-sensitive lexing
+    /// has its own tests in `red_core::sql`.
+    fn is_read_only(sql: &str) -> bool {
+        super::is_read_only(sql, Dialect::Generic)
+    }
+
+    fn statement_at(content: &str, cursor: usize) -> &str {
+        super::statement_at(content, cursor, Dialect::Generic)
+    }
+
+    fn statement_count(sql: &str) -> usize {
+        super::statement_count(sql, Dialect::Generic)
+    }
+
+    fn statement_start_lines(content: &str) -> Vec<usize> {
+        super::statement_start_lines(content, Dialect::Generic)
+    }
+
+    fn diagnostics(content: &str, schema: &dyn SchemaView) -> Vec<Diagnostic> {
+        super::diagnostics(content, schema, Dialect::Generic)
     }
 
     #[test]
@@ -1830,9 +1886,12 @@ mod tests {
     #[test]
     fn semicolon_in_string_does_not_split() {
         let (content, cursor) = at("SELECT ';' AS s, na| FROM users");
-        assert_eq!(analyze(&content, cursor), CompletionContext::Column);
         assert_eq!(
-            referenced_tables_at(&content, cursor),
+            analyze(&content, cursor, Dialect::Generic),
+            CompletionContext::Column
+        );
+        assert_eq!(
+            referenced_tables_at(&content, cursor, Dialect::Generic),
             vec![("users".into(), "users".into())]
         );
     }

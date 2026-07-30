@@ -59,7 +59,7 @@ impl AppState {
             return;
         }
         let saved = self.health_store.get(&active.conn_id).cloned();
-        let mut tab = crate::app::QueryTab::new("Health".to_string(), cx);
+        let mut tab = crate::app::QueryTab::new("Health".to_string(), self.active_dialect(), cx);
         tab.view = Some(TabView::Health(HealthView {
             state: HealthState::Loading(saved),
             scroll: ScrollHandle::new(),
@@ -441,26 +441,4 @@ pub(crate) fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-fn fmt_age(secs: i64) -> String {
-    match secs {
-        s if s < 60 => "just now".to_string(),
-        s if s < 3600 => format!("{}m ago", s / 60),
-        s if s < 86_400 => format!("{}h ago", s / 3600),
-        s => format!("{}d ago", s / 86_400),
-    }
-}
-
-fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
+use crate::fmt::{fmt_ago_secs as fmt_age, human_bytes};

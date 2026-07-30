@@ -620,6 +620,25 @@ impl GridBuffer {
         out
     }
 
+    /// Call `f(absolute ordinal, row)` for every resident row, in no particular
+    /// order. For whole-resident-set passes (the watch-mode snapshot) that would
+    /// otherwise walk `0..total` and skip the non-resident majority — `total`
+    /// can be 50M while at most a window is resident.
+    pub(super) fn for_each_resident(&self, mut f: impl FnMut(usize, &Row)) {
+        match &self.mode {
+            BufferMode::Offset(pages) => {
+                for (&ord, row) in &pages.rows {
+                    f(ord, row);
+                }
+            }
+            BufferMode::Keyed(run) => {
+                for (i, row) in run.rows.iter().enumerate() {
+                    f(run.anchor + i, row);
+                }
+            }
+        }
+    }
+
     /// Whether the resident rows' ordinals are interpolation estimates.
     pub(super) fn is_estimated(&self) -> bool {
         match &self.mode {

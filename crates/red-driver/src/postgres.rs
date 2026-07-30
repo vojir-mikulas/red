@@ -449,11 +449,18 @@ impl DatabaseDriver for PostgresDriver {
         let pk: std::collections::HashSet<String> =
             pk_rows.iter().map(|r| r.get::<_, String>(0)).collect();
 
-        // Columns.
+        // Columns. `udt_name`, not `data_type`: the latter spells types the
+        // catalog way (`character varying`, `timestamp without time zone`,
+        // `USER-DEFINED`, `ARRAY`), none of which is a *typname* — and this
+        // string ends up quoted inside `pg_cast`'s explicit cast, where
+        // `::"character varying"` is a 42704 "type does not exist" that fails
+        // every copy/import into the column. `udt_name` is the typname
+        // (`varchar`, `timestamptz`, the enum's own name, `_text` for arrays),
+        // which both `pg_cast` and the migration typemap accept.
         let column_rows = self
             .client
             .query(
-                "SELECT column_name, data_type, is_nullable, column_default \
+                "SELECT column_name, udt_name, is_nullable, column_default \
                  FROM information_schema.columns \
                  WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
                 &[&schema, &table],
@@ -804,14 +811,16 @@ impl DatabaseDriver for PostgresDriver {
         .await
     }
 
-    async fn execute(&self, sql: &str) -> Result<u64> {
+    async fn execute_abort(&self, sql: &str, abort: &AbortSignal) -> Result<u64> {
         // Run the write on a borrowed pool connection, never the shared `client`
         // that backs the live cursor: a `BEGIN`/`COMMIT` pipelined onto the cursor's
         // connection can entangle an in-flight stream ("another command is already in
         // progress"). The pool connection carries the same read-only posture, so a
         // write on a read-only session is still rejected at the engine.
-        let client = self.acquire().await?;
-        let result = async {
+        // `with_fetch_conn` arms `abort` to this connection's cancel for the
+        // duration, so a write wedged on a lock is stoppable (57014 → Interrupted
+        // via `map_pg_err`, rolled back below).
+        self.with_fetch_conn(abort, |client| async move {
             client.batch_execute("BEGIN").await.map_err(driver_err)?;
             match client.execute(sql, &[]).await {
                 Ok(affected) => {
@@ -823,18 +832,19 @@ impl DatabaseDriver for PostgresDriver {
                     Err(map_pg_err(e))
                 }
             }
-        }
-        .await;
-        self.release(client);
-        result
+        })
+        .await
     }
 
-    async fn execute_batch(&self, statements: &[String]) -> Result<Vec<u64>> {
+    async fn execute_batch_abort(
+        &self,
+        statements: &[String],
+        abort: &AbortSignal,
+    ) -> Result<Vec<u64>> {
         if statements.is_empty() {
             return Ok(Vec::new());
         }
-        let client = self.acquire().await?;
-        let result = async {
+        self.with_fetch_conn(abort, |client| async move {
             client.batch_execute("BEGIN").await.map_err(driver_err)?;
             let mut affected = Vec::with_capacity(statements.len());
             for sql in statements {
@@ -851,10 +861,8 @@ impl DatabaseDriver for PostgresDriver {
             }
             client.batch_execute("COMMIT").await.map_err(driver_err)?;
             Ok(affected)
-        }
-        .await;
-        self.release(client);
-        result
+        })
+        .await
     }
 
     async fn apply_edits(&self, ops: &[EditOp]) -> Result<u64> {
@@ -985,6 +993,17 @@ impl DatabaseDriver for PostgresDriver {
 
     fn quote_ident(&self, ident: &str) -> String {
         pg_quote(ident)
+    }
+
+    fn diff_order_clause(&self, key: &str, key_is_text: bool) -> String {
+        // Postgres defaults to locale collation ('apple' < 'Banana' under ICU)
+        // and NULLS LAST — both disagree with the merge-walk's byte/NULLs-first
+        // order. `COLLATE "C"` is byte order, valid only on collatable types.
+        if key_is_text {
+            format!("{} COLLATE \"C\" ASC NULLS FIRST", pg_quote(key))
+        } else {
+            format!("{} ASC NULLS FIRST", pg_quote(key))
+        }
     }
 
     async fn create_index(
@@ -2053,7 +2072,9 @@ fn be_i32(b: &[u8]) -> Option<i32> {
 /// `"db error"`; the text lives only in the attached `DbError`).
 fn map_connect_err(e: tokio_postgres::Error) -> RedError {
     if let Some(db) = e.as_db_error() {
-        let class = &db.code().code()[..2];
+        // `.get`: an unrecognised SQLSTATE is stored verbatim, so a broken
+        // server/pooler can hand back fewer than two bytes.
+        let class = db.code().code().get(..2).unwrap_or_default();
         // SQLSTATE class 28 = invalid authorization; 3D000 = invalid catalog
         // (database does not exist). Both need a credential/target fix, not a wait.
         if class == "28" || db.code() == &tokio_postgres::error::SqlState::INVALID_CATALOG_NAME {

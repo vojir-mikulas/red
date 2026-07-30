@@ -37,5 +37,3 @@ assistant-agent_prompt = [Ágéñt prömpt]
 assistant-message_claude_agent_for_commands = [Mésságé Çláúdé Ágéñt (/ för çömmáñds)]
 
 assistant-search_conversations = [Séárçh çöñvérsátíöñs…]
-
-assistant-result_shape = [, shöwíñg á résúlt öf { $rows } röw(s) × { $cols } çölúmñ(s): { $names }]

@@ -129,8 +129,10 @@ impl ResultGrid {
         let buffer = self.buffer.borrow();
         let key_cols = self.watch_key_cols();
         let mut out = HashMap::new();
-        for ord in 0..self.total {
-            let Some(row) = buffer.row(ord) else { continue };
+        // Only the resident rows, not `0..total`: `total` can be 50M while the
+        // buffer holds at most a window, so the old loop stalled ~0.5-1s per
+        // tick skipping the non-resident majority.
+        buffer.for_each_resident(|ord, row| {
             let id = match &key_cols {
                 Some(cols) => WatchKey::Keyed(
                     cols.iter()
@@ -142,7 +144,7 @@ impl ResultGrid {
                 None => WatchKey::Ordinal(ord),
             };
             out.insert(id, row.values.iter().map(digest).collect());
-        }
+        });
         out
     }
 
@@ -207,10 +209,11 @@ impl AppState {
         let sql = sql.trim();
         // A table browse's editor holds the generated SELECT, so both paths land
         // on the same check.
-        if !sql.is_empty() && !crate::sql::is_read_only(sql) {
+        let dialect = crate::sql::Dialect::of(active.config.kind);
+        if !sql.is_empty() && !crate::sql::is_read_only(sql, dialect) {
             return Err("watch only re-runs read-only queries");
         }
-        if crate::sql::statement_count(sql) > 1 {
+        if crate::sql::statement_count(sql, dialect) > 1 {
             return Err("watch needs a single statement");
         }
         Ok(())
@@ -340,6 +343,14 @@ impl AppState {
             None
         };
         let next_epoch_for_arm = tab.result.as_ref().map_or(epoch, |g: &ResultGrid| g.epoch);
+        // The *watched tab's* namespace, not `send_namespace()`'s focused-tab
+        // one: tab 1 watching `sales` must re-open against `sales` even while
+        // tab 2 (focused on `staging`) is on screen.
+        let namespace = if active.config.kind.namespace_caps().settable {
+            tab.namespace.clone().or_else(|| active.namespace.clone())
+        } else {
+            None
+        };
 
         if let Some((sql, new_epoch, table, sort, filter, joins, old_epoch)) = reopen {
             // Close the superseded cursor every tick; without this a watch left
@@ -356,7 +367,7 @@ impl AppState {
                     sort,
                     filter,
                     joins,
-                    namespace: self.send_namespace(),
+                    namespace,
                 },
             );
         }

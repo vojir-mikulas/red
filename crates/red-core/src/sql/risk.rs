@@ -20,7 +20,7 @@
 //! boolean expression) are deliberately left narrow here, and answered properly by
 //! counting the affected rows against the engine instead.
 
-use super::{first_keyword, has_word, split_statements, strip_noise};
+use super::{Dialect, first_keyword, has_word, split_statements, strip_noise};
 
 /// Whole-word tokens that make a statement a write even though it leads with a read
 /// keyword: the data-modifying CTE verbs (Postgres executes these), `INTO` for
@@ -196,12 +196,14 @@ fn bare_name(reference: &str) -> &str {
 }
 
 /// Grade `sql`, which may be a whole `;`-separated script, by its most dangerous
-/// statement.
+/// statement. The `dialect` must be the engine that will run it: statement
+/// boundaries and comment forms differ per engine, and grading against the wrong
+/// lexing is exactly the drift this module exists to prevent.
 ///
 /// Blank and comment-only input grades [`RiskLevel::Safe`] with no risks, matching
 /// the "nothing runnable" reading the rest of the module uses.
-pub fn assess(sql: &str) -> Assessment {
-    let statements: Vec<&str> = split_statements(sql)
+pub fn assess(sql: &str, dialect: Dialect) -> Assessment {
+    let statements: Vec<&str> = split_statements(sql, dialect)
         .into_iter()
         .filter(|s| !first_keyword(s).is_empty())
         .collect();
@@ -209,7 +211,7 @@ pub fn assess(sql: &str) -> Assessment {
     let mut level = RiskLevel::Safe;
     let mut risks = Vec::new();
     for (index, stmt) in statements.iter().enumerate() {
-        let (stmt_level, mut stmt_risks) = assess_one(stmt);
+        let (stmt_level, mut stmt_risks) = assess_one(stmt, dialect);
         level = level.max(stmt_level);
         // Flag *where* the danger is only when it could be overlooked. In a single
         // statement the user is already looking at it.
@@ -232,8 +234,8 @@ pub fn assess(sql: &str) -> Assessment {
 }
 
 /// Grade one statement. Split out so [`assess`] owns only the batch reasoning.
-fn assess_one(stmt: &str) -> (RiskLevel, Vec<Risk>) {
-    let stripped = strip_noise(stmt);
+fn assess_one(stmt: &str, dialect: Dialect) -> (RiskLevel, Vec<Risk>) {
+    let stripped = strip_noise(stmt, dialect);
     let lower = stripped
         .trim()
         .trim_end_matches(';')
@@ -499,7 +501,13 @@ fn read_ref(tokens: &[Ref<'_>]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DropKind, MutateVerb, Risk, RiskLevel, assess, target_object};
+    use super::{Assessment, Dialect, DropKind, MutateVerb, Risk, RiskLevel, target_object};
+
+    /// The gradings here probe shapes, not dialect lexing, so they all run under
+    /// [`Dialect::Generic`]; the per-dialect lexing has its own tests in `sql`.
+    fn assess(sql: &str) -> Assessment {
+        super::assess(sql, Dialect::Generic)
+    }
 
     #[test]
     fn confirm_target_names_what_the_user_must_type() {

@@ -554,6 +554,21 @@ const DIFF_PROGRESS_STEP: usize = 20_000;
 /// diff of huge tables stays cheap.
 const DIFF_ROW_CAP: usize = 20_000;
 
+/// Whether a declared column type reads as text-family, across every engine's
+/// spelling (`varchar`, `character varying`, `TEXT`, ClickHouse `String`, …).
+/// Gates the diff's byte-collation ORDER BY decoration to collatable columns; a
+/// false negative only skips the decoration (an enum key, say, falls back to
+/// the engine's own order).
+fn is_text_decl(ty: Option<&str>) -> bool {
+    let Some(t) = ty.map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    matches!(t.as_str(), "name" | "citext" | "clob")
+        || t.contains("char")
+        || t.contains("text")
+        || t.contains("string")
+}
+
 /// Compare two tables by a shared key: read both sides key-ordered at full fidelity
 /// and merge-walk them, classifying each row as added / removed / changed (see
 /// docs/plans/todo/data-diff.md). The structural counterpart to [`copy_job`] — same
@@ -586,15 +601,22 @@ pub(super) async fn diff_job(
 > {
     use red_core::diff::{DiffAccumulator, DiffColumnPlan};
 
-    // An empty `key` means "align on the left table's primary key": describe it and
-    // use its single PK column. This lets the UI trigger a diff from two table names
-    // alone, without resolving the key itself. A composite / absent PK is an error
-    // the caller surfaces (the user must name a key column).
+    // Both details are needed regardless of who supplies the key: the PK
+    // resolution below reads the left's, and each side's ORDER BY decoration
+    // needs its own key column type (`diff_order_clause`).
+    let left_detail = left_driver
+        .describe_table(left.schema.as_deref().unwrap_or(""), &left.name)
+        .await?;
+    let right_detail = right_driver
+        .describe_table(right.schema.as_deref().unwrap_or(""), &right.name)
+        .await?;
+
+    // An empty `key` means "align on the left table's primary key". This lets the
+    // UI trigger a diff from two table names alone, without resolving the key
+    // itself. A composite / absent PK is an error the caller surfaces (the user
+    // must name a key column).
     let key = if key.is_empty() {
-        let detail = left_driver
-            .describe_table(left.schema.as_deref().unwrap_or(""), &left.name)
-            .await?;
-        let pk: Vec<&str> = detail
+        let pk: Vec<&str> = left_detail
             .columns
             .iter()
             .filter(|c| c.primary_key)
@@ -620,7 +642,17 @@ pub(super) async fn diff_job(
     };
 
     // Key-ordered, full-fidelity reads of both whole tables. The key is quoted by
-    // the engine's own helper; the table by `quote_table` — no raw UI text.
+    // the engine's own helper; the table by `quote_table` — no raw UI text. The
+    // ORDER BY is decorated per engine so both streams arrive in the byte /
+    // NULLs-first order the merge-walk compares with; without it, Postgres'
+    // locale collation and NULLS LAST report paired rows as added AND removed.
+    let key_is_text = |detail: &red_core::TableDetail| {
+        detail
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&key))
+            .is_some_and(|c| is_text_decl(c.type_name.as_deref()))
+    };
     let opts = QueryOptions {
         window: COPY_CHUNK_ROWS,
         timeout: None,
@@ -629,12 +661,12 @@ pub(super) async fn diff_job(
     let left_sql = format!(
         "SELECT * FROM {} ORDER BY {}",
         left_driver.quote_table(&left),
-        left_driver.quote_ident(&key),
+        left_driver.diff_order_clause(&key, key_is_text(&left_detail)),
     );
     let right_sql = format!(
         "SELECT * FROM {} ORDER BY {}",
         right_driver.quote_table(&right),
-        right_driver.quote_ident(&key),
+        right_driver.diff_order_clause(&key, key_is_text(&right_detail)),
     );
     let left_cursor = left_driver.open_cursor(&left_sql, opts.clone()).await?;
     let right_cursor = right_driver.open_cursor(&right_sql, opts).await?;

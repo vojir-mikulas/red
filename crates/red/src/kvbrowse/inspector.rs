@@ -17,7 +17,8 @@ use red_core::kv::{
 use red_service::{Command, SessionId};
 
 use crate::app::{
-    AppState, Notification, NotificationAction, RECYCLE_BIN_CAP, RecycleBatch, TabWorkspace,
+    AppState, Notification, NotificationAction, RECYCLE_BIN_BYTE_CAP, RECYCLE_BIN_CAP,
+    RecycleBatch, TabWorkspace,
 };
 
 use super::*;
@@ -427,7 +428,7 @@ impl AppState {
         let Some(inspector) = self.kv_inspector_mut(session) else {
             return;
         };
-        inspector.str_preview = Some(KvStrPreview { editor, sub });
+        inspector.str_preview = Some(KvStrPreview { editor, _sub: sub });
     }
 
     pub(crate) fn kv_close_inspector(&mut self, session: SessionId, cx: &mut Context<Self>) {
@@ -1447,10 +1448,20 @@ impl AppState {
             epoch,
             keys,
         });
-        // Evict the oldest batches beyond the cap (a session-scoped, bounded bin).
+        // Evict the oldest batches beyond the count cap (a session-scoped,
+        // bounded bin).
         if self.recycle_bin.len() > RECYCLE_BIN_CAP {
             let overflow = self.recycle_bin.len() - RECYCLE_BIN_CAP;
             self.recycle_bin.drain(0..overflow);
+        }
+        // ...and beyond the byte budget: a few batches of large values can pin
+        // gigabytes that the count cap alone never bounds. Keep at least the
+        // just-pushed batch even if it alone exceeds the budget (so its undo
+        // still works), then trim the oldest until under.
+        let mut total: usize = self.recycle_bin.iter().map(RecycleBatch::bytes).sum();
+        while total > RECYCLE_BIN_BYTE_CAP && self.recycle_bin.len() > 1 {
+            let evicted = self.recycle_bin.remove(0);
+            total -= evicted.bytes();
         }
         let msg = if n == 1 {
             "Deleted 1 key".to_string()

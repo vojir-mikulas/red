@@ -827,22 +827,50 @@ fn rect_visible(x: f32, y: f32, w: f32, h: f32, vp: &Rect) -> bool {
         && y <= vp.h + CULL_MARGIN
 }
 
-fn assign_layer(i: usize, parents: &[Vec<usize>], layer: &mut [usize], state: &mut [u8]) -> usize {
-    if state[i] == 2 {
-        return layer[i];
+/// Longest-path layer of `root`: 1 + the max layer of its parents, memoised in
+/// `layer`/`state` (0 unseen · 1 in-progress · 2 done), a cycle contributing a
+/// single hop. An explicit stack rather than recursion, so the longest FK chain
+/// a schema can hold costs heap, never stack (`components` above made the same
+/// choice; a stack overflow is an abort, not a catchable panic).
+fn assign_layer(
+    root: usize,
+    parents: &[Vec<usize>],
+    layer: &mut [usize],
+    state: &mut [u8],
+) -> usize {
+    if state[root] == 2 {
+        return layer[root];
     }
-    if state[i] == 1 {
+    if state[root] == 1 {
         return 0; // cycle: break here
     }
-    state[i] = 1;
-    let mut l = 0;
-    for k in 0..parents[i].len() {
-        let p = parents[i][k];
-        l = l.max(assign_layer(p, parents, layer, state) + 1);
+    state[root] = 1;
+    // Each frame is (node, index of the next parent to examine); `layer[i]`
+    // accumulates the running max while the frame is open.
+    let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
+    while let Some(top) = stack.last_mut() {
+        let (i, k) = *top;
+        if let Some(&p) = parents[i].get(k) {
+            top.1 += 1;
+            match state[p] {
+                2 => layer[i] = layer[i].max(layer[p] + 1),
+                // In-progress parent = a cycle; the recursion counted it as one
+                // hop (a return of 0, plus 1), so the same here.
+                1 => layer[i] = layer[i].max(1),
+                _ => {
+                    state[p] = 1;
+                    stack.push((p, 0));
+                }
+            }
+        } else {
+            state[i] = 2;
+            stack.pop();
+            if let Some(&mut (j, _)) = stack.last_mut() {
+                layer[j] = layer[j].max(layer[i] + 1);
+            }
+        }
     }
-    layer[i] = l;
-    state[i] = 2;
-    l
+    layer[root]
 }
 
 impl AppState {
@@ -870,7 +898,7 @@ impl AppState {
             Some(ns) => format!("ER: {ns}"),
             None => format!("ER: {}", active.config.name),
         };
-        let mut tab = crate::app::QueryTab::new(title, cx);
+        let mut tab = crate::app::QueryTab::new(title, self.active_dialect(), cx);
         let Phase::Connected(active) = &self.phase else {
             return;
         };

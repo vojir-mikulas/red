@@ -151,6 +151,34 @@ impl AppState {
         index
     }
 
+    /// Push `tab` into the connection that owns `session`, even when that
+    /// connection is parked (not on screen). Used for a background job's result
+    /// (a schema diff) that must land in the connection that *asked* for it, not
+    /// whatever happens to be foreground when the reply arrives — otherwise its
+    /// "Open script" would generate DDL against the wrong server. Foreground
+    /// session falls through to the focus-changing [`push_tab`](Self::push_tab).
+    pub(crate) fn push_tab_to(
+        &mut self,
+        session: Option<SessionId>,
+        mut tab: QueryTab,
+        cx: &mut Context<Self>,
+    ) {
+        if session.is_none() || session == self.foreground_session {
+            self.push_tab(tab, cx);
+            return;
+        }
+        // A parked connection: append without touching focus. The user sees it
+        // when they switch back; `set_pane_active` binds it as that half's tab.
+        if let Some(active) = self.conn_mut(session) {
+            let half = active.focused_half();
+            tab.pane = half;
+            active.tabs.push(tab);
+            let index = active.tabs.len() - 1;
+            active.set_pane_active(half, index);
+        }
+        cx.notify();
+    }
+
     /// Focus the next query tab, wrapping past the end. No-op with one tab.
     pub(crate) fn next_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cycle_tab(true, window, cx);
@@ -312,10 +340,11 @@ impl AppState {
             self.doc_new_empty_tab(session, cx);
             return;
         }
+        let dialect = self.active_dialect();
         let tab = match &mut self.phase {
             Phase::Connected(active) => {
                 active.query_seq += 1;
-                QueryTab::new(format!("query {}", active.query_seq), cx)
+                QueryTab::new(format!("query {}", active.query_seq), dialect, cx)
             }
             _ => return,
         };

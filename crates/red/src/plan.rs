@@ -67,7 +67,10 @@ impl AppState {
 
         // EXPLAIN ANALYZE runs the statement, so refuse it for anything but a read
         // query (a confirmed `EXPLAIN ANALYZE DELETE …` would still delete).
-        if analyze && red_core::sql::assess(&sql).level > red_core::sql::RiskLevel::Safe {
+        if analyze
+            && red_core::sql::assess(&sql, self.active_dialect()).level
+                > red_core::sql::RiskLevel::Safe
+        {
             self.notify(
                 ToastVariant::Error,
                 "Explain Analyze runs the statement, so it's only available for read queries.",

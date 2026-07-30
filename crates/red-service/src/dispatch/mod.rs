@@ -500,6 +500,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
     // probe and page/run fetch. `None` = no cap. Global, set by the UI at launch
     // and on each settings reload, captured into each spawned fetch task.
     let mut statement_timeout: Option<Duration> = None;
+    // Monotonic id for the in-flight write registry (`SessionState::writes`);
+    // loop-global so two sessions' writes can never collide on an id.
+    let mut write_seq: u64 = 0;
     // Bounds how many page fetches hit servers concurrently across *all* sessions
     // (see the const), a shared backstop, so a flung scrollbar on one connection
     // can't fan out dozens of deep scans. A busy session can briefly delay
@@ -718,8 +721,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // own tool catalog; see docs/plans/redis-workflow-parity.md Part 1).
                 let session_driver = session_id
                     .and_then(|id| sessions.get(&id))
-                    .map(|s| s.driver.clone());
-                let Some(session_driver) = session_driver else {
+                    .map(|s| (s.driver.clone(), s.kind));
+                let Some((session_driver, session_kind)) = session_driver else {
                     emit(
                         &events,
                         session_id,
@@ -800,7 +803,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         };
                         let model = model.clone();
                         // Ground in whichever seam the session holds.
-                        let backend = crate::ai::AiBackend::from(&session_driver);
+                        let backend = session_driver.ai_backend(session_kind);
                         let cancel = red_ai::CancelToken::new();
                         lock(&ai_state).register(conversation_id, cancel.clone());
                         tokio::spawn(crate::ai::run_turn(
@@ -823,7 +826,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         // server, which hosts whichever seam this session holds (SQL
                         // schema/query tools, the Redis `kv_*` tools, or the MongoDB
                         // doc tools).
-                        let backend = crate::ai::AiBackend::from(&session_driver);
+                        let backend = session_driver.ai_backend(session_kind);
                         let command = command.clone();
                         // The agent loads its own config (and login) from cwd; use
                         // the process working directory.
@@ -898,7 +901,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         session_id,
                         Event::AiToolResult {
                             call_id,
-                            text: "error: not connected".into(),
+                            text: "error: not connected, or the AI agent is disabled for this \
+                                   connection"
+                                .into(),
                             is_error: true,
                         },
                     );
@@ -1177,13 +1182,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 }
             }
 
-            Command::LoadObjects => schema_cmds::load_objects(&sessions, session_id, &events).await,
+            // Each handler resolves its driver under the loop's borrow, then
+            // spawns the catalog round trip — the pump never awaits a server.
+            Command::LoadObjects => schema_cmds::load_objects(&sessions, session_id, &events),
             Command::LoadObjectCounts => {
-                schema_cmds::load_object_counts(&sessions, session_id, &events).await
+                schema_cmds::load_object_counts(&sessions, session_id, &events)
             }
             Command::LoadObjectGroup { namespace, kind } => {
                 schema_cmds::load_object_group(&sessions, session_id, &events, namespace, kind)
-                    .await
             }
             Command::DiffSchemas {
                 id,
@@ -1199,37 +1205,33 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     left_namespace,
                     right_session,
                     right_namespace,
-                )
-                .await
+                );
             }
             Command::BuildHealthReport => {
-                schema_cmds::build_health_report(&sessions, session_id, &events).await
+                schema_cmds::build_health_report(&sessions, session_id, &events)
             }
             Command::ListServerSessions => {
-                schema_cmds::list_server_sessions(&sessions, session_id, &events).await
+                schema_cmds::list_server_sessions(&sessions, session_id, &events)
             }
             Command::KillServerSession { key, mode } => {
-                schema_cmds::kill_server_session(&sessions, session_id, &events, key, mode).await
+                schema_cmds::kill_server_session(&sessions, session_id, &events, key, mode)
             }
             Command::ObjectDdl {
                 epoch,
                 namespace,
                 name,
                 kind,
-            } => {
-                schema_cmds::object_ddl(
-                    &sessions, session_id, &events, epoch, namespace, name, kind,
-                )
-                .await
-            }
+            } => schema_cmds::object_ddl(
+                &sessions, session_id, &events, epoch, namespace, name, kind,
+            ),
             Command::LoadForeignKeys => {
-                schema_cmds::load_foreign_keys(&sessions, session_id, &events).await
+                schema_cmds::load_foreign_keys(&sessions, session_id, &events)
             }
             Command::LoadEnums { table } => {
-                schema_cmds::load_enums(&sessions, session_id, &events, table).await
+                schema_cmds::load_enums(&sessions, session_id, &events, table)
             }
             Command::DescribeTable { schema, table } => {
-                schema_cmds::describe_table(&sessions, session_id, &events, schema, table).await
+                schema_cmds::describe_table(&sessions, session_id, &events, schema, table)
             }
 
             Command::OpenResult {
@@ -1453,15 +1455,27 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             // Fill the spec in only if the result is still open.
                             // `key_cols` locate the key columns within a row so the
                             // checkpoint build can read each checkpoint's key tuple.
+                            // All-or-nothing: silently dropping just a missing
+                            // column would shift the remaining values one slot
+                            // left and bind the tiebreak's value against the
+                            // lead column — a checkpoint that addresses the
+                            // wrong rows, not a slower one. An empty vec simply
+                            // disables the checkpoint index for this result.
                             let key_cols = key
                                 .as_ref()
                                 .map(|k| {
-                                    k.column_names()
+                                    let positions: Vec<Option<usize>> = k
+                                        .column_names()
                                         .iter()
-                                        .filter_map(|name| {
+                                        .map(|name| {
                                             page.columns.iter().position(|c| &c.name == name)
                                         })
-                                        .collect::<Vec<_>>()
+                                        .collect();
+                                    if positions.iter().all(Option::is_some) {
+                                        positions.into_iter().flatten().collect()
+                                    } else {
+                                        Vec::new()
+                                    }
                                 })
                                 .unwrap_or_default();
                             if let Some(spec) = lock(&results).get_mut(&epoch) {
@@ -1483,6 +1497,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                 },
                             );
                         }
+                        // Superseded mid-probe (a re-sort sends CloseResult +
+                        // OpenResult, aborting the old bundle's count): a clean
+                        // cancel, not an error toast. Without this the aborted
+                        // count's "query cancelled" lands on the *newly opened*,
+                        // healthy grid, whose error isn't epoch-tagged UI-side.
+                        // Mirrors the filter FetchPage/FetchRun already carry.
+                        (Err(RedError::Interrupted), _) | (_, Err(RedError::Interrupted)) => {}
                         (Err(e), _) | (_, Err(e)) => {
                             emit(&events, session_id, Event::Error(e.to_string()))
                         }
@@ -2242,6 +2263,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     );
                     continue;
                 };
+                // Register an abort under the epoch (same `KvValue` slot as
+                // `KvBatch`) so a `KvBatchStop` and session teardown can stop a
+                // 500k-command import between commands — otherwise the spawned
+                // task owns its driver `Arc` and keeps writing after the UI shows
+                // the connection gone.
+                let entry = state.inflight.entry(epoch).or_default();
+                let abort = entry.supersede(Slot::KvValue);
                 let events = events.clone();
                 tokio::spawn(async move {
                     // Sequential so dependent commands (e.g. HSET after DEL) keep
@@ -2250,6 +2278,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     let (mut ok, mut failed) = (0usize, 0usize);
                     let mut first_error = None;
                     for argv in &commands {
+                        if abort.is_aborted() {
+                            break;
+                        }
                         if argv.is_empty() {
                             continue;
                         }
@@ -3175,6 +3206,24 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         continue;
                     }
                 };
+                // Aggregation is a read surface with two write stages hiding in it:
+                // `$out`/`$merge` write collections (`$merge` even cross-database),
+                // so a read-only connection must refuse them like any other write.
+                if state.read_only
+                    && let Some(stage) = red_core::doc::pipeline_write_stage(&stages)
+                {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::DocError {
+                            epoch,
+                            message: format!(
+                                "write stage `{stage}` is not allowed on a read-only connection"
+                            ),
+                        },
+                    );
+                    continue;
+                }
                 // Share the browse's abort slot: only one read runs at a time, so a
                 // new aggregate (or a page fetch) supersedes the prior in-flight one.
                 let entry = state.inflight.entry(epoch).or_default();
@@ -3503,21 +3552,27 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     let rows = match with_timeout(timeout, &abort, driver.count(&sql, &abort)).await
                     {
                         Ok(rows) => Some(rows),
-                        // Logged at `warn`, and with the rewritten SQL, because this is
-                        // the *only* trace of the failure: the dialog says "row count
-                        // unavailable" and deliberately says no more, so a preflight
-                        // that never works on some engine is otherwise undiagnosable.
-                        // The two causes need different fixes, so name which it was.
+                        // Logged at `warn` because this is the *only* trace of the
+                        // failure: the dialog says "row count unavailable" and no
+                        // more, so a preflight that never works on some engine is
+                        // otherwise undiagnosable. The SQL is stripped of its
+                        // literals first — the predicate carries the user's own
+                        // data verbatim, and journald is outside RED's 0600
+                        // perimeter — leaving the shape that actually diagnoses it.
                         Err(RedError::Timeout) => {
+                            let shape =
+                                red_core::sql::strip_noise(&sql, red_core::sql::Dialect::Generic);
                             tracing::warn!(
-                                %sql,
+                                sql.shape = %shape,
                                 "row-count preflight timed out after {timeout:?}; \
                                  the dialog shows no count"
                             );
                             None
                         }
                         Err(e) => {
-                            tracing::warn!(%sql, "row-count preflight failed: {e}");
+                            let shape =
+                                red_core::sql::strip_noise(&sql, red_core::sql::Dialect::Generic);
+                            tracing::warn!(sql.shape = %shape, "row-count preflight failed: {e}");
                             None
                         }
                     };
@@ -3744,46 +3799,90 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // in one transaction. How much that rollback is worth is the engine's
                 // business, not ours to promise: MySQL implicitly commits DDL, and
                 // ClickHouse has no multi-statement transaction at all.
-                let statements = red_core::sql::split_statements(&sql);
-                let outcome = match statements.as_slice() {
-                    [] => {
-                        emit(
-                            &events,
-                            session_id,
-                            Event::Error("no statements to execute".into()),
-                        );
-                        continue;
-                    }
-                    [one] => driver.execute(one).await.map(|affected| (1, affected)),
-                    many => {
-                        let owned: Vec<String> = many.iter().map(|s| (*s).to_string()).collect();
-                        driver
-                            .execute_batch(&owned)
-                            .await
-                            .map(|affected| (owned.len(), affected.iter().sum()))
-                    }
-                };
-                match outcome {
-                    Ok((ran, affected)) => {
-                        // A write may have shifted rows under any open result, so
-                        // drop the checkpoint indexes; they rebuild lazily on the
-                        // next deep jump rather than serving from stale keys.
-                        for spec in lock(&results).values() {
-                            let mut idx = lock(&spec.checkpoints);
-                            idx.points.clear();
-                            idx.status = BuildStatus::Idle;
-                        }
-                        emit(
-                            &events,
-                            session_id,
-                            Event::Executed {
-                                statements: ran,
-                                affected: affected as usize,
-                            },
-                        );
-                    }
-                    Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                let statements: Vec<String> =
+                    red_core::sql::split_statements(&sql, red_core::sql::Dialect::of(state.kind))
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect();
+                if statements.is_empty() {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("no statements to execute".into()),
+                    );
+                    continue;
                 }
+                // Spawned off the pump: a write wedged on a metadata/row lock must
+                // not stall every session's fetches, connects, and cancels. The
+                // engine-level cancel is registered so `Command::Cancel` (the UI's
+                // stop affordance) and session teardown can reach it, the statement
+                // timeout is armed against it, and the pin keeps idle eviction from
+                // tearing the session down mid-write.
+                let abort = AbortSignal::new();
+                write_seq += 1;
+                let write_id = write_seq;
+                lock(&state.writes).insert(write_id, abort.clone());
+                let writes = state.writes.clone();
+                let pin = PinGuard::new(state.busy.clone());
+                let timeout = statement_timeout;
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let _pin = pin;
+                    // On timeout, fire the engine cancel and keep awaiting: the
+                    // driver returns `Interrupted` promptly and its transaction
+                    // cleanup still runs (dropping the future mid-COMMIT would
+                    // strand the borrowed connection instead of rolling back).
+                    let timed_out = Arc::new(AtomicBool::new(false));
+                    let timer = timeout.map(|t| {
+                        let abort = abort.clone();
+                        let timed_out = timed_out.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(t).await;
+                            timed_out.store(true, Ordering::Relaxed);
+                            abort.abort();
+                        })
+                    });
+                    let outcome = match statements.as_slice() {
+                        [one] => driver
+                            .execute_abort(one, &abort)
+                            .await
+                            .map(|affected| (1, affected)),
+                        many => driver
+                            .execute_batch_abort(many, &abort)
+                            .await
+                            .map(|affected| (many.len(), affected.iter().sum())),
+                    };
+                    if let Some(timer) = timer {
+                        timer.abort();
+                    }
+                    lock(&writes).remove(&write_id);
+                    match outcome {
+                        Ok((ran, affected)) => {
+                            // A write may have shifted rows under any open result, so
+                            // drop the checkpoint indexes; they rebuild lazily on the
+                            // next deep jump rather than serving from stale keys.
+                            for spec in lock(&results).values() {
+                                let mut idx = lock(&spec.checkpoints);
+                                idx.points.clear();
+                                idx.status = BuildStatus::Idle;
+                            }
+                            emit(
+                                &events,
+                                session_id,
+                                Event::Executed {
+                                    statements: ran,
+                                    affected: affected as usize,
+                                },
+                            );
+                        }
+                        Err(RedError::Interrupted) if timed_out.load(Ordering::Relaxed) => emit(
+                            &events,
+                            session_id,
+                            Event::Error(RedError::Timeout.to_string()),
+                        ),
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                    }
+                });
             }
 
             Command::ApplyBatch { epoch, ops, mode } => {
@@ -3801,45 +3900,32 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
                 let results = state.results.clone();
-                // Any write may have shifted rows under any open result, so the
-                // checkpoint indexes are dropped and rebuilt lazily on the next deep
-                // jump rather than served from stale keys. Done for a *partial* batch
-                // too: some ops landed, so the indexes are just as stale.
-                let drop_checkpoints = || {
-                    for spec in lock(&results).values() {
-                        let mut idx = lock(&spec.checkpoints);
-                        idx.points.clear();
-                        idx.status = BuildStatus::Idle;
-                    }
-                };
-                match mode {
-                    // The relational contract: one transaction, each op asserted to
-                    // touch exactly one row, all-or-nothing. The failure is pane-local
-                    // (`BatchFailed`), not a global error toast.
-                    BatchMode::Atomic => match driver.apply_edits(&ops).await {
-                        Ok(applied) => {
-                            drop_checkpoints();
-                            emit(&events, session_id, Event::BatchApplied { epoch, applied });
+                // Spawned off the pump (a batch stuck on a row lock must not stall
+                // other sessions), pinned against idle eviction for its duration.
+                let pin = PinGuard::new(state.busy.clone());
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let _pin = pin;
+                    // Any write may have shifted rows under any open result, so the
+                    // checkpoint indexes are dropped and rebuilt lazily on the next
+                    // deep jump rather than served from stale keys. Done for a
+                    // *partial* batch too: some ops landed, so the indexes are just
+                    // as stale.
+                    let drop_checkpoints = || {
+                        for spec in lock(&results).values() {
+                            let mut idx = lock(&spec.checkpoints);
+                            idx.points.clear();
+                            idx.status = BuildStatus::Idle;
                         }
-                        Err(e) => emit(
-                            &events,
-                            session_id,
-                            Event::BatchFailed {
-                                epoch,
-                                failed_index: None,
-                                message: e.to_string(),
-                            },
-                        ),
-                    },
-                    // Best-effort: every op runs and reports for itself. Only a
-                    // failure to run the batch *at all* is a `BatchFailed`; a batch
-                    // where some ops didn't land is a successful `BatchPartial`
-                    // carrying that news, because that is what happened.
-                    BatchMode::BestEffort { .. } => {
-                        match driver.apply_edits_best_effort(&ops, mode).await {
-                            Ok(outcomes) => {
+                    };
+                    match mode {
+                        // The relational contract: one transaction, each op asserted
+                        // to touch exactly one row, all-or-nothing. The failure is
+                        // pane-local (`BatchFailed`), not a global error toast.
+                        BatchMode::Atomic => match driver.apply_edits(&ops).await {
+                            Ok(applied) => {
                                 drop_checkpoints();
-                                emit(&events, session_id, Event::BatchPartial { epoch, outcomes });
+                                emit(&events, session_id, Event::BatchApplied { epoch, applied });
                             }
                             Err(e) => emit(
                                 &events,
@@ -3850,9 +3936,35 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                     message: e.to_string(),
                                 },
                             ),
+                        },
+                        // Best-effort: every op runs and reports for itself. Only a
+                        // failure to run the batch *at all* is a `BatchFailed`; a
+                        // batch where some ops didn't land is a successful
+                        // `BatchPartial` carrying that news, because that is what
+                        // happened.
+                        BatchMode::BestEffort { .. } => {
+                            match driver.apply_edits_best_effort(&ops, mode).await {
+                                Ok(outcomes) => {
+                                    drop_checkpoints();
+                                    emit(
+                                        &events,
+                                        session_id,
+                                        Event::BatchPartial { epoch, outcomes },
+                                    );
+                                }
+                                Err(e) => emit(
+                                    &events,
+                                    session_id,
+                                    Event::BatchFailed {
+                                        epoch,
+                                        failed_index: None,
+                                        message: e.to_string(),
+                                    },
+                                ),
+                            }
                         }
                     }
-                }
+                });
             }
 
             cmd @ (Command::ListMutations | Command::KillMutation { .. }) => {
@@ -3878,19 +3990,23 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // A kill is followed by the same listing, so the panel reflects it
                 // without a second round trip. Killing stops further part rewrites; it
                 // does not undo the parts already rewritten, which is why the panel
-                // shows progress rather than offering an "undo".
-                if let Some((table, id)) = &kill
-                    && let Err(e) = driver.kill_mutation(table, id.as_str()).await
-                {
-                    emit(&events, session_id, Event::Error(e.to_string()));
-                    continue;
-                }
-                match driver.mutations().await {
-                    Ok(mutations) => {
-                        emit(&events, session_id, Event::MutationsLoaded { mutations })
+                // shows progress rather than offering an "undo". Spawned: these are
+                // round trips to the server and must not stall the pump.
+                let events = events.clone();
+                tokio::spawn(async move {
+                    if let Some((table, id)) = &kill
+                        && let Err(e) = driver.kill_mutation(table, id.as_str()).await
+                    {
+                        emit(&events, session_id, Event::Error(e.to_string()));
+                        return;
                     }
-                    Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
-                }
+                    match driver.mutations().await {
+                        Ok(mutations) => {
+                            emit(&events, session_id, Event::MutationsLoaded { mutations })
+                        }
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                    }
+                });
             }
 
             Command::PreflightBatch { epoch, ops } => {
@@ -3909,18 +4025,23 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 };
                 // Reads only: this is what makes the confirm dialog able to show the
                 // statement that will actually run, and the row counts it will hit,
-                // before anything is written.
-                match driver.preflight_edits(&ops).await {
-                    Ok(plan) => emit(&events, session_id, Event::BatchPreflight { epoch, plan }),
-                    Err(e) => emit(
-                        &events,
-                        session_id,
-                        Event::BatchPreflightFailed {
-                            epoch,
-                            message: e.to_string(),
-                        },
-                    ),
-                }
+                // before anything is written. Spawned: the counts are real queries.
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver.preflight_edits(&ops).await {
+                        Ok(plan) => {
+                            emit(&events, session_id, Event::BatchPreflight { epoch, plan })
+                        }
+                        Err(e) => emit(
+                            &events,
+                            session_id,
+                            Event::BatchPreflightFailed {
+                                epoch,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
+                });
             }
 
             Command::Explain {
@@ -3943,17 +4064,22 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 };
                 // A plan is one bounded round-trip: no cursor, no windowing. The
                 // failure is pane-local (`PlanFailed`), not a global error toast.
-                match driver.explain(&sql, analyze).await {
-                    Ok(plan) => emit(&events, session_id, Event::PlanReady { epoch, plan }),
-                    Err(e) => emit(
-                        &events,
-                        session_id,
-                        Event::PlanFailed {
-                            epoch,
-                            message: e.to_string(),
-                        },
-                    ),
-                }
+                // Spawned: EXPLAIN ANALYZE *executes* the statement, which can run
+                // as long as the statement itself.
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver.explain(&sql, analyze).await {
+                        Ok(plan) => emit(&events, session_id, Event::PlanReady { epoch, plan }),
+                        Err(e) => emit(
+                            &events,
+                            session_id,
+                            Event::PlanFailed {
+                                epoch,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
+                });
             }
 
             Command::Export {
@@ -4019,7 +4145,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 let events = events.clone();
                 let exports = state.exports.clone();
                 let export_limit = export_limit.clone();
+                // Pin against idle eviction for the export's whole lifetime: a
+                // multi-million-row export runs for minutes with no commands, so
+                // without the pin the sweep would evict the session, teardown
+                // would flip the cancel flag, and the export would delete its
+                // partial file and toast "cancelled" out of nowhere.
+                let pin = PinGuard::new(state.busy.clone());
                 tokio::spawn(async move {
+                    let _pin = pin;
                     // Hold a permit for the export's lifetime so concurrent exports
                     // are capped (queued exports wait here; the cancel flag is
                     // already registered, so a wait can still be cancelled).
@@ -4108,7 +4241,12 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 let events = events.clone();
                 let exports = state.exports.clone();
                 let import_limit = import_limit.clone();
+                // Pin against idle eviction (like Export): a long import must not
+                // be evicted mid-file, which would flip its cancel flag and stop
+                // it with earlier chunks already committed.
+                let pin = PinGuard::new(state.busy.clone());
                 tokio::spawn(async move {
+                    let _pin = pin;
                     let _permit = import_limit.acquire_owned().await;
                     let handle = tokio::runtime::Handle::current();
                     let outcome = tokio::task::spawn_blocking(move || {
@@ -4571,6 +4709,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     aq.cancel.cancel();
                     emit(&events, session_id, Event::QueryCancelled);
                 }
+                // Fire the engine-level cancel of every in-flight write (the UI's
+                // stop affordance): each spawned write surfaces its own
+                // Interrupted error and removes itself from the registry.
+                if let Some(state) = sessions.get(&id) {
+                    for abort in lock(&state.writes).values() {
+                        abort.abort();
+                    }
+                }
             }
 
             Command::Shutdown => break,
@@ -4597,9 +4743,15 @@ fn resolve_ai_tool_ctx(
     ai_policy: &red_core::AiPolicy,
 ) -> Option<(crate::ai::AiBackend, red_core::AiPolicy)> {
     let state = sessions.get(&session_id?)?;
-    let backend = crate::ai::AiBackend::from(&state.driver);
     let mut effective = ai_policy.with_overrides(state.ai_override.enabled, state.ai_override.tier);
     effective.read_only = state.read_only;
+    // The master switch. `AiPolicy.enabled` promises "no tools and no MCP
+    // server"; without this check the headless path would keep serving reads on
+    // a connection whose assistant the user turned off.
+    if !effective.enabled {
+        return None;
+    }
+    let backend = state.driver.ai_backend(state.kind);
     Some((backend, effective))
 }
 

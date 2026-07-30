@@ -31,8 +31,8 @@ pub(crate) enum FindTarget {
 /// the owning `Option`) drops the subscription with it.
 pub(crate) struct FindBarState {
     pub(crate) input: Entity<TextInput>,
-    #[allow(dead_code)]
-    pub(crate) sub: gpui::Subscription,
+    /// RAII: held to keep the input subscription alive; never read.
+    pub(crate) _sub: gpui::Subscription,
     pub(crate) target: FindTarget,
     /// Index into the active target's matches of the focused match (meaningless
     /// when there are none).
@@ -107,7 +107,7 @@ impl AppState {
         });
         self.find_bar = Some(FindBarState {
             input,
-            sub,
+            _sub: sub,
             target,
             current: 0,
             grid_matches: Vec::new(),

@@ -498,7 +498,10 @@ impl AppState {
                         div()
                             .text_size(theme.scale(9.5))
                             .text_color(theme.text_muted)
-                            .child(format!("{}{client}", fmt_ago(now, e.time_secs))),
+                            .child(format!(
+                                "{}{client}",
+                                crate::fmt::fmt_ago_secs(now - e.time_secs)
+                            )),
                     )
                     .into_any_element()
             })
@@ -842,21 +845,6 @@ fn unix_now() -> i64 {
 
 /// A coarse "N ago" for a slow-log entry's timestamp (server clock vs. local,
 /// roughly aligned). `just now` under a second, else `Ns/Nm/Nh/Nd ago`.
-fn fmt_ago(now: i64, then: i64) -> String {
-    let d = (now - then).max(0);
-    if d < 1 {
-        "just now".to_string()
-    } else if d < 60 {
-        format!("{d}s ago")
-    } else if d < 3600 {
-        format!("{}m ago", d / 60)
-    } else if d < 86_400 {
-        format!("{}h ago", d / 3600)
-    } else {
-        format!("{}d ago", d / 86_400)
-    }
-}
-
 /// A compact human duration from whole seconds (`CLIENT LIST` age/idle):
 /// `"0s"`, `"45s"`, `"3m"`, `"2h"`, `"1d"`.
 fn fmt_secs(s: u64) -> String {

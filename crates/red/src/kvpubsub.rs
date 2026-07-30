@@ -281,15 +281,4 @@ fn now_unix() -> i64 {
 /// A compact, timezone-free "N ago" for a message's arrival: `now`, `Ns`, `Nm`,
 /// `Nh`. Timezone-free (relative) so it reads right regardless of the user's
 /// clock offset.
-fn fmt_ago(now: i64, then: i64) -> String {
-    let d = (now - then).max(0);
-    if d < 1 {
-        "now".to_string()
-    } else if d < 60 {
-        format!("{d}s")
-    } else if d < 3_600 {
-        format!("{}m", d / 60)
-    } else {
-        format!("{}h", d / 3_600)
-    }
-}
+use crate::fmt::fmt_ago;

@@ -166,6 +166,9 @@ struct ExecArgs {
     /// Read SQL from a file (`-` for stdin).
     #[arg(short = 'f', long = "file")]
     file: Option<PathBuf>,
+    /// Skip the confirmation prompt for risky/destructive statements (scripts/CI).
+    #[arg(long)]
+    yes: bool,
 }
 
 /// Entry point from `main`. Returns `Some(code)` when a CLI verb ran (the caller
@@ -388,14 +391,6 @@ fn cmd_exec(args: ExecArgs) -> u8 {
             return EXIT_USAGE;
         }
     };
-    // The service would split a script itself, but it runs one whole `Execute` in a
-    // single transaction; a seed script is run statement by statement here so a
-    // failure names the offending statement and the ones before it stay committed.
-    let statements = red_core::sql::split_statements(&sql);
-    if statements.is_empty() {
-        eprintln!("no statements to execute");
-        return EXIT_OK;
-    }
     let config = match resolve(&args.conn) {
         Ok(c) => c,
         Err(e) => {
@@ -403,6 +398,37 @@ fn cmd_exec(args: ExecArgs) -> u8 {
             return EXIT_USAGE;
         }
     };
+    // The service would split a script itself, but it runs one whole `Execute` in a
+    // single transaction; a seed script is run statement by statement here so a
+    // failure names the offending statement and the ones before it stay committed.
+    // Split with the engine's own dialect: `red exec -f seed.sql` has no confirm
+    // gate, so a mis-split here executes text the user never wrote as a statement.
+    let dialect = red_core::sql::Dialect::of(config.kind);
+    let statements = red_core::sql::split_statements(&sql, dialect);
+    if statements.is_empty() {
+        eprintln!("no statements to execute");
+        return EXIT_OK;
+    }
+    // The confirm gate the GUI applies exists only UI-side, so a headless
+    // `red exec 'DROP TABLE users'` would run unchallenged. Grade the whole
+    // script and gate anything Risky-or-worse behind the same prompt/`--yes` as
+    // the GUI's destructive confirm.
+    let assessment = red_core::sql::assess(&sql, dialect);
+    if assessment.level >= red_core::sql::RiskLevel::Risky {
+        let what = assessment
+            .confirm_target()
+            .map(|t| format!(" (targets `{t}`)"))
+            .unwrap_or_default();
+        if let Some(code) = confirm_destructive(
+            args.yes,
+            &format!(
+                "This runs a {:?} statement{what}. This may be irreversible.",
+                assessment.level
+            ),
+        ) {
+            return code;
+        }
+    }
     let (svc, mut events) = start();
     if let Err(code) = connect(&svc, &mut events, config) {
         shutdown(&svc);
@@ -435,6 +461,30 @@ fn cmd_exec(args: ExecArgs) -> u8 {
     );
     shutdown(&svc);
     EXIT_OK
+}
+
+/// A destructive-op gate for the CLI, mirroring the GUI's confirm dialog: on an
+/// interactive terminal, print `warning` and require a `y`; when `yes` is set,
+/// proceed silently; on a non-interactive terminal without `--yes`, refuse.
+/// Returns `Some(exit_code)` when the caller should stop, `None` to proceed.
+pub(crate) fn confirm_destructive(yes: bool, warning: &str) -> Option<u8> {
+    if yes {
+        return None;
+    }
+    if !std::io::stdin().is_terminal() {
+        eprintln!("refusing a destructive operation without confirmation; pass --yes to proceed");
+        return Some(EXIT_USAGE);
+    }
+    eprint!("{warning}\nContinue? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err()
+        || !matches!(answer.trim(), "y" | "Y" | "yes" | "Yes")
+    {
+        eprintln!("aborted");
+        return Some(EXIT_OK);
+    }
+    None
 }
 
 /// `red reset [--yes]`: wipe every RED directory and keychain secret. Prompts for

@@ -18,7 +18,7 @@
 //! forms, `RETURNING`, CTEs, batches) is declined rather than guessed at.
 
 use super::risk::target_object;
-use super::{first_keyword, split_statements, strip_noise};
+use super::{Dialect, first_keyword, split_statements, strip_noise};
 
 /// The query whose row count equals the number of rows `sql` would affect, or `None`
 /// when `sql` is not a shape this can rewrite faithfully.
@@ -34,8 +34,8 @@ use super::{first_keyword, split_statements, strip_noise};
 /// - `DELETE FROM t [WHERE p]` -> `SELECT 1 FROM t [WHERE p]`
 /// - `TRUNCATE [TABLE] t` and `DROP TABLE t` -> `SELECT 1 FROM t`, so a
 ///   confirmation can say how much lives in the table before it goes.
-pub fn count_preflight(sql: &str) -> Option<String> {
-    let statements: Vec<&str> = split_statements(sql)
+pub fn count_preflight(sql: &str, dialect: Dialect) -> Option<String> {
+    let statements: Vec<&str> = split_statements(sql, dialect)
         .into_iter()
         .filter(|s| !first_keyword(s).is_empty())
         .collect();
@@ -43,7 +43,7 @@ pub fn count_preflight(sql: &str) -> Option<String> {
     let [stmt] = statements.as_slice() else {
         return None;
     };
-    let stripped = strip_noise(stmt);
+    let stripped = strip_noise(stmt, dialect);
     let lower = stripped.to_ascii_lowercase();
 
     // `RETURNING` would be swept into the sliced tail and make the count query
@@ -157,7 +157,13 @@ fn word_at(lower: &str, n: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::count_preflight;
+    use super::Dialect;
+
+    /// The rewrites here probe shapes, not dialect lexing, so they all run under
+    /// [`Dialect::Generic`].
+    fn count_preflight(sql: &str) -> Option<String> {
+        super::count_preflight(sql, Dialect::Generic)
+    }
 
     #[test]
     fn rewrites_the_shapes_it_accepts() {
